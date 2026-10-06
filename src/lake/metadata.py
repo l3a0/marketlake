@@ -162,7 +162,8 @@ def stamp_assertion_pid(lake_root: Path | str, *, pid: int | None) -> None:
     """Stamp the pid of the ``caffeinate`` now holding idle sleep off, or clear it.
 
     ``pid`` is ``None`` when the daemon holds nothing, which is every minute outside an
-    assertion window and every minute inside one whose spawn failed. Clearing rather
+    assertion window, every minute inside one whose spawn failed, and every minute on a
+    Linux host, where the daemon spawns no ``caffeinate`` at all. Clearing rather
     than leaving the last pid is what keeps the stamp a statement about now. A number
     left behind after the window closed would name a process that has already exited,
     and the self-check reading it could only ever be told a lie or told nothing.

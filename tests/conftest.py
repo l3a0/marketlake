@@ -1,17 +1,19 @@
 """Shared fixtures that expose the four seams and the fixture-lake builder.
 
-It also carries three guards, one redirect, one deletion, and one check on the outcome.
-The network guard fails any test that reaches another machine from inside this process.
-The subprocess guard fails any test that shells out to rsync, launchctl, pmset, or
-tmutil. The config-directory guard fails any test that writes under the machine's real
-``~/.config/marketlake/``, and its other half, the predicate deciding what counts as that
-directory, sits in ``tests/support/config_guard.py`` so a child can ask without importing
-this file. The redirect points this process, and every child that inherits its
-environment, at a throwaway config directory, which is what covers the children the three
-guards cannot reach. The deletion drops an inherited ``MARKETLAKE_CONFIG``, which names a
-config file rather than a directory and so is not moved by that redirect. The check on the
-outcome lists the real config directory when this file is imported and again when the
-session ends, and fails the run when it changed.
+It also carries three guards, one redirect, one deletion, one host pin, and one check on
+the outcome. The network guard fails any test that reaches another machine from inside
+this process. The subprocess guard fails any test that shells out to rsync, launchctl,
+pmset, tmutil, systemctl, or timedatectl. The config-directory guard fails any test that
+writes under the machine's real ``~/.config/marketlake/``, and its other half, the
+predicate deciding what counts as that directory, sits in
+``tests/support/config_guard.py`` so a child can ask without importing this file. The
+redirect points this process, and every child that inherits its environment, at a
+throwaway config directory, which is what covers the children the three guards cannot
+reach. The deletion drops an inherited ``MARKETLAKE_CONFIG``, which names a config file
+rather than a directory and so is not moved by that redirect. The host pin makes every
+test run as macOS unless it asks for Linux, so CI's Linux runner takes the same branch as
+the laptop. The check on the outcome lists the real config directory when this file is
+imported and again when the session ends, and fails the run when it changed.
 """
 
 from __future__ import annotations
@@ -268,14 +270,16 @@ def _no_network() -> Iterator[None]:
 
 # -- the subprocess guard --------------------------------------------------------------
 
-# Six production call sites shell out to a named external tool through
+# Eight production call sites shell out to a named external tool through
 # ``subprocess.run``: ``RsyncBackup.sync`` runs ``rsync``, ``launchctl_probe`` runs
 # ``launchctl``, ``read_pmset_schedule`` and ``pmset_assertions_probe`` run ``pmset``,
-# ``read_exclusions`` runs ``tmutil``, and ``sweep.set_sunday_wake`` runs ``pmset`` under
-# ``sudo``. Each is a seam, so a test injects a fake in place of the function that calls
-# it. A test that forgets runs the real tool instead, which the network guard above
-# cannot catch: none of the six touch a socket in this process. This fixture closes that
-# gap the same way, on those program names only.
+# ``read_exclusions`` runs ``tmutil``, ``sweep.set_sunday_wake`` runs ``pmset`` under
+# ``sudo``, ``systemctl_probe`` runs ``systemctl``, and ``timedatectl_clock_probe`` runs
+# ``timedatectl``. Each is a seam, so a test injects a fake in place of the function that
+# calls it. A test that forgets runs the real tool instead, which the network guard above
+# cannot catch: none of the eight touch a socket in this process. The two Linux probes
+# would read the CI runner's own systemd, whose answer has nothing to do with the case
+# under test. This fixture closes that gap the same way, on those program names only.
 #
 # The refusal has to name the program rather than block every subprocess. Four tests in
 # ``tests/component/test_control_plane_render.py`` run the rendered install, reinstall,
@@ -291,7 +295,7 @@ def _no_network() -> Iterator[None]:
 # that writes rather than reads: a forgotten seam would have re-scheduled the
 # developer's own machine. So the wrapper is stepped over below.
 
-_GUARDED_PROGRAMS = frozenset({"rsync", "launchctl", "pmset", "tmutil"})
+_GUARDED_PROGRAMS = frozenset({"rsync", "launchctl", "pmset", "tmutil", "systemctl", "timedatectl"})
 
 # Programs that run another program named later in the same argument list. ``sudo`` is
 # the one this repo uses. ``env`` and ``arch`` are listed beside it because all three
@@ -301,7 +305,10 @@ _WRAPPER_PROGRAMS = frozenset({"sudo", "env", "arch"})
 
 
 class SubprocessAccessInTest(BaseException):
-    """Raised when a test reaches ``rsync``, ``launchctl``, ``pmset``, or ``tmutil``.
+    """Raised when a test reaches one of the six guarded programs.
+
+    They are ``rsync``, ``launchctl``, ``pmset``, ``tmutil``, ``systemctl``, and
+    ``timedatectl``.
 
     It derives from ``BaseException``, the same reason ``NetworkAccessInTest`` does.
     The Sunday self-check wraps both ``schedule_reader()`` and ``exclusion_reader()``
@@ -360,10 +367,10 @@ def _program_of(args: object) -> str | None:
 
 @pytest.fixture(autouse=True)
 def _no_subprocess() -> Iterator[None]:
-    """Fail any test that would shell out to rsync, launchctl, pmset, or tmutil.
+    """Fail any test that would shell out to one of the six guarded programs.
 
     Autouse, for the same reason ``_no_network`` is: the failure this catches is a test
-    forgetting to inject one of the four seams, and a test that forgets one would
+    forgetting to inject one of the eight seams, and a test that forgets one would
     equally forget to ask for the guard.
 
     Every other subprocess call passes through untouched, ``caffeinate`` included. Its
@@ -393,6 +400,50 @@ def _no_subprocess() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(subprocess, "run", _refuser(subprocess.run))
         mp.setattr(subprocess, "Popen", _refuser(subprocess.Popen))
+        yield
+
+
+# -- the host pin -----------------------------------------------------------------------
+
+# ``control_plane.is_macos`` decides which probes the jobs wire, and it reads
+# ``sys.platform``. CI runs on Linux and the laptop on macOS, so without a pin every test
+# that drives a ``main`` would take one branch on the laptop and the other on CI. So every
+# test runs as macOS unless it asks for ``on_linux``.
+#
+# The pin goes on the helper, never on ``sys.platform``, because the helper is what every
+# caller reads, and ``daemon`` and ``sweep`` call it through the module so this one patch
+# reaches them too. The real helper is still checked, by a test that binds it at import,
+# ``tests/unit/test_control_plane_linux.py``.
+
+
+@pytest.fixture(autouse=True)
+def _host_is_macos() -> Iterator[None]:
+    """Pin every test to the macOS host unless it asks for ``on_linux``.
+
+    The fixture holds its own ``MonkeyPatch``, for the reason ``_no_network`` does: a test
+    calling ``monkeypatch.undo()`` must not disarm it. It imports ``control_plane`` inside
+    its body, because that module builds a default from the config directory, and a
+    module-level import above the export at the top of this file would trip
+    ``_ALREADY_BOUND``.
+    """
+    from lake import control_plane
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(control_plane, "is_macos", lambda: True)
+        yield
+
+
+@pytest.fixture
+def on_linux(_host_is_macos: None) -> Iterator[None]:
+    """Run this test as the Linux host.
+
+    It asks for the pin by name, so the pin is set first and this lands on top of it, and
+    it holds its own ``MonkeyPatch`` for the reason the pin does.
+    """
+    from lake import control_plane
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(control_plane, "is_macos", lambda: False)
         yield
 
 

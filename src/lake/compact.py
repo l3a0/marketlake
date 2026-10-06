@@ -33,10 +33,11 @@ The job's rules, each glossed at first use.
    seals the live day and never unlinks a segment the daemon holds open.
 3. *Verify before manifest, manifest before delete.* Each ticker-day's segments are read
    to their last complete batch, concatenated, and written as one Parquet file. The file
-   is then read back, once, and that one read serves both checks. Its row count is
-   compared to the sum across the segments, and its digest is what the manifest records.
-   Only after that does the manifest entry land, and only after the manifest append are
-   the segments unlinked. A crash at any point re-runs with nothing lost.
+   is then read back, once, and that one read serves every check. Its row count is
+   compared to the sum across the segments, its footer to the schema that was written,
+   and its digest is what the manifest records. Only after that does the manifest entry
+   land, and only after the manifest append are the segments unlinked. A crash at any
+   point re-runs with nothing lost.
 
    That count cannot see a segment whose bytes changed on disk, because the sum it is
    checked against is taken from the same reads. A damaged segment can read as a torn
@@ -217,6 +218,13 @@ COMPACTION_SOURCE = "compaction"
 # The chains columns the re-tune profile reads. Everything else stays on disk.
 _PROFILE_COLUMNS = ("ticker", "snap_ts", "row_kind", "window_start", "window_end")
 
+# How many rows the seal's read-back and the re-tune's profile decode at a time. Both
+# stream the partition rather than decoding it whole, because a whole ticker-day decoded
+# at once needed 4,017.2 MiB for SPY on 2026-09-30, more than a 2 GiB host has
+# (marketlake #660). A batch's memory grows with this number and not with the file, so
+# it bounds both reads however large a day gets.
+_READ_BATCH_ROWS = 8192
+
 # The event and title on compaction's schema-drift page. The design's message table gives
 # schema drift one row and names four producers for it: the parser mid-day, the close+5
 # fill through the same page, the nightly battery, and this one. The other three read what
@@ -275,13 +283,84 @@ class PartitionMismatch(Exception):
 
 
 class CompactionVerifyError(Exception):
-    """Raised when a freshly written partition re-reads with the wrong row count."""
+    """Raised when a freshly written partition fails the seal's read-back.
 
-    def __init__(self, partition: str, expected: int, actual: int) -> None:
-        super().__init__(f"{partition}: wrote {expected} rows, re-read {actual}")
+    Either the file re-reads with the wrong row count, or its footer disagrees with what
+    was written, which ``disagreement`` then names. ``_footer_disagreement`` lists what
+    the footer is checked for.
+    """
+
+    def __init__(
+        self, partition: str, expected: int, actual: int, disagreement: str | None = None
+    ) -> None:
+        message = f"{partition}: wrote {expected} rows, re-read {actual}"
+        super().__init__(message if disagreement is None else f"{message}, but {disagreement}")
         self.partition = partition
         self.expected = expected
         self.actual = actual
+        self.disagreement = disagreement
+
+
+def _schema_difference(found: pa.Schema, written: pa.Schema) -> str:
+    """The first field where the footer's schema differs from the one written.
+
+    A chains schema has dozens of columns, so the message names the one that differs
+    rather than printing both schemas whole.
+    """
+
+    def described(field: pa.Field) -> str:
+        return f"{field.name} ({field.type}{'' if field.nullable else ', not null'})"
+
+    for index in range(min(len(found), len(written))):
+        if not found.field(index).equals(written.field(index)):
+            return (
+                f"the footer names column {index} {described(found.field(index))} "
+                f"where {described(written.field(index))} was written"
+            )
+    if len(found) < len(written):
+        return f"the footer has no column {written.field(len(found)).name}"
+    return f"the footer adds column {found.field(len(written)).name}"
+
+
+def _footer_disagreement(reader: pq.ParquetFile, written: pa.Schema) -> str | None:
+    """Where the re-read file's footer disagrees with what was written, or None.
+
+    A batched read decodes every page, but it trusts three footer facts that can be wrong
+    while every page still decodes and the count still matches.
+
+    1. The schema. Any read returns whatever schema the footer names, so a renamed or
+       retyped column reads without complaint, and a reader asking for the column by its
+       written name finds nothing.
+    2. Each column chunk's physical type. A whole-table read refuses a chunk whose type
+       disagrees with the schema, and a filtered read, which decodes the chunk's
+       statistics by that type, hangs on it.
+    3. Each column chunk's value count. A whole-table read, the loader's included, sizes
+       each column by it, so a count that disagrees with its row group refuses the
+       partition there.
+
+    All three are metadata, so checking them decodes nothing. The chunk's statistics are
+    never read here, because reading them from a chunk with the wrong type aborts the
+    process.
+    """
+    if not reader.schema_arrow.equals(written):
+        return _schema_difference(reader.schema_arrow, written)
+    metadata = reader.metadata
+    for i in range(metadata.num_row_groups):
+        group = metadata.row_group(i)
+        for j in range(group.num_columns):
+            column, leaf = group.column(j), metadata.schema.column(j)
+            if column.physical_type != leaf.physical_type:
+                return (
+                    f"row group {i} stores {column.path_in_schema} as "
+                    f"{column.physical_type}, but the schema says {leaf.physical_type}"
+                )
+            # A leaf with no repetition holds one value per row, null or not.
+            if not leaf.max_repetition_level and column.num_values != group.num_rows:
+                return (
+                    f"row group {i} declares {column.num_values} values in "
+                    f"{column.path_in_schema} for {group.num_rows} rows"
+                )
+    return None
 
 
 class RecompactionRefused(Exception):
@@ -1399,9 +1478,10 @@ def _seal(
     segment is then read before anything is written, so a shadow-append raises with the
     ticker-day untouched, and every segment the read proves damaged raises
     ``DamagedSegments`` the same way, after the rest have been read. The
-    Parquet lands and is read back once. That read yields both the row count, checked
-    against the sum across the segments, and the digest the manifest entry carries. The
-    entry is appended. Only then are the segments unlinked.
+    Parquet lands and is read back once. That read yields the row count, checked against
+    the sum across the segments, the footer, checked against the schema that was written,
+    and the digest the manifest entry carries. The entry is appended. Only then are the
+    segments unlinked.
 
     With ``guard`` on, the no-shrink invariant is checked before the partition file is
     replaced. A refused rebuild must leave the larger partition on disk, untouched,
@@ -1577,12 +1657,21 @@ def _seal(
         guard_row_count(root, rel, expected)
 
     _write_partition(merged, partition)
-    # One read of the sealed file serves both post-write checks. The row count proves
-    # every page decodes, and the digest attests the very bytes the count came from.
+    # One read of the sealed file serves every post-write check. The row count proves
+    # every page decodes, and the digest attests the very bytes the count came from. The
+    # count is summed over batches decoded from those same bytes, every column of every
+    # row, so only one batch is ever decoded at a time. A batched read trusts footer facts
+    # that a whole-table read refuses on, so the same reader's footer is checked against
+    # the schema written. Without that, a day the loader cannot read would seal, and its
+    # segments would be deleted.
     written = partition.read_bytes()
-    actual = pq.read_table(pa.BufferReader(written)).num_rows
+    reader = pq.ParquetFile(pa.BufferReader(written))
+    actual = sum(batch.num_rows for batch in reader.iter_batches(batch_size=_READ_BATCH_ROWS))
     if actual != expected:
         raise CompactionVerifyError(rel, expected, actual)
+    disagreement = _footer_disagreement(reader, merged.schema)
+    if disagreement is not None:
+        raise CompactionVerifyError(rel, expected, actual, disagreement)
 
     # ``guard`` is passed on, but not because this append re-checks anything reachable.
     # It arrives with the same row count, against the same manifest, and nothing appends
@@ -1692,8 +1781,10 @@ def _offsets(row: Mapping[str, object], session_date: date) -> Window:
     return (start, end)
 
 
-def window_profile(table: pa.Table, session_date: date) -> WindowProfile:
-    """Profile one day's chains rows by plan window.
+def window_profile(
+    partition: Path | str, session_date: date, *, batch_size: int = _READ_BATCH_ROWS
+) -> WindowProfile:
+    """Profile one day's chains partition by plan window.
 
     A cycle is one ``(ticker, snap_ts)``. Its contracts in a window are its data rows
     whose ``window_start`` and ``window_end`` name that window. The peak across cycles
@@ -1701,34 +1792,54 @@ def window_profile(table: pa.Table, session_date: date) -> WindowProfile:
     rows carrying a window are that window's absence markers, so they mark it failed
     for the day rather than counting toward it. The ISO window bounds are turned back
     into day offsets from ``session_date``, the same arithmetic ``ChainPlan.windows_for``
-    runs forward. Rows with no window, from a one-shot whole-chain fetch, a whole-chain
-    gap, or an expiration before the session date, are left out.
+    runs forward.
+
+    The partition at ``partition`` is read ``batch_size`` rows at a time, and only the
+    profile columns, so its memory does not grow with the day (marketlake #660). A cycle
+    can straddle two batches, so each cycle's count in a window is summed across batches,
+    and the peak per window is taken only once every batch has been counted.
+
+    Three rules decide what a row with a null counts as.
+
+    1. A null ``window_start`` leaves the row out. Rows with no window come from a
+       one-shot whole-chain fetch, a whole-chain gap, or an expiration before the
+       session date.
+    2. A null ``window_end`` is the plan's open tail, which counts as its own window.
+    3. A null ``row_kind`` counts as neither a data row nor a gap row.
     """
-    if table.num_rows == 0:
-        return WindowProfile({}, frozenset())
-    windowed = table.filter(pc.is_valid(table.column("window_start")))
-    if windowed.num_rows == 0:
-        return WindowProfile({}, frozenset())
-    kinds = windowed.column("row_kind")
-    data = windowed.filter(pc.equal(kinds, ROW_KIND_DATA))
-    gaps = windowed.filter(pc.not_equal(kinds, ROW_KIND_DATA))
+    keys = ["ticker", "snap_ts", "window_start", "window_end"]
+    per_cycle: dict[tuple[object, ...], int] = {}
+    gap_bounds: set[tuple[object, object]] = set()
+    with pq.ParquetFile(partition) as reader:
+        for batch in reader.iter_batches(columns=list(_PROFILE_COLUMNS), batch_size=batch_size):
+            windowed = batch.filter(pc.is_valid(batch.column("window_start")))
+            if windowed.num_rows == 0:
+                continue
+            kinds = windowed.column("row_kind")
+            # ``equal`` and ``not_equal`` give null on a null ``row_kind``, and ``filter``
+            # drops a null, which is rule 3.
+            data = windowed.filter(pc.equal(kinds, ROW_KIND_DATA))
+            gaps = windowed.filter(pc.not_equal(kinds, ROW_KIND_DATA))
+            if data.num_rows:
+                counted = (
+                    pa.Table.from_batches([data]).group_by(keys).aggregate([([], "count_all")])
+                )
+                for row in counted.to_pylist():
+                    key = tuple(row[name] for name in keys)
+                    per_cycle[key] = per_cycle.get(key, 0) + int(row["count_all"])
+            if gaps.num_rows:
+                distinct = pa.Table.from_batches([gaps]).group_by(keys[2:]).aggregate([])
+                for row in distinct.to_pylist():
+                    gap_bounds.add((row["window_start"], row["window_end"]))
 
     peaks: dict[Window, int] = {}
-    if data.num_rows:
-        per_cycle = data.group_by(["ticker", "snap_ts", "window_start", "window_end"]).aggregate(
-            [([], "count_all")]
-        )
-        by_window = per_cycle.group_by(["window_start", "window_end"]).aggregate(
-            [("count_all", "max")]
-        )
-        for row in by_window.to_pylist():
-            peaks[_offsets(row, session_date)] = int(row["count_all_max"])
-
-    failed: set[Window] = set()
-    if gaps.num_rows:
-        distinct = gaps.group_by(["window_start", "window_end"]).aggregate([])
-        for row in distinct.to_pylist():
-            failed.add(_offsets(row, session_date))
+    for (_, _, start, end), count in per_cycle.items():
+        window = _offsets({"window_start": start, "window_end": end}, session_date)
+        peaks[window] = max(peaks.get(window, 0), count)
+    failed = {
+        _offsets({"window_start": start, "window_end": end}, session_date)
+        for start, end in gap_bounds
+    }
     return WindowProfile(peaks, frozenset(failed))
 
 
@@ -1873,8 +1984,7 @@ def _retune(
             # A partition without the window columns predates the windowed fetch. It
             # carries no profile, so it has nothing to say about the plan.
             continue
-        table = pq.read_table(path, columns=list(_PROFILE_COLUMNS))
-        profile = window_profile(table, day)
+        profile = window_profile(path, day)
         for window, count in profile.peaks.items():
             peaks[window] = max(peaks.get(window, 0), count)
         failed |= profile.failed

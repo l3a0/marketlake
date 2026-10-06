@@ -202,6 +202,62 @@ def test_a_raising_probe_never_pings():
     assert pinger.urls == []
 
 
+# -- the clock check, which the Linux host asks ------------------------------------------
+
+# Saturday noon, outside every assertion window, so a clock check moved inside the
+# assertion block would not run here and the ping would fire.
+SATURDAY_NOON = et(2026, 9, 5, 12, 0)
+
+
+def test_an_unsynchronized_clock_withholds_the_ping_at_any_hour():
+    pinger = FakePinger()
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=pinger,
+        ping_url=URL,
+        assertion_probe=None,
+        clock_probe=lambda: cp.CLOCK_NOT_SYNCED,
+        now=SATURDAY_NOON,
+    )
+    assert outcome == cp.SelfCheckOutcome(
+        daemon_up=True, pinged=False, problem="clock not synchronized (NTPSynchronized=no)"
+    )
+    assert pinger.urls == []
+
+
+def test_a_synchronized_clock_lets_the_ping_fire():
+    pinger = FakePinger()
+    outcome = cp.self_check(
+        probe=lambda label: True,
+        pinger=pinger,
+        ping_url=URL,
+        assertion_probe=None,
+        clock_probe=lambda: None,
+        now=SATURDAY_NOON,
+    )
+    assert outcome == cp.SelfCheckOutcome(daemon_up=True, pinged=True)
+    assert outcome.problem is None
+    assert pinger.urls == [URL]
+
+
+def test_a_down_daemon_is_never_asked_about_the_clock():
+    asked: list[str] = []
+
+    def clock_probe() -> str | None:
+        asked.append("clock")
+        return None
+
+    outcome = cp.self_check(
+        probe=lambda label: False,
+        pinger=FakePinger(),
+        ping_url=URL,
+        clock_probe=clock_probe,
+        now=SATURDAY_NOON,
+    )
+    assert outcome == cp.SelfCheckOutcome(daemon_up=False, pinged=False)
+    assert asked == []
+
+
 class RaisingPinger:
     """A pinger whose GET fails, the way a wifi blip makes the real one fail."""
 
