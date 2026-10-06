@@ -2893,8 +2893,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     real clock and the real calendar are wired here and nowhere else in this module.
 
     A malformed config exits with code 2 and a one-line message. A port already in
-    use does the same. The design puts this service under launchd ``KeepAlive``, where
-    an uncaught traceback becomes a restart loop instead of a readable complaint.
+    use does the same. The design keeps this service running under the host's service
+    manager, launchd's ``KeepAlive`` or systemd's ``Restart=always``, where an uncaught
+    traceback becomes a restart loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
     if args.lake_root is not None:

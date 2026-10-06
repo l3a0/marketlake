@@ -735,8 +735,9 @@ def load_config(
 
     A parse failure names the file and nothing else. PyYAML quotes the offending line
     back in its message, and four to six of this file's values are secrets, so a stray quote
-    on the ping-key line would put that key in the error. Jobs run from launchd with
-    stdout and stderr going to a log file, so an uncaught traceback writes it to disk.
+    on the ping-key line would put that key in the error. A scheduled job's stdout and
+    stderr go to the service manager's log, a file under launchd and the journal under
+    systemd, so an uncaught traceback leaves the key in that log.
     ``_parse_yaml`` drops the parse error rather than chaining it, and the ``ConfigError``
     is raised outside that handler, so the quoted line is on neither the traceback nor
     the exception's ``__context__``.

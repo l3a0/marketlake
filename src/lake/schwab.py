@@ -807,7 +807,7 @@ class SchwabVendor:
         cycle, so dropping the client frees nothing until the cyclic collector runs, and the
         sockets stay open until then. Closing it at the end of the cycle frees them at once.
         A close that fails costs nothing the cycle captured, so it prints one line to the
-        launchd log and returns.
+        daemon's log and returns.
         """
         session = getattr(self._client, "session", None)
         if session is None:

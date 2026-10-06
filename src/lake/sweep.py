@@ -63,16 +63,18 @@ and ``report``, because one list would let a held finding silence the check.
 **A catch-up run must not ping green.** ``RunAtLoad`` being off does not stop launchd firing a
 missed 18:30 occurrence on the next wake, and ``control_plane.sunday_job`` says that coalescing
 "has nothing to do with ``RunAtLoad``". Such a run fires at the 08:25 wake, against a session
-whose close has not happened. Every ticker would fail the bar span check and the run would ping
-green while the missed evening's bars stayed missing forever. So the bar fetch runs only once
+whose close has not happened. On Linux the sweep's timer carries ``Persistent=true``, so a VM
+that was down at 18:30 runs it once it is back up, which can be the next morning too. Every
+ticker would fail the bar span check and the run would ping green while the missed evening's
+bars stayed missing forever. So the bar fetch runs only once
 the session's equity close has passed, and a run that skipped it for that reason stays silent.
 The guard cannot refuse a real run, because the job fires at 18:30 against a 16:00 close, or
 13:00 on an early close. Recovering the evening that was missed is the walk's own doing now:
 marketlake #422 pointed this job at #319's span walk, so the next run that does fire reaches
 every session still unlanded rather than only the one its clock sits on.
 
-**A holiday runs none of the data work.** The launchd interval is Monday through Friday, so a
-non-session weekday is a holiday, and the design has "compaction and the sweep no-op on an
+**A holiday runs none of the data work.** The schedule is Monday through Friday on both hosts, so
+a non-session weekday is a holiday, and the design has "compaction and the sweep no-op on an
 empty journal". The one-line digest settles it: a run whose walks found something would have
 nowhere to say so. The walks read every sealed ticker-day rather than today's, so a holiday
 run would re-derive yesterday's held findings and file each one again under
@@ -1074,8 +1076,9 @@ def sweep(
             except _BARS_REFUSALS as exc:
                 pieces.append((BARS_PIECE, _refused(exc)))
         else:
-            # A catch-up run, fired by launchd on the next wake for an 18:30 the machine
-            # slept through. Fetching now would ask for a session still in progress.
+            # A catch-up run for an 18:30 the host missed: launchd fires it on the Mac's next
+            # wake, and systemd's ``Persistent=true`` once a VM is back up. Fetching now would
+            # ask for a session still in progress.
             #
             # The guard stays although the walk above now applies its own per-session ceiling and
             # would simply leave today out. What it costs is the earlier sessions that run could

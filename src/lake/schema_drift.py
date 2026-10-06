@@ -293,9 +293,9 @@ def page(publisher: Publisher, drifted: Sequence[ColumnDrift], *, now: datetime)
     """Page once for the cycle, naming every column that started drifting in it.
 
     The finding reaches stderr as well as the phone, which is what compaction's drift page
-    and the daemon's assertion page both already do. launchd captures that stream and the
-    restart script sends the operator to it, so the per-ticker detail the page folds away
-    is still recoverable without opening a segment.
+    and the daemon's assertion page both already do. The service manager captures that
+    stream and the restart script sends the operator to it, so the per-ticker detail the
+    page folds away is still recoverable without opening a segment.
 
     A publisher that refused the page found one of its own secrets in the body, and it
     redacted its record for that reason, so stderr must not undo the redaction. That is the

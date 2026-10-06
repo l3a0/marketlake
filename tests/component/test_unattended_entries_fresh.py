@@ -10,8 +10,16 @@ helper extracted from the daemon and reached only through it passes the full sui
 in-process entry test included, and stops capture: under ``KeepAlive`` the daemon exits 1
 on every relaunch.
 
-So each job here runs as a real child, the way launchd runs it: the job's own argv,
-environment and working directory. The working directory matters under ``-m``, because
+So each job here runs as a real child, the way its service manager runs it: the job's own
+argv, environment and working directory. Each runs twice, once as launchd starts it and
+once as systemd does. systemd hands a unit its own fixed ``PATH`` and, from ``User=``,
+``HOME``, ``USER``, ``LOGNAME`` and ``SHELL``, and then the unit's ``Environment=`` on top.
+The service manager's own environment reaches the unit too, which holds the host's locale
+and whatever ``DefaultEnvironment=`` or ``systemctl set-environment`` added. The child here
+starts without it. An operator's shell export reaches a unit through neither source.
+The suite pins ``is_macos`` to true, and that pin does not reach a child, so on CI's Linux
+runner the child takes the Linux branch. Every entry still exits 2 on the missing config
+before any probe. The working directory matters under ``-m``, because
 Python puts it first on ``sys.path``. The compaction child the daemon spawns runs the same
 way, with the argv ``daemon.compaction_command`` builds and the daemon job's environment
 and working directory, which it inherits because the spawn passes neither. The host is
@@ -45,37 +53,73 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TIMEOUT_SECONDS = 30
 
 
-def fresh_job(label: str, home: Path) -> cp.LaunchdJob:
+# The owner the units run as. systemd sets ``USER`` and ``LOGNAME`` from ``User=``.
+OWNER = "someone"
+
+# The ``PATH`` systemd gives a system service that sets none, on a host where ``/bin`` and
+# ``/sbin`` are not merged into ``/usr``. The rendered units leave ``PATH`` to it.
+SYSTEMD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def fresh_job(host_kind: str, label: str, home: Path) -> cp.Job:
     """The job with this label, as rendered for a host whose home is ``home``."""
-    host = cp.LaunchdHost(
-        python=sys.executable,
-        owner="someone",
-        home=str(home),
-        project_dir=str(REPO_ROOT),
-        log_dir=str(home / "logs"),
-    )
+    host: cp.Host
+    if host_kind == "launchd":
+        host = cp.LaunchdHost(
+            python=sys.executable,
+            owner=OWNER,
+            home=str(home),
+            project_dir=str(REPO_ROOT),
+            log_dir=str(home / "logs"),
+        )
+    else:
+        host = cp.SystemdHost(
+            python=sys.executable, owner=OWNER, home=str(home), project_dir=str(REPO_ROOT)
+        )
     (job,) = [job for job in cp.all_jobs(host) if job.label == label]
     return job
 
 
-def fresh_entry(label: str, home: Path) -> tuple[list[str], dict[str, str], str]:
+def started_environment(host_kind: str, job: cp.Job, home: Path) -> dict[str, str]:
+    """The environment the service manager starts the job with.
+
+    launchd hands a job exactly its plist's block. systemd sets its own five first and
+    lays the unit's ``Environment=`` over them. The manager's own environment, which the
+    module docstring names, is left out.
+    """
+    if host_kind == "launchd":
+        return dict(job.environment)
+    return {
+        "PATH": SYSTEMD_PATH,
+        "HOME": str(home),
+        "USER": OWNER,
+        "LOGNAME": OWNER,
+        "SHELL": "/bin/bash",
+        **job.environment,
+    }
+
+
+def fresh_entry(host_kind: str, label: str, home: Path) -> tuple[list[str], dict[str, str], str]:
     """The argv, environment and working directory the entry with this label starts with.
 
-    The compaction child is not a launchd job. The daemon spawns it with
+    The compaction child is not a job of either host. The daemon spawns it with
     ``subprocess.Popen`` and no ``env`` or ``cwd``, so it starts with the daemon job's.
     """
     if label == COMPACTION:
-        parent = fresh_job(cp.DAEMON_LABEL, home)
-        return daemon.compaction_command(None), parent.environment, parent.working_directory
-    job = fresh_job(label, home)
-    return list(job.program_arguments), job.environment, job.working_directory
+        parent = fresh_job(host_kind, cp.DAEMON_LABEL, home)
+        env = started_environment(host_kind, parent, home)
+        return daemon.compaction_command(None), env, parent.working_directory
+    job = fresh_job(host_kind, label, home)
+    env = started_environment(host_kind, job, home)
+    return list(job.program_arguments), env, job.working_directory
 
 
+@pytest.mark.parametrize("host_kind", ["launchd", "systemd"])
 @pytest.mark.parametrize("label", [job.label for job in JOBS] + [COMPACTION])
-def test_the_entry_imports_cleanly_from_a_fresh_interpreter(label, tmp_path):
+def test_the_entry_imports_cleanly_from_a_fresh_interpreter(host_kind, label, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    argv, env, cwd = fresh_entry(label, home)
+    argv, env, cwd = fresh_entry(host_kind, label, home)
     python, flag, module, *args = argv
     assert flag == "-m", f"{label} does not start a module: {argv}"
 

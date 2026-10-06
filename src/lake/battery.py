@@ -2573,10 +2573,11 @@ def render(report: BatteryReport) -> str:
 def main(argv: Sequence[str] | None = None, *, clock=None) -> int:
     """The ``python -m lake.battery`` entry. Returns a process exit code.
 
-    **Every refusal reaches the operator as a line rather than a stack.** A run from launchd
-    writes stderr to a log file, and an uncaught traceback there is a wall of frames around one
-    sentence. ``input_errors_exit`` covers the config files that are the operator's to edit, and
-    the two ways a lake can fail here are named apart because they send the operator to
+    **Every refusal reaches the operator as a line rather than a stack.** A scheduled run
+    writes stderr to the service manager's log, a file under launchd and the journal under
+    systemd, and an uncaught traceback there is a wall of frames around one sentence.
+    ``input_errors_exit`` covers the config files that are the operator's to edit, and the
+    two ways a lake can fail here are named apart because they send the operator to
     different repairs.
 
     **A quarantine is not an error.** A run that found a delayed feed did its job, so it exits

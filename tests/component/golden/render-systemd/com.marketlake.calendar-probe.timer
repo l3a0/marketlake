@@ -1,0 +1,12 @@
+# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,
+# not this file: the install entry point renders afresh on every run.
+
+[Unit]
+Description=com.marketlake.calendar-probe
+
+[Timer]
+OnCalendar=Mon..Fri 09:35:00 America/New_York
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1095,9 +1095,9 @@ def _file_drift(
     has no partition and no manifest entry behind it, which changes what the finding says
     and not how it is filed.
 
-    A write that itself fails leaves stderr, which launchd files. That is ``alert._record``'s
-    rule for the same situation: the record is the last line of defence, and when it
-    fails the one place left to say so is the log.
+    A write that itself fails leaves stderr, which the service manager keeps in a log. That
+    is ``alert._record``'s rule for the same situation: the record is the last line of
+    defence, and when it fails the one place left to say so is the log.
 
     ``found`` is the list the run collects its findings in, and ``_page_drift`` turns that
     list into one page. This helper appends the finding before it attempts the write. The
@@ -1248,10 +1248,10 @@ def _page(
     """Send one of compaction's pages, and say on stderr what became of it.
 
     The finding reaches stderr as well as the phone, which is what the daemon's assertion
-    page already does. launchd files that log and the restart script sends the operator to
-    it. A publisher that refused the page found one of its own secrets in the body, and it
-    redacted its record for that reason, so stderr must not undo the redaction. That is
-    the one case where the body stops here.
+    page already does. The service manager keeps that stream with the daemon's, and the
+    restart script sends the operator to it. A publisher that refused the page found one of
+    its own secrets in the body, and it redacted its record for that reason, so stderr must
+    not undo the redaction. That is the one case where the body stops here.
 
     ``publish`` never raises, so this cannot cost the backup that runs after it. A page
     that did not reach the phone is written down under ``reports/alerts/`` by the
@@ -2443,8 +2443,9 @@ def main(
         raise SystemExit(2) from None
     print(result.render())
     if isinstance(backup, bucket.BucketBackup) and backup.last is not None:
-        # The nightly throughput, the same line the first upload prints. Under launchd
-        # this lands in compaction's log, which is where the night's rate is read.
+        # The nightly throughput, the same line the first upload prints. Compaction runs as
+        # the daemon's child and shares its stdout, so this lands in the daemon's log, which
+        # is where the night's rate is read.
         print(f"compact: {backup.last.render()}")
     return 0
 

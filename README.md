@@ -20,6 +20,9 @@ except the bootstrap that CI itself stands on, which the owner applies from the 
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
 bucket, its IAM user, and the instance role the VM will use.
 
+The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
+systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
+
 The first deliverable, D0, is the test harness. It builds the seams the whole suite
 leans on. A seam is an injection point where a real dependency is swapped for a fake
 one in a test. There are four seams and one builder.
@@ -62,6 +65,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
+- `deploy/linux-install.sh` is the one install on a Linux host. It renders the systemd
+  units from the checkout and installs them, and the host's first boot and every deploy
+  call it.
 - `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
   and `python -m lake.roster apply` copies it onto a host.
 
@@ -243,6 +249,51 @@ no `s3:GetObjectVersion`, so this is a console step.
 Versioning keeps every version of a partition and 30 days of the files rewritten nightly,
 per the lifecycle rules above.
 
+## Install on a Linux host
+
+A VM runs the control plane under systemd, and one tracked script installs it. Run it as
+root from the checkout, which the owner account owns:
+
+```bash
+sudo deploy/linux-install.sh --owner <account> --lake-mount <path> [--config <path>]
+```
+
+`--lake-mount` is the lake volume's mount point, or `lake_root` when the lake sits on the
+root volume. Every service waits for that mount. The script needs `uv` installed for the
+owner at `~/.local/bin/uv`, and none of the files the jobs read. It is safe to run again,
+and it restarts nothing that is running.
+
+It renders the units afresh on every run into `<owner home>/.local/state/marketlake/systemd/`,
+beside `install.sh`, `restart.sh` and `uninstall.sh`. A running service keeps its old unit
+until it restarts:
+
+```bash
+sudo ~/.local/state/marketlake/systemd/restart.sh          # the dashboard only
+sudo ~/.local/state/marketlake/systemd/restart.sh daemon   # the daemon, and a role change
+sudo ~/.local/state/marketlake/systemd/restart.sh all      # both
+```
+
+A bare `restart.sh` restarts the dashboard alone, because restarting the daemon costs its
+in-flight cycle. A role change in `config.yaml` reaches the daemon only through
+`restart.sh daemon`.
+
+New code does not wait for a restart. `lake` is an editable install, so once the checkout
+moves or the install runs, the timer jobs, the compaction the daemon starts at close+15,
+and any module the running daemon imports for the first time all run the new code. A
+deploy therefore waits for the session's close before it updates the checkout or installs,
+not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
+
+Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern
+time:
+
+```bash
+TZ=America/New_York journalctl -u com.marketlake.daemon
+```
+
+The steps that follow the install, and their order, are the hosted VM runbook in
+[#686](https://github.com/l3a0/marketlake/issues/686). The design doc's Deployment section
+carries the reasoning for each unit setting.
+
 ## Reach the dashboard on a hosted VM
 
 The dashboard binds the loopback address and serves only requests whose `Host` names
@@ -254,10 +305,10 @@ dashboard section carries the reasoning, and
 [#637](https://github.com/l3a0/marketlake/issues/637) carries the plan.
 
 Nothing is installed on the VM for this. The forward needs only a running dashboard and
-the SSH port. The dashboard will run on the VM under the systemd unit that
-[#634](https://github.com/l3a0/marketlake/issues/634) adds. Until that lands nothing
-listens on the VM's `127.0.0.1:8765`, and the forward reports the refusal described at
-the end of this section. On the laptop, open the forward and leave it running:
+the SSH port. The dashboard runs on the VM under its systemd unit,
+`com.marketlake.dashboard.service`, which the Linux install places. While it is down
+nothing listens on the VM's `127.0.0.1:8765`, and the forward reports the refusal
+described at the end of this section. On the laptop, open the forward and leave it running:
 
 ```bash
 ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 127.0.0.1:8766:127.0.0.1:8765 <vm>
