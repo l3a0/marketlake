@@ -320,6 +320,21 @@ def test_the_install_places_every_unit_and_the_dropin(tmp_path, rendered):
     )
 
 
+def test_the_install_leaves_every_unit_and_the_dropin_at_0644(tmp_path, rendered):
+    """The install sets the mode itself rather than carrying the render's.
+
+    The rendered copies are made private first, so a copy that kept the source's mode
+    would leave 0600 behind, as would an install at the wrong mode.
+    """
+    for name in [*UNITS, cp.NEEDRESTART_FILE]:
+        (rendered / name).chmod(0o600)
+    harness = Harness(tmp_path)
+    proc = _install(harness, rendered)
+    assert proc.returncode == 0, proc.stderr
+    for path in [*(harness.unit_dir / unit for unit in UNITS), harness.dropin]:
+        assert path.stat().st_mode & 0o777 == 0o644, path.name
+
+
 def test_the_install_reloads_then_enables_only_what_has_an_install_section(tmp_path, rendered):
     harness = Harness(tmp_path)
     proc = _install(harness, rendered)
