@@ -163,6 +163,21 @@ Three things still hold.
 
 Branch before the first edit, not just before the commit. The moment a task will modify any tracked file, run `git branch --show-current` and branch if it shows `main`. Re-check before every commit, not just the first of a session, because a mid-session squash-merge deletes the branch and leaves the checkout on `main`.
 
+## Deployment approvals (owner directive, 2026-10-06)
+
+**A session never approves, rejects or cancels a deployment.** This holds in every GitHub environment, including the `infra` environment that gates `tofu apply` for [#664](https://github.com/l3a0/marketlake/issues/664). It also holds by every route a session could take:
+
+1. The `gh` CLI, including `gh api`.
+2. `curl` or any other HTTP client.
+3. The GitHub web UI, driven through a browser tool.
+4. Any MCP tool.
+
+When a deployment waits on approval, the session tells the owner which run is waiting and stops.
+
+Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. The approval is the human check on what a session wrote, and a session that approves its own change removes that check.
+
+A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the directive up. It refuses any shell command that names `pending_deployments` or `deployment_protection_rule`, the two REST endpoints that approve or reject a waiting deployment. The rule reads command text only, so a browser click, an MCP call, or a path built at runtime gets past it, and the directive is what covers those routes. Cancelling a run stays outside the rule, because a session may need to cancel an ordinary CI run. Cancelling a run that waits on approval still counts as rejecting it.
+
 ## Pull requests
 
 **Review every PR before the owner does (owner directive, 2026-09-06).** A PR the owner has not seen reviewed is not finished work. This holds whether the PR is yours or someone else's, whether it is one line or a thousand, and whether or not a review was asked for. The owner's time is the scarce thing, so a PR reaches them already checked rather than waiting to be read cold.

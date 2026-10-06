@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(*pending_deployments*)",
+      "Bash(*deployment_protection_rule*)"
+    ]
+  }
+}
