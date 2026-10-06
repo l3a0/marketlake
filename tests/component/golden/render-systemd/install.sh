@@ -3,9 +3,9 @@
 #
 # Written by `python -m lake.control_plane render --init systemd`, which never runs
 # it. deploy/linux-install.sh renders this directory afresh and runs this script,
-# as root, on every install. Running it again by hand is safe:
-#
-#     sudo ./install.sh
+# as root, on every install, holding /run/marketlake-install.lock while it does.
+# Run it through that entry point rather than by hand. A hand run skips the lock,
+# so it can interleave with a deploy and leave the older commit's units installed.
 #
 # It copies a unit only when its content changed, and prints `changed: <file>`
 # when it does. It retires any com.marketlake unit the render no longer names,

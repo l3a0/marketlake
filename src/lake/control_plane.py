@@ -4051,8 +4051,10 @@ def _bash_each(name: str) -> str:
 def systemd_install_script(host: SystemdHost) -> str:
     """Place the units and the drop-in, retire stale units, reload, enable, read back.
 
-    It runs as root, from ``deploy/linux-install.sh`` or by hand, and finds the files it
-    installs beside itself. It is safe to run again on a host that already has it.
+    It runs as root, from ``deploy/linux-install.sh``, and finds the files it installs
+    beside itself. It is safe to run again on a host that already has it. The entry point
+    holds the install lock around it, so its header sends the operator there rather than
+    to a hand run, which would skip the lock and could interleave with a deploy.
 
     1. Each unit and the drop-in is copied through a temporary file and a rename, and
        only when its content differs from the installed copy. A copy that happens prints
@@ -4079,9 +4081,9 @@ def systemd_install_script(host: SystemdHost) -> str:
         "#",
         "# Written by `python -m lake.control_plane render --init systemd`, which never runs",
         "# it. deploy/linux-install.sh renders this directory afresh and runs this script,",
-        "# as root, on every install. Running it again by hand is safe:",
-        "#",
-        f"#     sudo ./{INSTALL_SCRIPT_FILE}",
+        f"# as root, on every install, holding {INSTALL_LOCK} while it does.",
+        "# Run it through that entry point rather than by hand. A hand run skips the lock,",
+        "# so it can interleave with a deploy and leave the older commit's units installed.",
         "#",
         "# It copies a unit only when its content changed, and prints `changed: <file>`",
         "# when it does. It retires any com.marketlake unit the render no longer names,",
