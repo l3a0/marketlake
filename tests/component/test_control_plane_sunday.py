@@ -249,8 +249,12 @@ def test_a_clean_sunday_restores_the_week_s_file_from_the_target_and_pings(fixtu
     assert outcome.restore.week == 34
     assert outcome.restore.restored == (QUOTES,)
     assert outcome.restore.ok is True
-    assert outcome.restore.pass_line is not None
-    assert outcome.restore.pass_line.startswith(f"1 file and {(root / QUOTES).stat().st_size} ")
+    assert outcome.restore.bytes_read == (root / QUOTES).stat().st_size
+    assert outcome.restore.pass_line == (
+        f"1 file (0.0 MB) read back from {_backup_of(root)} matched the manifest, "
+        "week of Sunday 2026-08-30, rotation slot 34 of 52, from slot 2 because slot 34 "
+        "held no files"
+    )
     # A pass rides its own field, so a healthy run's report keeps its shape.
     assert outcome.problems == () and outcome.report == ()
     assert outcome.pinged is True and pinger.urls == [URL]
@@ -289,9 +293,9 @@ def test_a_file_that_restores_wrong_withholds_the_ping_and_is_named(fixture_lake
     assert outcome.restore is not None
     assert outcome.restore.mismatches == (QUOTES,)
     assert outcome.pinged is False and pinger.urls == []
-    assert f"restore test failed: mismatches=1: {_backup_of(root)}" in outcome.problems
+    assert f"restore test failed: mismatches=1 unreadable=0: {_backup_of(root)}" in outcome.problems
     assert f"restore read back bytes that do not match the manifest: {QUOTES}" in outcome.report
-    assert any("two reads of one file disagreed" in line for line in outcome.report)
+    assert any("two reads of one file returned different bytes" in line for line in outcome.report)
 
 
 def test_a_failed_restore_read_withholds_the_ping_without_raising(fixture_lake):
@@ -303,10 +307,7 @@ def test_a_failed_restore_read_withholds_the_ping_without_raising(fixture_lake):
     assert outcome.pinged is False and pinger.urls == []
     # Every check after the restore still ran.
     assert outcome.canary_passed is True and outcome.covered is True
-    assert (
-        f"restore test failed: mismatches=0, stopped at a failed read: {_backup_of(root)}"
-        in outcome.problems
-    )
+    assert f"restore test failed: mismatches=0 unreadable=1: {_backup_of(root)}" in outcome.problems
     assert f"restore could not read: {QUOTES}: OSError: fake read failed: {QUOTES}" in (
         outcome.report
     )
@@ -353,7 +354,8 @@ def test_a_copy_wholly_flagged_by_the_scrub_leaves_nothing_to_restore(fixture_la
     assert reader.calls == []
     assert outcome.restore is not None and outcome.restore.ok is True
     assert outcome.restore.pass_line == (
-        "nothing to restore, the backup scrub matched no files, week 34"
+        "nothing to restore, the backup scrub matched no files, "
+        "week of Sunday 2026-08-30, rotation slot 34 of 52"
     )
     assert not any(line.startswith("restore") for line in outcome.problems)
 

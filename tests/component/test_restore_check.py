@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 
 from lake import manifest
-from lake.manifest import BackupScrubResult, backup_scrub, path_reader, restore_check
+from lake.manifest import (
+    BackupScrubResult,
+    RestoreResult,
+    backup_scrub,
+    path_reader,
+    restore_check,
+)
 from lake.paths import MANIFEST_FILE
 from tests.support.backup import FAIL, FAIL_MIDWAY, WRONG, FakeBackupReader, mirror_lake
 from tests.support.lake import FixtureLake, sample_chains_table
@@ -71,7 +77,8 @@ def test_a_week_whose_files_all_match_passes_and_says_what_it_read(tmp_path):
     assert result.problem is None and result.ok is True
     assert result.notes == ()
     assert result.pass_line == (
-        f"3 files and 18 bytes read back from {target} matched the manifest, week 3"
+        f"3 files (0.0 MB) read back from {target} matched the manifest, "
+        "week of Sunday 2026-01-25, rotation slot 3 of 52"
     )
 
 
@@ -82,24 +89,66 @@ def test_the_real_path_reader_passes_the_same_week(tmp_path):
     assert result.ok is True
 
 
-def test_a_week_that_fell_through_names_the_week_it_read(tmp_path):
+def test_a_file_read_in_many_chunks_is_hashed_whole(tmp_path, monkeypatch):
+    # Two-byte chunks split every file, so a hash of the first chunk alone matches none.
+    monkeypatch.setattr(manifest, "_RESTORE_CHUNK", 2)
     target, pairs = _target(tmp_path)
-    # Residues 4 to 6 hold nothing, so week 4 reads residue 7.
+    result = restore_check(target, pairs, 3, path_reader(target))
+    assert result.restored == (R3_A, R3_B, R3_C)
+    assert result.ok is True
+    assert result.bytes_read == 18
+
+
+def test_rot_past_the_first_chunk_is_a_mismatch(tmp_path):
+    # The first byte arrives sound and the second is wrong, so only a hash over every
+    # chunk can see it.
+    target, pairs = _target(tmp_path)
+
+    def reader(rel):
+        data = (target / rel).read_bytes()
+        return iter([data[:1], b"X" + data[2:]])
+
+    result = restore_check(target, pairs, 3, reader)
+    assert result.mismatches == (R3_A, R3_B, R3_C)
+    assert result.restored == ()
+
+
+def test_a_week_that_fell_through_names_the_slot_it_read(tmp_path):
+    target, pairs = _target(tmp_path)
+    # Slots 4 to 6 hold nothing, so week 4 reads slot 7.
     result = restore_check(target, pairs, 4, FakeBackupReader(target))
     assert result.restored == (R7,)
     assert result.residue == 7
     assert result.pass_line == (
-        f"1 file and 5 bytes read back from {target} matched the manifest, week 4, "
-        "from week 7 of the rotation because week 4 held no files"
+        f"1 file (0.0 MB) read back from {target} matched the manifest, "
+        "week of Sunday 2026-02-01, rotation slot 4 of 52, from slot 7 because slot 4 held "
+        "no files"
     )
 
 
 def test_a_week_past_the_first_cycle_that_did_not_fall_through_says_nothing_more(tmp_path):
     target, pairs = _target(tmp_path)
-    result = restore_check(target, pairs, 55, FakeBackupReader(target))  # 55 is residue 3
+    result = restore_check(target, pairs, 55, FakeBackupReader(target))  # 55 is slot 3
     assert result.residue == 3
-    assert result.pass_line is not None
-    assert "of the rotation" not in result.pass_line
+    assert result.pass_line == (
+        f"3 files (0.0 MB) read back from {target} matched the manifest, "
+        "week of Sunday 2027-01-24, rotation slot 3 of 52"
+    )
+
+
+def test_the_pass_line_gives_megabytes_to_one_decimal():
+    # A megabyte is a million bytes here, and the figure rounds rather than truncates.
+    def line(size):
+        result = RestoreResult(
+            target="/ssd", week=39, candidates=1, residue=39, restored=("a",), bytes_read=size
+        )
+        return result.pass_line
+
+    assert line(12_400_000) == (
+        "1 file (12.4 MB) read back from /ssd matched the manifest, "
+        "week of Sunday 2026-10-04, rotation slot 39 of 52"
+    )
+    assert "(12.5 MB)" in line(12_460_000)
 
 
 def test_nothing_matched_is_said_plainly_and_withholds_nothing(tmp_path):
@@ -107,7 +156,10 @@ def test_nothing_matched_is_said_plainly_and_withholds_nothing(tmp_path):
     result = restore_check(tmp_path, [], 39, reader)
     assert reader.calls == []
     assert result.problem is None and result.ok is True
-    assert result.pass_line == "nothing to restore, the backup scrub matched no files, week 39"
+    assert result.pass_line == (
+        "nothing to restore, the backup scrub matched no files, "
+        "week of Sunday 2026-10-04, rotation slot 39 of 52"
+    )
     assert result.notes == ()
 
 
@@ -131,17 +183,47 @@ def test_a_file_that_reads_back_wrong_is_named_and_the_rest_are_still_read(tmp_p
     assert result.mismatches == (R3_A,)
     assert result.restored == (R3_B, R3_C)
     assert result.ok is False
-    assert result.problem == f"restore test failed: mismatches=1: {target}"
+    assert result.problem == f"restore test failed: mismatches=1 unreadable=0: {target}"
     assert result.pass_line is None
-    assert f"restore read back bytes that do not match the manifest: {R3_A}" in result.notes
-    repair = [line for line in result.notes if line.startswith("restore mismatch:")]
-    assert len(repair) == 1
     # A path mismatch is two reads disagreeing, so the line sends the operator to the disk
     # and names the one benign cause rather than asking for a re-copy.
-    assert "two reads of one file disagreed" in repair[0]
-    assert "disk or its connection" in repair[0]
-    assert "lake.compact" in repair[0]
-    assert "a re-run clears that case" in repair[0]
+    assert result.notes == (
+        f"restore read back bytes that do not match the manifest: {R3_A}",
+        "restore mismatch: the backup scrub matched these files moments earlier, so two "
+        "reads of one file returned different bytes. Check the disk and its cable, then "
+        "re-run the Sunday job. A hand-run lake.compact that replaced the file between the "
+        "two reads causes the same mismatch, and a re-run clears it",
+    )
+
+
+def test_two_mismatches_and_a_failed_read_are_all_named_in_order(tmp_path):
+    target, pairs = _target(tmp_path)
+    reader = FakeBackupReader(target, faults={R3_A: WRONG, R3_B: WRONG, R3_C: FAIL})
+
+    result = restore_check(target, pairs, 3, reader)
+
+    assert result.problem == f"restore test failed: mismatches=2 unreadable=1: {target}"
+    assert result.pass_line is None
+    label = "restore read back bytes that do not match the manifest"
+    notes = result.notes
+    # Each mismatch is named, then one repair line covers them all, then the failed read.
+    assert notes[:2] == (f"{label}: {R3_A}", f"{label}: {R3_B}")
+    assert notes[2].startswith("restore mismatch:")
+    assert notes[3] == f"restore could not read: {R3_C}: OSError: fake read failed: {R3_C}"
+    assert notes[4].startswith("restore stopped at that read")
+    assert len(notes) == 5
+
+
+def test_mismatched_files_are_named_up_to_the_cap():
+    result = RestoreResult(target="/ssd", week=3, candidates=4, mismatches=("a", "b", "c", "d"))
+    label = "restore read back bytes that do not match the manifest"
+    assert result.notes[:4] == (
+        f"{label}: a",
+        f"{label}: b",
+        f"{label}: c",
+        f"{label}: and 1 more",
+    )
+    assert result.problem == "restore test failed: mismatches=4 unreadable=0: /ssd"
 
 
 def test_a_failed_read_stops_the_restore_and_still_names_the_mismatch_before_it(tmp_path):
@@ -156,12 +238,19 @@ def test_a_failed_read_stops_the_restore_and_still_names_the_mismatch_before_it(
     assert result.restored == ()
     assert result.unreadable == f"{R3_B}: OSError: fake read failed: {R3_B}"
     assert result.ok is False
-    assert result.problem == (
-        f"restore test failed: mismatches=1, stopped at a failed read: {target}"
-    )
+    assert result.problem == f"restore test failed: mismatches=1 unreadable=1: {target}"
+    assert result.pass_line is None
     assert f"restore could not read: {R3_B}: OSError: fake read failed: {R3_B}" in result.notes
     assert f"restore read back bytes that do not match the manifest: {R3_A}" in result.notes
     assert any("files after it were not checked" in line for line in result.notes)
+
+
+def test_a_failed_read_alone_prints_no_pass_line(tmp_path):
+    target, pairs = _target(tmp_path)
+    result = restore_check(target, pairs, 3, FakeBackupReader(target, faults={R3_A: FAIL}))
+    assert result.mismatches == ()
+    assert result.problem == f"restore test failed: mismatches=0 unreadable=1: {target}"
+    assert result.pass_line is None
 
 
 def test_a_read_that_fails_partway_through_its_bytes_is_caught_too(tmp_path):
@@ -173,9 +262,18 @@ def test_a_read_that_fails_partway_through_its_bytes_is_caught_too(tmp_path):
     assert reader.calls == [R3_A]
     assert result.unreadable == f"{R3_A}: OSError: fake read failed partway: {R3_A}"
     assert result.mismatches == ()
-    assert (
-        result.problem == f"restore test failed: mismatches=0, stopped at a failed read: {target}"
-    )
+    assert result.problem == f"restore test failed: mismatches=0 unreadable=1: {target}"
+    # The one chunk that arrived before the failure is counted.
+    assert result.bytes_read == 1
+
+
+def test_bytes_read_counts_wrong_bytes_and_candidates_counts_every_pair(tmp_path):
+    # The fake's wrong bytes are 30 long, and the two sound files after it are 6 and 7.
+    target, pairs = _target(tmp_path)
+    result = restore_check(target, pairs, 3, FakeBackupReader(target, faults={R3_A: WRONG}))
+    assert result.bytes_read == 30 + 6 + 7
+    # Four pairs were handed over and three were read.
+    assert result.candidates == 4
 
 
 def test_a_file_gone_from_a_path_target_is_a_failed_read_not_a_raise(tmp_path):
@@ -238,6 +336,15 @@ def test_matched_names_every_file_the_walk_found_present_and_matching(fixture_la
     result = backup_scrub(root, target)
     assert result.matched == ((CHAINS, shas[CHAINS][-1]), (QUOTES, shas[QUOTES][-1]))
     assert result.walked is True
+
+
+def test_matched_is_sorted_by_path_whatever_order_the_manifest_holds(tmp_path):
+    # Quotes are sealed first here, so the manifest lists them before chains and a walk
+    # that kept the manifest's order would hand them over first.
+    root = FixtureLake(tmp_path / "lake").with_quotes("SPY", DAY).with_chains("SPY", DAY).build()
+    assert [rel for rel in _shas(root)] == [QUOTES, CHAINS]
+    target = mirror_lake(root, tmp_path / "ssd")
+    assert [rel for rel, _ in backup_scrub(root, target).matched] == [CHAINS, QUOTES]
 
 
 def test_matched_leaves_out_a_file_the_walk_found_wrong_or_gone(fixture_lake):

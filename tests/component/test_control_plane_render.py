@@ -31,7 +31,7 @@ from lake.metadata import stamp_assertion_pid, stamp_cycle
 from lake.paths import TOKEN_FILE, config_dir
 from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.tickers import Roster
-from tests.support.backup import mirror_lake
+from tests.support.backup import WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -690,6 +690,30 @@ def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, mo
     assert "scrub failed: missing=0" not in printed.replace("backup scrub failed", "")
 
 
+def _restore_cli(tmp_path: Path, config: Path, monkeypatch) -> int:
+    """Run ``main sunday`` with every live leaf faked, and return its exit code.
+
+    The backup reader is left as main builds it, so these tests drive main's own wiring
+    of the restore test.
+    """
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    return cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+
 def test_the_sunday_cli_prints_the_restore_test_s_pass_line(tmp_path, capsys, monkeypatch):
     """A pass prints its own line, so the log can tell a pass from a test that never ran.
 
@@ -700,36 +724,75 @@ def test_the_sunday_cli_prints_the_restore_test_s_pass_line(tmp_path, capsys, mo
     lake, config = _sunday_lake(tmp_path)
     stamp_assertion_pid(lake, pid=_DAEMON_PID)
     (tmp_path / "ssd" / ".DS_Store").write_bytes(b"finder state")
-    pinger = FakePinger()
-    monkeypatch.setattr(
-        cp,
-        "read_pmset_schedule",
-        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
-    )
-    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
-    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
-    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
-    monkeypatch.setattr(cp, "read_exclusions", _excluded)
-    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
-    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
-    code = cp.main(
-        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
-        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
-        calendar=weekday_sessions(date(2026, 8, 31)),
-    )
 
-    assert code == 0
-    rel = "chains/ticker=SPY/date=2026-08-28.parquet"
-    size = (tmp_path / "ssd" / rel).stat().st_size
+    assert _restore_cli(tmp_path, config, monkeypatch) == 0
+
     lines = capsys.readouterr().out.splitlines()
     assert (
-        f"sunday: restore: 1 file and {size} bytes read back from {tmp_path / 'ssd'} matched "
-        "the manifest, week 34, from week 7 of the rotation because week 34 held no files"
+        f"sunday: restore: 1 file (0.0 MB) read back from {tmp_path / 'ssd'} matched the "
+        "manifest, week of Sunday 2026-08-30, rotation slot 34 of 52, from slot 7 because "
+        "slot 34 held no files"
     ) in lines
     # The restore line comes after the report lines and before the closing summary.
     restore = next(i for i, line in enumerate(lines) if line.startswith("sunday: restore:"))
     assert lines[restore - 1] == "sunday: report: backup file the lake never recorded: .DS_Store"
     assert lines[restore + 1].startswith("sunday: attempts=1 pinged=True")
+
+
+def test_the_sunday_cli_restores_from_the_target_and_not_the_lake(tmp_path, capsys, monkeypatch):
+    # The lake has lost its only partition and the copy still holds it. The primary scrub
+    # names the loss, and a restore that read the lake root would fail to read the file.
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    (lake / "chains/ticker=SPY/date=2026-08-28.parquet").unlink()
+
+    _restore_cli(tmp_path, config, monkeypatch)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert not any(line.startswith("sunday: restore test failed") for line in lines)
+    assert any(
+        line.startswith("sunday: restore: 1 file (0.0 MB) read back from ") for line in lines
+    )
+
+
+def test_the_sunday_cli_prints_the_empty_restore_line_on_every_attempt(
+    tmp_path, capsys, monkeypatch
+):
+    # The copy of the one partition is rotted, so the backup scrub matches nothing and
+    # withholds the ping. Every attempt the evening retries still says the restore found
+    # nothing to read, rather than only the last attempt saying so, or none.
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    (tmp_path / "ssd" / "chains/ticker=SPY/date=2026-08-28.parquet").write_bytes(b"rot")
+
+    assert _restore_cli(tmp_path, config, monkeypatch) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    attempts = [line for line in lines if line.startswith("sunday: attempt ")]
+    restores = [line for line in lines if line.startswith("sunday: restore:")]
+    assert len(attempts) == 7
+    assert (
+        restores
+        == [
+            "sunday: restore: nothing to restore, the backup scrub matched no files, "
+            "week of Sunday 2026-08-30, rotation slot 34 of 52"
+        ]
+        * 7
+    )
+
+
+def test_the_sunday_cli_prints_no_restore_line_for_a_failed_restore(tmp_path, capsys, monkeypatch):
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    monkeypatch.setattr(cp, "path_reader", lambda target: FakeBackupReader(target, every=WRONG))
+
+    assert _restore_cli(tmp_path, config, monkeypatch) == 1
+
+    lines = capsys.readouterr().out.splitlines()
+    assert f"sunday: restore test failed: mismatches=1 unreadable=0: {tmp_path / 'ssd'}" in lines
+    # The problem line is the record of a failure. No pass line rides beside it, and in
+    # particular no line printing the absent pass as ``None``.
+    assert not any(line.startswith("sunday: restore:") for line in lines)
 
 
 def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monkeypatch):

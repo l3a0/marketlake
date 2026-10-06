@@ -100,6 +100,7 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, BucketTarget, input_errors_exit, load_config
 from lake.manifest import (
+    RESTORE_EPOCH,
     BackupReader,
     BackupScrubResult,
     RestoreResult,
@@ -1863,9 +1864,8 @@ class SundayOutcome:
     when it is reached and fails. The withholding ones are a missing lake root, a
     failed scrub, a failed backup scrub, a failed restore test, a failed canary, a token
     that does not cover the coming week, and a mint time that could not be read. The
-    ping's failure is
-    different in kind. It is recorded after the others have all passed, and it names why
-    the ping did not land rather than why it was not attempted.
+    ping's failure is different in kind. It is recorded after the others have all
+    passed, and it names why the ping did not land rather than why it was not attempted.
 
     ``report`` carries the report-tier findings. Two kinds ride it. The first is pmset
     alarm drift, which the design pins to the nightly report because the pre-open
@@ -1876,12 +1876,14 @@ class SundayOutcome:
     lake, neither of which can be lake data going missing. How far behind reads by eye
     from the partition count, and one run carries no history of the last one. The
     restore test's own findings ride it the same way, each file it read back wrong and
-    the repair for it.
+    the repair for it. So does the line saying the restore test is not built for a
+    bucket target yet.
 
-    ``restore`` is the restore test's result, or ``None`` when the backup scrub stopped
-    before the end of its walk and the test did not run. A pass rides here rather than
-    in ``report``, because ``report`` carries findings, and ``main`` prints its line so
-    the log can tell a pass from a test that never ran.
+    ``restore`` is the restore test's result. It is ``None`` when the test did not run,
+    either because the backup scrub stopped before the end of its walk or because the
+    target is a bucket. A pass rides here rather than in ``report``, because ``report``
+    carries findings, and ``main`` prints its line so the log can tell a pass from a test
+    that never ran.
 
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
@@ -1907,22 +1909,18 @@ class SundayOutcome:
     restore: RestoreResult | None = None
 
 
-# The Sunday the restore test counts its weeks from. Any Sunday would do, since only the
-# count matters, and this is the first one of 2026.
-_RESTORE_EPOCH = date(2026, 1, 4)
-
-
 def restore_week(now: datetime) -> int:
-    """How many whole weeks the market-time Sunday of ``now`` falls after the epoch.
+    """How many whole weeks the market-time date of ``now`` falls after ``RESTORE_EPOCH``.
 
-    ``now`` is UTC, and Sunday 20:00 in New York is already Monday there, so the date is
-    read in market time. A Monday is then stepped back to its Sunday, so the 08:25
-    catch-up launchd fires for a missed Sunday restores that Sunday's files rather than
-    the next week's. An ISO week would split the two, because it starts on Monday.
+    Two things make the count right. The first is the market-time date: ``now`` is UTC,
+    and Sunday 20:00 in New York is already Monday there. The second is counting whole
+    weeks from a Sunday epoch, which puts every day from a Sunday to the Saturday after it
+    in one week. So the 08:25 Monday catch-up launchd fires for a missed Sunday restores
+    that Sunday's files rather than the next week's, and a Saturday counts in the week
+    before. An ISO week would split a Sunday from its Monday, because it starts on Monday.
     """
     day = now.astimezone(MARKET_TZ).date()
-    sunday = day - timedelta(days=(day.weekday() + 1) % 7)
-    return (sunday - _RESTORE_EPOCH).days // 7
+    return (day - RESTORE_EPOCH).days // 7
 
 
 def sunday_maintenance(
@@ -1947,7 +1945,7 @@ def sunday_maintenance(
     bucket_unusable: str | None = None,
     backup_reader: BackupReader | None = None,
 ) -> SundayOutcome:
-    """Scrub both copies, test a restore, verify the alarms, run the canary, assert, ping.
+    """Scrub both copies, test a restore, verify the alarms, run the canary, assert coverage, ping.
 
     Every check runs and every finding is named, so one run reports all of them.
     The ping fires only when both scrubs, the restore test, the canary, and the coverage
@@ -2044,11 +2042,11 @@ def sunday_maintenance(
     the target through ``backup_reader``, per ``manifest.restore_check``, on every
     attempt. A mismatch or a failed read is a problem and withholds the ping, by the
     backup scrub's own rule, and the files it names ride ``report``. A scrub that stopped
-    early, on an unmounted target or a manifest copy it could not trust, already named
-    the target, so the test does not run and adds no second line. ``backup_reader`` of
-    ``None`` reads ``backup_target`` from disk, which is still a real restore, so the
-    default never reads as verified without reading. A bucket target gets no restore yet,
-    only a report line saying so, which withholds nothing.
+    early, such as on an unmounted target or a manifest copy it could not trust, already
+    named the target, so the test does not run and adds no second line. When
+    ``backup_reader`` is ``None`` the test reads ``backup_target`` from disk, so the
+    default reads real bytes. A bucket target gets no restore yet, only a report line
+    saying so, which withholds nothing.
 
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
@@ -2079,14 +2077,15 @@ def sunday_maintenance(
     if backup.problem is not None:
         problems.append(backup.problem)
 
-    # A bucket target has no restore yet. Its download is marketlake #640, and a path
-    # reader built on a ``BucketTarget`` would raise ``TypeError``, which the restore's
-    # ``OSError`` catch does not stop. The owner's switch to the bucket already waits on
-    # #640, so the gap is a report line and withholds nothing.
+    # A bucket target has no restore yet. Its download is marketlake #640. ``Path`` raises
+    # ``TypeError`` on a ``BucketTarget`` before ``restore_check`` and its ``OSError``
+    # catch are ever reached, so the bucket case has to branch off here. The owner's
+    # switch to the bucket already waits on #640, so the gap is a report line and
+    # withholds nothing.
     restore: RestoreResult | None = None
     restore_unbuilt: str | None = None
     if backup.walked and isinstance(backup_target, BucketTarget):
-        restore_unbuilt = f"restore test not built for a bucket target yet: {backup_target}"
+        restore_unbuilt = f"restore test not built for a bucket target yet: {backup_target} (#640)"
     elif backup.walked:
         reader = backup_reader if backup_reader is not None else path_reader(Path(backup_target))
         restore = restore_check(backup_target, backup.matched, restore_week(now), reader)

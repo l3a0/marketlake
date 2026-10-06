@@ -532,8 +532,9 @@ def test_a_bucket_target_reports_the_restore_test_as_not_built_and_still_pings(t
     # than silent, and it withholds nothing, since the switch to the bucket waits on it.
     lake, client = _uploaded(tmp_path / "lake")
     outcome, pinger = _sunday(lake, client)
+    assert outcome.backup.walked is True and outcome.backup.matched == ()
     assert outcome.restore is None
-    assert f"restore test not built for a bucket target yet: {TARGET}" in outcome.report
+    assert f"restore test not built for a bucket target yet: {TARGET} (#640)" in outcome.report
     assert outcome.problems == ()
     assert pinger.urls == [URL]
 

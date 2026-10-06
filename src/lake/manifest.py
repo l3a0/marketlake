@@ -58,11 +58,11 @@ rules, and it returns the same ``BackupScrubResult``.
 The weekly restore test rides on that scrub. ``restore_check`` reads a rotating share of
 the files the backup scrub just matched back out of the target, through a
 ``BackupReader``, and hashes the bytes as they arrive. ``restore_picks`` decides the share
-from the week alone, so the rotation keeps no state.
+from the week and the matched files, so the rotation keeps no state.
 
-The scrub reads. It never writes. Both scrubs do, and so does the restore test. Repair
-is a separate, deliberate, human-invoked step under the lake-root lock. This module
-supplies the primitives that step and the daily compaction job call.
+Both scrubs and the restore test read and never write. Repair is a separate, deliberate,
+human-invoked step under the lake-root lock. This module supplies the primitives that
+step and the daily compaction job call.
 
 Times are injected. ``fetched_at`` is passed in by the caller. Nothing here reads a
 wall clock.
@@ -75,6 +75,7 @@ import json
 import os
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 from lake.paths import (
@@ -1058,7 +1059,8 @@ class BackupScrubResult:
     ``matched`` is what the restore test reads from: the sorted ``(path, sha256)`` pairs
     the forward walk found present and matching, each sha the one the lake recorded at
     the backup's watermark. A file the walk found missing or wrong is left out, so one
-    rotted file is named once. Only a walk that ran to the end fills it.
+    rotted file is named once. Only the path scrub's final return fills it, so only a
+    walk that ran to the end does. The bucket scrub leaves it empty until marketlake #640.
     """
 
     target: str
@@ -1307,11 +1309,17 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
 
 # Reads one backup file's bytes by its lake-relative path, a chunk at a time. A read that
 # fails raises ``OSError``, whether on the call or partway through the chunks. A bucket
-# download maps its client's errors onto it, so the restore has one failure to name.
+# reader, which marketlake #640 builds, must map its client's errors onto ``OSError``, so
+# the restore has one failure to name.
 BackupReader = Callable[[str], Iterator[bytes]]
 
 # How many weeks the rotation takes to reach every file the backup scrub matched.
 _RESTORE_WEEKS = 52
+
+# The Sunday the restore test counts its weeks from, the first one of 2026. It has to be a
+# Sunday. Counting whole weeks from a Sunday is what puts a Monday catch-up in its
+# Sunday's week, so ``control_plane.restore_week`` does no stepping of its own.
+RESTORE_EPOCH = date(2026, 1, 4)
 
 # How much of a file one read takes. A sealed partition runs to a few hundred megabytes,
 # so reading one whole, as ``sha256_file`` does, would hold all of it in memory at once.
@@ -1321,10 +1329,10 @@ _RESTORE_CHUNK = 1 << 20
 def path_reader(target: Path) -> BackupReader:
     """The reader for a backup on a mounted path: open ``target / rel`` and read it.
 
-    The read is an explicit loop over ``read`` calls, and that is the point of it. A
-    copy primitive can finish without reading a byte: an APFS clone shares the blocks,
-    and from 3.14 ``shutil.copyfile`` tries ``copy_file_range``, which can share them on
-    XFS or btrfs too. A restore check that read nothing would pass over a dead disk.
+    The read is an explicit loop over ``read`` calls. A copy primitive can finish
+    without reading a byte: an APFS clone shares the blocks, and from 3.14
+    ``shutil.copyfile`` tries ``copy_file_range``, which can share them on XFS or btrfs
+    too. A restore check that read nothing would pass over a dead disk.
     """
     root = Path(target)
 
@@ -1337,9 +1345,11 @@ def path_reader(target: Path) -> BackupReader:
 
 
 def _restore_residue(rel: str) -> int:
-    """The week of the rotation a path belongs to, the same on every machine and run.
+    """The rotation slot a path belongs to, the same on every machine and run.
 
-    Python's ``hash`` is salted per process, so two Sundays would disagree about it.
+    The slot is the remainder the first eight bytes of the path's sha256 leave when
+    divided by 52, read as a big-endian integer. Python's ``hash`` is salted per process,
+    so two Sundays would disagree about it.
     """
     digest = hashlib.sha256(rel.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") % _RESTORE_WEEKS
@@ -1348,11 +1358,12 @@ def _restore_residue(rel: str) -> int:
 def restore_picks(pairs: Sequence[tuple[str, str]], week: int) -> tuple[tuple[str, str], ...]:
     """The pairs the restore test reads in ``week``, sorted by path.
 
-    A path is read in the weeks its residue matches, so every file is read once every 52
-    weeks with nothing stored between runs. A week whose residue holds no file takes the
-    next residue that does, wrapping past 51 to 0. A small lake would otherwise read
-    nothing in most weeks, and a test that ran on nothing would say nothing about the
-    disk. No pairs at all gives no picks.
+    A path is read in each week whose slot, ``week`` modulo 52, is its own. So every file
+    is read at least once every 52 weeks, with nothing stored between runs, provided each
+    week has a run whose backup scrub checks every file. A week whose slot holds no file
+    takes the next slot that does, wrapping past 51 to 0. A small lake would otherwise
+    read nothing in most weeks, and a test that ran on nothing would say nothing about
+    the disk. No pairs at all gives no picks.
     """
     by_residue: dict[int, list[tuple[str, str]]] = {}
     for rel, sha in pairs:
@@ -1368,11 +1379,11 @@ def restore_picks(pairs: Sequence[tuple[str, str]], week: int) -> tuple[tuple[st
 class RestoreResult:
     """What one restore test read back from the backup, and what it found.
 
-    ``week`` is the week the test ran for, and ``residue`` the week of the rotation it
-    read, which differs only when the week's own residue held no file. ``candidates`` is
-    how many files the backup scrub handed over. ``restored`` names each file whose bytes
-    matched the manifest and ``bytes_read`` counts every byte that arrived, matching or
-    not.
+    ``week`` is how many whole weeks the run's Sunday falls after ``RESTORE_EPOCH``, and
+    ``residue`` the rotation slot it read, which differs from ``week`` modulo 52 only when
+    the week's own slot held no file. ``candidates`` is how many files the backup scrub
+    handed over. ``restored`` names each file whose bytes matched the manifest and
+    ``bytes_read`` counts every byte that arrived, matching or not.
 
     Two findings withhold the Sunday ping.
 
@@ -1393,11 +1404,18 @@ class RestoreResult:
 
     @property
     def problem(self) -> str | None:
-        """The one line that withholds the ping, or ``None`` when every read matched."""
+        """The one line that withholds the ping, or ``None`` when every read matched.
+
+        It counts in the backup scrub's style. ``unreadable`` is 0 or 1, because the test
+        stops at the first failed read.
+        """
         if not self.mismatches and self.unreadable is None:
             return None
-        stopped = ", stopped at a failed read" if self.unreadable is not None else ""
-        return f"restore test failed: mismatches={len(self.mismatches)}{stopped}: {self.target}"
+        unreadable = 0 if self.unreadable is None else 1
+        return (
+            f"restore test failed: mismatches={len(self.mismatches)} "
+            f"unreadable={unreadable}: {self.target}"
+        )
 
     @property
     def notes(self) -> tuple[str, ...]:
@@ -1407,17 +1425,17 @@ class RestoreResult:
         modification time, and a bucket upload skips an object whose stored checksum
         matches. So each kind of finding carries its repair. On a path target the test
         only reads files the backup scrub matched moments earlier, so a mismatch means two
-        reads of one file disagreed, and the line says so rather than asking for a
-        re-copy.
+        reads of one file returned different bytes, and the line says so rather than
+        asking for a re-copy.
         """
         lines = _named("restore read back bytes that do not match the manifest", self.mismatches)
         if self.mismatches:
             lines.append(
                 "restore mismatch: the backup scrub matched these files moments earlier, so "
-                "two reads of one file disagreed, which points at the disk or its connection "
-                "rather than the copy at rest. A sync that replaced the file between the two "
-                "reads, such as a hand-run lake.compact, does the same, and a re-run clears "
-                "that case"
+                "two reads of one file returned different bytes. Check the disk and its "
+                "cable, then re-run the Sunday job. A hand-run lake.compact that replaced "
+                "the file between the two reads causes the same mismatch, and a re-run "
+                "clears it"
             )
         if self.unreadable is not None:
             lines.append(f"restore could not read: {self.unreadable}")
@@ -1433,25 +1451,32 @@ class RestoreResult:
         return self.problem is None
 
     @property
+    def sunday(self) -> date:
+        """The Sunday whose week this run counts as, ``week`` whole weeks after the epoch."""
+        return RESTORE_EPOCH + timedelta(weeks=self.week)
+
+    @property
     def pass_line(self) -> str | None:
         """The line a pass prints, or ``None`` when there is a problem to print instead.
 
         Silence could not tell a pass from a test that never ran, so a pass names how many
-        files it read, how many bytes, and the week. A lake with nothing matched says so,
-        and withholds nothing.
+        files it read, how many megabytes, the week by its Sunday, and the rotation slot.
+        A megabyte is a million bytes, as in ``lake.bucket``'s upload line. A lake with
+        nothing matched says so, and withholds nothing.
         """
         if self.problem is not None:
             return None
+        own = self.week % _RESTORE_WEEKS
+        week = f"week of Sunday {self.sunday.isoformat()}, rotation slot {own} of {_RESTORE_WEEKS}"
         if self.candidates == 0:
-            return f"nothing to restore, the backup scrub matched no files, week {self.week}"
+            return f"nothing to restore, the backup scrub matched no files, {week}"
         files = "file" if len(self.restored) == 1 else "files"
         line = (
-            f"{len(self.restored)} {files} and {self.bytes_read} bytes read back from "
-            f"{self.target} matched the manifest, week {self.week}"
+            f"{len(self.restored)} {files} ({self.bytes_read / 1_000_000:.1f} MB) read back "
+            f"from {self.target} matched the manifest, {week}"
         )
-        own = self.week % _RESTORE_WEEKS
         if self.residue != own:
-            line += f", from week {self.residue} of the rotation because week {own} held no files"
+            line += f", from slot {self.residue} because slot {own} held no files"
         return line
 
 
@@ -1472,6 +1497,9 @@ def restore_check(
     canary, so a raise here would cost the run its canary, its coverage assertion and its
     re-auth reminder. The catch wraps the whole read, the call and every chunk, because a
     reader that is a generator raises on its first chunk rather than on the call.
+
+    ``week`` counts whole weeks from ``RESTORE_EPOCH``, as ``control_plane.restore_week``
+    computes it.
     """
     picks = restore_picks(pairs, week)
     restored: list[str] = []
