@@ -32,7 +32,9 @@ seam is the spawn rather than the ``rsync`` the child goes on to run. ``clock`` 
 ``calendar`` stay injectable on both. A system clock and an exchange calendar never
 reach past this process, so neither is a seam. A test drives a seam-requiring helper
 directly, or, to exercise a ``main``, monkeypatches the producer the ``main`` builds and
-checks the objects it built.
+checks the objects it built. The ntfy and healthchecks senders are the exception to where
+that patch goes. Every ``main`` gets them from ``lake.outbox``, which builds them from the
+classes on ``lake.alert`` and ``lake.runner``, so a test patches them there.
 """
 
 from __future__ import annotations
