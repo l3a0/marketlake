@@ -328,6 +328,31 @@ look at the page and confirm every card this round added or moved.
    screenshot. Text extraction cannot read the page, because it renders inside
    a frame.
 
+### Changing the page
+
+The page was republished 54 times from sessions' scratch copies, with no review
+and no history. On 2026-10-06 a bug in its column logic sent an unfinished pull
+request to the owner's queue. So the page's source now lives in the repository
+as `board.html`, beside this skill, and a change to it is a change to code.
+
+1. Edit `board.html` on a branch and open a pull request. It gets the same
+   review as any other change, per `CLAUDE.md`.
+2. After the pull request merges, publish the file from a checkout of `main`
+   fast-forwarded to `origin/main`. Use the `Artifact` tool's publish with
+   `url` set to the board's URL and `file_path` set to `board.html`. Read the
+   board with `action: "read"` first, because the tool refuses a publish to an
+   artifact the session has not read. Leave `capabilities` out of the call,
+   which keeps the page's database access as it is.
+3. Never republish from a scratch copy, an unmerged branch, or a copy read back
+   from the live page. Each of those can carry a change nobody reviewed, or undo
+   one that merged.
+
+The file carries no board data. Its `FALLBACK` is a stub that `usable()`
+accepts, so a view that cannot reach the database says it has no board data
+rather than showing an old copy. Data writes stay as they are. A round writes
+the `data` document as described above, and never republishes the page to
+change what it shows.
+
 ## 4. Recommend what to take next
 
 `CLAUDE.md`'s ranking directive and its exceptions decide the order. Read them
