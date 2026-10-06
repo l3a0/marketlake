@@ -52,8 +52,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/outbox.py` is the one place the ntfy transport and the healthchecks pinger
   are built. Under the config's `role: shadow` it builds recorders instead, which write
   each ping and page to `journal/outbox/` rather than sending it.
-- `tests/support` holds the fakes, the fixture-lake builder, and the enforcement
-  scanners.
+- `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
+  and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, and the plan and apply
   roles. The owner applies it from the laptop.

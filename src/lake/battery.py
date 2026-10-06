@@ -1011,12 +1011,14 @@ def _overlaps(span: CaptureSpan, start: datetime, end: datetime) -> bool:
 def _contained(partition: SealedPartition):
     """Turn any failure reading one partition into :class:`PartitionUnreadable`.
 
-    **A column's type is not checked by reading its schema.** Every read here guards
-    ``pq.read_schema`` and ``pq.read_table`` and then hands the columns to an Arrow kernel,
-    which raises ``ArrowNotImplementedError`` when a pinned column arrives retyped: a ``bid``
-    the vendor started sending as a string has no ``less_equal`` against a ``mark`` that is
-    still a double. That raise is outside the walk's per-partition containment, so one drifted
-    column on one partition costs every partition's verdict for the whole lake that night.
+    **A column's type is not checked by reading its schema.** Every read here guards its
+    open and its decode, ``pq.read_schema`` and ``pq.read_table`` or, in
+    :func:`read_entitlement`, a ``ParquetFile`` and its batches. It then hands the columns to
+    an Arrow kernel, which raises ``ArrowNotImplementedError`` when a pinned column arrives
+    retyped: a ``bid`` the vendor started sending as a string has no ``less_equal`` against a
+    ``mark`` that is still a double. That raise is outside the walk's per-partition
+    containment, so one drifted column on one partition costs every partition's verdict for the
+    whole lake that night.
 
     Retyping a pinned column is drift, which is the condition the battery exists to notice, so
     the partitions most likely to raise here are the ones that most need judging. That is
@@ -1064,67 +1066,103 @@ class Entitlement:
     session_rows: int = 0
 
 
-def read_entitlement(
-    partition: SealedPartition, bounds: tuple[datetime, datetime] | None = None
-) -> Entitlement:
-    """Read one partition's entitlement evidence, two columns plus the flag.
+# How many rows the entitlement read decodes at a time. The read streams rather than decoding
+# the partition whole, because the whole read peaked at 1,295.8 MiB of Arrow memory on SPY
+# 2026-09-28, more than a 2 GiB host has left for it (marketlake #670). A batch's memory grows
+# with this number and not with the file. At 65,536 rows the same day peaked at 90.2 MiB, and
+# a smaller batch saved about 5.5 MiB, because the final median sets the floor.
+_ENTITLEMENT_BATCH_ROWS = 65_536
 
-    Only four columns are read, so the cost is the parse rather than the file. The two stamps
-    are ISO strings rather than timestamps, and that parse is where the time goes: a whole-lake
-    duckdb scan of the difference over 29,718,244 chain rows took about 4 seconds unconstrained
-    and about 11 at ``dashboard.open_lake_connection``'s ``threads=2`` and ``memory_limit=2GB``.
-    This module is not the dashboard and takes neither cap.
+
+def read_entitlement(
+    partition: SealedPartition,
+    bounds: tuple[datetime, datetime] | None = None,
+    *,
+    batch_size: int = _ENTITLEMENT_BATCH_ROWS,
+) -> Entitlement:
+    """Read one partition's entitlement evidence, four columns plus the flag.
+
+    The four are ``row_kind``, ``snap_ts``, ``fetch_ts`` and ``vendor_quote_ts``, and the three
+    stamps are ISO strings rather than timestamps. Only those columns are read, so the time goes
+    to the parse rather than to the file: a whole-lake duckdb scan of the difference over
+    29,718,244 chain rows took about 4 seconds unconstrained and about 11 at
+    ``dashboard.open_lake_connection``'s ``threads=2`` and ``memory_limit=2GB``. This module is
+    not the dashboard and takes neither cap.
+
+    **The memory goes to the strings, so the read streams.** Decoding the five columns of a
+    whole ticker-day at once peaked at 1,295.8 MiB of Arrow memory on SPY 2026-09-28, 5,397,364
+    rows, and the 18:30 sweep runs on a 2 GiB host (marketlake #670). So the read decodes
+    ``batch_size`` rows at a time and keeps only the float64 seconds of each batch's session
+    rows. The same day then peaked at 90.2 MiB. Each batch runs the steps the whole read ran,
+    in the same order: the data-row filter, the flag count, the session filter, then the stamp
+    parse. A stamp is therefore parsed only on a row both filters kept, and a bad stamp on a
+    gap row or an overnight row still cannot fail the partition.
 
     The median is taken over the session's rows rather than per snapshot. The design says
     session-median and the tail is why per-row would not do: the maximum on QQQ 2026-09-14 is
     1,789,392,600 seconds, 56.7 years, so any per-row rule would quarantine a healthy feed.
-    ``bounds`` is
-    that session, open through option close, and ``None`` widens the median to every data row,
-    which only a caller that has no calendar should pass.
+    ``bounds`` is that session, open through option close, and ``None`` widens the median to
+    every data row, which only a caller that has no calendar should pass. The median is taken
+    once, over every batch's seconds, by :func:`_median_staleness`. A median of each batch
+    would be a different number.
+
+    **Every row decoded is counted against the footer's count.** ``iter_batches`` can end early
+    without raising where ``pq.read_table`` raises: a column chunk whose metadata header is
+    damaged ends the stream when that column runs out on a batch boundary, and a row group whose
+    footer count is lowered is read only that far. Either one answered silently, as no rows or
+    as a day short its final row group, and a read of no rows is out of scope rather than
+    unreadable. So the read counts every row before any filter and refuses a file whose total
+    differs from the file's own ``num_rows``. The sum of the row groups' counts would not do,
+    because it reads the same damaged field the stream reads. The price is that a file whose
+    own count alone is damaged, which a whole read answers correctly, is refused. That is the
+    check failing closed on a footer that disagrees with its data.
+
+    Every failure, at the open, in a batch or in a kernel, reaches the caller as
+    :class:`PartitionUnreadable` through :func:`_contained`, whose message starts with the
+    partition. The first failure raises.
     """
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
-    flag, _ = ENTITLEMENT_FLAGS[partition.surface]
-    try:
-        available = set(pq.read_schema(partition.path).names)
-    except Exception as exc:  # noqa: BLE001 - one damaged file must not cost the run
-        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+    flag, wanted_value = ENTITLEMENT_FLAGS[partition.surface]
+    rows = 0
+    agreeing = 0
+    session_rows = 0
+    decoded = 0
+    kept = []
+    with _contained(partition), pq.ParquetFile(partition.path, pre_buffer=False) as source:
+        available = set(source.schema_arrow.names)
+        wanted = [ROW_KIND_COLUMN, SNAP_TS, FETCH_TS, VENDOR_QUOTE_TS]
+        flag_present = flag in available
+        if flag_present:
+            wanted.append(flag)
+        missing = [name for name in wanted if name not in available]
+        if missing:
+            raise PartitionUnreadable(f"{partition.relative}: missing {', '.join(sorted(missing))}")
 
-    wanted = [ROW_KIND_COLUMN, SNAP_TS, FETCH_TS, VENDOR_QUOTE_TS]
-    flag_present = flag in available
-    if flag_present:
-        wanted.append(flag)
-    missing = [name for name in wanted if name not in available]
-    if missing:
-        raise PartitionUnreadable(f"{partition.relative}: missing {', '.join(sorted(missing))}")
+        for batch in source.iter_batches(columns=wanted, batch_size=batch_size, use_threads=False):
+            decoded += batch.num_rows
+            data = batch.filter(pc.equal(batch[ROW_KIND_COLUMN], ROW_KIND_DATA))
+            rows += data.num_rows
+            if flag_present:
+                agreeing += pc.sum(pc.equal(data[flag], wanted_value)).as_py() or 0
+            in_session = _within(data, partition, bounds)
+            session_rows += in_session.num_rows
+            kept.append(_staleness_seconds(in_session, partition))
 
-    try:
-        table = pq.read_table(partition.path, columns=wanted)
-    except Exception as exc:  # noqa: BLE001 - same reason as above
-        raise PartitionUnreadable(f"{partition.relative}: {type(exc).__name__}: {exc}") from exc
+        expected = source.metadata.num_rows
+        if decoded != expected:
+            raise PartitionUnreadable(
+                f"{partition.relative}: decoded {decoded:,} of {expected:,} rows"
+            )
+        median_staleness = _median_staleness(kept)
 
-    table = table.filter(pc.equal(table[ROW_KIND_COLUMN], ROW_KIND_DATA))
-    rows = table.num_rows
-    if rows == 0:
-        return Entitlement(
-            rows=0, flag_present=flag_present, flag_violations=0, median_staleness=None
-        )
-
-    violations = 0
-    if flag_present:
-        _, wanted_value = ENTITLEMENT_FLAGS[partition.surface]
-        with _contained(partition):
-            agreeing = pc.sum(pc.equal(table[flag], wanted_value)).as_py() or 0
-        violations = rows - agreeing
-
-    in_session = _within(table, partition, bounds)
     return Entitlement(
         rows=rows,
         flag_present=flag_present,
-        flag_violations=violations,
-        median_staleness=_median_staleness(in_session, partition),
-        session_rows=in_session.num_rows,
+        flag_violations=rows - agreeing if flag_present else 0,
+        median_staleness=median_staleness,
+        session_rows=session_rows,
     )
 
 
@@ -1155,25 +1193,24 @@ def _within(table, partition: SealedPartition, bounds: tuple[datetime, datetime]
     return table.filter(inside)
 
 
-def _median_staleness(table, partition: SealedPartition) -> float | None:
-    """The median of ``fetch_ts`` minus ``vendor_quote_ts``, in seconds, or ``None``.
+def _staleness_seconds(batch, partition: SealedPartition):
+    """One batch's ``fetch_ts`` minus ``vendor_quote_ts``, in float64 seconds, nulls dropped.
 
     Both stamps are ISO-8601 strings on every row rather than timestamps, so the difference is
     two parses per row and the parse is the whole cost. It runs in Arrow rather than row by row
     in Python, and the gap is not small: on SPY's 2026-09-16 chains partition, 5,307,030 rows,
-    the Arrow path takes 0.36 seconds against 2.75 for the Python loop. That is the difference
-    between the 18:30 job spending a second on this and spending eight.
+    the Arrow path took 0.36 seconds against 2.75 for the Python loop. That is the difference
+    between the 18:30 job spending a second on this and spending eight. Those figures were
+    measured on the whole-table read, before marketlake #670 streamed it.
 
-    ``pc.quantile`` at ``q=0.5`` is exact rather than approximate, and the distinction is worth
-    the word. ``pc.approximate_median`` is a t-digest and runs no faster here, 0.53 seconds
-    against 0.36, while answering -1.69 where the exact median is -1.697566. A guard compared
-    against a 60-second threshold would not care about that gap today, and a guard whose answer
-    depends on where its estimator's buckets fell is a guard nobody can reproduce from the rows.
+    The seconds stay float64 rather than int64 microseconds divided after the median. The two
+    medians are not the same number: on the real lake 32 of 162 comparisons differed in the last
+    bit, for example -2.4873469999999998 against -2.487347 on QQQ 2026-09-23. Both take 8 bytes a
+    row, so the integer form saves nothing either.
 
     A row missing either stamp has no defined staleness. The cast maps null to null and the
-    quantile skips nulls, so those rows drop out without being counted as zero, which would drag
-    the median toward a pass. A partition where every row lacks a stamp returns ``None``, and
-    :func:`judge_entitlement` treats that as its own quarantining condition rather than a pass.
+    row is dropped here, so it is not counted as zero, which would drag the median toward a
+    pass.
 
     A stamp that is not parseable ISO-8601, including one carrying no zone offset, raises rather
     than dropping the row. Both columns are pinned strings in the capture schema, so a value that
@@ -1184,8 +1221,8 @@ def _median_staleness(table, partition: SealedPartition) -> float | None:
     import pyarrow.compute as pc
 
     try:
-        fetched = pc.cast(table[FETCH_TS], pa.timestamp("us", tz="UTC"))
-        quoted = pc.cast(table[VENDOR_QUOTE_TS], pa.timestamp("us", tz="UTC"))
+        fetched = pc.cast(batch[FETCH_TS], pa.timestamp("us", tz="UTC"))
+        quoted = pc.cast(batch[VENDOR_QUOTE_TS], pa.timestamp("us", tz="UTC"))
     except pa.ArrowInvalid as exc:
         raise PartitionUnreadable(
             f"{partition.relative}: {FETCH_TS} or {VENDOR_QUOTE_TS} will not parse as a "
@@ -1193,7 +1230,29 @@ def _median_staleness(table, partition: SealedPartition) -> float | None:
         ) from exc
 
     seconds = pc.divide(pc.cast(pc.microseconds_between(quoted, fetched), pa.float64()), 1e6)
-    if seconds.null_count == len(seconds):
+    return seconds.drop_null()
+
+
+def _median_staleness(kept) -> float | None:
+    """The exact median of every batch's seconds, or ``None`` when no batch kept one.
+
+    ``pc.quantile`` at ``q=0.5`` is exact rather than approximate, and the distinction is worth
+    the word. ``pc.approximate_median`` is a t-digest and ran no faster on the whole-table read,
+    0.53 seconds against 0.36, while answering -1.69 where the exact median is -1.697566. A
+    guard compared against a 60-second threshold would not care about that gap today, and a
+    guard whose answer depends on where its estimator's buckets fell is a guard nobody can
+    reproduce from the rows.
+
+    ``None`` is the partition where no session row carried both stamps, and
+    :func:`judge_entitlement` treats that as its own quarantining condition rather than a pass.
+    The chunked array is typed because a partition of no rows yields no batch at all, and an
+    untyped ``pa.chunked_array([])`` raises rather than answering ``None``.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    seconds = pa.chunked_array(kept, type=pa.float64())
+    if len(seconds) == 0:
         return None
     return pc.quantile(seconds, q=0.5, interpolation="midpoint")[0].as_py()
 
@@ -1738,9 +1797,9 @@ def median(values: Sequence[float]) -> float:
     """The midpoint of a sorted copy, averaging the middle pair on an even count.
 
     Written here rather than taken from ``statistics`` so the interpolation matches
-    ``pc.quantile(..., interpolation="midpoint")``, which :func:`_median_staleness` uses. Two
-    medians in one module answering the same question two ways is the kind of drift the
-    module's own constants exist to prevent.
+    ``pc.quantile(..., interpolation="midpoint")``, which :func:`_median_staleness` takes over
+    the entitlement read's seconds from every batch. Two medians in one module answering the
+    same question two ways is the kind of drift the module's own constants exist to prevent.
     """
     ordered = sorted(values)
     middle = len(ordered) // 2
