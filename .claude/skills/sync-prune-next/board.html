@@ -246,12 +246,12 @@
   </div>
   <div class="strip" id="strip"></div>
   <!-- marketlake: the milestone filter (owner asked 2026-10-05). -->
-  <div class="msbar"><label for="mssel">Milestone</label><select id="mssel"></select>
+  <div class="msbar" id="msbar"><label for="mssel">Milestone</label><select id="mssel"></select>
     <span class="cnt" id="mscount"></span></div>
   <div class="caveat warn" id="source" hidden></div>
   <p class="note" style="margin:0 0 4px;font-size:0.8125rem;color:var(--faint)">What each deliverable is for lives in <a href="https://github.com/l3a0/marketlake/blob/main/docs/design.md" target="_blank" rel="noopener">the design doc</a>, and the slice order in <a href="https://github.com/l3a0/marketlake/blob/main/docs/build-plan.md" target="_blank" rel="noopener">the build plan</a>. The order below follows the repository's ranking rule: capture reliability first, then what makes the lake usable, and evidence from real use over any ranking made in advance.</p>
 
-  <section class="sec">
+  <section class="sec" id="flightsec">
     <header>
       <h2>In flight</h2>
       <span class="note">the five states between a plan being written and a merge, <b>most finished
@@ -263,7 +263,7 @@
     <div class="caveat" id="flownote"></div>
   </section>
 
-  <section class="sec">
+  <section class="sec" id="ordersec">
     <header>
       <h2>Build order</h2>
       <span class="note" id="ordernote"></span>
@@ -294,29 +294,24 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
    other: each write names the version it was based on and is refused if the
    document moved. The page subscribes once and redraws on every write.
 
-   marketlake: FALLBACK is an empty stub rather than a copy of that document.
-   It is what a view shows until the live document arrives, and what it keeps
-   showing when the database cannot be reached. A copy used to sit here, and a
-   copy goes stale silently: the old board's read as current while nine days
-   out of date. So whenever the page is not showing live data, the banner under
-   the strip says so, and says the page has no board data of its own.
+   marketlake: FALLBACK carries no board data. A copy of the document used to
+   sit here, and a copy goes stale silently: the old board's read as current
+   while nine days out of date. Until a live document arrives, or when the
+   database cannot be reached, the page draws only the banner under the strip,
+   which says why there is nothing to show.
 
    The document's shape is { schema, state, prs, working, planned, next,
    untracked, tracker }, and each field is what the constant of the same name
    held on the Quantitative Trading page. `usable` below is the whole contract
    the page checks before adopting a document. */
 const DOC = "board/data";
-/* marketlake: a stub, not a copy. The page's source lives in the repository,
-   and a snapshot of the board inside it would turn every publish into a data
-   diff. `usable` needs a non-empty tracker, so the stub carries one stand-in
-   card, which the default view hides because nothing ranks it. `updatedAt` is
-   left out on purpose: `ago` then returns an empty string, where a null would
-   be read as 1970 and print an age of decades. */
-const FALLBACK = { schema: 1,
-  state: { main: "none", issues: { open: "?" }, lake: {}, suite: {} },
-  prs: [], working: [], planned: [], next: [], untracked: [],
-  tracker: [{ n: 0, kind: "deferred", ms: "no milestone", labels: [], needs: [],
-    label: "No board data. The page carries no copy of the board, so this card stands in until the live board arrives." }] };
+/* marketlake: `none` tells render() there is no board to draw. Every section
+   below states facts about the tracker, so any stand-in document, however
+   empty, makes the page assert facts it does not have. A stand-in card also
+   drew as a real issue #0. So the page draws nothing but the banner until a
+   document passes `usable`, and NONE stays true until then. */
+const FALLBACK = { none: true };
+let NONE = true;
 
 let STATE, PRS, WORKING, PLANNED, NEXT, UNTRACKED, TRACKER, NEXT_SORTED;
 let SOURCE = { live: false, why: "loading" };
@@ -352,6 +347,8 @@ function usable(d) {
 
 /* A delivered snapshot is frozen, so the page works on a clone. */
 function adopt(src) {
+  NONE = !!src.none; /* marketlake: only FALLBACK carries it. */
+  if (NONE) return;
   const d = JSON.parse(JSON.stringify(src));
   STATE = d.state; PRS = d.prs; WORKING = d.working; PLANNED = d.planned;
   NEXT = d.next; UNTRACKED = d.untracked || []; TRACKER = d.tracker;
@@ -369,9 +366,11 @@ function source() {
   const el = document.getElementById("source");
   if (!el) return;
   if (SOURCE.live) { el.hidden = true; el.innerHTML = ""; return; }
-  const age = `measured ${esc(ago(STATE.updatedAt))} against <span class="mono">${esc(STATE.main)}</span>`;
-  /* marketlake: the page carries a stub rather than a copy, so the lines that
-     used to name the copy's age say there is no board data instead. */
+  /* marketlake: a function, because STATE is unset while the page has no
+     data, and only the stopped line with live data behind it names an age. */
+  const age = () => `measured ${esc(ago(STATE.updatedAt))} against <span class="mono">${esc(STATE.main)}</span>`;
+  /* marketlake: the page carries no copy of the board, so the lines that used
+     to name the copy's age say there is no board data instead. */
   const copy = `no board data`;
   const lines = {
     loading: `<b>Showing ${copy}.</b> The live board has not arrived yet, and the page carries no copy of its own.`,
@@ -379,18 +378,16 @@ function source() {
     empty: `<b>Showing ${copy}.</b> The live board holds no document yet.`,
     shape: `<b>Showing ${copy}.</b> The live board's document is missing fields this page needs, so it was not used.`,
     stopped: `<b>Live updates stopped${SOURCE.code ? ` (${esc(SOURCE.code)})` : ""}.</b> ` +
-      (SOURCE.had ? `What is shown is the last live data, ${age}. Reload to reconnect.`
+      (SOURCE.had ? `What is shown is the last live data, ${age()}. Reload to reconnect.`
                   : `Showing ${copy}.`)
   };
   el.innerHTML = lines[SOURCE.why] || lines.none;
-  /* The loading line waits a few seconds before it shows, so a normal load that
-     connects at once never flashes a warning. */
-  if (SOURCE.why === "loading") {
-    el.hidden = true;
-    setTimeout(() => { if (!SOURCE.live && SOURCE.why === "loading") el.hidden = false; }, 4000);
-  } else {
-    el.hidden = false;
-  }
+  /* marketlake: shown at once. The loading line used to wait four seconds, so a
+     load that connects at once never flashed a warning. That wait suited a page
+     with a copy of the board to show meanwhile. This page has nothing to show
+     while loading, so the wait left a blank page with no word of why. The price
+     is that a normal load shows the loading line until the board arrives. */
+  el.hidden = false;
 }
 
 /* marketlake: the button above the board, so it shows before the reader scrolls
@@ -1379,8 +1376,19 @@ function inFlight(ctx) {
       : `Nothing in ${esc(MS)} is in flight. Its cards are in the board below.`; /* marketlake */
 }
 
-/* marketlake: msbar() first, because every section reads the MS it resolves. */
-function render() { strip(); msbar(); source(); buildOrder(); more(); stamped(); }
+/* marketlake: msbar() first, because every section reads the MS it resolves.
+   With no board data only the banner is drawn, and the selector, both card
+   sections and the footer are hidden, since each states facts about the
+   tracker. The platform's page wrapper makes `hidden` win over a section's own
+   display rule. */
+function render() {
+  ["msbar", "flightsec", "ordersec", "foot"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = NONE;
+  });
+  if (NONE) { source(); return; }
+  strip(); msbar(); source(); buildOrder(); more(); stamped();
+}
 adopt(FALLBACK);
 render();
 
@@ -1412,6 +1420,6 @@ render();
 
 setInterval(() => {
   const el = document.getElementById("stamp");
-  if (el) el.textContent = "measured " + ago(STATE.updatedAt);
+  if (el && !NONE) el.textContent = "measured " + ago(STATE.updatedAt);
 }, 60000);
 </script>
