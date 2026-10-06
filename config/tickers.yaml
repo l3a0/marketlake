@@ -1,0 +1,12 @@
+QQQ:
+  bars:
+  - 1m
+  - 1d
+  chain_cadence: 1m
+  options: true
+SPY:
+  bars:
+  - 1m
+  - 1d
+  chain_cadence: 1m
+  options: true

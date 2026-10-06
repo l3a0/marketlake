@@ -1,9 +1,15 @@
 """The tickers module: the portable capture roster.
 
-``tickers.yaml`` is the *portable* half of the configuration. It says what to capture,
-and it travels with the token on migration. Its machine-local counterpart is
-``config.yaml``, loaded by ``lake.config``. The two live side by side in
-``~/.config/marketlake/``.
+``tickers.yaml`` is the *portable* half of the configuration. It says what to capture.
+Its machine-local counterpart is ``config.yaml``, loaded by ``lake.config``. The two live
+side by side in ``~/.config/marketlake/``, and every reader reads the roster there.
+
+The roster's content is tracked in this repository as ``config/tickers.yaml``, so a
+change to it is a reviewed pull request. It holds symbols, booleans, cadences and bar
+lists, so tracking it commits no secret and no machine path. ``apply_roster`` copies the
+tracked file into the config directory, and ``python -m lake.roster apply`` is its
+command. No host reads the tracked path in place, because a checkout replaces the file
+without a rename, so a reader looping on it can catch it missing or empty.
 
 The file is a mapping from ticker to its capture settings::
 
@@ -20,7 +26,7 @@ on the next cycle with no restart.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,7 +154,7 @@ def load_tickers(
     return _roster_from(mapping, resolved)
 
 
-def _roster_from(mapping: Mapping[str, object], resolved: Path) -> Roster:
+def _roster_from(mapping: Mapping[str, object], resolved: Path | str) -> Roster:
     """The roster for an already-parsed mapping, with the file named on any refusal.
 
     ``Roster.from_mapping`` takes a mapping and no path, so its message names the entry
@@ -178,7 +184,7 @@ def _read_text(resolved: Path) -> str:
         raise TickersError(f"tickers file cannot be read: {resolved}") from None
 
 
-def _parse(text: str, resolved: Path) -> object:
+def _parse(text: str, resolved: Path | str) -> object:
     """The parsed document, or a ``TickersError`` naming where the YAML broke.
 
     A half-saved file is the ordinary way this fails, and where the cut lands decides
@@ -229,9 +235,12 @@ def upsert_ticker(
     ``bars`` is written as a plain list.
 
     The path precedence matches ``load_tickers``: an explicit ``path``, then the
-    ``MARKETLAKE_TICKERS`` environment variable, then the default. The roster lives in
-    ``~/.config/marketlake/``, outside the repo. It is portable config, never a tracked
-    file, so no machine path or secret is committed by writing it.
+    ``MARKETLAKE_TICKERS`` environment variable, then the default. This writes the host's
+    copy in ``~/.config/marketlake/``. The reviewed copy is the repository's
+    ``config/tickers.yaml``, which ``apply_roster`` copies onto each host, so an entry
+    written here and not merged there is overwritten by the next apply. No lake check
+    refuses that apply until marketlake #692 builds one. The roster holds no machine path
+    and no secret, which is why tracking it commits neither.
     """
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}
@@ -275,6 +284,89 @@ def upsert_ticker(
     except OSError:
         raise TickersError(f"tickers file cannot be written: {resolved}") from None
     return resolved
+
+
+# How a roster read from standard input is named in a refusal, where a file would be
+# named by its path.
+STDIN_SOURCE = "<stdin>"
+
+
+def roster_from_bytes(payload: bytes, *, source: str = STDIN_SOURCE) -> Roster:
+    """The roster ``payload`` holds, or a ``TickersError`` saying why it is not one.
+
+    The bytes must decode as UTF-8 and parse to a mapping the loader accepts, which is
+    the validation ``load_tickers`` runs on the file. An absent document is an empty
+    roster here, as it is there. Whether an empty roster may be applied is
+    ``apply_roster``'s question, not this one's.
+    """
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise TickersError(f"tickers file is not UTF-8 text: {source}") from None
+    parsed = _parse(text, source)
+    mapping = {} if parsed is None else parsed
+    if not isinstance(mapping, Mapping):
+        raise TickersError(f"tickers file is not a mapping: {source}")
+    return _roster_from(mapping, source)
+
+
+def apply_roster(
+    payload: bytes,
+    *,
+    check: Callable[[Roster], None],
+    path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    source: str = STDIN_SOURCE,
+) -> bool:
+    """Copy a reviewed roster's bytes onto this host, and return whether it replaced one.
+
+    This is the core of ``python -m lake.roster apply``. The repository tracks the roster
+    as ``config/tickers.yaml`` and every reader keeps reading the host's copy, so this is
+    how a merged change reaches a host. It runs four steps in order and stops at the
+    first refusal, each a ``TickersError``.
+
+    1. It validates ``payload`` with ``roster_from_bytes``, so nothing is written for
+       bytes the loader would refuse.
+    2. It refuses a roster with no enabled ticker. Parsing alone accepts an empty
+       document, and the daemon feeds the capture dead-man when no ticker is enabled, so
+       a host handed one would capture nothing and raise no alarm. The price is that
+       retiring the last ticker needs a hand step.
+    3. It calls ``check`` with the roster on every call and before any write, including
+       when the bytes already match. A refusing check raises, and nothing is written.
+       This is where a check against the host's lake runs. It comes in as a callable
+       because this module cannot import ``capture`` or ``outbox`` without an import
+       cycle. A refusal on an unchanged roster still matters, because it says a ticker
+       the lake owes is not being captured now.
+    4. It replaces the host's roster when the bytes differ, and leaves it alone when they
+       are equal. The bytes are written as given, never re-serialized, so the host's copy
+       stays byte for byte the reviewed file.
+
+    The write goes through ``_write_atomically``, because the daemon re-reads the roster
+    at the top of every cycle and the rename lets it see only the whole old file or the
+    whole new one. Nothing is started or restarted, since the next cycle reads the new
+    roster. The path precedence matches ``load_tickers``.
+    """
+    roster = roster_from_bytes(payload, source=source)
+    if not roster.enabled:
+        raise TickersError(
+            f"tickers file names no enabled ticker, so a host would capture nothing: {source}"
+        )
+    check(roster)
+    resolved = _resolve_path(path, env)
+    try:
+        current: bytes | None = resolved.read_bytes()
+    except FileNotFoundError:
+        current = None
+    except OSError:
+        raise TickersError(f"tickers file cannot be read: {resolved}") from None
+    if current == payload:
+        return False
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        _write_atomically(resolved, payload.decode("utf-8"))
+    except OSError:
+        raise TickersError(f"tickers file cannot be written: {resolved}") from None
+    return True
 
 
 def set_enabled(

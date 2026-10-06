@@ -1075,7 +1075,9 @@ def test_the_command_exits_two_on_a_roster_frequency_nothing_can_fetch(
     """The refusal reaches the operator as one line naming the file they have to edit.
 
     It is tested through ``main`` rather than only through the core, because the exit code is
-    what an operator and a scheduler both read, and the core cannot say what that is.
+    what an operator and a scheduler both read, and the core cannot say what that is. The file
+    is the tracked ``config/tickers.yaml`` and the step after the merge is ``apply``, because an
+    edit to the host's copy is overwritten by the next apply.
     """
     root = _lake(fixture_lake)
     config = write_config(tmp_path, root)
@@ -1088,7 +1090,10 @@ def test_the_command_exits_two_on_a_roster_frequency_nothing_can_fetch(
     )
 
     assert code == 2
-    assert "tickers.yaml" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "config/tickers.yaml through a pull request" in err
+    assert "python -m lake.roster apply" in err
 
 
 def test_the_command_exits_two_when_the_token_is_dead(

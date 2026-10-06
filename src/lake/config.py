@@ -7,7 +7,8 @@ the design's ``DATA_DIR`` pattern.
 
 The file is *machine-local* config: where things live on this machine and how to alert
 from it. It is the counterpart to the *portable* ``tickers.yaml`` roster, which says
-what to capture and travels on migration. This module loads the machine-local half.
+what to capture and is tracked in the repository as ``config/tickers.yaml``. This module
+loads the machine-local half.
 The roster lives in ``lake.tickers``.
 
 Four of the values are always secrets, and two more join them once the bucket's access
