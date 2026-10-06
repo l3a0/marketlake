@@ -1,0 +1,14 @@
+# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,
+# not this file: the install entry point renders afresh on every run.
+
+[Unit]
+Description=com.marketlake.self-check
+RequiresMountsFor=/srv/lake
+
+[Service]
+Type=oneshot
+User=someone
+WorkingDirectory=/home/someone/marketlake
+Environment=HOME=/home/someone
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/someone/marketlake/.venv/bin/python -m lake.control_plane self-check

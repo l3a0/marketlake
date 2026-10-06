@@ -54,13 +54,14 @@ from tests.support.config_defaults import modules_building_a_default
 # Two shapes of child are outside it, both on purpose, and neither can be closed from
 # here. A child handed an explicit ``env=`` carries only what that mapping names, which
 # is how ``_child`` in ``tests/component/test_config_dir_override.py`` asks what a
-# process with no override resolves, and how the four render tests sandbox a rendered
+# process with no override resolves, and how the render tests sandbox a rendered
 # script. And the rendered ``reauth.sh`` unsets the variable before it calls the tool, so
 # anything it runs is outside this by design. One test's explicit-``env=`` children do
 # reach real code at a default path: ``tests/component/test_unattended_entries_fresh.py``
-# starts each launchd entry with its job's own environment, and the compaction child the
-# daemon spawns with the daemon job's. Neither carries a config-directory variable, so
-# ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the child imports ``lake.config``.
+# starts each entry with its launchd job's or systemd unit's own environment, and the
+# compaction child the daemon spawns with the daemon job's. Neither carries a
+# config-directory variable, so ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the
+# child imports ``lake.config``.
 # That test arranges its own redirect by pointing ``HOME`` at a throwaway directory. Any
 # other child that reaches a default path has to do the same.
 #
@@ -281,12 +282,13 @@ def _no_network() -> Iterator[None]:
 # would read the CI runner's own systemd, whose answer has nothing to do with the case
 # under test. This fixture closes that gap the same way, on those program names only.
 #
-# The refusal has to name the program rather than block every subprocess. Four tests in
-# ``tests/component/test_control_plane_render.py`` run the rendered install, reinstall,
-# restart, and uninstall scripts for real, each sandboxed by a fake ``PATH`` that points
-# at stand-ins for the tools the script calls. Those calls name a script path or
-# ``bash``, never one of the guarded names directly, so refusing only those names
-# leaves them untouched.
+# The refusal has to name the program rather than block every subprocess. The render
+# tests in ``tests/component/test_control_plane_render.py`` and
+# ``tests/component/test_control_plane_systemd.py`` run the rendered install, reinstall,
+# restart, and uninstall scripts, and ``deploy/linux-install.sh``, for real, each
+# sandboxed by a fake ``PATH`` that points at stand-ins for the tools the script calls.
+# Those calls name a script path or ``bash``, never one of the guarded names directly, so
+# refusing only those names leaves them untouched.
 #
 # The sixth site is what made the wrapper case real. ``set_sunday_wake`` runs
 # ``sudo -n /usr/bin/pmset schedule ...``, so the program at ``argv[0]`` is ``sudo`` and

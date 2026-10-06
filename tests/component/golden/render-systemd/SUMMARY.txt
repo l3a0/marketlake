@@ -1,0 +1,17 @@
+render: systemd units for someone in <OUT>
+  ten unit files:
+    com.marketlake.daemon.service
+    com.marketlake.dashboard.service
+    com.marketlake.self-check.service
+    com.marketlake.self-check.timer
+    com.marketlake.calendar-probe.service
+    com.marketlake.calendar-probe.timer
+    com.marketlake.sunday.service
+    com.marketlake.sunday.timer
+    com.marketlake.eod-sweep.service
+    com.marketlake.eod-sweep.timer
+  needrestart.conf
+  install.sh
+  uninstall.sh
+  restart.sh
+  next: run <OUT>/install.sh as root. deploy/linux-install.sh does that after every render.

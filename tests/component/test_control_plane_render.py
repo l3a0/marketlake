@@ -65,23 +65,72 @@ EXPECTED_FILES = {
     cp.REAUTH_SCRIPT_FILE,
 }
 
+# The systemd render's placeholder identity. It takes no --log-dir and no --group, and is
+# rendered with --lake-mount so ``RequiresMountsFor=`` is covered.
+SYSTEMD_RENDER_ARGS = [
+    "--init",
+    "systemd",
+    "--python",
+    "/home/someone/marketlake/.venv/bin/python",
+    "--owner",
+    "someone",
+    "--home",
+    "/home/someone",
+    "--project-dir",
+    "/home/someone/marketlake",
+    "--lake-mount",
+    "/srv/lake",
+]
+
+SYSTEMD_EXPECTED_FILES = {
+    "com.marketlake.daemon.service",
+    "com.marketlake.dashboard.service",
+    "com.marketlake.self-check.service",
+    "com.marketlake.self-check.timer",
+    "com.marketlake.calendar-probe.service",
+    "com.marketlake.calendar-probe.timer",
+    "com.marketlake.sunday.service",
+    "com.marketlake.sunday.timer",
+    "com.marketlake.eod-sweep.service",
+    "com.marketlake.eod-sweep.timer",
+    cp.NEEDRESTART_FILE,
+    cp.INSTALL_SCRIPT_FILE,
+    cp.UNINSTALL_SCRIPT_FILE,
+    cp.RESTART_SCRIPT_FILE,
+}
+
+HOSTS = ("launchd", "systemd")
+RENDER_ARGS_BY_HOST = {"launchd": RENDER_ARGS, "systemd": SYSTEMD_RENDER_ARGS}
+EXPECTED_FILES_BY_HOST = {"launchd": EXPECTED_FILES, "systemd": SYSTEMD_EXPECTED_FILES}
+
+# What each host's render prints on stdout, saved beside its goldens under this name.
+STDOUT_GOLDEN = {"launchd": "INSTALL.txt", "systemd": "SUMMARY.txt"}
+
 
 # -- render ------------------------------------------------------------------------
 
 
-def test_render_writes_every_file_into_the_directory_and_nothing_outside(tmp_path, capsys):
+@pytest.mark.parametrize("host", HOSTS)
+def test_render_writes_every_file_into_the_directory_and_nothing_outside(host, tmp_path, capsys):
     out = tmp_path / "out"
-    code = cp.main(["render", "--out", str(out), *RENDER_ARGS])
+    code = cp.main(["render", "--out", str(out), *RENDER_ARGS_BY_HOST[host]])
     assert code == 0
-    assert {p.name for p in out.iterdir()} == EXPECTED_FILES
+    assert {p.name for p in out.iterdir()} == EXPECTED_FILES_BY_HOST[host]
     # Nothing landed beside the output directory.
     assert [p.name for p in tmp_path.iterdir()] == ["out"]
+    printed = capsys.readouterr().out
+    if host == "systemd":
+        # Every service names the owner, and the summary names every file written.
+        for name in SYSTEMD_EXPECTED_FILES:
+            if name.endswith(".service"):
+                assert "\nUser=someone\n" in (out / name).read_text(), name
+            assert name in printed, name
+        return
     # Every plist parses and names the owner.
     for name in EXPECTED_FILES:
         if name.endswith(".plist"):
             plist = plistlib.loads((out / name).read_bytes())
             assert plist["UserName"] == "someone"
-    printed = capsys.readouterr().out
     assert "sudo pmset repeat wakeorpoweron MTWRF 08:25:00" in printed
     assert "/Library/LaunchDaemons/" in printed
     assert "launchctl bootstrap system" in printed
@@ -366,15 +415,37 @@ def test_the_install_text_quotes_every_path_that_needs_it(tmp_path, capsys):
                 )
 
 
-@pytest.mark.parametrize("flag", ["--python", "--home", "--project-dir", "--log-dir"])
-def test_render_refuses_a_relative_machine_path(flag, capsys):
-    # These land in a plist or in a printed line the operator pastes from anywhere, so
-    # a relative value is never right. --out is the exception: it is resolved instead.
-    args = list(RENDER_ARGS)
-    args[args.index(flag) + 1] = "relative/path"
+@pytest.mark.parametrize(
+    ("host", "flag"),
+    [
+        *(("launchd", f) for f in ("--python", "--home", "--project-dir", "--log-dir", "--config")),
+        *(
+            ("systemd", f)
+            for f in ("--python", "--home", "--project-dir", "--config", "--lake-mount")
+        ),
+    ],
+)
+def test_render_refuses_a_relative_machine_path(host, flag, capsys):
+    # These land in a plist, a unit or a printed line run from anywhere, so a relative
+    # value is never right. --out is the exception: it is resolved instead.
+    args = list(RENDER_ARGS_BY_HOST[host])
+    if flag in args:
+        args[args.index(flag) + 1] = "relative/path"
+    else:
+        args += [flag, "relative/path"]
     code = cp.main(["render", "--out", "/tmp/unused-render", *args])
     assert code == 2
-    assert "must be absolute" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert captured.err == f"render: these must be absolute paths: {flag} 'relative/path'\n"
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_an_absent_optional_path_is_not_checked(host, tmp_path):
+    """A ``None`` reaching ``Path`` would exit 1 with a traceback rather than render."""
+    args = RENDER_ARGS_BY_HOST[host]
+    assert "--config" not in args
+    assert cp.main(["render", "--out", str(tmp_path / "out"), *args]) == 0
 
 
 def test_the_install_text_names_absolute_paths_from_a_relative_out(tmp_path, capsys, monkeypatch):
@@ -1318,7 +1389,7 @@ def test_the_install_text_counts_the_jobs_it_actually_installs(tmp_path, capsys)
 
 
 def _spelled(count: int) -> str:
-    return {4: "four", 5: "five", 6: "six"}[count]
+    return {4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten"}[count]
 
 
 def test_render_puts_progress_on_stderr_so_stdout_is_pasteable(tmp_path, capsys):
@@ -1423,7 +1494,8 @@ def test_the_reauth_script_says_it_cannot_run_unattended(tmp_path):
     assert "refuses when stdin is not a terminal" in header
 
 
-def test_nothing_rendered_bakes_in_a_secret_url(tmp_path, capsys):
+@pytest.mark.parametrize("host", HOSTS)
+def test_nothing_rendered_bakes_in_a_secret_url(host, tmp_path, capsys):
     """The renderer reads no config, so no callback and no secret can reach a file.
 
     ``render_all`` takes a ``LaunchdHost`` and nothing else, so it cannot know the
@@ -1436,10 +1508,10 @@ def test_nothing_rendered_bakes_in_a_secret_url(tmp_path, capsys):
     beside it would put a secret in a tracked rendering.
     """
     out = tmp_path / "out"
-    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS_BY_HOST[host]]) == 0
     texts = {path.name: path.read_text() for path in out.iterdir()}
-    texts["INSTALL.txt"] = capsys.readouterr().out
-    assert set(texts) == EXPECTED_FILES | {"INSTALL.txt"}
+    texts[STDOUT_GOLDEN[host]] = capsys.readouterr().out
+    assert set(texts) == EXPECTED_FILES_BY_HOST[host] | {STDOUT_GOLDEN[host]}
     for name, text in texts.items():
         for marker in ("hc-ping.com", "healthchecks.io/", "ntfy.sh", f"{cp.CALLBACK_KEY}:"):
             assert marker not in text, (name, marker)
@@ -1450,8 +1522,12 @@ def test_nothing_rendered_bakes_in_a_secret_url(tmp_path, capsys):
         assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-", text), name
         assert not re.search(r"\b[0-9a-f]{32}\b", text), name
     # The re-auth script carries no URL at all. Its one job is the browser login, so a
-    # baked-in callback is likelier there than anywhere else.
-    assert "://" not in texts[cp.REAUTH_SCRIPT_FILE]
+    # baked-in callback is likelier there than anywhere else. A systemd host renders no
+    # re-auth script, since a VM has no browser.
+    if host == "launchd":
+        assert "://" not in texts[cp.REAUTH_SCRIPT_FILE]
+    else:
+        assert cp.REAUTH_SCRIPT_FILE not in texts
 
 
 def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
@@ -1758,6 +1834,8 @@ def test_every_line_of_the_arming_step_is_a_comment(tmp_path, capsys):
 # -- the golden rendering ------------------------------------------------------
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "render"
+SYSTEMD_GOLDEN_DIR = Path(__file__).parent / "golden" / "render-systemd"
+GOLDEN_DIR_BY_HOST = {"launchd": GOLDEN_DIR, "systemd": SYSTEMD_GOLDEN_DIR}
 
 # The install text names the output directory, which is a fresh tmp_path on every run.
 # Nothing else in the rendering varies, so that one path is normalised and every other
@@ -1770,7 +1848,7 @@ def _normalise(text: str, out: Path) -> str:
     return text.replace(str(out.resolve()), OUT_PLACEHOLDER).replace(str(out), OUT_PLACEHOLDER)
 
 
-def _check_golden(name: str, actual: bytes) -> None:
+def _check_golden(directory: Path, name: str, actual: bytes) -> None:
     """Compare one rendering to its golden file, or rewrite it when asked.
 
     The comparison is on bytes. ``read_text`` would open with universal newlines and
@@ -1782,7 +1860,7 @@ def _check_golden(name: str, actual: bytes) -> None:
     Set ``MARKETLAKE_UPDATE_GOLDEN=1`` to rewrite. That is the only way these files
     change, so a diff in a pull request is the reviewable record of a rendering change.
     """
-    path = GOLDEN_DIR / name
+    path = directory / name
     if os.environ.get("MARKETLAKE_UPDATE_GOLDEN") == "1":
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(actual)
@@ -1807,24 +1885,37 @@ def test_each_rendered_file_matches_its_golden(name, tmp_path):
     """
     out = tmp_path / "out"
     assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    _check_golden(name, (out / name).read_bytes())
+    _check_golden(GOLDEN_DIR, name, (out / name).read_bytes())
 
 
-def test_the_install_text_matches_its_golden(tmp_path, capsys):
-    """The pasted script is checked whole, with only the output directory normalised."""
+@pytest.mark.parametrize("name", sorted(SYSTEMD_EXPECTED_FILES))
+def test_each_systemd_file_matches_its_golden(name, tmp_path):
+    """The systemd render's own golden directory, every byte of every file."""
     out = tmp_path / "out"
-    assert cp.main(["render", "--out", str(out), *RENDER_ARGS]) == 0
-    _check_golden("INSTALL.txt", _normalise(capsys.readouterr().out, out).encode())
+    assert cp.main(["render", "--out", str(out), *SYSTEMD_RENDER_ARGS]) == 0
+    _check_golden(SYSTEMD_GOLDEN_DIR, name, (out / name).read_bytes())
 
 
-def test_the_golden_directory_holds_exactly_what_is_covered():
+@pytest.mark.parametrize("host", HOSTS)
+def test_the_printed_text_matches_its_golden(host, tmp_path, capsys):
+    """The launchd install text or the systemd summary, whole, with only the output
+    directory normalised."""
+    out = tmp_path / "out"
+    assert cp.main(["render", "--out", str(out), *RENDER_ARGS_BY_HOST[host]]) == 0
+    printed = _normalise(capsys.readouterr().out, out).encode()
+    _check_golden(GOLDEN_DIR_BY_HOST[host], STDOUT_GOLDEN[host], printed)
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_the_golden_directory_holds_exactly_what_is_covered(host):
     """A golden for a file the renderer no longer writes would sit unread forever.
 
-    The per-file test is parametrised over ``EXPECTED_FILES``, so it only ever asks
+    The per-file test is parametrised over the expected files, so it only ever asks
     about files the renderer still produces. Nothing looks the other way, and a stale
     golden reads in review as coverage that is not there.
     """
-    assert {p.name for p in GOLDEN_DIR.iterdir()} == EXPECTED_FILES | {"INSTALL.txt"}
+    held = {p.name for p in GOLDEN_DIR_BY_HOST[host].iterdir()}
+    assert held == EXPECTED_FILES_BY_HOST[host] | {STDOUT_GOLDEN[host]}
 
 
 # -- the install script --------------------------------------------------------
