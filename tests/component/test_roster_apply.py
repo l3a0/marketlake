@@ -229,6 +229,40 @@ def test_main_names_a_bad_payload_before_a_missing_config(tmp_path, monkeypatch,
     assert _listing(tmp_path) == []
 
 
+class _UnreadableBuffer:
+    def read(self) -> bytes:
+        raise OSError(5, "Input/output error")
+
+
+class _UnreadableStdin:
+    buffer = _UnreadableBuffer()
+
+
+@pytest.mark.parametrize(
+    ("stdin", "named"),
+    [
+        pytest.param(None, "standard input is closed", id="closed"),
+        pytest.param(_UnreadableStdin(), "cannot read the roster", id="read-fails"),
+    ],
+)
+def test_main_refuses_a_stdin_it_cannot_read_in_one_line(
+    tmp_path, config_path, monkeypatch, capsys, stdin, named
+):
+    # ``<&-`` starts the process with ``sys.stdin`` set to None. Before this was a
+    # refusal, the read sat outside the refusal handling and escaped as a traceback.
+    target = tmp_path / "out" / "tickers.yaml"
+    monkeypatch.setenv("MARKETLAKE_CONFIG", str(config_path))
+    monkeypatch.setenv("MARKETLAKE_TICKERS", str(target))
+    monkeypatch.setattr(sys, "stdin", stdin)
+    with pytest.raises(SystemExit) as excinfo:
+        roster_cli.main(["apply"])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert err.startswith(f"roster: {named}")
+    assert not target.exists()
+
+
 def test_a_fresh_process_writes_the_path_the_loader_reads(tmp_path):
     # Two children, given only a PATH and a HOME holding a config.yaml. The first applies
     # the roster with every path at its default. The second asks the loader, also at its

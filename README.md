@@ -312,7 +312,9 @@ host still reads `~/.config/marketlake/tickers.yaml`, and
 does not parse, one with no enabled ticker, a host with no `config.yaml`, and a run as
 root. It replaces the host's file when the bytes differ, leaves it alone when they match,
 and prints which. It never restarts the daemon, which reads the new roster on its next
-cycle. On the VM, the boot render and the post-close deploy run it.
+cycle. On the VM, the boot render
+([#686](https://github.com/l3a0/marketlake/issues/686)) and the post-close deploy
+([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once they are built.
 
 On the laptop, run it from the main checkout after a `git pull`. Call the checkout's own
 venv interpreter, the way the rendered `reauth.sh` does. `uv run` would sync the venv
@@ -338,11 +340,13 @@ steps, and the order matters.
    `lake.onboard` the same evening. Capture keeps an enabled ticker the security master
    cannot resolve yet, so a forgotten onboard loses no minute.
 2. **To retire,** run `lake.retire` after the close, then merge the roster pull request
-   before 09:30 ET. Merged first, the deploy's lake check
-   ([#692](https://github.com/l3a0/marketlake/issues/692)) refuses it and the ticker keeps
-   being captured. Run first and left unmerged, the next apply puts the entry back, and
-   the daemon pages during the session that an enabled ticker sits outside every span.
-   Both mistakes are loud, and neither loses a minute.
+   before 09:30 ET. Never merge the retire pull request before `lake.retire` has run.
+   `apply` does not yet check the roster against the lake, so it copies an early merge
+   onto the host, and the ticker silently stops being captured with no page. The check
+   that would refuse that copy arrives with
+   [#692](https://github.com/l3a0/marketlake/issues/692). The other mistake is loud. Run
+   first and left unmerged, the next apply puts the entry back, and the daemon pages
+   during the session that an enabled ticker sits outside every span.
 
 ## Apply the infrastructure
 

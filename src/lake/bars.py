@@ -2447,7 +2447,10 @@ def main(
        operator told to seed a corrupt file is being told the wrong thing.
     2. An absent capture-spans file wants ``python -m lake.seed_spans``, which is what a master
        from before that file existed needs, and a torn one wants a restore.
-    3. A roster frequency nothing can fetch wants an edit to ``tickers.yaml``.
+    3. A roster frequency nothing can fetch wants a fix to the bars list in the tracked
+       ``config/tickers.yaml``, merged through a pull request and copied onto the host by
+       ``python -m lake.roster apply``. An edit to the host's copy is overwritten by the next
+       apply.
     4. A day that is not a session has no bars to fetch.
     5. A dead refresh token wants the reauth command, and it is named rather than contained
        because every remaining ticker-day would fail it identically.
@@ -2503,7 +2506,11 @@ def main(
         print(f"bars: {exc}.", file=sys.stderr)
         return 2
     except UnsupportedBarFreq as exc:
-        print(f"bars: {exc}. Fix the bars list in tickers.yaml.", file=sys.stderr)
+        print(
+            f"bars: {exc}. Fix the bars list in config/tickers.yaml through a pull "
+            "request, then run python -m lake.roster apply.",
+            file=sys.stderr,
+        )
         return 2
     except StampNotAnInstant as exc:
         # The refusal reaches a person as one line rather than a stack, which is the treatment

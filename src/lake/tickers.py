@@ -238,8 +238,9 @@ def upsert_ticker(
     ``MARKETLAKE_TICKERS`` environment variable, then the default. This writes the host's
     copy in ``~/.config/marketlake/``. The reviewed copy is the repository's
     ``config/tickers.yaml``, which ``apply_roster`` copies onto each host, so an entry
-    written here and not merged there is reconciled or refused by the next apply. The
-    roster holds no machine path and no secret, which is why tracking it commits neither.
+    written here and not merged there is overwritten by the next apply. No lake check
+    refuses that apply until marketlake #692 builds one. The roster holds no machine path
+    and no secret, which is why tracking it commits neither.
     """
     resolved = _resolve_path(path, env)
     existing: dict[str, object] = {}

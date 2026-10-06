@@ -108,12 +108,30 @@ def _build_parser():
     return parser
 
 
+def _read_stdin() -> bytes:
+    """The roster's bytes from standard input, or a ``RosterError`` naming why not.
+
+    A process started with its standard input closed, as ``<&-`` does, has ``sys.stdin``
+    set to ``None``, and a read can fail with ``OSError``. Either escaped as a traceback
+    before, so both are refusals here, printed as one line with exit 2.
+    """
+    stdin = sys.stdin
+    if stdin is None:
+        raise RosterError(
+            "standard input is closed; pipe the roster in, as in "
+            "'python -m lake.roster apply < config/tickers.yaml'"
+        )
+    try:
+        return stdin.buffer.read()
+    except OSError as exc:
+        raise RosterError(f"cannot read the roster from standard input ({exc})") from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.roster`` entry. Returns a process exit code."""
     _build_parser().parse_args(argv)
-    payload = sys.stdin.buffer.read()
     with input_errors_exit("roster", RosterError):
-        outcome = apply(payload)
+        outcome = apply(_read_stdin())
     print(f"roster: {outcome} {tickers_file_path()}")
     return 0
 
