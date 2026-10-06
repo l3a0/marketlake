@@ -2861,7 +2861,7 @@ def test_an_unreadable_ledger_pages_under_its_own_event(tmp_path):
     ``sweep`` computes the same verdict and loses it with the rest of the run, because
     ``_LEDGER_REFUSALS`` does not name ``SchemaVersionsError``. That is marketlake #494. Until
     it lands, this binding is the whole of what says a corrupt ledger exists, and the file it
-    names is the one the next backup copies over the last good copy.
+    names is the one the next path backup copies over the last good copy.
     """
     rig = _rig(tmp_path)
     ledger_path(rig.lake_root).write_bytes(b"not parquet at all")

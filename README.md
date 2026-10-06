@@ -132,7 +132,9 @@ Three commands go with it.
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
    plan. It writes three probe objects and names the prefix to delete by hand, since the
-   narrow key cannot delete.
+   narrow key cannot delete. The narrow key also cannot read an old version, so behavior
+   3's read-back of the first version fails with it, and the check says to confirm in
+   the console that the probe key shows two versions.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
    an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,

@@ -428,7 +428,9 @@ def test_the_sunday_entry_pages_through_a_real_publisher(tmp_path, monkeypatch, 
 
 
 def test_no_page_a_root_sent_carried_a_secret(tmp_path, monkeypatch, capsys):
-    """Each root builds its publisher with the two values that must never reach a phone.
+    """Each root builds its publisher with the values that must never reach a phone.
+
+    This config holds no bucket keys, so those values are the ping key and the topic.
 
     A page carrying either is refused rather than sent, so a page arriving at the
     transport is itself the proof. This names the secrets so the assertion reads as one.

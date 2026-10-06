@@ -60,8 +60,8 @@ def test_explicit_argument_beats_the_env_var(tmp_path: Path):
 
 
 def test_malformed_yaml_names_the_file_and_never_the_secret(tmp_path: Path):
-    # PyYAML quotes the offending line back in its message, and four of this file's
-    # values are secrets. Jobs run from launchd with stderr going to a log file, so an
+    # PyYAML quotes the offending line back in its message, and four to six of this
+    # file's values are secrets. Jobs run from launchd with stderr going to a log file, so an
     # uncaught traceback would write the ping key to disk.
     bad = tmp_path / "bad.yaml"
     bad.write_text(

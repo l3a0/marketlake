@@ -37,9 +37,11 @@ Terms, glossed at first use.
   token still works. It retries every 30 minutes until it passes or its deadline.
 - The *scrub* is the weekly integrity pass over the lake. It checks every recorded file
   against its recorded checksum, and checks that no data file went unrecorded. The
-  *backup scrub* asks the same two questions of the rsync copy on the external SSD,
-  against the lake's manifest rather than the copy's. It is what notices the backup
-  rotting, which is why ``rsync`` no longer pays for ``--checksum`` every day.
+  *backup scrub* asks the same two questions of the backup copy, against the lake's
+  manifest rather than the copy's. For a path target, the rsync copy on the external
+  SSD, it is what notices the backup rotting, which is why ``rsync`` no longer pays for
+  ``--checksum`` every day. For a bucket target it proves less, because S3 reports the
+  checksum it stored at upload rather than re-hashing the bytes at rest.
 - The *mint* is the moment the brokerage refresh token was issued. The *coverage
   assertion* adds the token's lifetime to the mint and requires the sum to clear the
   week's last option close.
