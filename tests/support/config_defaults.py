@@ -6,7 +6,7 @@ all, and it is also what makes the list of them load-bearing in three places: th
 redirect checks that none of these modules was imported too early, one test asks a child
 where each one resolved, and another asks the same of the pytest process. The roster's
 default is a function resolved on each call, so it is not on the list, and marketlake
-#715 converts these four the same way.
+#715 will convert these four the same way.
 
 All three used to type the list out. Nothing bound those spellings to the source, so a
 new constant added to ``src/lake`` would have been outside every one of them with
