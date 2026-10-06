@@ -8,6 +8,7 @@ healthchecks pages. ``compact.main`` reports a bucket refusal as one line and ex
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -123,6 +124,17 @@ def test_a_deadline_raises_before_the_ping(lake_root):
     assert len(events) == 1 and events[0].startswith("put lake/chains/")
 
 
+def test_the_backup_hands_its_budget_to_the_upload(lake_root):
+    # A budget of nothing puts the deadline at the start, so the upload stops before its
+    # first request. The default 75 minutes would let it run.
+    client = _seeded(lake_root)
+    clock = _clock_at(DAY, 16, 30)
+    backup = BucketBackup(client=client, clock=clock, calendar=_calendar(), budget=timedelta(0))
+    with pytest.raises(UploadDeadline, match="0 minutes after it started"):
+        backup.sync(lake_root, TARGET)
+    assert client.calls == []
+
+
 def _bucket_config(tmp_path: Path, lake_root: Path) -> Path:
     config = write_config(tmp_path, lake_root)
     text = config.read_text().replace(
@@ -153,6 +165,12 @@ def test_main_uploads_to_a_bucket_target_and_pings(lake_root, tmp_path, monkeypa
     assert client.put_keys()[-1] == "lake/manifest.jsonl"
     assert pinger.urls == [f"https://hc-ping.com/secret-key/{COMPACTION_SLUG}"]
     captured = capsys.readouterr()
+    # The night's throughput reaches compaction's log as one line. The sealed partition
+    # and the manifest went up, and no other file needed comparing.
+    lines = [line for line in captured.out.splitlines() if "Mbit/s" in line]
+    assert len(lines) == 1
+    assert lines[0].startswith("compact: uploaded 2 file(s), ")
+    assert lines[0].endswith("skipped 0 already in the bucket: s3://lake-backup/lake")
     for value in ("secret-bucket-key", "AKIDCONFIG"):
         assert value not in captured.out and value not in captured.err
 

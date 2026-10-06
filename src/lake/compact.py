@@ -2298,6 +2298,10 @@ def main(
         print(f"compact: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
     print(result.render())
+    if isinstance(backup, bucket.BucketBackup) and backup.last is not None:
+        # The nightly throughput, the same line the first upload prints. Under launchd
+        # this lands in compaction's log, which is where the night's rate is read.
+        print(f"compact: {backup.last.render()}")
     return 0
 
 

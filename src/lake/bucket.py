@@ -965,7 +965,7 @@ class BucketBackup:
 
     ``client`` is an S3 client. ``compact.main`` passes a ``ClientFromConfig``, and a
     test passes a fake. ``clock`` and ``calendar`` set the deadline. ``last`` is what
-    the most recent ``sync`` did.
+    the most recent ``sync`` did, and ``compact.main`` prints it as one line.
     """
 
     def __init__(

@@ -150,6 +150,8 @@ Three commands go with it.
    upload capacity beforehand.
 3. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it.
+   Compaction prints the upload's throughput to its log, in the line the first upload
+   prints.
 
 ## Develop
 
