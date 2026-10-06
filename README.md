@@ -192,7 +192,8 @@ Then browse to `http://127.0.0.1:8766/`. Four choices in the command matter.
    unanswered checks, about 45 seconds, and close the forward. Without it a dead forward
    can sit open for hours. The page marks itself stale only when its requests fail, so a
    forward that neither answers nor closes leaves the last data on screen unmarked
-   ([#678](https://github.com/l3a0/marketlake/issues/678)).
+   ([#678](https://github.com/l3a0/marketlake/issues/678)). Once ssh has exited, after
+   the laptop sleeps for example, run the command again and the page recovers on its own.
 4. **`-N`** runs no remote command, so the session exists only to carry the forward.
 
 The same forward as an entry in `~/.ssh/config`, with `marketlake-vm` as a placeholder
