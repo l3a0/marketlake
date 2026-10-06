@@ -781,6 +781,31 @@ def test_the_lock_refusal_names_the_wait(tmp_path):
     )
 
 
+def test_the_entry_point_finds_its_checkout_under_an_exported_cdpath(tmp_path):
+    """A relative invocation with ``CDPATH`` exported still resolves this checkout.
+
+    ``cd`` searches ``CDPATH`` for a relative directory and prints the one it chose. The
+    decoy holds a ``deploy`` directory of its own, so an unguarded ``cd`` would both print
+    into the checkout path and pick the wrong directory.
+    """
+    checkout, home = _checkout(tmp_path)
+    decoy = tmp_path / "decoy"
+    (decoy / "deploy").mkdir(parents=True)
+    harness = Harness(tmp_path, FAKE_OWNER=OWNER, FAKE_HOME=str(home))
+    proc = subprocess.run(
+        [f"deploy/{ENTRY_POINT.name}", "--owner", OWNER, "--lake-mount", "/srv/lake"],
+        cwd=checkout,
+        env={**harness.env, "CDPATH": str(decoy)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"uv sync --frozen --no-dev in {checkout}" in harness.calls()
+    daemon = (harness.unit_dir / "com.marketlake.daemon.service").read_text()
+    assert f"\nWorkingDirectory={checkout}\n" in daemon
+
+
 def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
     """The real render, twice, with the units installed by the rendered install.sh.
 

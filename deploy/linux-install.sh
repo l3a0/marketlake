@@ -92,7 +92,9 @@ if [[ -z "$OWNER_HOME" ]]; then
   refuse "account $OWNER has no home directory"
 fi
 
-CHECKOUT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# An exported CDPATH would make cd search other directories and print the one it
+# chose into this substitution. Emptying it for the one cd keeps the path exact.
+CHECKOUT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
 PYTHON="$CHECKOUT/.venv/bin/python"
 STATE_DIR="$OWNER_HOME/.local/state/marketlake"
 LIVE="$STATE_DIR/systemd"
