@@ -70,6 +70,17 @@ resource "aws_iam_role" "instance" {
   })
 }
 
+# Run Command reaches only an SSM-managed instance, and #676 deploys over it. This must
+# apply before #686's instance first boots, because the SSM agent backs off for up to an
+# hour after failing to authenticate. The attachment names the role through its
+# resource, so a combined apply orders it after CreateRole. Setting managed_policy_arns
+# on the role, or using aws_iam_role_policy_attachments_exclusive, would detach it on
+# every apply.
+resource "aws_iam_role_policy_attachment" "instance_ssm" {
+  role       = aws_iam_role.instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 # Off until #638's cutover. On a shadow host, a role with s3:PutObject would be a write
 # credential to the primary's bucket that only the code's `role: shadow` refusal
 # declines to use.
@@ -104,9 +115,9 @@ resource "aws_iam_instance_profile" "instance" {
 # The VM's config.yaml secrets and the Schwab token, as SecureString parameters (#699).
 # This is not a statement in instance_s3, for two reasons. That policy is off until the
 # cutover, and the VM needs its config on the shadow day. And its statements are tested
-# equal to marketlake-backup's. Until #695 attaches AmazonSSMManagedInstanceCore, this
-# is the role's only SSM read. After that, the managed policy, which allows both actions
-# on every parameter, sets the role's real read scope. No kms: action is needed, because
+# equal to marketlake-backup's. AmazonSSMManagedInstanceCore, which #695 attaches to the
+# same role, allows both actions on every parameter, so it sets the role's real read
+# scope. This grant keeps the read from depending on that managed policy. No kms: action is needed, because
 # the parameters use the AWS-managed aws/ssm key.
 resource "aws_iam_role_policy" "instance_config_read" {
   name = "config-parameters-read"

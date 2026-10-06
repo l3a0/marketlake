@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and seven things are not in one.
+``tofu test`` sees one configuration's plan, and nine things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -14,10 +14,19 @@
    at once, and without ``encrypt`` it lands unencrypted.
 5. Whether the IAM names the apply role may write in ``infra/bootstrap`` are the names
    ``infra/live`` declares. Each configuration's tests see only their own side.
-6. Every policy on an IAM user in ``infra/live``. An assert names the policy it checks,
+6. Whether every managed policy ``infra/live`` attaches is one the apply role may
+   attach to that role. A plan only reads, so an ARN the apply role's ``iam:PolicyARN``
+   condition refuses passes every pull request check and first fails with an
+   AccessDenied at the apply after the merge.
+7. Whether anything in ``infra/live`` manages a role's policies exclusively.
+   ``managed_policy_arns`` on a role, or a resource type such as
+   ``aws_iam_role_policy_attachments_exclusive``, detaches every managed policy it does
+   not list on each apply, the SSM policy included. An assert can only name what is
+   present, so an added argument or resource type passes every ``tofu test`` run.
+8. Every policy on an IAM user in ``infra/live``. An assert names the policy it checks,
    so a second inline policy on the same user passes it, and the apply role's
    ``iam:PutUserPolicy`` would apply it.
-7. Whether either configuration declares an SSM parameter as a resource or a data
+9. Whether either configuration declares an SSM parameter as a resource or a data
    source. A data source, or a resource that takes its value the ordinary way, puts the
    decrypted value into the state, which every pull request's plan role can read, and a
    mock provider plans it without complaint. An ephemeral block stores nothing, so it
@@ -72,6 +81,22 @@ BOOTSTRAP_TYPES = {
     "aws_iam_role",
     "aws_iam_role_policy",
     "aws_iam_role_policy_attachment",
+}
+
+# Every resource type infra/live may hold. A new type, such as one that manages a role's
+# attachments exclusively, fails here until this list and the checks below account for it.
+LIVE_TYPES = {
+    "aws_s3_bucket",
+    "aws_s3_bucket_versioning",
+    "aws_s3_bucket_server_side_encryption_configuration",
+    "aws_s3_bucket_public_access_block",
+    "aws_s3_bucket_lifecycle_configuration",
+    "aws_iam_user",
+    "aws_iam_user_policy",
+    "aws_iam_role",
+    "aws_iam_role_policy",
+    "aws_iam_role_policy_attachment",
+    "aws_iam_instance_profile",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -212,6 +237,28 @@ def test_bootstrap_holds_only_known_resource_types() -> None:
     assert types == BOOTSTRAP_TYPES
 
 
+def test_live_holds_only_known_resource_types() -> None:
+    types = {address.split(".")[0] for address in _resources("live")}
+    assert types == LIVE_TYPES
+
+
+def test_live_roles_leave_their_policies_to_separate_resources() -> None:
+    """``managed_policy_arns`` and ``inline_policy`` on a role manage its policies
+    exclusively, so on every apply they detach a managed policy or delete an inline one
+    that they do not list. ``managed_policy_arns`` would detach the SSM policy from
+    ``marketlake-instance``, and the apply role's ``iam:DetachRolePolicy`` grant on that
+    ARN lets the detach succeed silently. ``inline_policy`` would delete the gated
+    ``backup-bucket`` policy once ``instance_s3_enabled`` is on. ``python-hcl2`` files a
+    ``dynamic "inline_policy"`` block under ``dynamic``, so that key is read too."""
+    roles = {a: body for a, body in _resources("live").items() if a.startswith("aws_iam_role.")}
+    assert roles, "infra/live declares no role, so this check reads nothing"
+    for address, body in roles.items():
+        assert "managed_policy_arns" not in body, f"infra/live/{address} sets managed_policy_arns"
+        assert "inline_policy" not in body, f"infra/live/{address} sets inline_policy"
+        dynamic = [label for block in body.get("dynamic", []) for label in block]
+        assert "inline_policy" not in dynamic, f"infra/live/{address} sets inline_policy"
+
+
 def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     resources = _resources("bootstrap")
     roles = sorted(a.split(".")[1] for a in resources if a.startswith("aws_iam_role."))
@@ -303,6 +350,55 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
         ("user", "marketlake-token-writer"),
     }
     assert declared == granted
+
+
+# The condition operators under which an ``iam:PolicyARN`` value grants that ARN. A
+# negated operator such as ``ArnNotEquals`` grants every other ARN instead.
+_GRANTING_OPERATORS = {"ArnEquals", "StringEquals"}
+
+
+def _listed(value: str | list[str]) -> list[str]:
+    return [value] if isinstance(value, str) else list(value)
+
+
+def test_apply_role_may_attach_every_policy_live_attaches() -> None:
+    """Each attachment needs one Allow statement that grants ``iam:AttachRolePolicy`` on
+    its role's name and names its ARN under a granting operator. Collecting every
+    ``iam:PolicyARN`` in the policy instead would pass a Deny statement, a negated
+    operator and an Allow that grants only ``iam:DetachRolePolicy``."""
+    live = _resources("live")
+    attachments = {
+        address: body
+        for address, body in live.items()
+        if address.split(".")[0] == "aws_iam_role_policy_attachment"
+    }
+    assert attachments, "infra/live attaches no managed policy, so this check reads nothing"
+
+    policy = _jsonencode_argument(_resources("bootstrap")["aws_iam_role_policy.apply"]["policy"])
+    grants: list[tuple[set[str], set[str]]] = []
+    for statement in policy["Statement"]:
+        if statement["Effect"] != "Allow" or "iam:AttachRolePolicy" not in _actions(statement):
+            continue
+        roles = set()
+        for resource in _listed(statement["Resource"]):
+            match = re.fullmatch(r"arn:aws:iam::\$\{local\.account_id\}:role/(.+)", resource)
+            if match:
+                roles.add(match.group(1))
+        arns = set()
+        for operator, keys in statement.get("Condition", {}).items():
+            if operator not in _GRANTING_OPERATORS:
+                continue
+            for key, value in keys.items():
+                if key.lower() == "iam:policyarn":
+                    arns.update(_listed(value))
+        grants.append((roles, arns))
+
+    for address, body in attachments.items():
+        role = live[f"aws_iam_role.{_role_name(body['role'])}"]["name"]
+        arn = body["policy_arn"]
+        assert any(role in roles and arn in arns for roles, arns in grants), (
+            f"infra/live/{address} attaches {arn} to {role}, which the apply role may not"
+        )
 
 
 # Each of these gives a user a policy that no aws_iam_user_policy block shows.

@@ -354,7 +354,8 @@ def build_from_master(
     is not a signal to trust as "nothing is rostered." A missing or broken roster file
     must never cost every instrument its span, so every instrument gets an open one,
     with ``options`` defaulted to false, the same widen-on-a-missing-reference rule
-    every other reader of these files follows.
+    every reader of these files on the capture path follows. ``lake.roster.check_lake``
+    is the deliberate exception, as ``capture._live_roster``'s docstring says.
 
     For an instrument that is kept, the span starts at its ``capture_start``. ``on`` is
     the market date used to resolve each instrument's current ticker.

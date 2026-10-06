@@ -238,7 +238,9 @@ old content under a new version, and looks exactly like a good write.
   (with `open` and `deferred`). The page no longer draws `lake` or `suite`, but
   its `usable()` check refuses a document without them, so keep both.
   `state.deployed` changes only when the owner's restart lands. A fast-forward
-  of the main checkout leaves it as it was.
+  of the main checkout leaves it as it was. `state.page` is the full sha of the
+  last commit to the page's source that the live page carries, per "Record
+  what is live" below. The page itself never reads it.
 - **`prs`** has one entry per open pull request, written as
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
   An entry keyed `n` drops its card without any error. `linked` comes from the
@@ -259,10 +261,10 @@ old content under a new version, and looks exactly like a good write.
   `reviewed: false` until a session posts one, and the sync reports it rather
   than guessing whether its review finished. GitHub's review
   decision cannot tell whether the review ran, so it does not decide
-  `reviewed`. A session posting review results puts that heading only on the
-  comment that closes the review, after every lens has reported. A partial
-  comment leaves `reviewed` false, and the entry's `review` text says which
-  lens is still running. `rollup` is a list
+  `reviewed`. The rule for writing the heading lives in `CLAUDE.md`, under
+  "Pull requests", where review sessions read it. A partial comment leaves
+  `reviewed` false, and the entry's `review` text says which lens is still
+  running. `rollup` is a list
   of `[name, conclusion]` pairs, where the conclusion is one of `"success"`,
   `"failure"`, `"running"` or `"neutral"`.
 - **`working`** marks a card a session is on right now, as `{n, kind, what}`.
@@ -306,6 +308,8 @@ So a card's milestone comes only from `tracker`, and an issue missing from
   other `kind` does not hold the card, because a planning loop on leftover
   scope should not hide a finished pull request. Ask whoever added an entry
   before calling it stale.
+- The round compares `state.page` with `main` and publishes the page when they
+  differ, per "Record what is live" below.
 
 Pass `--limit 1000` to every `gh` list command that feeds the board, because
 `gh` stops at its limit without a warning and its default is 30. A cut list
@@ -327,6 +331,135 @@ look at the page and confirm every card this round added or moved.
    browser signed in to claude.ai, through Claude in Chrome, and read a
    screenshot. Text extraction cannot read the page, because it renders inside
    a frame.
+
+### Changing the page
+
+A page republished from a session's scratch copy has no review and no history.
+Fifty-four versions of the board went out that way, and on 2026-10-06 a bug in
+the column logic of one of them sent an unfinished pull request to the owner's
+queue. So the page's source is `.claude/skills/sync-prune-next/board.html`,
+and a change to it goes through a pull request and the same review as any
+other code, per `CLAUDE.md`.
+
+One rule decides every publish: the bytes published to the board equal
+`main`'s copy of that file. Where the file sits on disk does not matter.
+
+A round changes what the board shows by writing the `data` document, as above.
+It publishes the page only to bring it level with `main`.
+
+#### Test the page before the pull request
+
+Nothing in CI runs the page, so a change that throws or draws the wrong thing
+reaches every viewer unless its author runs it first. `board-harness.js`,
+beside this skill, runs the page's inline script against a stub DOM and prints
+what each element drew, as JSON. It runs under `osascript -l JavaScript`,
+because macOS ships that and node may be absent.
+
+```bash
+osascript -l JavaScript .claude/skills/sync-prune-next/board-harness.js \
+  .claude/skills/sync-prune-next/board.html live - "MVP 2" <scratch>/readback/board/data.json
+```
+
+The arguments, in order, are these five.
+
+1. The page file.
+2. How the database answers: `none`, `loading`, `empty`, `shape`, `stopped`,
+   `live` or `dropped`. The header of `board-harness.js` says what each one
+   delivers.
+3. The saved "Show all" choice, as `1` or `0`, or `-` for none saved.
+4. The saved milestone choice, or `-` for none saved.
+5. The data file, read as described above. Only `live` and `dropped` use it.
+
+In the output, `errors` lists anything that threw, and `visible` maps each
+drawn element to the text a reader would see. Run `main`'s copy and the changed
+copy over the same modes, choices and data, and compare the two outputs. Every
+difference should be one the change intends. Run each mode at least once,
+because the modes with no data take a different path through the page.
+
+#### A change to what the page requires
+
+A page change that makes `usable()` or a render path require a new field ships
+in this order after its pull request merges.
+
+1. Write the field into the `data` document. The live page ignores a field it
+   does not read.
+2. Publish the page.
+
+In the other order the new page refuses the old document, and the board shows
+no data until a round writes the field. The same pull request updates "The
+document's shape" above.
+
+#### Publish from main
+
+1. Fetch with `git fetch origin`.
+2. Write the published file to a scratch directory with
+   `git show origin/main:.claude/skills/sync-prune-next/board.html > <scratch>/board.html`.
+3. Check that `git hash-object <scratch>/board.html` prints the same id as
+   `git rev-parse origin/main:.claude/skills/sync-prune-next/board.html`. Stop
+   if they differ.
+4. Run the `Artifact` tool's `read` action on the board's URL. The only reason
+   for this step is that the tool refuses a publish to an artifact the session
+   has not read. The file the read saves is never a source for the publish.
+5. Publish with the `Artifact` tool, with `url` set to the board's URL and
+   `file_path` set to `<scratch>/board.html`. Set `label` to the short sha of
+   the last commit that touched the page's source, which
+   `git log -1 --format=%h origin/main -- .claude/skills/sync-prune-next/board.html`
+   prints.
+6. Leave `capabilities` and `contract` out of the call. Leaving them out keeps
+   the page's database access and its runtime version as they are.
+
+```text
+Artifact action="publish" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+         file_path="<scratch>/board.html" label="<short sha>"
+```
+
+Then record the publish in `state.page`, as below, and look at the page, per
+"Confirm the page drew it" above.
+
+#### On a publish conflict
+
+The `Artifact` tool can refuse a publish because the live page changed after
+the read, and hand back the newer content. Its general advice is to merge the
+session's changes into that content. This page overrides that advice, because
+`main` is its only source, and content handed back by a refusal is a version
+nobody reviewed. So fetch again, read the board again, and publish from `origin/main`
+by the steps above.
+
+- Never merge the content the refusal hands back.
+- Never build the published file from a copy read back from the live page.
+- Never pass `force`.
+
+If the refusal repeats, stop and tell the owner rather than forcing the publish.
+
+#### Record what is live
+
+A merge whose author leaves before publishing leaves the board running old code,
+and nothing on the page shows it. So the data document records which commit is
+live, and every sync round checks it.
+
+After a publish, write `state.page` as the full sha of the last commit that
+touched the page's source, which
+`git log -1 --format=%H origin/main -- .claude/skills/sync-prune-next/board.html`
+prints. Write it with an `update` pinned to the document's current version,
+which the round's last read or write names. Its `data` carries `state` exactly
+as read, with only `page` set. Sending the whole `state` keeps the write
+correct whether `update` merges nested fields or replaces the `state` object.
+
+```text
+ArtifactData action="update" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+             collection="board" doc_id="data"
+             data={"state": {<state as read>, "page": "<full sha>"}} if_version=<read version>
+```
+
+Each sync round compares `state.page` with what that `git log` command prints
+against the freshly fetched `origin/main`. When they differ, or `state.page` is
+missing, the round publishes by the steps above. That covers the first publish
+after the page's source entered the repository, and any merge whose author is
+gone.
+
+The page's `usable()` check tests only the fields it needs and accepts a
+document that carries more, and no render path reads `state.page`. A document
+with `state.page` set draws exactly what the same document without it draws.
 
 ## 4. Recommend what to take next
 

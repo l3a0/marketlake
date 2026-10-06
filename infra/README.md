@@ -60,7 +60,9 @@ account, differs in three steps.
    request's branch.
 2. Step 10 drops out, since no pull request needs a plan.
 3. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
-   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`.
+   `gh workflow run infra.yml --repo l3a0/marketlake --ref main`. Its first apply in a
+   fresh account also creates `aws_iam_role_policy_attachment.instance_ssm`, which
+   [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run.
 
 ### 1. Install the tools
 
@@ -646,12 +648,12 @@ written in kebab case.
 4. `/marketlake/config/ntfy-topic`, for `ntfy_topic`.
 5. `/marketlake/config/schwab-oauth-token`, the contents of `token.json`.
 
-The code manages no parameter and names only the path. A parameter resource would read
-the decrypted value into the state on every refresh, so the owner puts each value from
-the laptop. `marketlake-instance` reads the path, and neither CI role can. Once
-[#695](https://github.com/l3a0/marketlake/issues/695) attaches AWS's
-`AmazonSSMManagedInstanceCore`, the instance role can read every parameter in the
-account, which holds no other secret. `marketlake-token-writer` can only overwrite the
+The code manages no parameter and names only the path. A parameter resource needs its
+value at apply time, so CI would hold every secret, and a data source writes the
+decrypted value into the state. So the owner puts each value from the laptop. `marketlake-instance` reads the path, and neither CI role can. AWS's
+`AmazonSSMManagedInstanceCore`, which [#695](https://github.com/l3a0/marketlake/issues/695)
+attaches, lets the instance role read every parameter in the account, which holds no
+other secret. `marketlake-token-writer` can only overwrite the
 token, which the laptop's weekly re-auth does once
 [#636](https://github.com/l3a0/marketlake/issues/636) lands.
 
