@@ -368,8 +368,9 @@ def _decode(path: Path, raw: bytes) -> str:
     mode on by itself under a C locale, so a bare ``LC_ALL=C`` is harmless, and it takes UTF-8
     mode being off as well before the decode narrows to ASCII. A ledger a writer produced
     survives even that, because ``json.dumps`` leaves ``ensure_ascii`` at its default, and no
-    installed launchd job sets a locale or turns UTF-8 mode off. So pinning the encoding removes
-    a dependence on an interpreter flag nobody tracks rather than a failure anything has met.
+    rendered job, a plist or a unit, sets a locale or turns UTF-8 mode off. So pinning the
+    encoding removes a dependence on an interpreter flag nobody tracks rather than a failure
+    anything has met.
 
     ``manifest._decode_utf8`` is not reused, although the rule is identical, because it raises
     ``manifest.LedgerNotUtf8``. That is a ``ManifestError``, and :func:`main` already prints a

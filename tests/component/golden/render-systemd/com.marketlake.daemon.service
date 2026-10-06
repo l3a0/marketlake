@@ -1,0 +1,23 @@
+# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,
+# not this file: the install entry point renders afresh on every run.
+
+[Unit]
+Description=com.marketlake.daemon
+StartLimitIntervalSec=0
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/lake
+
+[Service]
+Type=exec
+User=someone
+WorkingDirectory=/home/someone/marketlake
+Environment=HOME=/home/someone
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/someone/marketlake/.venv/bin/python -m lake.daemon
+Restart=always
+RestartSec=10
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

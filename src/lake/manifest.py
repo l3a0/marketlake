@@ -310,7 +310,8 @@ def _decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
     decode narrows to ASCII. Measured: with ``LC_ALL=C`` and ``-X utf8=0``, ``read_text``
     refuses a file that is perfectly good UTF-8. A ledger a writer produced survives that
     anyway, because ``json.dumps`` leaves ``ensure_ascii`` at its default and pure ASCII decodes
-    under US-ASCII, and no installed launchd job sets a locale or turns UTF-8 mode off. So what
+    under US-ASCII, and no rendered job, a plist or a unit, sets a locale or turns UTF-8 mode
+    off. So what
     pinning removes is a dependence on an interpreter flag nobody tracks rather than a failure
     anything has met.
 

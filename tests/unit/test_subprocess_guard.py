@@ -12,8 +12,9 @@ Five properties carry the whole guard, and each is covered below.
 2. The failure is not an ``Exception``. The Sunday self-check catches bare
    ``Exception`` around both read-backs on purpose, so a guard derived from it would
    be swallowed and the test would pass.
-3. Every other program still runs for real, which is what lets the four render tests
-   in ``tests/component/test_control_plane_render.py`` spawn a rendered script.
+3. Every other program still runs for real, which is what lets the render tests in
+   ``tests/component/test_control_plane_render.py`` and
+   ``tests/component/test_control_plane_systemd.py`` spawn a rendered script.
 4. The eight production seams that forget to fake a guarded program are themselves
    caught, not just a synthetic call naming the program directly.
 5. A guarded program named behind a prefix wrapper is refused too. ``sudo`` is the one
@@ -64,7 +65,7 @@ def test_a_bytes_argv_is_still_refused():
 
 
 def test_an_unguarded_program_still_runs_for_real():
-    # None of the four render tests name a guarded program directly, only a rendered
+    # None of the render tests name a guarded program directly, only a rendered
     # script or bash. Confirms the guard leaves everything else
     # untouched, which is what those tests depend on.
     proc = subprocess.run([sys.executable, "-c", "print('hi')"], capture_output=True, text=True)

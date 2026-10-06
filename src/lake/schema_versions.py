@@ -767,7 +767,8 @@ def check_running_version(lake_root: Path | str) -> RunningVersionCheck:
     does with a reportable verdict is its own.
 
     It never raises, and the caller is why. A daemon that will not start captures nothing, and
-    under launchd's ``KeepAlive`` the successor reaches the same check and refuses again, so a
+    when the service manager restarts it, under launchd's ``KeepAlive`` or systemd's
+    ``Restart=always``, the successor reaches the same check and refuses again, so a
     missing row in a reference table would cost a whole session. Anything the decision raises
     becomes ``UNREADABLE`` instead, except the two failures of the open named below. The guard
     is broad rather than a list of classes, because every list so far has run short. The read

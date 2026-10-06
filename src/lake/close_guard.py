@@ -102,7 +102,7 @@ class GuardOutcome:
     ``reports/close_guard/`` and the daemon prints it beside.
 
     ``problems`` is the one field that interpolates an exception, and its strings keep the
-    fuller message. The file drops it, so a reader with the launchd log gets what the
+    fuller message. The file drops it, so a reader with the daemon's log gets what the
     exception said and the tree the dashboard may read gets the class alone. The other
     eight fields are composed from tickers, counts, error classes, dates, and the two
     source names, so they go down whole. ``report.redacted`` owns that split and says

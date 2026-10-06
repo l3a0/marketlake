@@ -1510,10 +1510,10 @@ def _walk(
             # the clock against ``SessionBounds.compaction`` asks when compaction was *due*,
             # not whether it ran. A compaction the machine slept through, or one that failed,
             # leaves a session past its own due time with nothing sealed, and the schedule
-            # reading calls that permanent. It is not: launchd fires the missed job on the next
-            # wake and the bar lands. The manifest cannot make that mistake, because it records
-            # what happened rather than what was owed, and it is already read once for this
-            # run a few lines above.
+            # reading calls that permanent. It is not: the missed job runs late, on the Mac's
+            # next wake or once a VM is back up, and the bar lands. The manifest cannot make
+            # that mistake, because it records what happened rather than what was owed, and
+            # it is already read once for this run a few lines above.
             #
             # A repair is still possible for some of them and the reason says which: a
             # quarantined session clears through ``python -m lake.signoff`` and the
