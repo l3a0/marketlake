@@ -23,6 +23,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import IncompleteReadError
 
 from lake import bucket
 from lake import control_plane as cp
@@ -527,15 +528,220 @@ def test_the_sunday_job_reports_suspended_versioning_and_still_pings(tmp_path):
     assert any("versioning is Suspended" in line for line in outcome.report)
 
 
-def test_a_bucket_target_reports_the_restore_test_as_not_built_and_still_pings(tmp_path):
-    # The bucket's restore is marketlake #640's. Until it lands the gap is named rather
-    # than silent, and it withholds nothing, since the switch to the bucket waits on it.
+# The restore test's bucket half, marketlake #640. Week 34's rotation slot holds neither
+# fixture file, so the test reads the next slot that holds one, which is the quotes
+# partition's. ``tests/component/test_control_plane_sunday.py`` asserts the same pick for
+# a path target.
+QUOTES = "quotes/ticker=SPY/date=2026-08-28.parquet"
+STALE_MINT = et(2026, 8, 27, 18, 0)  # last week's late mint: valid, not fresh
+
+
+def _gets(client: FakeS3, rel: str) -> int:
+    keys = [kwargs["Key"] for name, kwargs in client.calls if name == "get_object"]
+    return keys.count(_key(rel))
+
+
+def _rot(client: FakeS3, rel: str, lake: Path) -> bytes:
+    """Serve wrong bytes under the checksum S3 stored for the true ones, and return those.
+
+    That is rot at rest. ``HeadObject`` still reports what S3 accepted at upload, so the
+    scrub matches the object and only a download can see the damage.
+    """
+    good = (lake / rel).read_bytes()
+    checksum = base64.b64encode(hashlib.sha256(good).digest()).decode()
+    client.store(_key(rel), b"rotted bytes", checksum=checksum)
+    return good
+
+
+def test_a_bucket_target_downloads_the_week_s_file_and_verifies_it(tmp_path):
     lake, client = _uploaded(tmp_path / "lake")
+    client.calls.clear()
+
     outcome, pinger = _sunday(lake, client)
-    assert outcome.backup.walked is True and outcome.backup.matched == ()
-    assert outcome.restore is None
-    assert f"restore test not built for a bucket target yet: {TARGET} (#640)" in outcome.report
-    assert outcome.problems == ()
+
+    assert outcome.backup.matched == (
+        (PARTITION, hashlib.sha256((lake / PARTITION).read_bytes()).hexdigest()),
+        (QUOTES, hashlib.sha256((lake / QUOTES).read_bytes()).hexdigest()),
+    )
+    assert outcome.restore is not None
+    assert outcome.restore.restored == (QUOTES,)
+    assert outcome.restore.bytes_read == (lake / QUOTES).stat().st_size
+    assert _gets(client, QUOTES) == 1 and _gets(client, PARTITION) == 0
+    assert outcome.restore.pass_line.startswith(
+        "1 file (0.0 MB) read back from s3://lake-backup/lake matched the manifest, "
+        "week of Sunday 2026-08-30"
+    )
+    assert outcome.problems == () and outcome.report == ()
+    assert pinger.urls == [URL]
+
+
+def test_a_rotted_object_the_scrub_matched_fails_the_restore_and_withholds(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    _rot(client, QUOTES, lake)
+
+    outcome, pinger = _sunday(lake, client)
+
+    assert outcome.backup.ok is True
+    assert outcome.restore.mismatches == (QUOTES,)
+    assert f"restore test failed: mismatches=1 unreadable=0: {TARGET}" in outcome.problems
+    assert f"restore read back bytes that do not match the manifest: {QUOTES}" in outcome.report
+    # The advice names the bucket, never the disk-and-cable advice a path target gets.
+    assert any("the bytes S3 served" in line for line in outcome.report)
+    assert not any("cable" in line for line in outcome.report)
+    assert pinger.urls == []
+
+
+def test_a_refused_download_is_a_named_finding_and_never_raises(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+
+    def refused(**kwargs):
+        raise client_error("AccessDenied", "GetObject", 403)
+
+    client.get_object = refused
+    outcome, pinger = _sunday(lake, client)
+
+    assert outcome.restore.unreadable == (
+        f"{QUOTES}: BucketReadError: the bucket refused the read (AccessDenied)"
+    )
+    assert any("Check the network and the bucket's access key" in line for line in outcome.report)
+    # The canary still ran after the failed read.
+    assert outcome.canary_passed is True
+    assert pinger.urls == []
+
+
+def test_a_read_cut_off_mid_body_is_an_os_error(tmp_path):
+    _, client = _uploaded(tmp_path / "lake")
+
+    class _Cut:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self, n: int) -> bytes:
+            self.reads += 1
+            if self.reads > 1:
+                raise IncompleteReadError(actual_bytes=1, expected_bytes=2)
+            return b"x"
+
+        def close(self) -> None:
+            pass
+
+    client.get_object = lambda **kwargs: {"Body": _Cut()}
+    reader = bucket.bucket_reader(client, TARGET)
+
+    with pytest.raises(OSError, match="could not be reached or was unavailable"):
+        list(reader(QUOTES))
+
+
+def test_a_bug_in_the_download_is_not_mapped_to_an_os_error(tmp_path):
+    _, client = _uploaded(tmp_path / "lake")
+
+    def broken(**kwargs):
+        raise KeyError("Body")
+
+    client.get_object = broken
+    with pytest.raises(KeyError):
+        list(bucket.bucket_reader(client, TARGET)(QUOTES))
+
+
+class _Mints:
+    """Hands back one mint per attempt, repeating the last once the list runs out."""
+
+    def __init__(self, *mints):
+        self.mints = list(mints)
+        self.reads = 0
+
+    def __call__(self):
+        mint = self.mints[min(self.reads, len(self.mints) - 1)]
+        self.reads += 1
+        return mint
+
+
+def _sunday_run(lake: Path, client: FakeS3, *, mints, canary=lambda: True):
+    pinger = FakePinger()
+    outcomes = cp.sunday_run(
+        lake_root=lake,
+        backup_target=TARGET,
+        bucket_client=client,
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=CALENDAR,
+        schedule_reader=lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+        pinger=pinger,
+        ping_url=URL,
+        mint_reader=mints,
+        canary=canary,
+    )
+    return outcomes, pinger
+
+
+def test_a_pass_is_reused_by_the_next_attempt_and_the_line_says_so(tmp_path):
+    # 20:00 finds last week's token, so the evening retries at 20:30. The restore passed
+    # at 20:00, so 20:30 hands that pass back rather than downloading the file again.
+    lake, client = _uploaded(tmp_path / "lake")
+    client.calls.clear()
+
+    outcomes, pinger = _sunday_run(lake, client, mints=_Mints(STALE_MINT, FRESH_MINT))
+
+    assert len(outcomes) == 2
+    assert _gets(client, QUOTES) == 1
+    first, second = (outcome.restore for outcome in outcomes)
+    assert first.reused is False and not first.pass_line.endswith("rather than read again")
+    assert second.reused is True
+    assert second.restored == (QUOTES,)
+    assert second.pass_line.endswith(
+        ", reused from an earlier attempt this evening rather than read again"
+    )
+    # The scrub itself still ran on both attempts.
+    assert all(outcome.backup.walked for outcome in outcomes)
+    assert pinger.urls == [URL]
+
+
+def test_a_failing_restore_is_not_kept_and_the_next_attempt_reads_again(tmp_path):
+    # The 20:00 restore reads rotted bytes. The canary stands in for a repair made before
+    # 20:30, which puts the true bytes back, so only a fresh read can pass.
+    lake, client = _uploaded(tmp_path / "lake")
+    good = _rot(client, QUOTES, lake)
+    stored = client.versions(_key(QUOTES))[-1].checksum
+    repaired: list[bool] = []
+
+    def repair() -> bool:
+        if not repaired:
+            client.store(_key(QUOTES), good, checksum=stored)
+            repaired.append(True)
+        return True
+
+    client.calls.clear()
+    outcomes, pinger = _sunday_run(lake, client, mints=_Mints(FRESH_MINT), canary=repair)
+
+    assert len(outcomes) == 2
+    assert outcomes[0].restore.mismatches == (QUOTES,)
+    assert outcomes[1].restore.ok is True and outcomes[1].restore.reused is False
+    assert _gets(client, QUOTES) == 2
+    assert pinger.urls == [URL]
+
+
+def test_a_kept_pass_over_other_files_is_not_reused(tmp_path):
+    # At 20:00 the quotes object is overwritten, so the scrub leaves it out and the week
+    # reads the chains partition instead. Putting the quotes object back before 20:30
+    # changes the week's files, so the kept pass covers the wrong ones and 20:30 reads.
+    lake, client = _uploaded(tmp_path / "lake")
+    good = client.versions(_key(QUOTES))[-1]
+    client.store(_key(QUOTES), b"overwritten")
+    repaired: list[bool] = []
+
+    def repair() -> bool:
+        if not repaired:
+            client.store(_key(QUOTES), good.body, checksum=good.checksum)
+            repaired.append(True)
+        return True
+
+    client.calls.clear()
+    outcomes, pinger = _sunday_run(lake, client, mints=_Mints(FRESH_MINT), canary=repair)
+
+    assert len(outcomes) == 2
+    assert outcomes[0].restore.restored == (PARTITION,)
+    assert outcomes[1].restore.restored == (QUOTES,)
+    assert outcomes[1].restore.reused is False
+    assert _gets(client, QUOTES) == 1
     assert pinger.urls == [URL]
 
 
@@ -628,6 +834,24 @@ def test_the_sunday_cli_scrubs_the_configured_bucket(tmp_path, capsys, monkeypat
     assert "s3://lake-backup/lake" in printed
     for value in ("secret-bucket-key", "AKIDCONFIG"):
         assert value not in printed and value not in captured.err
+
+
+def test_the_sunday_cli_restores_from_the_configured_bucket(tmp_path, capsys, monkeypatch):
+    # ``main`` passes no reader, so the download is the one built from the config's own
+    # client. The pass line is printed, so the log tells a pass from a test that never ran.
+    lake, client = _uploaded(tmp_path / "lake")
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    client.calls.clear()
+
+    code, pinger, _ = _sunday_cli(tmp_path, monkeypatch, lake)
+
+    assert code == 0
+    assert pinger.urls == [URL]
+    assert _gets(client, QUOTES) == 1
+    assert (
+        "sunday: restore: 1 file (0.0 MB) read back from s3://lake-backup/lake matched the "
+        "manifest, week of Sunday 2026-08-30"
+    ) in capsys.readouterr().out
 
 
 def test_the_sunday_publishers_carry_the_bucket_keys(tmp_path, capsys, monkeypatch):

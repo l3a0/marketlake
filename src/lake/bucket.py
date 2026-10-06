@@ -1,4 +1,4 @@
-"""The bucket backup: the nightly upload, the first upload, and the Sunday bucket scrub.
+"""The bucket backup: the nightly upload, the first upload, the Sunday scrub, and the restore.
 
 ``backup_target`` takes a bucket URL as well as a path, and this module is what a bucket
 target runs. The path form, ``rsync`` to a mounted directory, is unchanged and stays the
@@ -6,7 +6,7 @@ default, so switching back is one setting. The design's Backup section carries t
 reasoning for a bucket at all, and marketlake #630 carries the provider choice: S3
 Standard-IA, versioning on, no Object Lock, and a narrow key.
 
-Three jobs live here.
+Four jobs live here.
 
 1. **The nightly upload**, ``BucketBackup``, runs where ``RsyncBackup`` runs, inside the
    close+15 compaction's lake-root lock. It uploads what changed since the last night
@@ -16,7 +16,11 @@ Three jobs live here.
    both seeds an empty bucket and re-baselines one whose copy stopped being a prefix.
 3. **The bucket scrub**, ``bucket_scrub``, is the Sunday job's check of the bucket. It
    returns the same ``BackupScrubResult`` the path scrub returns, with the same
-   findings and the same rule about which of them withhold the ping.
+   findings and the same rule about which of them withhold the ping. The Sunday restore
+   test then downloads the week's share of what it matched through ``bucket_reader``.
+4. **The restore**, ``python -m lake.bucket restore <dest>``, is run by hand. It
+   downloads the bucket's current versions into an empty directory and verifies every
+   file before the directory is filled. ``bucket_reader`` is its download too.
 
 **The manifest's digest travels with every upload.** ``manifest.jsonl`` records each
 file's SHA-256 as 64 hex characters. S3 takes a SHA-256 as ``ChecksumSHA256``, the
@@ -58,6 +62,7 @@ import binascii
 import fnmatch
 import hashlib
 import os
+import shutil
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -91,12 +96,14 @@ from lake.lock import lake_lock
 from lake.manifest import (
     SCRUB_EXCLUSIONS,
     BackupScrubResult,
+    ManifestError,
     _compacted_partition_for_segment,
     _first_difference,
     _is_excluded,
     _latest_by_partition,
     manifest_path,
     parse_jsonl,
+    sha256_file,
 )
 from lake.paths import MANIFEST_FILE
 from lake.runner import BACKUP_EXCLUSIONS
@@ -1136,7 +1143,8 @@ def bucket_scrub(lake_root: Path, target: BucketTarget, client: Any) -> BackupSc
     stored at upload, and does not re-hash the bytes at rest. So the scrub proves each
     object is present, is the current version, and held the manifest's bytes when it
     arrived. An overwrite or a delete marker still shows. Rot at rest is the provider's
-    durability guarantee plus the restore test rather than this scrub's job.
+    durability guarantee plus the restore test rather than this scrub's job. Each object
+    whose stored SHA-256 matched is handed to that test in ``matched``.
     """
     name = str(target)
     root = Path(lake_root)
@@ -1204,6 +1212,7 @@ def _bucket_scrub(
 
     missing: list[str] = []
     sha_mismatches: list[str] = []
+    matched: list[tuple[str, str]] = []
     for partition, entry in copied.items():
         compacted = _compacted_partition_for_segment(partition)
         if compacted is not None and compacted in copied:
@@ -1217,7 +1226,10 @@ def _bucket_scrub(
                 missing.append(partition)
                 continue
             raise
-        if not _matches(head, str(entry.get("sha256"))):
+        sha = str(entry.get("sha256"))
+        if _matches(head, sha):
+            matched.append((partition, sha))
+        else:
             sha_mismatches.append(partition)
 
     orphans: list[str] = []
@@ -1235,7 +1247,365 @@ def _bucket_scrub(
         orphans=tuple(sorted(orphans)),
         pending=tuple(sorted(set(latest) - set(copied))),
         versioning=versioning,
+        matched=tuple(sorted(matched)),
     )
+
+
+# -- reading the bucket back --------------------------------------------------
+
+# How much of an object one read takes. A sealed partition runs to a few hundred
+# megabytes, so reading one whole would hold all of it in memory at once.
+_READ_CHUNK = 1 << 20
+
+
+class BucketReadError(OSError):
+    """A read from the bucket that failed, as the ``OSError`` a ``BackupReader`` raises.
+
+    ``manifest.restore_check`` catches ``OSError`` and nothing else, so the bucket's
+    client errors are mapped onto it here. ``code`` keeps the S3 error code, and
+    ``absent`` says S3 answered that the key does not exist, which the restore command
+    names as a missing file rather than as a bucket it cannot reach.
+    """
+
+    def __init__(self, rel: str, kind: str, code: str) -> None:
+        verb = {
+            "refused": "refused the read",
+            "unreachable": "could not be reached or was unavailable",
+        }.get(kind, "answered the read with an error")
+        super().__init__(f"the bucket {verb} ({code})")
+        self.rel = rel
+        self.kind = kind
+        self.code = code
+        self.absent = code in _ABSENT_CODES
+
+
+def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator[bytes]]:
+    """The ``manifest.BackupReader`` for a bucket: download the current version of ``rel``.
+
+    The body is read in an explicit loop of ``read`` calls, so every byte crosses the
+    network. A client error on the request or partway through the body raises
+    ``BucketReadError``, which is an ``OSError``. Anything that is not a bucket failure
+    is a bug and raises as itself.
+
+    The Sunday restore test and the restore command both read through this, so the
+    download the Sunday job runs every week is the one a full restore runs.
+    """
+
+    def read(rel: str) -> Iterator[bytes]:
+        try:
+            body = client.get_object(Bucket=target.bucket, Key=target.key(rel))["Body"]
+            try:
+                while chunk := body.read(_READ_CHUNK):
+                    yield chunk
+            finally:
+                body.close()
+        except Exception as exc:
+            failure = _failure(exc)
+            if failure is None:
+                raise
+            raise BucketReadError(rel, *failure) from exc
+
+    return read
+
+
+# -- the restore command ------------------------------------------------------
+#
+# ``python -m lake.bucket restore <dest>`` rebuilds a lake from the bucket into an empty
+# directory. A backup that has never been restored from is a hypothesis, and the owner's
+# switch of ``backup_target`` to the bucket waits on one full restore passing. marketlake
+# #640 is the plan, and the design's Backup section carries the reasoning.
+#
+# The download lands in a sibling working directory, ``<dest>.restoring``, and is renamed
+# onto the destination only after every file verifies. So a run that fails partway, on a
+# full disk or a dropped connection, leaves the destination as it was, and a second run
+# resumes in the working directory, skipping each file whose hash already matches.
+
+# The suffix of the working directory beside the destination.
+RESTORING_SUFFIX = ".restoring"
+
+# The file that marks a working directory as one a restore made. A resumed run refuses a
+# directory without it, so a restore never prunes files out of a directory it did not
+# create.
+RESTORE_MARKER = ".marketlake-restore"
+
+# The suffix a file carries while its download is in flight. It is renamed onto its own
+# name only once its bytes have hashed to what they must.
+_PART_SUFFIX = ".part"
+
+
+class RestoreRefused(BucketRefusal):
+    """The restore command refused to start, or stopped, with one line for an operator."""
+
+
+def _free_bytes(path: Path) -> int:
+    """The free space on the filesystem holding ``path``, in bytes."""
+    return shutil.disk_usage(path).free
+
+
+@dataclass
+class RestoreSummary:
+    """What one restore run did, for the lines the command prints.
+
+    ``failures`` holds ``(rel, why)`` for every file that failed verification or was
+    missing, and any one of them leaves the destination as it was. ``restored`` says
+    whether the working directory was renamed onto the destination. ``unrecorded`` names
+    each restored file the restored manifest does not record, outside ``journal/`` and
+    ``reports/``. A torn last manifest line leaves one behind. Each was verified against
+    the checksum S3 stored at upload, so it is named rather than failed.
+    """
+
+    target: str
+    dest: Path
+    work: Path
+    files: int = 0
+    downloaded: int = 0
+    downloaded_bytes: int = 0
+    resumed: int = 0
+    segments_left_out: int = 0
+    unrecorded: list[str] = field(default_factory=list)
+    failures: list[tuple[str, str]] = field(default_factory=list)
+    restored: bool = False
+
+    def render(self) -> str:
+        """One line naming what came down and where it went."""
+        megabytes = self.downloaded_bytes / 1_000_000
+        return (
+            f"restored {self.files} file(s) from {self.target} into {self.dest}: downloaded "
+            f"{self.downloaded} ({megabytes:.1f} MB), {self.resumed} already verified in the "
+            f"working directory, {self.segments_left_out} compacted journal segment(s) left out"
+        )
+
+
+def _check_destination(dest: Path) -> None:
+    """Refuse a destination a restore must not write into, before any request is sent."""
+    if dest.exists() and not dest.is_dir():
+        raise RestoreRefused(f"{dest} is not a directory, so nothing was restored")
+    if dest.is_dir() and any(dest.iterdir()):
+        raise RestoreRefused(
+            f"{dest} is not empty. A restore writes only into an empty directory, which "
+            "keeps it off a live lake, so nothing was restored"
+        )
+    if not dest.parent.is_dir():
+        raise RestoreRefused(f"{dest.parent} does not exist, so nothing was restored")
+    if dest.is_dir() and dest.stat().st_dev != dest.parent.stat().st_dev:
+        raise RestoreRefused(
+            f"{dest} is a mount point, so the finished restore cannot be renamed onto it. "
+            "Restore into a directory inside it"
+        )
+
+
+def _prepare_work(work: Path) -> None:
+    """Create the working directory with its marker, or accept one a restore made."""
+    if work.is_dir():
+        if not (work / RESTORE_MARKER).is_file():
+            raise RestoreRefused(
+                f"{work} exists and no restore made it, so nothing was restored. Move it "
+                "aside and run the restore again"
+            )
+        return
+    if work.exists():
+        raise RestoreRefused(f"{work} exists and is not a directory, so nothing was restored")
+    work.mkdir()
+    (work / RESTORE_MARKER).write_text("a marketlake restore in progress\n")
+
+
+def _stored_hex(client: Any, target: BucketTarget, rel: str) -> str | None:
+    """The SHA-256 S3 stored for ``rel`` at upload, as hex, or ``None`` when it proves nothing.
+
+    A key that does not exist raises ``BucketReadError`` with ``absent`` set. Any other
+    bucket failure raises as itself, for the command to name as one line.
+    """
+    try:
+        head = client.head_object(Bucket=target.bucket, Key=target.key(rel), ChecksumMode="ENABLED")
+    except Exception as exc:
+        if _is_absent(exc):
+            raise BucketReadError(rel, "failed", _error_code(exc) or "404") from exc
+        raise
+    stored = stored_sha256(head)
+    return None if stored is None else stored.hex()
+
+
+def _part(path: Path) -> Path:
+    return path.with_name(path.name + _PART_SUFFIX)
+
+
+def _download_to(read: Callable[[str], Iterator[bytes]], rel: str, path: Path) -> tuple[str, int]:
+    """Stream ``rel`` into ``path``'s part file, and return its hex SHA-256 and its size.
+
+    The part file is left for the caller to rename or remove. A read failure raises
+    ``BucketReadError`` and a write failure raises a plain ``OSError``, and the caller
+    tells the two apart by type.
+    """
+    part = _part(path)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    with open(part, "wb") as handle:
+        for chunk in read(rel):
+            digest.update(chunk)
+            size += len(chunk)
+            handle.write(chunk)
+    return digest.hexdigest(), size
+
+
+def _prune(work: Path, keep: set[str]) -> None:
+    """Remove every file in the working directory outside ``keep``, then empty directories.
+
+    A run that died leaves a part file behind. A resumed run whose bucket moved on can
+    find a file the newer manifest no longer wants, such as a journal segment whose day
+    has since been compacted. Neither may reach the destination.
+    """
+    for current, _dirs, files in os.walk(work, topdown=False):
+        here = Path(current)
+        for name in files:
+            if (here / name).relative_to(work).as_posix() not in keep:
+                (here / name).unlink()
+        if here != work and not any(here.iterdir()):
+            here.rmdir()
+
+
+def restore_lake(
+    dest: Path | str,
+    target: BucketTarget,
+    *,
+    client: Any,
+    free_space: Callable[[Path], int] = _free_bytes,
+) -> RestoreSummary:
+    """Restore the bucket's current versions into the empty directory ``dest``.
+
+    The steps, in order.
+
+    1. ``dest`` must be absent or an empty directory that is not a mount point, and its
+       parent must exist. Anything else refuses before a request is sent.
+    2. The bucket's ``manifest.jsonl`` is downloaded into memory and checked against the
+       SHA-256 S3 stored for it. The latest entry per partition is read from it, with a
+       torn last line discarded the way every reader discards one.
+    3. The plan is every object under the target, less each journal segment whose
+       compacted partition the manifest records. The bucket never deletes, so it can
+       hold the segments of a day compacted after they uploaded, and the restore leaves
+       them out by the scrub's own rule, ``_compacted_partition_for_segment``. A
+       manifested file the bucket does not hold is a failure named missing.
+    4. The free space beside ``dest`` must cover every planned byte not already verified
+       in the working directory, or the command refuses before the first data file.
+    5. Each planned file streams into ``<dest>.restoring`` and is hashed as it arrives.
+       A manifested file must match its latest entry. Any other file must match the
+       SHA-256 S3 stored at upload, since the manifest has no entry for it. A file
+       already there with the right hash is not downloaded again.
+    6. Only when every file verified is the working directory pruned to the plan and
+       renamed onto ``dest``. Any failure leaves ``dest`` as it was and names the file.
+
+    Nothing takes the lake-root lock. ``lake_lock`` creates ``manifest.jsonl`` under the
+    root it is handed, and a restore writes into a directory nothing else uses. A client
+    error other than a missing key stops the run and raises, and the working directory
+    keeps every file that verified for the next run.
+    """
+    dest = Path(os.path.abspath(Path(dest).expanduser()))
+    work = dest.with_name(dest.name + RESTORING_SUFFIX)
+    summary = RestoreSummary(target=str(target), dest=dest, work=work)
+    _check_destination(dest)
+    read = bucket_reader(client, target)
+
+    listing = list_bucket(client, target)
+    if MANIFEST_FILE not in listing:
+        raise RestoreRefused(
+            f"the bucket holds no manifest.jsonl, so there is no lake to restore: {target}"
+        )
+    manifest_sha = _stored_hex(client, target, MANIFEST_FILE)
+    raw = b"".join(read(MANIFEST_FILE))
+    if manifest_sha is None or hashlib.sha256(raw).hexdigest() != manifest_sha:
+        raise RestoreRefused(
+            "the bucket's manifest.jsonl does not match the SHA-256 S3 stored for it, so "
+            f"nothing it records can be verified and nothing was restored: {target}"
+        )
+    try:
+        latest = _latest_by_partition(
+            parse_jsonl(raw.decode("utf-8", "replace")), Path(MANIFEST_FILE)
+        )
+    except ManifestError as exc:
+        raise RestoreRefused(f"the bucket's {exc}, so nothing was restored") from None
+
+    def superseded(rel: str) -> bool:
+        compacted = _compacted_partition_for_segment(rel)
+        return compacted is not None and compacted in latest
+
+    plan: dict[str, str | None] = {}
+    for rel in sorted(listing):
+        if rel == MANIFEST_FILE:
+            continue
+        if superseded(rel):
+            summary.segments_left_out += 1
+            continue
+        plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
+    for rel in sorted(latest):
+        if rel not in listing and not superseded(rel):
+            summary.failures.append((rel, "missing from the bucket"))
+
+    needed = len(raw) + sum(
+        listing[rel]
+        for rel in plan
+        if not ((work / rel).is_file() and (work / rel).stat().st_size == listing[rel])
+    )
+    free = free_space(dest.parent)
+    if free < needed:
+        raise RestoreRefused(
+            f"the restore needs {needed / 1_000_000:.1f} MB and {dest.parent} has "
+            f"{free / 1_000_000:.1f} MB free, so nothing was restored"
+        )
+
+    _prepare_work(work)
+    for rel, entry_sha in plan.items():
+        path = work / rel
+        try:
+            expected = entry_sha if entry_sha is not None else _stored_hex(client, target, rel)
+            if expected is None:
+                summary.failures.append((rel, "has no SHA-256 stored in the bucket to verify"))
+                continue
+            if path.is_file() and sha256_file(path) == expected:
+                summary.resumed += 1
+                continue
+            actual, size = _download_to(read, rel, path)
+        except BucketReadError as exc:
+            if not exc.absent:
+                raise
+            _part(path).unlink(missing_ok=True)
+            summary.failures.append((rel, "missing from the bucket"))
+            continue
+        except OSError as exc:
+            # A timeout or an SSL failure from the client is an ``OSError`` too, and it is
+            # the bucket's failure rather than the disk's, so it is named as one.
+            if _failure(exc) is not None:
+                raise
+            raise RestoreRefused(
+                f"writing {rel} into {work} failed ({type(exc).__name__}: {exc.strerror}). "
+                f"{dest} is untouched, and a re-run resumes in {work}"
+            ) from None
+        if actual != expected:
+            _part(path).unlink()
+            path.unlink(missing_ok=True)
+            summary.failures.append((rel, "does not match its SHA-256"))
+            continue
+        os.replace(_part(path), path)
+        summary.downloaded += 1
+        summary.downloaded_bytes += size
+    (work / MANIFEST_FILE).write_bytes(raw)
+
+    summary.files = len(plan) + 1
+    summary.unrecorded = [
+        rel for rel in plan if rel not in latest and not _is_excluded(rel, SCRUB_EXCLUSIONS)
+    ]
+    if summary.failures:
+        return summary
+    _prune(work, {*plan, MANIFEST_FILE})
+    try:
+        os.rename(work, dest)
+    except OSError as exc:
+        (work / RESTORE_MARKER).write_text("a marketlake restore in progress\n")
+        raise RestoreRefused(
+            f"every file verified and the rename of {work} onto {dest} failed "
+            f"({type(exc).__name__}: {exc.strerror})"
+        ) from None
+    summary.restored = True
+    return summary
 
 
 # -- the live check -----------------------------------------------------------
@@ -1347,11 +1717,36 @@ def live_check(
 # -- the command-line entry ---------------------------------------------------
 
 
+def _restore_command(dest: str, target: BucketTarget, client: Any) -> int:
+    """Run the restore and print its lines. A refusal raises, for ``main`` to print."""
+    summary = restore_lake(dest, target, client=client)
+    for rel in summary.unrecorded:
+        print(
+            f"restore: restored with no manifest entry, verified against the bucket's "
+            f"stored SHA-256: {rel}"
+        )
+    if not summary.restored:
+        for rel, why in summary.failures:
+            print(f"restore: {why}: {rel}", file=sys.stderr)
+        print(
+            f"restore: {len(summary.failures)} file(s) failed, so {summary.dest} was left as "
+            f"it was. Every file that verified stays in {summary.work}, and a re-run resumes "
+            "there",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"restore: {summary.render()}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The ``python -m lake.bucket`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m lake.bucket",
-        description="Seed the backup bucket by hand, or check the provider's behavior live.",
+        description=(
+            "Seed the backup bucket by hand, restore a lake from it, or check the "
+            "provider's behavior live."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     first = sub.add_parser(
@@ -1372,6 +1767,18 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Where to write the probe objects, as s3://<bucket>/<prefix>, outside the lake's.",
     )
+    restore = sub.add_parser(
+        "restore",
+        help="Download the bucket's current versions into an empty directory and verify them.",
+    )
+    restore.add_argument(
+        "dest", help="The empty directory to restore into. It may also not exist yet."
+    )
+    restore.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
+    restore.add_argument(
+        "--target",
+        help="The bucket, as s3://<bucket>[/<prefix>]. Defaults to backup_target when it is one.",
+    )
     return parser
 
 
@@ -1391,7 +1798,7 @@ def _target(config: Config, given: str | None) -> BucketTarget:
 
 def _one_line(exc: BaseException, target: BucketTarget) -> BucketUnreachable | None:
     """A bucket failure as one operator line, or ``None`` when it is not one."""
-    failure = _failure(exc)
+    failure = (exc.kind, exc.code) if isinstance(exc, BucketReadError) else _failure(exc)
     if failure is None:
         return None
     kind, detail = failure
@@ -1419,9 +1826,14 @@ def main(
     other ``main`` keeps for a seam that reaches past this process. ``clock`` and
     ``calendar`` stay injectable, since neither reaches past this process.
 
-    Under a ``shadow`` role both commands refuse with exit 2 before a client is built. A
-    shadow seeded from the primary would upload under the primary's keys, and
-    ``first-upload`` replaces the bucket's ``manifest.jsonl`` outright.
+    Under a ``shadow`` role ``first-upload`` and ``live-check`` refuse with exit 2 before
+    a client is built. A shadow seeded from the primary would upload under the primary's
+    keys, and ``first-upload`` replaces the bucket's ``manifest.jsonl`` outright.
+    ``restore`` runs under either role. It uploads nothing and writes only into an empty
+    directory, which is how a new host is seeded.
+
+    ``restore`` exits 0 when the destination was filled, 1 when a file failed
+    verification, with one line per failing file, and 2 on a refusal, with one line.
     """
     args = build_parser().parse_args(argv)
     label = args.command
@@ -1430,7 +1842,7 @@ def main(
         role, warning = outbox.role_of(config)
         if warning is not None:
             print(f"{label}: {warning}", file=sys.stderr)
-        if role != outbox.PRIMARY:
+        if role != outbox.PRIMARY and args.command != "restore":
             print(f"{label}: {BUCKET_SHADOW}", file=sys.stderr)
             return 2
         target, client = connect(config, _target(config, args.target))
@@ -1439,6 +1851,8 @@ def main(
 
             clock = SystemClock()
         try:
+            if args.command == "restore":
+                return _restore_command(args.dest, target, client)
             if args.command == "first-upload":
                 if calendar is None:
                     from lake.calendar import ExchangeCalendar
@@ -1457,6 +1871,11 @@ def main(
             line = _one_line(exc, target)
             if line is None:
                 raise
+            if args.command == "restore":
+                line = BucketUnreachable(
+                    f"{line}. The destination is untouched, and a re-run resumes in the "
+                    "working directory"
+                )
             raise line from exc
     if summary.rebaselined:
         print(
@@ -1480,7 +1899,10 @@ __all__ = [
     "SEAL_ALLOWANCE",
     "STORAGE_CLASS",
     "SWEEP_MARGIN",
+    "RESTORE_MARKER",
+    "RESTORING_SUFFIX",
     "BucketBackup",
+    "BucketReadError",
     "BucketRefusal",
     "BucketSettingsInvalid",
     "BucketUnreachable",
@@ -1491,10 +1913,13 @@ __all__ = [
     "Ledger",
     "ManifestedFileMissing",
     "ObjectTooLarge",
+    "RestoreRefused",
+    "RestoreSummary",
     "UploadDeadline",
     "UploadSummary",
     "WatermarkMissing",
     "b64_sha256",
+    "bucket_reader",
     "bucket_scrub",
     "build_parser",
     "client_from_config",
@@ -1509,6 +1934,7 @@ __all__ = [
     "nightly_upload",
     "read_copy_state",
     "read_ledger",
+    "restore_lake",
     "rsync_excluded",
     "session_bound",
     "stored_sha256",

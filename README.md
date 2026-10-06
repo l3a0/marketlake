@@ -64,8 +64,10 @@ Tests sit in one folder per tier, matching the build plan's placement rule.
 The backup target is an external SSD by default, copied with `rsync`. It can instead be an
 S3 bucket, which is what a hosted VM needs, since no SSD is attached to one. The design's
 Backup section carries the reasoning, and
-[#639](https://github.com/l3a0/marketlake/issues/639) carries the plan. Switching back is one
-setting: put the path back in `backup_target`.
+[#639](https://github.com/l3a0/marketlake/issues/639) and
+[#640](https://github.com/l3a0/marketlake/issues/640) carry the plans for the upload and the
+restore. Switching back is one setting: put the path back in `backup_target`. A path target
+keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 
 Four steps set the bucket up. The owner does each by hand in the AWS console or CLI, and
 nothing here names a real account, bucket, or key.
@@ -78,9 +80,8 @@ nothing here names a real account, bucket, or key.
 3. Create an access key whose policy grants exactly `s3:PutObject`, `s3:GetObject`,
    `s3:ListBucket` and `s3:GetBucketVersioning`, and nothing that deletes a version or
    changes the bucket.
-4. Put the key in `config.yaml`, run the first upload, restore once from the bucket
-   ([#640](https://github.com/l3a0/marketlake/issues/640)), and only then change
-   `backup_target`.
+4. Put the key in `config.yaml`, run the first upload, restore the whole lake once from
+   the bucket with the `restore` command below, and only then change `backup_target`.
 
 The examples below use the placeholder bucket `example-lake-backup` and keep the lake
 under the `lake/` prefix, so the live check's probe objects can sit under `live-check/`
@@ -131,8 +132,9 @@ environment variable. Loading `config.yaml` never checks them or the bucket's na
 a mistyped value fails the backup, the first upload or the Sunday scrub that uses it,
 each with one line naming the key, and never stops capture.
 
-Three commands go with it. The first two refuse with exit 2 on a shadow host, which is
-any host whose config sets `role` to something other than `primary`.
+Four commands go with it. The first two refuse with exit 2 on a shadow host, which is
+any host whose config sets `role` to something other than `primary`. The restore runs on
+either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -153,11 +155,41 @@ any host whose config sets `role` to something other than `primary`.
    copy of `manifest.jsonl` stopped being a prefix of the lake's, which the nightly
    upload refuses with a line naming it. `networkQuality -s`, built into macOS, measures
    upload capacity beforehand.
-3. The nightly upload needs no command. Once `backup_target` names the bucket, the
-   close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it.
-   A `shadow` host does neither.
+3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
+   downloads the current version of every object into `<dest>`, which must be empty or
+   not exist yet, and verifies each file before `<dest>` is filled. A file the manifest
+   records must match its latest entry, and any other file must match the SHA-256 S3
+   stored when it was uploaded. A journal segment whose day the manifest records as
+   compacted stays out, so the restored lake holds what the lake it came from holds. The
+   download lands in `<dest>.restoring` beside it and is renamed onto `<dest>` only once
+   every file has verified. A file that fails is named on its own line, `<dest>` is left
+   as it was, and the command exits 1. Running it again resumes in `<dest>.restoring` and
+   downloads only what is not already there and correct. It refuses with exit 2 when
+   `<dest>` is not empty, which keeps it off a live lake, and when the disk beside it is
+   too small. A year-end lake is about 154 GB. `<dest>` cannot be a mount point, since the
+   finished directory is renamed onto it, so restore into a directory inside one. A
+   restore uploads nothing and takes no lock, which is why a shadow host may run it, and
+   it is how a new host's empty `lake_root` is seeded.
+4. The nightly upload needs no command. Once `backup_target` names the bucket, the
+   close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
+   downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
+
+The restore brings back current versions only. When it names a file that failed, or a
+file needs to be undone to an earlier state, the older version is recovered by hand in
+the S3 console, because the narrow key holds no `s3:GetObjectVersion`.
+
+1. Open the bucket, turn on **Show versions**, and go to the file's key under the lake's
+   prefix.
+2. Pick the latest version uploaded before the damage, and download it.
+3. Check `shasum -a 256` of the download against the file's latest entry in the
+   restored `manifest.jsonl`, which sits in `<dest>.restoring`.
+4. Put the download at the file's path under `<dest>.restoring` and run the restore
+   again. It finds the right hash there, skips the damaged current version, and finishes.
+
+Versioning keeps every version of a partition and 30 days of the files rewritten nightly,
+per the lifecycle rules above.
 
 ## Reach the dashboard on a hosted VM
 

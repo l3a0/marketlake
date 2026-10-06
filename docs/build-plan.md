@@ -597,15 +597,19 @@ beside them, which is what lets a fixture say *which* contract was re-symboled i
 rather than only that a root changed, so the replay can assert the master's mapping rows and
 not just the ledger's entry. Test 12 joined the list when
 [#281](https://github.com/l3a0/marketlake/issues/281) shipped the 18:30 job it replays, so
-nothing on the roster is blocked on unbuilt work except test 14's bucket form.
+nothing on the roster is blocked on unbuilt work.
 
-Test 14, restore from backup, is served for a path target and waits on
-[#640](https://github.com/l3a0/marketlake/issues/640) for a bucket. The Sunday job's weekly
-restore test, from [#631](https://github.com/l3a0/marketlake/issues/631), reads files back
-out of the backup copy and verifies them, and
-`tests/component/test_control_plane_sunday.py` and `tests/component/test_restore_check.py`
-drive it with a reader that returns wrong bytes or fails. The bucket form needs the bucket
-download, which is not built yet.
+Test 14, restore from backup, is served for both targets. The Sunday job's weekly restore
+test, from [#631](https://github.com/l3a0/marketlake/issues/631), reads files back out of
+the backup copy and verifies them, and `tests/component/test_control_plane_sunday.py` and
+`tests/component/test_restore_check.py` drive it with a reader that returns wrong bytes or
+fails. [#640](https://github.com/l3a0/marketlake/issues/640) served the bucket form. Its
+weekly test downloads through `bucket.bucket_reader`, and
+`tests/component/test_bucket_scrub.py` drives it against the fake S3 client with an object
+whose bytes rotted under a matching stored checksum. Its restore command,
+`python -m lake.bucket restore`, is driven by `tests/component/test_bucket_restore.py`,
+which uploads a lake with the real upload code, restores it into an empty directory, and
+compares every file byte for byte.
 
 ## The 8 live checks
 
@@ -616,7 +620,11 @@ These need the real world. They run by hand, off CI.
 3. The 08:25 wake and the 08:30 pre-open self-check.
 4. The Friday-set Sunday one-shot, read back with `pmset -g sched`. pmset is the macOS power-scheduling tool.
 5. The DST-weekend one-shot behavior. DST is the daylight-saving-time clock change.
-6. A real restore from the SSD.
+6. A real restore from the SSD. Its bucket twin is the owner's step: a full restore by
+   hand from the owner's real bucket with `python -m lake.bucket restore`, which verifies
+   every file against the restored manifest
+   ([#640](https://github.com/l3a0/marketlake/issues/640)). The switch of `backup_target`
+   to the bucket waits on it passing once.
 7. The Sunday canary coverage assertion. The Sunday canary is the weekend check that proves capture still works.
 8. The four S3 behaviors the bucket backup rests on, against the owner's real bucket ([#639](https://github.com/l3a0/marketlake/issues/639)). `python -m lake.bucket live-check --target s3://<bucket>/live-check` runs it and prints one PASS or FAIL line per behavior. The target prefix sits outside the lake's, so its probe objects never reach the Sunday scrub.
 

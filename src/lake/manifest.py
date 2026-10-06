@@ -1151,8 +1151,11 @@ class BackupScrubResult:
     ``matched`` is what the restore test reads from: the sorted ``(path, sha256)`` pairs
     the forward walk found present and matching, each sha the one the lake recorded at
     the backup's watermark. A file the walk found missing or wrong is left out, so one
-    rotted file is named once. Only the path scrub's final return fills it, so only a
-    walk that ran to the end does. The bucket scrub leaves it empty until marketlake #640.
+    rotted file is named once. Only each scrub's final return fills it, so only a walk
+    that ran to the end does. The path scrub adds a file whose bytes hashed to the sha,
+    and the bucket scrub adds an object whose stored SHA-256 equals it. The bucket's
+    stored value is the one S3 took at upload, so the restore test's download is the
+    only read of the bucket's bytes.
     """
 
     target: str
@@ -1400,9 +1403,9 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
 # -- the weekly restore test -------------------------------------------------
 
 # Reads one backup file's bytes by its lake-relative path, a chunk at a time. A read that
-# fails raises ``OSError``, whether on the call or partway through the chunks. A bucket
-# reader, which marketlake #640 builds, must map its client's errors onto ``OSError``, so
-# the restore has one failure to name.
+# fails raises ``OSError``, whether on the call or partway through the chunks. The bucket
+# reader, ``lake.bucket.bucket_reader``, maps its client's errors onto ``OSError``, so the
+# restore has one failure to name for either kind of target.
 BackupReader = Callable[[str], Iterator[bytes]]
 
 # How many weeks the rotation takes to reach every file the backup scrub matched.
@@ -1475,7 +1478,13 @@ class RestoreResult:
     ``residue`` the rotation slot it read, which differs from ``week`` modulo 52 only when
     the week's own slot held no file. ``candidates`` is how many files the backup scrub
     handed over. ``restored`` names each file whose bytes matched the manifest and
-    ``bytes_read`` counts every byte that arrived, matching or not.
+    ``bytes_read`` counts every byte that arrived, matching or not. ``picks`` is the
+    ``(path, sha256)`` pairs the test set out to read, which is what lets a later attempt
+    tell whether a saved pass covers the same files.
+
+    ``bucket`` is true when the target is a bucket, which changes the advice ``notes``
+    gives. ``reused`` is true when the Sunday job handed back a pass an earlier attempt
+    that evening made, rather than downloading the files again, and ``pass_line`` says so.
 
     Two findings withhold the Sunday ping.
 
@@ -1493,6 +1502,9 @@ class RestoreResult:
     bytes_read: int = 0
     mismatches: tuple[str, ...] = ()
     unreadable: str | None = None
+    picks: tuple[tuple[str, str], ...] = ()
+    bucket: bool = False
+    reused: bool = False
 
     @property
     def problem(self) -> str | None:
@@ -1519,9 +1531,24 @@ class RestoreResult:
         only reads files the backup scrub matched moments earlier, so a mismatch means two
         reads of one file returned different bytes, and the line says so rather than
         asking for a re-copy.
+
+        A bucket target gets its own advice. Its scrub compared the checksum S3 stored at
+        upload, so a mismatch there means the bytes S3 served are not the bytes it
+        accepted. Neither upload replaces an object whose stored checksum matches, so
+        the repair is an earlier version recovered by hand, which ``README.md`` describes.
+        A failed read there is the network or the bucket's key rather than a cable.
         """
         lines = _named("restore read back bytes that do not match the manifest", self.mismatches)
-        if self.mismatches:
+        if self.mismatches and self.bucket:
+            lines.append(
+                "restore mismatch: the bucket's stored checksum matched the manifest when the "
+                "scrub asked moments earlier, so the bytes S3 served are not the bytes it "
+                "accepted at upload. Re-run the Sunday job. A repeat means the object's "
+                "current version is damaged, and no upload replaces an object whose stored "
+                "checksum matches, so recover an earlier version by hand as README.md's "
+                "bucket section describes"
+            )
+        elif self.mismatches:
             lines.append(
                 "restore mismatch: the backup scrub matched these files moments earlier, so "
                 "two reads of one file returned different bytes. Check the disk and its "
@@ -1531,9 +1558,14 @@ class RestoreResult:
             )
         if self.unreadable is not None:
             lines.append(f"restore could not read: {self.unreadable}")
+            where = (
+                "Check the network and the bucket's access key"
+                if self.bucket
+                else "Check the disk and its connection"
+            )
             lines.append(
                 "restore stopped at that read, so the files after it were not checked. "
-                "Check the disk and its connection, then re-run the Sunday job"
+                f"{where}, then re-run the Sunday job"
             )
         return tuple(lines)
 
@@ -1554,7 +1586,8 @@ class RestoreResult:
         Silence could not tell a pass from a test that never ran, so a pass names how many
         files it read, how many megabytes, the week by its Sunday, and the rotation slot.
         A megabyte is a million bytes, as in ``lake.bucket``'s upload line. A lake with
-        nothing matched says so, and withholds nothing.
+        nothing matched says so, and withholds nothing. A pass handed back from an earlier
+        attempt says so too, so the log does not claim a second download that never ran.
         """
         if self.problem is not None:
             return None
@@ -1569,6 +1602,8 @@ class RestoreResult:
         )
         if self.residue != own:
             line += f", from slot {self.residue} because slot {own} held no files"
+        if self.reused:
+            line += ", reused from an earlier attempt this evening rather than read again"
         return line
 
 
@@ -1577,6 +1612,8 @@ def restore_check(
     pairs: Sequence[tuple[str, str]],
     week: int,
     reader: BackupReader,
+    *,
+    bucket: bool = False,
 ) -> RestoreResult:
     """Read the week's files back out of the backup and hash the bytes as they arrive.
 
@@ -1591,7 +1628,8 @@ def restore_check(
     reader that is a generator raises on its first chunk rather than on the call.
 
     ``week`` counts whole weeks from ``RESTORE_EPOCH``, as ``control_plane.restore_week``
-    computes it.
+    computes it. ``bucket`` says the target is a bucket, which only changes the advice the
+    result's ``notes`` give.
     """
     picks = restore_picks(pairs, week)
     restored: list[str] = []
@@ -1617,4 +1655,6 @@ def restore_check(
         bytes_read=bytes_read,
         mismatches=tuple(mismatches),
         unreadable=unreadable,
+        picks=picks,
+        bucket=bucket,
     )
