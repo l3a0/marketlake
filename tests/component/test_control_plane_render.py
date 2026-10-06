@@ -690,6 +690,45 @@ def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, mo
     assert "scrub failed: missing=0" not in printed.replace("backup scrub failed", "")
 
 
+def test_the_sunday_cli_prints_the_restore_test_s_pass_line(tmp_path, capsys, monkeypatch):
+    """A pass prints its own line, so the log can tell a pass from a test that never ran.
+
+    The one partition sits in residue 7, computed by hand, and 2026-08-30 is week 34, so
+    the restore wraps round to it and the line says so.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    pinger = FakePinger()
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr(cp, "UrllibPinger", lambda: pinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr(cp, "NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+    assert code == 0
+    rel = "chains/ticker=SPY/date=2026-08-28.parquet"
+    size = (tmp_path / "ssd" / rel).stat().st_size
+    lines = capsys.readouterr().out.splitlines()
+    assert (
+        f"sunday: restore: 1 file and {size} bytes read back from {tmp_path / 'ssd'} matched "
+        "the manifest, week 34, from week 7 of the rotation because week 34 held no files"
+    ) in lines
+    # The restore line comes after the report lines and before the closing summary.
+    restore = next(i for i, line in enumerate(lines) if line.startswith("sunday: restore:"))
+    assert lines[restore + 1].startswith("sunday: attempts=1 pinged=True")
+
+
 def test_sunday_cli_withholds_the_ping_for_a_stale_token(tmp_path, capsys, monkeypatch):
     # Minted late the prior week: still valid on Sunday, dead before Friday's option
     # close. Validity is not freshness, and the command line has to act on that, not

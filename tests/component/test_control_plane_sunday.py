@@ -24,7 +24,7 @@ from pathlib import Path
 from lake import control_plane as cp
 from lake.alert import Publisher
 from lake.metadata import JournalMetadata, stamp_assertion_pid
-from tests.support.backup import mirror_lake
+from tests.support.backup import FAIL, WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
@@ -70,7 +70,13 @@ def _passing_canary() -> bool:
 
 
 def _run(
-    lake_root: Path, *, now=SUNDAY_20, schedule=REPEAT_ONLY, canary=_passing_canary, mint=FRESH_MINT
+    lake_root: Path,
+    *,
+    now=SUNDAY_20,
+    schedule=REPEAT_ONLY,
+    canary=_passing_canary,
+    mint=FRESH_MINT,
+    backup_reader=None,
 ):
     pinger = FakePinger()
     outcome = cp.sunday_maintenance(
@@ -83,6 +89,7 @@ def _run(
         ping_url=URL,
         mint=mint,
         canary=canary,
+        backup_reader=backup_reader,
     )
     return outcome, pinger
 
@@ -224,6 +231,131 @@ def test_a_backup_merely_behind_the_lake_still_pings(fixture_lake):
     behind, pinger = _run(root)
     assert "backup behind the lake by 2 partitions" in behind.report
     assert behind.pinged is True
+
+
+# -- the restore test ----------------------------------------------------------------
+
+# The clean lake's two partitions sit in residues 7 (chains) and 2 (quotes), computed by
+# hand. SUNDAY_20 is week 34, which holds neither, so the restore wraps round to residue 2
+# and reads the quotes partition alone.
+CHAINS = "chains/ticker=SPY/date=2026-08-28.parquet"
+QUOTES = "quotes/ticker=SPY/date=2026-08-28.parquet"
+
+
+def test_a_clean_sunday_restores_the_week_s_file_from_the_target_and_pings(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    outcome, pinger = _run(root)
+    assert outcome.restore is not None
+    assert outcome.restore.week == 34
+    assert outcome.restore.restored == (QUOTES,)
+    assert outcome.restore.ok is True
+    assert outcome.restore.pass_line is not None
+    assert outcome.restore.pass_line.startswith(f"1 file and {(root / QUOTES).stat().st_size} ")
+    # A pass rides its own field, so a healthy run's report keeps its shape.
+    assert outcome.problems == () and outcome.report == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_the_default_reader_reads_the_backup_target_and_not_the_lake(fixture_lake):
+    # The lake's own copy of the file week 34 reads is rotted, and the backup's is sound.
+    # The primary scrub names the lake, and a restore that read the lake root instead of
+    # the target would name the file a second time as a backup fault.
+    root = _clean_lake(fixture_lake)
+    (root / QUOTES).write_bytes(b"rot")
+
+    outcome, _ = _run(root)
+
+    assert outcome.scrub.sha_mismatches == (QUOTES,)
+    assert outcome.backup.ok is True
+    assert outcome.restore is not None
+    assert outcome.restore.restored == (QUOTES,) and outcome.restore.ok is True
+
+
+def test_a_monday_catch_up_restores_the_sunday_s_files(fixture_lake):
+    outcome, _ = _run(_clean_lake(fixture_lake), now=et(2026, 8, 31, 8, 25))
+    assert outcome.restore is not None
+    assert outcome.restore.week == 34
+
+
+def test_a_file_that_restores_wrong_withholds_the_ping_and_is_named(fixture_lake):
+    # The copy on disk is sound, so the backup scrub passes. The bad bytes come through
+    # the reader, which is the only way a path target can show the restore its own case.
+    root = _clean_lake(fixture_lake)
+    reader = FakeBackupReader(_backup_of(root), every=WRONG)
+
+    outcome, pinger = _run(root, backup_reader=reader)
+
+    assert outcome.backup.ok is True
+    assert outcome.restore is not None
+    assert outcome.restore.mismatches == (QUOTES,)
+    assert outcome.pinged is False and pinger.urls == []
+    assert f"restore test failed: mismatches=1: {_backup_of(root)}" in outcome.problems
+    assert f"restore read back bytes that do not match the manifest: {QUOTES}" in outcome.report
+    assert any("two reads of one file disagreed" in line for line in outcome.report)
+
+
+def test_a_failed_restore_read_withholds_the_ping_without_raising(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    reader = FakeBackupReader(_backup_of(root), every=FAIL)
+
+    outcome, pinger = _run(root, backup_reader=reader)
+
+    assert outcome.pinged is False and pinger.urls == []
+    # Every check after the restore still ran.
+    assert outcome.canary_passed is True and outcome.covered is True
+    assert (
+        f"restore test failed: mismatches=0, stopped at a failed read: {_backup_of(root)}"
+        in outcome.problems
+    )
+    assert f"restore could not read: {QUOTES}: OSError: fake read failed: {QUOTES}" in (
+        outcome.report
+    )
+
+
+def test_an_unmounted_target_runs_no_restore_and_adds_no_second_line(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    reader = FakeBackupReader(_backup_of(root), every=WRONG)
+    shutil.rmtree(_backup_of(root))
+
+    outcome, pinger = _run(root, backup_reader=reader)
+
+    assert outcome.backup.target_missing is True
+    assert outcome.restore is None
+    assert reader.calls == []
+    assert not any(line.startswith("restore") for line in outcome.problems + outcome.report)
+    assert outcome.pinged is False
+
+
+def test_a_copy_the_scrub_already_flagged_is_not_restored_again(fixture_lake):
+    # The quotes copy is the file week 34 would read. Once the scrub names it, the restore
+    # takes what is left, which is the chains file, and names nothing twice.
+    root = _clean_lake(fixture_lake)
+    (_backup_of(root) / QUOTES).write_bytes(b"rot")
+    reader = FakeBackupReader(_backup_of(root))
+
+    outcome, pinger = _run(root, backup_reader=reader)
+
+    assert outcome.backup.sha_mismatches == (QUOTES,)
+    assert reader.calls == [CHAINS]
+    assert outcome.restore is not None and outcome.restore.ok is True
+    assert not any(line.startswith("restore") for line in outcome.problems + outcome.report)
+    assert outcome.pinged is False
+
+
+def test_a_copy_wholly_flagged_by_the_scrub_leaves_nothing_to_restore(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    (_backup_of(root) / QUOTES).write_bytes(b"rot")
+    (_backup_of(root) / CHAINS).write_bytes(b"rot")
+    reader = FakeBackupReader(_backup_of(root), every=WRONG)
+
+    outcome, _ = _run(root, backup_reader=reader)
+
+    assert reader.calls == []
+    assert outcome.restore is not None and outcome.restore.ok is True
+    assert outcome.restore.pass_line == (
+        "nothing to restore, the backup scrub matched no files, week 34"
+    )
+    assert not any(line.startswith("restore") for line in outcome.problems)
 
 
 def test_a_missing_lake_root_is_a_failure_not_a_clean_scrub(tmp_path):
@@ -392,7 +524,16 @@ class _Mints:
         return mint
 
 
-def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, reminder_sink=None):
+def _retry_run(
+    lake_root,
+    *,
+    start,
+    mints,
+    canary=None,
+    schedule=REPEAT_ONLY,
+    reminder_sink=None,
+    backup_reader=None,
+):
     clock = ManualClock(start=start)
     pinger = FakePinger()
     outcomes = cp.sunday_run(
@@ -406,6 +547,7 @@ def _retry_run(lake_root, *, start, mints, canary=None, schedule=REPEAT_ONLY, re
         mint_reader=mints,
         canary=canary if canary is not None else _passing_canary,
         reminder_sink=reminder_sink,
+        backup_reader=backup_reader,
     )
     return outcomes, pinger, clock
 
@@ -421,6 +563,20 @@ def test_the_retry_loop_scrubs_the_copy_it_was_handed(fixture_lake):
     assert pinger.urls == []
     assert all(o.scrub.ok for o in outcomes)
     assert all(any(p.startswith("backup scrub failed") for p in o.problems) for o in outcomes)
+
+
+def test_every_attempt_restores_afresh_and_a_failing_restore_retries(fixture_lake):
+    # Nothing carries a pass or a failure from one attempt to the next, so a reader that
+    # fails all evening is asked once per attempt and the evening never pings.
+    root = _clean_lake(fixture_lake)
+    reader = FakeBackupReader(_backup_of(root), every=FAIL)
+    outcomes, pinger, _ = _retry_run(
+        root, start=SUNDAY_20, mints=_Mints(FRESH_MINT), backup_reader=reader
+    )
+    assert len(outcomes) == 7
+    assert reader.calls == [QUOTES] * 7
+    assert all(o.restore is not None and o.restore.ok is False for o in outcomes)
+    assert pinger.urls == []
 
 
 def test_a_healthy_sunday_makes_one_attempt(fixture_lake):

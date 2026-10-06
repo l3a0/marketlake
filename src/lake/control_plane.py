@@ -99,7 +99,16 @@ from lake.alert import REFUSED, Message, NtfyTransport, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import CALLBACK_KEY, BucketTarget, input_errors_exit, load_config
-from lake.manifest import BackupScrubResult, ScrubResult, backup_scrub, scrub
+from lake.manifest import (
+    BackupReader,
+    BackupScrubResult,
+    RestoreResult,
+    ScrubResult,
+    backup_scrub,
+    path_reader,
+    restore_check,
+    scrub,
+)
 from lake.metadata import JournalMetadata, read_metadata
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir
 from lake.runner import (
@@ -1852,8 +1861,9 @@ class SundayOutcome:
 
     ``problems`` are the findings that withhold the ping, plus the ping's own failure
     when it is reached and fails. The withholding ones are a missing lake root, a
-    failed scrub, a failed backup scrub, a failed canary, a token that does not cover
-    the coming week, and a mint time that could not be read. The ping's failure is
+    failed scrub, a failed backup scrub, a failed restore test, a failed canary, a token
+    that does not cover the coming week, and a mint time that could not be read. The
+    ping's failure is
     different in kind. It is recorded after the others have all passed, and it names why
     the ping did not land rather than why it was not attempted.
 
@@ -1864,7 +1874,14 @@ class SundayOutcome:
     every file it found wrong, because a count decides whether to ping and only a path
     says where to look. It also covers an extra file on the copy and a copy behind its
     lake, neither of which can be lake data going missing. How far behind reads by eye
-    from the partition count, and one run carries no history of the last one.
+    from the partition count, and one run carries no history of the last one. The
+    restore test's own findings ride it the same way, each file it read back wrong and
+    the repair for it.
+
+    ``restore`` is the restore test's result, or ``None`` when the backup scrub stopped
+    before the end of its walk and the test did not run. A pass rides here rather than
+    in ``report``, because ``report`` carries findings, and ``main`` prints its line so
+    the log can tell a pass from a test that never ran.
 
     ``covered`` is ``None`` when the mint time could not be read. That is a problem,
     never a skip. ``pinged`` is the success condition.
@@ -1887,6 +1904,25 @@ class SundayOutcome:
     problems: tuple[str, ...] = ()
     report: tuple[str, ...] = ()
     daemon_page: Message | None = None
+    restore: RestoreResult | None = None
+
+
+# The Sunday the restore test counts its weeks from. Any Sunday would do, since only the
+# count matters, and this is the first one of 2026.
+_RESTORE_EPOCH = date(2026, 1, 4)
+
+
+def restore_week(now: datetime) -> int:
+    """How many whole weeks the market-time Sunday of ``now`` falls after the epoch.
+
+    ``now`` is UTC, and Sunday 20:00 in New York is already Monday there, so the date is
+    read in market time. A Monday is then stepped back to its Sunday, so the 08:25
+    catch-up launchd fires for a missed Sunday restores that Sunday's files rather than
+    the next week's. An ISO week would split the two, because it starts on Monday.
+    """
+    day = now.astimezone(MARKET_TZ).date()
+    sunday = day - timedelta(days=(day.weekday() + 1) % 7)
+    return (sunday - _RESTORE_EPOCH).days // 7
 
 
 def sunday_maintenance(
@@ -1909,11 +1945,13 @@ def sunday_maintenance(
     stamped_at: datetime | None = None,
     bucket_client: object | None = None,
     bucket_unusable: str | None = None,
+    backup_reader: BackupReader | None = None,
 ) -> SundayOutcome:
-    """Scrub both copies, verify the wake alarms, run the canary, assert coverage, ping.
+    """Scrub both copies, test a restore, verify the alarms, run the canary, assert, ping.
 
     Every check runs and every finding is named, so one run reports all of them.
-    The ping fires only when both scrubs, the canary, and the coverage assertion pass.
+    The ping fires only when both scrubs, the restore test, the canary, and the coverage
+    assertion pass.
     Alarm drift is checked and named in ``report`` but never withholds the ping. A
     read-back that cannot be run or parsed is named there too, for the same reason:
     the design routes the whole read-back step to the nightly report, and the
@@ -2001,6 +2039,17 @@ def sunday_maintenance(
     bytes at rest, so rot at rest in a bucket is the provider's durability guarantee plus
     the restore test rather than this job's.
 
+    The restore test runs right after the backup scrub, whenever that scrub reached the
+    end of its walk. It reads the week's share of the files the scrub matched back out of
+    the target through ``backup_reader``, per ``manifest.restore_check``, on every
+    attempt. A mismatch or a failed read is a problem and withholds the ping, by the
+    backup scrub's own rule, and the files it names ride ``report``. A scrub that stopped
+    early, on an unmounted target or a manifest copy it could not trust, already named
+    the target, so the test does not run and adds no second line. ``backup_reader`` of
+    ``None`` reads ``backup_target`` from disk, which is still a real restore, so the
+    default never reads as verified without reading. A bucket target gets no restore yet,
+    only a report line saying so, which withholds nothing.
+
     The canary's 30-minute retry until the deadline belongs to ``sunday_run``, not to
     this function. This function decides one attempt.
     """
@@ -2030,6 +2079,20 @@ def sunday_maintenance(
     if backup.problem is not None:
         problems.append(backup.problem)
 
+    # A bucket target has no restore yet. Its download is marketlake #640, and a path
+    # reader built on a ``BucketTarget`` would raise ``TypeError``, which the restore's
+    # ``OSError`` catch does not stop. The owner's switch to the bucket already waits on
+    # #640, so the gap is a report line and withholds nothing.
+    restore: RestoreResult | None = None
+    restore_unbuilt: str | None = None
+    if backup.walked and isinstance(backup_target, BucketTarget):
+        restore_unbuilt = f"restore test not built for a bucket target yet: {backup_target}"
+    elif backup.walked:
+        reader = backup_reader if backup_reader is not None else path_reader(Path(backup_target))
+        restore = restore_check(backup_target, backup.matched, restore_week(now), reader)
+        if restore.problem is not None:
+            problems.append(restore.problem)
+
     # The design routes this whole step to the nightly report, so nothing it can raise
     # may withhold the ping. The reader is an injected seam that shells out in
     # production, and ``pmset -g sched`` lists every owner's events, in shapes the
@@ -2049,6 +2112,10 @@ def sunday_maintenance(
     report = list(alarms.problems)
 
     report.extend(backup.notes)
+    if restore is not None:
+        report.extend(restore.notes)
+    if restore_unbuilt is not None:
+        report.append(restore_unbuilt)
 
     if exclusion_reader is not None and exclusion_targets:
         try:
@@ -2125,6 +2192,7 @@ def sunday_maintenance(
         problems=tuple(problems),
         report=tuple(report),
         daemon_page=daemon_page,
+        restore=restore,
     )
 
 
@@ -2190,6 +2258,7 @@ def sunday_run(
     stamp_reader: StampReader | None = None,
     bucket_client: object | None = None,
     bucket_unusable: str | None = None,
+    backup_reader: BackupReader | None = None,
 ) -> list[SundayOutcome]:
     """Run the Sunday job, retrying until it passes or the canary deadline.
 
@@ -2231,6 +2300,9 @@ def sunday_run(
     inside one process, so that local flag is the entire state a once-per-window rule
     needs, unlike the daemon's own once-per-window rule, which has to survive across
     ticks and so keeps a stamp instead.
+
+    ``backup_reader`` passes straight through too, and every attempt runs the restore
+    test afresh. Nothing carries a pass from one attempt to the next.
     """
     start = clock.now().astimezone(MARKET_TZ)
     in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
@@ -2270,6 +2342,7 @@ def sunday_run(
             stamped_at=stamp.stamped_at,
             bucket_client=bucket_client,
             bucket_unusable=bucket_unusable,
+            backup_reader=backup_reader,
         )
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
         # outcome records only the one that went out.
@@ -3539,6 +3612,8 @@ def main(
                 print(f"sunday: {problem}")
             for line in outcome.report:
                 print(f"sunday: report: {line}")
+            if outcome.restore is not None and outcome.restore.pass_line is not None:
+                print(f"sunday: restore: {outcome.restore.pass_line}")
             if outcome.reminder is not None:
                 print(f"sunday: reminder: {outcome.reminder.body}")
         pinged = outcomes[-1].pinged
