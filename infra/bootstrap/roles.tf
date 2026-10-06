@@ -283,6 +283,16 @@ resource "aws_iam_role_policy" "apply" {
         Resource = ["arn:aws:iam::${local.account_id}:user/marketlake-backup"]
       },
       {
+        # infra/live creates this user rather than importing it, so it needs
+        # iam:CreateUser. No iam:DeleteUser or iam:DeleteUserPolicy, so CI can never
+        # remove the token's only writer, and no iam:CreateAccessKey, whose Deny above
+        # keeps the key a hand step.
+        Sid      = "TokenWriterUserWrite"
+        Effect   = "Allow"
+        Action   = ["iam:CreateUser", "iam:PutUserPolicy"]
+        Resource = ["arn:aws:iam::${local.account_id}:user/marketlake-token-writer"]
+      },
+      {
         Sid      = "Ec2InHomeRegion"
         Effect   = "Allow"
         Action   = ["ec2:*"]

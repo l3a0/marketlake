@@ -332,6 +332,12 @@ run "policies_are_exactly_the_reviewed_statements" {
           Resource = ["arn:aws:iam::000000000000:user/marketlake-backup"]
         },
         {
+          Sid      = "TokenWriterUserWrite"
+          Effect   = "Allow"
+          Action   = ["iam:CreateUser", "iam:PutUserPolicy"]
+          Resource = ["arn:aws:iam::000000000000:user/marketlake-token-writer"]
+        },
+        {
           Sid      = "Ec2InHomeRegion"
           Effect   = "Allow"
           Action   = ["ec2:*"]
