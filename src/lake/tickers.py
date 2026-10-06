@@ -46,7 +46,7 @@ def default_tickers_path() -> Path:
     throwaway kept the real directory, and on 2026-10-06 a probe doing exactly that
     overwrote a host's live roster. Resolved here, the environment at the moment of the
     read or the write decides. The other config-directory defaults still bind at import,
-    and marketlake #715 converts them.
+    and marketlake #715 will convert them.
     """
     return config_dir() / TICKERS_FILE
 

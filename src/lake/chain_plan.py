@@ -46,7 +46,7 @@ from lake.paths import CHAIN_PLAN_FILE, config_dir
 # ``load_chain_plan`` falls back to the built-in default.
 # The path is fixed when this module is imported, so a process that sets HOME or
 # MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
-# resolves it at call time instead.
+# will resolve it at call time instead.
 DEFAULT_CHAIN_PLAN_PATH = config_dir() / CHAIN_PLAN_FILE
 
 # One window: a start day-offset and an end day-offset, the end ``None`` on the open tail.

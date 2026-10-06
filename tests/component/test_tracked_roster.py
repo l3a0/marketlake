@@ -83,6 +83,18 @@ def test_the_tracked_roster_keeps_the_rules():
             "no enabled entry",
             id="all-disabled",
         ),
+        pytest.param(
+            "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+            "QQQ: {option: true, chain_cadence: 1m, bars: [1m, 1d]}\n",
+            "QQQ: unknown keys ['option']",
+            id="typo-in-the-second-entry",
+        ),
+        pytest.param(
+            "SPY: {option: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+            "QQQ: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n",
+            "SPY: unknown keys ['option']",
+            id="typo-in-the-first-entry",
+        ),
     ],
 )
 def test_the_rules_catch_a_typo(text, problem):
@@ -98,6 +110,8 @@ def test_the_rules_catch_a_typo(text, problem):
             id="one-enabled-one-disabled",
         ),
         pytest.param("IWM: {options: false, bars: [1d]}\n", id="equity-only-without-cadence"),
+        # The loader reads a missing ``options`` as false, so the rule must too.
+        pytest.param("IWM: {bars: [1d]}\n", id="no-options-key-without-cadence"),
     ],
 )
 def test_the_rules_accept_a_roster_that_keeps_them(text):

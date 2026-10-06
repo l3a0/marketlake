@@ -174,6 +174,11 @@ def test_each_call_shape(tmp_path, source, found):
             "for",
             "from lake.paths import config_dir\nfor _ in range(1):\n    D = config_dir() / 'x'\n",
         ),
+        (
+            "for-else",
+            "from lake.paths import config_dir\n"
+            "for _ in range(0):\n    pass\nelse:\n    D = config_dir() / 'x'\n",
+        ),
     ],
 )
 def test_a_default_bound_under_a_top_level_block_is_found(tmp_path, name, source):
