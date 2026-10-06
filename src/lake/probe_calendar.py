@@ -10,8 +10,9 @@ This is the one check that asks someone else. At 09:35 on a weekday the calendar
 closed, it asks the vendor for quotes and looks at their timestamps. A stamp from today
 means the market is trading while the daemon sleeps, which pages.
 
-It runs as a fixed-time launchd job rather than from inside the daemon, because the
-daemon is exactly what is not running on the day this matters.
+It runs as a fixed-time job, a launchd job on the Mac and a systemd timer on Linux, rather
+than from inside the daemon, because the daemon is exactly what is not running on the day
+this matters.
 
 The probe asks about the whole roster in one batched request. That costs the same as
 asking about one symbol, and it removes both the arbitrary choice of which ticker to

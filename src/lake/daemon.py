@@ -1,9 +1,10 @@
 """The daemon loop: the market-hours resident that fires the capture cycle.
 
 The capture primitive in ``lake.capture`` runs one cycle and returns. This module is the
-loop that calls it once a minute across a trading session. It is the long-lived,
-launchd-managed daemon the design names. launchd is macOS's built-in service manager.
-Under its ``KeepAlive`` an exiting process is relaunched within seconds, so a daemon that
+loop that calls it once a minute across a trading session. It is the long-lived daemon
+the design names, kept running by the host's service manager: launchd, macOS's built-in
+one, on the Mac, and systemd on a Linux VM. Under launchd's ``KeepAlive`` or systemd's
+``Restart=always`` an exiting process is restarted within seconds, so a daemon that
 exited at the close would relaunch-loop all night. This loop therefore never exits on its
 own. Outside the capture window it idles and keeps ticking.
 

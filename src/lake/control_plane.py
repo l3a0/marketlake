@@ -5,9 +5,12 @@ laptop awake, keeps the two resident processes running, and proves both to the o
 world. One codebase serves both hosts and branches on ``is_macos``, which reads
 ``sys.platform``. On macOS the probes ask ``launchctl`` and ``pmset``. On Linux they ask
 systemd, no assertion is held and no wake is set, because a VM never sleeps. This module
-renders the macOS half and reasons about both. It executes nothing privileged. No
-``sudo``, no ``pmset`` write, no ``launchctl`` bootstrap, and no ``tmutil`` write runs
-from here. Installing is the operator's step, by hand. Six read-only probes do run, from
+renders both halves, launchd plists for the Mac and systemd units for a Linux VM, and
+reasons about both. It executes nothing privileged. No ``sudo``, no ``pmset`` write, no
+``launchctl`` bootstrap, no ``systemctl`` write and no ``tmutil`` write runs from here. On
+the Mac installing is the operator's step, by hand, from the text the render prints. On
+Linux it is the tracked entry point ``deploy/linux-install.sh``, which renders through this
+module and runs the rendered ``install.sh`` as root. Six read-only probes do run, from
 the scheduled jobs and from the by-hand live checks. Four run on macOS: ``launchctl
 print``, ``pmset -g sched``, ``pmset -g assertions``, and ``tmutil isexcluded``. Two run
 on Linux: ``systemctl is-active`` and ``timedatectl show``. None of them needs root.
@@ -19,6 +22,9 @@ Terms, glossed at first use.
   plist sets ``UserName`` and ``GroupName`` to the owner, so everything the job creates
   stays user-owned. ``KeepAlive`` makes launchd relaunch an exiting process within
   seconds. That is the resident-process shape the daemon and the query service take.
+- *systemd* is Linux's service manager. It reads *units*: a ``.service`` runs a process
+  and a ``.timer`` starts its service on a calendar. ``Restart=always`` is its
+  ``KeepAlive``, and ``journald`` keeps each unit's output, read with ``journalctl -u``.
 - *pmset* is the macOS power-scheduling tool. ``pmset repeat`` holds one repeating
   firmware wake alarm. ``pmset schedule`` adds a one-shot. Both writes need root.
   ``pmset -g sched`` reads the schedule back and needs no root.
@@ -51,7 +57,8 @@ Terms, glossed at first use.
 
 Nine operational wall-clock times live here as named integer constants, in order. They
 are not session times. The session times come from the calendar. These are the moments
-the design pins to the machine's clock, so launchd and pmset can fire them.
+the design pins to the machine's clock, so launchd, systemd timers and pmset can fire
+them.
 
 1. The 08:25 weekday firmware wake.
 2. The 08:30 weekday pre-open self-check.
@@ -195,16 +202,16 @@ class Schedule:
 
 
 # The operational wall-clock times, per the design's deployment section. These are
-# machine-clock moments, not session times. launchd and pmset can only fire on the
-# wall clock, so the design pins them there.
+# machine-clock moments, not session times. launchd, systemd timers and pmset can only
+# fire on the wall clock, so the design pins them there.
 WEEKDAY_WAKE = WallClockTime(8, 25)  # pmset repeat wakeorpoweron MTWRF
-PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check launchd job, Mon-Fri
+PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check job, Mon-Fri
 CALENDAR_PROBE = WallClockTime(9, 35)  # the says-closed-but-open probe, Mon-Fri
 VENDOR_SWEEP = WallClockTime(18, 30)  # the sweep job, which sets the Sunday one-shot
 COMPACTION_RUN = WallClockTime(16, 30)  # the close+15 job's regular time, for a day with no close
 WEEKDAY_ASSERTION_END = WallClockTime(18, 45)  # when the vendor sweep's ping lands
 SUNDAY_WAKE = WallClockTime(19, 55)  # the Friday-set one-shot wake
-SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub launchd job
+SUNDAY_MAINTENANCE = WallClockTime(20, 0)  # the canary + scrub job
 CANARY_DEADLINE = WallClockTime(23, 0)  # the canary's last retry, not the check's deadline
 SUNDAY_ASSERTION_END = WallClockTime(23, 30)  # when that last retry's ping must have landed
 
@@ -371,10 +378,11 @@ def _listed(items: Sequence[str]) -> str:
 # tmutil, caffeinate, and rsync. These are OS locations, not machine-specific paths.
 _SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
-# Directories the dry-run renderer refuses to write into. Installing is the operator's
-# step, by hand, with the printed commands. Both /etc spellings are listed. On macOS
-# /etc is a symlink that resolve() folds into /private/etc, and on a host where /etc is
-# a real directory the /etc entry is the one that catches it.
+# Directories the dry-run renderer refuses to write into. Installing is a separate step:
+# by hand with the printed commands on the Mac, and ``deploy/linux-install.sh`` on Linux.
+# Both /etc spellings are listed. On macOS /etc is a symlink that resolve() folds into
+# /private/etc, and on a host where /etc is a real directory the /etc entry is the one
+# that catches it.
 _PROTECTED_ROOTS = (Path("/Library"), Path("/System"), Path("/etc"), Path("/private/etc"))
 
 # The one rendered setup file beside the six plists. The Time Machine exclusion is a
@@ -3134,7 +3142,8 @@ def write_rendered(files: Sequence[RenderedFile], out_dir: Path) -> list[Path]:
     """Write the rendered files into ``out_dir`` and nowhere else.
 
     The renderer is dry-run only. It refuses a target under the system directories,
-    so the install itself stays a deliberate, by-hand step.
+    so the install itself stays a separate step: by hand on the Mac, and the rendered
+    ``install.sh``, run as root by ``deploy/linux-install.sh``, on Linux.
     """
     out = Path(out_dir)
     if _is_protected(out):
@@ -4449,8 +4458,10 @@ def _build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m lake.control_plane",
         description=(
-            "The control plane: the launchd plists, pmset and sudoers it renders on macOS, "
-            "and the self-check and Sunday jobs it runs on either host."
+            "The control plane: the launchd plists and sudoers drop-in it renders for the "
+            "Mac, the systemd units and install scripts it renders for a Linux host, the "
+            "pmset commands it prints, and the self-check and Sunday jobs it runs on either "
+            "host."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
