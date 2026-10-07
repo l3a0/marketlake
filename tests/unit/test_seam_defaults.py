@@ -29,7 +29,9 @@ a test drives the entry with a fake ``schwab`` package in ``sys.modules`` rather
 handing the entry a flow. Its second seam is the token parameter's AWS client, which
 ``reauth_from_config`` takes as a factory and ``token_store.push`` and ``token_store.pull``
 take as a client and a factory. ``reauth.main`` and ``token_store.main`` build both
-themselves, so a test answers the client through botocore's event hooks instead. The put's
+themselves, so a test answers the client through botocore's event hooks instead.
+``control_plane.main`` builds the Sunday job's pull the same way and hands it to
+``sunday_run`` as ``token_pull``. The put's
 client also assumes a role through an STS client private to the build, which no hook on
 the SSM client reaches, so a test of the put answers that at an STS server on loopback,
 through the ``aws_session.STS_ENDPOINT_URL`` seam. ``vm_config.render`` takes a factory
@@ -41,7 +43,8 @@ builds both.
 canary, the ``launchctl``, ``pmset`` and ``tmutil`` reads, the ``systemctl`` and
 ``timedatectl`` reads, and the daemon's assertion runner internally. ``daemon.main``
 joined them with the close+15 compaction: it spawns that job as its own process, so the
-seam is the spawn rather than the ``rsync`` the child goes on to run. ``clock`` and
+seam is the spawn rather than the ``rsync`` the child goes on to run. It spawns the token
+pull in auth death the same way, so that seam is a spawn too (marketlake #702). ``clock`` and
 ``calendar`` stay injectable on both. A system clock and an exchange calendar never
 reach past this process, so neither is a seam. A test drives a seam-requiring helper
 directly, or, to exercise a ``main``, monkeypatches the producer the ``main`` builds and
@@ -76,6 +79,7 @@ REQUIRED = [
     (daemon.run_loop_from_config, "transport"),
     (daemon.run_loop_from_config, "pinger"),
     (daemon.run_loop_from_config, "compaction_runner"),
+    (daemon.run_loop_from_config, "pull_runner"),
     (daemon._alarm, "transport"),
     (daemon._alarm, "pinger"),
     (runner.run_once_from_config, "pinger"),
@@ -86,6 +90,7 @@ REQUIRED = [
     (control_plane.sunday_run, "schedule_reader"),
     (control_plane.sunday_run, "pinger"),
     (control_plane.sunday_run, "canary"),
+    (control_plane.sunday_run, "token_pull"),
     (control_plane.sunday_maintenance, "schedule_reader"),
     (sweep.sweep, "schedule_setter"),
     (sweep.sweep, "schedule_reader"),
@@ -118,11 +123,13 @@ FORBIDDEN = [
     (compact.main, "publisher"),
     (compact.main, "transport"),
     (daemon.main, "compaction_runner"),
+    (daemon.main, "pull_runner"),
     (daemon.main, "assertion_runner"),
     (control_plane.main, "probe"),
     (control_plane.main, "pinger"),
     (control_plane.main, "schedule_reader"),
     (control_plane.main, "canary"),
+    (control_plane.main, "token_pull"),
     (control_plane.main, "exclusion_reader"),
     (control_plane.main, "clock_probe"),
     (control_plane.main, "transport"),

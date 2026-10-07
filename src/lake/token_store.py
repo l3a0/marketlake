@@ -16,9 +16,11 @@ Three pieces live here.
 
 1. ``mode_of`` reads the per-host ``token_store`` key. ``file`` keeps the token in
    ``token.json`` alone. ``both`` and ``store`` make the re-auth put the parameter after
-   it writes the file. ``store`` and any other value make the VM's scheduled pulls run,
-   which marketlake #702 adds. An unknown value prints one line and falls to the side
-   that cannot cost a token: the re-auth still writes the file and tries the put.
+   it writes the file. ``store`` and any other value make the VM's scheduled pulls run:
+   before each Sunday canary attempt, and from the daemon while capture is down on a dead
+   token or a token file it cannot read (marketlake #702). An unknown value prints one
+   line and falls to the side that cannot cost a token: the re-auth still writes the
+   file and tries the put.
 2. ``push`` is the re-auth's put. It sends the JSON text the login wrote, as a string,
    never a read-back of the file. It signs only as the role ``token_store_role_arn``
    names, which may only put this one parameter, in ``token_store_region``. The command
@@ -335,10 +337,18 @@ EXIT_CODES = {WROTE: 0, CURRENT: 0, STORE_OLDER: 1, UNREADABLE: 1, NO_CREDENTIAL
 
 @dataclass(frozen=True)
 class PullResult:
-    """What a pull did, and the one line it prints. Neither carries the token."""
+    """What a pull did, and the one line it prints. Neither carries the token.
+
+    ``reason`` says why an ``unreadable`` pull could not use the parameter, and is
+    ``None`` on every other outcome. It is an AWS error code, a botocore class name,
+    ``AssumeRole <code>``, or a fixed phrase about the value, so it carries neither the
+    token's path nor a token byte. That is what lets the Sunday reminder carry it where
+    ``line``, which names the path, cannot go.
+    """
 
     outcome: str
     line: str
+    reason: str | None = None
 
 
 def pull_client(config: Config) -> Any:
@@ -504,6 +514,7 @@ def _unreadable(target: Path, why: str) -> PullResult:
     return PullResult(
         UNREADABLE,
         f"the token parameter could not be used ({why}), so {target} was left as it was",
+        reason=why,
     )
 
 
@@ -535,7 +546,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``store older`` and ``unreadable``, and 3 for ``no credentials``. A config problem
     exits 2 with one line. It builds the real client itself and takes no seam. It does
     not read ``token_store``: running it is the decision, and the gate belongs to the
-    scheduled calls that marketlake #702 adds. It reads no ``role`` either, so it runs on
+    scheduled calls, the Sunday job's and the daemon's (marketlake #702), which each read
+    ``mode_of`` before they pull. It reads no ``role`` either, so it runs on
     a shadow host, as the VM's first boot is.
 
     Run it as the account that runs the daemon. ``os.replace`` keeps the temp file's

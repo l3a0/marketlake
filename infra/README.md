@@ -1259,7 +1259,11 @@ runs the daemon.
       [#638](https://github.com/l3a0/marketlake/issues/638) that change code the VM runs:
       [#702](https://github.com/l3a0/marketlake/issues/702), and
       [#669](https://github.com/l3a0/marketlake/issues/669)'s
-      [PR #731](https://github.com/l3a0/marketlake/pull/731). With
+      [PR #731](https://github.com/l3a0/marketlake/pull/731). Both have merged:
+      [PR #731](https://github.com/l3a0/marketlake/pull/731) on 2026-10-07, and
+      [#702](https://github.com/l3a0/marketlake/issues/702)'s code in
+      [PR #750](https://github.com/l3a0/marketlake/pull/750) and
+      [PR #751](https://github.com/l3a0/marketlake/pull/751) the same day. With
       [#702](https://github.com/l3a0/marketlake/issues/702) on the VM from its first boot,
       the VM pulls each weekly token on its own. A merge after the apply reaches the VM
       only as [Rerun the bootstrap](#rerun-the-bootstrap) describes.

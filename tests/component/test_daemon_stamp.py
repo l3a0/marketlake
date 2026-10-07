@@ -122,6 +122,7 @@ def _run(
         transport=Broken(),
         pinger=pinger if pinger is not None else FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=_no_cycle,
         should_continue=more,
     )
@@ -201,6 +202,7 @@ def test_an_idle_stamp_resolves_the_default_token_when_it_stamps(tmp_path, monke
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=_no_cycle,
         should_continue=move_then_one_tick,
     )
@@ -250,6 +252,7 @@ def test_a_capture_minute_is_left_to_the_cycle_s_own_stamp(tmp_path):
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=record_cycle,
         should_continue=once,
     )
@@ -336,6 +339,7 @@ def test_a_capture_minute_stamps_the_pid_too(tmp_path):
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=record_cycle,
         should_continue=once,
     )
@@ -420,6 +424,7 @@ def test_a_re_take_inside_the_window_stamps_the_replacement(tmp_path):
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=_no_cycle,
         should_continue=three,
     )
@@ -537,6 +542,7 @@ def test_a_stamp_deleted_mid_window_comes_back_on_the_next_tick(tmp_path):
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=_no_cycle,
         should_continue=three,
     )
@@ -601,6 +607,7 @@ def test_a_stamp_the_daemon_could_not_write_is_written_on_the_next_tick(tmp_path
         transport=Broken(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         cycle_runner=_no_cycle,
         should_continue=twice,
     )

@@ -225,7 +225,8 @@ def test_a_write_that_fails_exits_one_with_one_line(
 
 
 def test_the_pull_does_not_read_token_store(tmp_path, lake_root, monkeypatch, capsys, metadata):
-    # Running it is the decision. The gate belongs to the scheduled calls #702 adds.
+    # Running it is the decision. The gate belongs to the scheduled calls, the Sunday job's
+    # and the daemon's, which each read ``token_store`` before they pull (#702).
     StoreHook(json.dumps(TOKEN)).install(monkeypatch)
     token = tmp_path / "token.json"
 

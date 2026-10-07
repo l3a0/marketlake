@@ -1383,6 +1383,7 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
         "transport",
         "pinger",
         "compaction_runner",
+        "pull_runner",
         "assertion_runner",
     }
     assert seen["config_path"] == str(config)
@@ -1397,6 +1398,9 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     assert isinstance(seen["pinger"], UrllibPinger)
     # The live runner is the one that actually spawns a child process.
     assert seen["compaction_runner"] is daemon._spawn_compaction
+    # This config has no ``token_store`` key, so it is the ``file`` laptop, which ran the
+    # re-auth itself and pulls nothing.
+    assert seen["pull_runner"] is None
     # The topic, not just the class. It is the write credential for the ntfy channel, so
     # the wiring worth covering is which topic reached the transport. Asserting the class
     # alone passes a `main` that ignored --config and read the machine's own config,
@@ -1406,6 +1410,40 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     # ``caffeinate``. Compared equal to ``None`` rather than dropped from the call, so a
     # Mac handed the Linux no-op runner fails here.
     assert seen["assertion_runner"] is None
+
+
+@pytest.mark.parametrize(
+    ("token_store", "pulls"),
+    [("store", True), ("stoer", True), ("both", False), ("file", False)],
+)
+def test_main_pulls_the_token_only_where_the_token_parameter_is_the_source(
+    token_store, pulls, tmp_path, monkeypatch, capsys
+):
+    """``store`` and a mistyped value pull in auth death, ``file`` and ``both`` never do.
+
+    A ``both`` laptop ran the re-auth that put the parameter, so its own file is already
+    the newest token, and a pull there would only spend a ``GetParameter`` it has no grant
+    for (marketlake #703). A mistyped value falls to the side that cannot cost a token,
+    which is the one that pulls, and says so once at start.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root, token_store=token_store)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(daemon, "run_loop_from_config", lambda **kwargs: seen.update(kwargs))
+    assert daemon.main(["--config", str(config)]) == 0
+
+    if pulls:
+        assert seen["pull_runner"] is daemon._spawn_token_pull
+    else:
+        assert seen["pull_runner"] is None
+    lines = capsys.readouterr().err.splitlines()
+    unknown = [line for line in lines if "is not 'file', 'both' or 'store'" in line]
+    if token_store == "stoer":
+        (line,) = unknown
+        assert line.startswith("daemon: token_store 'stoer' is not 'file', 'both' or 'store'")
+    else:
+        assert unknown == []
 
 
 def test_main_on_linux_passes_a_runner_that_spawns_nothing(tmp_path, monkeypatch, on_linux):
@@ -1489,6 +1527,7 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_pat
         transport=FakeTransport(),
         pinger=pinger,
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=_stop_after(4),
     )
     # Four ticks, one window, one caffeinate process.
@@ -1517,6 +1556,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_config(tmp_path):
             transport=FakeTransport(),
             pinger=FakePinger(),
             compaction_runner=lambda args: None,
+            pull_runner=None,
             should_continue=_stop_after(1),
         )
 
@@ -1537,6 +1577,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_roster(tmp_path):
             transport=FakeTransport(),
             pinger=FakePinger(),
             compaction_runner=lambda args: None,
+            pull_runner=None,
             should_continue=_stop_after(1),
         )
 
@@ -1560,6 +1601,7 @@ def test_the_wired_daemon_still_runs_a_caller_tick_hook(tmp_path):
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=_stop_after(2),
     )
     assert len(ticks) == 2
@@ -1597,3 +1639,25 @@ def test_main_with_no_arguments_forwards_three_unset_paths(tmp_path, monkeypatch
     assert seen["token_path"] is None
     # The topic came from the file the variable names, so ``main`` read that config.
     assert seen["transport"]._topic == NTFY_TOPIC
+
+
+def test_a_pull_line_the_stderr_refuses_costs_nothing(monkeypatch):
+    # ``_start_token_pull`` runs from ``on_cycle``, which nothing guards, so a stderr that
+    # refuses the line must not raise into the loop, on either the started or the failed path.
+    class _Refusing:
+        def write(self, text: str) -> int:
+            raise OSError(5, "Input/output error")
+
+        def flush(self) -> None:
+            raise OSError(5, "Input/output error")
+
+    slot = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+
+    def refuse(args):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(daemon.sys, "stderr", _Refusing())
+    daemon._start_token_pull(calls.append, ["pull"], slot)
+    daemon._start_token_pull(refuse, ["pull"], slot)
+    assert calls == [["pull"]]
