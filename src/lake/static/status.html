@@ -1150,11 +1150,13 @@
   // The runway line. It is the panel's whole point, so it is first and it is a sentence
   // rather than a table cell.
   //
-  // Three readings are not a number and each says something different. No growth measured
-  // is not a long runway, it is a lake that stopped growing, which is a capture failure
-  // the Now panel above is the place to read. A runway past the calendar's horizon has no
-  // date because exchange_calendars knows about a year ahead, and a runway longer than a
-  // year is not the few weeks the headroom test cares about. A failed reading is neither.
+  // Three readings are not a number and each says something different. No growth in the
+  // window is not a long runway. Capture may have stopped, which the Now panel above is
+  // the place to read, or the lake may not have had a capture day yet. A compaction that
+  // refuses every ticker is not this case: its past days' journals stay on the disk and set
+  // the rate. A runway past the calendar's horizon has no date because exchange_calendars
+  // knows about a year ahead, and a runway longer than a year is not the few weeks the
+  // headroom test cares about. A failed reading is neither.
   function renderRunway(lake) {
     var box = byId("runway");
     clear(box);
@@ -1174,18 +1176,21 @@
         ". There is no free-space figure and so no runway.", "alarm");
     } else if (lake.capture_days_left === null) {
       line = el("p",
-        "No growth measured in the window, so there is no runway to report. " +
-        "That is a lake that stopped growing rather than a disk that will last. " +
-        "Read the Now panel for whether capture is running.", "note");
+        "No growth in the window, so there is no runway to report. " +
+        "That is not a disk that will last. Capture may have stopped, or the lake may " +
+        "not have had a capture day yet. Read the Now panel for whether capture is " +
+        "running.", "note");
     } else if (lake.beyond_horizon) {
       line = el("p",
-        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
-          "capture days") + " at the window's busiest day. That runs past the calendar's " +
-        "horizon, so there is no date for it, and it is not the " +
+        bytes(lake.free) + " free, less a " + bytes(lake.reserve_bytes) +
+        " journal reserve, is " + plural(lake.capture_days_left, "capture day",
+          "capture days") + " at the window's busiest day of growth. That runs " +
+        "past the calendar's horizon, so there is no date for it, and it is not the " +
         lake.headroom_weeks + " weeks the nightly report flags.");
     } else {
       line = el("p",
-        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
+        bytes(lake.free) + " free, less a " + bytes(lake.reserve_bytes) +
+        " journal reserve, is " + plural(lake.capture_days_left, "capture day",
           "capture days") + ", exhausted " + lake.exhausts_on + ".",
         lake.short ? "alarm" : null);
       if (lake.short) {
@@ -1194,6 +1199,16 @@
       }
     }
     box.appendChild(line);
+    if (lake.capture_days_left !== null) {
+      // The reserve holds a session's journal, which lands uncompressed under the lake
+      // root and is freed only when compaction seals it at close+15. Nothing records its
+      // size, so it is a multiple of the busiest day's sealed bytes, which leave out any
+      // journal a past day still carries.
+      box.appendChild(el("p",
+        "The journal reserve is " + bytes(lake.reserve_bytes) + ", room for one " +
+        "session's uncompressed journal before compaction seals it. It comes off in " +
+        "full even mid-session, when today's journal already fills part of it.", "muted"));
+    }
     if (!lake.space_error) {
       box.appendChild(el("p",
         "Free space is the whole device's, not the lake's allowance: " + bytes(lake.free) +
@@ -1244,7 +1259,8 @@
   // spread is visible rather than asserted.
   function renderGrowth(lake) {
     byId("growth-note").textContent =
-      lake.capture_days ? plural(lake.capture_days, "day", "days") + " with bytes" : "";
+      lake.capture_days ? plural(lake.capture_days, "day", "days") +
+        " of growth" : "";
     var box = byId("growth");
     clear(box);
     if (!lake.days.length) {
@@ -1252,8 +1268,12 @@
       return;
     }
     box.appendChild(el("p",
-      "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", which sets the " +
-      "runway. Mean " + bytes(lake.mean_bytes) + " over the days that wrote bytes. " +
+      "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", the busiest " +
+      "day's permanent growth, which sets the runway. A past day counts in full, " +
+      "including any journal compaction left on the disk. Today counts only its " +
+      "sealed bytes until it becomes a past day, so while its journal is there today " +
+      "reads larger below than it counts. " +
+      "Mean " + bytes(lake.mean_bytes) + " over the days that grew. " +
       "A mean over all " + lake.window_days + " calendar days would be lower still, and " +
       "a rate that is too low lengthens the runway rather than shortening it."));
     var wrap = el("div", null, "table-wrap");
@@ -1265,10 +1285,19 @@
       var tr = el("tr");
       tr.appendChild(el("td", day.day));
       tr.appendChild(el("td", bytes(day.bytes), "num"));
-      // An unsealed day is still journal segments, which are uncompressed and larger than
-      // the partition they become at close+15. The figure drops when it seals, and a
-      // number that halves at 16:30 with no explanation is a number a reader distrusts.
-      tr.appendChild(el("td", day.unsealed ? "unsealed, seals at close+15" : "", "muted"));
+      // An unsealed day still carries journal segments, which are uncompressed and larger
+      // than the partition they become. Today's segments normally seal at close+15 and the
+      // figure drops then. A compaction that refuses leaves them, and nothing on the disk
+      // tells the two apart, so today's label promises no seal. A number that halves at
+      // 16:30 with no explanation is a number a reader distrusts. A past day's segments are
+      // ones compaction left on the disk.
+      var note = "";
+      if (day.unsealed) {
+        note = day.day === lake.window_end
+          ? "unsealed, today's journal"
+          : "unsealed, journal segments left on disk";
+      }
+      tr.appendChild(el("td", note, "muted"));
       table.appendChild(tr);
     });
     wrap.appendChild(table);

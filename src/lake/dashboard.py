@@ -2443,10 +2443,11 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
 
 # -- the Lake panel ----------------------------------------------------------
 
-# The refusal a failed reading reports in place of a runway. ``shutil.disk_usage`` raises
-# for a root that is not there, and ``lake.runway.assess`` deliberately lets that through
-# rather than inventing a free-space figure. The containment belongs here, where the rule
-# that nothing may raise lives.
+# The refusal a failed reading reports in place of a runway. ``lake.runway.assess``
+# contains both of its own readings: a device that will not read is ``space_error`` and a
+# path that will not walk is a refusal, so neither reaches this tuple. It is the backstop
+# for a class neither of them expected. The containment belongs here, where the rule that
+# nothing may raise lives.
 _RUNWAY_READ_ERRORS = (OSError, ValueError)
 
 
@@ -2473,12 +2474,12 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     ``lake_root``. The sandbox refuses every path outside the root, so that reading could
     not have gone through DuckDB even if it wanted to.
 
-    The computation is ``lake.runway``'s rather than this module's, because the Sunday
-    run's third duty reads the same answer and marketlake #438 is where that lands. Two
-    independent computations would drift, and a panel and an alarm disagreeing about how
-    long the disk lasts is worse than either being wrong alone. It could not live here:
-    this module already imports ``lake.control_plane``, so a Sunday duty reading back into
-    it would close a cycle.
+    The computation is ``lake.runway``'s rather than this module's, because the evening
+    sweep reads the same answer to flag the nightly report and to page, which is
+    marketlake #438. Two independent computations would drift, and a panel and an alarm
+    disagreeing about how long the disk lasts is worse than either being wrong alone. The
+    sweep has no reason to import this module's DuckDB query layer to read a number off
+    the disk, so the computation sits in a module both can import.
 
     **Nothing here may raise**, for the reason ``query_history`` gives one panel over: a
     500 throws away every finding the payload was going to carry, and this payload's whole
@@ -2529,6 +2530,7 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
         ],
         "peak_day": runway.peak_day.isoformat() if runway.peak_day is not None else None,
         "peak_bytes": runway.peak,
+        "reserve_bytes": runway.reserve,
         "mean_bytes": runway.mean,
         "capture_days": runway.capture_days,
         "capture_days_left": runway.capture_days_left,

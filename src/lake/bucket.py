@@ -136,7 +136,7 @@ from lake.manifest import (
     parse_jsonl,
     sha256_file,
 )
-from lake.paths import MANIFEST_FILE
+from lake.paths import LOST_AND_FOUND, MANIFEST_FILE
 from lake.runner import BACKUP_EXCLUSIONS
 from lake.session import SessionClock
 
@@ -1365,10 +1365,6 @@ RESTORE_MARKER = ".marketlake-restore"
 # The file that says every file in the working directory verified. A run that finds it
 # finishes moving the files into the destination and downloads nothing.
 VERIFIED_MARKER = ".marketlake-verified"
-
-# The one entry a fresh filesystem holds, which the destination may hold and still count
-# as empty. ext4 creates it at the root of every new volume.
-LOST_AND_FOUND = "lost+found"
 
 # The suffix a file carries while its download is in flight. It is renamed onto its own
 # name only once its bytes have hashed to what they must.

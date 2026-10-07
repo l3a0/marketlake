@@ -9,6 +9,8 @@ checks the module reads the real device at all.
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Sequence
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -232,7 +234,8 @@ def test_the_rate_is_the_busiest_day_and_not_a_mean_over_the_window(
     # below the peak, which is what the panel shows the pair for.
     assert result.capture_days == 4
     assert result.mean is not None and result.mean < result.peak
-    assert result.capture_days_left == 10_000_000 // result.peak
+    # Thirteen sessions of the peak are the journal reserve, which comes off free first.
+    assert result.capture_days_left == (10_000_000 - 13 * result.peak) // result.peak
 
 
 def test_a_day_that_wrote_nothing_is_not_a_day_the_lake_grew_slowly_on(
@@ -259,10 +262,10 @@ def test_a_day_outside_the_window_sets_no_rate(tmp_path: Path, monkeypatch: pyte
 def test_no_growth_reports_no_runway_rather_than_an_unbounded_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # Reachable three ways: a fresh root, a lake read before its first capture day, and a
-    # window capture was down through. A runway goes unbounded exactly when capture has
-    # stopped, so reporting a large number there would go quiet at the one moment
-    # something is wrong. It is also the division by zero.
+    # Reachable when no day in the window grew the lake: a fresh root, a lake read before
+    # its first capture day, and a window capture was down through. The last is a failure,
+    # so reporting a large number there would go quiet at the one moment something is
+    # wrong. It is also the division by zero.
     _write(tmp_path, "manifest.jsonl", 10)
     _stub_space(monkeypatch, free=10_000_000)
     result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
@@ -270,6 +273,7 @@ def test_no_growth_reports_no_runway_rather_than_an_unbounded_one(
     assert result.exhausts_on is None
     assert result.mean is None
     assert result.short is False
+    assert result.critical is False
 
 
 # -- the runway's unit -------------------------------------------------------
@@ -285,8 +289,9 @@ def test_the_runway_is_counted_in_sessions_and_not_in_calendar_days(
     _stub_space(monkeypatch, free=0)
     result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == 0
-    # Five sessions' worth of free space, priced at the one day that wrote bytes.
-    _stub_space(monkeypatch, free=result.peak * 5)
+    # Five sessions' worth of free space past the 13-session journal reserve, priced at the
+    # one day that wrote bytes.
+    _stub_space(monkeypatch, free=result.peak * (5 + 13))
     result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == 5
     assert result.exhausts_on == MONDAY + timedelta(days=7)
@@ -341,9 +346,9 @@ def test_headroom_under_the_threshold_is_short_and_a_day_over_it_is_not(
         for offset in range(1, (inside - MONDAY).days + 1)
         if calendar.is_session(MONDAY + timedelta(days=offset))
     )
-    _stub_space(monkeypatch, free=peak * sessions)
+    _stub_space(monkeypatch, free=peak * (sessions + 13))
     assert assess(tmp_path, today=MONDAY, calendar=calendar).short is True
-    _stub_space(monkeypatch, free=peak * (sessions + 1))
+    _stub_space(monkeypatch, free=peak * (sessions + 1 + 13))
     assert assess(tmp_path, today=MONDAY, calendar=calendar).short is False
 
 
@@ -372,6 +377,7 @@ def test_the_usage_total_is_its_two_halves(tmp_path: Path):
         entries=(),
         day_bytes={},
         unsealed=frozenset(),
+        journal_bytes={},
         dated=7,
         undated=5,
         files=0,
@@ -414,7 +420,7 @@ def test_one_day_of_headroom_still_lands_on_the_next_session(
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=0)
     peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
-    _stub_space(monkeypatch, free=peak)
+    _stub_space(monkeypatch, free=peak * (1 + 13))
     result = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert result.capture_days_left == 1
     assert result.exhausts_on == MONDAY + timedelta(days=1)
@@ -523,6 +529,8 @@ def test_the_design_constants_are_pinned_to_their_literal_values():
     silently stops being flagged. The window and the refusal cap have the same shape.
     """
     assert HEADROOM_WEEKS == 3
+    assert runway.PAGE_FLOOR_WEEKS == 2
+    assert runway.JOURNAL_RESERVE_SESSIONS == 13
     assert runway.GROWTH_WINDOW_DAYS == 30
     assert runway.NAMED_REFUSALS == 3
     assert runway.MAX_FORWARD_DAYS == 366 * 2
@@ -538,7 +546,7 @@ def test_a_runway_inside_the_forward_bound_still_gets_a_date(
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=0)
     peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
-    _stub_space(monkeypatch, free=peak * 45)
+    _stub_space(monkeypatch, free=peak * (45 + 13))
     result = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert result.capture_days_left == 45
     assert result.exhausts_on is not None
@@ -818,3 +826,446 @@ def test_a_device_that_will_not_read_leaves_both_of_its_figures_unset(tmp_path: 
     assert usage.free is None
     assert usage.capacity is None
     assert usage.space_error == "FileNotFoundError"
+
+
+# -- the two tiers, counted in sessions from a Monday --------------------------
+
+
+def _peak_of_one_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """One sealed Monday partition, and the peak it sets, read with no free space at all."""
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _stub_space(monkeypatch, free=0)
+    return assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)).peak
+
+
+@pytest.mark.parametrize(
+    ("sessions", "short", "critical"),
+    [(10, True, True), (11, True, False), (15, True, False), (16, False, False)],
+)
+def test_the_page_floor_is_two_weeks_and_the_report_line_is_three(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sessions: int,
+    short: bool,
+    critical: bool,
+):
+    """Both thresholds, from both sides, with the session counts written out.
+
+    From a Monday with no holiday, two weeks is ten sessions and three weeks is fifteen, so
+    the page fires at ten and not at eleven, and the report line fires at fifteen and not at
+    sixteen. The counts are literals rather than derived from ``PAGE_FLOOR_WEEKS`` or
+    ``HEADROOM_WEEKS``, so a changed constant turns this red. Free space is the sessions
+    plus the 13-session journal reserve, which comes off first.
+    """
+    peak = _peak_of_one_day(tmp_path, monkeypatch)
+    _stub_space(monkeypatch, free=peak * (sessions + 13))
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
+    assert result.capture_days_left == sessions
+    assert result.short is short
+    assert result.critical is critical
+
+
+def test_free_space_under_the_reserve_reads_zero_days_and_fills_today(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The clamp. Without it, free space below the reserve reads a negative count.
+
+    Twelve sessions of free space is one short of the 13-session reserve, which is a disk
+    the next session's journal would fill. It reads zero capture days, fills today, and
+    pages. Fourteen sessions leaves one, which is the other side of the line.
+    """
+    peak = _peak_of_one_day(tmp_path, monkeypatch)
+    calendar = _weekday_calendar(MONDAY, 400)
+    _stub_space(monkeypatch, free=peak * 12)
+    under = assess(tmp_path, today=MONDAY, calendar=calendar)
+    assert under.reserve == peak * 13
+    assert under.capture_days_left == 0
+    assert under.exhausts_on == MONDAY
+    assert under.critical is True
+
+    _stub_space(monkeypatch, free=peak * 14)
+    over = assess(tmp_path, today=MONDAY, calendar=calendar)
+    assert over.capture_days_left == 1
+    assert over.exhausts_on == MONDAY + timedelta(days=1)
+
+
+def test_the_reserve_is_thirteen_sessions_of_the_busiest_sealed_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Carried on the result so the panel can name it. With no journal anywhere the sealed
+    # peak and the rate's peak are one figure, and the stuck-journal test below separates
+    # them.
+    peak = _peak_of_one_day(tmp_path, monkeypatch)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
+    assert result.reserve == 13 * peak
+    assert result.reserve > 0
+
+
+def test_todays_in_flight_journal_does_not_set_the_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Today's journal sets no rate, because the disk cannot say what state it is in.
+
+    Nothing on the disk tells a journal still growing from one part way through compaction
+    or one compaction refused, so a half-compacted journal counted in full would read as
+    growth. So today counts only its sealed bytes, and the peak is the past days' 40,960. Today is
+    still listed in the window, because its bytes are real. Counting today's journal would
+    read a 901,120-byte peak. Every size is a whole number of 4,096-byte blocks, so the
+    allocated bytes equal the written ones and the figures below are literals.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_960)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 20_480)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 901_120)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    sizes = dict(result.window_days)
+    assert sizes[date(2026, 9, 16)] == 901_120
+    assert result.usage.journal_bytes == {date(2026, 9, 16): 901_120}
+    assert result.peak_day == date(2026, 9, 14)
+    assert result.peak == 40_960
+    assert result.reserve == 532_480
+    assert result.capture_days == 2
+    assert result.mean == 30_720
+
+
+def test_a_sealed_day_still_sets_the_rate_beside_todays_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The other side: today's segments come off and nothing else, so a past day larger than
+    # today's journal is still the peak.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 901_120)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 40_960)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.peak_day == date(2026, 9, 14)
+    assert result.peak == 901_120
+
+
+def _twenty_weekdays(tmp_path: Path, files: Sequence[tuple[str, int]]) -> date:
+    """Write ``files`` for each of the twenty weekdays from ``MONDAY``, and return the last.
+
+    Each entry is a lake-relative path with ``{day}`` where the date goes, and its size.
+    The last weekday is Friday 2026-10-09, which the tests below read as today, so nineteen
+    of the twenty days are past days and one is today.
+    """
+    day = MONDAY
+    written = 0
+    while True:
+        if day.weekday() < 5:
+            for rel, size in files:
+                _write(tmp_path, rel.format(day=day.isoformat()), size)
+            written += 1
+            if written == 20:
+                return day
+        day += timedelta(days=1)
+
+
+def test_compaction_refusing_every_ticker_every_day_reads_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A past day's stuck journal is permanent growth, so it sets the rate.
+
+    Compaction refused every ticker on every day, so each day is a 1,003,520-byte journal
+    segment and the 4,096-byte timing file every session writes, with no Parquet at all.
+    The segments stay on the disk until someone repairs them, so the disk grows by a whole
+    day each session. Free space of about one day's journal is under one session left: it
+    fills today and pages.
+
+    Reading only sealed bytes, the rate would be the 4,096-byte timing file, and the same
+    disk would read 232 capture days left with no flag. Today's segment is the one left
+    out, because it may still be compacted, which leaves today's rate at 4,096 bytes. The
+    reserve is thirteen of those timing files, since no day sealed anything else.
+    """
+    today = _twenty_weekdays(
+        tmp_path,
+        [
+            ("journal/date={day}/surface=chains/ticker=SPY/seg-a.arrows", 1_003_520),
+            ("journal/timing/date={day}.jsonl", 4_096),
+        ],
+    )
+    assert today == date(2026, 10, 9)
+    calendar = _weekday_calendar(MONDAY, 400)
+
+    _stub_space(monkeypatch, free=1_003_520)
+    full = assess(tmp_path, today=today, calendar=calendar)
+    assert dict(full.window_days)[MONDAY] == 1_007_616
+    assert full.peak == 1_007_616
+    assert full.peak_day == MONDAY
+    assert full.capture_days == 20
+    # Nineteen past days of 1,007,616 bytes and today's 4,096, over twenty.
+    assert full.mean == 957_440
+    assert full.reserve == 53_248
+    assert full.capture_days_left == 0
+    assert full.exhausts_on == today
+    assert full.short is True
+    assert full.critical is True
+
+    # The other side: sixteen of those days past the reserve is over three weeks.
+    _stub_space(monkeypatch, free=53_248 + 16 * 1_007_616)
+    roomy = assess(tmp_path, today=today, calendar=calendar)
+    assert roomy.capture_days_left == 16
+    assert roomy.short is False
+    assert roomy.critical is False
+
+
+def test_a_ticker_that_never_seals_adds_its_leftover_to_the_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Compaction refuses one ticker-day at a time and seals the rest.
+
+    Each day here seals 602,112 bytes of SPY and leaves a 1,003,520-byte QQQ segment
+    behind, so the disk grows by 1,605,632 bytes a session and that is the rate. The
+    reserve is still thirteen sealed days, 7,827,456 bytes, because a journal scales with
+    the sealed session it compacts into.
+
+    At 17,461,248 bytes free, the sealed bytes alone would read sixteen capture days,
+    which is over three weeks and flags nothing. The disk actually has six, which pages.
+    """
+    today = _twenty_weekdays(
+        tmp_path,
+        [
+            ("chains/ticker=SPY/date={day}.parquet", 602_112),
+            ("journal/date={day}/surface=chains/ticker=QQQ/seg-a.arrows", 1_003_520),
+        ],
+    )
+    _stub_space(monkeypatch, free=17_461_248)
+    result = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
+    assert len(result.usage.unsealed) == 20
+    assert result.peak == 1_605_632
+    assert result.reserve == 7_827_456
+    assert result.capture_days_left == 6
+    assert result.short is True
+    assert result.critical is True
+
+
+def test_a_leftover_segment_leaves_its_days_sealed_bytes_in_the_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A day with one small leftover segment still counts its whole sealed set.
+
+    Dropping every such day from the rate read twenty weekdays of 602,112 sealed bytes,
+    each beside a 4,096-byte leftover segment, as no growth at all. On a full disk that
+    was no runway, not short, not critical, and no page. Each past day now counts in full,
+    606,208 bytes, since its leftover stays on the disk. Today counts 602,112, because its
+    segment may still be compacted. So a full disk fills today and pages.
+
+    The reserve is thirteen sealed days, 7,827,456 bytes. Sixteen sessions past it at the
+    606,208-byte rate is over three weeks and does neither. The free space here was once
+    sixteen sessions at the sealed 602,112 bytes. At the full rate that same figure buys
+    fifteen, which is short, so the free space is now written in the full rate.
+    """
+    today = _twenty_weekdays(
+        tmp_path,
+        [
+            ("chains/ticker=SPY/date={day}.parquet", 602_112),
+            ("journal/date={day}/surface=chains/ticker=QQQ/seg-a.arrows", 4_096),
+        ],
+    )
+    calendar = _weekday_calendar(MONDAY, 400)
+
+    _stub_space(monkeypatch, free=0)
+    full = assess(tmp_path, today=today, calendar=calendar)
+    assert len(full.usage.unsealed) == 20
+    assert full.peak == 606_208
+    # Nineteen past days of 606,208 bytes and today's 602,112, over twenty, rounded down.
+    assert full.mean == 606_003
+    assert full.capture_days == 20
+    assert full.reserve == 7_827_456
+    assert full.capture_days_left == 0
+    assert full.exhausts_on == today
+    assert full.short is True
+    assert full.critical is True
+
+    _stub_space(monkeypatch, free=7_827_456 + 16 * 606_208)
+    roomy = assess(tmp_path, today=today, calendar=calendar)
+    assert roomy.capture_days_left == 16
+    assert roomy.short is False
+    assert roomy.critical is False
+
+
+def test_the_busiest_day_sets_the_peak_with_its_leftover_and_the_reserve_without(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The busiest day is a past one carrying a leftover. Its whole 405,504 bytes stay on
+    # the disk, so that is the peak. Dropping it whole would hand the peak to the next day
+    # down, 200,704 bytes. The reserve is thirteen of its sealed 401,408 bytes, 5,218,304.
+    # The mean is 708,608 bytes over three days, rounded down.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 200_704)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 401_408)
+    _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 102_400)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert dict(result.window_days)[date(2026, 9, 15)] == 405_504
+    assert result.peak_day == date(2026, 9, 15)
+    assert result.peak == 405_504
+    assert result.reserve == 5_218_304
+    assert result.capture_days == 3
+    assert result.mean == 236_202
+
+
+def test_a_stuck_journal_raises_the_rate_and_not_the_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The reserve is thirteen of the busiest sealed day, whatever a past journal holds.
+
+    Monday sealed 401,408 bytes. Tuesday sealed 200,704 and left a 2,002,944-byte journal
+    stuck behind. Tuesday's whole 2,203,648 bytes are on the disk, so it sets the rate.
+    The reserve holds one session's journal, which scales with the sealed session, so it
+    is thirteen of Monday's 401,408 bytes, 5,218,304. Thirteen of Tuesday's would be
+    28,647,424, a stuck day inflating the reserve thirteen-fold.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 401_408)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 200_704)
+    _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 2_002_944)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 102_400)
+    _stub_space(monkeypatch, free=50_000_000)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.peak_day == date(2026, 9, 15)
+    assert result.peak == 2_203_648
+    assert result.reserve == 5_218_304
+    # (50,000,000 - 5,218,304) // 2,203,648.
+    assert result.capture_days_left == 20
+
+
+def test_a_timing_file_counts_as_its_days_sealed_growth_and_not_as_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # ``journal/timing/date=D.jsonl`` sits under ``journal/`` but is not a segment. It
+    # outlives the seal and is permanent growth, so it stays in today's sealed bytes and in
+    # the reserve's basis. Reading it as journal would take 8,192 bytes off today's rate,
+    # leaving 401,408, and 106,496 off the reserve.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 401_408)
+    _write(tmp_path, "journal/timing/date=2026-09-16.jsonl", 8_192)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.usage.journal_bytes == {date(2026, 9, 16): 4_096}
+    assert result.usage.day_bytes[date(2026, 9, 16)] == 413_696
+    assert result.peak == 409_600
+    assert result.reserve == 5_324_800
+
+
+# -- what the walk skips at the root -----------------------------------------
+
+
+def test_lost_and_found_at_the_root_is_skipped_and_one_below_it_is_refused(tmp_path: Path):
+    """``mkfs.ext4`` leaves ``lost+found`` at the volume's root, owned by root at 0700.
+
+    On the hosted VM ``lake_root`` is that mount point, so a walk that descended into it
+    would report a refusal every night that names nothing about the lake. One anywhere
+    else is not the filesystem's, so an unreadable one is still a refusal.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _write(tmp_path, "lost+found/orphan", 10)
+    _write(tmp_path, "chains/lost+found/orphan", 10)
+    at_root = tmp_path / "lost+found"
+    nested = tmp_path / "chains" / "lost+found"
+    at_root.chmod(0o000)
+    nested.chmod(0o000)
+    try:
+        usage = walk(tmp_path)
+    finally:
+        at_root.chmod(0o755)
+        nested.chmod(0o755)
+    assert usage.refusals == ("chains/lost+found: PermissionError",)
+    assert usage.refused == 1
+    assert "lost+found" not in {entry.name for entry in usage.entries}
+
+
+def test_a_readable_lost_and_found_at_the_root_is_not_counted_either(tmp_path: Path):
+    # Skipped before it is listed, so a readable one adds no entry and no bytes. A walk that
+    # only swallowed its refusal would still count what it could read.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _write(tmp_path, "lost+found/orphan", 50_000)
+    usage = walk(tmp_path)
+    assert {entry.name for entry in usage.entries} == {"chains"}
+    assert usage.files == 1
+
+
+def test_lost_and_found_is_skipped_when_the_root_is_reached_through_a_symlink(tmp_path: Path):
+    # The walk lists the resolved root, so the root it compares each listing against must be
+    # the resolved one too. Otherwise a configured path through a link walks the
+    # filesystem's own directory and counts it.
+    volume = tmp_path / "volume"
+    _write(volume, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _write(volume, "lost+found/orphan", 50_000)
+    link = tmp_path / "lake"
+    link.symlink_to(volume)
+    usage = walk(link)
+    assert {entry.name for entry in usage.entries} == {"chains"}
+    assert usage.files == 1
+
+
+# -- a directory that vanishes mid-walk --------------------------------------
+
+
+def _vanish_on_listing(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Remove ``target`` the moment the walk lists it, the way compaction's prune does.
+
+    ``os.walk`` lists each directory through ``os.scandir`` after its parent's listing
+    already named it, so removing it at that call is the race ``_prune_empty`` runs.
+    """
+    real = os.scandir
+
+    def scandir(path=None):
+        # ``shutil.rmtree`` lists by file descriptor, so only a path is compared.
+        if isinstance(path, (str, os.PathLike)) and Path(path) == target and target.exists():
+            shutil.rmtree(target)
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
+def test_a_directory_pruned_mid_walk_is_skipped_and_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Compaction removes an emptied ``journal/date=<D>/`` while holding the lake lock.
+
+    Measured before the fix, a walk that met it reported
+    ``journal/date=2026-10-07: FileNotFoundError``, every weekday at close+15 on a lake
+    behaving as designed. The vanished file is already skipped, and this is its directory
+    form.
+    """
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 10)
+    _vanish_on_listing(monkeypatch, tmp_path.resolve() / "journal" / "date=2026-09-16")
+    usage = walk(tmp_path)
+    assert usage.refused == 0
+    assert usage.refusals == ()
+    assert {entry.name for entry in usage.entries} == {"chains"}
+
+
+def test_a_root_that_vanishes_as_the_walk_starts_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The skip is for directories below the root. The root going away is a panel pointed at
+    # nothing, the same as a root that was never there.
+    lake = tmp_path / "lake"
+    _write(lake, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _vanish_on_listing(monkeypatch, lake.resolve())
+    usage = walk(lake)
+    assert usage.refusals == ("the lake root: FileNotFoundError",)
+
+
+def test_a_vanished_listing_that_names_no_path_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A ``FileNotFoundError`` carrying no filename cannot be told apart from the root
+    # going, so it refuses rather than being skipped.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    target = tmp_path.resolve() / "chains" / "ticker=SPY"
+    real = os.scandir
+
+    def scandir(path=None):
+        if isinstance(path, (str, os.PathLike)) and Path(path) == target:
+            raise FileNotFoundError("gone")
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    usage = walk(tmp_path)
+    assert usage.refused == 1
+    # Named as the root. The failure carries no path of its own, and naming it by its class
+    # alone would hide that it reads the same as the whole lake going.
+    assert usage.refusals == ("the lake root: FileNotFoundError",)

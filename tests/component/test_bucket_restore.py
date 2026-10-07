@@ -1155,6 +1155,7 @@ def test_a_working_directory_left_beside_a_finished_lake_is_named_as_finished(tm
         pytest.param("lake/Manifest.jsonl", id="manifest-in-another-case"),
         pytest.param("lake/.MARKETLAKE-RESTORE", id="marker-in-another-case"),
         pytest.param("lake/x\x00y", id="nul-byte"),
+        pytest.param("lake/lost+found/orphan", id="lost-and-found"),
     ],
 )
 def test_a_key_that_would_clobber_the_restore_s_own_files_is_never_written(tmp_path, key):
