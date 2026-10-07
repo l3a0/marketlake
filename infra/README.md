@@ -792,7 +792,7 @@ pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A tag the metadata
 service does not serve gives exit 3, which the first boot retries, because AWS does
 not document that a tag given at launch is served from the first moment of the
 first boot. The line names both causes. Either the tag is not served yet, or the
-instance has no tag or has `instance_metadata_tags` disabled, which is fixed in
+instance has no tag or has `instance_metadata_tags` disabled, which the owner fixes in
 `vm.tf`. Metadata that does not answer also gives exit 3. Any other HTTP error from
 it gives exit 1, and so does a redirect, which the render never follows. A tag value
 that is empty, padded or not UTF-8 makes the render refuse with exit 2.
@@ -1077,8 +1077,8 @@ describe the instance can read it. The boot takes two steps.
    these steps and releases it during the 20 seconds it waits before a retry. One
    attempt against an SSM endpoint that hangs holds the lock about 160 seconds, four
    botocore attempts of up to 40 seconds each, well under the 600 seconds another
-   install waits for it. A metadata read cannot hang that long, because it gives up
-   after two 1-second attempts.
+   install waits for it. A metadata read cannot hang that long, because each request
+   to the metadata service times out after a second.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`

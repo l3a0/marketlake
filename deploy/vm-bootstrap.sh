@@ -428,8 +428,8 @@ done
 # The lock is taken around each attempt, never across the retries, and the 20-second
 # wait runs without it. One attempt against an SSM endpoint that hangs takes about 160
 # seconds: four botocore attempts, the first and three retries, each a 10-second connect
-# timeout and a 30-second read timeout. A metadata read cannot hang that long, because
-# it gives up after two 1-second attempts. So the lock is held about 160 seconds at a
+# timeout and a 30-second read timeout. A metadata read cannot hang that long: each
+# request to the metadata service times out after a second. So the lock is held about 160 seconds at a
 # time, under the 600 seconds another install waits for it with flock -w 600. Held
 # across all six attempts of both steps and the 20-second waits between them, it could
 # stay taken about 2,100 seconds.
