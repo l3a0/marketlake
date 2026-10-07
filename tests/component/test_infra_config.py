@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and seven things are not in one.
+``tofu test`` sees one configuration's plan, and nine things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -23,6 +23,14 @@
    ``aws_iam_role_policy_attachments_exclusive``, detaches every managed policy it does
    not list on each apply, the SSM policy included. An assert can only name what is
    present, so an added argument or resource type passes every ``tofu test`` run.
+8. Every policy on an IAM user in ``infra/live``. An assert names the policy it checks,
+   so a second inline policy on the same user passes it, and the apply role's
+   ``iam:PutUserPolicy`` would apply it.
+9. Whether either configuration declares an SSM parameter as a resource or a data
+   source. A data source, or a resource that takes its value the ordinary way, puts the
+   decrypted value into the state, which every pull request's plan role can read, and a
+   mock provider plans it without complaint. An ephemeral block stores nothing, so it
+   stays allowed.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -47,7 +55,9 @@ _OPTIONS = hcl2.SerializationOptions(
     strip_string_quotes=True, explicit_blocks=False, with_comments=False
 )
 
-# Price 4 of issue #664: every resource whose loss would lose backups or stop them.
+# Price 4 of issue #664: every resource whose loss would lose backups or stop them. The
+# token writer and its policy are here too (#699). CI cannot delete either, so a pull
+# request that renames one fails at plan rather than at apply.
 PREVENT_DESTROY = [
     "bootstrap/aws_s3_bucket.state",
     "bootstrap/aws_s3_bucket_versioning.state",
@@ -58,6 +68,8 @@ PREVENT_DESTROY = [
     "live/aws_s3_bucket_lifecycle_configuration.backup",
     "live/aws_iam_user.backup",
     "live/aws_iam_user_policy.backup",
+    "live/aws_iam_user.token_writer",
+    "live/aws_iam_user_policy.token_writer",
 ]
 
 # Every resource type the bootstrap may hold. A new type, such as a second way to
@@ -160,6 +172,64 @@ def test_configuration_calls_no_module(config: str) -> None:
         with path.open() as f:
             parsed = hcl2.load(f, serialization_options=_OPTIONS)
         assert not parsed.get("module"), f"infra/{config}/{path.name} calls a module"
+
+
+# Each of these puts a parameter's decrypted value into the state (#699). An ephemeral
+# block reads a value without storing it, so it stays allowed.
+_PARAMETER_VALUE_TYPES = {"aws_ssm_parameter", "aws_ssm_parameters_by_path"}
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_configuration_keeps_parameter_values_out_of_state(config: str) -> None:
+    for path in sorted((INFRA / config).glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        for kind in ("resource", "data"):
+            declared = {rtype for block in parsed.get(kind, []) for rtype in block}
+            assert not declared & _PARAMETER_VALUE_TYPES, (
+                f"infra/{config}/{path.name} declares a {kind} that stores a parameter's value"
+            )
+        # A data block scoped inside a check block is stored in the state too.
+        scoped = {
+            rtype
+            for check in parsed.get("check", [])
+            for body in check.values()
+            for block in body.get("data", [])
+            for rtype in block
+        }
+        assert not scoped & _PARAMETER_VALUE_TYPES, (
+            f"infra/{config}/{path.name} reads a parameter's value in a check block"
+        )
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_configuration_is_only_tf_files(config: str) -> None:
+    """tofu also loads ``*.tf.json``, ``*.tofu`` and ``*.tofu.json``, and a ``.tofu``
+    file replaces the ``.tf`` file of the same name. Every check here reads ``*.tf``."""
+    others = [
+        p.name
+        for pattern in ("*.tf.json", "*.tofu", "*.tofu.json")
+        for p in (INFRA / config).glob(pattern)
+    ]
+    assert others == []
+
+
+def test_live_role_carries_exactly_its_inline_policies() -> None:
+    """The role-side twin of the one-policy-per-user check. The apply role's
+    ``iam:PutRolePolicy`` would apply any third inline policy on marketlake-instance."""
+    policies = sorted(
+        (_role_name(body["role"]), address.split(".")[1])
+        for address, body in _resources("live").items()
+        if address.split(".")[0] == "aws_iam_role_policy"
+    )
+    assert policies == [("instance", "instance_config_read"), ("instance", "instance_s3")]
+
+
+def test_token_writer_user_sets_only_its_name() -> None:
+    """A path, tags or a permissions boundary changes what the apply role's grant on
+    ``user/marketlake-token-writer`` must allow, and the first apply is refused."""
+    body = _resources("live")["aws_iam_user.token_writer"]
+    assert set(body) <= {"name", "lifecycle"}
 
 
 def test_bootstrap_holds_only_known_resource_types() -> None:
@@ -277,6 +347,7 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
         ("role", "marketlake-instance"),
         ("instance-profile", "marketlake-instance"),
         ("user", "marketlake-backup"),
+        ("user", "marketlake-token-writer"),
     }
     assert declared == granted
 
@@ -328,3 +399,34 @@ def test_apply_role_may_attach_every_policy_live_attaches() -> None:
         assert any(role in roles and arn in arns for roles, arns in grants), (
             f"infra/live/{address} attaches {arn} to {role}, which the apply role may not"
         )
+
+
+# Each of these gives a user a policy that no aws_iam_user_policy block shows.
+_USER_POLICY_ROUTES = {
+    "aws_iam_user_policy_attachment",
+    "aws_iam_policy_attachment",
+    "aws_iam_user_group_membership",
+    "aws_iam_group_membership",
+}
+
+
+def test_each_live_user_carries_exactly_one_inline_policy() -> None:
+    """``tofu test`` compares each user's policy by its address, so a second policy on
+    the same user passes it. That would give the token writer more than its one put, or
+    ``marketlake-backup`` an SSM permission."""
+    resources = _resources("live")
+    assert not {address.split(".")[0] for address in resources} & _USER_POLICY_ROUTES
+
+    users = sorted(a.split(".")[1] for a in resources if a.split(".")[0] == "aws_iam_user")
+    assert users
+    policies: list[str] = []
+    for address, body in resources.items():
+        if address.split(".")[0] not in ("aws_iam_user", "aws_iam_user_policy"):
+            continue
+        # One block must mean one user or one policy.
+        assert "count" not in body and "for_each" not in body, address
+        if address.startswith("aws_iam_user_policy."):
+            match = re.fullmatch(r"\$\{aws_iam_user\.(\w+)\.(?:name|id)\}", body["user"])
+            assert match, f"a user must be referenced through its resource, got {body['user']!r}"
+            policies.append(match.group(1))
+    assert sorted(policies) == users

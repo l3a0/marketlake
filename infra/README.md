@@ -18,10 +18,11 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    AWS credentials. The plan role reads, and pull requests may assume it. The apply role
    writes, and only the `infra` environment on `main` may assume it. CI cannot apply the
    configuration that creates it, so the owner applies this one from the laptop.
-2. `infra/live/` holds the backup bucket, its IAM user `marketlake-backup`, and the
-   instance role `marketlake-instance`. `.github/workflows/infra.yml` plans it on each
-   pull request from a branch here, and applies it after a merge to `main` once the owner
-   approves the run.
+2. `infra/live/` holds the backup bucket, its IAM user `marketlake-backup`, the instance
+   role `marketlake-instance` with its read of the config parameters, and the IAM user
+   `marketlake-token-writer`, which writes the Schwab token's parameter.
+   `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
+   applies it after a merge to `main` once the owner approves the run.
 
 The laptop also applies any change the apply role may not make, such as the backup
 bucket's versioning or a role's trust policy. A trust policy says who may assume the
@@ -633,13 +634,138 @@ request does not change. Every checkout reads the same backend file in
 change away, and OpenTofu gives no warning. After the merge, plan the bootstrap from
 `main`'s merge commit, as in step 11, and expect no changes.
 
+## The config parameters
+
+The hosted VM's `config.yaml` is written at deploy time from SSM Parameter Store, so a VM
+can be rebuilt and a secret rotated without logging in to it
+([#699](https://github.com/l3a0/marketlake/issues/699)). Five `SecureString` parameters
+sit under `/marketlake/config/`. Each of the first four is the `config.yaml` key it fills,
+written in kebab case.
+
+1. `/marketlake/config/schwab-api-key`, for `schwab_api_key`.
+2. `/marketlake/config/schwab-app-secret`, for `schwab_app_secret`.
+3. `/marketlake/config/healthchecks-ping-key`, for `healthchecks_ping_key`.
+4. `/marketlake/config/ntfy-topic`, for `ntfy_topic`.
+5. `/marketlake/config/schwab-oauth-token`, the contents of `token.json`.
+
+The code manages no parameter and names only the path. A parameter resource needs its
+value at apply time, so CI would hold every secret, and a data source writes the
+decrypted value into the state. So the owner puts each value from the laptop. `marketlake-instance` reads the path, and neither CI role can. AWS's
+`AmazonSSMManagedInstanceCore`, which [#695](https://github.com/l3a0/marketlake/issues/695)
+attaches, lets the instance role read every parameter in the account, which holds no
+other secret. `marketlake-token-writer` can only overwrite the
+token, which the laptop's weekly re-auth does when its `config.yaml` sets
+`token_store: both` ([#636](https://github.com/l3a0/marketlake/issues/636)).
+
+### Create the token writer, in order
+
+The pull request that adds the token writer changes the bootstrap too, so it follows
+[Changing the bootstrap](#changing-the-bootstrap).
+
+1. Apply the bootstrap from the laptop, from the pull request's branch at its final head,
+   as in step 7. That gives the apply role `iam:CreateUser` and `iam:PutUserPolicy` on
+   `marketlake-token-writer`.
+2. Merge, then approve the `tofu apply (live)` run, which creates the user and its
+   policy.
+3. Create an access key for `marketlake-token-writer` in the AWS console. The key goes
+   into the laptop's `config.yaml` under
+   [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys, and it
+   stays out of code, so no secret reaches the state.
+
+Never create the user by hand. The live apply creates it, and its `CreateUser` fails with
+`EntityAlreadyExists` when the user already exists. A rebuild into a fresh account
+creates the token writer's key after its own live apply, then puts all five values below.
+
+### Put the values
+
+Every command below passes `--profile marketlake-admin` and `--region us-east-1`. The CI
+roles' Deny and the VM's read both name that region, so a parameter put anywhere else is
+readable by the plan role and out of the VM's reach. Each passes `--tier Standard`,
+because a parameter once put as Advanced never moves back to Standard, and
+[#636](https://github.com/l3a0/marketlake/issues/636)'s re-auth puts the token as
+Standard, so its puts would then fail. Each also passes `--overwrite`, so a re-run
+replaces the value instead of failing with `ParameterAlreadyExists`.
+
+Each of the four secrets is read from the keyboard into a variable. A value typed on the
+command line lands in shell history. A value kept in a file picks up the editor's
+trailing newline, and the put stores that newline as part of the secret. `read -rs`
+echoes nothing and writes nothing to disk, and `unset` drops the value after the put.
+The value is piped into the put and read from `file:///dev/stdin`, so it never appears
+in any command's arguments. `ps` shows every argument of a running command, and on macOS
+it shows them across users. `printf '%s'` adds no newline. Passing `--value "$V"` would
+also fail with `expected one argument` for a value that starts with `-`, and would read a
+value that starts with `file://` as a path. Each command prints a prompt. Paste the
+value and press Enter. The prompt comes from `printf`, because zsh's `read -p` means a
+coprocess and leaves the variable empty. The variable lives in one command line, because
+a command run through Claude Code's `!` prefix may start a fresh shell.
+
+```bash
+printf 'Schwab API key: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/schwab-api-key --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+```
+
+```bash
+printf 'Schwab app secret: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/schwab-app-secret --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+```
+
+```bash
+printf 'Healthchecks ping key: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/healthchecks-ping-key --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+```
+
+```bash
+printf 'ntfy topic: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/ntfy-topic --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
+```
+
+The token comes from its file, which `src/lake/reauth.py`'s `write_token` writes with no
+trailing newline. Skip this put when
+[#636](https://github.com/l3a0/marketlake/issues/636)'s re-auth has already written the
+token.
+
+```bash
+aws ssm put-parameter --name /marketlake/config/schwab-oauth-token --value "file://$HOME/.config/marketlake/token.json" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1
+```
+
+Optionally, check that all five landed. The listing shows each parameter's name, type
+and tier, and never a value.
+
+```bash
+aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --parameter-filters "Key=Path,Values=/marketlake/config"
+```
+
+### Recover from a leaked token-writer key
+
+A put can change more than the value. It can move the parameter to the Advanced tier,
+attach a parameter policy, set an allowed pattern, or store a forged token that the VM's
+pull accepts. So recovery deletes the parameter whatever its listing shows, and a fresh
+re-auth puts the real token back.
+
+1. Deactivate the key for `marketlake-token-writer` in the AWS console.
+2. Create a new access key for the same user, and put it in the laptop's `config.yaml`
+   under [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys.
+3. Delete the parameter.
+
+   ```bash
+   aws ssm delete-parameter --name /marketlake/config/schwab-oauth-token --profile marketlake-admin --region us-east-1
+   ```
+
+4. Run the weekly re-auth, the rendered `reauth.sh`, which creates the parameter again as
+   a Standard `SecureString`. While the laptop's `config.yaml` leaves `token_store` absent
+   or `file`, the re-auth puts nothing, so put the token again with the `file://` command
+   above instead.
+5. Delete the deactivated key in the console. A user holds at most two access keys, and a
+   deactivated key counts toward the two.
+
+Step 4 mints a new token rather than putting the laptop's existing `token.json` again. A
+forged token can carry a later mint time than that file, and the VM's pull never writes
+an older mint over a newer one. The guard against a forged token belongs to
+[#636](https://github.com/l3a0/marketlake/issues/636)'s pull, which refuses a mint time
+more than an hour past its own clock. So if capture has not recovered, re-auth once more
+after that hour.
+
 ## Bootstrap changes already known
 
-Three open issues change `infra/bootstrap/`, and each follows the order under
+Two open issues change `infra/bootstrap/`, and each follows the order under
 [Changing the bootstrap](#changing-the-bootstrap). Each issue carries its own scope.
 
 1. [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role.
-2. [#699](https://github.com/l3a0/marketlake/issues/699) widens the apply role's grants to
-   a new IAM user.
-3. [#704](https://github.com/l3a0/marketlake/issues/704) widens the apply role's trust to
+2. [#704](https://github.com/l3a0/marketlake/issues/704) widens the apply role's trust to
    a second environment.

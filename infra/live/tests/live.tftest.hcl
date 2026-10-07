@@ -3,7 +3,13 @@
 # success. prevent_destroy itself is checked by tests/component/test_infra_config.py,
 # which reads the .tf files.
 
-mock_provider "aws" {}
+mock_provider "aws" {
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "000000000000"
+    }
+  }
+}
 
 variables {
   backup_bucket      = "example-lake-backup"
@@ -147,6 +153,65 @@ run "user_and_instance_role_get_the_same_four_actions" {
   }
 }
 
+# No variable is set, so instance_s3_enabled keeps its default of false. The VM reads
+# its config on the shadow day, before the cutover turns the S3 policy on, and a count
+# on this policy would make the unindexed references below fail.
+run "instance_reads_exactly_the_config_parameters" {
+  command = plan
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.instance_config_read.policy).Statement == [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:GetParameters"]
+        Resource = "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"
+      },
+    ]
+    error_message = "marketlake-instance's config read is not exactly GetParameter and GetParameters on /marketlake/config/*."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_config_read.role == aws_iam_role.instance.name
+    error_message = "The config read policy is not on marketlake-instance."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_config_read.name == "config-parameters-read"
+    error_message = "The config read policy is not named config-parameters-read."
+  }
+}
+
+run "token_writer_puts_only_the_token" {
+  command = plan
+
+  # The apply role may write only the user named marketlake-token-writer.
+  assert {
+    condition     = aws_iam_user.token_writer.name == "marketlake-token-writer"
+    error_message = "The token writer is not named marketlake-token-writer, the user the apply role may create."
+  }
+
+  assert {
+    condition     = aws_iam_user_policy.token_writer.user == aws_iam_user.token_writer.name
+    error_message = "The token's put policy is not on marketlake-token-writer."
+  }
+
+  assert {
+    condition     = aws_iam_user_policy.token_writer.name == "put-schwab-oauth-token"
+    error_message = "The token writer's policy is not named put-schwab-oauth-token."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_user_policy.token_writer.policy).Statement == [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/schwab-oauth-token"
+      },
+    ]
+    error_message = "marketlake-token-writer's policy is not exactly PutParameter on the token parameter."
+  }
+}
+
 run "lifecycle_rules_are_exactly_the_four" {
   command = plan
 
@@ -223,4 +288,29 @@ run "a_name_with_a_space_fails_validation" {
   }
 
   expect_failures = [var.backup_bucket, var.backup_policy_name]
+}
+
+# The mock account id is also what a hard-coded ARN would carry, so plan once under a
+# second account. An ARN that does not follow the caller's account names nobody's
+# parameter, and the VM's read and the token's write would both be refused.
+run "parameter_arns_follow_the_callers_account" {
+  command = plan
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "111111111111"
+    }
+  }
+
+  assert {
+    condition = [
+      jsondecode(aws_iam_role_policy.instance_config_read.policy).Statement[0].Resource,
+      jsondecode(aws_iam_user_policy.token_writer.policy).Statement[0].Resource,
+      ] == [
+      "arn:aws:ssm:us-east-1:111111111111:parameter/marketlake/config/*",
+      "arn:aws:ssm:us-east-1:111111111111:parameter/marketlake/config/schwab-oauth-token",
+    ]
+    error_message = "A parameter ARN does not name the caller's account."
+  }
 }
