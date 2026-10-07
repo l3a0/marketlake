@@ -18,7 +18,9 @@ LAKE_VOLUME_ID=${lake_volume_id}
 CONF
 chmod 0644 /etc/marketlake/bootstrap.conf
 
-home="$(getent passwd '${owner}' | cut -d: -f6)"
+# getent exits 2 for a missing account, which pipefail and set -e would turn into a
+# silent exit before the check below prints its line.
+home="$(getent passwd '${owner}' | cut -d: -f6)" || true
 if [ -z "$home" ]; then
   echo "user-data: no account named ${owner}" >&2
   exit 1
