@@ -814,11 +814,7 @@ def _check_disk_runway(
     a capture page's place under ``alert.DEFAULT_DAILY_CAP``.
     """
     try:
-        # The journal is never in flight here. The gate at the call site runs this check
-        # only on a day with no session or once the option close plus
-        # ``COMPACTION_DELAY`` has passed, so today's journal is either compacted or
-        # stuck, and a stuck one stays on the disk like a past day's.
-        runway = assess(lake_root, today=day, calendar=calendar, journal_in_flight=False)
+        runway = assess(lake_root, today=day, calendar=calendar)
         if runway.space_error is not None:
             report.add(f"disk runway unreadable: {runway.space_error}", ACTION)
         usage = runway.usage
@@ -996,9 +992,7 @@ def sweep(
     # a run between 16:00 and 16:30 would still read today's journal. A day with no session
     # has no journal to wait for, and the ``not session`` arm short-circuits first because
     # ``option_close`` refuses a non-session. Gating on ``today in usage.unsealed`` instead
-    # would silence the night a compaction failed, which is a night this check is for. This
-    # gate is also why ``_check_disk_runway`` passes ``journal_in_flight=False``: past it, a
-    # journal still under today is one compaction refused, and it counts in full.
+    # would silence the night a compaction failed, which is a night this check is for.
     if not session or calendar.option_close(day) + COMPACTION_DELAY <= now:
         _check_disk_runway(
             root, day=day, now=now, calendar=calendar, publisher=publisher, report=report

@@ -143,7 +143,7 @@ from lake.security_master import (
     SecurityMasterError,
     master_path,
 )
-from lake.session import COMPACTION_DELAY, SessionClock, SessionPhase, session_slots
+from lake.session import SessionClock, SessionPhase, session_slots
 
 log = logging.getLogger(__name__)
 
@@ -2465,21 +2465,6 @@ def _entry_rows(usage: RunwayUsage) -> list[dict[str, object]]:
     ]
 
 
-def _journal_in_flight(ctx: QueryContext, today: date) -> bool:
-    """Whether today's journal is still being written or waiting for compaction.
-
-    That is a session day before the option close plus ``COMPACTION_DELAY``, the moment
-    compaction runs. Before it the journal is still growing and is about to be compacted
-    into a partition 9 to 13 times smaller, so the runway counts only today's sealed bytes.
-    From it on, a journal still under today is one compaction refused, and it counts in
-    full. A day with no session has no journal to wait for. The gate is the option close
-    rather than the equity close, since between the two the journal is still growing.
-    """
-    if not ctx.calendar.is_session(today):
-        return False
-    return ctx.now < ctx.calendar.option_close(today) + COMPACTION_DELAY
-
-
 def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
     """The Lake panel: size by surface, growth rate, and the disk runway.
 
@@ -2508,13 +2493,10 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     the ordinary case rather than the exotic one.
     """
     try:
-        today = ctx.session.session_date()
-        in_flight = _journal_in_flight(ctx, today)
         runway = assess(
             ctx.paths.root,
-            today=today,
+            today=ctx.session.session_date(),
             calendar=ctx.calendar,
-            journal_in_flight=in_flight,
             window_days=GROWTH_WINDOW_DAYS,
         )
     except _RUNWAY_READ_ERRORS as exc:
@@ -2529,7 +2511,6 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
         "window_days": GROWTH_WINDOW_DAYS,
         "window_start": runway.window_start.isoformat(),
         "window_end": runway.window_end.isoformat(),
-        "journal_in_flight": in_flight,
         "free": runway.free,
         "capacity": runway.capacity,
         "space_error": runway.space_error,

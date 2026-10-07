@@ -228,12 +228,7 @@ def test_the_rate_is_the_busiest_day_and_not_a_mean_over_the_window(
     for day, size in ((14, 400_000), (15, 500_000), (16, 450_000)):
         _write(tmp_path, f"chains/ticker=SPY/date=2026-09-{day}.parquet", size)
     _stub_space(monkeypatch, free=10_000_000)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 15)
     # Four days wrote bytes, not thirty. The mean is denominated by those, and it is still
     # below the peak, which is what the panel shows the pair for.
@@ -250,12 +245,7 @@ def test_a_day_that_wrote_nothing_is_not_a_day_the_lake_grew_slowly_on(
     # weekend, and every day before capture started, none of which are slow growth.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 400_000)
     _stub_space(monkeypatch, free=10_000_000)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days == 1
     assert result.mean == result.peak
 
@@ -265,12 +255,7 @@ def test_a_day_outside_the_window_sets_no_rate(tmp_path: Path, monkeypatch: pyte
     _write(tmp_path, "chains/ticker=SPY/date=2025-01-02.parquet", 9_000_000)
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 400_000)
     _stub_space(monkeypatch, free=10_000_000)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 16)
 
 
@@ -283,12 +268,7 @@ def test_no_growth_reports_no_runway_rather_than_an_unbounded_one(
     # wrong. It is also the division by zero.
     _write(tmp_path, "manifest.jsonl", 10)
     _stub_space(monkeypatch, free=10_000_000)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left is None
     assert result.exhausts_on is None
     assert result.mean is None
@@ -307,16 +287,12 @@ def test_the_runway_is_counted_in_sessions_and_not_in_calendar_days(
     # a capture-day count by a ratio would be a guess where the calendar has the answer.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 100)
     _stub_space(monkeypatch, free=0)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == 0
     # Five sessions' worth of free space past the 13-session journal reserve, priced at the
     # one day that wrote bytes.
     _stub_space(monkeypatch, free=result.peak * (5 + 13))
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == 5
     assert result.exhausts_on == MONDAY + timedelta(days=7)
     assert result.exhausts_on != MONDAY + timedelta(days=5)
@@ -330,9 +306,7 @@ def test_a_runway_past_the_horizon_reports_no_date_and_is_not_short(
     # than a year is not a few weeks.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 100)
     _stub_space(monkeypatch, free=1 << 45)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 30)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 30))
     assert result.capture_days_left > 0
     assert result.exhausts_on is None
     assert result.beyond_horizon is True
@@ -351,7 +325,7 @@ def test_the_forward_walk_is_bounded_even_by_a_calendar_that_never_refuses(
 
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 100)
     _stub_space(monkeypatch, free=1 << 45)
-    result = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=EverySession())
+    result = assess(tmp_path, today=MONDAY, calendar=EverySession())
     assert result.exhausts_on is None
     assert result.beyond_horizon is True
 
@@ -364,7 +338,7 @@ def test_headroom_under_the_threshold_is_short_and_a_day_over_it_is_not(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 100)
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=0)
-    peak = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar).peak
+    peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
 
     inside = MONDAY + timedelta(weeks=HEADROOM_WEEKS)
     sessions = sum(
@@ -373,9 +347,9 @@ def test_headroom_under_the_threshold_is_short_and_a_day_over_it_is_not(
         if calendar.is_session(MONDAY + timedelta(days=offset))
     )
     _stub_space(monkeypatch, free=peak * (sessions + 13))
-    assert assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar).short is True
+    assert assess(tmp_path, today=MONDAY, calendar=calendar).short is True
     _stub_space(monkeypatch, free=peak * (sessions + 1 + 13))
-    assert assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar).short is False
+    assert assess(tmp_path, today=MONDAY, calendar=calendar).short is False
 
 
 # -- the device --------------------------------------------------------------
@@ -387,12 +361,7 @@ def test_free_space_is_read_off_the_real_device_and_is_the_available_figure(tmp_
     # ``f_frsize`` is the one ``f_bavail`` counts in. Multiplying by ``f_bsize`` overstates
     # free space 256 times on this platform, in the fail-open direction.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     stat = os.statvfs(tmp_path)
     # The machine's own disk moves between the two readings, so this matches the
     # multiplier rather than the byte. A megabyte of drift is ordinary. A wrong multiplier
@@ -435,9 +404,7 @@ def test_a_disk_with_under_one_day_left_exhausts_today_and_reads_short(
     """
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
     _stub_space(monkeypatch, free=free)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == 0
     assert result.exhausts_on == MONDAY
     assert result.beyond_horizon is False
@@ -452,9 +419,9 @@ def test_one_day_of_headroom_still_lands_on_the_next_session(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=0)
-    peak = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar).peak
+    peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
     _stub_space(monkeypatch, free=peak * (1 + 13))
-    result = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar)
+    result = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert result.capture_days_left == 1
     assert result.exhausts_on == MONDAY + timedelta(days=1)
 
@@ -476,18 +443,14 @@ def test_the_window_includes_its_first_day_and_excludes_the_one_before(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 10)
     _write(tmp_path, f"chains/ticker=QQQ/date={first}.parquet", 400_000)
     _stub_space(monkeypatch, free=1 << 40)
-    on_edge = assess(
-        tmp_path, journal_in_flight=False, today=today, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    on_edge = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
     assert on_edge.peak_day == first
     assert on_edge.window_start == first
 
     (tmp_path / "chains" / "ticker=QQQ" / f"date={first}.parquet").rename(
         tmp_path / "chains" / "ticker=QQQ" / f"date={first - timedelta(days=1)}.parquet"
     )
-    outside = assess(
-        tmp_path, journal_in_flight=False, today=today, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    outside = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
     assert outside.peak_day == date(2026, 9, 16)
 
 
@@ -497,12 +460,7 @@ def test_the_window_excludes_a_day_after_today(tmp_path: Path, monkeypatch: pyte
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 10)
     _write(tmp_path, "chains/ticker=QQQ/date=2026-09-30.parquet", 400_000)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 16)
 
 
@@ -587,9 +545,9 @@ def test_a_runway_inside_the_forward_bound_still_gets_a_date(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=0)
-    peak = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar).peak
+    peak = assess(tmp_path, today=MONDAY, calendar=calendar).peak
     _stub_space(monkeypatch, free=peak * (45 + 13))
-    result = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar)
+    result = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert result.capture_days_left == 45
     assert result.exhausts_on is not None
     assert result.beyond_horizon is False
@@ -625,9 +583,7 @@ def test_a_calendar_that_raises_past_its_horizon_is_contained(
     # forbids.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
     _stub_space(monkeypatch, free=1 << 45)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_BoundedCalendar(MONDAY, 60)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_BoundedCalendar(MONDAY, 60))
     assert result.beyond_horizon is True
     assert result.exhausts_on is None
     assert result.capture_days_left > 0
@@ -692,12 +648,7 @@ def test_a_day_whose_every_file_is_empty_is_not_a_capture_day(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 400_000)
     _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=SPY/seg-a.arrows", 0)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days == 1
     assert result.mean == result.peak
 
@@ -841,12 +792,7 @@ def test_the_mean_is_a_whole_number_of_bytes(tmp_path: Path, monkeypatch: pytest
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_000)
     _write(tmp_path, "chains/ticker=QQQ/date=2026-09-15.parquet", 30_000)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert isinstance(result.mean, int)
     assert not isinstance(result.mean, bool)
     assert isinstance(result.peak, int)
@@ -861,12 +807,7 @@ def test_a_lake_with_no_growth_says_so_on_every_field_not_just_the_runway(
     # outran the calendar when nothing was measured at all.
     _write(tmp_path, "manifest.jsonl", 10)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 17),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left is None
     assert result.beyond_horizon is False
     assert result.space_error is None
@@ -881,7 +822,6 @@ def test_a_device_that_will_not_read_leaves_both_of_its_figures_unset(tmp_path: 
         tmp_path / "not-a-lake",
         today=date(2026, 9, 17),
         calendar=_weekday_calendar(MONDAY, 400),
-        journal_in_flight=False,
     )
     assert usage.free is None
     assert usage.capacity is None
@@ -895,9 +835,7 @@ def _peak_of_one_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
     """One sealed Monday partition, and the peak it sets, read with no free space at all."""
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
     _stub_space(monkeypatch, free=0)
-    return assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    ).peak
+    return assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)).peak
 
 
 @pytest.mark.parametrize(
@@ -921,9 +859,7 @@ def test_the_page_floor_is_two_weeks_and_the_report_line_is_three(
     """
     peak = _peak_of_one_day(tmp_path, monkeypatch)
     _stub_space(monkeypatch, free=peak * (sessions + 13))
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.capture_days_left == sessions
     assert result.short is short
     assert result.critical is critical
@@ -941,14 +877,14 @@ def test_free_space_under_the_reserve_reads_zero_days_and_fills_today(
     peak = _peak_of_one_day(tmp_path, monkeypatch)
     calendar = _weekday_calendar(MONDAY, 400)
     _stub_space(monkeypatch, free=peak * 12)
-    under = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar)
+    under = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert under.reserve == peak * 13
     assert under.capture_days_left == 0
     assert under.exhausts_on == MONDAY
     assert under.critical is True
 
     _stub_space(monkeypatch, free=peak * 14)
-    over = assess(tmp_path, journal_in_flight=False, today=MONDAY, calendar=calendar)
+    over = assess(tmp_path, today=MONDAY, calendar=calendar)
     assert over.capture_days_left == 1
     assert over.exhausts_on == MONDAY + timedelta(days=1)
 
@@ -961,9 +897,7 @@ def test_the_reserve_is_thirteen_sessions_of_the_busiest_sealed_day(
     # them.
     peak = _peak_of_one_day(tmp_path, monkeypatch)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=MONDAY, calendar=_weekday_calendar(MONDAY, 400))
     assert result.reserve == 13 * peak
     assert result.reserve > 0
 
@@ -971,11 +905,11 @@ def test_the_reserve_is_thirteen_sessions_of_the_busiest_sealed_day(
 def test_todays_in_flight_journal_does_not_set_the_rate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Before compaction is due, today's journal sets no rate.
+    """Today's journal is still growing or about to be compacted, so it sets no rate.
 
-    It is still growing and is about to be compacted into a partition 9 to 13 times
-    smaller, so it is not yet growth. The panel reads this way mid-session. So today counts
-    only its sealed bytes, and the peak is the past days' 40,960. Today is
+    A journal segment is uncompressed and 9 to 13 times the partition it becomes. Read as
+    the busiest day and multiplied by the reserve, today's would page every afternoon. So
+    today counts only its sealed bytes, and the peak is the past days' 40,960. Today is
     still listed in the window, because its bytes are real. Counting today's journal would
     read a 901,120-byte peak. Every size is a whole number of 4,096-byte blocks, so the
     allocated bytes equal the written ones and the figures below are literals.
@@ -984,12 +918,7 @@ def test_todays_in_flight_journal_does_not_set_the_rate(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 20_480)
     _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 901_120)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=True,
-        today=date(2026, 9, 16),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     sizes = dict(result.window_days)
     assert sizes[date(2026, 9, 16)] == 901_120
     assert result.usage.journal_bytes == {date(2026, 9, 16): 901_120}
@@ -1008,12 +937,7 @@ def test_a_sealed_day_still_sets_the_rate_beside_todays_journal(
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 901_120)
     _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 40_960)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=True,
-        today=date(2026, 9, 16),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 14)
     assert result.peak == 901_120
 
@@ -1049,9 +973,8 @@ def test_compaction_refusing_every_ticker_every_day_reads_short(
     fills today and pages.
 
     Reading only sealed bytes, the rate would be the 4,096-byte timing file, and the same
-    disk would read 232 capture days left with no flag. This reads mid-session, before
-    compaction is due, so today's segment is the one left out, because it is still in
-    flight, which leaves today's rate at 4,096 bytes. The
+    disk would read 232 capture days left with no flag. Today's segment is the one left
+    out, because it may still be compacted, which leaves today's rate at 4,096 bytes. The
     reserve is thirteen of those timing files, since no day sealed anything else.
     """
     today = _twenty_weekdays(
@@ -1065,7 +988,7 @@ def test_compaction_refusing_every_ticker_every_day_reads_short(
     calendar = _weekday_calendar(MONDAY, 400)
 
     _stub_space(monkeypatch, free=1_003_520)
-    full = assess(tmp_path, journal_in_flight=True, today=today, calendar=calendar)
+    full = assess(tmp_path, today=today, calendar=calendar)
     assert dict(full.window_days)[MONDAY] == 1_007_616
     assert full.peak == 1_007_616
     assert full.peak_day == MONDAY
@@ -1080,7 +1003,7 @@ def test_compaction_refusing_every_ticker_every_day_reads_short(
 
     # The other side: sixteen of those days past the reserve is over three weeks.
     _stub_space(monkeypatch, free=53_248 + 16 * 1_007_616)
-    roomy = assess(tmp_path, journal_in_flight=True, today=today, calendar=calendar)
+    roomy = assess(tmp_path, today=today, calendar=calendar)
     assert roomy.capture_days_left == 16
     assert roomy.short is False
     assert roomy.critical is False
@@ -1107,9 +1030,7 @@ def test_a_ticker_that_never_seals_adds_its_leftover_to_the_rate(
         ],
     )
     _stub_space(monkeypatch, free=17_461_248)
-    result = assess(
-        tmp_path, journal_in_flight=False, today=today, calendar=_weekday_calendar(MONDAY, 400)
-    )
+    result = assess(tmp_path, today=today, calendar=_weekday_calendar(MONDAY, 400))
     assert len(result.usage.unsealed) == 20
     assert result.peak == 1_605_632
     assert result.reserve == 7_827_456
@@ -1126,8 +1047,8 @@ def test_a_leftover_segment_leaves_its_days_sealed_bytes_in_the_rate(
     Dropping every such day from the rate read twenty weekdays of 602,112 sealed bytes,
     each beside a 4,096-byte leftover segment, as no growth at all. On a full disk that
     was no runway, not short, not critical, and no page. Each past day now counts in full,
-    606,208 bytes, since its leftover stays on the disk. Read mid-session, today counts
-    602,112, because its segment is still in flight. So a full disk fills today and pages.
+    606,208 bytes, since its leftover stays on the disk. Today counts 602,112, because its
+    segment may still be compacted. So a full disk fills today and pages.
 
     The reserve is thirteen sealed days, 7,827,456 bytes. Sixteen sessions past it at the
     606,208-byte rate is over three weeks and does neither. The free space here was once
@@ -1144,7 +1065,7 @@ def test_a_leftover_segment_leaves_its_days_sealed_bytes_in_the_rate(
     calendar = _weekday_calendar(MONDAY, 400)
 
     _stub_space(monkeypatch, free=0)
-    full = assess(tmp_path, journal_in_flight=True, today=today, calendar=calendar)
+    full = assess(tmp_path, today=today, calendar=calendar)
     assert len(full.usage.unsealed) == 20
     assert full.peak == 606_208
     # Nineteen past days of 606,208 bytes and today's 602,112, over twenty, rounded down.
@@ -1157,7 +1078,7 @@ def test_a_leftover_segment_leaves_its_days_sealed_bytes_in_the_rate(
     assert full.critical is True
 
     _stub_space(monkeypatch, free=7_827_456 + 16 * 606_208)
-    roomy = assess(tmp_path, journal_in_flight=True, today=today, calendar=calendar)
+    roomy = assess(tmp_path, today=today, calendar=calendar)
     assert roomy.capture_days_left == 16
     assert roomy.short is False
     assert roomy.critical is False
@@ -1175,12 +1096,7 @@ def test_the_busiest_day_sets_the_peak_with_its_leftover_and_the_reserve_without
     _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 102_400)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 16),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     assert dict(result.window_days)[date(2026, 9, 15)] == 405_504
     assert result.peak_day == date(2026, 9, 15)
     assert result.peak == 405_504
@@ -1205,12 +1121,7 @@ def test_a_stuck_journal_raises_the_rate_and_not_the_reserve(
     _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 2_002_944)
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 102_400)
     _stub_space(monkeypatch, free=50_000_000)
-    result = assess(
-        tmp_path,
-        journal_in_flight=False,
-        today=date(2026, 9, 16),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 15)
     assert result.peak == 2_203_648
     assert result.reserve == 5_218_304
@@ -1223,69 +1134,17 @@ def test_a_timing_file_counts_as_its_days_sealed_growth_and_not_as_journal(
 ):
     # ``journal/timing/date=D.jsonl`` sits under ``journal/`` but is not a segment. It
     # outlives the seal and is permanent growth, so it stays in today's sealed bytes and in
-    # the reserve's basis. Read mid-session, today's rate is its sealed bytes. Reading the
-    # timing file as journal would take 8,192 bytes off that rate, leaving 401,408, and
-    # 106,496 off the reserve.
+    # the reserve's basis. Reading it as journal would take 8,192 bytes off today's rate,
+    # leaving 401,408, and 106,496 off the reserve.
     _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 401_408)
     _write(tmp_path, "journal/timing/date=2026-09-16.jsonl", 8_192)
     _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
     _stub_space(monkeypatch, free=1 << 40)
-    result = assess(
-        tmp_path,
-        journal_in_flight=True,
-        today=date(2026, 9, 16),
-        calendar=_weekday_calendar(MONDAY, 400),
-    )
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     assert result.usage.journal_bytes == {date(2026, 9, 16): 4_096}
     assert result.usage.day_bytes[date(2026, 9, 16)] == 413_696
     assert result.peak == 409_600
     assert result.reserve == 5_324_800
-
-
-def test_todays_stuck_journal_sets_the_rate_once_compaction_is_due(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """Both sides of ``journal_in_flight``, on one lake whose today carries a stuck journal.
-
-    Monday and Tuesday each sealed 401,408 bytes. Wednesday, today, sealed 200,704 and left
-    a 2,002,944-byte journal behind, 2,203,648 bytes in all. The reserve is thirteen of the
-    busiest sealed day, 5,218,304, either way, and free space is that plus four of today's
-    full days, 14,032,896.
-
-    Once compaction is due the journal is one compaction refused, so it is growth now and
-    not the next night. Today's full bytes set the rate, which leaves exactly 4 capture
-    days, filling Tuesday 2026-09-22, under the two-week floor, so the sweep pages tonight.
-    Before compaction is due the same journal is still in flight, so today counts its
-    200,704 sealed bytes, the peak is Monday's 401,408, and the same disk reads 21 capture
-    days and flags nothing.
-    """
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 401_408)
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 401_408)
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 200_704)
-    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=QQQ/seg-a.arrows", 2_002_944)
-    _stub_space(monkeypatch, free=14_032_896)
-    today = date(2026, 9, 16)
-    calendar = _weekday_calendar(MONDAY, 400)
-
-    due = assess(tmp_path, today=today, calendar=calendar, journal_in_flight=False)
-    assert due.peak_day == today
-    assert due.peak == 2_203_648
-    assert due.reserve == 5_218_304
-    assert due.mean == 1_002_154
-    assert due.capture_days_left == 4
-    assert due.exhausts_on == date(2026, 9, 22)
-    assert due.short is True
-    assert due.critical is True
-
-    in_flight = assess(tmp_path, today=today, calendar=calendar, journal_in_flight=True)
-    assert in_flight.peak_day == MONDAY
-    assert in_flight.peak == 401_408
-    assert in_flight.reserve == 5_218_304
-    assert in_flight.mean == 334_506
-    assert in_flight.capture_days_left == 21
-    assert in_flight.exhausts_on == date(2026, 10, 15)
-    assert in_flight.short is False
-    assert in_flight.critical is False
 
 
 # -- what the walk skips at the root -----------------------------------------

@@ -1267,17 +1267,12 @@
       box.appendChild(el("p", "No day in the window wrote anything.", "note"));
       return;
     }
-    // Before compaction is due today's journal is still growing and is about to be
-    // compacted, so today counts only its sealed bytes. After that moment a journal still
-    // under today is one compaction refused, and today counts in full like a past day.
     box.appendChild(el("p",
       "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", the busiest " +
       "day's permanent growth, which sets the runway. A past day counts in full, " +
-      "including any journal compaction left on the disk. " +
-      (lake.journal_in_flight
-        ? "Today counts without its journal, which is still in flight, so while that " +
-          "journal is there today reads larger below than it counts. "
-        : "") +
+      "including any journal compaction left on the disk. Today counts without its " +
+      "journal, which is still in flight, so while that journal is there today reads " +
+      "larger below than it counts. " +
       "Mean " + bytes(lake.mean_bytes) + " over the days that grew. " +
       "A mean over all " + lake.window_days + " calendar days would be lower still, and " +
       "a rate that is too low lengthens the runway rather than shortening it."));
@@ -1293,11 +1288,11 @@
       // An unsealed day still carries journal segments, which are uncompressed and larger
       // than the partition they become. Today's segments seal at close+15 and the figure
       // drops then. A number that halves at 16:30 with no explanation is a number a reader
-      // distrusts. Segments still there once compaction is due, today's or a past day's,
-      // are ones compaction left on the disk, so no seal is promised for them.
+      // distrusts. A past day's segments are ones compaction left on the disk, so no seal
+      // is promised for them.
       var note = "";
       if (day.unsealed) {
-        note = lake.journal_in_flight && day.day === lake.window_end
+        note = day.day === lake.window_end
           ? "unsealed, seals at close+15"
           : "unsealed, journal segments left on disk";
       }

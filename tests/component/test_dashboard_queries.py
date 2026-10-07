@@ -4534,43 +4534,6 @@ def test_a_journal_day_is_flagged_unsealed_on_the_panel(fixture_lake: FixtureLak
     assert days[MONDAY.isoformat()]["unsealed"] is True
 
 
-@pytest.mark.parametrize(
-    ("now", "in_flight"),
-    [
-        # After the 16:00 equity close and before the 16:30 compaction, so a gate on the
-        # equity close, or on the 16:15 option close alone, reads this one wrong.
-        (et(MONDAY, 16, 20), True),
-        (et(MONDAY, 16, 30), False),
-    ],
-)
-def test_todays_journal_is_in_flight_until_compaction_is_due(
-    root: Path, now: datetime, in_flight: bool
-):
-    """The option close plus fifteen minutes is when compaction seals today's journal.
-
-    The fixture's Monday is today and mostly journal, and its largest day. Before 16:30 the
-    journal is still in flight, so Monday counts only its sealed bytes and the peak is
-    under Monday's full bytes. From 16:30 a journal still there is one compaction refused,
-    so Monday counts in full and sets the peak. The payload says which reading the page is
-    looking at.
-    """
-    payload = service_over(root, now=now).run_query("lake", {})
-    assert payload["journal_in_flight"] is in_flight
-    monday = {day["day"]: day for day in payload["days"]}[MONDAY.isoformat()]
-    assert monday["unsealed"] is True
-    assert (payload["peak_bytes"] == monday["bytes"]) is not in_flight
-    assert (payload["peak_bytes"] < monday["bytes"]) is in_flight
-
-
-def test_a_day_with_no_session_has_no_journal_in_flight(root: Path):
-    # Saturday has no session, so no journal to wait for, and the flag reads False at any
-    # hour. A flag fixed at True would read noon wrong, and a gate that skipped the session
-    # check would ask the calendar for a close Saturday does not have.
-    payload = service_over(root, now=et(SATURDAY, 12, 0)).run_query("lake", {})
-    assert payload["error"] is None
-    assert payload["journal_in_flight"] is False
-
-
 def test_a_lake_with_no_growth_in_the_window_reports_no_runway(fixture_lake: FixtureLake):
     # No growth in the window means capture stopped or the lake has not had a capture day
     # yet. A large number there would go quiet at the one moment something is wrong in the
