@@ -1884,6 +1884,11 @@ def test_a_chain_alternating_a_401_and_an_empty_answer_does_not_re_page_the_caus
     empty 200 answer. The empty answer resets no counter, so counting it released every
     write failure, emptied the cause, and the next 401 paged the dead token again at
     once. A probe measured 19 pages in 40 minutes, where 2 go out.
+
+    The assertion also records the guard's price. Nothing lands data in any of the 40
+    minutes, so the write-failing surfaces stay in the cause and send no page. The
+    dead-man starves and pages that outage, and the chain's ``contracts_absent`` page
+    still goes out.
     """
     writes = (
         SegmentError("quotes", "SPY", "os_error"),

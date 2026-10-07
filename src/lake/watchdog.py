@@ -522,8 +522,12 @@ class Watchdog:
         resolves to no cause, and the cause it held stayed live until the session date
         changed, so a second token death that session paged nothing (marketlake #754).
         Data landing on another surface proves the vendor answered, so ``observe`` brings
-        the surface here in that minute, and its own page goes out at once because its
-        counter kept climbing under the cause. A minute in which nothing landed keeps it,
+        the surface here in that minute. Its own page then goes out at once, unless it
+        already paged before the cause did and is still in ``_paged``. Its counter kept
+        climbing under the cause, so it skips the threshold and the page carries the
+        outage's minutes, even when its write failed only on the minute the outage healed.
+        A surface that answers with no contract on that minute already pages the same way.
+        A minute in which nothing landed keeps it,
         since nothing then shows the outage has ended. Releasing it there would page every
         write failure, and then the cause a second time.
         """
@@ -638,7 +642,8 @@ class Watchdog:
         it named while that surface keeps failing its way, and an ordinary transient
         failure counts as still covered. The one thing that lifts the cover is the
         surface failing a way some other cause names, because that is a different outage
-        with a different remedy, and the operator has to hear it.
+        with a different remedy, and the operator has to hear it. A surface also leaves a
+        cause outright through :meth:`_release`, which names the four ways it does.
         """
         return any(
             key in held and title in (None, cause) for cause, held in self._paged_causes.items()
