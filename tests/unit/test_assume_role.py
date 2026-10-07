@@ -111,6 +111,8 @@ MALFORMED_ARNS = [
     f"{ACCOUNT_ID}:role/marketlake-backup",
     "marketlake-backup",
     f"arn:aws:iam::{ACCOUNT_ID}:role/",
+    f"arn:aws:iam::{ACCOUNT_ID}:role/ops/",
+    f"arn:aws:iam::{ACCOUNT_ID}:role/{'n' * 65}",
 ]
 
 
@@ -135,7 +137,16 @@ def test_a_malformed_token_role_arn_is_refused_before_the_login(arn):
     assert ACCOUNT_ID not in problems[0]
 
 
-@pytest.mark.parametrize("arn", [BUCKET_ROLE, f"arn:aws:iam::{ACCOUNT_ID}:role/ops/backup.v2"])
+@pytest.mark.parametrize(
+    "arn",
+    [
+        BUCKET_ROLE,
+        f"arn:aws:iam::{ACCOUNT_ID}:role/ops/backup.v2",
+        f"arn:aws:iam::{ACCOUNT_ID}:role/team#1/a:b/backup",
+        f"arn:aws:iam::{ACCOUNT_ID}:role/{'p' * 500}/{'n' * 64}",
+        f"arn:aws-us-gov:iam::{ACCOUNT_ID}:role/service-role/backup",
+    ],
+)
 def test_a_role_arn_under_a_path_is_accepted(arn):
     require_bucket_settings(_config(bucket_role_arn=arn))
 

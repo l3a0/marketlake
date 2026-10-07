@@ -176,8 +176,10 @@ _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 _REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
 
 # The shape of an IAM role ARN: a partition, a 12-digit account id, and a role name that
-# may sit under a path, as in ``arn:aws:iam::<account>:role/marketlake-backup``.
-_ROLE_ARN = re.compile(r"arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}")
+# may sit under a path, as in ``arn:aws:iam::<account>:role/marketlake-backup``. IAM lets
+# a path hold any printable ASCII character and run to 512 characters, and a name hold
+# 1 to 64 of a narrower set, so the two parts are matched apart.
+_ROLE_ARN = re.compile(r"arn:aws[a-z-]*:iam::\d{12}:role/(?:[\x21-\x7e]{1,510}/)?[\w+=,.@-]{1,64}")
 
 # The token-store keys, marketlake #636. ``token_store`` says what this host does with the
 # Schwab token, and ``lake.token_store.mode_of`` reads it. ``file``, the default when the
