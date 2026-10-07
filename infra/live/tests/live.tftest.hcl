@@ -350,6 +350,23 @@ run "lifecycle_rules_are_exactly_the_four" {
   }
 }
 
+# Every other run uses one bucket name, so a policy that typed it would pass them all.
+run "bucket_arns_follow_the_bucket_variable" {
+  command = plan
+
+  variables {
+    backup_bucket = "other-lake-backup"
+  }
+
+  assert {
+    condition = [for s in jsondecode(aws_iam_role_policy.backup.policy).Statement : s.Resource] == [
+      "arn:aws:s3:::other-lake-backup",
+      "arn:aws:s3:::other-lake-backup/*",
+    ]
+    error_message = "marketlake-backup's policy does not name the bucket backup_bucket names."
+  }
+}
+
 # An ARN or a name with a space would match an unanchored pattern, and "ab" is one
 # character short of S3's minimum.
 run "an_arn_fails_validation" {
