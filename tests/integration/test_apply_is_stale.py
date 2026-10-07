@@ -10,7 +10,8 @@ change. So the script reads stale for exactly the changes that start a run.
 
 1. A newer commit on ``main`` changes a file under ``infra/`` that is not Markdown, or
    changes the workflow: the run is stale. A commit that changes Markdown beside a
-   ``.tf`` file is stale too, since it starts a run.
+   ``.tf`` file is stale too, since it starts a run. So is a commit that only deletes a
+   ``.tf`` file, since applying the older commit last would recreate what it deleted.
 2. A newer commit on ``main`` changes only files outside ``infra/``, or only Markdown
    under ``infra/``, at the top or nested: the run is fresh. Such a merge starts no run,
    so skipping would leave the pending apply's change unapplied.
@@ -62,21 +63,30 @@ def _commit(repo: Path, paths: tuple[str, ...], text: str) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _setup(tmp_path: Path, *newer_changes: str) -> tuple[Path, str]:
-    """A clone at an older commit, whose remote's main carries ``newer_changes``."""
+def _origin(tmp_path: Path) -> tuple[Path, str]:
+    """A remote whose main holds one older commit, and that commit's sha."""
     origin = tmp_path / "origin"
     origin.mkdir()
     _git(origin, "init", "--quiet", "--initial-branch=main")
-    older = _commit(origin, ("infra/live/main.tf",), "# first\n")
-    _commit(origin, newer_changes, "# newer\n")
+    return origin, _commit(origin, ("infra/live/main.tf",), "# first\n")
 
+
+def _setup(tmp_path: Path, *newer_changes: str) -> tuple[Path, str]:
+    """A clone at an older commit, whose remote's main carries ``newer_changes``."""
+    origin, older = _origin(tmp_path)
+    _commit(origin, newer_changes, "# newer\n")
+    return _clone_at(tmp_path, origin, older), older
+
+
+def _clone_at(tmp_path: Path, origin: Path, older: str) -> Path:
+    """A clone of ``origin`` checked out at ``older``."""
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", "--quiet", "--no-local", "--depth=1", origin.as_uri(), str(clone))
     _git(clone, "fetch", "--quiet", "--depth=1", "origin", older)
     _git(clone, "checkout", "--quiet", "--detach", older)
     # actions/checkout leaves the triggering commit in origin/main, as this does.
     _git(clone, "update-ref", "refs/remotes/origin/main", older)
-    return clone, older
+    return clone
 
 
 def _run(clone: Path, sha: str) -> subprocess.CompletedProcess[str]:
@@ -92,6 +102,14 @@ def _run(clone: Path, sha: str) -> subprocess.CompletedProcess[str]:
 def test_a_newer_infra_change_makes_the_run_stale(tmp_path: Path) -> None:
     clone, older = _setup(tmp_path, "infra/live/iam.tf")
     result = _run(clone, older)
+    assert (result.returncode, result.stdout) == (0, "stale\n")
+
+
+def test_a_newer_deletion_under_infra_makes_the_run_stale(tmp_path: Path) -> None:
+    origin, older = _origin(tmp_path)
+    _git(origin, "rm", "--quiet", "infra/live/main.tf")
+    _git(origin, "commit", "--quiet", "-m", "remove infra/live/main.tf")
+    result = _run(_clone_at(tmp_path, origin, older), older)
     assert (result.returncode, result.stdout) == (0, "stale\n")
 
 

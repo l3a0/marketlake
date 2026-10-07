@@ -13,9 +13,10 @@ job instead.
 3. Every ``tofu plan`` and ``tofu apply`` sends its output to ``/dev/null``, because the
    repository's logs are public and that output carries values.
 4. The validate job runs ``tofu test`` on both configurations.
-5. Both triggers watch ``infra/`` and the workflow itself, and leave out Markdown under
-   ``infra/``, which no configuration reads. The exclusion follows ``infra/**``, since
-   GitHub's later positive match would include the file again. Running
+5. Both triggers watch ``infra/`` and the workflow itself, and leave out only Markdown
+   under ``infra/``, which no configuration reads. Any other exclusion strands a real
+   change, such as one to the template ``infra/live/vm.tf`` reads. The exclusion follows
+   ``infra/**``, since GitHub's later positive match would include the file again. Running
    ``infra/ci/apply-is-stale.sh`` against a fake ``git`` shows that it compares exactly
    the trigger's paths, in the trigger's order. A stale run skips only because the
    newer commit started its own run, so a path the script compares and the trigger
@@ -132,14 +133,16 @@ def _trigger_paths(event: str) -> list[str]:
     return _workflow()[True][event]["paths"]
 
 
-def test_both_triggers_watch_infra_and_the_workflow_but_not_its_markdown() -> None:
+def test_both_triggers_watch_infra_and_the_workflow_and_leave_out_only_its_markdown() -> None:
     for event in ("push", "pull_request"):
         paths = _trigger_paths(event)
         assert "infra/**" in paths, event
         assert ".github/workflows/infra.yml" in paths, event
+        # Markdown is the only file type no configuration reads, so any other exclusion
+        # strands a real change. #736 has the reasoning.
+        assert [path for path in paths if path.startswith("!")] == ["!infra/**/*.md"], event
         # GitHub applies the patterns in order, so an exclusion placed before the
         # positive match it narrows is undone by that match.
-        assert "!infra/**/*.md" in paths, event
         assert paths.index("!infra/**/*.md") > paths.index("infra/**"), event
 
 
