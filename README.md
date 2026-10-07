@@ -106,7 +106,7 @@ The bucket and the IAM user whose key the laptop uses are code in `infra/live/`,
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
 files rewritten every night. Partitions keep every version, because with no Object Lock an overwritten
-partition's old version is its only good copy. `infra/live/iam.tf` holds the user's policy,
+partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
