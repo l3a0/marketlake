@@ -26,8 +26,7 @@ Five decisions are worth reading before the code.
    the window and the idle days before it drag any mean down. Every such error lengthens
    the runway, and a check that flags short headroom never fires if its rate is too low.
    The mean over the days that grew is reported beside the peak so a reader sees the
-   spread. Permanent growth is what a day leaves on the disk, and only today's journal is
-   still in flight.
+   spread. Permanent growth is what a day leaves on the disk.
 
    So a past day counts all of its dated bytes, journal segments included. A segment
    still under a past day is one compaction refused, and it stays on the disk until
@@ -37,11 +36,14 @@ Five decisions are worth reading before the code.
    capture days, on a disk about one session from full.
 
    Today counts only its sealed bytes, its dated bytes less its journal segments, which
-   ``Usage.journal_bytes`` carries. Today's journal is either still growing or about to
-   be compacted into a partition 9 to 13 times smaller. Read in full and multiplied by the
-   journal reserve below, it would page every afternoon. Its bytes still count against
-   free space, because they are on the disk. The timing file every session writes and the
-   dated nightly reports are sealed bytes, because both outlive the seal.
+   ``Usage.journal_bytes`` carries. A reader cannot tell from the disk whether today's
+   journal is still growing, part way through compaction, or refused. Compaction seals
+   today's ticker-days one at a time under the lake lock, which neither reader of this
+   module takes, and nothing on the disk records that compaction finished. Counted in
+   full, a half-compacted journal would read as growth. So today's journal first counts
+   once today is a past day. Its bytes still count against free space, because they are
+   on the disk. The timing file every session writes and the dated nightly reports are
+   sealed bytes, because both outlive the seal.
 
    Three prices are named.
 
@@ -51,9 +53,16 @@ Five decisions are worth reading before the code.
       window, so the runway can page every night beside compaction's own damaged-segment
       page until the day is repaired. Both pages point at a real action: one says the
       segments need repair, the other that the disk is filling faster than it should.
-   3. On the night compaction refuses, its segments are still today's at the 18:30 sweep
-      and stay out of the rate. They first count the next night, after compaction's own
-      page has already fired.
+   3. A ticker-day compaction refuses reaches the rate from the first sweep after today
+      becomes a past day. The sweep runs Monday to Friday, so a Friday refusal reaches it
+      on Monday's 18:30 sweep, after Monday's session has written another journal.
+      Compaction pages that refusal itself the night it happens, with the damaged-segment
+      or schema-drift page. The panel counts it from midnight, when today becomes a past
+      day, so the panel's runway can drop at the midnight after a refusal. On a lake's
+      first session, when no past day in the window grew, the night compaction refuses
+      reads a long runway until today becomes a past day. Both the rate and the reserve
+      fall back to today's sealed bytes, which are the timing file and that night's
+      reports. Compaction's own page covers that night.
 
    A false page costs an operator a look at the Lake panel, while a missed one costs the
    disk, and a minute lost to a full disk is gone forever.
@@ -278,8 +287,9 @@ class Runway:
 
     ``reserve`` is the journal reserve, which came off ``free`` before
     ``capture_days_left`` was counted. It is ``JOURNAL_RESERVE_SESSIONS`` times the
-    busiest day's sealed bytes in the window, today's included, so it equals thirteen times
-    ``peak`` only while no past day carries journal segments. It is carried so a reader can
+    busiest day's sealed bytes in the window, today's included. So it is never more than
+    thirteen times ``peak``, and exactly that whenever no day the rate counts in full
+    carries journal segments. It is carried so a reader can
     see why free space and the capture-day count disagree. ``peak``, ``peak_day``, ``mean``
     and ``capture_days`` are read off the rate series of decision 2: each past day's dated
     bytes in full, and today's sealed bytes. ``window_days`` lists each day's dated bytes,
@@ -558,8 +568,8 @@ def assess(
     window = tuple((day, size) for day, size in usage.day_bytes.items() if start <= day <= today)
     # The rate series, per module docstring decision 2. A past day counts in full, journal
     # included, because a segment compaction left behind stays on the disk until someone
-    # repairs it. Today counts without its journal, which is either still growing or about
-    # to be compacted into a partition 9 to 13 times smaller.
+    # repairs it. Today counts without its journal, because nothing on the disk says
+    # whether that journal is still growing, part way through compaction, or refused.
     rate = ((day, usage.sealed_bytes(day) if day == today else size) for day, size in window)
     capturing = [(day, size) for day, size in rate if size > 0]
     peak_day, peak = max(capturing, key=lambda item: item[1]) if capturing else (None, 0)

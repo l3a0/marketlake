@@ -1270,9 +1270,9 @@
     box.appendChild(el("p",
       "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", the busiest " +
       "day's permanent growth, which sets the runway. A past day counts in full, " +
-      "including any journal compaction left on the disk. Today counts without its " +
-      "journal, which is still in flight, so while that journal is there today reads " +
-      "larger below than it counts. " +
+      "including any journal compaction left on the disk. Today counts only its " +
+      "sealed bytes until it becomes a past day, so while its journal is there today " +
+      "reads larger below than it counts. " +
       "Mean " + bytes(lake.mean_bytes) + " over the days that grew. " +
       "A mean over all " + lake.window_days + " calendar days would be lower still, and " +
       "a rate that is too low lengthens the runway rather than shortening it."));
@@ -1286,14 +1286,15 @@
       tr.appendChild(el("td", day.day));
       tr.appendChild(el("td", bytes(day.bytes), "num"));
       // An unsealed day still carries journal segments, which are uncompressed and larger
-      // than the partition they become. Today's segments seal at close+15 and the figure
-      // drops then. A number that halves at 16:30 with no explanation is a number a reader
-      // distrusts. A past day's segments are ones compaction left on the disk, so no seal
-      // is promised for them.
+      // than the partition they become. Today's segments normally seal at close+15 and the
+      // figure drops then. A compaction that refuses leaves them, and nothing on the disk
+      // tells the two apart, so today's label promises no seal. A number that halves at
+      // 16:30 with no explanation is a number a reader distrusts. A past day's segments are
+      // ones compaction left on the disk.
       var note = "";
       if (day.unsealed) {
         note = day.day === lake.window_end
-          ? "unsealed, seals at close+15"
+          ? "unsealed, today's journal"
           : "unsealed, journal segments left on disk";
       }
       tr.appendChild(el("td", note, "muted"));

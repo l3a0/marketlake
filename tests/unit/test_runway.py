@@ -905,11 +905,11 @@ def test_the_reserve_is_thirteen_sessions_of_the_busiest_sealed_day(
 def test_todays_in_flight_journal_does_not_set_the_rate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Today's journal is still growing or about to be compacted, so it sets no rate.
+    """Today's journal sets no rate, because the disk cannot say what state it is in.
 
-    A journal segment is uncompressed and 9 to 13 times the partition it becomes. Read as
-    the busiest day and multiplied by the reserve, today's would page every afternoon. So
-    today counts only its sealed bytes, and the peak is the past days' 40,960. Today is
+    Nothing on the disk tells a journal still growing from one part way through compaction
+    or one compaction refused, so a half-compacted journal counted in full would read as
+    growth. So today counts only its sealed bytes, and the peak is the past days' 40,960. Today is
     still listed in the window, because its bytes are real. Counting today's journal would
     read a 901,120-byte peak. Every size is a whole number of 4,096-byte blocks, so the
     allocated bytes equal the written ones and the figures below are literals.

@@ -4492,9 +4492,9 @@ def test_the_growth_rate_is_the_busiest_day_and_the_mean_rides_beside_it(root: P
     # bytes rather than by the window's width, and the runway is taken off the peak,
     # because every way of understating the rate lengthens the runway and a check that
     # flags short headroom never fires if its rate is too low. The fixture's Monday is
-    # today, mostly journal, and its largest day. Today's journal is still in flight, so it
-    # counts only its sealed bytes, and reading it in full is the shape that would make the
-    # panel read short every afternoon (marketlake #438). Monday also carries one sealed
+    # today, mostly journal, and its largest day. Today counts only its sealed bytes,
+    # because nothing on the disk says whether its journal is still growing, part way
+    # through compaction, or refused (marketlake #438). Monday also carries one sealed
     # quotes partition, and that partition still counts, so three days grew the lake:
     # Thursday, Friday and Monday.
     payload = service_over(root).run_query("lake", {})
