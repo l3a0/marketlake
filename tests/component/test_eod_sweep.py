@@ -3394,7 +3394,7 @@ def _sealed_peak(monkeypatch: pytest.MonkeyPatch, root: Path) -> int:
     """
     _stub_free(monkeypatch, 0)
     calendar = weekday_sessions(MONDAY, NEXT_MONDAY)
-    peak = runway.assess(root, today=SESSION, calendar=calendar).peak
+    peak = runway.assess(root, today=SESSION, calendar=calendar, journal_in_flight=False).peak
     assert peak > 0
     return peak
 
@@ -3546,6 +3546,37 @@ def test_a_critical_runway_pages_once_and_files_the_line(
     assert f"report: {line}" in _digest(transport).body.split("\n")
     # A page is not a problem, so the ping still lands.
     assert pinger.urls == [PING_URL]
+
+
+def test_a_stuck_journal_under_today_sets_the_rate_the_night_compaction_refuses(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """At 18:30 compaction is due, so a journal still under today is growth tonight.
+
+    The lake seals tonight's session, and then a journal segment three times its busiest
+    sealed day stays under today, the way a compaction that refused leaves one. Today's
+    full bytes are then four of that sealed day, and they set the rate. The reserve is
+    still thirteen sealed days. Free space of the reserve plus four of today's full days
+    reads exactly 4 capture days, filling Friday 2026-09-18, which pages.
+
+    Read with the journal left out, the peak would be the sealed day and the same disk
+    would read 16 capture days, past the default calendar's horizon, with no line at all.
+    That was the reading on the night a compaction failed, which counted the journal only
+    the next night.
+    """
+    root = _lake(fixture_lake)
+    sealed = _sealed_peak(monkeypatch, root)
+    assert sealed % 4_096 == 0
+    segment = root / f"journal/date={SESSION.isoformat()}/surface=chains/ticker=SPY/seg-a.arrows"
+    segment.parent.mkdir(parents=True)
+    segment.write_bytes(b"x" * (3 * sealed))
+    _stub_free(monkeypatch, 13 * sealed + 4 * (4 * sealed))
+    outcome, _, transport = _run(root)
+
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 4 capture days left, fills 2026-09-18, ")
+    (page,) = _pages(transport)
+    assert page.body.startswith("4 capture days left, fills 2026-09-18: ")
 
 
 def test_the_line_and_the_page_print_gib_with_every_number_before_a_second_field(

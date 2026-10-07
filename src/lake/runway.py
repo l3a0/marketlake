@@ -26,8 +26,7 @@ Five decisions are worth reading before the code.
    the window and the idle days before it drag any mean down. Every such error lengthens
    the runway, and a check that flags short headroom never fires if its rate is too low.
    The mean over the days that grew is reported beside the peak so a reader sees the
-   spread. Permanent growth is what a day leaves on the disk, and only today's journal is
-   still in flight.
+   spread. Permanent growth is what a day leaves on the disk.
 
    So a past day counts all of its dated bytes, journal segments included. A segment
    still under a past day is one compaction refused, and it stays on the disk until
@@ -36,24 +35,28 @@ Five decisions are worth reading before the code.
    segments out read a lake whose compaction refused every ticker every day as 157
    capture days, on a disk about one session from full.
 
-   Today counts only its sealed bytes, its dated bytes less its journal segments, which
-   ``Usage.journal_bytes`` carries. Today's journal is either still growing or about to
-   be compacted into a partition 9 to 13 times smaller. Read in full and multiplied by the
-   journal reserve below, it would page every afternoon. Its bytes still count against
-   free space, because they are on the disk. The timing file every session writes and the
-   dated nightly reports are sealed bytes, because both outlive the seal.
+   Today counts the same way once compaction is due, at the option close plus
+   ``lake.session.COMPACTION_DELAY`` on a session day. By then a healthy compaction has
+   turned today's journal into a partition, and a segment still there is one compaction
+   refused. Before that moment today's journal is still growing and is about to be
+   compacted into a partition 9 to 13 times smaller, so it is not yet growth. This module
+   reads no clock, so the caller says which side of that moment it reads from through
+   ``journal_in_flight``. While it is true, today counts only its sealed bytes, its dated
+   bytes less its journal segments, which ``Usage.journal_bytes`` carries. So the panel
+   mid-session counts only today's sealed bytes. The evening sweep runs only once
+   compaction is due, so on the night a compaction refuses, today's stuck journal sets the
+   rate that same night. Today's journal counts against free space either way, because it
+   is on the disk. The timing file every session writes and the dated nightly reports are
+   sealed bytes, because both outlive the seal.
 
-   Three prices are named.
+   Two prices are named.
 
    1. One anomalous sealed day, a backfill or a reseal, shortens the runway and can flag
       or page early.
-   2. A past day with an unrepaired stuck journal sets the rate for up to the whole
-      window, so the runway can page every night beside compaction's own damaged-segment
-      page until the day is repaired. Both pages point at a real action: one says the
-      segments need repair, the other that the disk is filling faster than it should.
-   3. On the night compaction refuses, its segments are still today's at the 18:30 sweep
-      and stay out of the rate. They first count the next night, after compaction's own
-      page has already fired.
+   2. A day with an unrepaired stuck journal sets the rate for up to the whole window, so
+      the runway can page every night beside compaction's own damaged-segment page until
+      the day is repaired. Both pages point at a real action: one says the segments need
+      repair, the other that the disk is filling faster than it should.
 
    A false page costs an operator a look at the Lake panel, while a missed one costs the
    disk, and a minute lost to a full disk is gone forever.
@@ -70,21 +73,21 @@ Five decisions are worth reading before the code.
    only ``f_frsize`` is the one ``f_bavail`` is counted in. Multiplying by ``f_bsize``
    instead overstates free space 256 times, in the same direction as the mean above, and
    the wrapper applies the right one.
-5. **A session's journal is reserved off free space before the runway is counted.** The
-   rate leaves today's journal out, but every session first lands under ``lake_root`` as
-   an uncompressed journal that compaction frees only at close+15, and nothing records its
-   size. The measured peaks ran 9 to 13 times a sealed day: 7.5 GB on 2026-10-06 against a
-   599.3 MB sealed upload that night. So ``JOURNAL_RESERVE_SESSIONS`` times the busiest
-   day's sealed bytes in the window, today's included, comes off ``free`` first, and a
-   disk with less free space than that reads zero capture days. The basis is sealed bytes
-   rather than the rate's peak, because a journal scales with the session it compacts
-   into. A past day's stuck segments already raise the rate, and as the basis they would
-   inflate the reserve thirteen-fold on top. A multiple follows the roster as it grows,
-   where a byte count would go stale. The whole reserve comes off every time, with no
-   credit for a journal already on the disk, so mid-session the panel reads up to 13
-   sessions short until compaction frees the journal. That is the price. A credit would
-   lengthen the runway on exactly the night a compaction failed and left its journal
-   stuck, when tomorrow still needs the full reserve.
+5. **A session's journal is reserved off free space before the runway is counted.** Every
+   session first lands under ``lake_root`` as an uncompressed journal that compaction
+   frees only at close+15, and nothing records its size. The measured peaks ran 9 to 13
+   times a sealed day: 7.5 GB on 2026-10-06 against a 599.3 MB sealed upload that night.
+   So ``JOURNAL_RESERVE_SESSIONS`` times the busiest day's sealed bytes in the window,
+   today's included, comes off ``free`` first, and a disk with less free space than that
+   reads zero capture days. The basis is sealed bytes rather than the rate's peak,
+   because a journal scales with the session it compacts into. A stuck journal's segments
+   already raise the rate, and as the basis they would inflate the reserve thirteen-fold
+   on top. A multiple follows the roster as it grows, where a byte count would go stale.
+   The whole reserve comes off every time, with no credit for a journal already on the
+   disk, so mid-session the panel reads up to 13 sessions short until compaction frees
+   the journal. That is the price. A credit would lengthen the runway on exactly the night
+   a compaction failed and left its journal stuck, when tomorrow still needs the full
+   reserve.
 
 **Nothing here raises for a lake it cannot read.** The dashboard turns any escape into a
 500 for the whole panel, which would throw away the refusal lines this module exists to
@@ -143,7 +146,7 @@ PAGE_FLOOR_WEEKS = 2
 # session's journal before the runway is counted. Module docstring decision 5 gives the
 # measurement: the journal's peak ran 9 to 13 times the sealed day it compacts into, and
 # this takes the top of that range. The basis is sealed bytes, never the rate's peak,
-# because a past day's stuck journal raises the rate and must not raise this thirteen-fold.
+# because a stuck journal raises the rate and must not raise this thirteen-fold.
 JOURNAL_RESERVE_SESSIONS = 13
 
 # ``st_blocks`` is counted in 512-byte units by POSIX, whatever the filesystem's own
@@ -215,10 +218,11 @@ class Usage:
     manifest entry before it unlinks the segments, so for a moment a day is both. Both
     readings run high, which shortens the runway rather than lengthening it, so neither
     is worth engineering around. The flag is carried for two reasons. A growth figure that
-    visibly drops at 16:30 needs an explanation where a reader will see it, and today's
-    rate is taken off its sealed bytes, its ``day_bytes`` less its ``journal_bytes``, for
-    the reason the module docstring's decision 2 gives. A past day's rate is its whole
-    ``day_bytes``, and the journal reserve reads every day's sealed bytes.
+    visibly drops at 16:30 needs an explanation where a reader will see it, and while
+    today's journal is in flight today's rate is taken off its sealed bytes, its
+    ``day_bytes`` less its ``journal_bytes``, for the reason the module docstring's
+    decision 2 gives. Every other day's rate is its whole ``day_bytes``, and the journal
+    reserve reads every day's sealed bytes.
 
     ``refusals`` names what would not read, capped at ``NAMED_REFUSALS`` with
     ``refused`` holding the true count.
@@ -242,8 +246,9 @@ class Usage:
     def sealed_bytes(self, day: date) -> int:
         """A day's bytes less its journal segments.
 
-        The growth rate reads this for today alone, and the journal reserve reads it for
-        every day in the window. Module docstring decisions 2 and 5 give the reasons.
+        The growth rate reads this for today alone, and only while today's journal is in
+        flight. The journal reserve reads it for every day in the window. Module docstring
+        decisions 2 and 5 give the reasons.
         """
         return self.day_bytes.get(day, 0) - self.journal_bytes.get(day, 0)
 
@@ -260,10 +265,11 @@ class Runway:
     as a long runway would go quiet at the one moment something is wrong.
 
     Two other cases read a rate rather than none. A compaction refusing every ticker leaves
-    its past days' journals on the disk, and those set the rate, so the runway reads short
-    as the disk fills. A lake's first session, before close+15 seals it, has only today's
-    sealed bytes to go on, the timing file and nothing else, so the panel reads a long
-    runway for that one session. The 18:30 sweep reads after the seal.
+    its journals on the disk, and those set the rate, so the runway reads short as the disk
+    fills. A lake's first session, before close+15 seals it, has only today's sealed bytes
+    to go on, the timing file and nothing else, so the panel reads a long runway for that
+    one session. The 18:30 sweep reads after the seal, and counts in full any journal
+    compaction left.
 
     ``free`` and ``capacity`` are ``None`` with ``space_error`` naming the class when the
     device would not read, which happens for a root that is not there. That is contained
@@ -278,12 +284,14 @@ class Runway:
 
     ``reserve`` is the journal reserve, which came off ``free`` before
     ``capture_days_left`` was counted. It is ``JOURNAL_RESERVE_SESSIONS`` times the
-    busiest day's sealed bytes in the window, today's included, so it equals thirteen times
-    ``peak`` only while no past day carries journal segments. It is carried so a reader can
-    see why free space and the capture-day count disagree. ``peak``, ``peak_day``, ``mean``
-    and ``capture_days`` are read off the rate series of decision 2: each past day's dated
-    bytes in full, and today's sealed bytes. ``window_days`` lists each day's dated bytes,
-    journal included.
+    busiest day's sealed bytes in the window, today's included. No day's sealed bytes
+    exceed what the rate counts for it, so the reserve is never more than thirteen times
+    ``peak``, and it is exactly that whenever no day the rate counts in full carries
+    journal segments. It is carried so a reader can see why free space and the capture-day
+    count disagree. ``peak``, ``peak_day``, ``mean`` and ``capture_days`` are read off the
+    rate series of decision 2: each past day's dated bytes in full, and today's in full
+    too unless its journal is in flight, when only its sealed bytes count.
+    ``window_days`` lists each day's dated bytes, journal included.
     """
 
     free: int | None
@@ -525,6 +533,7 @@ def assess(
     *,
     today: date,
     calendar: Calendar,
+    journal_in_flight: bool,
     window_days: int = GROWTH_WINDOW_DAYS,
 ) -> Runway:
     """Read the lake and the device, and answer how long capture can keep going.
@@ -532,12 +541,19 @@ def assess(
     ``today`` is the caller's own session date rather than a wall-clock read, because
     nothing in this module reads a clock, the same rule the dashboard keeps.
 
+    ``journal_in_flight`` says whether today's journal is still being written or waiting
+    for compaction, which on a session day is before the option close plus
+    ``lake.session.COMPACTION_DELAY``. The caller answers it off its own clock for the same
+    reason. It has no default, so each caller decides rather than inheriting an answer
+    meant for the other's moment.
+
     The rate is the busiest day's permanent growth in the window: a past day's dated bytes
-    in full, and today's sealed bytes. The mean rides beside it, denominated by the days
-    that grew rather than by the window's width, because a day that captured nothing is
-    not a day the lake grew slowly on. The journal reserve, thirteen of the busiest day's
-    sealed bytes, comes off free space before the count, and a disk with less free space
-    than the reserve reads zero capture days rather than a negative count.
+    in full, and today's the same way, except that while its journal is in flight only its
+    sealed bytes count. The mean rides beside it, denominated by the days that grew rather
+    than by the window's width, because a day that captured nothing is not a day the lake
+    grew slowly on. The journal reserve, thirteen of the busiest day's sealed bytes, comes
+    off free space before the count, and a disk with less free space than the reserve
+    reads zero capture days rather than a negative count.
 
     Nothing here raises for a lake or a device it cannot read. Both readings report as
     values, for one reason: the caller is a panel where an escape becomes a 500 saying
@@ -556,11 +572,15 @@ def assess(
 
     start = today - timedelta(days=window_days - 1)
     window = tuple((day, size) for day, size in usage.day_bytes.items() if start <= day <= today)
-    # The rate series, per module docstring decision 2. A past day counts in full, journal
+    # The rate series, per module docstring decision 2. A day counts in full, journal
     # included, because a segment compaction left behind stays on the disk until someone
-    # repairs it. Today counts without its journal, which is either still growing or about
-    # to be compacted into a partition 9 to 13 times smaller.
-    rate = ((day, usage.sealed_bytes(day) if day == today else size) for day, size in window)
+    # repairs it. The one exception is today before compaction is due: its journal is still
+    # growing and is about to be compacted into a partition 9 to 13 times smaller, so it
+    # counts only its sealed bytes.
+    rate = (
+        (day, usage.sealed_bytes(day) if journal_in_flight and day == today else size)
+        for day, size in window
+    )
     capturing = [(day, size) for day, size in rate if size > 0]
     peak_day, peak = max(capturing, key=lambda item: item[1]) if capturing else (None, 0)
     mean = sum(size for _day, size in capturing) // len(capturing) if capturing else None
