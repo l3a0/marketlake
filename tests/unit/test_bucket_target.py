@@ -276,7 +276,7 @@ def test_an_unrecognised_credential_source_is_refused_alone(value):
     )
     with pytest.raises(ConfigError) as refused:
         require_bucket_settings(cfg)
-    assert str(refused.value) == "bucket_credentials must be keys or instance_profile"
+    assert str(refused.value) == "bucket_credentials must be keys, instance_profile or assume_role"
 
 
 def test_a_bucket_target_with_its_keys_loads_them_as_secrets():
@@ -311,35 +311,51 @@ def test_the_page_secrets_hold_the_bucket_keys_when_present():
     )
 
 
-# The put-only key the weekly re-auth signs the token parameter's put with, marketlake #636.
-STORE_KEYS = {
-    "token_store_access_key_id": "AKIDTOKENSTOREKEY",
-    "token_store_secret_access_key": "token-store-secret-value",
-    "token_store_region": "us-east-2",
+# The command key, which assumes the bucket's role and the token store's, marketlake #737,
+# beside the two role ARNs, which carry the account id and are not secrets.
+COMMAND_KEYS = {
+    "command_access_key_id": "AKIDCOMMANDKEY",
+    "command_secret_access_key": "command-secret-value",
+    "bucket_role_arn": "arn:aws:iam::111122223333:role/marketlake-backup",
+    "token_store_role_arn": "arn:aws:iam::111122223333:role/marketlake-token-writer",
+    "token_store_region": "us-east-1",
 }
 
 
-def test_the_page_secrets_hold_the_token_store_keys_when_present():
+def test_the_page_secrets_hold_the_command_key_when_present():
     # Each pair alone and both together, so a method that added only one pair passes
     # neither the first nor the last assertion.
-    alone = Config.from_mapping({**BASE, **STORE_KEYS}).page_secrets()
+    alone = Config.from_mapping({**BASE, **COMMAND_KEYS}).page_secrets()
     assert alone == (
         "PING-KEY-SECRET",
         "topic-secret-xyz",
-        "AKIDTOKENSTOREKEY",
-        "token-store-secret-value",
+        "AKIDCOMMANDKEY",
+        "command-secret-value",
     )
-    both = Config.from_mapping({**BASE, **KEYS, **STORE_KEYS}).page_secrets()
+    both = Config.from_mapping({**BASE, **KEYS, **COMMAND_KEYS}).page_secrets()
     assert both == (
         "PING-KEY-SECRET",
         "topic-secret-xyz",
         "AKIDBUCKETKEY",
         "bucket-secret-value",
-        "AKIDTOKENSTOREKEY",
-        "token-store-secret-value",
+        "AKIDCOMMANDKEY",
+        "command-secret-value",
     )
-    # The region is not a secret, so it never joins them.
-    assert "us-east-2" not in both
+    # The region and the role ARNs are not secrets, so none of them joins them.
+    assert "us-east-1" not in both
+    assert not any(value.startswith("arn:") for value in both)
+
+
+def test_the_retired_put_keys_are_ignored_at_load():
+    # No principal holds a key for them any more, and a config written for older code
+    # still loads, as one with any unknown key does.
+    retired = {
+        "token_store_access_key_id": "AKIDRETIRED",
+        "token_store_secret_access_key": "retired-secret",
+    }
+    cfg = Config.from_mapping({**BASE, **retired})
+    assert cfg.page_secrets() == ("PING-KEY-SECRET", "topic-secret-xyz")
+    assert not hasattr(cfg, "token_store_access_key_id")
 
 
 def _publisher_sites() -> list[tuple[str, int, ast.Call]]:

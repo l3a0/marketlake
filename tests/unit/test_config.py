@@ -133,12 +133,12 @@ def test_healthchecks_url_uses_the_slug_form():
     )
 
 
-# The four optional secrets: the bucket's key pair and the token store's key pair.
+# The four optional secrets: the bucket's key pair and the command key's pair.
 OPTIONAL_SECRETS = {
     "bucket_access_key_id": "AKID-BUCKET-SECRET",
     "bucket_secret_access_key": "BUCKET-SECRET-VALUE",
-    "token_store_access_key_id": "AKID-TOKEN-STORE-SECRET",
-    "token_store_secret_access_key": "TOKEN-STORE-SECRET-VALUE",
+    "command_access_key_id": "AKID-COMMAND-SECRET",
+    "command_secret_access_key": "COMMAND-SECRET-VALUE",
 }
 
 
@@ -151,8 +151,8 @@ def test_all_eight_secrets_are_secret_wrapped():
         cfg.schwab_app_secret,
         cfg.bucket_access_key_id,
         cfg.bucket_secret_access_key,
-        cfg.token_store_access_key_id,
-        cfg.token_store_secret_access_key,
+        cfg.command_access_key_id,
+        cfg.command_secret_access_key,
     ):
         assert type(value) is Secret
 
@@ -172,9 +172,9 @@ def test_secret_never_leaks_in_any_string_form():
         repr(cfg.schwab_app_secret),
         str(cfg.schwab_app_secret),
         f"{cfg.schwab_app_secret}",
-        repr(cfg.token_store_access_key_id),
-        str(cfg.token_store_access_key_id),
-        f"{cfg.token_store_secret_access_key}",
+        repr(cfg.command_access_key_id),
+        str(cfg.command_access_key_id),
+        f"{cfg.command_secret_access_key}",
     )
     secret_values = (
         "PING-KEY-SECRET",

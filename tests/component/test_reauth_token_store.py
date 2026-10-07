@@ -3,8 +3,10 @@
 The real ``main`` runs here, with a fake ``schwab.auth`` in ``sys.modules`` as in
 ``test_reauth_command.py``. ``main`` builds the token parameter's client itself, through
 ``token_store.push_client``. These tests replace that producer with one that builds the
-real client and then answers it through a ``before-send`` hook, so botocore signs and
-serialises exactly as it would for AWS and no socket opens.
+real client and then answers SSM through a ``before-send`` hook, so botocore signs and
+serialises exactly as it would for AWS. The client assumes the token-writer role with the
+command key at its first request (marketlake #737), and the ``sts`` fixture answers that
+on loopback, applied to this file alone. So no request reaches AWS.
 
 The fake login hands over a token with distinct access and refresh tokens, and no line
 on either stream may contain either one, whatever the put does.
@@ -27,6 +29,17 @@ from tests.component.test_reauth_command import (
     _install_seam,
 )
 from tests.support.config import write_config
+from tests.support.sts import (
+    ACCOUNT_ID,
+    COMMAND_KEY_ID,
+    COMMAND_SECRET,
+    PRINCIPAL_ARN,
+    TOKEN_ROLE_ARN,
+    session_key_id,
+    session_token,
+)
+
+pytestmark = pytest.mark.usefixtures("sts")
 
 ACCESS = "ACCESS-TOKEN-SENTINEL-5b2d"
 REFRESH = "REFRESH-TOKEN-SENTINEL-e04f"
@@ -34,12 +47,12 @@ STORE_TOKEN = {
     "creation_timestamp": 1787529900,
     "token": {"access_token": ACCESS, "refresh_token": REFRESH, "expires_in": 1800},
 }
-PUT_KEY_ID = "AKIDTOKENSTOREPUT"
 BUCKET_KEY_ID = "AKIDBUCKETBACKUP"
 REGION = "us-east-2"
 PUT_KEYS = {
-    "token_store_access_key_id": PUT_KEY_ID,
-    "token_store_secret_access_key": "token-store-put-secret",
+    "command_access_key_id": COMMAND_KEY_ID,
+    "command_secret_access_key": COMMAND_SECRET,
+    "token_store_role_arn": TOKEN_ROLE_ARN,
     "token_store_region": REGION,
 }
 BUCKET_KEYS = {
@@ -110,12 +123,15 @@ def _assert_no_token_bytes(captured) -> None:
         assert ACCESS not in stream
         assert REFRESH not in stream
         assert "Traceback" not in stream
+        assert ACCOUNT_ID not in stream
+        assert PRINCIPAL_ARN not in stream
+        assert COMMAND_SECRET not in stream
 
 
 # -- the setting -----------------------------------------------------------------------
 
 
-def test_file_mode_with_complete_keys_sends_nothing(tmp_path, lake_root, monkeypatch, capsys):
+def test_file_mode_with_complete_keys_sends_nothing(tmp_path, lake_root, monkeypatch, capsys, sts):
     hook = StoreHook().install(monkeypatch)
     config = _config(tmp_path, lake_root, token_store="file", **PUT_KEYS)
 
@@ -123,6 +139,7 @@ def test_file_mode_with_complete_keys_sends_nothing(tmp_path, lake_root, monkeyp
 
     assert code == 0
     assert hook.builds == 0 and hook.requests == []
+    assert sts.requests == []
     assert json.loads(token.read_text()) == STORE_TOKEN
     captured = capsys.readouterr()
     assert "parameter" not in captured.out
@@ -163,7 +180,7 @@ def test_an_unknown_value_with_missing_keys_logs_in_writes_the_file_and_exits_th
     assert len(lines) == 2
     assert "token_store 'Both'" in lines[0]
     assert str(token) in lines[1]
-    assert "token_store_access_key_id" in lines[1]
+    assert "command_access_key_id" in lines[1]
     assert "Fix config.yaml" in lines[1]
     _assert_no_token_bytes(captured)
 
@@ -187,7 +204,7 @@ def test_an_unknown_value_with_complete_keys_puts(tmp_path, lake_root, monkeypat
 @pytest.mark.parametrize("mode", ["both", "store"])
 @pytest.mark.parametrize("missing", sorted(PUT_KEYS))
 def test_a_missing_put_key_refuses_before_the_browser(
-    tmp_path, lake_root, monkeypatch, capsys, mode, missing
+    tmp_path, lake_root, monkeypatch, capsys, sts, mode, missing
 ):
     # Complete ``bucket_*`` keys sit beside them, so a fallback to the backup's key would
     # build a client and send a request.
@@ -201,6 +218,7 @@ def test_a_missing_put_key_refuses_before_the_browser(
     assert flow.calls == []
     assert not token.exists()
     assert hook.builds == 0 and hook.requests == []
+    assert sts.requests == []
     err = capsys.readouterr().err
     assert err.startswith("reauth: ")
     assert missing in err
@@ -236,6 +254,25 @@ def test_a_malformed_put_region_refuses_before_the_browser(
     assert code == 2
     assert flow.calls == []
     assert "token_store_region 'useast2' is not an AWS region name" in capsys.readouterr().err
+
+
+def test_a_malformed_role_arn_refuses_before_the_browser_and_quotes_none_of_it(
+    tmp_path, lake_root, monkeypatch, capsys, sts
+):
+    StoreHook().install(monkeypatch)
+    arn = f"arn:aws:iam::{ACCOUNT_ID}:user/marketlake-token-writer"
+    config = _config(
+        tmp_path, lake_root, token_store="both", **{**PUT_KEYS, "token_store_role_arn": arn}
+    )
+
+    code, flow, _ = _run(tmp_path, config, monkeypatch)
+
+    assert code == 2
+    assert flow.calls == []
+    assert sts.requests == []
+    err = capsys.readouterr().err
+    assert "token_store_role_arn is not an IAM role ARN" in err
+    assert ACCOUNT_ID not in err and "marketlake-token-writer" not in err
 
 
 # -- the put ---------------------------------------------------------------------------
@@ -295,9 +332,7 @@ def test_the_put_sends_the_written_text_not_a_read_back(tmp_path, lake_root, mon
     assert json.loads(json.loads(hook.requests[0].body)["Value"]) == STORE_TOKEN
 
 
-def test_with_both_key_sets_the_put_signs_with_the_token_store_key(
-    tmp_path, lake_root, monkeypatch
-):
+def test_with_both_key_sets_the_put_signs_as_the_token_role(tmp_path, lake_root, monkeypatch, sts):
     # The two regions differ, so a put that read ``bucket_region`` signs for the wrong one.
     hook = StoreHook().install(monkeypatch)
     bucket = {**BUCKET_KEYS, "bucket_region": "us-west-1"}
@@ -305,11 +340,18 @@ def test_with_both_key_sets_the_put_signs_with_the_token_store_key(
 
     _run(tmp_path, config, monkeypatch)
 
+    assert len(sts.requests) == 1
+    assumed = sts.requests[0]
+    assert assumed.params["RoleArn"] == TOKEN_ROLE_ARN
+    assert assumed.params["RoleSessionName"] == "marketlake-token-put"
+    assert assumed.key_id == COMMAND_KEY_ID
+    assert assumed.scope_region == REGION
     request = hook.requests[0]
     authorization = request.headers["Authorization"].decode()
     credential = authorization.split("Credential=", 1)[1].split("/", 1)[0]
-    assert credential == PUT_KEY_ID
-    assert BUCKET_KEY_ID not in authorization
+    assert credential == session_key_id(1)
+    assert request.headers["X-Amz-Security-Token"].decode() == session_token(1)
+    assert BUCKET_KEY_ID not in authorization and COMMAND_KEY_ID not in authorization
     assert "/us-east-2/ssm/" in authorization
     assert request.url == "https://ssm.us-east-2.amazonaws.com/"
 
@@ -347,32 +389,69 @@ def test_a_token_over_4096_bytes_is_refused_before_any_request(
 # -- a put that fails ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "code",
-    [
-        "AccessDenied",
-        "AccessDeniedException",
-        "UnrecognizedClientException",
-        "InvalidSignatureException",
-    ],
-)
-def test_a_refused_put_leaves_the_file_and_names_the_token_store_keys(
-    tmp_path, lake_root, monkeypatch, capsys, code
+@pytest.mark.parametrize("code", ["AccessDenied", "AccessDeniedException"])
+def test_an_ssm_refusal_after_a_good_assume_leaves_the_file_and_names_the_role(
+    tmp_path, lake_root, monkeypatch, capsys, sts, code
 ):
-    body = {"__type": code, "message": f"no {REFRESH}"}
+    body = {"__type": code, "message": f"no {REFRESH} for {PRINCIPAL_ARN}"}
     StoreHook(status=400, body=body).install(monkeypatch)
     config = _config(tmp_path, lake_root, token_store="both", **PUT_KEYS)
 
     exit_code, _, token = _run(tmp_path, config, monkeypatch)
 
     assert exit_code == 3
+    assert len(sts.requests) == 1
     assert json.loads(token.read_text()) == STORE_TOKEN
     captured = capsys.readouterr()
     lines = captured.err.strip().splitlines()
     assert len(lines) == 1
     assert str(token) in lines[0]
     assert f"({code})" in lines[0]
-    assert "token_store_access_key_id and token_store_secret_access_key" in lines[0]
+    assert "token_store_role_arn" in lines[0] and "token_store_region" in lines[0]
+    assert "Run reauth.sh again" not in lines[0]
+    _assert_no_token_bytes(captured)
+
+
+@pytest.mark.parametrize("code", ["UnrecognizedClientException", "InvalidSignatureException"])
+def test_an_unknown_session_after_a_good_assume_says_run_again(
+    tmp_path, lake_root, monkeypatch, capsys, code
+):
+    StoreHook(status=400, body={"__type": code, "message": "no"}).install(monkeypatch)
+    config = _config(tmp_path, lake_root, token_store="both", **PUT_KEYS)
+
+    exit_code, _, _ = _run(tmp_path, config, monkeypatch)
+
+    assert exit_code == 3
+    captured = capsys.readouterr()
+    assert captured.err.strip().endswith(
+        f"({code}). SSM did not accept the session STS had just issued for the role. "
+        "Run reauth.sh again"
+    )
+    _assert_no_token_bytes(captured)
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "InvalidClientTokenId", "SignatureDoesNotMatch"])
+def test_an_sts_refusal_leaves_the_file_and_names_the_command_key(
+    tmp_path, lake_root, monkeypatch, capsys, sts, code
+):
+    sts.refuse(code)
+    hook = StoreHook().install(monkeypatch)
+    config = _config(tmp_path, lake_root, token_store="both", **PUT_KEYS)
+
+    exit_code, flow, token = _run(tmp_path, config, monkeypatch)
+
+    assert exit_code == 3
+    assert flow.calls
+    assert json.loads(token.read_text()) == STORE_TOKEN
+    assert len(sts.requests) == 1
+    assert hook.requests == []
+    captured = capsys.readouterr()
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 1
+    assert str(token) in lines[0]
+    assert f"(AssumeRole {code})" in lines[0]
+    assert "command_access_key_id and command_secret_access_key" in lines[0]
+    assert "A key made minutes ago may not be active yet" in lines[0]
     assert "Run reauth.sh again" not in lines[0]
     _assert_no_token_bytes(captured)
 

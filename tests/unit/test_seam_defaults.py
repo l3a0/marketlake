@@ -29,7 +29,10 @@ a test drives the entry with a fake ``schwab`` package in ``sys.modules`` rather
 handing the entry a flow. Its second seam is the token parameter's AWS client, which
 ``reauth_from_config`` takes as a factory and ``token_store.push`` and ``token_store.pull``
 take as a client and a factory. ``reauth.main`` and ``token_store.main`` build both
-themselves, so a test answers the client through botocore's event hooks instead.
+themselves, so a test answers the client through botocore's event hooks instead. The put's
+client also assumes a role through an STS client private to the build, which no hook on
+the SSM client reaches, so a test of the put answers that at an STS server on loopback,
+through the ``aws_session.STS_ENDPOINT_URL`` seam.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor

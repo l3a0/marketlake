@@ -252,7 +252,16 @@ def _profile_config(**overrides) -> Config:
     return _config(**values)
 
 
-UNRECOGNISED = [None, "", "Instance_Profile", " instance_profile ", "key", 1, SECRET_SHAPED]
+UNRECOGNISED = [
+    None,
+    "",
+    "Instance_Profile",
+    " instance_profile ",
+    "key",
+    "assume-role",
+    1,
+    SECRET_SHAPED,
+]
 
 
 @pytest.mark.parametrize("value", UNRECOGNISED)
@@ -263,7 +272,7 @@ def test_an_unrecognised_credential_source_refuses_alone_and_never_falls_back(mo
     with pytest.raises(ConfigError) as refused:
         client_from_config(_config(bucket_credentials=value))
     message = str(refused.value)
-    assert message == "bucket_credentials must be keys or instance_profile"
+    assert message == "bucket_credentials must be keys, instance_profile or assume_role"
     assert SECRET_SHAPED not in message
 
 
@@ -274,7 +283,7 @@ def test_the_builder_takes_neither_path_on_an_unrecognised_source(value):
     # that sent every other value down the key path would build a client here.
     with pytest.raises(ConfigError) as refused:
         bucket._build_client(_config(bucket_credentials=value))
-    assert str(refused.value) == "bucket_credentials must be keys or instance_profile"
+    assert str(refused.value) == "bucket_credentials must be keys, instance_profile or assume_role"
 
 
 def test_a_pasted_credential_source_stays_out_of_the_config_repr():

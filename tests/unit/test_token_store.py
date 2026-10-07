@@ -6,6 +6,12 @@ marketlake #636 carries the Schwab token to the hosted VM through one SSM
 would send is read exactly as it would leave, and no socket opens. No test reaches a real
 parameter store, and no key here is real.
 
+The put's own client assumes a role through STS at its first request (marketlake #737),
+and a hook on the SSM client cannot answer that. So the put's cases here build the SSM
+client from a ``KeyPair``, and a hook raises ``_AssumeRoleFailed`` where a case is about
+the assume step. ``tests/component/test_token_store_put.py`` drives ``push_client``
+itself against an STS on loopback.
+
 The token fixtures carry distinct access and refresh tokens, and the tests assert that
 neither reaches any line the module returns. A ``ClientError`` whose message echoes the
 token, and a real ``ParamValidationError`` raised over a ``Value`` turned into bytes, are
@@ -25,11 +31,13 @@ import pytest
 from botocore.awsrequest import AWSResponse
 
 from lake import aws_session, token_store
+from lake.aws_session import KeyPair, _AssumeRoleFailed
 from lake.config import Config, ConfigError, Secret
 from tests.support.clock import ManualClock
 
-PUT_KEY_ID = "AKIDTOKENSTOREPUT"
-PUT_SECRET = "token-store-put-secret"
+PUT_KEY_ID = "AKIDCOMMANDKEY"
+PUT_SECRET = "command-secret-value"
+TOKEN_ROLE = "arn:aws:iam::111122223333:role/marketlake-token-writer"
 BUCKET_KEY_ID = "AKIDBUCKETBACKUP"
 BUCKET_SECRET = "bucket-backup-secret"
 REGION = "us-east-2"
@@ -59,8 +67,9 @@ def _config(**overrides) -> Config:
         "ntfy_topic": "topic",
         "schwab_api_key": "api",
         "schwab_app_secret": "app",
-        "token_store_access_key_id": PUT_KEY_ID,
-        "token_store_secret_access_key": PUT_SECRET,
+        "command_access_key_id": PUT_KEY_ID,
+        "command_secret_access_key": PUT_SECRET,
+        "token_store_role_arn": TOKEN_ROLE,
         "token_store_region": REGION,
         **overrides,
     }
@@ -104,7 +113,30 @@ class Ssm:
 
 
 def _put_client(config: Config | None = None):
-    return token_store.push_client(config or _config())
+    """An SSM client for the put's cases, signed with the command key as a ``KeyPair``.
+
+    ``push_client`` assumes the role at the first request, which only an STS can answer,
+    so these cases sign with a key pair instead and leave the assume to the component
+    tests. The put itself is the same either way.
+    """
+    config = config or _config()
+    assert config.command_access_key_id is not None
+    assert config.command_secret_access_key is not None
+    return aws_session.build_client(
+        "ssm",
+        region=config.token_store_region,
+        source=KeyPair(config.command_access_key_id, config.command_secret_access_key),
+        client_config=token_store._SSM_CLIENT_CONFIG,
+    )
+
+
+def _assume_fails(client, code: str, *, transient: bool = False) -> None:
+    """Make the next request fail as the assume step does, at signing, before it is sent."""
+
+    def fail(**kwargs):
+        raise _AssumeRoleFailed(code, transient=transient)
+
+    client.meta.events.register("before-sign.ssm", fail)
 
 
 def _error(code: str, message: str = "") -> dict:
@@ -156,33 +188,37 @@ def test_a_yaml_date_is_named_by_its_repr():
 
 def test_the_mode_stays_in_the_config_repr():
     # It names a mode rather than a credential, so unlike ``bucket_credentials`` it is
-    # shown, and the key values beside it are not.
+    # shown, and the key values and the role ARN beside it are not.
     shown = repr(_config(token_store="both"))
     assert "token_store='both'" in shown
     assert PUT_SECRET not in shown and PUT_KEY_ID not in shown
+    assert TOKEN_ROLE not in shown and "111122223333" not in shown
 
 
 def test_the_put_keys_load_as_secrets_and_never_borrow_the_bucket_keys():
     config = _config(
-        token_store_access_key_id=None,
-        token_store_secret_access_key=None,
+        command_access_key_id=None,
+        command_secret_access_key=None,
         bucket_access_key_id=BUCKET_KEY_ID,
         bucket_secret_access_key=BUCKET_SECRET,
         bucket_region=REGION,
     )
-    assert config.token_store_access_key_id is None
-    assert config.token_store_secret_access_key is None
+    assert config.command_access_key_id is None
+    assert config.command_secret_access_key is None
     assert token_store.credential_problems(config) == [
         "the token parameter's put needs config key(s): "
-        "['token_store_access_key_id', 'token_store_secret_access_key']"
+        "['command_access_key_id', 'command_secret_access_key']"
     ]
     loaded = _config()
-    assert type(loaded.token_store_access_key_id) is Secret
-    assert type(loaded.token_store_secret_access_key) is Secret
+    assert type(loaded.command_access_key_id) is Secret
+    assert type(loaded.command_secret_access_key) is Secret
+    assert loaded.token_store_role_arn == TOKEN_ROLE
     assert loaded.token_store_region == REGION
 
 
-@pytest.mark.parametrize("missing", ["token_store_access_key_id", "token_store_secret_access_key"])
+@pytest.mark.parametrize(
+    "missing", ["command_access_key_id", "command_secret_access_key", "token_store_role_arn"]
+)
 def test_each_missing_key_is_named(missing):
     problems = token_store.credential_problems(_config(**{missing: None}))
     assert problems == [f"the token parameter's put needs config key(s): ['{missing}']"]
@@ -233,20 +269,6 @@ def test_the_put_sends_a_secure_standard_overwrite_of_exactly_the_text():
     assert set(sent) == {"Name", "Value", "Type", "Overwrite", "Tier"}
 
 
-def test_the_put_signs_with_the_token_store_key_in_its_region():
-    client = _put_client(
-        _config(bucket_access_key_id=BUCKET_KEY_ID, bucket_secret_access_key=BUCKET_SECRET)
-    )
-    ssm = Ssm(client)
-    token_store.push(client=client, text=json.dumps(_token()))
-    request = ssm.requests[0]
-    authorization = request.headers["Authorization"].decode()
-    assert f"Credential={PUT_KEY_ID}/" in authorization
-    assert BUCKET_KEY_ID not in authorization
-    assert f"/{REGION}/ssm/" in authorization
-    assert request.url == f"https://ssm.{REGION}.amazonaws.com/"
-
-
 def test_a_value_one_byte_over_4096_is_refused_before_any_request():
     client = _put_client()
     ssm = Ssm(client)
@@ -278,35 +300,75 @@ def test_the_size_is_counted_in_bytes_not_characters():
 
 KEY_CODES = ["AccessDenied", "AccessDeniedException"]
 UNKNOWN_KEY_CODES = ["UnrecognizedClientException", "InvalidSignatureException"]
+# What STS answers a command key it will not let assume the role: a policy or trust that
+# does not allow it, an unknown or deactivated key id, and a wrong secret.
+ASSUME_REFUSAL_CODES = ["AccessDenied", "InvalidClientTokenId", "SignatureDoesNotMatch"]
 
 
-@pytest.mark.parametrize("code", KEY_CODES + UNKNOWN_KEY_CODES)
-def test_a_refused_key_names_the_token_store_keys(code):
+@pytest.mark.parametrize("code", KEY_CODES)
+def test_an_ssm_denial_after_a_good_assume_names_the_role_and_the_region(code):
     client = _put_client()
     Ssm(client, status=400, body=_error(code, f"refused {REFRESH} {ACCESS}"))
     with pytest.raises(token_store.PushFailed) as failed:
         token_store.push(client=client, text=json.dumps(_token()))
     assert failed.value.code == code
+    assert failed.value.detail is None
     line = token_store.push_failure_line(Path("/t/token.json"), failed.value)
     assert line.startswith(
         f"/t/token.json was written and the token parameter was not updated ({code})."
     )
-    assert "token_store_access_key_id and token_store_secret_access_key" in line
+    assert "token_store_role_arn" in line and "token_store_region" in line
+    assert "us-east-1 only" in line
+    assert "command_access_key_id" not in line
     assert "fails the same way" in line
     assert "Run reauth.sh again" not in line
     assert REFRESH not in line and ACCESS not in line
     assert "\n" not in line
 
 
-def test_an_access_denied_line_says_the_backup_key_is_the_wrong_one():
-    line = token_store.push_failure_line(Path("/t"), token_store.PushFailed("AccessDenied"))
-    assert "not the backup's key" in line
-
-
 @pytest.mark.parametrize("code", UNKNOWN_KEY_CODES)
-def test_an_unknown_key_line_says_a_new_key_may_not_be_active(code):
-    line = token_store.push_failure_line(Path("/t"), token_store.PushFailed(code))
-    assert "A key created a minute ago may not be active yet" in line
+def test_an_unknown_session_after_a_good_assume_says_run_reauth_again(code):
+    client = _put_client()
+    Ssm(client, status=400, body=_error(code, f"refused {REFRESH}"))
+    with pytest.raises(token_store.PushFailed) as failed:
+        token_store.push(client=client, text=json.dumps(_token()))
+    line = token_store.push_failure_line(Path("/t/token.json"), failed.value)
+    assert f"({code})." in line
+    assert line.endswith("Run reauth.sh again")
+    assert "command_access_key_id" not in line
+    assert REFRESH not in line
+
+
+@pytest.mark.parametrize("code", ASSUME_REFUSAL_CODES)
+def test_a_refused_assume_names_the_command_key_and_a_key_not_yet_active(code):
+    client = _put_client()
+    ssm = Ssm(client)
+    _assume_fails(client, code)
+    with pytest.raises(token_store.PushFailed) as failed:
+        token_store.push(client=client, text=json.dumps(_token()))
+    assert (failed.value.code, failed.value.detail) == (code, token_store.ASSUMING)
+    assert failed.value.__cause__ is None and failed.value.__context__ is None
+    line = token_store.push_failure_line(Path("/t/token.json"), failed.value)
+    assert line.startswith(
+        f"/t/token.json was written and the token parameter was not updated (AssumeRole {code})."
+    )
+    assert "command_access_key_id and command_secret_access_key" in line
+    assert "token_store_role_arn" in line
+    assert "A key made minutes ago may not be active yet" in line
+    assert "fails the same way" in line
+    assert "Run reauth.sh again" not in line
+    assert ssm.requests == []
+    assert "\n" not in line
+
+
+def test_an_unavailable_sts_says_run_reauth_again():
+    client = _put_client()
+    _assume_fails(client, "ServiceUnavailable", transient=True)
+    with pytest.raises(token_store.PushFailed) as failed:
+        token_store.push(client=client, text=json.dumps(_token()))
+    assert failed.value.transient is True
+    line = token_store.push_failure_line(Path("/t/token.json"), failed.value)
+    assert line.endswith("(AssumeRole ServiceUnavailable). Run reauth.sh again")
 
 
 def test_any_other_code_says_run_reauth_again_and_never_echoes_the_message():
@@ -399,7 +461,7 @@ def _assert_signed_by_the_config(request) -> None:
     assert "X-Amz-Security-Token" not in request.headers
 
 
-def test_the_token_client_ignores_the_environment_and_the_aws_files(hostile_aws):
+def test_a_key_pair_client_ignores_the_environment_and_the_aws_files(hostile_aws):
     client = _put_client()
     ssm = Ssm(client)
     token_store.push(client=client, text=json.dumps(_token()))
@@ -428,7 +490,7 @@ def hostile_home(tmp_path, monkeypatch):
     return home
 
 
-def test_the_token_client_ignores_the_aws_files_in_the_home_directory(hostile_home):
+def test_a_key_pair_client_ignores_the_aws_files_in_the_home_directory(hostile_home):
     client = _put_client()
     ssm = Ssm(client)
     token_store.push(client=client, text=json.dumps(_token()))
@@ -460,7 +522,7 @@ def test_building_a_client_leaves_the_callers_settings_unchanged():
         },
     ]
     for _ in range(2):
-        _put_client()
+        token_store.push_client(_config())
         bucket.client_from_config(
             _config(
                 backup_target="s3://lake-backup/lake",
@@ -473,7 +535,7 @@ def test_building_a_client_leaves_the_callers_settings_unchanged():
 
 
 def test_the_ssm_client_carries_the_stated_timeouts_and_retries():
-    built = _put_client().meta.config
+    built = token_store.push_client(_config()).meta.config
     assert built.connect_timeout == 10
     assert built.read_timeout == 30
     # botocore counts the first attempt too, so three retries read back as four attempts.
@@ -506,7 +568,10 @@ def test_the_keys_source_names_a_missing_key():
 
 
 def test_no_service_model_loads_from_the_home_directory():
-    assert not any(".aws" in path for path in _put_client()._loader.search_paths)
+    client = token_store.push_client(_config())
+    assert not any(".aws" in path for path in client._loader.search_paths)
+    sts = client._request_signer._credentials._refresh_using.sts
+    assert not any(".aws" in path for path in sts._loader.search_paths)
 
 
 def test_the_bucket_module_does_not_carry_the_metadata_constants():
@@ -745,6 +810,17 @@ def test_an_aws_error_is_unreadable_by_its_code_alone(tmp_path, code):
     assert result.outcome == "unreadable"
     assert f"({code})" in result.line
     _assert_no_token_in(result)
+
+
+def test_a_role_that_cannot_be_assumed_is_unreadable_not_a_traceback(tmp_path):
+    # A laptop set to ``bucket_credentials: assume_role`` signs the pull as the bucket's
+    # role. One whose assume fails gets the unreadable line, never a traceback.
+    store = Store(_token())
+    _assume_fails(store.client, "AccessDenied")
+    result = _pull(store, tmp_path / "token.json")
+    assert result.outcome == "unreadable"
+    assert "(AssumeRole AccessDenied)" in result.line
+    assert not (tmp_path / "token.json").exists()
 
 
 def test_no_credentials_from_the_metadata_service_is_its_own_outcome(tmp_path):

@@ -17,11 +17,13 @@ an unauthenticated channel that anyone holding the name can read and spoof. The 
 API key and app secret are the static app-registration inputs ``schwab-py`` needs to
 build the client and refresh the token. The bucket's access key id and secret access
 key sign every request to the backup bucket on the key path, and ``lake.bucket`` builds
-its client from these two values alone. A host whose ``bucket_credentials`` is
-``instance_profile`` carries neither, because its credentials come from the EC2
-instance metadata service instead. The token store's access key id and secret access
-key sign the weekly re-auth's put of the token parameter, and only the host that runs
-the re-auth carries them. The Schwab token itself is not here. Each refresh replaces its
+its client from these two values alone. The command key, ``command_access_key_id`` and
+``command_secret_access_key``, is the laptop's one AWS identity, ``marketlake-command``
+(marketlake #737). It signs nothing but STS's ``AssumeRole``, for the bucket's role
+under ``bucket_credentials: assume_role`` and for the token store's role on the weekly
+re-auth's put of the token parameter. A host whose ``bucket_credentials`` is
+``instance_profile`` carries neither pair, because its credentials come from the EC2
+instance metadata service instead. The Schwab token itself is not here. Each refresh replaces its
 access token and leaves its refresh token unchanged, as marketlake #633 measured. It
 lives at ``~/.config/marketlake/token.json`` and is handled elsewhere. Every secret is wrapped
 in ``Secret``, which redacts itself in every log, repr, and traceback. The one caller
@@ -36,18 +38,26 @@ directory called ``s3:``. The bucket's two key values and its region are needed 
 when the target is a bucket. On the key path they may sit in the file beside a path
 target, which is how the first upload runs before the target is switched.
 
-``bucket_credentials`` says where the bucket client's credentials come from. ``keys``,
-the default when the key is absent, reads the two key values from this file.
-``instance_profile`` reads them from the EC2 instance metadata service, for a VM with an
-instance profile attached, and then this file must hold neither key value. The value is
-stored as read, the way ``role`` is, and only a bucket job checks it.
+``bucket_credentials`` says where the bucket client's credentials come from, and it
+takes three values.
+
+1. ``keys``, the default when the key is absent, reads the two bucket key values from
+   this file.
+2. ``instance_profile`` reads them from the EC2 instance metadata service, for a VM with
+   an instance profile attached, and then this file must hold neither bucket key value.
+3. ``assume_role`` signs with short-lived credentials from STS, which the command key
+   gets by assuming the role ``bucket_role_arn`` names. The bucket key values may stay in
+   the file beside it, unread, so setting ``keys`` again is the rollback.
+
+The value is stored as read, the way ``role`` is, and only a bucket job checks it.
 
 **Loading never refuses a backup setting.** Capture loads this file every cycle and the
 daemon loads it at startup, so a refusal here would stop capture over a setting only
 the nightly backup reads, and a lost minute cannot be recovered. A value that does not
 start with ``s3://`` loads as a ``Path`` exactly as it always has, whatever it holds. An
 ``s3://`` value loads as a ``BucketTarget`` with no checks, and a missing bucket key
-loads as ``None``, and any ``bucket_credentials`` value loads as read.
+loads as ``None``, and any ``bucket_credentials`` value loads as read. The two role ARNs
+load unchecked too.
 ``require_bucket_settings`` holds the strict checks, and each bucket job calls it when
 it runs, so a bad bucket setting fails only the backup.
 
@@ -69,8 +79,9 @@ the role only at start, so a check every minute would protect nothing.
 
 A third is ``token_store``, which says what this host does with the Schwab token:
 ``file``, ``both`` or ``store``, marketlake #636. It is stored the way ``role`` is, and
-``lake.token_store.mode_of`` decides what it means. The three ``token_store_*`` keys
-beside it are optional too, and only the re-auth checks them, for the same reason.
+``lake.token_store.mode_of`` decides what it means. The keys the put needs, the command
+key, ``token_store_role_arn`` and ``token_store_region``, are optional too, and only the
+re-auth checks them, for the same reason.
 
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
@@ -130,19 +141,29 @@ BUCKET_SECRET_KEY = "bucket_secret_access_key"
 BUCKET_REGION_KEY = "bucket_region"
 BUCKET_KEYS = (BUCKET_KEY_ID_KEY, BUCKET_SECRET_KEY, BUCKET_REGION_KEY)
 
-# Where the bucket client's credentials come from, and the two values that key takes.
+# Where the bucket client's credentials come from, and the three values that key takes.
 # ``keys`` reads the two key values from this file and is what an absent key means.
-# ``instance_profile`` reads them from the EC2 instance metadata service.
+# ``instance_profile`` reads them from the EC2 instance metadata service. ``assume_role``
+# has the command key assume the role ``bucket_role_arn`` names, marketlake #737.
 BUCKET_CREDENTIALS_KEY = "bucket_credentials"
 CREDENTIALS_FROM_KEYS = "keys"
 CREDENTIALS_FROM_INSTANCE_PROFILE = "instance_profile"
+CREDENTIALS_FROM_ASSUME_ROLE = "assume_role"
 
 # The refusal for any other ``bucket_credentials`` value. It never quotes the value, for
 # the reason ``bucket_credential_problems`` gives, and ``lake.bucket`` raises it too.
 UNRECOGNISED_CREDENTIALS = (
-    f"{BUCKET_CREDENTIALS_KEY} must be {CREDENTIALS_FROM_KEYS} or "
-    f"{CREDENTIALS_FROM_INSTANCE_PROFILE}"
+    f"{BUCKET_CREDENTIALS_KEY} must be {CREDENTIALS_FROM_KEYS}, "
+    f"{CREDENTIALS_FROM_INSTANCE_PROFILE} or {CREDENTIALS_FROM_ASSUME_ROLE}"
 )
+
+# The command key, ``marketlake-command``'s, marketlake #737. It is the laptop's one AWS
+# identity, and its only grant is ``sts:AssumeRole`` on two roles: the bucket's, which
+# ``bucket_role_arn`` names, and the token store's, which ``token_store_role_arn`` names.
+COMMAND_KEY_ID_KEY = "command_access_key_id"
+COMMAND_SECRET_KEY = "command_secret_access_key"
+COMMAND_KEYS = (COMMAND_KEY_ID_KEY, COMMAND_SECRET_KEY)
+BUCKET_ROLE_ARN_KEY = "bucket_role_arn"
 
 # What S3 allows in a bucket name: 3 to 63 lowercase letters, digits, dots and hyphens,
 # starting and ending with a letter or digit.
@@ -154,17 +175,26 @@ _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 # that is not a ``ConfigError``, so the check runs first and names the key instead.
 _REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
 
+# The shape of an IAM role ARN: a partition, a 12-digit account id, and a role name that
+# may sit under a path, as in ``arn:aws:iam::<account>:role/marketlake-backup``. IAM lets
+# a path hold any printable ASCII character and run to 512 characters, and a name hold
+# 1 to 64 of a narrower set, so the two parts are matched apart. ASCII mode keeps ``\d``
+# and ``\w`` from matching other scripts' digits and letters.
+_ROLE_ARN = re.compile(
+    r"arn:aws(?:-[a-z]+)*:iam::\d{12}:role/(?:[\x21-\x7e]{1,510}/)?[\w+=,.@-]{1,64}", re.ASCII
+)
+
 # The token-store keys, marketlake #636. ``token_store`` says what this host does with the
 # Schwab token, and ``lake.token_store.mode_of`` reads it. ``file``, the default when the
-# key is absent, keeps the token in ``token.json`` alone. The three keys after it hold the
-# put-only key the weekly re-auth signs its put with, and the region the parameter lives
-# in. They never fall back to the ``bucket_*`` keys.
+# key is absent, keeps the token in ``token.json`` alone. The weekly re-auth's put signs
+# only as the role ``token_store_role_arn`` names, which the command key assumes, in the
+# region ``token_store_region`` names, the parameter's own (marketlake #737). The put
+# never falls back to the ``bucket_*`` keys.
 TOKEN_STORE_KEY = "token_store"
 TOKEN_STORE_FILE = "file"
-TOKEN_STORE_KEY_ID_KEY = "token_store_access_key_id"
-TOKEN_STORE_SECRET_KEY = "token_store_secret_access_key"
+TOKEN_STORE_ROLE_ARN_KEY = "token_store_role_arn"
 TOKEN_STORE_REGION_KEY = "token_store_region"
-TOKEN_STORE_KEYS = (TOKEN_STORE_KEY_ID_KEY, TOKEN_STORE_SECRET_KEY, TOKEN_STORE_REGION_KEY)
+TOKEN_PUT_KEYS = (*COMMAND_KEYS, TOKEN_STORE_ROLE_ARN_KEY, TOKEN_STORE_REGION_KEY)
 
 # The host-role key, spelled once. ``lake.outbox`` names it in the line it prints for a
 # value it does not recognise.
@@ -314,19 +344,29 @@ def bucket_credential_problems(config: Config) -> list[str]:
 
     1. ``keys`` needs ``bucket_access_key_id``, ``bucket_secret_access_key`` and
        ``bucket_region``.
-    2. ``instance_profile`` needs ``bucket_region`` and refuses either key value, so one
-       machine cannot hold both by mistake.
-    3. Any other value is refused alone, naming the key and the two values it takes.
+    2. ``instance_profile`` needs ``bucket_region`` and refuses either bucket key value,
+       so one machine cannot hold both by mistake. It does not refuse the command key.
+       The token pull shares these checks, so a refusal here would stop the VM's pull,
+       and capture would follow within a week, when the refresh token died.
+    3. ``assume_role`` needs the command key, a ``bucket_role_arn`` shaped like a role
+       ARN, and ``bucket_region``. It reads no bucket key value, so those may stay in the
+       file for a rollback to ``keys``.
+    4. Any other value is refused alone, naming the key and the three values it takes.
        The value read is never quoted, because a key about credentials invites a pasted
        secret. It never falls back to ``keys``.
 
     ``require_bucket_settings`` and ``lake.bucket.client_from_config`` both call this.
     """
     source = config.bucket_credentials
-    if source not in (CREDENTIALS_FROM_KEYS, CREDENTIALS_FROM_INSTANCE_PROFILE):
+    if source not in (
+        CREDENTIALS_FROM_KEYS,
+        CREDENTIALS_FROM_INSTANCE_PROFILE,
+        CREDENTIALS_FROM_ASSUME_ROLE,
+    ):
         return [UNRECOGNISED_CREDENTIALS]
     problems = []
     key_id, secret_key = config.bucket_access_key_id, config.bucket_secret_access_key
+    needed: tuple[tuple[str, object], ...]
     if source == CREDENTIALS_FROM_INSTANCE_PROFILE:
         if key_id is not None or secret_key is not None:
             present = [
@@ -339,13 +379,34 @@ def bucket_credential_problems(config: Config) -> list[str]:
                 f"config must not hold {present}"
             )
         needed = ((BUCKET_REGION_KEY, config.bucket_region),)
+    elif source == CREDENTIALS_FROM_ASSUME_ROLE:
+        needed = (
+            (COMMAND_KEY_ID_KEY, config.command_access_key_id),
+            (COMMAND_SECRET_KEY, config.command_secret_access_key),
+            (BUCKET_ROLE_ARN_KEY, config.bucket_role_arn),
+            (BUCKET_REGION_KEY, config.bucket_region),
+        )
     else:
         values = (key_id, secret_key, config.bucket_region)
         needed = tuple(zip(BUCKET_KEYS, values, strict=True))
     absent = [key for key, value in needed if value is None]
     if absent:
         problems.append(f"the bucket needs config key(s): {absent}")
+    if source == CREDENTIALS_FROM_ASSUME_ROLE:
+        problems.extend(role_arn_problems(BUCKET_ROLE_ARN_KEY, config.bucket_role_arn))
     return problems
+
+
+def role_arn_problems(key: str, value: str | None) -> list[str]:
+    """What is wrong with a role ARN's shape, naming ``key`` and never quoting ``value``.
+
+    An absent value is the caller's to name. The value is never quoted, because it
+    carries the account id, and a refusal reaches the Sunday finding and the page it
+    sends, which ``Config.page_secrets`` does not cover.
+    """
+    if value is None or _ROLE_ARN.fullmatch(value):
+        return []
+    return [f"{key} is not an IAM role ARN like arn:aws:iam::<account>:role/<name>"]
 
 
 def is_region_name(value: str) -> bool:
@@ -367,7 +428,8 @@ def require_bucket_settings(config: Config, target: BucketTarget | None = None) 
     2. The prefix holds no ``.`` or ``..`` component.
     3. The credential settings fit ``bucket_credentials``, as
        :func:`bucket_credential_problems` states: ``bucket_region`` always, the two key
-       values on the key path, and neither of them on the instance-profile path.
+       values on the key path, neither of them on the instance-profile path, and the
+       command key and ``bucket_role_arn`` on the assume-role path.
     4. The region has the shape of an AWS region name.
 
     Loading the config runs none of these, so a bad bucket setting reaches the job that
@@ -674,9 +736,14 @@ class Config:
     # decides what the value means. It keeps its repr, unlike ``bucket_credentials``,
     # because it names a mode rather than where a credential comes from.
     token_store: str = TOKEN_STORE_FILE
-    token_store_access_key_id: Secret | None = None
-    token_store_secret_access_key: Secret | None = None
     token_store_region: str | None = None
+    # The command key, which signs only STS's ``AssumeRole``, marketlake #737.
+    command_access_key_id: Secret | None = None
+    command_secret_access_key: Secret | None = None
+    # The two roles the command key assumes. An ARN is not a secret, but it carries the
+    # account id, so neither is shown in the repr, and no check ever quotes one.
+    bucket_role_arn: str | None = field(default=None, repr=False)
+    token_store_role_arn: str | None = field(default=None, repr=False)
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""
@@ -694,7 +761,7 @@ class Config:
         """The values a page must never carry, for every ``Publisher`` that sends one.
 
         The healthchecks ping key and the ntfy topic always, and the bucket's two key
-        values and the token store's two key values when the file holds them. One method
+        values and the command key's two values when the file holds them. One method
         rather than a tuple at every construction site, so a secret added here reaches
         every publisher at once.
         """
@@ -702,8 +769,8 @@ class Config:
         for secret in (
             self.bucket_access_key_id,
             self.bucket_secret_access_key,
-            self.token_store_access_key_id,
-            self.token_store_secret_access_key,
+            self.command_access_key_id,
+            self.command_secret_access_key,
         ):
             if secret is not None:
                 values.append(secret.reveal())
@@ -730,8 +797,8 @@ class Config:
         backup_target = parse_backup_target(mapping["backup_target"])
         key_id = _optional_text(mapping.get(BUCKET_KEY_ID_KEY))
         secret_key = _optional_text(mapping.get(BUCKET_SECRET_KEY))
-        store_key_id = _optional_text(mapping.get(TOKEN_STORE_KEY_ID_KEY))
-        store_secret_key = _optional_text(mapping.get(TOKEN_STORE_SECRET_KEY))
+        command_key_id = _optional_text(mapping.get(COMMAND_KEY_ID_KEY))
+        command_secret_key = _optional_text(mapping.get(COMMAND_SECRET_KEY))
         return cls(
             lake_root=Path(str(mapping["lake_root"])).expanduser(),
             backup_target=backup_target,
@@ -755,11 +822,13 @@ class Config:
                 if TOKEN_STORE_KEY in mapping
                 else TOKEN_STORE_FILE
             ),
-            token_store_access_key_id=None if store_key_id is None else Secret(store_key_id),
-            token_store_secret_access_key=(
-                None if store_secret_key is None else Secret(store_secret_key)
-            ),
             token_store_region=_optional_text(mapping.get(TOKEN_STORE_REGION_KEY)),
+            command_access_key_id=None if command_key_id is None else Secret(command_key_id),
+            command_secret_access_key=(
+                None if command_secret_key is None else Secret(command_secret_key)
+            ),
+            bucket_role_arn=_optional_text(mapping.get(BUCKET_ROLE_ARN_KEY)),
+            token_store_role_arn=_optional_text(mapping.get(TOKEN_STORE_ROLE_ARN_KEY)),
         )
 
 
