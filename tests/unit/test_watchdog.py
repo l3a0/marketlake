@@ -1263,13 +1263,15 @@ def test_an_unwritten_segment_failing_another_cause_s_way_is_released():
             )
         )
     assert [page.title for page in raised] == ["Capture down: rate limited"]
-    # quotes SPY comes back, which keeps the cycle off the whole-daemon path. That path
-    # returns early while a cause is live and would never reach the per-surface pages.
+    # quotes SPY fails with a 500, which keeps the cycle off the whole-daemon path, since
+    # the classes no longer agree. That path returns early while a cause is live and would
+    # never reach the per-surface pages. No surface lands data, so the write failure stays
+    # inside the cause, and only its class can lift the cover (marketlake #754).
     for minute in range(3, 7):
         raised += watchdog.observe(
             _cycle(
                 _fail("chains", "QQQ", "http_429"),
-                _seg("quotes", "SPY", "data"),
+                _fail("quotes", "SPY", "http_500"),
                 errors=(SegmentError("chains", "SPY", "vendor_auth_error"),),
                 at=_at(minute),
             )
@@ -1706,6 +1708,199 @@ def test_a_write_failure_beside_a_dead_token_still_folds_under_it():
     assert [(page.title, len(page.surfaces)) for page in raised] == [
         ("Capture down: token dead", 3)
     ]
+
+
+# -- a write failure leaves the cause once the vendor answers (marketlake #754) -------
+
+TOKEN_DEAD_TITLE = "Capture down: token dead"
+QQQ_CHAINS = "Capture down: QQQ chains"
+WRITE_FAILED = SegmentError("chains", "QQQ", "os_error")
+
+
+def _write_failing(minute: int, error_class: str | None) -> CycleResult:
+    """One minute of the issue's probe: QQQ chains fails its write, every other surface not.
+
+    ``chains SPY``, ``quotes SPY`` and ``quotes QQQ`` each fail with ``error_class``, or
+    land data for ``None``. ``chains QQQ`` cannot be written in any minute.
+    """
+
+    def surface(name: str, ticker: str) -> SegmentOutcome:
+        if error_class is None:
+            return _seg(name, ticker, "data")
+        return _fail(name, ticker, error_class)
+
+    return _cycle(
+        surface("chains", "SPY"),
+        surface("quotes", "SPY"),
+        surface("quotes", "QQQ"),
+        errors=(WRITE_FAILED,),
+        at=_at(minute),
+    )
+
+
+def _per_minute(watchdog: Watchdog, cycles: list[CycleResult]) -> dict[int, list[tuple]]:
+    """The title and class of every page each cycle raised, keyed by the cycle's index.
+
+    A cycle that raised nothing is left out, so the result also says when each page went.
+    """
+    raised = {
+        minute: [(page.title, page.cause) for page in watchdog.observe(cycle)]
+        for minute, cycle in enumerate(cycles)
+    }
+    return {minute: pages for minute, pages in raised.items() if pages}
+
+
+def test_a_write_failure_that_outlives_a_token_death_pages_and_frees_the_cause():
+    """Test 1: the issue's probe. A second token death in the session must page.
+
+    A write failure records no class, so a token-dead cause that named it kept it, the
+    surface never paged, and the cause stayed live, so the second death paged nothing.
+    The first healed minute proves the vendor answered, so the write failure leaves the
+    cause and pages for itself in that minute.
+    """
+    cycles = (
+        [_write_failing(minute, "http_401") for minute in range(3)]
+        + [_write_failing(minute, None) for minute in range(3, 8)]
+        + [_write_failing(minute, "http_401") for minute in range(8, 12)]
+    )
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [(QQQ_CHAINS, "os_error")],
+        10: [(TOKEN_DEAD_TITLE, "http_401")],
+    }
+
+
+def test_a_surface_that_recorded_the_cause_and_then_failed_its_write_leaves_it_too():
+    """Test 2: membership is not decided once, at the page.
+
+    QQQ chains recorded the 401 when the cause paged, and only then started failing its
+    write. Keeping the surfaces that recorded a class at page time would keep this one,
+    and the cause would hold it for the rest of the session the same way.
+    """
+
+    def dead(minute: int, *, qqq_writes: bool) -> CycleResult:
+        surfaces = [
+            _fail("chains", "SPY", "http_401"),
+            _fail("quotes", "SPY", "http_401"),
+            _fail("quotes", "QQQ", "http_401"),
+        ]
+        if qqq_writes:
+            return _cycle(*surfaces, _fail("chains", "QQQ", "http_401"), at=_at(minute))
+        return _cycle(*surfaces, errors=(WRITE_FAILED,), at=_at(minute))
+
+    cycles = (
+        [dead(minute, qqq_writes=True) for minute in range(3)]
+        + [dead(minute, qqq_writes=False) for minute in range(3, 5)]
+        + [_write_failing(minute, None) for minute in range(5, 10)]
+        + [dead(minute, qqq_writes=False) for minute in range(10, 14)]
+    )
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        5: [(QQQ_CHAINS, "os_error")],
+        12: [(TOKEN_DEAD_TITLE, "http_401")],
+    }
+
+
+def test_a_minute_whose_every_write_failed_inside_a_token_death_sends_nothing_new():
+    """Test 3: a write failure leaves the cause only when another surface landed data.
+
+    A disk that refuses every write in one minute of a token death proves nothing about
+    the vendor. Releasing the write failures there emptied the cause, paged each of them,
+    and paged the dead token a second time on the next minute.
+    """
+    watchdog = Watchdog()
+    every_write = (
+        SegmentError("chains", "SPY", "os_error"),
+        SegmentError("quotes", "SPY", "os_error"),
+        SegmentError("quotes", "QQQ", "os_error"),
+        WRITE_FAILED,
+    )
+    cycles = (
+        [_write_failing(minute, "http_401") for minute in range(3)]
+        + [_cycle(errors=every_write, at=_at(3))]
+        + [_write_failing(minute, "http_401") for minute in range(4, 8)]
+    )
+    assert _per_minute(watchdog, cycles) == {2: [(TOKEN_DEAD_TITLE, "http_401")]}
+    assert watchdog._paged_causes == {
+        TOKEN_DEAD_TITLE: {
+            Surface("chains", "SPY"),
+            Surface("quotes", "SPY"),
+            Surface("quotes", "QQQ"),
+            Surface("chains", "QQQ"),
+        }
+    }
+
+
+def test_a_stall_inside_a_token_death_holding_a_write_failure_sends_nothing():
+    """Test 4: the write failure stays inside the cause while nothing lands.
+
+    A stall gaps every surface at once and attempts no request, so it is evidence about
+    the loop and never about the vendor. Had the write failure left the cause on a dead
+    minute, the stall would page ``loop stalled`` inside an outage that already paged.
+    """
+    watchdog = Watchdog()
+    cycles = [_write_failing(minute, "http_401") for minute in range(4)]
+    assert _per_minute(watchdog, cycles) == {2: [(TOKEN_DEAD_TITLE, "http_401")]}
+    watched = [
+        Surface("chains", "SPY"),
+        Surface("quotes", "SPY"),
+        Surface("quotes", "QQQ"),
+        Surface("chains", "QQQ"),
+    ]
+    assert watchdog.missed(watched, [_at(minute) for minute in range(4, 10)]) == []
+
+
+def test_a_write_failure_pages_while_another_surface_still_fails_the_cause_s_way():
+    """Test 5: the release is per surface, not the whole cause at once.
+
+    A rate limit that lets most requests through while one quotes surface stays limited
+    is the normal shape of a 429. Dropping the cause only once every surface it held
+    failed its write kept the write failure silent for as long as that one surface stayed
+    limited. The write failure pages on the first minute the vendor answers, and the
+    cause keeps the surface still limited.
+    """
+    watchdog = Watchdog()
+    cycles = [_write_failing(minute, "http_429") for minute in range(3)] + [
+        _cycle(
+            _seg("chains", "SPY", "data"),
+            _fail("quotes", "SPY", "http_429"),
+            _seg("quotes", "QQQ", "data"),
+            errors=(WRITE_FAILED,),
+            at=_at(minute),
+        )
+        for minute in range(3, 33)
+    ]
+    assert _per_minute(watchdog, cycles) == {
+        2: [("Capture down: rate limited", "http_429")],
+        3: [(QQQ_CHAINS, "os_error")],
+    }
+    assert watchdog._paged_causes == {"Capture down: rate limited": {Surface("quotes", "SPY")}}
+
+
+def test_a_chain_alternating_a_401_and_an_empty_answer_does_not_re_page_the_cause():
+    """Test 6: an answer with no contract does not count as the vendor answering here.
+
+    Every surface but one chain fails its write, and that chain alternates a 401 with an
+    empty 200 answer. The empty answer resets no counter, so counting it released every
+    write failure, emptied the cause, and the next 401 paged the dead token again at
+    once. A probe measured 19 pages in 40 minutes, where 2 go out.
+    """
+    writes = (
+        SegmentError("quotes", "SPY", "os_error"),
+        SegmentError("quotes", "QQQ", "os_error"),
+        WRITE_FAILED,
+    )
+
+    def chain(minute: int) -> SegmentOutcome:
+        if minute < 3 or minute % 2 == 0:
+            return _fail("chains", "SPY", "http_401")
+        return _empty_chain("SPY")
+
+    cycles = [_cycle(chain(minute), errors=writes, at=_at(minute)) for minute in range(40)]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [("Capture down: SPY chains", CONTRACTS_ABSENT)],
+    }
 
 
 # -- the whole-daemon rule as one public reading (marketlake #702) ---------------------
