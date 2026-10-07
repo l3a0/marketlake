@@ -1,10 +1,12 @@
 # The hosted VM's non-secret settings, marketlake #686.
 #
-# The VM's config.yaml is rendered from this file plus five SSM parameters, by
-# `python -m lake.vm_config render < config/vm.yaml`. cloud-init's first boot runs that
-# render, and #676's deploy runs it again after each pull, so a reviewed pull request is
-# the one way these settings change. The parameters carry the four secrets and the
-# backup target, which no tracked file may name.
+# The VM's config.yaml is rendered from this file, four SSM parameters and one instance
+# tag, by `python -m lake.vm_config render < config/vm.yaml`. cloud-init's first boot runs
+# that render, and #676's deploy runs it again after each pull, so a reviewed pull request
+# is the one way these settings change. The parameters carry the four secrets. The
+# instance's marketlake:backup-target tag carries the backup target, which infra/live/vm.tf
+# writes from the bucket OpenTofu already holds. No tracked file may name that bucket, and
+# this one may not set backup_target.
 #
 # #638's cutover flips `role` to primary here, in its own pull request.
 #

@@ -140,7 +140,8 @@ resource "aws_iam_instance_profile" "instance" {
 # attaches to the same role, allows both actions on every parameter, so it sets the
 # role's real read scope. This grant keeps the read from depending on that managed
 # policy. No kms: action is needed, because the parameters use the AWS-managed aws/ssm
-# key.
+# key. The backup target is not a parameter. The render reads it from the instance's
+# marketlake:backup-target tag through instance metadata, which needs no IAM grant.
 resource "aws_iam_role_policy" "instance_config_read" {
   name = "config-parameters-read"
   role = aws_iam_role.instance.name

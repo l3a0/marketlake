@@ -1,11 +1,13 @@
 """``python -m lake.vm_config render`` across its real boundaries, marketlake #686.
 
-The real ``main`` reads the settings on standard input, builds its own SSM client signed
-by the instance profile, and writes ``config.yaml`` into the config directory. The
-metadata service runs on loopback, the one ``tests/component/test_bucket_instance_profile.py``
-uses, reached through ``aws_session.METADATA_BASE_URL``. ``main`` builds the client
-through ``vm_config.render_client``, which a test wraps to answer ``GetParameters`` with a
-``before-send`` hook, so no request reaches AWS.
+The real ``main`` reads the settings on standard input, reads the backup target from the
+instance's ``marketlake:backup-target`` tag, builds its own SSM client signed by the
+instance profile, and writes ``config.yaml`` into the config directory. The metadata
+service runs on loopback, the one ``tests/component/test_bucket_instance_profile.py``
+uses, reached through ``aws_session.METADATA_BASE_URL``. :class:`_TagServer` extends it to
+serve instance tags. ``main`` builds the client through ``vm_config.render_client``, which
+a test wraps to answer ``GetParameters`` with a ``before-send`` hook, so no request reaches
+AWS.
 
 Every value the hook serves is a sentinel, and every test that reads the output checks
 that none of them reached it. The exit codes are what the first boot's retry reads: 0
@@ -17,7 +19,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
+import stat
 import sys
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -28,7 +33,7 @@ from botocore.awsrequest import AWSResponse
 from lake import aws_session, vm_config
 from lake.config import load_config
 from lake.paths import CONFIG_DIR_ENV, CONFIG_FILE, temp_write_path
-from tests.component.test_bucket_instance_profile import METADATA, _Server
+from tests.component.test_bucket_instance_profile import METADATA, TOKEN, _Server
 
 API_KEY = "API-KEY-SENTINEL-4a1f"
 APP_SECRET = "APP-SECRET-SENTINEL-77c2"
@@ -39,15 +44,19 @@ TARGET = f"s3://{BUCKET}/lake"
 ERROR_MESSAGE = "ERROR-MESSAGE-SENTINEL-91aa"
 SENTINELS = (API_KEY, APP_SECRET, PING_KEY, TOPIC, BUCKET, ERROR_MESSAGE)
 
-# The five names and the values the hook serves for them. Written out rather than read
+# The four names and the values the hook serves for them. Written out rather than read
 # from ``vm_config.PARAMETERS``, so a renamed parameter fails here.
 VALUES = {
     "/marketlake/config/schwab-api-key": API_KEY,
     "/marketlake/config/schwab-app-secret": APP_SECRET,
     "/marketlake/config/healthchecks-ping-key": PING_KEY,
     "/marketlake/config/ntfy-topic": TOPIC,
-    "/marketlake/config/backup-target": TARGET,
 }
+
+# The tag that carries the backup target, and the path the metadata service serves it at.
+TAG = "marketlake:backup-target"
+TAG_PATH = f"/latest/meta-data/tags/instance/{TAG}"
+TOKEN_PATH = "/latest/api/token"
 
 SETTINGS = {
     "role": "shadow",
@@ -92,11 +101,14 @@ class SsmHook:
         invalid: tuple[str, ...] = (),
         error: str | None = None,
         raises: Exception | None = None,
+        repeat: tuple[str, str] | None = None,
     ) -> None:
         self.values = dict(VALUES if values is None else values)
         self.invalid = invalid
         self.error = error
         self.raises = raises
+        # A name and a value the answer lists a second time, after the first.
+        self.repeat = repeat
         self.requests: list = []
         self.regions: list[str] = []
 
@@ -125,6 +137,9 @@ class SsmHook:
             for name in reversed(names)
             if name not in self.invalid and name in self.values
         ]
+        if self.repeat is not None:
+            name, value = self.repeat
+            parameters.append({"Name": name, "Type": "SecureString", "Value": value, "Version": 2})
         body = {"Parameters": parameters, "InvalidParameters": list(self.invalid)}
         data = json.dumps(body).encode()
         return AWSResponse(request.url, 200, {"Content-Length": str(len(data))}, _Raw(data))
@@ -133,9 +148,57 @@ class SsmHook:
         return json.loads(self.requests[0].body)
 
 
+class _TagServer(_Server):
+    """The shared loopback metadata service, which also serves the instance's tags.
+
+    The shared server answers 404 to every path it does not know, so this one wraps its
+    handler rather than changing it for the token pull's tests. A ``GET`` of a tag path
+    is recorded like any other request. It answers 401 without the shared server's token,
+    ``tag_status`` when that is set, the tag's value from ``tags`` when the key is there,
+    and 404 otherwise, which is what EC2 answers for a missing tag or for an instance
+    with ``instance_metadata_tags`` disabled. A value may be bytes, so a test can serve
+    bytes that are not UTF-8.
+    """
+
+    def __init__(self, creds: dict[str, str], tags: dict[str, str | bytes]) -> None:
+        super().__init__(creds)
+        self.tags = dict(tags)
+        self.tag_status: int | None = None
+        server = self
+        shared = self.httpd.RequestHandlerClass
+
+        class Handler(shared):
+            def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
+                prefix = "/latest/meta-data/tags/instance/"
+                if not self.path.startswith(prefix):
+                    return super().do_GET()
+                server.requests.append(("GET", self.path, dict(self.headers)))
+                key = urllib.parse.unquote(self.path[len(prefix) :])
+                if self.headers.get("x-aws-ec2-metadata-token") != TOKEN:
+                    self._answer_bytes(401, b"")
+                elif server.tag_status is not None:
+                    self._answer_bytes(server.tag_status, b"")
+                elif key in server.tags:
+                    value = server.tags[key]
+                    self._answer_bytes(200, value if isinstance(value, bytes) else value.encode())
+                else:
+                    self._answer_bytes(404, b"")
+
+            def _answer_bytes(self, status: int, data: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd.RequestHandlerClass = Handler
+
+    def tag_requests(self) -> list[tuple[str, str, dict[str, str]]]:
+        return [request for request in self.requests if request[1] == TAG_PATH]
+
+
 @pytest.fixture
-def metadata(monkeypatch) -> Iterator[_Server]:
-    with _Server(METADATA) as server:
+def metadata(monkeypatch) -> Iterator[_TagServer]:
+    with _TagServer(METADATA, {TAG: TARGET, "marketlake:host": "capture"}) as server:
         monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
         yield server
 
@@ -224,7 +287,7 @@ def test_the_tracked_settings_render(monkeypatch, capsys, metadata, config_dir, 
     assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == EXPECTED
 
 
-def test_the_render_asks_for_the_five_names_once_with_decryption(
+def test_the_render_asks_for_the_four_names_once_with_decryption(
     monkeypatch, capsys, metadata, config_dir, not_root
 ):
     hook = SsmHook().install(monkeypatch)
@@ -234,6 +297,56 @@ def test_the_render_asks_for_the_five_names_once_with_decryption(
     assert len(hook.requests) == 1
     assert hook.requests[0].headers["X-Amz-Target"].decode() == "AmazonSSM.GetParameters"
     assert hook.body() == {"Names": list(VALUES), "WithDecryption": True}
+    assert len(hook.body()["Names"]) == 4
+    assert "/marketlake/config/backup-target" not in hook.body()["Names"]
+
+
+def test_the_backup_target_comes_from_the_tag_with_an_imdsv2_token(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    assert yaml.safe_load((config_dir / CONFIG_FILE).read_text())["backup_target"] == TARGET
+    tag_reads = metadata.tag_requests()
+    assert len(tag_reads) == 1
+    headers = {key.lower(): value for key, value in tag_reads[0][2].items()}
+    assert headers["x-aws-ec2-metadata-token"] == TOKEN
+    tokens = [r for r in metadata.requests if r[0] == "PUT" and r[1] == TOKEN_PATH]
+    assert tokens, metadata.requests
+    for _, _, sent in tokens:
+        sent = {key.lower(): value for key, value in sent.items()}
+        assert int(sent["x-aws-ec2-metadata-token-ttl-seconds"]) > 0
+
+
+def test_the_tag_follows_the_value_the_instance_carries(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    # A second bucket, so a render that wrote a constant rather than the tag fails here.
+    SsmHook().install(monkeypatch)
+    metadata.tags[TAG] = "s3://another-sentinel-bucket/lake"
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written["backup_target"] == "s3://another-sentinel-bucket/lake"
+
+
+def test_a_proxy_in_the_environment_does_not_carry_the_tag_lookup(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    # Nothing listens on the proxy's port, so a lookup sent through it never answers.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, f"http://127.0.0.1:{port}")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+    assert len(metadata.tag_requests()) == 1
 
 
 def test_the_client_is_signed_by_the_instance_profile_in_the_settings_region(
@@ -244,7 +357,7 @@ def test_the_client_is_signed_by_the_instance_profile_in_the_settings_region(
     _render(monkeypatch, _settings_bytes(bucket_region="eu-west-3"))
 
     assert hook.regions == ["eu-west-3"]
-    assert "ssm.eu-west-3.amazonaws.com" in hook.requests[0].url
+    assert urllib.parse.urlsplit(hook.requests[0].url).hostname == "ssm.eu-west-3.amazonaws.com"
     authorization = hook.requests[0].headers["Authorization"].decode()
     assert f"Credential={METADATA['AccessKeyId']}/" in authorization
     assert "/eu-west-3/ssm/" in authorization
@@ -511,10 +624,11 @@ def test_the_temp_file_is_never_opened_through_a_link(
     assert not (config_dir / CONFIG_FILE).exists()
 
 
-def test_the_temp_file_is_synced_before_the_rename(
+def test_the_temp_file_is_synced_before_the_rename_and_the_directory_after(
     monkeypatch, capsys, metadata, config_dir, not_root
 ):
     SsmHook().install(monkeypatch)
+    config_dir.mkdir(parents=True)
     events: list[tuple[str, int]] = []
     real_fsync, real_replace = os.fsync, os.replace
 
@@ -530,8 +644,58 @@ def test_the_temp_file_is_synced_before_the_rename(
     monkeypatch.setattr(os, "replace", replace)
 
     assert _render(monkeypatch, _settings_bytes()) == 0
-    assert [name for name, _ in events] == ["fsync", "replace"]
+    assert [name for name, _ in events] == ["fsync", "replace", "fsync"]
     assert events[0][1] == events[1][1]
+    # The last sync is of the directory, so the rename itself survives a crash.
+    assert events[2][1] == config_dir.stat().st_ino
+
+
+def test_an_interrupt_during_the_write_leaves_the_old_file_and_no_temp(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    """``KeyboardInterrupt`` is not an ``Exception``, so only a cleanup that catches
+    ``BaseException`` removes the temp file holding the secrets."""
+    SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    def interrupt(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "fsync", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _render(monkeypatch, _settings_bytes())
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    assert sorted(p.name for p in config_dir.iterdir()) == [CONFIG_FILE]
+
+
+def test_a_link_at_config_yaml_is_replaced_not_followed(
+    monkeypatch, capsys, metadata, config_dir, not_root, tmp_path
+):
+    """A link to a file already holding this config is neither reported unchanged nor
+    chmodded through. The render writes over the link, so the file it named keeps its
+    content and its mode."""
+    SsmHook().install(monkeypatch)
+    config_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere.yaml"
+    elsewhere.write_text(yaml.safe_dump(EXPECTED))
+    elsewhere.chmod(0o644)
+    content = elsewhere.read_bytes()
+    path = config_dir / CONFIG_FILE
+    path.symlink_to(elsewhere)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    info = os.lstat(path)
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_mode & 0o777 == 0o600
+    assert yaml.safe_load(path.read_text()) == EXPECTED
+    assert elsewhere.read_bytes() == content
+    assert elsewhere.stat().st_mode & 0o777 == 0o644
+    line = _one_line(capsys)
+    assert line.startswith(f"vm_config: wrote {path}, which was a symbolic link. ")
+    assert "restart the daemon" in line.lower()
 
 
 def test_a_temp_file_left_by_a_crash_under_this_pid_is_replaced(
@@ -595,9 +759,11 @@ _CREDENTIALS = "the settings' bucket_credentials must be exactly instance_profil
 SETTINGS_REFUSALS = {
     "a parameter's key": (_settings_bytes(ntfy_topic="tracked"), "set ['ntfy_topic']"),
     "two parameters' keys": (
-        _settings_bytes(backup_target="/x", schwab_api_key="k"),
-        "set ['backup_target', 'schwab_api_key']",
+        _settings_bytes(ntfy_topic="t", schwab_api_key="k"),
+        "set ['ntfy_topic', 'schwab_api_key']",
     ),
+    # The tag fills backup_target, so the settings may not set it either.
+    "the tag's key": (_settings_bytes(backup_target=TARGET), "set ['backup_target']"),
     "no role": (_settings_bytes(role=_DROP), "role must be exactly"),
     "a capitalised role": (_settings_bytes(role="Shadow"), "role must be exactly"),
     "a role with a space": (_settings_bytes(role="primary "), "role must be exactly"),
@@ -688,8 +854,8 @@ def _without(name: str) -> dict[str, str]:
 
 PARAMETER_REFUSALS = {
     "one invalid name": (
-        SsmHook(invalid=("/marketlake/config/backup-target",)),
-        "SSM has no parameter named ['/marketlake/config/backup-target']",
+        SsmHook(invalid=("/marketlake/config/ntfy-topic",)),
+        "SSM has no parameter named ['/marketlake/config/ntfy-topic']",
     ),
     "every name invalid, as a wrong region gives": (
         SsmHook(invalid=tuple(VALUES)),
@@ -710,24 +876,22 @@ PARAMETER_REFUSALS = {
         "the parameter /marketlake/config/ntfy-topic is empty or not text",
     ),
     "a trailing newline": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"{TARGET}\n"}),
-        "the parameter /marketlake/config/backup-target has whitespace",
+        SsmHook({**VALUES, "/marketlake/config/ntfy-topic": f"{TOPIC}\n"}),
+        "the parameter /marketlake/config/ntfy-topic has whitespace",
     ),
     "a leading space": (
         SsmHook({**VALUES, "/marketlake/config/schwab-api-key": f" {API_KEY}"}),
         "the parameter /marketlake/config/schwab-api-key has whitespace",
     ),
-    "a target that is a path": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"{BUCKET}/lake"}),
-        "backup_target is not an s3:// bucket target",
+    # Which value would win depends on the answer's order, so neither is used, whether
+    # the two agree or not.
+    "a name listed twice with another value": (
+        SsmHook(repeat=("/marketlake/config/ntfy-topic", "SECOND-TOPIC-SENTINEL")),
+        "SSM returned ['/marketlake/config/ntfy-topic'] more than once",
     ),
-    "a target naming no valid bucket": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"s3://{BUCKET.upper()}/lake"}),
-        "backup_target names no valid bucket",
-    ),
-    "a target whose prefix climbs": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"s3://{BUCKET}/../lake"}),
-        "backup_target has a prefix holding . or ..",
+    "a name listed twice with the same value": (
+        SsmHook(repeat=("/marketlake/config/schwab-api-key", API_KEY)),
+        "SSM returned ['/marketlake/config/schwab-api-key'] more than once",
     ),
 }
 
@@ -743,7 +907,140 @@ def test_parameters_the_render_cannot_use_refuse(
 
     line = _assert_refused(capsys, config_dir, before)
     assert expected in line
+    assert "SECOND-TOPIC-SENTINEL" not in line
+
+
+# Each tag value, the refusal it gives, and whether the parameters were read first. The
+# empty and padded values are refused before any credential is fetched. The bucket
+# checks run on the merged config, after the parameters.
+TAG_REFUSALS = {
+    "an empty value": ("", "the marketlake:backup-target tag is empty or not text", False),
+    "a trailing newline": (
+        f"{TARGET}\n",
+        "the marketlake:backup-target tag has whitespace at its start or end",
+        False,
+    ),
+    "a leading space": (
+        f" {TARGET}",
+        "the marketlake:backup-target tag has whitespace at its start or end",
+        False,
+    ),
+    "bytes that are not UTF-8": (
+        b"s3://" + BUCKET.encode() + b"/\xfflake",
+        "the marketlake:backup-target tag is not UTF-8 text",
+        False,
+    ),
+    "a target that is a path": (
+        f"{BUCKET}/lake",
+        "backup_target is not an s3:// bucket target",
+        True,
+    ),
+    "a target naming no valid bucket": (
+        f"s3://{BUCKET.upper()}/lake",
+        "backup_target names no valid bucket",
+        True,
+    ),
+    "a target whose prefix climbs": (
+        f"s3://{BUCKET}/../lake",
+        "backup_target has a prefix holding . or ..",
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize(("value", "expected", "fetched"), TAG_REFUSALS.values(), ids=TAG_REFUSALS)
+def test_a_tag_the_render_cannot_use_refuses_and_is_never_printed(
+    monkeypatch, capsys, metadata, config_dir, not_root, value, expected, fetched
+):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tags[TAG] = value
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    assert expected in line
     assert BUCKET.upper() not in line
+    assert len(hook.requests) == (1 if fetched else 0)
+
+
+@pytest.mark.parametrize("cause", ["no tag", "tags disabled"])
+def test_a_tag_the_metadata_service_does_not_serve_refuses_naming_the_fix(
+    monkeypatch, capsys, metadata, config_dir, not_root, cause
+):
+    """EC2 answers 404 both for an instance with no such tag and for one whose
+    ``instance_metadata_tags`` is disabled, so the line names both fixes. A retry
+    cannot fix either, so it is a refusal rather than ``no credentials``."""
+    hook = SsmHook().install(monkeypatch)
+    if cause == "no tag":
+        del metadata.tags[TAG]
+    else:
+        metadata.tag_status = 404
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    path = config_dir / CONFIG_FILE
+    assert _assert_refused(capsys, config_dir, before) == (
+        f"vm_config: refused, and {path} was left as it was: the instance metadata serves "
+        "no marketlake:backup-target tag. Either the instance has no such tag or its "
+        "instance_metadata_tags is disabled, so set both in infra/live/vm.tf and apply"
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+@pytest.mark.parametrize("status", [500, 401, 403])
+def test_any_other_http_error_on_the_tag_exits_one(
+    monkeypatch, capsys, metadata, config_dir, not_root, status
+):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tag_status = status
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 1
+
+    path = config_dir / CONFIG_FILE
+    assert path.read_bytes() == before
+    assert _one_line(capsys) == (
+        f"vm_config: failed: the marketlake:backup-target tag could not be read "
+        f"(HTTP {status}), so {path} was left as it was"
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+def test_a_metadata_service_that_does_not_answer_exits_three(
+    monkeypatch, capsys, config_dir, not_root
+):
+    # Nothing listens on this port, which is what the render meets off the VM.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setattr(aws_session, "METADATA_BASE_URL", f"http://127.0.0.1:{port}/")
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    line = _one_line(capsys)
+    assert line.startswith(
+        "vm_config: no credentials: the instance metadata service did not answer the "
+        "marketlake:backup-target tag lookup ("
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+def test_a_refused_token_exits_three(monkeypatch, capsys, metadata, config_dir, not_root):
+    metadata.mode = "refuse_token"
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    assert "tag lookup (token HTTP 403)" in _one_line(capsys)
+    assert metadata.tag_requests() == []
+    assert hook.requests == []
 
 
 CONFIG_REFUSALS = {
@@ -896,3 +1193,144 @@ def test_the_client_carries_the_token_pulls_timeouts_and_retries(metadata):
     assert (config.connect_timeout, config.read_timeout) == (10, 30)
     # botocore reads ``max_attempts: 3`` as three retries, so four attempts in all.
     assert config.retries == {"mode": "standard", "total_max_attempts": 4}
+
+
+# -- what a refusal carries ---------------------------------------------------------------
+
+SECRET = "PASTED-SECRET-SENTINEL-3c1d"
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` and every exception reachable through its cause and context."""
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is known for known in seen):
+            continue
+        seen.append(current)
+        pending.extend([current.__cause__, current.__context__])
+    return seen
+
+
+def _no_tag_wanted():
+    pytest.fail("the render read the tag after a refusal that should have come first")
+
+
+def _no_client_wanted(region):
+    pytest.fail("the render built a client after a refusal that should have come first")
+
+
+class _OneParameterStore:
+    def get_parameters(self, *, Names, WithDecryption):  # noqa: N803 - botocore's names
+        values = {name: VALUES[name] for name in Names}
+        return {
+            "Parameters": [{"Name": name, "Value": value} for name, value in values.items()],
+            "InvalidParameters": [],
+        }
+
+
+def test_a_refused_parse_carries_neither_the_yaml_error_nor_the_secret_it_quotes(tmp_path):
+    payload = f'schwab_api_key: "{SECRET}\n'.encode()
+    # PyYAML quotes the offending line, so the error the render drops holds the secret.
+    with pytest.raises(yaml.YAMLError) as parse_error:
+        yaml.safe_load(payload.decode())
+    assert SECRET in str(parse_error.value)
+
+    with pytest.raises(vm_config.RenderRefused) as refused:
+        vm_config.render(
+            payload,
+            client_factory=_no_client_wanted,
+            tag_reader=_no_tag_wanted,
+            config_path=tmp_path / CONFIG_FILE,
+            geteuid=lambda: 1000,
+        )
+
+    chain = _chain(refused.value)
+    assert chain == [refused.value]
+    for exc in chain:
+        assert SECRET not in str(exc) and SECRET not in repr(exc)
+
+
+def test_a_merged_config_that_raises_on_load_is_refused_with_no_context(tmp_path):
+    # ``expanduser`` raises RuntimeError for a home that does not exist.
+    payload = _settings_bytes(lake_root=f"~{SECRET.lower()}/lake")
+
+    with pytest.raises(vm_config.RenderRefused) as refused:
+        vm_config.render(
+            payload,
+            client_factory=lambda region: _OneParameterStore(),
+            tag_reader=lambda: TARGET,
+            config_path=tmp_path / CONFIG_FILE,
+            geteuid=lambda: 1000,
+        )
+
+    assert "the merged config does not load (RuntimeError)" in str(refused.value)
+    assert _chain(refused.value) == [refused.value]
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        lambda: vm_config._parse_settings(f'schwab_api_key: "{SECRET}\n'.encode()),
+        lambda: vm_config._check_config({**EXPECTED, "lake_root": f"~{SECRET.lower()}/lake"}),
+        lambda: vm_config._check_config({k: v for k, v in EXPECTED.items() if k != "lake_root"}),
+    ],
+    ids=["a parse error", "a load that raises RuntimeError", "a ConfigError"],
+)
+def test_each_helper_raises_its_refusal_with_no_context(check):
+    """``render`` raises a new refusal outside its own handler, which hides the helpers'
+    context at that boundary. Each helper is checked on its own, so a second caller of
+    one cannot inherit a chain that quotes a secret."""
+    with pytest.raises(vm_config.RenderRefused) as refused:
+        check()
+
+    assert _chain(refused.value) == [refused.value]
+    assert SECRET not in str(refused.value)
+
+
+def test_a_merged_config_error_is_refused_with_no_context(tmp_path):
+    payload = _settings_bytes(lake_root=_DROP)
+
+    with pytest.raises(vm_config.RenderRefused) as refused:
+        vm_config.render(
+            payload,
+            client_factory=lambda region: _OneParameterStore(),
+            tag_reader=lambda: TARGET,
+            config_path=tmp_path / CONFIG_FILE,
+            geteuid=lambda: 1000,
+        )
+
+    assert "the merged config does not load (config missing" in str(refused.value)
+    assert _chain(refused.value) == [refused.value]
+
+
+@pytest.mark.parametrize(
+    ("tags", "status"),
+    [({}, None), ({TAG: b"\xff"}, None)],
+    ids=["a 404", "bytes that are not UTF-8"],
+)
+def test_a_tag_refusal_is_raised_with_no_context(monkeypatch, tmp_path, tags, status):
+    with _TagServer(METADATA, tags) as server:
+        server.tag_status = status
+        monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
+        with pytest.raises(vm_config.RenderRefused) as refused:
+            vm_config.read_backup_target_tag()
+
+    assert _chain(refused.value) == [refused.value]
+
+
+def test_a_failed_standard_input_read_is_refused_with_no_context(monkeypatch):
+    class Broken:
+        def read(self, size=-1):
+            raise OSError(5, f"Input/output error {SECRET}")
+
+    stdin = _Stdin(b"")
+    stdin.buffer = Broken()
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    with pytest.raises(vm_config.RenderRefused) as refused:
+        vm_config._read_stdin()
+
+    assert _chain(refused.value) == [refused.value]
+    assert SECRET not in str(refused.value)

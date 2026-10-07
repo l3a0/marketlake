@@ -484,6 +484,13 @@ run "instance_is_built_as_the_issue_describes" {
     error_message = "The instance does not require IMDSv2 tokens with a hop limit of 1."
   }
 
+  # The config render reads marketlake:backup-target from the metadata service, which
+  # serves no tag unless this is enabled.
+  assert {
+    condition     = aws_instance.vm.metadata_options[0].instance_metadata_tags == "enabled"
+    error_message = "The instance does not serve its tags through instance metadata, so the config render finds no backup target."
+  }
+
   assert {
     condition     = aws_instance.vm.credit_specification[0].cpu_credits == "unlimited"
     error_message = "The instance's CPU credits are not named unlimited."
@@ -494,9 +501,15 @@ run "instance_is_built_as_the_issue_describes" {
     error_message = "The instance does not ask for a public address, so with no NAT it reaches nothing."
   }
 
+  # The bucket is the file-level variable's, written out here so the test does not
+  # rebuild the tag the way vm.tf builds it.
   assert {
-    condition     = aws_instance.vm.tags == tomap({ Name = "marketlake", "marketlake:host" = "capture" })
-    error_message = "The instance's tags are not exactly Name = marketlake and marketlake:host = capture."
+    condition = aws_instance.vm.tags == tomap({
+      Name                       = "marketlake"
+      "marketlake:host"          = "capture"
+      "marketlake:backup-target" = "s3://example-lake-backup/lake"
+    })
+    error_message = "The instance's tags are not exactly Name, marketlake:host and marketlake:backup-target = s3://example-lake-backup/lake."
   }
 
   assert {
@@ -529,6 +542,20 @@ run "instance_is_built_as_the_issue_describes" {
   assert {
     condition     = aws_key_pair.vm.public_key == "ssh-ed25519 AAAAexamplenotakey"
     error_message = "The key pair does not carry ssh_public_key."
+  }
+}
+
+# The tag follows backup_bucket, so a bucket change reaches the VM with the apply.
+run "backup_target_tag_follows_the_bucket" {
+  command = plan
+
+  variables {
+    backup_bucket = "another-lake-backup"
+  }
+
+  assert {
+    condition     = aws_instance.vm.tags["marketlake:backup-target"] == "s3://another-lake-backup/lake"
+    error_message = "The marketlake:backup-target tag does not follow backup_bucket."
   }
 }
 
@@ -584,4 +611,75 @@ run "a_cidr_with_host_bits_fails_validation" {
   }
 
   expect_failures = [var.owner_ssh_cidr]
+}
+
+# A home address is a /32. A prefix shorter than /16 opens SSH to far more than one
+# owner, and 0.0.0.0/0 opens it to everyone.
+run "an_open_cidr_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "0.0.0.0/0"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_eight_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/8"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_fifteen_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/15"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_sixteen_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/16"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["10.0.0.0/16"])]
+    error_message = "A /16 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_twenty_four_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.0/24"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.0/24"])]
+    error_message = "A /24 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_thirty_two_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.7/32"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.7/32"])]
+    error_message = "A /32 does not reach the ingress rule."
+  }
 }

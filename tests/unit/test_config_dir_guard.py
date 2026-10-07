@@ -482,7 +482,6 @@ class _ParameterStore:
 
     def get_parameters(self, *, Names, WithDecryption):  # noqa: N803 - botocore's names
         values = {name: "value" for name in Names}
-        values["/marketlake/config/backup-target"] = "s3://probe-bucket/lake"
         return {
             "Parameters": [{"Name": name, "Value": value} for name, value in values.items()],
             "InvalidParameters": [],
@@ -493,8 +492,9 @@ def test_a_forgotten_config_render_is_caught():
     """The VM's ``config.yaml`` holds four secrets, and ``vm_config.render`` writes it.
 
     The render defaults its target to ``config.default_config_path()``, so it is aimed at
-    the probe here, per the module docstring. The fake client serves all five parameters,
-    so the render passes every refusal and reaches its write. The guard fires on the
+    the probe here, per the module docstring. The fake client serves all four parameters
+    and the fake tag reader serves the backup target, so the render passes every refusal
+    and reaches its write. The guard fires on the
     ``parent.mkdir`` that write takes before it opens anything.
     """
     settings = (
@@ -505,6 +505,7 @@ def test_a_forgotten_config_render_is_caught():
         render(
             settings,
             client_factory=lambda region: _ParameterStore(),
+            tag_reader=lambda: "s3://probe-bucket/lake",
             config_path=PROBE,
             geteuid=lambda: 1000,
         )
