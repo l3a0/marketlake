@@ -102,8 +102,8 @@ from lake.config import (
     BUCKET_ROLE_ARN_KEY,
     COMMAND_KEY_ID_KEY,
     COMMAND_SECRET_KEY,
+    CREDENTIALS_FROM_ASSUME_ROLE,
     CREDENTIALS_FROM_INSTANCE_PROFILE,
-    CREDENTIALS_FROM_KEYS,
     BucketTarget,
     Config,
     ConfigError,
@@ -489,12 +489,12 @@ def _lookup_failed(detail: str) -> ConfigError:
 
     It names both fixes, because the fix depends on the host. On the VM it is the
     instance profile, and on a laptop that carries the setting by mistake it is
-    ``config.yaml``.
+    ``config.yaml``, where the laptop's own value is ``assume_role``.
     """
     return ConfigError(
         f"{BUCKET_CREDENTIALS_KEY} is {CREDENTIALS_FROM_INSTANCE_PROFILE} and no credentials "
         f"came from the instance metadata service ({detail}). Attach the instance profile, "
-        f"or set {BUCKET_CREDENTIALS_KEY}: {CREDENTIALS_FROM_KEYS} in config.yaml"
+        f"or set {BUCKET_CREDENTIALS_KEY}: {CREDENTIALS_FROM_ASSUME_ROLE} in config.yaml"
     )
 
 
@@ -1270,9 +1270,10 @@ class BucketReadError(OSError):
     """A read from the bucket that failed, as the ``OSError`` a ``BackupReader`` raises.
 
     ``manifest.restore_check`` catches ``OSError`` and nothing else, so the bucket's
-    client errors are mapped onto it here. ``code`` keeps the S3 error code, and
-    ``absent`` says S3 answered that the key does not exist, which the restore command
-    names as a missing file rather than as a bucket it cannot reach.
+    client errors are mapped onto it here. ``code`` keeps the S3 error code, or
+    ``AssumeRole <code>`` when STS refused the role, and ``absent`` says S3 answered
+    that the key does not exist, which the restore command names as a missing file
+    rather than as a bucket it cannot reach.
     """
 
     def __init__(self, rel: str, kind: str, code: str) -> None:

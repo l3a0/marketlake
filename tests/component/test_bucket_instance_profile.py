@@ -379,7 +379,7 @@ LOOKUP_FAILURES = [
 def _assert_both_fixes(line: str, detail: str) -> None:
     assert f"({detail})" in line
     assert "Attach the instance profile" in line
-    assert "set bucket_credentials: keys in config.yaml" in line
+    assert "set bucket_credentials: assume_role in config.yaml" in line
     assert "\n" not in line
 
 
@@ -398,7 +398,7 @@ def test_the_lookup_failure_line_in_full(metadata, hostile):
     assert str(refused.value) == (
         "bucket_credentials is instance_profile and no credentials came from the instance "
         "metadata service (none returned). Attach the instance profile, or set "
-        "bucket_credentials: keys in config.yaml"
+        "bucket_credentials: assume_role in config.yaml"
     )
 
 

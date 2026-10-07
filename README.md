@@ -102,7 +102,7 @@ The bucket and the IAM principals the laptop signs as are code in `infra/live/`,
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
 files rewritten every night. Partitions keep every version, because with no Object Lock an overwritten
-partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
+partition's old version is its only good copy. `infra/live/iam.tf` holds the user's policy,
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
@@ -124,9 +124,9 @@ The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target`
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
 examples below use the placeholder bucket `example-lake-backup`.
 
-Read the role's ARN in your own shell, under the admin profile, and write it straight into
-the copy of `config.yaml` you are editing, so the account id it carries reaches no
-transcript or log:
+Read the role's ARN in the owner's own shell, under the admin profile, and write it
+straight into the copy of `config.yaml` being edited, so the account id it carries
+reaches no transcript or log:
 
 ```bash
 aws iam get-role --role-name marketlake-backup --query Role.Arn --output text --profile marketlake-admin
@@ -194,7 +194,7 @@ through no proxy. An absent
 `bucket_credentials` means `keys`. A host where the setting finds no
 credentials, such as a VM with no instance profile or a laptop that carries the setting
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
-`bucket_credentials: keys` in `config.yaml`.
+`bucket_credentials: assume_role` in `config.yaml`.
 
 Four commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
 any host whose config sets `role` to something other than `primary`. The restore runs on
