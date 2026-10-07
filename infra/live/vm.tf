@@ -10,9 +10,9 @@ locals {
   zone = "us-east-1c"
 }
 
-# 099720109477 is Canonical's public publisher account, not the owner's. The name
-# pattern was written from memory, so check it against Canonical's published list of
-# Ubuntu images. An aws_ssm_parameter lookup of Canonical's AMI parameter is ruled out,
+# 099720109477 is Canonical's public publisher account, not the owner's. On 2026-10-07
+# the name pattern found ubuntu-noble-24.04-arm64-server-20261004, the newest image, in
+# the owner's account. An aws_ssm_parameter lookup of Canonical's AMI parameter is ruled out,
 # because tests/component/test_infra_config.py refuses that data type.
 data "aws_ami" "ubuntu" {
   most_recent = true

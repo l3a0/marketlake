@@ -992,9 +992,10 @@ runs the daemon.
    `marketlake-measure`, runs in it, so the zone is known to offer `t4g.small` in this
    account.
 
-   The image lookup in `infra/live/vm.tf` names Ubuntu's images by a pattern nobody has
-   checked against Canonical's published list. Before approving the first apply, check
-   that it finds an image. The command prints the newest matching image's name.
+   The image lookup in `infra/live/vm.tf` names Ubuntu's images by a pattern. On
+   2026-10-07 this command printed `ubuntu-noble-24.04-arm64-server-20261004`, so the
+   pattern finds an image. Run it again before a later apply if Canonical's naming may
+   have changed. The command prints the newest matching image's name.
 
    ```bash
    aws ec2 describe-images --owners 099720109477 --filters Name=name,Values='ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*' --query 'sort_by(Images,&CreationDate)[-1].Name' --output text --profile marketlake-admin --region us-east-1
@@ -1344,8 +1345,14 @@ aws ec2 describe-key-pairs --filters Name=key-name,Values=marketlake-vm --query 
 aws ec2 describe-security-groups --filters Name=group-name,Values=marketlake-vm --query 'SecurityGroups[].GroupId' --output text --profile marketlake-admin --region us-east-1
 ```
 
-When either prints a name or an id, delete the console-made one once nothing uses it. A
-security group still attached to an instance cannot be deleted.
+When either prints a name or an id, delete the console-made one before the apply. A
+key pair can go at once, even while an instance launched with it runs. EC2 copied the
+public key into that instance's `authorized_keys` at launch, so deleting the key pair
+record leaves SSH to it working. A security group must wait until no instance is attached
+to it, because EC2 refuses to delete one that is in use. On 2026-10-07 the key pair check
+printed `marketlake-vm`, an ed25519 key made on 2026-10-05 for the measurement VM, with
+the same fingerprint as `~/.ssh/marketlake_vm.pub`. The security group check printed
+nothing.
 
 ### Replace the instance, and the approval window
 
