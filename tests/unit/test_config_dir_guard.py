@@ -46,6 +46,7 @@ import pytest
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, TOKEN_FILE
 from lake.reauth import token_writer, write_token
 from lake.tickers import upsert_ticker
+from lake.vm_config import render
 from tests.conftest import ConfigWriteInTest
 from tests.support import config_guard
 from tests.support.config_guard import is_protected, protected_roots
@@ -474,3 +475,37 @@ def test_a_forgotten_roster_upsert_is_caught():
     """
     with pytest.raises(ConfigWriteInTest):
         upsert_ticker("SPY", options=True, chain_cadence="1m", path=PROBE)
+
+
+class _ParameterStore:
+    """An SSM client that serves every parameter the render asks for."""
+
+    def get_parameters(self, *, Names, WithDecryption):  # noqa: N803 - botocore's names
+        values = {name: "value" for name in Names}
+        return {
+            "Parameters": [{"Name": name, "Value": value} for name, value in values.items()],
+            "InvalidParameters": [],
+        }
+
+
+def test_a_forgotten_config_render_is_caught():
+    """The VM's ``config.yaml`` holds four secrets, and ``vm_config.render`` writes it.
+
+    The render defaults its target to ``config.default_config_path()``, so it is aimed at
+    the probe here, per the module docstring. The fake client serves all four parameters
+    and the fake tag reader serves the backup target, so the render passes every refusal
+    and reaches its write. The guard fires on the
+    ``parent.mkdir`` that write takes before it opens anything.
+    """
+    settings = (
+        b"role: shadow\nlake_root: /srv/marketlake\ntoken_store: store\n"
+        b"bucket_credentials: instance_profile\nbucket_region: us-east-1\n"
+    )
+    with pytest.raises(ConfigWriteInTest):
+        render(
+            settings,
+            client_factory=lambda region: _ParameterStore(),
+            tag_reader=lambda: "s3://probe-bucket/lake",
+            config_path=PROBE,
+            geteuid=lambda: 1000,
+        )

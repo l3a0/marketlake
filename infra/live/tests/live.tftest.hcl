@@ -1,7 +1,7 @@
 # Plan-mode checks on the live configuration, against literals. Every run plans,
 # because test cleanup cannot destroy a prevent_destroy resource and still reports
-# success. prevent_destroy itself is checked by tests/component/test_infra_config.py,
-# which reads the .tf files.
+# success. prevent_destroy and ignore_changes are checked by
+# tests/component/test_infra_config.py, which reads the .tf files.
 
 mock_provider "aws" {
   mock_data "aws_caller_identity" {
@@ -9,25 +9,72 @@ mock_provider "aws" {
       account_id = "000000000000"
     }
   }
+
+  # The pinned zone, so every run passes the lake volume's precondition. A change to
+  # the zone in vm.tf fails every run until this moves with it.
+  mock_data "aws_ec2_instance_type_offerings" {
+    defaults = {
+      locations = ["us-east-1c"]
+    }
+  }
+
+  # A volume id of the real shape, which the shim writes to bootstrap.conf.
+  mock_resource "aws_ebs_volume" {
+    defaults = {
+      id = "vol-0123456789abcdef0"
+    }
+  }
 }
 
+# The address is from TEST-NET-3, a range reserved for documentation, and the key is not
+# a key.
 variables {
   backup_bucket      = "example-lake-backup"
   backup_policy_name = "example-policy"
   adopt_existing     = false
+  owner_ssh_cidr     = "203.0.113.7/32"
+  ssh_public_key     = "ssh-ed25519 AAAAexamplenotakey"
 }
 
-run "instance_s3_policy_is_off_by_default" {
+run "instance_s3_write_half_is_off_by_default" {
   command = plan
 
   # #638's cutover pull request flips the default and inverts this assert.
   assert {
     condition     = length(aws_iam_role_policy.instance_s3) == 0
-    error_message = "marketlake-instance has S3 access by default. It would be a write credential on a shadow host."
+    error_message = "marketlake-instance has S3 write access by default. It would be a write credential on a shadow host."
+  }
+
+  # The read half is compared whole, so a write action moved into it fails here even
+  # though the two halves together still equal marketlake-backup's policy.
+  assert {
+    condition = jsondecode(aws_iam_role_policy.instance_s3_read.policy).Statement == [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Resource = "arn:aws:s3:::example-lake-backup"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::example-lake-backup/*"
+      },
+    ]
+    error_message = "marketlake-instance's read half is not exactly ListBucket and GetBucketVersioning on the bucket and GetObject on its objects."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_s3_read.role == aws_iam_role.instance.name
+    error_message = "The S3 read half is not on marketlake-instance."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_s3_read.name == "backup-bucket-read"
+    error_message = "The S3 read half is not named backup-bucket-read."
   }
 }
 
-run "instance_s3_policy_is_on_when_enabled" {
+run "instance_s3_write_half_is_put_alone_when_enabled" {
   command = plan
 
   variables {
@@ -36,7 +83,23 @@ run "instance_s3_policy_is_on_when_enabled" {
 
   assert {
     condition     = length(aws_iam_role_policy.instance_s3) == 1
-    error_message = "Turning instance_s3_enabled on does not give marketlake-instance its S3 policy."
+    error_message = "Turning instance_s3_enabled on does not give marketlake-instance its S3 write half."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.instance_s3[0].policy).Statement == [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::example-lake-backup/*"
+      },
+    ]
+    error_message = "marketlake-instance's write half is not exactly PutObject on the bucket's objects."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_s3[0].name == "backup-bucket"
+    error_message = "The S3 write half is not named backup-bucket."
   }
 }
 
@@ -90,7 +153,7 @@ run "instance_role_is_trusted_by_ec2_alone" {
   # profile pointed anywhere else fails the first apply.
   assert {
     condition     = aws_iam_role_policy.instance_s3[0].role == aws_iam_role.instance.name
-    error_message = "The S3 policy is not on marketlake-instance."
+    error_message = "The S3 write half is not on marketlake-instance."
   }
 
   assert {
@@ -125,8 +188,9 @@ run "empty_names_fail_validation" {
 }
 
 # Each policy is compared with its own literal rather than with the other, because
-# #638's cutover drops s3:PutObject from the backup role alone.
-run "backup_and_instance_roles_get_the_same_four_actions" {
+# #638's cutover drops s3:PutObject from the backup role alone. The instance role's two
+# halves have their own runs above.
+run "backup_role_gets_the_four_actions" {
   command = plan
 
   variables {
@@ -160,27 +224,11 @@ run "backup_and_instance_roles_get_the_same_four_actions" {
     condition     = aws_iam_role_policy.backup.name == "backup-bucket"
     error_message = "The marketlake-backup role's policy is not named backup-bucket."
   }
-
-  assert {
-    condition = jsondecode(aws_iam_role_policy.instance_s3[0].policy).Statement == [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
-        Resource = "arn:aws:s3:::example-lake-backup"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:GetObject"]
-        Resource = "arn:aws:s3:::example-lake-backup/*"
-      },
-    ]
-    error_message = "marketlake-instance's S3 policy is not exactly the four actions src/lake/bucket.py needs."
-  }
 }
 
 # No variable is set, so instance_s3_enabled keeps its default of false. The VM reads
-# its config on the shadow day, before the cutover turns the S3 policy on, and a count
-# on this policy would make the unindexed references below fail.
+# its config on the shadow day, before the cutover turns the S3 write half on, and a
+# count on this policy would make the unindexed references below fail.
 run "instance_reads_exactly_the_config_parameters" {
   command = plan
 
@@ -436,5 +484,299 @@ run "parameter_arns_follow_the_callers_account" {
       aws_iam_role.token_writer.assume_role_policy,
     ]))) == jsonencode(["111111111111", "111111111111", "111111111111", "111111111111", "111111111111", "111111111111"])
     error_message = "marketlake-command's policy or a command role's trust names an account other than the caller's."
+  }
+}
+
+# The mock offerings list the pinned zone, so the precondition passes, and the volume
+# and the subnet lookup both sit in that zone.
+run "lake_volume_sits_in_a_zone_that_offers_the_instance_type" {
+  command = plan
+
+  assert {
+    condition = [
+      aws_ebs_volume.lake.availability_zone,
+      data.aws_subnet.default.availability_zone,
+    ] == ["us-east-1c", "us-east-1c"]
+    error_message = "The lake volume and the instance's subnet are not both in us-east-1c."
+  }
+
+  assert {
+    condition = [
+      aws_ebs_volume.lake.type,
+      aws_ebs_volume.lake.encrypted,
+      aws_ebs_volume.lake.size,
+    ] == ["gp3", true, 30]
+    error_message = "The lake volume is not an encrypted 30 GiB gp3 volume."
+  }
+
+  assert {
+    condition = [
+      aws_volume_attachment.lake.volume_id,
+      aws_volume_attachment.lake.instance_id,
+      aws_volume_attachment.lake.device_name,
+      aws_volume_attachment.lake.stop_instance_before_detaching,
+    ] == [aws_ebs_volume.lake.id, aws_instance.vm.id, "/dev/sdf", true]
+    error_message = "The lake volume is not attached at /dev/sdf with the instance stopped before a detach."
+  }
+}
+
+# A zone that does not offer instance_type stops the plan at the volume, before a first
+# apply could create a volume that no instance in that zone can use.
+run "a_zone_without_the_instance_type_fails_the_plan" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type_offerings.instance_type
+    values = {
+      locations = []
+    }
+  }
+
+  expect_failures = [aws_ebs_volume.lake]
+}
+
+run "security_group_allows_ssh_from_the_owner_and_all_egress" {
+  command = plan
+
+  # Differs from the file-level value, so a literal address in vm.tf fails here.
+  variables {
+    owner_ssh_cidr = "198.51.100.0/24"
+  }
+
+  assert {
+    condition = [
+      for r in aws_security_group.vm.ingress :
+      [
+        r.from_port, r.to_port, r.protocol, tolist(r.cidr_blocks),
+        r.ipv6_cidr_blocks == null, r.prefix_list_ids == null, r.security_groups == null, r.self == null,
+      ]
+    ] == [[22, 22, "tcp", tolist(["198.51.100.0/24"]), true, true, true, true]]
+    error_message = "The ingress is not exactly TCP 22 from owner_ssh_cidr."
+  }
+
+  # OpenTofu drops the default egress rule, so without this the daemon is cut off.
+  assert {
+    condition = [
+      for r in aws_security_group.vm.egress :
+      [r.from_port, r.to_port, r.protocol, tolist(r.cidr_blocks)]
+    ] == [[0, 0, "-1", tolist(["0.0.0.0/0"])]]
+    error_message = "The egress is not exactly every protocol to 0.0.0.0/0."
+  }
+
+  assert {
+    condition     = [aws_security_group.vm.name, aws_security_group.vm.vpc_id] == ["marketlake-vm", data.aws_vpc.default.id]
+    error_message = "The security group is not marketlake-vm in the default VPC."
+  }
+}
+
+run "instance_is_built_as_the_issue_describes" {
+  command = plan
+
+  assert {
+    condition = [
+      aws_instance.vm.metadata_options[0].http_endpoint,
+      aws_instance.vm.metadata_options[0].http_tokens,
+      aws_instance.vm.metadata_options[0].http_put_response_hop_limit,
+    ] == ["enabled", "required", 1]
+    error_message = "The instance does not require IMDSv2 tokens with a hop limit of 1."
+  }
+
+  # The config render reads marketlake:backup-target from the metadata service, which
+  # serves no tag unless this is enabled.
+  assert {
+    condition     = aws_instance.vm.metadata_options[0].instance_metadata_tags == "enabled"
+    error_message = "The instance does not serve its tags through instance metadata, so the config render finds no backup target."
+  }
+
+  assert {
+    condition     = aws_instance.vm.credit_specification[0].cpu_credits == "unlimited"
+    error_message = "The instance's CPU credits are not named unlimited."
+  }
+
+  assert {
+    condition     = aws_instance.vm.associate_public_ip_address == true
+    error_message = "The instance does not ask for a public address, so with no NAT it reaches nothing."
+  }
+
+  # The bucket is the file-level variable's, written out here so the test does not
+  # rebuild the tag the way vm.tf builds it.
+  assert {
+    condition = aws_instance.vm.tags == tomap({
+      Name                       = "marketlake"
+      "marketlake:host"          = "capture"
+      "marketlake:backup-target" = "s3://example-lake-backup/lake"
+    })
+    error_message = "The instance's tags are not exactly Name, marketlake:host and marketlake:backup-target = s3://example-lake-backup/lake."
+  }
+
+  assert {
+    condition = [
+      aws_instance.vm.instance_type,
+      aws_instance.vm.iam_instance_profile,
+      aws_instance.vm.key_name,
+      aws_instance.vm.subnet_id,
+      tolist(aws_instance.vm.vpc_security_group_ids),
+      ] == [
+      "t4g.small",
+      aws_iam_instance_profile.instance.name,
+      "marketlake-vm",
+      data.aws_subnet.default.id,
+      tolist([aws_security_group.vm.id]),
+    ]
+    error_message = "The instance is not a t4g.small with marketlake-instance, the marketlake-vm key, the zone's subnet and its group."
+  }
+
+  assert {
+    condition = [
+      aws_instance.vm.root_block_device[0].volume_type,
+      aws_instance.vm.root_block_device[0].volume_size,
+      aws_instance.vm.root_block_device[0].encrypted,
+      aws_instance.vm.root_block_device[0].delete_on_termination,
+    ] == ["gp3", 16, true, true]
+    error_message = "The root volume is not an encrypted 16 GiB gp3 volume deleted with the instance."
+  }
+
+  assert {
+    condition     = aws_key_pair.vm.public_key == "ssh-ed25519 AAAAexamplenotakey"
+    error_message = "The key pair does not carry ssh_public_key."
+  }
+}
+
+# The tag follows backup_bucket, so a bucket change reaches the VM with the apply.
+run "backup_target_tag_follows_the_bucket" {
+  command = plan
+
+  variables {
+    backup_bucket = "another-lake-backup"
+  }
+
+  assert {
+    condition     = aws_instance.vm.tags["marketlake:backup-target"] == "s3://another-lake-backup/lake"
+    error_message = "The marketlake:backup-target tag does not follow backup_bucket."
+  }
+}
+
+# Anyone who can describe the instance can read user_data, so the shim carries the
+# owner's name and the volume id, as bootstrap.conf's only two lines, and neither SSH
+# input.
+run "shim_carries_only_the_owner_and_the_volume_id" {
+  command = plan
+
+  assert {
+    condition     = strcontains(aws_instance.vm.user_data, "<<'CONF'\nOWNER=ubuntu\nLAKE_VOLUME_ID=vol-0123456789abcdef0\nCONF\n")
+    error_message = "The shim does not write exactly OWNER=ubuntu and the lake volume's id to bootstrap.conf."
+  }
+
+  assert {
+    condition = !anytrue([
+      for value in [split("/", var.owner_ssh_cidr)[0], var.ssh_public_key, "AAAAexamplenotakey"] :
+      strcontains(aws_instance.vm.user_data, value)
+    ])
+    error_message = "The shim carries the owner's address or SSH key."
+  }
+}
+
+# The validations refuse a malformed input with a message that names no value. The
+# provider refuses some of these too, but its error prints the address.
+run "a_bare_address_and_an_empty_key_fail_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.7"
+    ssh_public_key = ""
+  }
+
+  expect_failures = [var.owner_ssh_cidr, var.ssh_public_key]
+}
+
+# The ingress rule's cidr_blocks takes IPv4 only.
+run "an_ipv6_cidr_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "2001:db8::/64"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_cidr_with_host_bits_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.7/24"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+# A home address is a /32. A prefix shorter than /16 opens SSH to far more than one
+# owner, and 0.0.0.0/0 opens it to everyone.
+run "an_open_cidr_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "0.0.0.0/0"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_eight_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/8"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_fifteen_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/15"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_sixteen_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/16"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["10.0.0.0/16"])]
+    error_message = "A /16 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_twenty_four_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.0/24"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.0/24"])]
+    error_message = "A /24 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_thirty_two_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.7/32"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.7/32"])]
+    error_message = "A /32 does not reach the ingress rule."
   }
 }

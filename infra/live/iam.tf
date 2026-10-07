@@ -1,8 +1,9 @@
 # The hosted VM's instance role. It gets the same four S3 actions as the laptop's
 # marketlake-backup role in command.tf, which are the ones src/lake/bucket.py calls:
 # PutObject, GetObject (which also authorises HEAD), ListBucket and GetBucketVersioning.
-# Nothing deletes a version or reads an old one. The instance role also reads the config
-# parameters.
+# They are split across two policies, a read half that is always on and a write half,
+# PutObject alone, that stays off until #638's cutover. Nothing deletes a version or
+# reads an old one. The instance role also reads the config parameters.
 
 # -- the instance role --------------------------------------------------------------
 
@@ -33,13 +34,33 @@ resource "aws_iam_role_policy_attachment" "instance_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Off until #638's cutover. On a shadow host, a role with s3:PutObject would be a write
-# credential to the primary's bucket that only the code's `role: shadow` refusal
-# declines to use.
+# The write half, off until #638's cutover. On a shadow host, a role with s3:PutObject
+# would be a write credential to the primary's bucket that only the code's
+# `role: shadow` refusal declines to use. It keeps the address and the policy name it
+# had before the split (#686).
 resource "aws_iam_role_policy" "instance_s3" {
   count = var.instance_s3_enabled ? 1 : 0
 
   name = "backup-bucket"
+  role = aws_iam_role.instance.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::${var.backup_bucket}/*"
+      },
+    ]
+  })
+}
+
+# The read half, always on, so #640's restore runs on the VM through the instance
+# profile with no stored key. Its name differs from the write half's, because
+# PutRolePolicy on a shared name would make one overwrite the other.
+resource "aws_iam_role_policy" "instance_s3_read" {
+  name = "backup-bucket-read"
   role = aws_iam_role.instance.name
 
   policy = jsonencode({
@@ -52,7 +73,7 @@ resource "aws_iam_role_policy" "instance_s3" {
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:GetObject"]
+        Action   = ["s3:GetObject"]
         Resource = "arn:aws:s3:::${var.backup_bucket}/*"
       },
     ]
@@ -65,12 +86,14 @@ resource "aws_iam_instance_profile" "instance" {
 }
 
 # The VM's config.yaml secrets and the Schwab token, as SecureString parameters (#699).
-# This is not a statement in instance_s3, for two reasons. That policy is off until the
-# cutover, and the VM needs its config on the shadow day. And its statements are tested
-# as exactly the bucket's four S3 actions. AmazonSSMManagedInstanceCore, which #695 attaches to the
-# same role, allows both actions on every parameter, so it sets the role's real read
-# scope. This grant keeps the read from depending on that managed policy. No kms: action is needed, because
-# the parameters use the AWS-managed aws/ssm key.
+# This is not a statement in either S3 half, for two reasons. The write half is off
+# until the cutover, and the VM needs its config on the shadow day. And each half is
+# tested as exactly its own S3 actions. AmazonSSMManagedInstanceCore, which #695
+# attaches to the same role, allows both actions on every parameter, so it sets the
+# role's real read scope. This grant keeps the read from depending on that managed
+# policy. No kms: action is needed, because the parameters use the AWS-managed aws/ssm
+# key. The backup target is not a parameter. The render reads it from the instance's
+# marketlake:backup-target tag through instance metadata, which needs no IAM grant.
 resource "aws_iam_role_policy" "instance_config_read" {
   name = "config-parameters-read"
   role = aws_iam_role.instance.name

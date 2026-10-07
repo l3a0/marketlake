@@ -17,6 +17,10 @@ a test too.
 4. ``restart`` of a unit that cannot start exits 1, as ``Type=exec`` makes it.
 5. ``show`` answers each property the scripts read. ``NeedDaemonReload`` reads ``yes``
    while a unit file differs from the copy taken at the last ``daemon-reload``.
+6. ``start`` of a ``.mount`` unit mounts the fake disk in ``tests.support.fake_disk``,
+   succeeds again while it is mounted, and fails for a unit named in ``FAIL_START``.
+7. ``list-units`` prints one plain line per ``com.marketlake.*`` unit with its active
+   state, and a started timer reads ``active waiting``.
 
 ``FAIL_START`` names units whose interpreter cannot start. ``RESTART_MODE`` picks what a
 restart does: ``new`` brings a new pid, ``same`` leaves the pid alone, ``never`` leaves no
@@ -26,7 +30,13 @@ units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
 which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
-fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does.
+fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. Its
+home field is ``FAKE_GETENT_HOME`` when that is set, even to nothing, and ``FAKE_HOME``
+otherwise. The
+fake ``sudo`` clears the environment as the real one does. It keeps only ``PATH``,
+``LOG``, ``STATE``, ``TOOLS``, every ``FAKE_*`` variable, the exit-code knobs named
+``*_RC`` and ``*_RCS``, and the fake ``git``'s ``IS_REPO``, ``BRANCH`` and ``DIRTY``. It
+sets ``HOME`` from ``FAKE_HOME``.
 """
 
 from __future__ import annotations
@@ -169,6 +179,45 @@ case "$cmd" in
     : > "$STATE/restarted-$1"
     printf '%s' "${RESTART_DELAY:-0}" > "$STATE/pending/$1"
     exit 0 ;;
+  start)
+    # A mount unit mounts the fake disk's filesystem, recording its UUID where the fake
+    # findmnt reads it. Starting an active unit succeeds whatever is mounted, as
+    # systemd's does, and a unit named in FAIL_START fails.
+    if [[ "$1" == *.mount ]]; then
+      if fails_to_start "$1"; then
+        echo "Job for $1 failed. See \"systemctl status $1\" for details." >&2
+        exit 1
+      fi
+      if [[ -f "$STATE/mounted" ]]; then exit 0; fi
+      if [[ ! -f "$STATE/disk/uuid" ]]; then
+        echo "Job for $1 failed: no filesystem." >&2
+        exit 1
+      fi
+      cp "$STATE/disk/uuid" "$STATE/mounted"
+      exit 0
+    fi
+    if ! start "$1"; then exit 1; fi
+    exit 0 ;;
+  list-units)
+    # Every com.marketlake.* unit with a file, a process or a failure, one plain line
+    # each, as --all --no-legend --plain prints them. A started timer reads as waiting.
+    [[ -n "${LIST_UNITS_RC:-}" ]] && exit "$LIST_UNITS_RC"
+    names=""
+    for f in "$UNIT_DIR"/com.marketlake.* "$STATE"/pid/com.marketlake.* \
+        "$STATE"/failed/com.marketlake.*; do
+      if [[ -e "$f" ]]; then names="$names ${f##*/}"; fi
+    done
+    for name in $(printf '%s\n' $names | sort -u); do
+      if [[ -f "$STATE/pid/$name" ]]; then
+        sub=running; [[ "$name" == *.timer ]] && sub=waiting
+        echo "$name loaded active $sub $name"
+      elif [[ -f "$STATE/failed/$name" ]]; then
+        echo "$name loaded failed failed $name"
+      else
+        echo "$name loaded inactive dead $name"
+      fi
+    done
+    exit 0 ;;
   show)
     for arg in "$@"; do
       case " ${FAIL_SHOW:-} " in
@@ -204,7 +253,10 @@ exit 1
 """
 
 # sudo -u <account> -H runs the rest as that account. The fake logs the whole line and
-# runs the command, so the log shows which commands ran through it.
+# runs the command, so the log shows which commands ran through it. It resets the
+# environment as sudo's env_reset does, so a variable exported before sudo does not reach
+# the command. The command keeps PATH, the harness's own variables and its knobs, and
+# gets HOME from FAKE_HOME, as -H sets it to the account's home.
 FAKE_SUDO = """#!/bin/bash
 printf 'sudo %s\\n' "$*" >> "$LOG"
 while [[ $# -gt 0 ]]; do
@@ -214,14 +266,21 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-exec "$@"
+keep=()
+for name in $(compgen -e); do
+  case "$name" in
+    PATH|LOG|STATE|TOOLS|FAKE_*|*_RC|*_RCS|IS_REPO|BRANCH|DIRTY) keep+=("$name=${!name}") ;;
+  esac
+done
+if [[ -n "${FAKE_HOME:-}" ]]; then keep+=("HOME=$FAKE_HOME"); fi
+exec /usr/bin/env -i "${keep[@]}" "$@"
 """
 
 # glibc's getent passwd resolves a uid as well as a name, so this answers both.
 FAKE_GETENT = """#!/bin/bash
 printf 'getent %s\\n' "$*" >> "$LOG"
 if [[ "$1" == "passwd" && ( "$2" == "$FAKE_OWNER" || "$2" == 1000 ) ]]; then
-  echo "$FAKE_OWNER:x:1000:1000:Some One:$FAKE_HOME:/bin/bash"
+  echo "$FAKE_OWNER:x:1000:1000:Some One:${FAKE_GETENT_HOME-$FAKE_HOME}:/bin/bash"
   exit 0
 fi
 exit 2

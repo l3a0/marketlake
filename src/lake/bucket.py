@@ -45,11 +45,14 @@ switching back to a path free.
 
 **The client is built from ``config.yaml`` alone, with one exception.** On the
 instance-profile path its credentials come from the EC2 instance metadata service, and
-``config.yaml`` is what decides that. The exception has a second user: the token pull in
-``lake.token_store`` follows ``bucket_credentials`` too, so on the VM it reads the token
-parameter with the same instance profile (marketlake #636). ``client_from_config`` reads
-the region and ``bucket_credentials`` from the config, and ``lake.aws_session``, the
-builder both clients share, clears every ``AWS_*`` variable, ``~/.aws/config``,
+``config.yaml`` is what decides that. The exception has two other users. The token pull
+in ``lake.token_store`` follows ``bucket_credentials`` too, so on the VM it reads the
+token parameter with the same instance profile (marketlake #636). ``lake.vm_config``'s
+render cannot read ``config.yaml``, because it writes that file, so it takes the
+instance profile and the region from the tracked ``config/vm.yaml`` instead (marketlake
+#686). ``client_from_config`` reads the region and ``bucket_credentials`` from the
+config, and ``lake.aws_session``, the builder all three clients share, clears every
+``AWS_*`` variable, ``~/.aws/config``,
 ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's reach while it builds.
 ``bucket_credentials`` takes three values.
 

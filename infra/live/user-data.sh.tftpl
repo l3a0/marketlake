@@ -1,0 +1,52 @@
+#!/bin/bash
+# Marketlake's first-boot shim, rendered by infra/live/vm.tf into the VM's user_data.
+#
+# cloud-init runs it once, as root, after network-online.target, with HOME unset, so
+# every step as the owner goes through `sudo -H`. It records the owner and the lake
+# volume's id, clones main as the owner, and hands over to deploy/vm-bootstrap.sh, which
+# holds the logic and can be run again by hand. Anyone who can describe the instance
+# can read user_data, so this carries nothing secret and nothing naming the account.
+#
+# A clone that fails every attempt leaves no bootstrap on disk. Recover by cloning as
+# the owner by hand and running deploy/vm-bootstrap.sh, as infra/README.md says.
+set -euo pipefail
+
+install -d -m 0755 /etc/marketlake
+cat > /etc/marketlake/bootstrap.conf <<'CONF'
+OWNER=${owner}
+LAKE_VOLUME_ID=${lake_volume_id}
+CONF
+chmod 0644 /etc/marketlake/bootstrap.conf
+
+# getent exits 2 for a missing account, which pipefail and set -e would turn into a
+# silent exit before the check below prints its line.
+home="$(getent passwd '${owner}' | cut -d: -f6)" || true
+if [ -z "$home" ]; then
+  echo "user-data: no account named ${owner}" >&2
+  exit 1
+fi
+checkout="$home/marketlake"
+
+as_owner() {
+  sudo -u '${owner}' -H "$@"
+}
+
+# A directory with no valid HEAD, such as a clone cut off by a reboot, is no checkout.
+if [ -e "$checkout" ] && ! as_owner git -C "$checkout" rev-parse --verify --quiet HEAD > /dev/null; then
+  rm -rf -- "$checkout"
+fi
+
+if [ ! -e "$checkout" ]; then
+  attempt=1
+  until as_owner git clone --quiet --branch main https://github.com/l3a0/marketlake.git "$checkout"; do
+    if [ "$attempt" -ge 10 ]; then
+      echo "user-data: cloning marketlake failed 10 times, so no bootstrap ran" >&2
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    rm -rf -- "$checkout"
+    sleep 30
+  done
+fi
+
+exec "$checkout/deploy/vm-bootstrap.sh"

@@ -34,7 +34,9 @@ themselves, so a test answers the client through botocore's event hooks instead.
 ``sunday_run`` as ``token_pull``. The put's
 client also assumes a role through an STS client private to the build, which no hook on
 the SSM client reaches, so a test of the put answers that at an STS server on loopback,
-through the ``aws_session.STS_ENDPOINT_URL`` seam.
+through the ``aws_session.STS_ENDPOINT_URL`` seam. ``vm_config.render`` takes a factory
+for its own SSM client and a reader for its instance tag too, and ``vm_config.main``
+builds both.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
@@ -57,7 +59,17 @@ import inspect
 
 import pytest
 
-from lake import bucket, compact, control_plane, daemon, reauth, runner, sweep, token_store
+from lake import (
+    bucket,
+    compact,
+    control_plane,
+    daemon,
+    reauth,
+    runner,
+    sweep,
+    token_store,
+    vm_config,
+)
 
 # Each row is an entry and a seam it must never default. Requiring the seam means a caller
 # that omits it gets a TypeError, not a live object. The protection follows each seam to
@@ -89,6 +101,8 @@ REQUIRED = [
     (reauth.reauth_from_config, "store_client_factory"),
     (token_store.push, "client"),
     (token_store.pull, "client_factory"),
+    (vm_config.render, "client_factory"),
+    (vm_config.render, "tag_reader"),
     (bucket.nightly_upload, "client"),
     (bucket.first_upload, "client"),
     (bucket.bucket_scrub, "client"),
@@ -123,6 +137,9 @@ FORBIDDEN = [
     (reauth.main, "store_client_factory"),
     (token_store.main, "client"),
     (token_store.main, "client_factory"),
+    (vm_config.main, "client"),
+    (vm_config.main, "client_factory"),
+    (vm_config.main, "tag_reader"),
     (bucket.main, "client"),
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),
