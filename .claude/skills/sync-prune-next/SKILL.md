@@ -501,11 +501,14 @@ Collect candidates from three places, and give the evidence for each one.
    first.
    - Pull requests that are reviewed, green at the current head as the
      `rollup` entry above defines it, and carry no `working` entry of
-     `kind: "build"` on their card.
+     `kind: "build"` on their card. When the card's `needs` names an issue
+     still in `tracker`, the owner can review now but not merge, so name each
+     open blocker rather than present the pull request as ready to merge.
    - `planned` entries with `ready` of `decide`.
    - Questions a session handed back.
 2. **Plans ready to build with no builder.** These are `planned` entries with
-   `ready` of `build`, with no `working` entry and no open pull request.
+   `ready` of `build`, with no `working` entry, no open pull request, and no
+   `needs` entry naming an issue still in `tracker`.
 3. **The MVP milestone's remaining issues**, in `next`'s order, each with the
    blockers its `needs` names. A blocked issue is not a candidate until its
    blockers close, so name what it waits on rather than recommending it.
