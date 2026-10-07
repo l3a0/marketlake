@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and nine things are not in one.
+``tofu test`` sees one configuration's plan, and fourteen things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -31,6 +31,20 @@
    decrypted value into the state, which every pull request's plan role can read, and a
    mock provider plans it without complaint. An ephemeral block stores nothing, so it
    stays allowed.
+10. The VM's ``ignore_changes`` list, which ``lifecycle`` keeps out of the plan as it
+    does ``prevent_destroy``. Without an entry, a new AMI or a stop that drops the
+    public address plans a replacement of the instance (#686).
+11. Whether two inline policies on one role share a name. ``PutRolePolicy`` on a shared
+    name makes one overwrite the other, and a mock provider plans both.
+12. Whether the lake volume's zone is one literal that the subnet lookup shares. A
+    variable would offer a change ``prevent_destroy`` refuses, and the mock plans any
+    zone.
+13. Arguments that must stay absent. ``disable_api_stop`` makes the attachment's stop
+    before a detach fail, and a ``kms_key_id`` reads back as an ARN, so every plan
+    shows a change.
+14. The shim template's variables. A third one could carry a value into ``user_data``,
+    which anyone who can describe the instance reads, and the plan shows only the
+    rendered text.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -70,6 +84,8 @@ PREVENT_DESTROY = [
     "live/aws_iam_user_policy.backup",
     "live/aws_iam_user.token_writer",
     "live/aws_iam_user_policy.token_writer",
+    # The lake volume holds every minute captured since the last nightly upload (#686).
+    "live/aws_ebs_volume.lake",
 ]
 
 # Every resource type the bootstrap may hold. A new type, such as a second way to
@@ -97,6 +113,11 @@ LIVE_TYPES = {
     "aws_iam_role_policy",
     "aws_iam_role_policy_attachment",
     "aws_iam_instance_profile",
+    "aws_instance",
+    "aws_security_group",
+    "aws_key_pair",
+    "aws_ebs_volume",
+    "aws_volume_attachment",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -222,7 +243,25 @@ def test_live_role_carries_exactly_its_inline_policies() -> None:
         for address, body in _resources("live").items()
         if address.split(".")[0] == "aws_iam_role_policy"
     )
-    assert policies == [("instance", "instance_config_read"), ("instance", "instance_s3")]
+    assert policies == [
+        ("instance", "instance_config_read"),
+        ("instance", "instance_s3"),
+        ("instance", "instance_s3_read"),
+    ]
+
+
+def test_live_role_policy_names_are_distinct() -> None:
+    """``PutRolePolicy`` keys an inline policy by its role and name, so two blocks with
+    one name make the second apply overwrite the first. The S3 read half and the write
+    half are the pair this protects (#686), and a mock provider plans both."""
+    names = [
+        (_role_name(body["role"]), body["name"])
+        for address, body in _resources("live").items()
+        if address.split(".")[0] == "aws_iam_role_policy"
+    ]
+    assert len(names) == len(set(names)), names
+    assert ("instance", "backup-bucket") in names
+    assert ("instance", "backup-bucket-read") in names
 
 
 def test_token_writer_user_sets_only_its_name() -> None:
@@ -247,8 +286,10 @@ def test_live_roles_leave_their_policies_to_separate_resources() -> None:
     exclusively, so on every apply they detach a managed policy or delete an inline one
     that they do not list. ``managed_policy_arns`` would detach the SSM policy from
     ``marketlake-instance``, and the apply role's ``iam:DetachRolePolicy`` grant on that
-    ARN lets the detach succeed silently. ``inline_policy`` would delete the gated
-    ``backup-bucket`` policy once ``instance_s3_enabled`` is on. ``python-hcl2`` files a
+    ARN lets the detach succeed silently. ``inline_policy`` would delete every inline
+    policy it does not list, the S3 read half and the config read among them, and the
+    gated ``backup-bucket`` write half once ``instance_s3_enabled`` is on.
+    ``python-hcl2`` files a
     ``dynamic "inline_policy"`` block under ``dynamic``, so that key is read too."""
     roles = {a: body for a, body in _resources("live").items() if a.startswith("aws_iam_role.")}
     assert roles, "infra/live declares no role, so this check reads nothing"
@@ -430,3 +471,105 @@ def test_each_live_user_carries_exactly_one_inline_policy() -> None:
             assert match, f"a user must be referenced through its resource, got {body['user']!r}"
             policies.append(match.group(1))
     assert sorted(policies) == users
+
+
+def _parsed(config: str) -> list[dict[str, Any]]:
+    parsed = []
+    for path in sorted((INFRA / config).glob("*.tf")):
+        with path.open() as f:
+            parsed.append(hcl2.load(f, serialization_options=_OPTIONS))
+    return parsed
+
+
+def _data_sources(config: str) -> dict[str, dict[str, Any]]:
+    """Every data block in one configuration, keyed ``type.name``."""
+    return {
+        f"{dtype}.{name}": body
+        for parsed in _parsed(config)
+        for block in parsed.get("data", [])
+        for dtype, named in block.items()
+        for name, body in named.items()
+    }
+
+
+def _locals(config: str) -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    for parsed in _parsed(config):
+        for block in parsed.get("locals", []):
+            for name, value in block.items():
+                assert name not in found, f"local.{name} is declared twice"
+                found[name] = value
+    return found
+
+
+def test_vm_ignores_exactly_the_changes_that_would_replace_or_stop_it() -> None:
+    """A new AMI replaces the instance, a changed ``user_data`` stops and starts it, and
+    a stopped instance reads back with no public address, which plans a replacement of
+    the instance and its root volume. ``instance_type`` stays out, so a resize still
+    applies. #686 item 4 carries the reasoning."""
+    lifecycles = _resources("live")["aws_instance.vm"].get("lifecycle", [])
+    ignored = [entry for block in lifecycles for entry in block.get("ignore_changes", [])]
+    assert sorted(ignored) == ["ami", "associate_public_ip_address", "user_data"]
+
+
+def test_lake_volume_zone_is_one_literal_the_subnet_lookup_shares() -> None:
+    """A variable would offer a zone change that ``prevent_destroy`` refuses, and the
+    instance lands in the subnet's zone, so the volume and the subnet must name the same
+    one. The precondition must read it too, or it checks a zone nothing uses."""
+    zone = _locals("live")["zone"]
+    assert isinstance(zone, str)
+    assert re.fullmatch(r"us-east-1[a-z]", zone), zone
+    volume = _resources("live")["aws_ebs_volume.lake"]
+    subnet = _data_sources("live")["aws_subnet.default"]
+    assert volume["availability_zone"] == "${local.zone}"
+    assert subnet["availability_zone"] == "${local.zone}"
+    assert subnet["default_for_az"] is True
+    conditions = [
+        check["condition"]
+        for block in volume.get("lifecycle", [])
+        for check in block.get("precondition", [])
+    ]
+    assert any("local.zone" in condition for condition in conditions), conditions
+
+
+def _keys(value: Any) -> set[str]:
+    """Every key in a parsed block, at any depth."""
+    if isinstance(value, dict):
+        return set(value) | {key for inner in value.values() for key in _keys(inner)}
+    if isinstance(value, list):
+        return {key for inner in value for key in _keys(inner)}
+    return set()
+
+
+def test_live_sets_neither_disable_api_stop_nor_kms_key_id() -> None:
+    """``disable_api_stop`` makes ``stop_instance_before_detaching`` fail, and AWS
+    stores a ``kms_key_id`` as an ARN, so an alias or a key id shows as a change on every
+    plan. Nested blocks such as ``root_block_device`` are read too."""
+    resources = _resources("live")
+    for address in ("aws_instance.vm", "aws_ebs_volume.lake"):
+        assert address in resources, f"infra/live/{address} is missing"
+    for address, body in resources.items():
+        found = _keys(body) & {"disable_api_stop", "kms_key_id"}
+        assert not found, f"infra/live/{address} sets {sorted(found)}"
+
+
+_TEMPLATE = INFRA / "live" / "user-data.sh.tftpl"
+
+
+def test_shim_template_takes_only_the_owner_and_the_volume_id() -> None:
+    """``user_data`` is readable by anyone who can describe the instance. The plan shows
+    only the rendered text, so a third variable fed from a secret would pass every
+    ``tofu test`` run that checks for the values the test happens to know. ``$${`` is a
+    literal ``${`` in a template, so it is skipped."""
+    text = _TEMPLATE.read_text()
+    assert "%{" not in text, "the shim uses a template directive"
+    variables = set(re.findall(r"(?<!\$)\$\{\s*([^}]*?)\s*\}", text))
+    assert variables == {"owner", "lake_volume_id"}
+
+    user_data = _resources("live")["aws_instance.vm"]["user_data"]
+    match = re.fullmatch(
+        r'\$\{templatefile\("\$\{path\.module\}/user-data\.sh\.tftpl", \{(.*)\}\)\}', user_data
+    )
+    assert match, f"user_data is not a templatefile() of the shim, got {user_data[:60]!r}"
+    passed = set(re.findall(r"(\w+)\s*=", match.group(1)))
+    assert passed == {"owner", "lake_volume_id"}
