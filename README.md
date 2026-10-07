@@ -646,10 +646,11 @@ come from Homebrew.
 brew install awscli opentofu
 ```
 
-`.github/workflows/infra.yml` runs these checks on every pull request that touches `infra/`
-or the workflow, with no AWS credentials. The tests run against a mock AWS provider. The
-first `init` downloads the AWS provider, about 750 MB unpacked, and setting
-`TF_PLUGIN_CACHE_DIR` to a directory shares one copy between the two configurations.
+`.github/workflows/infra.yml` runs these checks on every pull request that changes the
+workflow or a file under `infra/` other than Markdown, with no AWS credentials. The tests
+run against a mock AWS provider. The first `init` downloads the AWS provider, about
+750 MB unpacked, and setting `TF_PLUGIN_CACHE_DIR` to a directory shares one copy between
+the two configurations.
 
 ```bash
 tofu fmt -check -recursive infra/

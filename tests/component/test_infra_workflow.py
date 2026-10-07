@@ -1,8 +1,9 @@
 """Checks on ``.github/workflows/infra.yml``, which only runs on GitHub.
 
-The workflow's own checks run only when ``infra/`` changes, and none of them reads the
-workflow. A broken condition or a dropped redirect shows up first on ``main``, inside
-the approved apply job, so these run in ``ci.yml``'s required ``test`` job instead.
+The workflow's own checks run only when a path in its trigger changes, and none of them
+reads the workflow. A broken condition or a dropped redirect shows up first on
+``main``, inside the approved apply job, so these run in ``ci.yml``'s required ``test``
+job instead.
 
 1. Every apply step after the freshness check runs only on a fresh commit. A dropped
    or misspelt condition applies a superseded commit.
@@ -12,7 +13,12 @@ the approved apply job, so these run in ``ci.yml``'s required ``test`` job inste
 3. Every ``tofu plan`` and ``tofu apply`` sends its output to ``/dev/null``, because the
    repository's logs are public and that output carries values.
 4. The validate job runs ``tofu test`` on both configurations.
-5. Both triggers watch ``infra/`` and the workflow itself.
+5. Both triggers watch ``infra/`` and the workflow itself, and leave out Markdown under
+   ``infra/``, which no configuration reads. The exclusion follows ``infra/**``, since
+   GitHub's later positive match would include the file again. Running
+   ``infra/ci/apply-is-stale.sh`` against a fake ``git`` shows that it compares exactly
+   the trigger's paths. A stale run skips only because the newer commit started its own
+   run, so a path the script compares and the trigger skips would strand a change.
 6. ``infra/ci/apply-is-stale.sh`` is committed executable, or the freshness step fails.
 7. Every ``infra/live`` variable with no default reaches both plan steps, and each
    one's secret or repository variable is in both refusals of an empty input. A missing
@@ -24,7 +30,7 @@ the approved apply job, so these run in ``ci.yml``'s required ``test`` job inste
    attachment, which stops the instance and never starts it. Running the step's script
    shows that the plan gets ``-replace`` only when the input is ``true``. A push renders
    the input empty, so a condition that let the empty value through would replace the VM
-   on every merge to ``infra/``.
+   on every merge that starts the workflow.
 """
 
 from __future__ import annotations
@@ -120,13 +126,73 @@ def test_the_validate_job_runs_tofu_test_on_both_configurations() -> None:
     assert "test" in [subcommand for subcommand, _ in _tofu_calls(job)]
 
 
-def test_both_triggers_watch_infra_and_the_workflow() -> None:
+def _trigger_paths(event: str) -> list[str]:
     # YAML 1.1 reads the bare key `on` as true.
-    triggers = _workflow()[True]
+    return _workflow()[True][event]["paths"]
+
+
+def test_both_triggers_watch_infra_and_the_workflow_but_not_its_markdown() -> None:
     for event in ("push", "pull_request"):
-        paths = triggers[event]["paths"]
+        paths = _trigger_paths(event)
         assert "infra/**" in paths, event
         assert ".github/workflows/infra.yml" in paths, event
+        # GitHub applies the patterns in order, so an exclusion placed before the
+        # positive match it narrows is undone by that match.
+        assert "!infra/**/*.md" in paths, event
+        assert paths.index("!infra/**/*.md") > paths.index("infra/**"), event
+
+
+# git as the freshness script calls it. It writes the diff's arguments one per line and
+# reports no difference. The log's variable must not start with GIT_, which git reads.
+_FAKE_GIT = """#!/bin/bash
+case "$1" in
+  fetch) exit 0 ;;
+  diff) printf '%s\\n' "$@" > "$STALE_DIFF_ARGV"; exit 0 ;;
+  *) echo "unexpected git $1" >&2; exit 99 ;;
+esac
+"""
+
+
+def test_the_freshness_script_compares_exactly_the_paths_that_start_a_run(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    git = bin_dir / "git"
+    git.write_text(_FAKE_GIT)
+    git.chmod(0o755)
+    argv_log = tmp_path / "argv"
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / STALE_SCRIPT)],
+        env={
+            "GITHUB_SHA": "stub",
+            "STALE_DIFF_ARGV": str(argv_log),
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+        },
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (result.returncode, result.stdout) == (0, "fresh\n"), result.stderr
+
+    argv = argv_log.read_text().splitlines()
+    assert argv[0] == "diff"
+    compared = argv[argv.index("--") + 1 :]
+
+    paths = _trigger_paths("push")
+    # A skip is safe only when the newer commit started its own run, so the script
+    # leaves out exactly what the trigger leaves out, under git's glob magic, where
+    # `**/` also matches no directory at all, as GitHub's `**` does.
+    excluded = [f":(exclude,glob){path[1:]}" for path in paths if path.startswith("!")]
+    assert excluded, "the trigger excludes nothing"
+    assert sorted(compared) == sorted(["infra/", ".github/workflows/infra.yml", *excluded])
+    # One event alone excluding a path would start a plan with no apply, or the reverse.
+    assert _trigger_paths("pull_request") == paths
+    for path in paths:
+        if path.startswith("!"):
+            assert paths.index(path) > paths.index("infra/**"), path
 
 
 def test_the_freshness_script_is_executable() -> None:

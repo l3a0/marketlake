@@ -1,15 +1,21 @@
-"""``infra/ci/apply-is-stale.sh`` against a real git remote, in three cases.
+"""``infra/ci/apply-is-stale.sh`` against a real git remote.
 
 The script runs only after a merge, inside the approved apply job, so its first run
 would otherwise be on ``main``. Each case builds a remote holding ``main``, a clone
 checked out at an older commit the way ``actions/checkout`` leaves one, and runs the
 script with ``GITHUB_SHA`` naming that older commit.
 
-1. A newer commit on ``main`` changes ``infra/``: the run is stale.
-2. A newer commit on ``main`` changes only docs: the run is fresh, so a docs-only merge
-   never skips a pending apply.
-3. The fetch fails: the script exits non-zero and prints nothing, so the job fails red
-   rather than skipping green.
+A stale run skips because the newer commit started its own run, which applies the
+change. So the script reads stale for exactly the changes that start a run.
+
+1. A newer commit on ``main`` changes a file under ``infra/`` that is not Markdown, or
+   changes the workflow: the run is stale. A commit that changes Markdown beside a
+   ``.tf`` file is stale too, since it starts a run.
+2. A newer commit on ``main`` changes only files outside ``infra/``, or only Markdown
+   under ``infra/``, at the top or nested: the run is fresh. Such a merge starts no run,
+   so skipping would leave the pending apply's change unapplied.
+3. The fetch fails, or the older commit is missing from the clone: the script exits
+   non-zero and prints nothing, so the job fails red rather than skipping green.
 """
 
 from __future__ import annotations
@@ -46,22 +52,23 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _commit(repo: Path, path: str, text: str) -> str:
-    target = repo / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text)
-    _git(repo, "add", path)
-    _git(repo, "commit", "--quiet", "-m", f"change {path}")
+def _commit(repo: Path, paths: tuple[str, ...], text: str) -> str:
+    for path in paths:
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    _git(repo, "add", *paths)
+    _git(repo, "commit", "--quiet", "-m", f"change {' '.join(paths)}")
     return _git(repo, "rev-parse", "HEAD")
 
 
-def _setup(tmp_path: Path, newer_change: str) -> tuple[Path, str]:
-    """A clone at an older commit, whose remote's main carries ``newer_change``."""
+def _setup(tmp_path: Path, *newer_changes: str) -> tuple[Path, str]:
+    """A clone at an older commit, whose remote's main carries ``newer_changes``."""
     origin = tmp_path / "origin"
     origin.mkdir()
     _git(origin, "init", "--quiet", "--initial-branch=main")
-    older = _commit(origin, "infra/live/main.tf", "# first\n")
-    _commit(origin, newer_change, "# newer\n")
+    older = _commit(origin, ("infra/live/main.tf",), "# first\n")
+    _commit(origin, newer_changes, "# newer\n")
 
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", "--quiet", "--no-local", "--depth=1", origin.as_uri(), str(clone))
@@ -94,10 +101,36 @@ def test_a_newer_workflow_change_makes_the_run_stale(tmp_path: Path) -> None:
     assert (result.returncode, result.stdout) == (0, "stale\n")
 
 
-def test_a_newer_docs_only_change_leaves_the_run_fresh(tmp_path: Path) -> None:
+def test_a_newer_change_outside_infra_leaves_the_run_fresh(tmp_path: Path) -> None:
     clone, older = _setup(tmp_path, "docs/design.md")
     result = _run(clone, older)
     assert (result.returncode, result.stdout) == (0, "fresh\n")
+
+
+def test_a_newer_change_to_only_the_infra_readme_leaves_the_run_fresh(
+    tmp_path: Path,
+) -> None:
+    # The top level is the case a pathspec without git's glob magic gets wrong, since
+    # there `**/` must match no directory at all.
+    clone, older = _setup(tmp_path, "infra/README.md")
+    result = _run(clone, older)
+    assert (result.returncode, result.stdout) == (0, "fresh\n")
+
+
+def test_a_newer_change_to_only_nested_infra_markdown_leaves_the_run_fresh(
+    tmp_path: Path,
+) -> None:
+    clone, older = _setup(tmp_path, "infra/live/notes.md")
+    result = _run(clone, older)
+    assert (result.returncode, result.stdout) == (0, "fresh\n")
+
+
+def test_a_newer_change_to_markdown_and_a_tf_file_makes_the_run_stale(
+    tmp_path: Path,
+) -> None:
+    clone, older = _setup(tmp_path, "infra/README.md", "infra/live/iam.tf")
+    result = _run(clone, older)
+    assert (result.returncode, result.stdout) == (0, "stale\n")
 
 
 def test_a_failed_fetch_fails_and_prints_nothing(tmp_path: Path) -> None:
