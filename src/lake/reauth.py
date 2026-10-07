@@ -24,8 +24,9 @@ Four rules shape the module.
    then fail, which reads as a broken job rather than a misuse of one. The refusal is
    enforcement rather than a comment in the rendered header. It comes before the login,
    so the tool costs no browser session where it cannot work. Loading ``config.yaml``
-   comes before it, and so does the check of the put's three ``token_store_*`` keys
-   under ``both`` and ``store``, which refuses with exit 2 before the browser opens.
+   comes before it, and so does the check of the put's keys under ``both`` and
+   ``store``: the command key, ``token_store_role_arn`` and ``token_store_region``. It
+   refuses with exit 2 before the browser opens.
 2. *The token write is atomic.* ``schwab-py`` writes the token with ``open(token_path,
    'w')``, which truncates the file before the new contents exist. A failure in between
    destroys a working token, and it lands on the one file capture cannot start without.
@@ -307,7 +308,8 @@ def _login(
 
 
 # What builds the token parameter's client from the config. ``main`` passes
-# ``token_store.push_client``, and a test passes one that answers through botocore hooks.
+# ``token_store.push_client``, and a test passes one that answers through botocore hooks,
+# or lets it assume the role at an STS server on loopback.
 StoreClientFactory = Callable[[Config], Any]
 
 
@@ -329,7 +331,7 @@ def reauth_from_config(
     ``lake.token_store.mode_of`` reads it.
 
     1. Under ``file`` nothing more happens, and no client is built.
-    2. Under ``both`` and ``store`` the put's three keys are checked before the login, so
+    2. Under ``both`` and ``store`` the put's four keys are checked before the login, so
        a missing or malformed one raises ``ConfigError`` before the browser opens. The
        ``bucket_*`` keys never stand in for them.
     3. Under any other value the line naming it is printed, and the keys are checked
@@ -338,8 +340,9 @@ def reauth_from_config(
 
     The put runs only when this run wrote a token, and it sends the text the writer
     wrote. A put that fails leaves the token written, and the report carries one line
-    naming the token's path, the AWS error code and the fix. Nothing from the token or
-    from an AWS error's message reaches either line.
+    naming the token's path, the AWS error code and the fix, which says whether STS or
+    SSM refused. Nothing from the token or from an AWS error's message reaches either
+    line.
     """
     config = load_config(config_path)
     mode, unknown = token_store.mode_of(config)
@@ -440,8 +443,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     2. 1: the flow returned without leaving a token, so a ritual that did not happen
        fails visibly rather than reporting success.
     3. 2: a refusal before the login, such as no terminal, no callback URL, or an
-       incomplete set of ``token_store_*`` keys under ``both`` or ``store``. It prints
-       one line, the code the sibling commands use for an operator mistake.
+       incomplete set of the put's keys under ``both`` or ``store``. It prints one line,
+       the code the sibling commands use for an operator mistake.
     4. 3: ``token.json`` was written and the token parameter was not updated. It prints
        one line naming the token's path and the fix, either the AWS error code from a
        put that failed or the config problem that skipped it.

@@ -51,10 +51,17 @@ parameter with the same instance profile (marketlake #636). ``client_from_config
 the region and ``bucket_credentials`` from the config, and ``lake.aws_session``, the
 builder both clients share, clears every ``AWS_*`` variable, ``~/.aws/config``,
 ``~/.aws/credentials`` and ``~/.aws/models`` out of the client's reach while it builds.
-Under ``keys``, the default, the access key and secret key come from the config too.
-Under ``instance_profile`` they come from the EC2 instance metadata service and from
-nowhere else, so a VM with an instance profile attached carries no long-lived key. A
-development run therefore cannot reach a real bucket on credentials it happened to find
+``bucket_credentials`` takes three values.
+
+1. Under ``keys``, the default, the access key and secret key come from the config too.
+2. Under ``instance_profile`` they come from the EC2 instance metadata service and from
+   nowhere else, so a VM with an instance profile attached carries no long-lived key.
+3. Under ``assume_role`` the command key in the config assumes the role
+   ``bucket_role_arn`` names, and the client signs with the short-lived credentials STS
+   returns (marketlake #737). The first request assumes the role, and a refusal then is
+   one line naming the command key and the role, by way of ``_failure``.
+
+A development run therefore cannot reach a real bucket on credentials it happened to find
 on the machine, because the metadata service is asked only when ``config.yaml`` says so.
 ``boto3`` is imported in the builder, lazily, so the offline suite never loads it unless
 a test builds a client. Every job reaches the
@@ -81,11 +88,20 @@ from pathlib import Path
 from typing import Any
 
 from lake import outbox
-from lake.aws_session import _MetadataLookupFailed, build_client, source_from_bucket_credentials
+from lake.aws_session import (
+    _UNAVAILABLE_CODES,
+    _AssumeRoleFailed,
+    _MetadataLookupFailed,
+    build_client,
+    source_from_bucket_credentials,
+)
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import (
     BUCKET_CREDENTIALS_KEY,
+    BUCKET_ROLE_ARN_KEY,
+    COMMAND_KEY_ID_KEY,
+    COMMAND_SECRET_KEY,
     CREDENTIALS_FROM_INSTANCE_PROFILE,
     CREDENTIALS_FROM_KEYS,
     BucketTarget,
@@ -171,21 +187,14 @@ _CREDENTIAL_CODES = frozenset(
     }
 )
 
-# The codes S3 uses to say it is busy or briefly unable to answer. These and any 5xx or
-# 429 are named *unreachable* with a failed connection, because the repair for all of
-# them is usually to wait.
-_UNAVAILABLE_CODES = frozenset(
-    {
-        "InternalError",
-        "RequestTimeout",
-        "RequestLimitExceeded",
-        "ServiceUnavailable",
-        "SlowDown",
-        "Throttling",
-        "ThrottlingException",
-        "TooManyRequests",
-    }
-)
+# The codes S3 uses to say it is busy or briefly unable to answer are
+# ``lake.aws_session._UNAVAILABLE_CODES``. Those and any 5xx or 429 are named
+# *unreachable* with a failed connection, because the repair for all of them is usually
+# to wait. They live there because the assume-role refresh sorts STS's answers with them.
+
+# The word every assume-role detail starts with, so a line can tell STS's refusal from
+# the bucket's own.
+ASSUME_ROLE = "AssumeRole"
 
 # -- the nightly upload's deadline ---------------------------------------------
 #
@@ -436,9 +445,17 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
        usually nothing, because the network or the service comes back.
     3. *Failed* is any other answer S3 gave, such as ``NoSuchBucket``. It names the code
        and promises no repair, because no single one fits.
+
+    On the assume-role path the first request, and any refresh after it, asks STS for
+    the role's credentials first. ``_AssumeRoleFailed`` is STS turning that down, so it
+    is *refused* or *unreachable* as ``lake.aws_session`` sorted it where it was caught,
+    with the detail ``AssumeRole <code>``. Without this branch every caller would re-raise
+    it, and the Sunday job would stop before its canary.
     """
     from botocore.exceptions import BotoCoreError, ClientError
 
+    if isinstance(exc, _AssumeRoleFailed):
+        return ("unreachable" if exc.transient else "refused"), f"{ASSUME_ROLE} {exc.code}"
     if isinstance(exc, ClientError):
         code = _error_code(exc) or type(exc).__name__
         status = _status(exc)
@@ -488,8 +505,10 @@ def client_from_config(config: Config) -> Any:
     secret key are passed explicitly. On the instance-profile path they come from the
     instance metadata service, and are fetched before the client is built, so a host
     with no instance profile refuses here as one line rather than at the first request.
-    Either way the region decides the endpoint, and ``lake.aws_session.build_client``
-    keeps the environment, ``~/.aws`` and ``~/.aws/models`` out of the build.
+    On the assume-role path no credentials are fetched here. The first request assumes
+    the role, and a refusal reaches the job that made it, which ``_failure`` sorts. Every
+    way, the region decides the endpoint, and ``lake.aws_session.build_client`` keeps the
+    environment, ``~/.aws`` and ``~/.aws/models`` out of the build.
     """
     problems = bucket_credential_problems(config)
     if problems:
@@ -512,7 +531,7 @@ def _build_client(config: Config) -> Any:
     """The S3 client for the config's bucket settings, built by ``lake.aws_session``.
 
     ``source_from_bucket_credentials`` picks the credential source and refuses any
-    ``bucket_credentials`` value but the two it names. The S3 checksum settings are this
+    ``bucket_credentials`` value but the three it names. The S3 checksum settings are this
     module's own, because only S3 has them.
     """
     return build_client(
@@ -1877,6 +1896,17 @@ def live_check(
     3. A PUT to an existing key on a versioned bucket creates a new version and keeps
        the old one.
     4. ``put_object`` sends one request and never splits into parts.
+
+    Three more lines prove the read grants the scrub and the restore need, which nothing
+    else calls while ``backup_target`` is still a path (marketlake #737).
+
+    5. ``ListObjectsV2`` under the check's own prefix lists the probe.
+    6. ``GetBucketVersioning`` answers ``Enabled``.
+    7. A plain ``GetObject`` of the probe returns the bytes of its current version.
+
+    On the assume-role path the first request is where the role is assumed. A refusal
+    there is STS's and not S3's verdict on behavior 1, so it is raised for ``main`` to
+    print as one line.
     """
     base = f"live-check-{stamp}"
     ok = True
@@ -1903,6 +1933,8 @@ def live_check(
             ChecksumSHA256=b64_sha256(b"other bytes"),
             StorageClass=STORAGE_CLASS,
         )
+    except _AssumeRoleFailed:
+        raise
     except Exception as exc:
         code = _error_code(exc)
         report(code == BAD_DIGEST, f"1 mismatched ChecksumSHA256 refused with {code}")
@@ -1951,6 +1983,38 @@ def live_check(
         )
     else:
         report(kept == probe, "3 the first version still holds the first PUT's bytes")
+
+    def grant(number: int, call: str, read: Callable[[], tuple[bool, str]]) -> None:
+        try:
+            passed, shown = read()
+        except Exception as exc:
+            failure = _failure(exc)
+            if failure is None:
+                raise
+            report(False, f"{number} {call} {failure[0]} with {failure[1]}")
+        else:
+            report(passed, f"{number} {call} {shown}")
+
+    # 5, 6 and 7. The read grants, each by the call the scrub or the restore makes.
+    listed_prefix = f"{target.key(base)}/"
+
+    def listing() -> tuple[bool, str]:
+        found = client.list_objects_v2(Bucket=target.bucket, Prefix=listed_prefix)
+        keys = [entry.get("Key") for entry in found.get("Contents", [])]
+        return key in keys, f"under {listed_prefix} listed {len(keys)} object(s)"
+
+    def versioning() -> tuple[bool, str]:
+        status = client.get_bucket_versioning(Bucket=target.bucket).get("Status")
+        return status == "Enabled", f"returned {status or 'no status'}"
+
+    def current() -> tuple[bool, str]:
+        body = client.get_object(Bucket=target.bucket, Key=key)["Body"].read()
+        held = "the current version's bytes" if body == replacement else "other bytes"
+        return body == replacement, f"of the probe returned {held}"
+
+    grant(5, "ListObjectsV2", listing)
+    grant(6, "GetBucketVersioning", versioning)
+    grant(7, "GetObject", current)
 
     out(
         f"live-check: delete {target.key(base)}/ and every version under it in the console. "
@@ -2004,7 +2068,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="The bucket, as s3://<bucket>[/<prefix>]. Defaults to backup_target when it is one.",
     )
     live = sub.add_parser(
-        "live-check", help="Confirm the four provider behaviors against the real bucket."
+        "live-check",
+        help="Confirm the four provider behaviors and three read grants against the real bucket.",
     )
     live.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     live.add_argument(
@@ -2047,6 +2112,12 @@ def _one_line(exc: BaseException, target: BucketTarget) -> BucketUnreachable | N
     if failure is None:
         return None
     kind, detail = failure
+    if kind == "refused" and detail.startswith(f"{ASSUME_ROLE} "):
+        return BucketUnreachable(
+            f"the bucket's role could not be assumed ({detail}), so check "
+            f"{COMMAND_KEY_ID_KEY}, {COMMAND_SECRET_KEY} and {BUCKET_ROLE_ARN_KEY} in "
+            f"config.yaml. A key made minutes ago may not be active yet: {target}"
+        )
     if kind == "refused":
         return BucketUnreachable(
             f"the bucket refused the request ({detail}), so the bucket's credentials or "
@@ -2133,6 +2204,7 @@ def main(
 
 
 __all__ = [
+    "ASSUME_ROLE",
     "BAD_DIGEST",
     "BUCKET_SHADOW",
     "FIRST_UPLOAD_COMMAND",

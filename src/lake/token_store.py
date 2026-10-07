@@ -20,9 +20,10 @@ Three pieces live here.
    which marketlake #702 adds. An unknown value prints one line and falls to the side
    that cannot cost a token: the re-auth still writes the file and tries the put.
 2. ``push`` is the re-auth's put. It sends the JSON text the login wrote, as a string,
-   never a read-back of the file, and it signs with the three ``token_store_*`` keys
-   alone. Those hold the key of an IAM user that may only put this one parameter, and
-   they never fall back to the ``bucket_*`` keys.
+   never a read-back of the file. It signs only as the role ``token_store_role_arn``
+   names, which may only put this one parameter, in ``token_store_region``. The command
+   key assumes that role, as the session ``marketlake-token-put`` (marketlake #737), and
+   the put never falls back to the ``bucket_*`` keys.
 3. ``pull`` is the VM's read, run as ``python -m lake.token_store pull``. It follows
    ``bucket_credentials``, which is the instance profile on the VM, and writes
    ``token.json`` only when the local file is absent, unreadable, or minted earlier
@@ -34,7 +35,9 @@ Three pieces live here.
 **No token byte reaches any output.** An AWS ``ClientError`` is reported by its error
 code alone, because a ``ValidationException`` message can echo its input. A
 ``BotoCoreError`` is reported by its type name alone, because botocore's client-side
-``ParamValidationError`` prints the parameter's value.
+``ParamValidationError`` prints the parameter's value. A failed ``AssumeRole`` arrives
+as ``_AssumeRoleFailed``, which carries a code and never STS's message, since that
+names the account and the principal.
 
 The client is a seam. It reaches AWS, so ``push`` takes the client and ``pull`` takes a
 factory for it, and neither defaults one. ``main`` builds the real one itself and accepts
@@ -55,7 +58,10 @@ from pathlib import Path
 from typing import Any
 
 from lake.aws_session import (
+    TOKEN_PUT_SESSION_NAME,
+    AssumeRole,
     KeyPair,
+    _AssumeRoleFailed,
     _MetadataLookupFailed,
     build_client,
     source_from_bucket_credentials,
@@ -63,24 +69,26 @@ from lake.aws_session import (
 from lake.clock import Clock, SystemClock
 from lake.config import (
     BUCKET_REGION_KEY,
+    COMMAND_KEY_ID_KEY,
+    COMMAND_SECRET_KEY,
+    TOKEN_PUT_KEYS,
     TOKEN_STORE_FILE,
     TOKEN_STORE_KEY,
-    TOKEN_STORE_KEY_ID_KEY,
-    TOKEN_STORE_KEYS,
     TOKEN_STORE_REGION_KEY,
-    TOKEN_STORE_SECRET_KEY,
+    TOKEN_STORE_ROLE_ARN_KEY,
     Config,
     ConfigError,
     bucket_credential_problems,
     input_errors_exit,
     is_region_name,
     load_config,
+    role_arn_problems,
 )
 from lake.paths import default_token_path
 from lake.token_epoch import epoch_second_to_utc
 
-# The parameter's name. marketlake #699 grants the VM's instance role read on it and the
-# put-only user write on it, and nothing else.
+# The parameter's name. marketlake #699 grants the VM's instance role read on it, and
+# marketlake #737 grants the token-writer role write on it, and nothing else.
 PARAMETER_NAME = "/marketlake/config/schwab-oauth-token"
 
 # The standard tier's limit on a parameter's value, in bytes. ``token.json`` is about 800.
@@ -120,27 +128,33 @@ def mode_of(config: Config) -> tuple[str, str | None]:
     return UNRECOGNISED, (
         f"{TOKEN_STORE_KEY} {value!r} is not {FILE!r}, {BOTH!r} or {STORE!r}, so it is "
         "read as the side that cannot cost a token: a re-auth writes token.json and then "
-        f"puts the token parameter if the {TOKEN_STORE_KEY}_* keys allow it, and the "
+        f"puts the token parameter if {COMMAND_KEY_ID_KEY}, {COMMAND_SECRET_KEY}, "
+        f"{TOKEN_STORE_ROLE_ARN_KEY} and {TOKEN_STORE_REGION_KEY} allow it, and the "
         "scheduled pulls run"
     )
 
 
 def credential_problems(config: Config) -> list[str]:
-    """What is wrong with the put's three keys, as operator phrases.
+    """What is wrong with the put's four keys, as operator phrases.
 
-    Both key values and the region must be present, and the region must have the shape
-    ``require_bucket_settings`` checks ``bucket_region`` for. The ``bucket_*`` keys play
-    no part, because the backup's key holds no grant to put the parameter.
+    The command key's two values, ``token_store_role_arn`` and ``token_store_region``
+    must be present. The role ARN must have a role ARN's shape, and the region the shape
+    ``require_bucket_settings`` checks ``bucket_region`` for. A refusal of the ARN never
+    quotes it, because it carries the account id. The ``bucket_*`` keys play no part, because
+    the backup's key holds no grant to put the parameter. The re-auth runs this before
+    the browser opens, so no ``ConfigError`` can reach its put after a token is written.
     """
     values = (
-        config.token_store_access_key_id,
-        config.token_store_secret_access_key,
+        config.command_access_key_id,
+        config.command_secret_access_key,
+        config.token_store_role_arn,
         config.token_store_region,
     )
-    absent = [key for key, value in zip(TOKEN_STORE_KEYS, values, strict=True) if value is None]
+    absent = [key for key, value in zip(TOKEN_PUT_KEYS, values, strict=True) if value is None]
     problems = []
     if absent:
         problems.append(f"the token parameter's put needs config key(s): {absent}")
+    problems.extend(role_arn_problems(TOKEN_STORE_ROLE_ARN_KEY, config.token_store_role_arn))
     region = config.token_store_region
     if region is not None and not is_region_name(region):
         problems.append(
@@ -150,17 +164,21 @@ def credential_problems(config: Config) -> list[str]:
 
 
 def push_client(config: Config) -> Any:
-    """An SSM client signed with the ``token_store_*`` keys, for the re-auth's put.
+    """An SSM client for the re-auth's put, signed as the role ``token_store_role_arn`` names.
 
-    The caller has run :func:`credential_problems` first, so all three are present.
+    The command key assumes the role, as the session ``marketlake-token-put``, at the
+    put's first request, and no STS call is made here. The caller has run
+    :func:`credential_problems` first, so every key is present.
     """
-    key_id, secret_key = config.token_store_access_key_id, config.token_store_secret_access_key
-    if key_id is None or secret_key is None:
-        raise ConfigError(". ".join(credential_problems(config)))
+    problems = credential_problems(config)
+    key_id, secret_key = config.command_access_key_id, config.command_secret_access_key
+    role_arn = config.token_store_role_arn
+    if problems or key_id is None or secret_key is None or role_arn is None:
+        raise ConfigError(". ".join(problems))
     return build_client(
         "ssm",
         region=config.token_store_region,
-        source=KeyPair(key_id, secret_key),
+        source=AssumeRole(role_arn, KeyPair(key_id, secret_key), TOKEN_PUT_SESSION_NAME),
         client_config=_SSM_CLIENT_CONFIG,
     )
 
@@ -169,20 +187,29 @@ class PushFailed(Exception):
     """The put did not update the parameter. ``code`` names why, and never the value.
 
     ``code`` is the AWS error code, the type name of a ``BotoCoreError``, or
-    ``TooLarge`` for a value refused before the call.
+    ``TooLarge`` for a value refused before the call. ``detail`` is ``ASSUMING`` when the
+    failure came from STS, as the command key assumed the role, rather than from SSM.
+    ``transient`` says an STS failure is likely to pass on its own.
     """
 
-    def __init__(self, code: str, detail: str | None = None) -> None:
+    def __init__(self, code: str, detail: str | None = None, *, transient: bool = False) -> None:
         super().__init__(code)
         self.code = code
         self.detail = detail
+        self.transient = transient
 
 
-# The error codes that mean the key in the ``token_store_*`` keys is the wrong one. SSM
-# returns the first two for a key without the grant, and the last two for an unknown or
-# deactivated key id and a wrong secret, per AWS's list of common errors. The last two
-# arrive as HTTP 400, so no status-code fallback would catch them.
+# What ``PushFailed.detail`` holds when the put failed while assuming the role.
+ASSUMING = "AssumeRole"
+
+# The error codes that mean the role cannot put the parameter. SSM returns these for a
+# principal without the grant, which after a good assume means the role in
+# ``token_store_role_arn`` or a ``token_store_region`` its grant does not name.
 _DENIED_CODES = frozenset({"AccessDenied", "AccessDeniedException"})
+# SSM's codes for an unknown key id and a wrong signature, per AWS's list of common
+# errors. After a good assume they mean the session STS just issued did not work, which
+# a second run repairs. They arrive as HTTP 400, so no status-code fallback would catch
+# them.
 _UNKNOWN_KEY_CODES = frozenset({"UnrecognizedClientException", "InvalidSignatureException"})
 
 TOO_LARGE = "TooLarge"
@@ -206,7 +233,7 @@ def push(*, client: Any, text: str) -> int:
         raise PushFailed(TOO_LARGE, f"the token is {size} bytes, over {MAX_VALUE_BYTES}")
     # The code is taken inside the handler and raised after it, so the AWS error, whose
     # message can carry the token, is on neither ``__cause__`` nor ``__context__``.
-    failed: str | None = None
+    failed: PushFailed | None = None
     try:
         response = client.put_parameter(
             Name=PARAMETER_NAME,
@@ -215,36 +242,56 @@ def push(*, client: Any, text: str) -> int:
             Overwrite=True,
             Tier="Standard",
         )
+    except _AssumeRoleFailed as exc:
+        failed = PushFailed(exc.code, ASSUMING, transient=exc.transient)
     except ClientError as exc:
-        failed = _client_error_code(exc)
+        failed = PushFailed(_client_error_code(exc))
     except BotoCoreError as exc:
-        failed = type(exc).__name__
+        failed = PushFailed(type(exc).__name__)
     if failed is not None:
-        raise PushFailed(failed)
+        raise failed
     return int(response["Version"])
 
 
 def push_failure_line(token_path: Path, failure: PushFailed) -> str:
     """The one line a failed put prints: the token's path, the code, and the fix.
 
-    The fix depends on the code. A refused or unknown key is fixed in ``config.yaml``,
-    and a second login would fail the same way, so the line says so. Anything else is
-    fixed by running ``reauth.sh`` again, the ritual's practised repair.
+    The fix depends on which step failed and on the code.
+
+    1. STS refused the assume, ``InvalidClientTokenId`` and ``SignatureDoesNotMatch``
+       included. The command key, or the policy and trust that let it assume the role,
+       is fixed in ``config.yaml`` or in AWS, and a second login would fail the same way,
+       so the line says so. A new key may simply not be active yet.
+    2. SSM denied the put after a good assume. The role in ``token_store_role_arn`` has
+       no grant for this parameter in ``token_store_region``, and the grant names
+       us-east-1 only.
+    3. SSM did not accept the session STS had just issued, which a second run repairs.
+
+    Anything else, a transient STS failure included, is fixed by running ``reauth.sh``
+    again, the ritual's practised repair.
     """
-    keys = f"{TOKEN_STORE_KEY_ID_KEY} and {TOKEN_STORE_SECRET_KEY}"
-    head = f"{token_path} was written and the token parameter was not updated ({failure.code})."
-    if failure.code in _DENIED_CODES:
+    command = f"{COMMAND_KEY_ID_KEY} and {COMMAND_SECRET_KEY}"
+    assuming = failure.detail == ASSUMING
+    shown = f"{ASSUMING} {failure.code}" if assuming else failure.code
+    head = f"{token_path} was written and the token parameter was not updated ({shown})."
+    if assuming and not failure.transient:
         fix = (
-            f"The key in {keys} has no grant to put it. They must hold the key of the "
-            "user that may only put the token parameter, not the backup's key. A second "
-            "login fails the same way until they do"
+            f"STS refused to let the key in {command} assume the role in "
+            f"{TOKEN_STORE_ROLE_ARN_KEY}: the key is unknown, deactivated or wrong, or "
+            "marketlake-command's policy or the role's trust does not allow it. A key made "
+            "minutes ago may not be active yet. A second login fails the same way until "
+            "the assume works"
+        )
+    elif assuming:
+        fix = "Run reauth.sh again"
+    elif failure.code in _DENIED_CODES:
+        fix = (
+            f"The role in {TOKEN_STORE_ROLE_ARN_KEY} has no grant to put it in "
+            f"{TOKEN_STORE_REGION_KEY}. The grant names the parameter in us-east-1 only, so "
+            "check both. A second login fails the same way until they are fixed"
         )
     elif failure.code in _UNKNOWN_KEY_CODES:
-        fix = (
-            f"AWS does not accept the key in {keys}: the key id is unknown or "
-            "deactivated, or the secret is wrong. A key created a minute ago may not be "
-            "active yet. A second login fails the same way until the key works"
-        )
+        fix = "SSM did not accept the session STS had just issued for the role. Run reauth.sh again"
     elif failure.code == TOO_LARGE:
         fix = f"{failure.detail}, which a standard parameter cannot hold"
     else:
@@ -386,7 +433,10 @@ def pull(
 
     The client is built through ``client_factory`` inside this function, so a metadata
     service that has no credentials yet becomes the ``no credentials`` outcome. A config
-    problem in the build raises ``ConfigError`` for the caller to report.
+    problem in the build raises ``ConfigError`` for the caller to report. A host set to
+    ``bucket_credentials: assume_role`` signs the pull as the bucket's role, which reads
+    no parameter, and a role that cannot be assumed at all is ``unreadable`` too, rather
+    than a traceback.
     """
     from botocore.exceptions import BotoCoreError, ClientError  # lazy: only a pull needs it
 
@@ -405,6 +455,8 @@ def pull(
         )
     try:
         response = client.get_parameter(Name=PARAMETER_NAME, WithDecryption=True)
+    except _AssumeRoleFailed as exc:
+        return _unreadable(target, f"AssumeRole {exc.code}")
     except ClientError as exc:
         return _unreadable(target, _client_error_code(exc))
     except BotoCoreError as exc:
@@ -509,6 +561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "ASSUMING",
     "BOTH",
     "CURRENT",
     "EXIT_CODES",

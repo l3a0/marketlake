@@ -3,7 +3,8 @@
 ``python -m lake.bucket live-check`` runs by hand against the owner's real bucket, and
 the suite never reaches one. What can be checked here is that the check reads each
 answer the right way: it passes a bucket that behaves as S3 documents, and it fails each
-of the four behaviors when the bucket breaks it. The command exits 1 when any one fails.
+of the four behaviors when the bucket breaks it. It fails each of the three read grants,
+marketlake #737, when the credentials lack one. The command exits 1 when any one fails.
 A live check that passed everything would prove nothing on the day it runs for real.
 """
 
@@ -34,11 +35,17 @@ def _run(client: FakeS3) -> tuple[bool, list[str]]:
     return passed, lines
 
 
-def test_a_bucket_that_behaves_as_documented_passes_all_four(tmp_path):
+def test_a_bucket_that_behaves_as_documented_passes_all_seven(tmp_path):
     passed, lines = _run(FakeS3())
     assert passed
-    for behavior in ("1", "2", "3", "4"):
+    for behavior in ("1", "2", "3", "4", "5", "6", "7"):
         assert any(line.startswith(f"live-check: PASS {behavior} ") for line in lines)
+    assert (
+        "live-check: PASS 5 ListObjectsV2 under live-check/live-check-20261005T230000Z/ "
+        "listed 1 object(s)"
+    ) in lines
+    assert "live-check: PASS 6 GetBucketVersioning returned Enabled" in lines
+    assert "live-check: PASS 7 GetObject of the probe returned the current version's bytes" in lines
     assert lines[-1].startswith("live-check: delete live-check/live-check-20261005T230000Z/")
     # The check runs on the VM too, where the credentials come from an instance profile,
     # so the line names the credentials rather than a key.
@@ -143,6 +150,83 @@ def test_an_old_version_holding_the_new_bytes_fails_behavior_three():
     passed, lines = _run(_KeepsNoOldBytes())
     assert not passed
     assert "live-check: FAIL 3 the first version still holds the first PUT's bytes" in lines
+
+
+class _DeniesList(FakeS3):
+    """Credentials whose policy lost ``s3:ListBucket``."""
+
+    def list_objects_v2(self, **kwargs):
+        self.calls.append(("list_objects_v2", dict(kwargs)))
+        raise client_error("AccessDenied", "ListObjectsV2", 403)
+
+
+def test_credentials_that_cannot_list_fail_grant_five():
+    passed, lines = _run(_DeniesList())
+    assert not passed
+    assert "live-check: FAIL 5 ListObjectsV2 refused with AccessDenied" in lines
+    # The other two grants are still read, so one run names every missing grant.
+    assert any(line.startswith("live-check: PASS 6 ") for line in lines)
+    assert any(line.startswith("live-check: PASS 7 ") for line in lines)
+
+
+def test_a_listing_without_the_probe_fails_grant_five():
+    class _ListsNothing(FakeS3):
+        def list_objects_v2(self, **kwargs):
+            return {"IsTruncated": False}
+
+    passed, lines = _run(_ListsNothing())
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 5 ") for line in lines)
+
+
+@pytest.mark.parametrize(("versioning", "shown"), [(None, "no status"), ("Suspended", "Suspended")])
+def test_a_bucket_without_versioning_enabled_fails_grant_six(versioning, shown):
+    passed, lines = _run(FakeS3(versioning=versioning))
+    assert not passed
+    assert f"live-check: FAIL 6 GetBucketVersioning returned {shown}" in lines
+
+
+class _DeniesVersioning(FakeS3):
+    """Credentials whose policy lost ``s3:GetBucketVersioning``."""
+
+    def get_bucket_versioning(self, **kwargs):
+        raise client_error("AccessDenied", "GetBucketVersioning", 403)
+
+
+def test_credentials_that_cannot_read_versioning_fail_grant_six():
+    passed, lines = _run(_DeniesVersioning())
+    assert not passed
+    assert "live-check: FAIL 6 GetBucketVersioning refused with AccessDenied" in lines
+
+
+class _DeniesPlainGet(FakeS3):
+    """Credentials that may read an old version and not the current one."""
+
+    def get_object(self, **kwargs):
+        if "VersionId" not in kwargs:
+            raise client_error("AccessDenied", "GetObject", 403)
+        return super().get_object(**kwargs)
+
+
+def test_credentials_that_cannot_get_fail_grant_seven():
+    passed, lines = _run(_DeniesPlainGet())
+    assert not passed
+    assert "live-check: FAIL 7 GetObject refused with AccessDenied" in lines
+
+
+class _ServesFirstVersion(FakeS3):
+    """A bucket whose plain ``GetObject`` answers with the oldest version."""
+
+    def get_object(self, **kwargs):
+        if "VersionId" not in kwargs:
+            kwargs["VersionId"] = self.objects[kwargs["Key"]][0].version_id
+        return super().get_object(**kwargs)
+
+
+def test_a_plain_get_of_old_bytes_fails_grant_seven():
+    passed, lines = _run(_ServesFirstVersion())
+    assert not passed
+    assert "live-check: FAIL 7 GetObject of the probe returned other bytes" in lines
 
 
 @pytest.mark.parametrize(("fake", "code"), [(FakeS3, 0), (_DeniesMismatch, 1)])
