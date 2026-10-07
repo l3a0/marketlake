@@ -469,9 +469,11 @@ list it on the pull request's issue.
 
 Merge the pull request. Then the owner approves the `tofu apply (live)` run in the
 Actions tab, outside 09:25 to 16:15 ET, so an apply never runs while the market is open
-and the daemon is capturing. To approve, open the waiting run, click **Review
-deployments**, tick `infra`, then click **Approve and deploy**. Only the owner clicks
-these, as step 8 says.
+and the daemon is capturing.
+
+A run that waits for approval waits in the `infra` environment. To approve it, open the
+run in the Actions tab, click **Review deployments**, tick `infra`, then click **Approve
+and deploy**. Only the owner clicks these, as step 8 says.
 
 After the first green apply, two runs confirm that nothing is left to change.
 
@@ -629,10 +631,9 @@ AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live
 ## Changing the bootstrap
 
 Apply any later change to `infra/bootstrap/*.tf` from the laptop first, as in
-step 7, then approve its live apply, as in
-[step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change). Apply it only from
-the bootstrap pull request's branch at its final head, and only when its plan changes
-nothing that pull request does not change. Every checkout reads the same backend file in
+step 7, then approve its live apply. Apply it only from the bootstrap pull
+request's branch at its final head, and only when its plan changes nothing that pull
+request does not change. Every checkout reads the same backend file in
 `~/.config/marketlake/infra/`, so a checkout that predates a merged change plans that
 change away, and OpenTofu gives no warning. After the merge, plan the bootstrap from
 `main`'s merge commit, as in step 11, and expect no changes.
@@ -641,13 +642,15 @@ change away, and OpenTofu gives no warning. After the merge, plan the bootstrap 
 
 A bootstrap pull request can merge before its bootstrap apply, as
 [PR #719](https://github.com/l3a0/marketlake/pull/719) did on 2026-10-06. Its
-`tofu apply (live)` run then waits for approval. Leave that run waiting. It runs with
-the apply role's old permissions, so it fails at the first call the old role may not
-make, after applying what it could. Approved first,
+`tofu apply (live)` run then waits for approval in the `infra` environment. Leave that
+run waiting. It runs with the apply role's old permissions, so it fails at the first call
+the old role may not make, after applying what it could. Approved first,
 [PR #719](https://github.com/l3a0/marketlake/pull/719)'s run would have created
 `aws_iam_role_policy.instance_config_read` and then failed at `iam:CreateUser`.
 
-Apply the bootstrap from the merge commit instead of the branch, in this order.
+The rule above, to apply from the branch's final head, assumes the apply comes before
+the merge. After the merge, apply the bootstrap from the merge commit instead, in this
+order.
 
 1. Read the pull request's final head and its merge commit. They are `<branch-head>` and
    `<merge-commit>` below.
@@ -675,14 +678,15 @@ Apply the bootstrap from the merge commit instead of the branch, in this order.
    git -C "$HOME/marketlake-infra-<n>" diff "<branch-head>" "<merge-commit>" -- infra/bootstrap
    ```
 
-4. Initialize, plan, read the plan and apply, with step 7's commands.
+4. Run step 7's `init`, `plan` and `apply` commands, and read the plan before the
+   apply. Skip step 7's worktree and head checks, which the steps above replace.
 5. Approve the waiting run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change).
 
 A run approved before the bootstrap apply has already failed, and [Recovery](#recovery)
 covers what a failed apply leaves behind. Once the bootstrap is applied, start a new run
-with step 11's `gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and approve
-it.
+with step 11's `gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and
+approve it as in step 11.
 
 ### Reading a statement inserted into a policy
 
@@ -730,7 +734,7 @@ The pull request that adds the token writer changes the bootstrap too, so it fol
    as in step 7. That gives the apply role `iam:CreateUser` and `iam:PutUserPolicy` on
    `marketlake-token-writer`. When the pull request merged first, follow
    [When the merge came before the bootstrap apply](#when-the-merge-came-before-the-bootstrap-apply)
-   instead.
+   in place of this step and the next.
 2. Merge, then approve the `tofu apply (live)` run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change), which creates the
    user and its policy.
