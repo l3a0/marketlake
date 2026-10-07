@@ -1486,3 +1486,19 @@ def test_a_refused_page_keeps_its_body_off_stderr(fixture_lake, capsys):
     err = capsys.readouterr().err
     assert "refused: it carried a secret" in err
     assert cp.DAEMON_LABEL not in err
+
+
+def test_a_reminder_for_a_failing_canary_names_a_failed_pull_too(fixture_lake):
+    # The token covers the week, but the vendor rejects it. The reminder that goes out is
+    # the canary's, and a failed pull still rides it, because the fix may be a re-auth put.
+    sent = []
+    _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(FRESH_MINT),
+        canary=lambda: False,
+        reminder_sink=sent.append,
+        token_pull=_Pulls(_pulled(token_store.UNREADABLE, "ParameterNotFound")),
+    )
+    assert len(sent) == 3
+    assert all(r.body.endswith(" Token pull: unreadable (ParameterNotFound).") for r in sent)

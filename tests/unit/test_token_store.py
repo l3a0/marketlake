@@ -1008,3 +1008,21 @@ def test_a_mint_time_thirty_minutes_ahead_is_accepted(tmp_path):
     result = _pull_at_now(Store(ahead), token)
     assert result.outcome == "wrote"
     assert json.loads(token.read_text()) == ahead
+
+
+def test_a_botocore_failure_is_unreadable_by_its_class_name(tmp_path):
+    # README maps an ``unreadable`` reason that is a botocore class name to the network or
+    # the metadata service, so the class name is the reason the reminder carries.
+    from botocore.exceptions import EndpointConnectionError
+
+    store = Store(_token())
+
+    def fail(**kwargs):
+        raise EndpointConnectionError(endpoint_url="https://ssm.us-east-2.amazonaws.com/")
+
+    store.client.meta.events.register("before-sign.ssm", fail)
+    result = _pull(store, tmp_path / "token.json")
+    assert result.outcome == "unreadable"
+    assert "(EndpointConnectionError)" in result.line
+    assert result.reason == "EndpointConnectionError"
+    _assert_no_token_in(result)
