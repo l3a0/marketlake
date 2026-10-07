@@ -163,16 +163,16 @@ PANEL_SURFACES = (CHAINS, QUOTES)
 SLOT = timedelta(minutes=1)
 
 # The connection's resource caps. The service shares its host with the minutely capture
-# daemon, a laptop or a 2-core, 1.8 GiB VM, and the capture loop's minute budget owns the
-# machine. The dashboard is the guest, so it takes a small fixed share rather than the
-# machine default, which is every core and most of RAM. One thread leaves the VM's second
-# core to capture. The memory cap is a fixed value rather than a fraction of the host,
-# because what a query needs is set by the roster and the 30-day window, not by the
-# host's size. 128MB covers two tabs refreshing at once up to about 20 tickers.
-# ``open_lake_connection`` also turns DuckDB's external file cache off. That cache keeps
-# Parquet bytes it has read until the cap forces them out, so it was what a large cap
-# bought. marketlake #672 records the measurements. Every cap must be set before
-# ``lock_configuration``, because a locked configuration refuses every later ``SET``.
+# daemon. The host is a laptop or a 2-core, 1.8 GiB VM, and the capture loop's minute
+# budget owns the machine. The dashboard is the guest, so it takes a small fixed share
+# rather than the machine default, which is every core and most of RAM. One thread leaves
+# the VM's second core to capture. The memory cap is a fixed value rather than a fraction
+# of the host, because what a query needs is set by the roster and the 30-day window, not
+# by the host's size. ``open_lake_connection`` also turns DuckDB's external file cache
+# off. That cache keeps Parquet bytes it has read until the cap forces them out, so it was
+# what a large cap bought. marketlake #672 records the measurements. Every cap must be set
+# before ``lock_configuration``, because a locked configuration refuses every later
+# ``SET``.
 QUERY_THREADS = 1
 QUERY_MEMORY_LIMIT = "128MB"
 

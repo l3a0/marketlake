@@ -67,6 +67,7 @@ from lake.dashboard import (
     MAX_LOOKBACK_SESSIONS,
     NAMED_QUERIES,
     DashboardService,
+    NamedQuery,
     QueryParameterError,
     group_nights,
 )
@@ -316,6 +317,29 @@ def test_the_page_and_icon_seams_return_what_was_injected(root: Path):
     default = DashboardService(root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR)
     assert default.page == dashboard.load_status_page()
     assert default.icon == dashboard.load_favicon()
+
+
+def test_a_service_without_an_injected_connection_queries_through_the_sandbox(
+    root: Path, monkeypatch
+):
+    # A service built without a connection must open its own through
+    # open_lake_connection, so the caps and the lock reach every request it serves. The
+    # sandbox tests open that connection directly and never build a service, so without
+    # this the default could become a bare duckdb.connect() and nothing would fail. A
+    # probe query is registered so the settings are read on the cursor run_query hands
+    # to a real query. The expected values are literals rather than the module's
+    # constants, so a change to a constant fails here too.
+    def probe(cursor, ctx, **params) -> dict[str, object]:
+        row = cursor.execute(
+            "SELECT current_setting('threads'), current_setting('memory_limit'), "
+            "current_setting('enable_external_file_cache'), "
+            "current_setting('lock_configuration')"
+        ).fetchone()
+        return {"settings": row}
+
+    monkeypatch.setitem(NAMED_QUERIES, "probe", NamedQuery("probe", probe, frozenset()))
+    default = DashboardService(root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR)
+    assert default.run_query("probe", {}) == {"settings": (1, "122.0 MiB", False, True)}
 
 
 def test_now_reports_the_last_data_cycle_and_minutes_since(service: DashboardService):

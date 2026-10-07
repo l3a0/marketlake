@@ -7,8 +7,9 @@ inside work, the two resource caps are applied, DuckDB's external file cache is 
 once the configuration is locked nothing can widen any of it.
 
 The caps are part of the sandbox, not a separate concern. The service shares its host
-with the minutely capture daemon, a laptop or a 2-core, 1.8 GiB VM, so the connection
-takes a small fixed share rather than the machine default of every core and most of RAM.
+with the minutely capture daemon. The host is a laptop or a 2-core, 1.8 GiB VM, so the
+connection takes a small fixed share rather than the machine default of every core and
+most of RAM.
 The file cache is off because it keeps Parquet bytes a query read until the memory cap
 forces them out. The two caps and the file cache setting must all land before the lock,
 because a locked configuration refuses every later ``SET``.
