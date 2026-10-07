@@ -373,7 +373,7 @@ The first `both` re-auth comes before the VM's first boot, in this order:
 
 1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists,
    and its access key is in the three `token_store_*` keys in the laptop's `config.yaml`.
-   The owner decided on 2026-10-06 that this key will not be created, and
+   The owner decided on 2026-10-06 not to create this key, and
    [#737](https://github.com/l3a0/marketlake/issues/737) replaces this step.
 2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
    older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a

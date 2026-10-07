@@ -788,9 +788,14 @@ leftover.
 `python -m lake.vm_config render < config/vm.yaml` writes the VM's `config.yaml`. It
 joins the four secret parameters and the tag with the tracked `config/vm.yaml`, which
 holds the settings that are not secret. The token goes to `token.json` through its own
-pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A missing tag makes the
-render refuse with exit 2 and a line naming the fix in `vm.tf`. Metadata that does not
-answer gives exit 3, and any other HTTP error from it gives exit 1.
+pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A tag the metadata
+service does not serve gives exit 3, which the first boot retries, because AWS does
+not document that a tag given at launch is served from the first moment of the
+first boot. The line names both causes. Either the tag is not served yet, or the
+instance has no tag or has `instance_metadata_tags` disabled, which is fixed in
+`vm.tf`. Metadata that does not answer also gives exit 3. Any other HTTP error from
+it gives exit 1, and so does a redirect, which the render never follows. A tag value
+that is empty, padded or not UTF-8 makes the render refuse with exit 2.
 
 The code manages no parameter and names only the path. A parameter resource needs its
 value at apply time, so CI would hold every secret, and a data source writes the
@@ -818,7 +823,7 @@ The pull request that adds the token writer changes the bootstrap too, so it fol
    into the laptop's `config.yaml` under
    [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys, and it
    stays out of code, so no secret reaches the state. The owner decided on 2026-10-06
-   that this key will not be created, and
+   not to create this key, and
    [#737](https://github.com/l3a0/marketlake/issues/737) replaces this step.
 
 Never create the user by hand. The live apply creates it, and its `CreateUser` fails with
@@ -890,7 +895,7 @@ aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --para
 
 ### Recover from a leaked token-writer key
 
-The owner decided on 2026-10-06 that the token writer's key will not be created, and
+The owner decided on 2026-10-06 not to create the token writer's key, and
 [#737](https://github.com/l3a0/marketlake/issues/737) replaces the step that made it. So
 this procedure applies only to a key that exists.
 
@@ -1069,9 +1074,11 @@ describe the instance can read it. The boot takes two steps.
    times on any error, and runs `deploy/linux-install.sh`, which starts the units. Then
    it renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
    token, and applies the roster. It takes the install lock around each attempt of
-   these steps and releases it during the 20 seconds it waits before a retry. One attempt
-   against a metadata service that hangs holds the lock about 120 seconds, well under the
-   600 seconds another install waits for it.
+   these steps and releases it during the 20 seconds it waits before a retry. One
+   attempt against an SSM endpoint that hangs holds the lock about 160 seconds, four
+   botocore attempts of up to 40 seconds each, well under the 600 seconds another
+   install waits for it. A metadata read cannot hang that long, because it gives up
+   after two 1-second attempts.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
@@ -1152,10 +1159,11 @@ So read every line, not only the last.
 
 Three things call for a rerun.
 
-1. **A parameter or the tag was missing at first boot.** The render refused, the
-   bootstrap ended with exit 1, and the daemon restarts every ten seconds without a
-   `config.yaml`. Put a missing parameter, or fix a missing tag in `infra/live/vm.tf`
-   through an approved apply, as the render's line says. Then rerun.
+1. **A parameter or the tag was missing at first boot.** A missing parameter makes
+   the render refuse, and a missing tag makes it exit 3 on all six attempts. Either
+   way the bootstrap ended with exit 1, and the daemon restarts every ten seconds
+   without a `config.yaml`. Put a missing parameter, or fix a missing tag in
+   `infra/live/vm.tf` through an approved apply, as the render's line says. Then rerun.
 2. **Code merged after the apply.** Nothing pulls on its own until
    [#676](https://github.com/l3a0/marketlake/issues/676). After the close, pull as the
    owner, rerun, and restart, because the install restarts nothing. Timers start fresh
@@ -1320,9 +1328,9 @@ aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture Nam
 A new address goes in the `HostName` of the laptop's `~/.ssh/config` entry, which the
 root README's
 [Reach the dashboard on a hosted VM](../README.md#reach-the-dashboard-on-a-hosted-vm)
-shows, with `IdentityFile ~/.ssh/marketlake_vm` beside it. A replacement also brings a
-new host key. When ssh refuses an address because a different key was seen there before,
-clear the old key with `ssh-keygen -R "<vm-address>"`.
+shows. That entry names no key, so add `IdentityFile ~/.ssh/marketlake_vm` to it. A
+replacement also brings a new host key. When ssh refuses an address because a different
+key was seen there before, clear the old key with `ssh-keygen -R "<vm-address>"`.
 
 ### The duplicate-name check
 

@@ -426,11 +426,13 @@ done
 # AccessDenied while a fresh IAM change spreads. Exit 2 is a refusal.
 #
 # The lock is taken around each attempt, never across the retries, and the 20-second
-# wait runs without it. One attempt against an endpoint that hangs takes about 120
-# seconds: three botocore attempts, each a 10-second connect timeout and a 30-second
-# read timeout. So the lock is held about 120 seconds at a time, under the 600 seconds
-# another install waits for it with flock -w 600. Held across six tries of both steps,
-# it could stay taken about 1,640 seconds.
+# wait runs without it. One attempt against an SSM endpoint that hangs takes about 160
+# seconds: four botocore attempts, the first and three retries, each a 10-second connect
+# timeout and a 30-second read timeout. A metadata read cannot hang that long, because
+# it gives up after two 1-second attempts. So the lock is held about 160 seconds at a
+# time, under the 600 seconds another install waits for it with flock -w 600. Held
+# across all six attempts of both steps and the 20-second waits between them, it could
+# stay taken about 2,100 seconds.
 #
 # The lock is taken only after the install returns, because the install takes the same
 # lock with flock -w 600, so holding it across the install would make the install wait
