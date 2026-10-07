@@ -777,8 +777,15 @@ so it follows [Changing the bootstrap](#changing-the-bootstrap).
    in place of this step and the next.
 2. Merge, then approve the `tofu apply (live)` run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change), which creates the
-   user, the two roles and their policies.
-3. Create an access key for `marketlake-command` in the AWS console. The key goes into the
+   user, the two roles and their policies. Its plan summary also shows four `forget` rows,
+   one for each old user and its policy, which leave the state and keep existing in AWS.
+   Every approved apply carries everything on `main`, so refuse a run whose plan summary
+   shows `aws_instance.vm` or `aws_ebs_volume.lake`. That run would boot the hosted VM
+   early. Merge and apply this before the hosted VM's pull request merges, or hold that
+   pull request until this apply has run.
+3. Wait until [#737](https://github.com/l3a0/marketlake/issues/737)'s code pull request
+   has merged and `main` is deployed to the laptop, because no earlier code reads the keys
+   below. Then create an access key for `marketlake-command` in the AWS console. The key goes into the
    laptop's `config.yaml` as `command_access_key_id` and `command_secret_access_key`, and
    it stays out of code, so no secret reaches the state.
 4. Write each role's ARN into the laptop's `config.yaml`, `marketlake-backup`'s as
