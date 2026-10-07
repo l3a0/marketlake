@@ -19,18 +19,26 @@ change it the way the real tools would change a volume.
 ``$STATE/mounted`` holds the UUID of whatever is mounted at the lake root. The fake
 ``systemctl start`` of a ``.mount`` unit writes it from the disk, and ``findmnt`` reads it.
 ``mount`` mounts the same way and exits 32 when something is already mounted, as
-util-linux's does.
+util-linux's does. ``$STATE/submounts`` lists the mount points below the lake root, which
+``findmnt -R`` prints after the lake root's own line.
 
 The other knobs: ``CMP_RC`` is ``cmp``'s exit on a volume with no probe result, since a
 volume with one always differs from zeros. ``FINDMNT_VERIFY_RC`` is the exit of
-``findmnt --verify``. ``FSTAB_SOURCE`` overrides what ``findmnt --fstab`` reads.
-``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC`` fail those tools.
-``$STATE/immutable`` lists the directories ``chattr +i`` has marked.
+``findmnt --verify`` on a file that holds an entry. On an empty or missing file it exits 1
+whatever the knob says, so a test cannot pass against a check looser than the real one.
+``FINDMNT_TREE_RC`` is the exit of ``findmnt -R``. ``FSTAB_SOURCE`` overrides what
+``findmnt --fstab`` reads. ``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC``
+fail those tools. ``CAT_FAIL`` names a file
+the fake ``cat`` fails to read, as an I/O error would make it. ``$STATE/immutable`` lists
+the directories ``chattr +i`` has marked.
 
-Each fake logs its argv to ``$LOG``. ``python3`` runs the test's own interpreter, which has
-PyYAML, and logs only its first argument, since the second is a whole program. ``chmod``
-and ``rm`` log and then run the real tool, inside the test root, and ``rm`` drops GNU's
-``--one-file-system``, which a Mac's ``rm`` does not know.
+Each fake logs its argv to ``$LOG``, except ``cat``, which the other fakes call too.
+``python3`` runs the test's own interpreter, which has PyYAML, and logs only its first
+argument, since the second is a whole program. ``chmod`` and ``rm`` log and then run the
+real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, which a
+Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to its line when it inherits
+an open descriptor 9, which is the one the scripts lock the install lock through, so a
+test sees a wait that holds the lock.
 """
 
 from __future__ import annotations
@@ -79,19 +87,40 @@ FAKE_FINDMNT = r"""#!/bin/bash
 printf 'findmnt %s\n' "$*" >> "$LOG"
 verify=0
 fstab=0
+submounts=0
 tab=""
 mountpoint=""
+target=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --verify) verify=1 ;;
     --fstab) fstab=1 ;;
+    -R) submounts=1 ;;
     --tab-file) tab="$2"; shift ;;
     --mountpoint) mountpoint="$2"; shift ;;
+    -o) shift ;;
+    -*) ;;
+    *) target="$1" ;;
   esac
   shift
 done
 if [[ $verify == 1 ]]; then
+  # A table with no entry at all is the one thing the fake always refuses.
+  if [[ ! -s "$tab" ]]; then
+    echo "fake findmnt: $tab holds no entry" >&2
+    exit 1
+  fi
   exit "${FINDMNT_VERIFY_RC:-0}"
+fi
+if [[ $submounts == 1 ]]; then
+  # The target's own line, then a tree line for each mount below it, as -R prints them.
+  if [[ -n "${FINDMNT_TREE_RC:-}" ]]; then exit "$FINDMNT_TREE_RC"; fi
+  [[ -f "$STATE/mounted" ]] || exit 1
+  echo "$target"
+  if [[ -f "$STATE/submounts" ]]; then
+    while IFS= read -r sub; do echo "└─$sub"; done < "$STATE/submounts"
+  fi
+  exit 0
 fi
 if [[ $fstab == 1 ]]; then
   if [[ -n "${FSTAB_SOURCE:-}" ]]; then echo "$FSTAB_SOURCE"; exit 0; fi
@@ -191,8 +220,18 @@ exec /bin/rm "${args[@]}"
 """
 
 FAKE_SLEEP = """#!/bin/bash
-printf 'sleep %s\\n' "$*" >> "$LOG"
+held=""
+if { : >&9; } 2>/dev/null; then held=" with fd 9 open"; fi
+printf 'sleep %s%s\\n' "$*" "$held" >> "$LOG"
 exit 0
+"""
+
+FAKE_CAT = """#!/bin/bash
+if [[ -n "${CAT_FAIL:-}" && "${*: -1}" == "$CAT_FAIL" ]]; then
+  echo "cat: $CAT_FAIL: Input/output error" >&2
+  exit 1
+fi
+exec /bin/cat "$@"
 """
 
 # A sequence of exit codes, one per call, read from a space-separated list. The last code
@@ -256,6 +295,7 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "chmod": FAKE_CHMOD,
         "rm": FAKE_RM,
         "sleep": FAKE_SLEEP,
+        "cat": FAKE_CAT,
         "python3": (
             f'#!/bin/bash\nprintf \'python3 %s\\n\' "$1" >> "$LOG"\nexec {sys.executable} "$@"\n'
         ),

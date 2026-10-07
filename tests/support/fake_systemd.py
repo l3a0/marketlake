@@ -30,7 +30,11 @@ units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
 which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
-fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does.
+fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. The
+fake ``sudo`` clears the environment as the real one does. It keeps only ``PATH``,
+``LOG``, ``STATE``, ``TOOLS``, every ``FAKE_*`` variable, the exit-code knobs named
+``*_RC`` and ``*_RCS``, and the fake ``git``'s ``IS_REPO``, ``BRANCH`` and ``DIRTY``. It
+sets ``HOME`` from ``FAKE_HOME``.
 """
 
 from __future__ import annotations
@@ -247,7 +251,10 @@ exit 1
 """
 
 # sudo -u <account> -H runs the rest as that account. The fake logs the whole line and
-# runs the command, so the log shows which commands ran through it.
+# runs the command, so the log shows which commands ran through it. It resets the
+# environment as sudo's env_reset does, so a variable exported before sudo does not reach
+# the command. The command keeps PATH, the harness's own variables and its knobs, and
+# gets HOME from FAKE_HOME, as -H sets it to the account's home.
 FAKE_SUDO = """#!/bin/bash
 printf 'sudo %s\\n' "$*" >> "$LOG"
 while [[ $# -gt 0 ]]; do
@@ -257,7 +264,14 @@ while [[ $# -gt 0 ]]; do
     *) break ;;
   esac
 done
-exec "$@"
+keep=()
+for name in $(compgen -e); do
+  case "$name" in
+    PATH|LOG|STATE|TOOLS|FAKE_*|*_RC|*_RCS|IS_REPO|BRANCH|DIRTY) keep+=("$name=${!name}") ;;
+  esac
+done
+if [[ -n "${FAKE_HOME:-}" ]]; then keep+=("HOME=$FAKE_HOME"); fi
+exec /usr/bin/env -i "${keep[@]}" "$@"
 """
 
 # glibc's getent passwd resolves a uid as well as a name, so this answers both.
