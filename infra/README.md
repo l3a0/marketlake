@@ -1037,11 +1037,9 @@ outside the window.
 ### Create the VM
 
 The approved apply of the VM's pull request creates the VM. The pull request's plan
-summary is expected to show these six creates, and no destroy or replace. This table is
-a prediction rather than an observation. The pull request's plans before 2026-10-07
-stopped at the check for empty inputs, because the two CI inputs in step 3 were not yet
-set, so check the table against the first plan that runs past it. The count comes from
-the code: the five
+summary shows these six creates, and no destroy or replace. The owner confirmed the table
+on 2026-10-07 in the step summary of the pull request's plan at `fcd37f9`, the first plan
+to run past the check for empty inputs. The count comes from the code: the five
 resources in `vm.tf`, and the read half from the instance role's split. The
 `marketlake:backup-target` tag is an argument of `aws_instance.vm`, so it adds no
 resource.
