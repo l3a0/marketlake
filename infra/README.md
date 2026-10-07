@@ -1189,20 +1189,22 @@ runs the daemon.
    already filled: the owner put `/marketlake/config/schwab-oauth-token` at version 1 on
    2026-10-06. [#737](https://github.com/l3a0/marketlake/issues/737)'s pull requests,
    [PR #743](https://github.com/l3a0/marketlake/pull/743) and
-   [PR #744](https://github.com/l3a0/marketlake/pull/744), merged on 2026-10-07. Once
-   their live apply has run and the laptop runs under `marketlake-command`, the re-auth's
-   weekly put goes through the role `marketlake-token-writer`, and no key for a token
-   writer user exists. Until then, the owner puts the token after each re-auth with the
-   admin session's `file://` command in [Put the values](#put-the-values). The laptop
-   should run under `marketlake-command` before the VM's first boot. Without it or the admin put, nothing puts a newer token, and the VM's
-   copy expires after its first week. The VM only pulls the token, through its instance
-   role, so [#737](https://github.com/l3a0/marketlake/issues/737) changes nothing on the
-   VM.
+   [PR #744](https://github.com/l3a0/marketlake/pull/744), merged on 2026-10-07, and
+   [PR #743](https://github.com/l3a0/marketlake/pull/743)'s live apply ran the same day.
+   Once the laptop runs under `marketlake-command`, the re-auth's weekly put goes through
+   the role `marketlake-token-writer`, and no key for a token writer user exists. Until
+   then, the owner puts the token after each re-auth with the admin session's `file://`
+   command in [Put the values](#put-the-values). The laptop should run under
+   `marketlake-command` before the VM's first boot. Without it or the admin put, nothing
+   puts a newer token, and the VM's copy expires after its first week. The VM only pulls
+   the token, through its instance role, so
+   [#737](https://github.com/l3a0/marketlake/issues/737) changes nothing on the VM.
 
    The order of the merges matters.
    [#737](https://github.com/l3a0/marketlake/issues/737)'s infra pull request,
    [PR #743](https://github.com/l3a0/marketlake/pull/743), merged on 2026-10-07, and its
-   apply must run before [PR #742](https://github.com/l3a0/marketlake/pull/742) merges. An
+   apply ran the same day, so the rule that it run before
+   [PR #742](https://github.com/l3a0/marketlake/pull/742) merges already holds. An
    approved `infra` apply carries all of `main`, so once
    [PR #742](https://github.com/l3a0/marketlake/pull/742) is on `main`, any approved
    apply, [#737](https://github.com/l3a0/marketlake/issues/737)'s included, creates the
