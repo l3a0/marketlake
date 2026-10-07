@@ -440,17 +440,27 @@ outcome the reminder can carry asks for one fix:
    `the parameter is not JSON`, or one naming a missing token or mint time: the put
    carried a bad value. The same fix. For `its mint time is in the future`, check the
    VM's clock first.
-4. `unreadable (AccessDeniedException)` or `unreadable (AssumeRole <code>)`: the pull is
-   not signing as the instance role, which can read the parameter. Check that the VM's
-   `config.yaml` says `bucket_credentials: instance_profile`.
-5. `unreadable` with a botocore class name, or `no credentials`: the network or the
-   instance metadata service. The next attempt retries, and only the same outcome on every
-   attempt calls for an SSH session.
+4. `unreadable (AccessDeniedException)`, `unreadable (UnrecognizedClientException)`, or
+   `unreadable (AssumeRole <code>)`: the pull is not signing as the instance role, which
+   can read the parameter. Check that the VM's `config.yaml` says
+   `bucket_credentials: instance_profile`.
+5. `unreadable` with a botocore class name, or with any other AWS error code such as
+   `ThrottlingException` or `InternalServerError`, or `no credentials`: the network, the
+   instance metadata service, or a transient or unknown service error. The next attempt
+   retries. Only the same outcome on every attempt calls for an SSH session, which reads
+   the pull's full line in the Sunday job's log and runs the pull by hand later.
 6. `config refused`: the VM's bucket settings in `config.yaml` could not build the pull's
    client. Fix them, then run the pull by hand.
-7. `not written`: the token's directory or file does not belong to the daemon's account,
-   which is what a pull run as root leaves. Return it to that account, then run the pull
-   by hand.
+7. `not written`: the pull could not replace `token.json`. Either the daemon's account
+   cannot write or search the token's directory, or the write failed another way, such as
+   a full disk. A root-owned `token.json` alone does not cause this, because the pull
+   replaces the file whenever the account can write its directory. Return the directory
+   to that account or free the disk, then run the pull by hand.
+
+On the laptop, a reminder that names a token pull at all means the laptop's
+`token_store` value is mistyped. The laptop pulls only under a value the job does not
+recognise, and the job's log names that value. Fix the value in the laptop's
+`config.yaml` rather than the VM's config.
 
 ## Reach the dashboard on a hosted VM
 

@@ -2156,10 +2156,11 @@ def token_canary(
 class ReauthReminder:
     """One Sunday re-auth reminder, in the shape the design's message table pins.
 
-    The body names which half failed and the token's mint date. That date is the one
-    fact from the config directory a message may carry, because it is already journal
-    metadata. Nothing else from that directory goes on the wire, so the message stays
-    worthless to anyone reading the topic.
+    The body names which half failed and the token's mint date, and ``sunday_run``
+    appends a failed token pull's outcome. That date is the one fact from the config
+    directory a message may carry, because it is already journal metadata. Nothing else
+    from that directory goes on the wire, so the message stays worthless to anyone reading
+    the topic.
     """
 
     title: str
