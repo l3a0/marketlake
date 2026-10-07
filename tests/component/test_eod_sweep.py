@@ -3673,3 +3673,129 @@ def test_on_a_day_with_no_session_the_check_runs_and_files_nothing_false(
     assert outcome.nightly.session is False
     assert len(calls) == 1
     assert _runway_lines(outcome) == []
+
+
+def test_one_capture_day_left_reads_in_the_singular(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # One session past the reserve from Monday 2026-09-14 fills on Tuesday 2026-09-15, which
+    # is under the two-week floor, so the line and the page both carry the count.
+    root = _lake(fixture_lake)
+    peak = _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, peak * (1 + 13))
+    outcome, _, transport = _run(root)
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 1 capture day left, fills 2026-09-15, ")
+    (page,) = _pages(transport)
+    assert page.body.startswith("1 capture day left, fills 2026-09-15: ")
+
+
+def _runway_stderr(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    """The lines the runway page printed to stderr, and no other part of the sweep's."""
+    return [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "disk-runway" in line or "disk runway" in line
+    ]
+
+
+def test_a_sent_page_is_echoed_to_stderr_whole_and_nothing_else_is_said(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    capsys.readouterr()
+    _, _, transport = _run(root)
+    (page,) = _pages(transport)
+    assert _runway_stderr(capsys) == [
+        f"sweep: Capture at risk: lake disk runway short: {page.body}"
+    ]
+
+
+def test_a_refused_page_says_so_and_never_echoes_its_body(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A publisher holding words from the page's body as a secret refuses the page.
+
+    Echoing the body to stderr then would undo the redaction. The secret is the page's
+    repair sentence, which the nightly report line does not carry, so the digest still goes
+    out and only the page is refused.
+    """
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    transport = FakeTransport()
+    publisher = Publisher(lake_root=root, transport=transport, secrets=("Grow the lake volume",))
+    capsys.readouterr()
+    _run(root, publisher=publisher, transport=transport)
+    assert _runway_stderr(capsys) == ["sweep: disk-runway page refused: it carried a secret"]
+    assert _pages(transport) == []
+    assert _digest(transport)
+
+
+@pytest.mark.parametrize(("lake_exists", "kept"), [(True, "written down"), (False, "lost")])
+def test_an_unsent_page_says_whether_it_was_written_down(
+    fixture_lake: FixtureLake,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    lake_exists: bool,
+    kept: str,
+):
+    # No transport fails the post. The publisher's record lands under a lake root that
+    # exists and is lost under one that does not, and the sweep says which after the echo.
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    record_root = root if lake_exists else tmp_path / "absent"
+    publisher = Publisher(lake_root=record_root, transport=None, secrets=("secret-key",))
+    capsys.readouterr()
+    _run(root, publisher=publisher)
+    echo, not_sent = _runway_stderr(capsys)
+    assert echo.startswith(
+        "sweep: Capture at risk: lake disk runway short: 0 capture days left, fills 2026-09-14: "
+    )
+    assert not_sent == f"sweep: disk-runway page not sent: post_failed, {kept}"
+
+
+def test_a_walk_refusing_past_the_named_cap_counts_every_path_and_names_three(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # Five locked directories, three named and two counted. The walk's order decides which
+    # three, so the names are matched by shape.
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    locked = [root / f"scratch{index}" for index in range(5)]
+    for directory in locked:
+        directory.mkdir()
+        (directory / "a").write_bytes(b"x")
+        directory.chmod(0o000)
+    try:
+        outcome, _, _ = _run(root)
+    finally:
+        for directory in locked:
+            directory.chmod(0o755)
+    (line,) = _runway_lines(outcome)
+    named = r"scratch[0-4] \(PermissionError\)"
+    assert re.fullmatch(
+        rf"disk runway walk refused: 5 paths, {named}, {named}, {named}, 2 more", line
+    ), line
+
+
+def test_a_refusal_named_by_its_class_alone_is_filed_as_it_is(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # ``walk`` names a path that will not sit under the root by its class alone, which has
+    # no ``": "`` to rewrite.
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    real = sweep.assess
+
+    def outside(*args, **kwargs):
+        result = real(*args, **kwargs)
+        return replace(result, usage=replace(result.usage, refusals=("OSError",), refused=1))
+
+    monkeypatch.setattr(sweep, "assess", outside)
+    outcome, _, _ = _run(root)
+    assert _runway_lines(outcome) == ["disk runway walk refused: 1 path, OSError"]

@@ -1184,6 +1184,20 @@ def test_a_readable_lost_and_found_at_the_root_is_not_counted_either(tmp_path: P
     assert usage.files == 1
 
 
+def test_lost_and_found_is_skipped_when_the_root_is_reached_through_a_symlink(tmp_path: Path):
+    # The walk lists the resolved root, so the root it compares each listing against must be
+    # the resolved one too. Otherwise a configured path through a link walks the
+    # filesystem's own directory and counts it.
+    volume = tmp_path / "volume"
+    _write(volume, "chains/ticker=SPY/date=2026-09-14.parquet", 10)
+    _write(volume, "lost+found/orphan", 50_000)
+    link = tmp_path / "lake"
+    link.symlink_to(volume)
+    usage = walk(link)
+    assert {entry.name for entry in usage.entries} == {"chains"}
+    assert usage.files == 1
+
+
 # -- a directory that vanishes mid-walk --------------------------------------
 
 
@@ -1252,3 +1266,6 @@ def test_a_vanished_listing_that_names_no_path_is_still_refused(
     monkeypatch.setattr(os, "scandir", scandir)
     usage = walk(tmp_path)
     assert usage.refused == 1
+    # Named as the root. The failure carries no path of its own, and naming it by its class
+    # alone would hide that it reads the same as the whole lake going.
+    assert usage.refusals == ("the lake root: FileNotFoundError",)
