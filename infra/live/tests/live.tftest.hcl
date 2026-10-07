@@ -552,8 +552,8 @@ run "shim_carries_only_the_owner_and_the_volume_id" {
   }
 }
 
-# The validations turn a malformed input into a failed plan rather than a rule the
-# provider refuses later.
+# The validations refuse a malformed input with a message that names no value. The
+# provider refuses some of these too, but its error prints the address.
 run "a_bare_address_and_an_empty_key_fail_validation" {
   command = plan
 

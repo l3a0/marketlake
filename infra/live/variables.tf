@@ -42,8 +42,9 @@ variable "instance_s3_enabled" {
 variable "owner_ssh_cidr" {
   # Sensitive, so the owner's address stays out of plan output. It still sits in state
   # as plain text, and the plan role can read it through ec2:DescribeSecurityGroups.
-  # The ingress rule takes IPv4 only, and a CIDR with host bits set fails at the
-  # provider, so the validation refuses both here.
+  # The provider refuses an IPv6 CIDR, or one with host bits set, but its error prints
+  # the address, and a plan's errors reach CI's public log. This validation refuses
+  # both first, with a message that names no value.
   description = "The owner's address that may SSH to the VM, as an IPv4 CIDR such as a /32. CI reads it from the OWNER_SSH_CIDR repository secret."
   type        = string
   sensitive   = true

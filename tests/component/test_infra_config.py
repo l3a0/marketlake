@@ -31,9 +31,10 @@
    decrypted value into the state, which every pull request's plan role can read, and a
    mock provider plans it without complaint. An ephemeral block stores nothing, so it
    stays allowed.
-10. The VM's ``ignore_changes`` list, which ``lifecycle`` keeps out of the plan as it
-    does ``prevent_destroy``. Without an entry, a new AMI or a stop that drops the
-    public address plans a replacement of the instance (#686).
+10. The VM's ``ignore_changes`` list and its ``depends_on``, neither of which a plan
+    shows. Without an ``ignore_changes`` entry, a new AMI or a stop that drops the
+    public address plans a replacement of the instance (#686). Without ``depends_on``,
+    the first boot can run before the role's grants exist.
 11. Whether two inline policies on one role share a name. ``PutRolePolicy`` on a shared
     name makes one overwrite the other, and a mock provider plans both.
 12. Whether the lake volume's zone is one literal that the subnet lookup shares. A
@@ -510,6 +511,17 @@ def test_vm_ignores_exactly_the_changes_that_would_replace_or_stop_it() -> None:
     lifecycles = _resources("live")["aws_instance.vm"].get("lifecycle", [])
     ignored = [entry for block in lifecycles for entry in block.get("ignore_changes", [])]
     assert sorted(ignored) == ["ami", "associate_public_ip_address", "user_data"]
+
+
+def test_vm_waits_for_the_ssm_attachment_and_the_config_read() -> None:
+    """The instance names neither grant through an argument, so only ``depends_on``
+    orders a combined apply. Without it the first boot's SSM agent backs off for up to
+    an hour, and the config render is refused. A plan shows no ordering."""
+    depends_on = _resources("live")["aws_instance.vm"].get("depends_on", [])
+    assert sorted(depends_on) == [
+        "${aws_iam_role_policy.instance_config_read}",
+        "${aws_iam_role_policy_attachment.instance_ssm}",
+    ]
 
 
 def test_lake_volume_zone_is_one_literal_the_subnet_lookup_shares() -> None:
