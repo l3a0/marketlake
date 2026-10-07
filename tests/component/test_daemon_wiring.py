@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -3424,6 +3425,64 @@ def test_a_host_that_pulls_nothing_runs_the_same_outage_without_a_spawn(tmp_path
     assert rig.pulls.calls == []
     assert "token pull" not in capsys.readouterr().err
     assert [message.title for message in rig.transport.sent] == ["Capture down: token dead"]
+
+
+def _qqq_chains_unwritable(minutes: Sequence[str | None]):
+    """A cycle runner for the probe in marketlake #754, one class per minute.
+
+    SPY's chains and quotes and QQQ's quotes each fail with the minute's class, or land
+    for ``None``. QQQ's chains segment cannot be written in any minute, so the cycle names
+    it only as an error, which records no class.
+    """
+    queue = list(minutes)
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        error_class = queue.pop(0)
+        spy = _failing(slot, error_class, error_class)
+        qqq = _segment(journal.ROW_KIND_DATA, Path("unused"), journal.QUOTES_SURFACE, "QQQ")
+        if error_class is not None:
+            qqq = replace(
+                _segment(journal.ROW_KIND_GAP, Path("unused"), "QQQ"), error_class=error_class
+            )
+        return CycleResult(
+            snap_ts=slot,
+            segments=(*spy.segments, qqq),
+            errors=(SegmentError(journal.CHAINS_SURFACE, "QQQ", "o_s_error"),),
+        )
+
+    return runner
+
+
+def test_a_write_failure_released_from_the_cause_moves_no_token_pull(tmp_path, capsys):
+    """The pull reads ``whole_daemon_cause``, and the release changes only the watchdog.
+
+    The probe that found marketlake #754: 3 dead-token minutes, 5 healed, then 4 dead
+    again, with QQQ's chains failing its write throughout. The write failure leaves the
+    cause on the first healed minute and pages for itself, and the second death pages
+    again. The pull fires on the first dead minute and the first dead minute 5 slots
+    later, the same cycles it fired on before the release existed.
+    """
+    rig = _rig(
+        tmp_path,
+        roster="SPY: {options: true, chain_cadence: 1m}\nQQQ: {options: true, chain_cadence: 1m}\n",
+    )
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    minutes = ["http_401"] * 3 + [None] * 5 + ["http_401"] * 4
+    _run(rig, clock, ticks=len(minutes), cycle_runner=_qqq_chains_unwritable(minutes))
+
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0), et(2026, 9, 2, 10, 8)]
+    # The class is the one word after "failing with", read that narrowly so the test
+    # holds whatever else the body says, its minutes included.
+    sent = [
+        (message.title, re.search(r"failing with (\w+)", message.body).group(1))
+        for message in rig.transport.sent
+        if message.event == "capture_down"
+    ]
+    assert sent == [
+        ("Capture down: token dead", "http_401"),
+        ("Capture down: QQQ chains", "o_s_error"),
+        ("Capture down: token dead", "http_401"),
+    ]
 
 
 def test_a_missing_token_file_heals_on_the_cycle_after_the_pull_writes_it(tmp_path, monkeypatch):

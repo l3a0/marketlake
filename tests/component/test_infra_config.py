@@ -59,8 +59,9 @@ configuration may call one.
 One check here a plan could make: the instance's tag keys. The instance serves its tags
 through instance metadata, where EC2 refuses a key holding a ``/`` or a space, and the
 config render reads the backup target there. ``infra.yml`` runs ``tofu test`` only when
-``infra/`` changes, and a mock provider plans any key, so the rule sits here, where every
-pull request's required ``test`` job runs it.
+the workflow or a file under ``infra/`` other than Markdown changes, and a mock provider
+plans any key, so the rule sits here, where every pull request's required ``test`` job
+runs it.
 
 These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The parse is
 ``python-hcl2``'s, which keeps a function call such as ``jsonencode({...})`` as text, so
