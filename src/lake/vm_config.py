@@ -54,13 +54,13 @@ holds. An AWS ``ClientError`` is reported by its error code alone and a
 ``BotoCoreError`` by its type name alone, for the reasons ``lake.token_store`` gives. A
 bucket-target problem names ``backup_target`` in place of the target itself.
 
-**This makes the render a third user of the instance profile.** ``lake.aws_session``
-names two, the bucket and the token pull, and both take it because ``config.yaml``'s
-``bucket_credentials`` says so. The render cannot read ``config.yaml``, which it is
-writing, so it takes the instance profile and the region from the tracked settings
-instead. That is acceptable for the reason the design gives for the ``aws`` CLI on the
-VM: there the IAM role's policy bounds what a process can do. Off the VM the metadata
-service does not answer, and the render exits 3.
+**This makes the render a third user of the instance profile.** The other two that
+``lake.aws_session`` names, the bucket and the token pull, both take it because
+``config.yaml``'s ``bucket_credentials`` says so. The render cannot read
+``config.yaml``, which it is writing, so it takes the instance profile and the region
+from the tracked settings instead. That is acceptable for the reason the design gives
+for the ``aws`` CLI on the VM: there the IAM role's policy bounds what a process can do.
+Off the VM the metadata service does not answer, and the render exits 3.
 
 **The write is atomic and private.** The temp file sits beside the target and is created
 at mode 0600 with ``O_EXCL``, rather than chmodded after the secrets land. It is fsynced

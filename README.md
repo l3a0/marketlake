@@ -18,8 +18,12 @@ The AWS resources it needs are code under `infra/`, written for
 [OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
 except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
-bucket, its IAM user, the instance role the VM will use, and the IAM user that writes the
-Schwab token to the VM's config parameters.
+bucket, its IAM user, the instance role, the IAM user that writes the Schwab token to the
+VM's config parameters, and the VM itself
+([#686](https://github.com/l3a0/marketlake/issues/686)). cloud-init takes a new VM from
+nothing to a running daemon with no login, through `deploy/vm-bootstrap.sh`, and the VM
+runs as a shadow beside the laptop until the cutover in
+[#638](https://github.com/l3a0/marketlake/issues/638).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -56,26 +60,41 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/outbox.py` is the one place the ntfy transport and the healthchecks pinger
   are built. Under the config's `role: shadow` it builds recorders instead, which write
   each ping and page to `journal/outbox/` rather than sending it.
-- `src/lake/aws_session.py` is the one place an AWS client is built. It builds the
-  bucket's client and the token parameter's from `config.yaml` alone, never from an
-  `AWS_*` variable or `~/.aws/`.
+- `src/lake/aws_session.py` is the one place an AWS client is built, never from an
+  `AWS_*` variable or `~/.aws/`. It builds the bucket's client and the token parameter's
+  from `config.yaml` alone. Three clients can sign with the VM's instance profile: the
+  bucket's, the token pull's, and the config render's, which takes its settings from the
+  tracked `config/vm.yaml` because it writes `config.yaml`.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
+- `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml` and
+  five SSM parameters, refusing and keeping the old file when any input is wrong.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, and the plan and apply
   roles. The owner applies it from the laptop.
 - `infra/live` is the configuration CI applies: the backup bucket, its IAM user, the
-  instance role, and the IAM user that writes the Schwab token.
+  instance role, the IAM user that writes the Schwab token, and the hosted VM.
+  `infra/live/vm.tf` holds the VM, its security group, key pair and lake volume, and
+  `infra/live/user-data.sh.tftpl` is the first-boot script it hands to cloud-init.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
 - `deploy/linux-install.sh` is the one install on a Linux host. It renders the systemd
-  units from the checkout and installs them, and the host's first boot and every deploy
-  call it.
+  units from the checkout and installs them. `deploy/vm-bootstrap.sh` calls it at the
+  VM's first boot, and every deploy calls it.
+- `deploy/vm-bootstrap.sh` takes the VM from a fresh boot to a running daemon: it mounts
+  the lake volume, installs `uv` and the units, renders `config.yaml`, pulls the token
+  and applies the roster. It is safe to run again over SSH.
+- `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
+  It refuses unless the lake volume is mounted, `role` is `shadow` and every unit is
+  stopped.
 - `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
   and `python -m lake.roster apply` copies it onto a host.
+- `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
+  `lake_root`, so a reviewed pull request is the one way they change.
+- `.tool-versions` pins the `uv` version that CI and the VM's bootstrap install.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 
@@ -142,13 +161,17 @@ instance profile, an IAM role attached to the instance, so no long-lived key sit
 two steps change as follows.
 
 1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
-   profile `marketlake-instance`, whose S3 policy carries the same four actions as the
-   laptop's key and stays off until the cutover turns it on, and
-   [#686](https://github.com/l3a0/marketlake/issues/686) has the VM require metadata
-   tokens.
+   profile `marketlake-instance`, whose S3 policies carry the same four actions as the
+   laptop's key, split in two. The read half, `s3:ListBucket`, `s3:GetBucketVersioning`
+   and `s3:GetObject`, is always on, so a restore runs on the VM with no stored key. The
+   write half, `s3:PutObject` alone, stays off until the cutover turns it on, so a
+   shadow VM holds no write credential to the primary's bucket
+   ([#686](https://github.com/l3a0/marketlake/issues/686)). The VM also requires
+   metadata tokens.
 2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy
-   time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s cloud-init and
-   [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the parameters
+   time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s bootstrap and
+   [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the tracked
+   `config/vm.yaml` and the parameters
    [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
    It names the source beside the region and holds neither key field.
 
@@ -161,7 +184,7 @@ two steps change as follows.
    follows the cutover order on [#638](https://github.com/l3a0/marketlake/issues/638).
    Run `first-upload` only on the host whose lake the bucket should hold, because it
    replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
-   IAM role's policy is turned on.
+   IAM role's write half is turned on, since the check writes probe objects.
 
 The client asks the instance metadata service for credentials only when `config.yaml`
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
@@ -296,9 +319,10 @@ time:
 TZ=America/New_York journalctl -u com.marketlake.daemon
 ```
 
-The steps that follow the install, and their order, are the hosted VM runbook in
-[#686](https://github.com/l3a0/marketlake/issues/686). The design doc's Deployment section
-carries the reasoning for each unit setting.
+On the hosted VM, `deploy/vm-bootstrap.sh` runs this install at first boot, then the
+steps that follow it, in order. [The hosted VM](infra/README.md#the-hosted-vm) in the
+infrastructure runbook says how to create the VM, rerun the bootstrap and restore its
+lake. The design doc's Deployment section carries the reasoning for each unit setting.
 
 ## Carry the Schwab token to a hosted VM
 
@@ -461,9 +485,9 @@ is not exactly `shadow`, since that means an unmounted or unrestored lake. A pas
 how many open spans it checked. On a host whose `role` is exactly `shadow`, a missing
 security master or capture spans file skips the check, and the skip says so.
 
-On the VM, the boot render
-([#686](https://github.com/l3a0/marketlake/issues/686)) and the post-close deploy
-([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once they are built.
+On the VM, `deploy/vm-bootstrap.sh` runs it at first boot and on every rerun
+([#686](https://github.com/l3a0/marketlake/issues/686)), and the post-close deploy
+([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once it is built.
 
 On the laptop, run it from the main checkout after a `git pull`. Call the checkout's own
 venv interpreter, the way the rendered `reauth.sh` does. `uv run` would sync the venv
@@ -504,12 +528,13 @@ The hosted deployment's AWS resources are code under `infra/`, in two OpenTofu
 configurations. The owner applies `infra/bootstrap/` from the laptop, and
 `.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the owner
 approves the run. [infra/README.md](infra/README.md) is the runbook, from the first
-bootstrap through recovery, and lists the secrets and the variable the workflow reads.
+bootstrap through recovery, and lists the secrets and the variables the workflow reads.
 
 ## Develop
 
-The toolchain is [uv](https://docs.astral.sh/uv/). Set up the environment, then run
-the linter and the test suite.
+The toolchain is [uv](https://docs.astral.sh/uv/). `.tool-versions` pins the version CI
+and the hosted VM install. Nothing checks it on the laptop, so a `uv` upgraded there by
+Homebrew keeps working. Set up the environment, then run the linter and the test suite.
 
 ```bash
 uv sync
@@ -540,13 +565,20 @@ tofu -chdir=infra/live validate
 tofu -chdir=infra/live test
 ```
 
-Four things those checks cannot see are covered by `uv run pytest` instead.
+Six things those checks cannot see are covered by `uv run pytest` instead.
 
-1. `prevent_destroy` on each resource whose loss would lose backups or the infrastructure's
-   state, and on the token writer and its policy, which CI cannot delete.
-2. The exact set of policies each bootstrap role and each live IAM user carries.
+1. `prevent_destroy` on each resource whose loss would lose backups, captured minutes or
+   the infrastructure's state, and on the token writer and its policy, which CI cannot
+   delete.
+2. The exact set of policies each bootstrap role and each live IAM user carries, and
+   distinct names for the inline policies on one role.
 3. The live backend's state key matching what the apply role may write.
 4. No resource or data source that would store an SSM parameter's value in state.
+5. The VM's `ignore_changes` list and the grants it waits for, the one zone its volume
+   and subnet share, and the template that becomes its first-boot script taking only the
+   owner and the volume id.
+6. Every variable `infra/live/` requires reaching both plans in `infra.yml`, and the
+   `replace_instance` input naming only the instance.
 
 ### Keep development runs off the real config directory
 

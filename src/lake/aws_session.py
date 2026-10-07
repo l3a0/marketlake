@@ -1,14 +1,17 @@
 """The AWS client builder every client in this package shares.
 
-Two clients reach AWS. ``lake.bucket`` uploads the lake to S3, and ``lake.token_store``
-puts and gets the Schwab token in SSM Parameter Store, marketlake #636. Both must be
-built from ``config.yaml`` alone, which is the design's isolation rule in its
-Configuration section: never from an ``AWS_*`` variable, never from ``~/.aws/config`` or
-``~/.aws/credentials``, and never with a service model from ``~/.aws/models``. A
-development run then cannot reach a real bucket or a real parameter on credentials it
-happened to find on the machine.
+Three clients reach AWS. ``lake.bucket`` uploads the lake to S3, ``lake.token_store``
+puts and gets the Schwab token in SSM Parameter Store, marketlake #636, and
+``lake.vm_config`` reads the hosted VM's config parameters to render its ``config.yaml``,
+marketlake #686. The first two must be built from ``config.yaml`` alone, which is the
+design's isolation rule in its Configuration section: never from an ``AWS_*`` variable,
+never from ``~/.aws/config`` or ``~/.aws/credentials``, and never with a service model
+from ``~/.aws/models``. A development run then cannot reach a real bucket or a real
+parameter on credentials it happened to find on the machine. The render keeps every part
+of that rule except the file it reads. It writes ``config.yaml``, so it takes its region
+from the tracked ``config/vm.yaml`` instead, and always signs with the instance profile.
 
-This module holds that rule once, so the two clients cannot drift apart. It imports
+This module holds that rule once, so the three clients cannot drift apart. It imports
 nothing from the package but ``lake.config``, so the re-auth command, which puts the
 token, never loads ``lake.bucket`` or ``lake.manifest``.
 
@@ -18,13 +21,15 @@ of two things.
 1. A ``KeyPair``, an access key id and a secret access key, each still wrapped in
    ``Secret``. The bucket's ``keys`` path and the token's put use one.
 2. ``INSTANCE_PROFILE``, which asks the EC2 instance metadata service for short-lived
-   credentials and nowhere else. The bucket's ``instance_profile`` path and the token's
-   pull on the VM use it. It is the one exception to building a client from
-   ``config.yaml`` alone, and ``config.yaml`` is still what decides to take it.
+   credentials and nowhere else. The bucket's ``instance_profile`` path, the token's
+   pull on the VM and the config render use it. It is the one exception to building a
+   client from ``config.yaml`` alone. ``config.yaml`` is still what decides to take it
+   for the bucket and the pull. The render always takes it, and refuses a
+   ``config/vm.yaml`` whose ``bucket_credentials`` names any other source.
 
 ``source_from_bucket_credentials`` turns the config's ``bucket_credentials`` into a
-source. The bucket and the pull share it, and the put never calls it, because the put
-reads keys of its own.
+source. The bucket and the pull share it. The put never calls it, because the put reads
+keys of its own, and neither does the render, which always takes ``INSTANCE_PROFILE``.
 
 ``boto3`` and ``botocore`` are imported inside the builder, lazily, so the offline suite
 never loads them unless a test builds a client.
