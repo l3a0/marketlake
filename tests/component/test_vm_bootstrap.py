@@ -822,6 +822,19 @@ def test_a_sync_that_keeps_failing_stops_the_bootstrap(vm, rcs, runs, line):
     assert not vm.ran("venv-python")
 
 
+def test_each_install_gets_its_own_retry_budget(vm):
+    # Step 9 spends two retries. The last install still gets all five attempts.
+    proc = vm.bootstrap(INSTALL_RCS="1 1 0 1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert vm.ran("linux-install") == [SYNC] * 3 + [INSTALL] * 5
+    assert vm.ran("sleep") == ["sleep 30"] * 6
+    retries = [line for line in proc.stdout.splitlines() if "retrying in 30 seconds" in line]
+    assert retries == [
+        f"vm-bootstrap: deploy/linux-install.sh exited 1, retrying in 30 seconds (attempt {n} of 5)"
+        for n in (1, 2, 1, 2, 3, 4)
+    ]
+
+
 def test_a_transient_failure_of_the_last_install_is_retried(vm):
     proc = vm.bootstrap(INSTALL_RCS="0 1 0")
     assert proc.returncode == 0, proc.stdout + proc.stderr
