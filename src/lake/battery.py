@@ -1085,9 +1085,11 @@ def read_entitlement(
     The four are ``row_kind``, ``snap_ts``, ``fetch_ts`` and ``vendor_quote_ts``, and the three
     stamps are ISO strings rather than timestamps. Only those columns are read, so the time goes
     to the parse rather than to the file: a whole-lake duckdb scan of the difference over
-    29,718,244 chain rows took about 4 seconds unconstrained and about 11 at
-    ``dashboard.open_lake_connection``'s ``threads=2`` and ``memory_limit=2GB``. This module is
-    not the dashboard and takes neither cap.
+    29,718,244 chain rows took about 4 seconds unconstrained and about 11 under the caps
+    ``dashboard.open_lake_connection`` set when it was measured, ``threads=2`` and
+    ``memory_limit=2GB``. marketlake #672 has since lowered both, so the second figure records
+    that measurement rather than today's caps. This module is not the dashboard and takes
+    none of its caps.
 
     **The memory goes to the strings, so the read streams.** Decoding the five columns of a
     whole ticker-day at once peaked at 1,295.8 MiB of Arrow memory on SPY 2026-09-28, 5,397,364
