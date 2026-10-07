@@ -23,10 +23,16 @@ comfortable one.
 One failure can take every surface down at once, such as a dead token or a rate
 limit. The watchdog calls that a cause, pages it once under its own title, and then
 suppresses the pages of every surface it named. That suppression ends one surface at a
-time, as each produces data again, answers with no contract, or leaves the roster, and
-the cause re-arms only when the last of them has. So a rate limit that
-runs all session stays one condition, and one surface returning and dying again never
-re-pages the cause.
+time, and the cause re-arms only when the last of them has gone. A surface goes when any
+of four things happens.
+
+1. It produces data again.
+2. It answers with no contract.
+3. Its segment could not be written in a minute another surface landed data.
+4. It leaves the roster.
+
+So a rate limit that runs all session stays one condition, and one surface returning and
+dying again never re-pages the cause.
 
 One case collapses. Every quotes ticker shares one batched request, so all quotes
 counters tripping in the same minute means the sampler died rather than N tickers
@@ -254,7 +260,8 @@ class Watchdog:
         self._counts: dict[Surface, int] = {}
         self._day: date | None = None
         # A cause maps to the surfaces its page covers. A surface leaves that set when
-        # it produces data, when it answers with no contract, or when the roster drops
+        # it produces data, when it answers with no contract, when its segment could not
+        # be written in a minute another surface landed data, or when the roster drops
         # it, per ``_release``. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
@@ -290,6 +297,8 @@ class Watchdog:
         an unwritten segment is the same absence as a failed one from the counter's side.
         A data segment holding no data row fails too, as ``contracts_absent``, per
         :func:`_failure_class`, and leaves every cause that named it, per :meth:`_release`.
+        A surface whose segment could not be written leaves every cause that named it too,
+        but only in a minute another surface landed data, per :meth:`_release`.
         A surface it did not touch at all has left the cycle and loses its counter, per
         :meth:`_drop_departed`.
 
@@ -319,6 +328,16 @@ class Watchdog:
         for error in result.errors:
             classes[Surface(error.surface, error.ticker)] = error.error_class
         self._release_retired(touched)
+        # A write failure records no class, so nothing about it says whether the cause is
+        # over. Data landing on another surface says the vendor answered this minute, so
+        # the write failure is the surface's own, and it leaves the cause and pages for
+        # itself. Only landed data counts. It resets the surface that landed it, so the
+        # cause cannot page again until that surface has failed for the threshold. An
+        # answer with no contract resets nothing, and counting it let a chain alternating
+        # a 401 with an empty answer re-page the cause every other minute (marketlake #754).
+        if touched - failed:
+            for key in failed - recorded.keys():
+                self._release(key)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
         cause = self._whole_daemon(tally, threshold, result.snap_ts)
@@ -501,15 +520,35 @@ class Watchdog:
         """Take one surface out of the causes covering it, dropping one that empties.
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
-        Three things bring a surface here: it produced data, the roster dropped it, or it
-        answered with no contract. That answer proves at least one of the surface's
-        requests authenticated and got through, so the token works and the vendor is
-        serving it, and what fails the surface now is an answer no cause explains. Kept in the
-        cause instead, it held a token-dead cause live after the token recovered, and the
-        next token death that session paged nothing (marketlake #326). Its counter keeps
+        Four things bring a surface here.
+
+        1. It produced data.
+        2. The roster dropped it.
+        3. It answered with no contract.
+        4. Its segment could not be written in a minute another surface landed data.
+
+        An answer with no contract proves at least one of the surface's requests
+        authenticated and got through, so the token works and the vendor is serving it, and
+        what fails the surface now is an answer no cause explains. Kept in the cause
+        instead, it held a token-dead cause live after the token recovered, and the next
+        token death that session paged nothing (marketlake #326). Its counter keeps
         climbing, because it still produced nothing. A surface that merely started failing
         another way, a timeout or a 5xx or another cause's class, is still down, so the
         cause that named it has not lifted and keeps it.
+
+        A write failure records no class, so it says nothing about what the vendor did.
+        Kept in the cause, it never paged for itself, because a cause covers a failure that
+        resolves to no cause, and the cause it held stayed live until the session date
+        changed, so a second token death that session paged nothing (marketlake #754).
+        Data landing on another surface proves the vendor answered, so ``observe`` brings
+        the surface here in that minute. Its own page then goes out at once, unless it
+        already paged before the cause did and is still in ``_paged``. Its counter kept
+        climbing under the cause, so it skips the threshold and the page carries the
+        outage's minutes, even when its write failed only on the minute the outage healed.
+        A surface that answers with no contract on that minute already pages the same way.
+        A minute in which nothing landed keeps it,
+        since nothing then shows the outage has ended. Releasing it there would page every
+        write failure, and then the cause a second time.
         """
         for title in list(self._paged_causes):
             held = self._paged_causes[title]
@@ -622,7 +661,8 @@ class Watchdog:
         it named while that surface keeps failing its way, and an ordinary transient
         failure counts as still covered. The one thing that lifts the cover is the
         surface failing a way some other cause names, because that is a different outage
-        with a different remedy, and the operator has to hear it.
+        with a different remedy, and the operator has to hear it. A surface also leaves a
+        cause outright through :meth:`_release`, which names the four ways it does.
         """
         return any(
             key in held and title in (None, cause) for cause, held in self._paged_causes.items()
