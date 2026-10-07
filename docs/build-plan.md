@@ -540,9 +540,9 @@ Every test sits in one of four tiers. The tier is set by the widest boundary the
 | Unit | One module, every seam faked. Decided from values alone. | 320 tests, under 10 seconds | every save |
 | Component | One subsystem across exactly one real boundary. Real files, real DuckDB, or real processes contending on a lock. Clock and vendor stay fake. | 60 tests, under 60 seconds | every commit |
 | Integration | Two or more subsystems wired through real boundaries. | 14 named tests, two to four minutes | every push |
-| Live | Needs the real vendor, the real OS scheduler, real elapsed time, or the real backup bucket. Deliberately not in CI. | 8 checks | by hand |
+| Live | Needs the real vendor, the real OS scheduler, real elapsed time, or the real backup bucket. Deliberately not in CI. | 10 checks | by hand |
 
-Two of these tiers get a named roster below. The 14 integration tests and the 8 live checks are each small and hand-picked, so every scenario is pinned by name. Unit and component are not rostered. Their counts are targets, filled per module and per subsystem as the build proceeds.
+Two of these tiers get a named roster below. The 14 integration tests and the 10 live checks are each small and hand-picked, so every scenario is pinned by name. Unit and component are not rostered. Their counts are targets, filled per module and per subsystem as the build proceeds.
 
 ## The placement rule
 
@@ -611,7 +611,7 @@ whose bytes rotted under a matching stored checksum. Its restore command,
 which uploads a lake with the real upload code, restores it into an empty directory, and
 compares every file byte for byte.
 
-## The 8 live checks
+## The 10 live checks
 
 These need the real world. They run by hand, off CI.
 
@@ -634,6 +634,13 @@ These need the real world. They run by hand, off CI.
    4. `put_object` of a 9 MiB body, past the 8 MiB point where `upload_file` and `aws s3 cp` switch to parts, sends one request.
 
    The bucket's credentials cannot delete, so the check ends by naming the probe prefix to delete by hand.
+
+9. A hosted VM created from scratch by `apply` reaches a running shadow daemon through cloud-init with no login, once the owner's steps in [`infra/README.md`](../infra/README.md#the-hosted-vm) are done ([#686](https://github.com/l3a0/marketlake/issues/686)). It needs the real cloud boot, systemd and elapsed time. A shadow's pings never reach healthchecks, so the check is read in two parts.
+
+   1. On the apply's evening: `/var/log/cloud-init-output.log`, the daemon's `role=shadow` start line in its journal, and `journal/metadata.json` advancing each minute. `df -h /` and `du -sh ~/.cache/uv ~/marketlake/.venv` check the 16 GiB root volume, estimated at 5 to 6 GB used.
+   2. At the next open: data segments under `lake_root`, and ping lines in the outbox.
+
+10. A `replace_instance` dispatch keeps the lake volume and its data, and the new instance's bootstrap mounts the volume without formatting it ([#686](https://github.com/l3a0/marketlake/issues/686)). It runs on the first apply's own evening, right after check 9's first part, while the volume holds only the first boot's files.
 
 ## When the alert channels get created
 
