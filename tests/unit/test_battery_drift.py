@@ -22,10 +22,17 @@ from lake import battery_drift, journal
 from lake import schema_versions as sv
 from lake.battery import SEALED_SURFACES, SealedPartition
 from lake.report import ACTION, HEALTHY, INFO
+from tests.support.memory import measured
 from tests.support.report_kinds import kind_of
 
 DAY = date(2026, 9, 16)
 BEFORE = date(2026, 9, 15)
+
+# How far below the whole-table read the streamed drift read's peak has to sit. On pyarrow
+# 25.0.1 the gate-open fixture of 4,000 rows streamed at 787,584 bytes against 3,129,664 read
+# whole, a ratio of 0.25. The read this replaced, the whole table plus its filtered copy,
+# peaked at 4,036,544, and a stream that ignored the batch size at 4,406,528.
+STREAMED_MARGIN = 0.5
 
 
 def _row(surface: str, index: int, day: date, *, kind: str = journal.ROW_KIND_DATA) -> dict:
@@ -530,35 +537,272 @@ def test_a_partition_short_of_extra_is_not_asked_the_retype_question(tmp_path: P
     assert report.findings == ()
 
 
-def test_a_retype_after_the_first_batch_is_seen(tmp_path: Path):
-    """The read is folded over every batch, and a real partition has many.
+def _batches_read(monkeypatch) -> list[tuple[date, bool]]:
+    """Record every batch the drift read streams, as its day and whether it was the first
+    cycle's pass rather than the summary's."""
+    seen: list[tuple[date, bool]] = []
+    real = battery_drift._batches
 
-    ``pq.read_table`` chunks at 131,072 rows whatever the row-group layout, and the lake's
-    chains partitions carry five and six row groups besides: SPY 2026-09-16 is 5,307,030
-    rows whose first batch ends at 09:39 ET. Asking only ``to_batches()[0]`` therefore reads
-    the open and calls the rest of the session clean.
+    def counting(source, partition, required, *args, **kwargs):
+        for batch in real(source, partition, required, *args, **kwargs):
+            seen.append((partition.day, "schema_version" not in required))
+            yield batch
 
-    It is the worst shape an alarm can take, because both halves go quiet together. The
-    column is non-null on the morning rows, so it never reaches ``absent`` either, and the
-    night's report line affirmatively says nothing drifted.
-    """
-    _ledger(tmp_path)
-    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, count=8))]
+    monkeypatch.setattr(battery_drift, "_batches", counting)
+    return seen
+
+
+def _late_retype(root: Path) -> SealedPartition:
+    """Today's SPY partition, eight data rows whose last four route ``open_interest``."""
     late = _table("chains", DAY, count=8).to_pydict()
     paths = journal.extra_paths("chains")
     late["open_interest"] = [10, 10, 10, 10, None, None, None, None]
     late[journal.EXTRA_COLUMN] = [None] * 4 + [
         json.dumps({paths["open_interest"].field: "raw"})
     ] * 4
-    path = tmp_path / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path = root / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table(late, schema=journal.schema_for("chains")), path, row_group_size=2)
-    today = [SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY)]
+    return SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY)
 
-    assert pq.read_metadata(path).num_row_groups > 1, "the fixture must span several batches"
+
+def test_a_retype_after_the_first_batch_is_seen(tmp_path: Path, monkeypatch):
+    """The read is folded over every batch, and a real partition has many.
+
+    The lake's chains partitions carry five and six row groups: SPY 2026-09-16 is 5,307,030
+    rows whose first row group ends at 10:49 ET. A read that asked only its first batch
+    would read the open and call the rest of the session clean.
+
+    It is the worst shape an alarm can take, because both halves go quiet together. The
+    column is non-null on the morning rows, so it never reaches ``absent`` either, and the
+    night's report line affirmatively says nothing drifted.
+
+    The batch is shrunk to two rows, because ``iter_batches`` spans row groups: at the
+    production size this fixture's four row groups of two decode as one batch of eight, and
+    the test would pass while folding nothing.
+    """
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 2)
+    seen = _batches_read(monkeypatch)
+    _ledger(tmp_path)
+    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, count=8))]
+    today = [_late_retype(tmp_path)]
+
     report = _judge(tmp_path, today, before)
 
+    assert seen.count((DAY, False)) == 4, "the fixture must span several batches"
     assert _kinds(report) == {(battery_drift.RETYPED, "open_interest")}
+
+
+def test_the_first_cycle_after_the_first_batch_is_found(tmp_path: Path, monkeypatch):
+    """The first-cycle pass streams too, so it owes the same fold over every batch.
+
+    The fixture's first routed row is its fifth, stamped 17:30 UTC, in the third of four
+    batches. A pass that stopped after its first batch would print no first cycle at all.
+    """
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 2)
+    seen = _batches_read(monkeypatch)
+    _ledger(tmp_path)
+    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, count=8))]
+    today = [_late_retype(tmp_path)]
+
+    report = _judge(tmp_path, today, before)
+
+    assert seen.count((DAY, True)) == 4, "the first-cycle pass must span several batches"
+    assert report.findings[0].first_cycle == "2026-09-16T13:30:00-04:00"
+
+
+def test_the_first_cycle_is_the_earliest_across_every_retyped_field(tmp_path: Path):
+    """One pass asks every field, and the page prints the earliest stamp any of them saw.
+
+    ``open_interest`` routes from the fourth row and ``volume`` from the second, so a pass
+    that asked only the first field in sorted order would print the fourth row's stamp.
+    """
+    _ledger(tmp_path)
+    before = [_seal(tmp_path, "chains", "SPY", BEFORE, _table("chains", BEFORE, count=6))]
+    rows = _table("chains", DAY, count=6).to_pydict()
+    paths = journal.extra_paths("chains")
+    overflow = []
+    for index in range(6):
+        held = {}
+        if index >= 3:
+            rows["open_interest"][index] = None
+            held[paths["open_interest"].field] = "raw"
+        if index >= 1:
+            rows["volume"][index] = None
+            held[paths["volume"].field] = "raw"
+        overflow.append(json.dumps(held) if held else None)
+    rows[journal.EXTRA_COLUMN] = overflow
+    path = tmp_path / "chains" / "ticker=SPY" / f"date={DAY.isoformat()}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(rows, schema=journal.schema_for("chains")), path)
+    today = [SealedPartition(path=path, surface="chains", ticker="SPY", day=DAY)]
+
+    report = _judge(tmp_path, today, before)
+
+    assert report.findings[0].fields == ("open_interest", "volume")
+    assert report.findings[0].first_cycle == "2026-09-16T10:30:00-04:00"
+
+
+def test_an_open_gate_holds_one_batch_at_a_time_rather_than_the_whole_day(
+    tmp_path: Path, monkeypatch
+):
+    """The gate opens the night ``extra`` carries a value, and on SPY the old whole-day read
+    was killed for memory on the 2 GiB host (marketlake #671).
+
+    Every row carries an unrecognized vendor field, which opens the gate and routes nothing,
+    so ``routed_columns`` walks every row's overflow. The reference is the whole-table read
+    the drift check made before it streamed, taken without threads so nothing frees through
+    its pool late.
+    """
+    rows = _table("chains", DAY, count=4_000).to_pydict()
+    rows[journal.EXTRA_COLUMN] = [json.dumps({"newGreek": 0.5})] * 4_000
+    partition = _seal(
+        tmp_path, "chains", "SPY", DAY, pa.table(rows, schema=journal.schema_for("chains"))
+    )
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 256)
+
+    with measured() as pool:
+        pq.read_table(partition.path, use_threads=False)
+    whole = pool.max_memory()
+    with measured() as pool:
+        day = battery_drift.read_surface_day([partition], "chains", DAY)
+    streamed = pool.max_memory()
+
+    assert day.unreadable == ()
+    assert day.tickers == ("SPY",)
+    assert streamed < STREAMED_MARGIN * whole, f"{streamed:,} bytes against {whole:,} whole"
+
+
+def _cut_streams(monkeypatch, rows: int, cut) -> None:
+    """Hand every stream over a file of ``rows`` rows through ``cut``, and others unchanged."""
+    real = pq.ParquetFile.iter_batches
+
+    def iter_batches(self, *args, **kwargs):
+        batches = real(self, *args, **kwargs)
+        if self.metadata.num_rows != rows:
+            return batches
+        return cut(batches)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", iter_batches)
+
+
+def _early_retype(root: Path) -> SealedPartition:
+    """Today's SPY partition, eight data rows whose first six route ``open_interest``."""
+    rows = _table("chains", DAY, count=8, route=("open_interest",)).to_pydict()
+    rows[journal.EXTRA_COLUMN] = rows[journal.EXTRA_COLUMN][:6] + [None, None]
+    rows["open_interest"] = [None] * 6 + [10, 10]
+    return _seal(root, "chains", "SPY", DAY, pa.table(rows, schema=journal.schema_for("chains")))
+
+
+def test_a_stream_cut_short_is_unreadable_and_leaves_nothing_in_the_fold(
+    tmp_path: Path, monkeypatch
+):
+    """``iter_batches`` can end short without raising where ``pq.read_table`` raises.
+
+    Answered silently, the day reads as one with no retype after the cut. So every decoded
+    row is counted against the footer's, and a partition that comes up short is refused. Its
+    first three batches routed ``open_interest`` before the cut, and a fold that took them
+    batch by batch would page a retype off a partition the night reports it could not read.
+    """
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 2)
+    _cut_streams(monkeypatch, 8, lambda batches: iter(list(batches)[:-1]))
+    _ledger(tmp_path)
+    before = [
+        _seal(tmp_path, "chains", t, BEFORE, _table("chains", BEFORE)) for t in ("QQQ", "SPY")
+    ]
+    today = [_seal(tmp_path, "chains", "QQQ", DAY, _table("chains", DAY)), _early_retype(tmp_path)]
+
+    report = _judge(tmp_path, today, before)
+
+    assert report.findings == ()
+    assert any("did not read: decoded 6 of 8 rows" in line for line in report.report)
+    assert kind_of(report, "nothing drifted") == HEALTHY
+
+
+def test_a_batch_that_fails_to_decode_did_not_read(tmp_path: Path, monkeypatch):
+    """A decode failure is "did not read", and never an overflow that does not decode.
+
+    ``pa.ArrowInvalid`` subclasses ``ValueError``, which is what the handler for
+    ``journal.routed_columns``'s bare ``json.loads`` catches. A fetch inside that handler
+    would send a reader looking for bad JSON in a file whose page would not decompress.
+    """
+    assert issubclass(pa.ArrowInvalid, ValueError)
+
+    def torn(batches):
+        yield next(batches)
+        raise pa.ArrowInvalid("a page did not decompress")
+
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 2)
+    _cut_streams(monkeypatch, 8, torn)
+    today = [_early_retype(tmp_path)]
+
+    day = battery_drift.read_surface_day(today, "chains", DAY)
+
+    assert len(day.unreadable) == 1
+    assert "did not read: a page did not decompress" in day.unreadable[0]
+    assert "does not decode" not in day.unreadable[0]
+    assert day.retyped == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("column", "retyped"),
+    [
+        ("snap_ts", pa.float64()),
+        ("schema_version", pa.string()),
+        ("snap_ts", pa.list_(pa.string())),
+        ("schema_version", pa.list_(pa.int64())),
+    ],
+)
+def test_a_gap_partition_with_a_retyped_summary_column_is_skipped(
+    tmp_path: Path, column: str, retyped: pa.DataType
+):
+    """A batch the data-row filter empties goes no further, so a gap day is skipped.
+
+    Arrow picks a kernel by type even for an empty array, and ``min`` and ``unique`` have no
+    kernel for a list. Asked of a gap-only batch, they would turn a partition that holds no
+    data row into one reported unreadable, which is the class marketlake PR #713's review
+    found in the entitlement read.
+    """
+    gap = _table("chains", DAY, kind=journal.ROW_KIND_GAP)
+    if pa.types.is_list(retyped):
+        values = pa.array([None] * gap.num_rows, type=retyped)
+    else:
+        values = pa.array([str(v) if column == "schema_version" else 1.5 for v in gap[column]])
+    index = gap.schema.get_field_index(column)
+    gap = gap.set_column(index, pa.field(column, retyped), values.cast(retyped))
+    partition = _seal(tmp_path, "chains", "SPY", DAY, gap)
+
+    day = battery_drift.read_surface_day([partition], "chains", DAY)
+
+    assert day.unreadable == ()
+    assert day.tickers == ()
+
+
+def test_a_summary_column_missing_from_an_open_gate_did_not_read(tmp_path: Path):
+    """``iter_batches`` reads past a column the file does not carry and raises nothing, so
+    the stream is refused before it starts rather than left to answer without it."""
+    full = _table("chains", DAY, route=("open_interest",))
+    short = full.select([name for name in full.column_names if name != "schema_version"])
+    partition = _seal(tmp_path, "chains", "SPY", DAY, short)
+
+    day = battery_drift.read_surface_day([partition], "chains", DAY)
+
+    assert day.unreadable == (f"{partition.relative} did not read: missing schema_version",)
+    assert day.retyped == frozenset()
+
+
+def test_a_vendor_column_missing_from_an_open_gate_lacks_the_running_schema(tmp_path: Path):
+    """A vendor column the file lacks is left out of the projection rather than refused, so
+    ``routed_columns`` raises the ``KeyError`` that names the partition's real shape."""
+    full = _table("chains", DAY, route=("open_interest",))
+    short = full.select([name for name in full.column_names if name != "volume"])
+    partition = _seal(tmp_path, "chains", "SPY", DAY, short)
+
+    day = battery_drift.read_surface_day([partition], "chains", DAY)
+
+    assert len(day.unreadable) == 1
+    assert "does not carry the running schema" in day.unreadable[0]
+    assert "volume" in day.unreadable[0]
 
 
 def test_an_overflow_that_does_not_decode_costs_its_surface_and_not_the_night(tmp_path: Path):
