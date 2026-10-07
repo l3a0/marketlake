@@ -45,12 +45,10 @@ path answers only when the instance has ``instance_metadata_tags`` enabled, whic
 6. ``bucket_credentials`` is not exactly ``instance_profile``. The render always signs
    with the instance profile, so a file saying ``keys`` would make every bucket job sign
    one way while the render that wrote it signed another.
-7. The tag is missing or unusable. A 404 means the instance has no
-   ``marketlake:backup-target`` tag or its ``instance_metadata_tags`` is disabled, and
-   both are fixed in ``infra/live/vm.tf`` rather than by a retry. A value that is not
-   UTF-8, is empty, or has whitespace at either end is refused too. A target with a
-   trailing newline gives the prefix ``lake\\n``, which no later check catches. All of
-   this runs before any credential is fetched.
+7. The tag's value is unusable: it is not UTF-8, is empty, or has whitespace at either
+   end. A target with a trailing newline gives the prefix ``lake\\n``, which no later
+   check catches. This runs before any credential is fetched. A tag the metadata service
+   does not serve at all is not a refusal, as the paragraph on exit 3 below says.
 8. ``InvalidParameters`` names any parameter. ``GetParameters`` answers HTTP 200 with a
    missing name listed there, and a render that read only ``Parameters`` would write a
    file missing a key, which #699's pass 3 found. A wrong region shows up here too, as
@@ -83,8 +81,14 @@ bucket-target problem names ``backup_target`` in place of the target itself.
 from the tracked settings instead. That is acceptable for the reason the design gives
 for the ``aws`` CLI on the VM: there the IAM role's policy bounds what a process can do.
 Off the VM the metadata service does not answer, and the render exits 3. The tag lookup
-exits 3 the same way when the service does not answer or serves no token, and exits 1
-on any HTTP error other than the 404 above.
+exits 3 the same way when the service does not answer, or serves no token or a token
+that is not printable ASCII without whitespace. It also exits 3 on a 404 for the tag.
+AWS does not document whether a tag given at launch is served from the first moment of
+the first boot, so a 404 may only mean the tag is not served yet, and the first boot
+retries exit 3 a bounded number of times. A 404 that lasts means the instance has no
+``marketlake:backup-target`` tag or its ``instance_metadata_tags`` is disabled, so the
+line names both causes and the fix in ``infra/live/vm.tf``. Any other HTTP error on the
+tag exits 1, and so does a redirect, which the lookup never follows.
 
 **The write is atomic and private.** The temp file sits beside the target and is created
 at mode 0600 with ``O_EXCL``, rather than chmodded after the secrets land. It is fsynced
@@ -112,7 +116,8 @@ changed, and the caller restarts the daemon. #638's cutover and #676's deploy ow
 restart.
 
 The exit codes match the token pull's, so the first boot's retry treats both alike: 0
-written, unchanged or tightened, 3 no credentials yet, 2 a refusal, and 1 any other failure.
+written, unchanged or tightened, 3 no credentials or no tag served yet, 2 a refusal, and
+1 any other failure.
 
 The client and the tag lookup are seams. ``render`` takes a required ``client_factory``,
 which it calls with the settings' region, so a metadata service with no credentials yet
@@ -201,11 +206,21 @@ WROTE = "wrote"
 UNCHANGED = "unchanged"
 TIGHTENED = "tightened"
 NO_CREDENTIALS = "no credentials"
+NO_TAG_YET = "no tag yet"
 FAILED = "failed"
 
 # The exit code each outcome gives. A refusal raises ``RenderRefused`` instead, which
-# ``main`` turns into exit 2.
-EXIT_CODES = {WROTE: 0, UNCHANGED: 0, TIGHTENED: 0, NO_CREDENTIALS: 3, FAILED: 1}
+# ``main`` turns into exit 2. A tag the metadata service does not serve gives 3 rather
+# than 2, because at first boot it may only be not served yet, and 3 is what the first
+# boot retries.
+EXIT_CODES = {
+    WROTE: 0,
+    UNCHANGED: 0,
+    TIGHTENED: 0,
+    NO_CREDENTIALS: 3,
+    NO_TAG_YET: 3,
+    FAILED: 1,
+}
 
 
 class RenderRefused(Exception):
@@ -217,7 +232,7 @@ class RenderRefused(Exception):
 
 
 class MetadataUnavailable(Exception):
-    """The metadata service did not answer the tag lookup, or served no token.
+    """The metadata service did not answer the tag lookup, or served no usable token.
 
     A retry can fix this, so :func:`render` reports it as ``no credentials`` and exits 3.
     ``detail`` names the failure by type or HTTP status, never by message.
@@ -228,8 +243,20 @@ class MetadataUnavailable(Exception):
         self.detail = detail
 
 
+class TagNotServed(Exception):
+    """The metadata service answered the tag lookup with a 404.
+
+    Either the tag is not served yet, which a retry fixes, or the instance has no such
+    tag or its ``instance_metadata_tags`` is disabled. :func:`render` reports it as
+    ``no tag yet`` and exits 3, with a line that names both causes.
+    """
+
+
 class TagLookupFailed(Exception):
-    """The metadata service answered the tag lookup with an HTTP error other than 404."""
+    """The metadata service answered the tag lookup with an HTTP error other than 404.
+
+    A redirect is one, because the lookup never follows it.
+    """
 
     def __init__(self, status: int) -> None:
         super().__init__(status)
@@ -258,6 +285,28 @@ def render_client(region: str) -> Any:
     )
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect, so a 3xx reaches the caller as an ``HTTPError``.
+
+    The default handler follows a redirect and copies the request's headers onto the new
+    request, the session token included, so a 302 from the metadata address would hand
+    the token to whatever host it named.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _usable_token(token: bytes) -> bool:
+    """Whether ``token`` is non-empty printable ASCII with no whitespace.
+
+    ``http.client`` raises ``ValueError`` on a header holding a newline, quoting the
+    value, and ``UnicodeEncodeError`` on one it cannot encode. Either would print the
+    token in a traceback, so a token outside this set is never sent.
+    """
+    return bool(token) and all(0x21 <= byte <= 0x7E for byte in token)
+
+
 def read_backup_target_tag() -> str:
     """The ``marketlake:backup-target`` tag's raw value, read from instance metadata.
 
@@ -265,18 +314,20 @@ def read_backup_target_tag() -> str:
     that token. The base address is ``aws_session.METADATA_BASE_URL``, read at call time
     so a test can point it at loopback, and each request waits at most
     ``aws_session.METADATA_TIMEOUT_S``. The opener holds an empty ``ProxyHandler``, so no
-    ``*_proxy`` variable can carry the request elsewhere. ``urllib`` never reads the
-    ``AWS_*`` variables. That is why it does not use ``aws_session._proxies_cleared``,
+    ``*_proxy`` variable can carry the request elsewhere, and a redirect handler that
+    follows nothing, so no redirect can carry the token elsewhere. ``urllib`` never reads
+    the ``AWS_*`` variables. That is why it does not use ``aws_session._proxies_cleared``,
     which edits the process's environment while it runs.
 
-    A service that does not answer, or serves no token, raises ``MetadataUnavailable``.
-    A 404 on the tag raises ``RenderRefused`` naming the fix, and any other HTTP error
-    raises ``TagLookupFailed``. The value is returned as it came, for :func:`render` to
-    check.
+    A service that does not answer, or serves no token or one that is not printable
+    ASCII without whitespace, raises ``MetadataUnavailable``, and the token is never sent
+    or quoted. A 404 on the tag raises ``TagNotServed``. Any other HTTP error, a redirect
+    included, raises ``TagLookupFailed``. The value is returned as it came, for
+    :func:`render` to check.
     """
     base = aws_session.METADATA_BASE_URL
     timeout = aws_session.METADATA_TIMEOUT_S
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects())
     # Each failure is recorded and raised after its handler, so no answer from the
     # service rides along as the raised exception's context.
     unavailable = None
@@ -296,6 +347,8 @@ def read_backup_target_tag() -> str:
         unavailable = type(exc).__name__
     if unavailable is None and not token.strip():
         unavailable = "no token"
+    if unavailable is None and not _usable_token(token):
+        unavailable = "a malformed token"
     if unavailable is not None:
         raise MetadataUnavailable(unavailable)
 
@@ -305,7 +358,7 @@ def read_backup_target_tag() -> str:
         request = urllib.request.Request(
             base + _TAG_PATH,
             method="GET",
-            headers={"X-aws-ec2-metadata-token": token.decode("ascii", "replace")},
+            headers={"X-aws-ec2-metadata-token": token.decode("ascii")},
         )
         with opener.open(request, timeout=timeout) as response:
             body = response.read()
@@ -317,11 +370,7 @@ def read_backup_target_tag() -> str:
     if unavailable is not None:
         raise MetadataUnavailable(unavailable)
     if status == 404:
-        raise RenderRefused(
-            f"the instance metadata serves no {BACKUP_TARGET_TAG} tag. Either the instance "
-            "has no such tag or its instance_metadata_tags is disabled, so set both in "
-            "infra/live/vm.tf and apply"
-        )
+        raise TagNotServed()
     if status is not None:
         raise TagLookupFailed(status)
     decoded = None
@@ -545,8 +594,9 @@ def render(
     The refusals and their order are the module docstring's, and each raises
     ``RenderRefused`` before anything is written. ``tag_reader`` is called once the
     settings pass, before any credential is fetched, and returns the tag's raw value. It
-    raises ``MetadataUnavailable``, which becomes ``no credentials``, ``TagLookupFailed``,
-    which becomes ``failed``, or ``RenderRefused``. ``client_factory`` is called next with
+    raises ``MetadataUnavailable``, which becomes ``no credentials``, ``TagNotServed``,
+    which becomes ``no tag yet``, ``TagLookupFailed``, which becomes ``failed``, or
+    ``RenderRefused``. ``client_factory`` is called next with
     the settings' ``bucket_region``, so a metadata service with no credentials yet becomes
     ``no credentials``. An AWS failure becomes ``failed``, named by its code or type.
     ``config_path`` defaults to ``config.default_config_path()``, resolved when this runs.
@@ -582,6 +632,14 @@ def render(
             f"no credentials: the instance metadata service did not answer the "
             f"{BACKUP_TARGET_TAG} tag lookup ({exc.detail}), so no parameter was read and "
             f"{target} was left as it was. Retry once the metadata service answers",
+        )
+    except TagNotServed:
+        return RenderResult(
+            NO_TAG_YET,
+            f"no tag yet: the instance metadata serves no {BACKUP_TARGET_TAG} tag, so no "
+            f"parameter was read and {target} was left as it was. Either the tag is not "
+            "served yet, which a retry fixes, or the instance has no such tag or its "
+            "instance_metadata_tags is disabled, so set both in infra/live/vm.tf and apply",
         )
     except TagLookupFailed as exc:
         return _failed(target, f"the {BACKUP_TARGET_TAG} tag could not be read (HTTP {exc.status})")
@@ -726,8 +784,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.vm_config`` entry. Returns a process exit code.
 
     It prints one line to stderr and exits 0 for ``wrote``, ``unchanged`` and
-    ``tightened``, 3 for ``no credentials``, 2 for a refusal, and 1 for any other failure,
-    a failed write or chmod included.
+    ``tightened``, 3 for ``no credentials`` and ``no tag yet``, 2 for a refusal, and 1
+    for any other failure, a failed write or chmod included.
     It builds the real client factory and tag reader itself and takes no seam. Run it as the account
     that runs the daemon.
     """
@@ -755,6 +813,7 @@ __all__ = [
     "FAILED",
     "FILLED_KEYS",
     "NO_CREDENTIALS",
+    "NO_TAG_YET",
     "PARAMETERS",
     "PARAMETER_KEYS",
     "SETTINGS_MAX_BYTES",
@@ -765,6 +824,7 @@ __all__ = [
     "RenderRefused",
     "RenderResult",
     "TagLookupFailed",
+    "TagNotServed",
     "main",
     "read_backup_target_tag",
     "render",

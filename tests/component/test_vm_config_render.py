@@ -11,7 +11,8 @@ AWS.
 
 Every value the hook serves is a sentinel, and every test that reads the output checks
 that none of them reached it. The exit codes are what the first boot's retry reads: 0
-written or unchanged, 1 any other failure, 2 a refusal, and 3 no credentials yet.
+written or unchanged, 1 any other failure, 2 a refusal, and 3 no credentials or no tag
+served yet.
 """
 
 from __future__ import annotations
@@ -154,20 +155,30 @@ class _TagServer(_Server):
     The shared server answers 404 to every path it does not know, so this one wraps its
     handler rather than changing it for the token pull's tests. A ``GET`` of a tag path
     is recorded like any other request. It answers 401 without the shared server's token,
-    ``tag_status`` when that is set, the tag's value from ``tags`` when the key is there,
-    and 404 otherwise, which is what EC2 answers for a missing tag or for an instance
-    with ``instance_metadata_tags`` disabled. A value may be bytes, so a test can serve
-    bytes that are not UTF-8.
+    a 302 to ``tag_redirect`` when that is set, ``tag_status`` when that is set, the tag's
+    value from ``tags`` when the key is there, and 404 otherwise, which is what EC2
+    answers for a missing tag or for an instance with ``instance_metadata_tags``
+    disabled. A value may be bytes, so a test can serve bytes that are not UTF-8.
+    ``token_body``, when set, is served as the session token in place of the shared
+    server's, so a test can serve one that is not a usable header value.
     """
 
     def __init__(self, creds: dict[str, str], tags: dict[str, str | bytes]) -> None:
         super().__init__(creds)
         self.tags = dict(tags)
         self.tag_status: int | None = None
+        self.tag_redirect: str | None = None
+        self.token_body: bytes | None = None
         server = self
         shared = self.httpd.RequestHandlerClass
 
         class Handler(shared):
+            def do_PUT(self) -> None:  # noqa: N802 - the stdlib's name
+                if server.token_body is None or not self.path.endswith(TOKEN_PATH):
+                    return super().do_PUT()
+                server.requests.append(("PUT", self.path, dict(self.headers)))
+                self._answer_bytes(200, server.token_body)
+
             def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
                 prefix = "/latest/meta-data/tags/instance/"
                 if not self.path.startswith(prefix):
@@ -176,6 +187,11 @@ class _TagServer(_Server):
                 key = urllib.parse.unquote(self.path[len(prefix) :])
                 if self.headers.get("x-aws-ec2-metadata-token") != TOKEN:
                     self._answer_bytes(401, b"")
+                elif server.tag_redirect is not None:
+                    self.send_response(302)
+                    self.send_header("Location", server.tag_redirect)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                 elif server.tag_status is not None:
                     self._answer_bytes(server.tag_status, b"")
                 elif key in server.tags:
@@ -965,12 +981,14 @@ def test_a_tag_the_render_cannot_use_refuses_and_is_never_printed(
 
 
 @pytest.mark.parametrize("cause", ["no tag", "tags disabled"])
-def test_a_tag_the_metadata_service_does_not_serve_refuses_naming_the_fix(
+def test_a_tag_the_metadata_service_does_not_serve_exits_three_naming_both_causes(
     monkeypatch, capsys, metadata, config_dir, not_root, cause
 ):
-    """EC2 answers 404 both for an instance with no such tag and for one whose
-    ``instance_metadata_tags`` is disabled, so the line names both fixes. A retry
-    cannot fix either, so it is a refusal rather than ``no credentials``."""
+    """EC2 answers 404 for an instance with no such tag and for one whose
+    ``instance_metadata_tags`` is disabled. AWS does not document whether a tag given at
+    launch is served from the first moment of the first boot, so a 404 may also mean the
+    tag is not served yet. The render exits 3, which the first boot retries, and the line
+    names both causes and the fix for the lasting one."""
     hook = SsmHook().install(monkeypatch)
     if cause == "no tag":
         del metadata.tags[TAG]
@@ -978,15 +996,110 @@ def test_a_tag_the_metadata_service_does_not_serve_refuses_naming_the_fix(
         metadata.tag_status = 404
     before = _existing(config_dir)
 
-    assert _render(monkeypatch, _settings_bytes()) == 2
+    assert _render(monkeypatch, _settings_bytes()) == 3
 
     path = config_dir / CONFIG_FILE
-    assert _assert_refused(capsys, config_dir, before) == (
-        f"vm_config: refused, and {path} was left as it was: the instance metadata serves "
-        "no marketlake:backup-target tag. Either the instance has no such tag or its "
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in config_dir.iterdir()) == [CONFIG_FILE]
+    assert _one_line(capsys) == (
+        "vm_config: no tag yet: the instance metadata serves no marketlake:backup-target "
+        f"tag, so no parameter was read and {path} was left as it was. Either the tag is "
+        "not served yet, which a retry fixes, or the instance has no such tag or its "
         "instance_metadata_tags is disabled, so set both in infra/live/vm.tf and apply"
     )
     assert hook.regions == [] and hook.requests == []
+
+
+def test_a_tag_that_appears_on_a_later_try_is_written(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    """The retry a 404 asks for succeeds once the tag is served, with nothing left over
+    from the first try."""
+    SsmHook().install(monkeypatch)
+    served = metadata.tags.pop(TAG)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+    capsys.readouterr()
+    metadata.tags[TAG] = served
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+    assert "wrote" in _one_line(capsys)
+    assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == EXPECTED
+
+
+def test_a_redirect_on_the_tag_is_not_followed_and_exits_one(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    """``urllib`` follows a 302 by default and copies the session token onto the new
+    request, so a redirect would hand the token to whatever host it named."""
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+    with _TagServer(METADATA, {TAG: TARGET}) as elsewhere:
+        metadata.tag_redirect = elsewhere.url + TAG_PATH.lstrip("/")
+
+        assert _render(monkeypatch, _settings_bytes()) == 1
+
+        assert elsewhere.requests == []
+    path = config_dir / CONFIG_FILE
+    assert path.read_bytes() == before
+    line = _one_line(capsys)
+    assert line == (
+        "vm_config: failed: the marketlake:backup-target tag could not be read "
+        f"(HTTP 302), so {path} was left as it was"
+    )
+    assert TOKEN not in line
+    assert len(metadata.tag_requests()) == 1
+    assert hook.regions == [] and hook.requests == []
+
+
+TOKEN_SENTINEL = b"IMDS-TOKEN-SENTINEL-5b1d"
+
+# Session tokens ``http.client`` cannot send as a header. A newline makes it raise
+# ``ValueError`` quoting the value, and a byte past ASCII makes it raise
+# ``UnicodeEncodeError``.
+MALFORMED_TOKENS = {
+    "a trailing newline": TOKEN_SENTINEL + b"\n",
+    "an inner newline": TOKEN_SENTINEL + b"\nX-Injected: 1",
+    "an inner space": TOKEN_SENTINEL + b" tail",
+    "a byte past ASCII": TOKEN_SENTINEL + "\u00e9".encode(),
+}
+
+
+@pytest.mark.parametrize("token", MALFORMED_TOKENS.values(), ids=MALFORMED_TOKENS)
+def test_a_malformed_token_exits_three_and_is_never_sent_or_printed(
+    monkeypatch, capsys, metadata, config_dir, not_root, token
+):
+    metadata.token_body = token
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    captured = capsys.readouterr()
+    assert TOKEN_SENTINEL.decode() not in captured.err
+    lines = captured.err.strip().splitlines()
+    assert lines == [
+        "vm_config: no credentials: the instance metadata service did not answer the "
+        "marketlake:backup-target tag lookup (a malformed token), so no parameter was read "
+        f"and {config_dir / CONFIG_FILE} was left as it was. Retry once the metadata "
+        "service answers"
+    ]
+    assert metadata.tag_requests() == []
+    assert hook.regions == [] and hook.requests == []
+
+
+@pytest.mark.parametrize("token", MALFORMED_TOKENS.values(), ids=MALFORMED_TOKENS)
+def test_a_malformed_token_is_raised_with_no_context_and_no_token(monkeypatch, token):
+    with _TagServer(METADATA, {TAG: TARGET}) as server:
+        server.token_body = token
+        monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
+        with pytest.raises(vm_config.MetadataUnavailable) as unavailable:
+            vm_config.read_backup_target_tag()
+
+    assert _chain(unavailable.value) == [unavailable.value]
+    assert TOKEN_SENTINEL.decode() not in f"{unavailable.value!s} {unavailable.value!r}"
+    assert unavailable.value.detail == "a malformed token"
 
 
 @pytest.mark.parametrize("status", [500, 401, 403])
@@ -1306,18 +1419,17 @@ def test_a_merged_config_error_is_refused_with_no_context(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("tags", "status"),
-    [({}, None), ({TAG: b"\xff"}, None)],
+    ("tags", "raised"),
+    [({}, vm_config.TagNotServed), ({TAG: b"\xff"}, vm_config.RenderRefused)],
     ids=["a 404", "bytes that are not UTF-8"],
 )
-def test_a_tag_refusal_is_raised_with_no_context(monkeypatch, tmp_path, tags, status):
+def test_a_tag_failure_is_raised_with_no_context(monkeypatch, tags, raised):
     with _TagServer(METADATA, tags) as server:
-        server.tag_status = status
         monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
-        with pytest.raises(vm_config.RenderRefused) as refused:
+        with pytest.raises(raised) as failure:
             vm_config.read_backup_target_tag()
 
-    assert _chain(refused.value) == [refused.value]
+    assert _chain(failure.value) == [failure.value]
 
 
 def test_a_failed_standard_input_read_is_refused_with_no_context(monkeypatch):

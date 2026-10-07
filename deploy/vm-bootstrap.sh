@@ -421,8 +421,9 @@ done
 # -- config, token, roster -------------------------------------------------------------
 
 # Exits 1 and 3 are retried: 3 is credentials the metadata service does not serve yet,
-# and 1 covers a network failure and an AccessDenied while a fresh IAM change spreads.
-# Exit 2 is a refusal.
+# or for the render the marketlake:backup-target tag, which AWS does not document as
+# served from the first moment of the first boot. Exit 1 covers a network failure and an
+# AccessDenied while a fresh IAM change spreads. Exit 2 is a refusal.
 #
 # The lock is taken around each attempt, never across the retries, and the 20-second
 # wait runs without it. One attempt against an endpoint that hangs takes about 120
