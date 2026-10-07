@@ -312,10 +312,49 @@ def test_a_hand_formatted_file_with_the_same_mapping_is_unchanged(
     path = config_dir / CONFIG_FILE
     text = "# by hand\n" + "".join(f"{key}: '{value}'\n" for key, value in EXPECTED.items())
     path.write_text(text)
+    path.chmod(0o600)
 
     assert _render(monkeypatch, _settings_bytes()) == 0
     assert path.read_text() == text
-    assert "unchanged" in _one_line(capsys)
+    assert _one_line(capsys) == f"vm_config: unchanged: {path} already holds this config"
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o400], ids=oct)
+def test_an_identical_file_at_another_mode_is_tightened_not_rewritten(
+    monkeypatch, capsys, metadata, config_dir, not_root, mode
+):
+    SsmHook().install(monkeypatch)
+    _render(monkeypatch, _settings_bytes())
+    capsys.readouterr()
+    path = config_dir / CONFIG_FILE
+    path.chmod(mode)
+    before = path.stat()
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    after = path.stat()
+    assert after.st_mode & 0o777 == 0o600
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert _one_line(capsys) == (
+        f"vm_config: tightened: {path} already holds this config, and its mode was "
+        f"{mode:04o}, now 0600"
+    )
+
+
+def test_a_failed_chmod_exits_one(monkeypatch, capsys, metadata, config_dir, not_root):
+    SsmHook().install(monkeypatch)
+    _render(monkeypatch, _settings_bytes())
+    capsys.readouterr()
+    path = config_dir / CONFIG_FILE
+    path.chmod(0o644)
+
+    def refuse(target, mode, **kwargs):
+        raise PermissionError(1, "Operation not permitted", str(target))
+
+    monkeypatch.setattr(os, "chmod", refuse)
+
+    assert _render(monkeypatch, _settings_bytes()) == 1
+    assert _one_line(capsys) == f"vm_config: failed: {path} could not be written (PermissionError)"
 
 
 def test_a_changed_value_is_named_and_never_printed(
@@ -551,6 +590,8 @@ def _assert_refused(capsys, config_dir: Path, before: bytes) -> str:
     return line
 
 
+_CREDENTIALS = "the settings' bucket_credentials must be exactly instance_profile"
+
 SETTINGS_REFUSALS = {
     "a parameter's key": (_settings_bytes(ntfy_topic="tracked"), "set ['ntfy_topic']"),
     "two parameters' keys": (
@@ -573,6 +614,21 @@ SETTINGS_REFUSALS = {
         f"over {vm_config.SETTINGS_MAX_BYTES}",
     ),
     "a key that is a number": (_settings_bytes() + b"1: one\n", "a key that is not text"),
+    # The render signs with the instance profile, so a config.yaml saying anything else
+    # would have every bucket job sign differently from the render that wrote it.
+    "the key path": (_settings_bytes(bucket_credentials="keys"), _CREDENTIALS),
+    "no credential source": (_settings_bytes(bucket_credentials=_DROP), _CREDENTIALS),
+    "a hyphenated source": (
+        _settings_bytes(bucket_credentials="instance-profile"),
+        _CREDENTIALS,
+    ),
+    "a capitalised source": (
+        _settings_bytes(bucket_credentials="Instance_Profile"),
+        _CREDENTIALS,
+    ),
+    "a source that is a boolean": (_settings_bytes(bucket_credentials=True), _CREDENTIALS),
+    # A key pasted where the source goes is never quoted back.
+    "a pasted secret": (_settings_bytes(bucket_credentials=API_KEY), _CREDENTIALS),
     # Written by hand, out of order, so the refusal's sorting is what puts them in order.
     "parameters' keys out of order": (
         b"schwab_api_key: k\nbackup_target: /x\n" + _settings_bytes(),
@@ -699,17 +755,9 @@ CONFIG_REFUSALS = {
         {"guards": {"no_such_guard": 1}},
         "unknown guard constant(s): ['no_such_guard']",
     ),
-    "the key path with no keys": (
-        {"bucket_credentials": "keys"},
-        "the bucket needs config key(s): ['bucket_access_key_id', 'bucket_secret_access_key']",
-    ),
     "a key beside the instance profile": (
         {"bucket_access_key_id": "AKIDSTRAY"},
         "the config must not hold ['bucket_access_key_id']",
-    ),
-    "an unknown credential source": (
-        {"bucket_credentials": "instance-profile"},
-        "bucket_credentials must be keys or instance_profile",
     ),
     "a lake_root under a home that does not exist": (
         {"lake_root": "~no-such-user-sentinel/lake"},

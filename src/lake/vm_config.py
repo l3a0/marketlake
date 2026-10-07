@@ -32,19 +32,22 @@ that path.
    loads as primary, so a missing line would make the VM capture as primary by accident.
 5. ``bucket_region`` is not an AWS region name. The client is signed for it, so the check
    runs before the client is built.
-6. ``InvalidParameters`` names any parameter. ``GetParameters`` answers HTTP 200 with a
+6. ``bucket_credentials`` is not exactly ``instance_profile``. The render always signs
+   with the instance profile, so a file saying ``keys`` would make every bucket job sign
+   one way while the render that wrote it signed another.
+7. ``InvalidParameters`` names any parameter. ``GetParameters`` answers HTTP 200 with a
    missing name listed there, and a render that read only ``Parameters`` would write a
    file missing a key, which #699's pass 3 found. A wrong region shows up here too, as
    every name at once.
-7. A fetched value is empty, or has whitespace at either end. ``s3://<bucket>/lake`` put
+8. A fetched value is empty, or has whitespace at either end. ``s3://<bucket>/lake`` put
    with a trailing newline gives the prefix ``lake\\n``, which no later check catches.
-8. The merged mapping fails ``Config.from_mapping``. The daemon loads ``config.yaml``
+9. The merged mapping fails ``Config.from_mapping``. The daemon loads ``config.yaml``
    every cycle, so a file that fails to load costs capture.
-9. ``backup_target`` is not an ``s3://`` target, or has a ``bucket_target_problems``
-   problem, or the config has a ``bucket_credential_problems`` problem. Loading never
-   refuses a backup setting, by design, so a target put without its scheme would load as
-   a relative path. The render is a job rather than the capture path, so it applies the
-   bucket jobs' strict checks.
+10. ``backup_target`` is not an ``s3://`` target, or has a ``bucket_target_problems``
+    problem, or the config has a ``bucket_credential_problems`` problem. Loading never
+    refuses a backup setting, by design, so a target put without its scheme would load
+    as a relative path. The render is a job rather than the capture path, so it applies
+    the bucket jobs' strict checks.
 
 **No value reaches any output.** A line names a parameter or a key and never what it
 holds. An AWS ``ClientError`` is reported by its error code alone and a
@@ -66,7 +69,9 @@ new one. The YAML comes from ``yaml.safe_dump``, because a secret written by han
 parse back as another type. ``tickers._write_atomically`` and ``reauth.write_token`` do
 not fit as they stand: neither creates its file at 0600, and ``write_token`` writes JSON.
 A missing config directory is created at mode 0700. A file that already parses to the
-same mapping is left alone and reported as ``unchanged``.
+same mapping is not rewritten. It is reported as ``unchanged`` when its mode is 0600, and
+otherwise chmodded to 0600 and reported as ``tightened``, because a file holding four
+secrets must not stay readable by others just because its content matched.
 
 **The line names the keys whose values changed.** The daemon builds its senders once, at
 start, so a changed ``role`` reaches it only through a restart. Each compaction starts a
@@ -77,7 +82,7 @@ changed, and the caller restarts the daemon. #638's cutover and #676's deploy ow
 restart.
 
 The exit codes match the token pull's, so the first boot's retry treats both alike: 0
-written or unchanged, 3 no credentials yet, 2 a refusal, and 1 any other failure.
+written, unchanged or tightened, 3 no credentials yet, 2 a refusal, and 1 any other failure.
 
 The client is a seam. ``render`` takes a required ``client_factory``, which it calls with
 the settings' region, so a metadata service with no credentials yet becomes the ``no
@@ -98,7 +103,9 @@ import yaml
 
 from lake.aws_session import INSTANCE_PROFILE, _MetadataLookupFailed, build_client
 from lake.config import (
+    BUCKET_CREDENTIALS_KEY,
     BUCKET_REGION_KEY,
+    CREDENTIALS_FROM_INSTANCE_PROFILE,
     ROLE_KEY,
     BucketTarget,
     Config,
@@ -142,12 +149,13 @@ _SSM_CLIENT_CONFIG = {
 
 WROTE = "wrote"
 UNCHANGED = "unchanged"
+TIGHTENED = "tightened"
 NO_CREDENTIALS = "no credentials"
 FAILED = "failed"
 
 # The exit code each outcome gives. A refusal raises ``RenderRefused`` instead, which
 # ``main`` turns into exit 2.
-EXIT_CODES = {WROTE: 0, UNCHANGED: 0, NO_CREDENTIALS: 3, FAILED: 1}
+EXIT_CODES = {WROTE: 0, UNCHANGED: 0, TIGHTENED: 0, NO_CREDENTIALS: 3, FAILED: 1}
 
 
 class RenderRefused(Exception):
@@ -227,6 +235,13 @@ def _check_settings(settings: Mapping[Any, Any]) -> str:
     if not (isinstance(region, str) and is_region_name(region)):
         raise RenderRefused(
             f"the settings' {BUCKET_REGION_KEY} {region!r} is not an AWS region name like us-east-2"
+        )
+    # Compared as a string, since the value is a credential setting and is never quoted.
+    if settings.get(BUCKET_CREDENTIALS_KEY) != CREDENTIALS_FROM_INSTANCE_PROFILE:
+        raise RenderRefused(
+            f"the settings' {BUCKET_CREDENTIALS_KEY} must be exactly "
+            f"{CREDENTIALS_FROM_INSTANCE_PROFILE}, because the render signs with the "
+            "instance profile and every bucket job must sign the same way"
         )
     return region
 
@@ -385,7 +400,15 @@ def render(
 
     state, previous = _existing(target)
     if previous is not None and _same(previous, merged):
-        return RenderResult(UNCHANGED, f"unchanged: {target} already holds this config")
+        mode = target.stat().st_mode & 0o777
+        if mode == FILE_MODE:
+            return RenderResult(UNCHANGED, f"unchanged: {target} already holds this config")
+        os.chmod(target, FILE_MODE)
+        return RenderResult(
+            TIGHTENED,
+            f"tightened: {target} already holds this config, and its mode was {mode:04o}, "
+            f"now {FILE_MODE:04o}",
+        )
     _write(target, yaml.safe_dump(merged, sort_keys=True))
     return RenderResult(WROTE, _wrote_line(target, state, previous, merged))
 
@@ -469,8 +492,9 @@ def _read_stdin() -> bytes:
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``python -m lake.vm_config`` entry. Returns a process exit code.
 
-    It prints one line to stderr and exits 0 for ``wrote`` and ``unchanged``, 3 for ``no
-    credentials``, 2 for a refusal, and 1 for any other failure, a failed write included.
+    It prints one line to stderr and exits 0 for ``wrote``, ``unchanged`` and
+    ``tightened``, 3 for ``no credentials``, 2 for a refusal, and 1 for any other failure,
+    a failed write or chmod included.
     It builds the real client factory itself and takes no seam. Run it as the account
     that runs the daemon.
     """
@@ -496,6 +520,7 @@ __all__ = [
     "PARAMETERS",
     "PARAMETER_KEYS",
     "SETTINGS_MAX_BYTES",
+    "TIGHTENED",
     "UNCHANGED",
     "WROTE",
     "RenderRefused",
