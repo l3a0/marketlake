@@ -49,6 +49,8 @@ The rest are read when they are needed.
 - `<github-user-id>` is the owner's numeric GitHub id, which step 8 reads.
 - `<backup-key-id>` is the id of the old `marketlake-backup` user's access key, which
   [Retire the old users](#retire-the-old-users) reads.
+- `<switch-time>` is when the laptop's `config.yaml` moved to `assume_role`, in UTC as
+  `2026-10-07T21:00:00Z`. The CloudTrail lookup reads every event since then.
 - `<branch>` and `<n>` are the pull request's branch and number.
 - `<run-id>`, `<lock-id>`, `<branch-head>` and `<merge-commit>` are ids that an earlier
   command prints, named where each one appears.
@@ -802,18 +804,26 @@ so it follows [Changing the bootstrap](#changing-the-bootstrap).
    Add the backup role's ARN.
 
    ```bash
-   A=$(aws iam get-role --role-name marketlake-backup --query Role.Arn --output text --profile marketlake-admin) && printf 'bucket_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
+   A=$(aws iam get-role --role-name marketlake-backup --query Role.Arn --output text --profile marketlake-admin) && printf '\nbucket_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
    ```
 
    Add the token writer's ARN.
 
    ```bash
-   A=$(aws iam get-role --role-name marketlake-token-writer --query Role.Arn --output text --profile marketlake-admin) && printf 'token_store_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
+   A=$(aws iam get-role --role-name marketlake-token-writer --query Role.Arn --output text --profile marketlake-admin) && printf '\ntoken_store_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
+   ```
+
+   Each line starts with a newline, because a copy whose last line has none would
+   otherwise join the new key to it and stop `config.yaml` from loading. A `get-role` that
+   fails appends nothing, so check that both keys landed before going on.
+
+   ```bash
+   grep -q '^bucket_role_arn:' "$HOME/.config/marketlake/config.yaml.new" && grep -q '^token_store_role_arn:' "$HOME/.config/marketlake/config.yaml.new" && echo both-present
    ```
 
    Finish the copy's other settings, which
    [#737](https://github.com/l3a0/marketlake/issues/737)'s step 6 lists, then rename it
-   into place.
+   into place only once the check printed `both-present`.
 
    ```bash
    mv "$HOME/.config/marketlake/config.yaml.new" "$HOME/.config/marketlake/config.yaml"
@@ -846,7 +856,7 @@ Never use a real role name for the probe. A role made by hand makes the live app
 `CreateRole` fail with `EntityAlreadyExists`, and the apply role may not delete it.
 
 ```bash
-aws iam create-user --user-name marketlake-name-probe --profile marketlake-admin; aws iam create-role --role-name marketlake-name-probe --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' --profile marketlake-admin; aws iam delete-role --role-name marketlake-name-probe --profile marketlake-admin; aws iam delete-user --user-name marketlake-name-probe --profile marketlake-admin
+aws iam create-user --user-name marketlake-name-probe --query User.UserName --output text --profile marketlake-admin; aws iam create-role --role-name marketlake-name-probe --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' --query Role.RoleName --output text --profile marketlake-admin; aws iam delete-role --role-name marketlake-name-probe --profile marketlake-admin; aws iam delete-user --user-name marketlake-name-probe --profile marketlake-admin
 ```
 
 A `create-role` that prints the new role means the names may be shared. One that fails
@@ -861,10 +871,11 @@ history records management calls only, so it shows each `AssumeRole`,
 `GetBucketVersioning` and `PutParameter`, and never an object read or write. The command
 prints each event's time, its name, the caller's ARN with its account prefix stripped, and
 for an `AssumeRole` the session name. It never prints `roleArn`, which carries the account
-id.
+id. It sets a start time rather than a result limit, because a limit turns off the CLI's
+paging, and the instance profile's own `AssumeRole` events could fill the one page.
 
 ```bash
-for e in AssumeRole GetBucketVersioning PutParameter; do aws cloudtrail lookup-events --region us-east-1 --profile marketlake-admin --lookup-attributes "AttributeKey=EventName,AttributeValue=$e" --max-results 20 --output json | jq -r '.Events[].CloudTrailEvent | fromjson | [.eventTime, .eventName, ((.userIdentity.arn // "-") | sub("^arn:aws:[a-z]+::[0-9]+:"; "")), (.requestParameters.roleSessionName? // "-")] | @tsv'; done
+for e in AssumeRole GetBucketVersioning PutParameter; do aws cloudtrail lookup-events --region us-east-1 --profile marketlake-admin --lookup-attributes "AttributeKey=EventName,AttributeValue=$e" --start-time "<switch-time>" --output json | jq -r '.Events[].CloudTrailEvent | fromjson | [.eventTime, .eventName, ((.userIdentity.arn // "-") | sub("^arn:aws:[a-z]+::[0-9]+:"; "")), (.requestParameters.roleSessionName? // "-")] | @tsv'; done
 ```
 
 The calls to look for are these three.
@@ -886,7 +897,8 @@ Delete the old users only once three things hold.
 1. The bucket check and the re-auth above both passed.
 2. A nightly upload has run under the role, if the laptop's backup target is the bucket by
    then.
-3. `marketlake-backup`'s key was last used before the switch, by the check below.
+3. `marketlake-backup`'s key was last used before its last copy was removed, and a
+   nightly cycle has passed since, by the check below.
 
 CloudTrail's event history never shows an object call, so the key's last use is the only
 record that the nightly job, and the copy of the key that
@@ -900,8 +912,10 @@ Read the old key's id. It is `<backup-key-id>` below.
 aws iam list-access-keys --user-name marketlake-backup --profile marketlake-admin
 ```
 
-Read when it was last used. Go on only when `LastUsedDate` is earlier than the switch to
-the role.
+Read when it was last used. Go on only when `LastUsedDate` is earlier than the removal of
+the key's last copy, from the laptop or the measurement VM, and a nightly cycle has passed
+since that removal. A use after the switch but before the removal does not block the
+gate.
 
 ```bash
 aws iam get-access-key-last-used --access-key-id "<backup-key-id>" --profile marketlake-admin
@@ -1030,23 +1044,35 @@ Advanced tier, attach a parameter policy, set an allowed pattern, or store a for
 that the VM's pull accepts. So recovery deletes the parameter whatever its listing shows,
 and a fresh re-auth puts the real token back.
 
-1. Deactivate the key for `marketlake-command` in the AWS console. That stops new
-   `AssumeRole` calls at once. A role session issued before it keeps working until it
-   expires, which takes at most an hour, the roles' session limit.
-2. Create a new access key for the same user, and put it in the laptop's `config.yaml` as
+1. Deactivate the key for `marketlake-command` in the AWS console. Deactivating stops the
+   key itself and nothing it already minted. A role session issued before it keeps working
+   for up to an hour, the roles' session limit. A session token from `sts:GetSessionToken`,
+   which needs no permission to mint, lasts up to 36 hours and can still assume both roles.
+2. Revoke what the key already minted, in the admin session. Deny the user every request
+   signed with a token issued before now. A request signed with an access key carries no
+   token issue time, so the new key in step 3 is unaffected.
+
+   ```bash
+   aws iam put-user-policy --user-name marketlake-command --policy-name revoke-older-sessions --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"*\",\"Resource\":\"*\",\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}}]}" --profile marketlake-admin
+   ```
+
+   Then, on each of the roles `marketlake-backup` and `marketlake-token-writer`, open the
+   console's **Revoke sessions** tab and revoke active sessions, which denies every role
+   session issued before then. Neither policy is one the live apply manages, so the apply
+   leaves both alone. Delete `revoke-older-sessions` from the user after 36 hours.
+3. Create a new access key for the same user, and put it in the laptop's `config.yaml` as
    `command_access_key_id` and `command_secret_access_key`.
-3. Wait until an hour has passed since the deactivation, so no old session can put the
-   token again after the delete. Then delete the parameter.
+4. Delete the parameter.
 
    ```bash
    aws ssm delete-parameter --name /marketlake/config/schwab-oauth-token --profile marketlake-admin --region us-east-1
    ```
 
-4. Run the weekly re-auth, the rendered `reauth.sh`, which creates the parameter again as
+5. Run the weekly re-auth, the rendered `reauth.sh`, which creates the parameter again as
    a Standard `SecureString`. While the laptop's `config.yaml` leaves `token_store` absent
    or `file`, the re-auth puts nothing, so put the token again with the `file://` command
    above instead.
-5. Delete the deactivated key in the console. A user holds at most two access keys, and a
+6. Delete the deactivated key in the console. A user holds at most two access keys, and a
    deactivated key counts toward the two.
 
 Step 4 mints a new token rather than putting the laptop's existing `token.json` again. A
