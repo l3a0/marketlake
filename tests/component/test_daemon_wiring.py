@@ -3386,7 +3386,10 @@ def test_a_missing_token_file_heals_on_the_cycle_after_the_pull_writes_it(tmp_pa
     assert not rig.token.exists()
     rig.pulls.then(lambda: rig.token.write_text("{}"))
     results: list[CycleResult] = []
-    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    # A long grace, because ``wait`` returns as soon as the cycle's futures finish. The
+    # default lets a slow machine move the clock past the bound mid-cycle, and the healed
+    # minute then gaps as ``request_abandoned``. A healthy run pays nothing for it.
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30), grace=30.0)
     _run(
         rig,
         clock,
