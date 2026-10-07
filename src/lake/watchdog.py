@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from lake.calendar import MARKET_TZ
 from lake.capture import TOKEN_FILE_UNREADABLE, CycleResult, SegmentOutcome
@@ -150,6 +150,12 @@ class Page:
     spans leave out, in roster order. The cycle knows those tickers and not which surfaces
     they owe, so that page leaves ``surfaces`` empty. It names no class either, because
     nothing was attempted for them.
+
+    ``since`` is set only on a cause page, and is the first minute of the run ``minutes``
+    counts, in the slot's own ET zone. A cause page fires only on a cycle in which every
+    surface failed, so it is the one page that always rides a minute feeding the
+    ``capture`` dead-man nothing. The body dates it and promises that check's DOWN on the
+    strength of this field, so no other page sets it (marketlake #747).
     """
 
     title: str
@@ -158,6 +164,7 @@ class Page:
     sampler_collapse: bool = False
     cause: str | None = None
     tickers: tuple[str, ...] = ()
+    since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -314,7 +321,7 @@ class Watchdog:
         self._release_retired(touched)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
-        cause = self._whole_daemon(tally, threshold)
+        cause = self._whole_daemon(tally, threshold, result.snap_ts)
         if cause is not None:
             return cause + out_of_span
         return self._pages(failed, touched, threshold=threshold, classes=classes) + out_of_span
@@ -400,7 +407,7 @@ class Watchdog:
             )
         ]
 
-    def _whole_daemon(self, tally: _Tally, threshold: int) -> list[Page] | None:
+    def _whole_daemon(self, tally: _Tally, threshold: int, slot: datetime) -> list[Page] | None:
         """One page naming the cause, when every surface failed the same way.
 
         The refresh token dies every seven days by design, and a dead token gaps chains
@@ -426,6 +433,16 @@ class Watchdog:
         chain that answered 200 with no contract counts against unanimity as
         ``contracts_absent``. That answer proves at least one of its requests authenticated
         and got through, so the cycle is not one cause.
+
+        The page's ``minutes`` is the smallest count over the failed surfaces, and
+        ``since`` is the first minute of that run, ``slot`` less ``minutes - 1``. The
+        smallest count is the run in which none of the surfaces the page folds landed
+        data, which is the run that starves the dead-man. The largest is one surface's own
+        failure, which can start long before the cause: a chain failing ``http_500`` from
+        10:00 under a token that dies at 10:30 would date the page 10:00. The threshold
+        check reads the same set, so ``minutes`` is never below the threshold. The slot is
+        already in ET, and :meth:`_roll` clears every count at the ET date change, so
+        ``since`` always falls inside the session (marketlake #747).
         """
         title = _whole_daemon_title(tally)
         if title is None:
@@ -438,12 +455,14 @@ class Watchdog:
         if any(self._counts.get(key, 0) < threshold for key in failed):
             return None
         self._paged_causes[title] = set(failed)
+        minutes = min(self._counts[key] for key in failed)
         return [
             Page(
                 title=title,
-                minutes=max(self._counts[key] for key in failed),
+                minutes=minutes,
                 surfaces=tuple(sorted(failed, key=str)),
                 cause=error_class,
+                since=slot - timedelta(minutes=minutes - 1),
             )
         ]
 

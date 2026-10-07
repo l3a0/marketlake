@@ -1596,54 +1596,64 @@ def test_a_mid_session_recalibration_reaches_the_watchdog(tmp_path):
 # -- 9. an empty roster keeps the daemon running ---------------------------------------
 
 
-class _RateLimited:
-    """A cycle runner whose every cycle gaps one surface with a rate-limit class."""
+class _OneSurfaceFailing:
+    """A cycle runner whose every cycle gaps the quotes surface while the chain lands data.
 
-    def __init__(self, rig: _Rig, clock: ManualClock):
+    The chain landing rows proves the vendor answered, so even a class a whole-daemon
+    cause names stays a page about the one surface.
+    """
+
+    def __init__(self, rig: _Rig, clock: ManualClock, error_class: str):
         self._rig = rig
         self._clock = clock
+        self._error_class = error_class
 
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
-        segment = SegmentOutcome(
+        failing = SegmentOutcome(
             surface=journal.QUOTES_SURFACE,
             ticker="XYZ",
             path=self._rig.lake_root / "segment.arrows",
             partition="quotes/ticker=XYZ/date=2026-09-02/segment.arrows",
             row_kind=journal.ROW_KIND_GAP,
             rows=1,
-            error_class="http_429",
+            error_class=self._error_class,
             fetched_at=None,
             data_rows=0,
         )
-        return CycleResult(snap_ts=slot, segments=(segment,))
+        landed = _segment(journal.ROW_KIND_DATA, self._rig.lake_root, journal.CHAINS_SURFACE)
+        return CycleResult(snap_ts=slot, segments=(failing, landed))
 
 
-def test_a_surface_page_names_the_class_it_is_failing_with(tmp_path):
+@pytest.mark.parametrize("error_class", ["http_429", "http_401"])
+def test_a_surface_page_names_the_class_it_is_failing_with(error_class, tmp_path):
     """The title says what went quiet, and the body has to say why.
 
-    A rate limit that starves one ticker while another still lands rows is not a
-    whole-daemon cause, so the page that goes out names the ticker. Without the class in
-    the body, that page sends the operator to look at one dead surface when the budget is
-    what is failing. The watchdog has held the class all along and dropped it here.
+    A rate limit or a refused token that starves one surface while another still lands
+    rows is not a whole-daemon cause, so the page that goes out names the ticker. Without
+    the class in the body, that page sends the operator to look at one dead surface when
+    the budget or the token is what is failing. The watchdog has held the class all along
+    and dropped it here. The page carries no time and no dead-man line, because the
+    surface that lands rows keeps the dead-man fed (marketlake #747).
     """
     rig = _rig(tmp_path)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    _run(rig, clock, ticks=4, cycle_runner=_RateLimited(rig, clock))
+    _run(rig, clock, ticks=4, cycle_runner=_OneSurfaceFailing(rig, clock, error_class))
 
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == "Capture down: XYZ quotes"
-    assert page.body == "3 session minutes without a durable cycle, failing with http_429"
+    assert page.body == f"3 session minutes without a durable cycle, failing with {error_class}"
 
 
 class _WholeDaemonFailure:
-    """A cycle runner whose every cycle fails both surfaces with one auth class."""
+    """A cycle runner whose every cycle fails both surfaces with one whole-daemon class."""
 
-    def __init__(self, rig: _Rig, clock: ManualClock):
+    def __init__(self, rig: _Rig, clock: ManualClock, error_class: str = "http_401"):
         self._rig = rig
         self._clock = clock
+        self._error_class = error_class
 
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
@@ -1656,7 +1666,7 @@ class _WholeDaemonFailure:
                 partition=f"{surface}/ticker=XYZ/date=2026-09-02/segment.arrows",
                 row_kind=journal.ROW_KIND_GAP,
                 rows=1,
-                error_class="http_401",
+                error_class=self._error_class,
                 fetched_at=None,
                 data_rows=0,
             )
@@ -1681,9 +1691,47 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
     assert page.event == "capture_down"
     assert page.title == "Capture down: token dead"
     # Two surfaces of one ticker, folded into this page. It counts surfaces rather than
-    # tickers, because a cause takes both surfaces of every ticker down together.
+    # tickers, because a cause takes both surfaces of every ticker down together. The
+    # first slot is 10:00, and the page says so, then names the dead-man's DOWN that the
+    # same outage sends next (marketlake #747).
     assert page.body == (
-        "3 session minutes without a durable cycle, failing with http_401, one page for 2 surfaces"
+        "3 session minutes without a durable cycle since 10:00 ET, failing with http_401,"
+        " one page for 2 surfaces. Expect Capture dead-man is DOWN in about 5 min:"
+        " same outage."
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_class", "title", "start", "since"),
+    [
+        # An afternoon outage reads on the 24-hour clock, so 14:00 never reads as 02:00.
+        ("http_429", "Capture down: rate limited", (13, 59), "14:00"),
+        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead", (9, 59), "10:00"),
+        # A morning outage off the hour shows its minute and the hour's leading zero.
+        ("http_401", "Capture down: token dead", (9, 44), "09:45"),
+    ],
+)
+def test_every_cause_page_dates_itself_and_names_the_dead_man_page_to_come(
+    error_class, title, start, since, tmp_path
+):
+    """The design's message table pins the time and the follow-on line on both causes.
+
+    The rate limit is the second row that carries them, and an unreadable token file
+    reaches the token-dead page by its own class (marketlake #702). The body is composed
+    from the page, not from the title or the class, so each cause is driven to the wire.
+    """
+    rig = _rig(tmp_path)
+    hour, minute = start
+    clock = ManualClock(start=et(2026, 9, 2, hour, minute, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock, error_class))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == title
+    assert page.body == (
+        f"3 session minutes without a durable cycle since {since} ET, failing with {error_class},"
+        " one page for 2 surfaces. Expect Capture dead-man is DOWN in about 5 min:"
+        " same outage."
     )
 
 
