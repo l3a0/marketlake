@@ -39,7 +39,8 @@ through the ``aws_session.STS_ENDPOINT_URL`` seam.
 canary, the ``launchctl``, ``pmset`` and ``tmutil`` reads, the ``systemctl`` and
 ``timedatectl`` reads, and the daemon's assertion runner internally. ``daemon.main``
 joined them with the close+15 compaction: it spawns that job as its own process, so the
-seam is the spawn rather than the ``rsync`` the child goes on to run. ``clock`` and
+seam is the spawn rather than the ``rsync`` the child goes on to run. It spawns the token
+pull in auth death the same way, so that seam is a spawn too (marketlake #702). ``clock`` and
 ``calendar`` stay injectable on both. A system clock and an exchange calendar never
 reach past this process, so neither is a seam. A test drives a seam-requiring helper
 directly, or, to exercise a ``main``, monkeypatches the producer the ``main`` builds and
@@ -64,6 +65,7 @@ REQUIRED = [
     (daemon.run_loop_from_config, "transport"),
     (daemon.run_loop_from_config, "pinger"),
     (daemon.run_loop_from_config, "compaction_runner"),
+    (daemon.run_loop_from_config, "pull_runner"),
     (daemon._alarm, "transport"),
     (daemon._alarm, "pinger"),
     (runner.run_once_from_config, "pinger"),
@@ -104,6 +106,7 @@ FORBIDDEN = [
     (compact.main, "publisher"),
     (compact.main, "transport"),
     (daemon.main, "compaction_runner"),
+    (daemon.main, "pull_runner"),
     (daemon.main, "assertion_runner"),
     (control_plane.main, "probe"),
     (control_plane.main, "pinger"),

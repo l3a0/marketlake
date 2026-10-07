@@ -424,8 +424,12 @@ later. It prints one line and exits with one of four codes:
 4. 3 when the instance profile is not serving credentials yet, which is worth retrying.
 
 The VM's first boot runs it
-([#686](https://github.com/l3a0/marketlake/issues/686)), and
-[#702](https://github.com/l3a0/marketlake/issues/702) runs it after that.
+([#686](https://github.com/l3a0/marketlake/issues/686)). After that it runs before each
+Sunday canary attempt, and the daemon spawns it while capture is down on a dead token or
+a `token.json` it cannot read, on the first such minute and at most once every 5 minutes
+after ([#702](https://github.com/l3a0/marketlake/issues/702)). Both run only under
+`token_store: store` or an unknown value. After a re-auth on the laptop, the VM resumes
+capture at the daemon's next pull. Running the command by hand skips that wait.
 
 ## Reach the dashboard on a hosted VM
 

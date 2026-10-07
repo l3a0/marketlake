@@ -36,6 +36,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ import pytest
 from lake import capture, journal
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import write_chain_plan
+from lake.config import ConfigError
+from lake.schwab import is_transient_failure
 from lake.vendor import VendorResponse
 from tests.support.calendar import et
 from tests.support.clock import ManualClock
@@ -738,3 +741,146 @@ def test_a_bad_backup_setting_still_captures(tmp_path, monkeypatch, target):
 
     assert result.segment(CHAINS, "SPY").row_kind == journal.ROW_KIND_DATA
     assert vendor.chains == ["SPY"]
+
+
+# -- a token file the build cannot use costs the minute, not the daemon -------------------
+
+# Each way a token file defeats the real ``SchwabVendor.from_token``, and the class the
+# build raises for it (marketlake #702). A missing file is what a VM whose first-boot pull
+# failed holds, a file the account cannot read is what a pull run as root leaves, and the
+# other two are a file that is not ``schwab-py``'s token.
+
+
+def _missing(token: Path) -> None:
+    token.unlink()
+
+
+def _not_json(token: Path) -> None:
+    token.write_text("not a token")
+
+
+def _no_token_key(token: Path) -> None:
+    token.write_text(json.dumps({"creation_timestamp": FRESH_MINTED}))
+
+
+def _unreadable(token: Path) -> None:
+    token.chmod(0)
+
+
+UNUSABLE_TOKEN_FILES = [
+    pytest.param(_missing, "FileNotFoundError", id="missing"),
+    pytest.param(_unreadable, "PermissionError", id="unreadable"),
+    pytest.param(_not_json, "JSONDecodeError", id="not-json"),
+    pytest.param(_no_token_key, "KeyError", id="no-token-key"),
+]
+
+
+@pytest.mark.parametrize(("spoil", "build_error"), UNUSABLE_TOKEN_FILES)
+def test_a_token_file_the_build_cannot_use_gaps_every_surface(
+    tmp_path, monkeypatch, capsys, spoil, build_error
+):
+    """The real build fails, and the cycle records that failure instead of raising it.
+
+    Raised, the build's failure ended the daemon's loop, and the service manager restarted
+    it into the same raise every capture minute. Here the cycle returns, with a gap row on
+    every surface carrying ``token_file_unreadable``. The watchdog folds that into "token
+    dead", and the daemon pulls on it. The cycle neither lands data nor reports nothing to
+    capture, so the capture dead-man stays unfed and pages as it does for a dead token.
+
+    The real ``SchwabVendor.from_token`` runs, so the exception classes are the ones
+    production meets rather than ones a stub chose.
+    """
+    if spoil is _unreadable and os.geteuid() == 0:
+        pytest.skip("root reads a file whatever its mode")
+    rig = _rig(tmp_path, WITH_XYZ)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: load_chain_plan(rig.plan))
+    spoil(rig.token)
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert _kinds(result) == {
+        (CHAINS, "SPY", journal.ROW_KIND_GAP, "token_file_unreadable"),
+        (QUOTES, "SPY", journal.ROW_KIND_GAP, "token_file_unreadable"),
+        (QUOTES, "XYZ", journal.ROW_KIND_GAP, "token_file_unreadable"),
+    }
+    assert result.errors == ()
+    assert not any(segment.landed_data for segment in result.segments)
+    assert not result.nothing_to_capture
+    # The rows on disk carry the class too, which is what the dashboard and the battery read.
+    rows = [
+        row for segment in result.segments for row in journal.read_segment(segment.path).to_pylist()
+    ]
+    assert rows
+    assert {row["error_class"] for row in rows} == {"token_file_unreadable"}
+    # One line naming the build's class, and nothing from the file or its path.
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "token file" in line]
+    assert lines == [
+        f"capture: the token file could not be read ({build_error}), so this cycle "
+        "gaps every surface as token_file_unreadable"
+    ]
+    assert str(rig.token) not in err
+    assert str(tmp_path) not in err
+
+
+@pytest.mark.parametrize("raised", [OSError, ValueError, KeyError, TypeError])
+def test_each_class_the_build_can_raise_is_recorded_as_a_gap(tmp_path, monkeypatch, raised):
+    # The four the build is caught for, each from a stub so a class the real file read
+    # never raises today, such as ``attach_timing``'s own ``TypeError``, is covered too.
+    rig = _rig(tmp_path, SPY_ONLY)
+
+    def refuse(path: Path) -> _Vendor:
+        raise raised("the build refused")
+
+    _wire(monkeypatch, rig, refuse)
+
+    result = _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+    assert _kinds(result) == {
+        (CHAINS, "SPY", journal.ROW_KIND_GAP, "token_file_unreadable"),
+        (QUOTES, "SPY", journal.ROW_KIND_GAP, "token_file_unreadable"),
+    }
+
+
+def test_a_build_failure_outside_the_four_still_raises(tmp_path, monkeypatch):
+    # Only the token file's failures are caught. A raise of any other class is a broken
+    # machine rather than a bad file, and it keeps ending the call as it did.
+    rig = _rig(tmp_path, SPY_ONLY)
+
+    def refuse(path: Path) -> _Vendor:
+        raise RuntimeError("not a file problem")
+
+    _wire(monkeypatch, rig, refuse)
+
+    with pytest.raises(RuntimeError, match="not a file problem"):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+
+def test_a_config_that_will_not_load_still_raises_beside_a_missing_token(tmp_path, monkeypatch):
+    # The catch wraps the build alone. A config read inside it would turn a broken config
+    # into gap rows the operator reads as a token problem.
+    rig = _rig(tmp_path, SPY_ONLY)
+    rig.token.unlink()
+    rig.config.unlink()
+    with pytest.raises(ConfigError):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+
+def test_the_stand_in_is_never_retried_and_closes_quietly():
+    # ``is_transient_failure`` matching the stand-in's exception would send every window
+    # and the quote batch twice a minute for nothing. A ``close`` that raised would escape
+    # from the cycle's ``finally`` and bring the crash back.
+    vendor = capture._token_file_unreadable(FileNotFoundError("gone"))
+    with pytest.raises(capture.TokenFileUnreadable) as refused:
+        vendor.get_quotes(["SPY"])
+    assert not is_transient_failure(refused.value)
+    assert type(refused.value).__mro__[1] is Exception
+    capture._close_vendor(vendor)
+    for call in (
+        lambda: vendor.get_chain("SPY"),
+        lambda: vendor.get_minute_bars("SPY", start=FIRST_MINUTE, end=FIRST_MINUTE),
+        lambda: vendor.get_daily_bars("SPY", start=FIRST_MINUTE, end=FIRST_MINUTE),
+        vendor.token_mint_time,
+    ):
+        with pytest.raises(capture.TokenFileUnreadable):
+            call()

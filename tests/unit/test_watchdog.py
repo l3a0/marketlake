@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from lake.capture import CycleResult, SegmentError, SegmentOutcome
-from lake.watchdog import CONTRACTS_ABSENT, Surface, Watchdog
+from lake.watchdog import CONTRACTS_ABSENT, Surface, Watchdog, whole_daemon_cause
 
 ET = ZoneInfo("America/New_York")
 SLOT = datetime(2026, 9, 2, 10, 0, tzinfo=ET)
@@ -1706,3 +1706,132 @@ def test_a_write_failure_beside_a_dead_token_still_folds_under_it():
     assert [(page.title, len(page.surfaces)) for page in raised] == [
         ("Capture down: token dead", 3)
     ]
+
+
+# -- the whole-daemon rule as one public reading (marketlake #702) ---------------------
+
+# Each case is one cycle, and the cause title the rule gives it. The daemon spawns a token
+# pull on the title, and the watchdog pages under it, so both read the same rule.
+WHOLE_DAEMON_CASES = [
+    pytest.param(
+        (_fail("chains", "SPY", "http_401"), _fail("quotes", "SPY", "http_401")),
+        (),
+        "Capture down: token dead",
+        id="every-surface-401",
+    ),
+    pytest.param(
+        (
+            _fail("chains", "SPY", "token_file_unreadable"),
+            _fail("quotes", "SPY", "token_file_unreadable"),
+        ),
+        (),
+        "Capture down: token dead",
+        id="every-surface-token-file-unreadable",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "vendor_auth_error"), _fail("quotes", "SPY", "vendor_auth_error")),
+        (),
+        "Capture down: token dead",
+        id="every-surface-vendor-auth-error",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "http_429"), _fail("quotes", "SPY", "http_429")),
+        (),
+        "Capture down: rate limited",
+        id="every-surface-429",
+    ),
+    pytest.param((_fail("quotes", "SPY", "http_401"),), (), None, id="one-surface"),
+    pytest.param(
+        (_fail("chains", "SPY", "http_401"), _fail("quotes", "SPY", "vendor_auth_error")),
+        (),
+        None,
+        id="two-auth-classes",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "http_401"), _seg("quotes", "SPY", "data")),
+        (),
+        None,
+        id="one-surface-landed",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "http_500"), _fail("quotes", "SPY", "http_500")),
+        (),
+        None,
+        id="unmapped-class",
+    ),
+    pytest.param(
+        (_seg("chains", "SPY", "data", data_rows=0), _fail("quotes", "SPY", "http_401")),
+        (),
+        None,
+        id="a-chain-with-no-contract",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "http_401"), _fail("quotes", "SPY", "http_401")),
+        (SegmentError("chains", "QQQ", "os_error"),),
+        "Capture down: token dead",
+        id="a-write-failure-records-no-class",
+    ),
+    pytest.param(
+        (_fail("quotes", "SPY", "http_401"),),
+        (SegmentError("chains", "SPY", "os_error"),),
+        "Capture down: token dead",
+        id="a-write-failure-counts-as-touched",
+    ),
+]
+
+
+@pytest.mark.parametrize(("segments", "errors", "title"), WHOLE_DAEMON_CASES)
+def test_the_whole_daemon_rule_reads_one_cycle(segments, errors, title):
+    assert whole_daemon_cause(_cycle(*segments, errors=errors)) == title
+
+
+@pytest.mark.parametrize(("segments", "errors", "title"), WHOLE_DAEMON_CASES)
+def test_the_watchdog_pages_the_cause_the_public_rule_names(segments, errors, title):
+    # The page decision and the daemon's pull read one rule. So at the threshold the
+    # watchdog sends a page under the title the public function gave the cycle, and sends
+    # no cause page when it gave none. A copy of the rule kept inside the watchdog would
+    # pass the case above and drift here.
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(_cycle(*segments, errors=errors, at=_at(minute)))
+    causes = {"Capture down: token dead", "Capture down: rate limited"}
+    assert [page.title for page in raised if page.title in causes] == (
+        [title] if title is not None else []
+    )
+
+
+def test_an_unreadable_token_file_pages_token_dead_and_names_its_class():
+    # The page names the class, which is what tells a file the cycle could not read apart
+    # from a token Schwab refused. A newer token repairs both.
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(4):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "token_file_unreadable"),
+                _fail("quotes", "SPY", "token_file_unreadable"),
+                at=_at(minute),
+            )
+        )
+    assert [(page.title, page.cause) for page in raised] == [
+        ("Capture down: token dead", "token_file_unreadable")
+    ]
+
+
+def test_a_dead_token_and_an_unreadable_token_file_are_one_outage():
+    # One title, one page. A dead token can arrive as a 401 and then as a refused refresh,
+    # and a pull that left a file the cycle cannot read lands as a third class. The cause
+    # is the title, so the outage pages once rather than once per class.
+    watchdog = Watchdog()
+    raised = []
+    classes = ["http_401"] * 3 + ["vendor_auth_error"] * 3 + ["token_file_unreadable"] * 3
+    for minute, error_class in enumerate(classes):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", error_class),
+                _fail("quotes", "SPY", error_class),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == ["Capture down: token dead"]

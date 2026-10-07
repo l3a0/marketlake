@@ -151,6 +151,9 @@ that the process exits up to one bound plus one transport timeout after the rais
 that delay would come anyway, since the interpreter joins a cycle's pool threads at exit.
 The production entry reloads config and the token per cycle, so a raise there means a
 broken machine, not a vendor hiccup, and the loop has no channel of its own to report it.
+A token file that cannot be read is the exception: the cycle records every surface as a
+``token_file_unreadable`` gap instead of raising, and the daemon pulls the token parameter
+on it (marketlake #702).
 The process exits non-zero, the service manager logs it and relaunches it, and the
 successor's startup gap-marking records the minutes lost. A vendor failure never reaches
 here: the cycle resolves it into gap rows and returns normally.
@@ -177,11 +180,11 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
-from lake import control_plane, outbox
+from lake import control_plane, outbox, token_store
 from lake.alert import REFUSED, Message, Publisher, Transport
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
@@ -223,7 +226,7 @@ from lake.session import (
     skipped_slots,
 )
 from lake.tickers import Roster, TickersError, load_tickers
-from lake.watchdog import Page, Surface, Watchdog
+from lake.watchdog import TOKEN_DEAD, Page, Surface, Watchdog, whole_daemon_cause
 
 # The loop's cadence: one tick per minute, on the minute top.
 
@@ -236,6 +239,18 @@ from lake.watchdog import Page, Surface, Watchdog
 # than defaulted: a caller who forgot it would run a real compaction over whatever config
 # the daemon was pointed at.
 CompactionRunner = Callable[[Sequence[str]], object]
+
+# Starts one ``python -m lake.token_store pull`` while capture is down on a dead token
+# (marketlake #702). It is shaped like ``CompactionRunner`` and required for the same
+# reason: a caller who forgot it would read the real token parameter and write a real
+# ``token.json``. ``None`` is the host that pulls nothing, which is any host whose
+# ``token_store`` is ``file`` or ``both``.
+PullRunner = Callable[[Sequence[str]], object]
+
+# How far apart two pulls spawned in one auth death must be, measured in slots. A pull's
+# SSM client gives up after about two minutes, three attempts of a 10-second connect and a
+# 30-second read, so two spawns from this daemon do not overlap.
+PULL_SPACING = timedelta(minutes=5)
 
 
 class CycleRunner(Protocol):
@@ -880,9 +895,9 @@ def _close_fill(
     collection failure a delisting.
 
     Nothing is built until a fill is actually owed. The vendor is constructed inside
-    ``fill_option_close_from_config``, on the call, which is how a daemon whose token
-    file is missing still runs every other minute of the day. A missing option close is
-    rare, so that construction normally never happens at all.
+    ``fill_option_close_from_config``, on the call, so a missing token file costs the fill
+    nothing until one is owed, and then costs that fill alone. A
+    missing option close is rare, so that construction normally never happens at all.
 
     The two provenance tags are the ones the 16:15 cycle would have carried. The close
     tag is ``option_close`` by definition, stamped by the fill itself. The session phase
@@ -1050,6 +1065,59 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
     job's failure costs is worth more than the word "spawn" in the message.
     """
     runner(args)
+
+
+def token_pull_command(config_path: str | Path | None, token_path: str | Path | None) -> list[str]:
+    """The argv that pulls the token parameter into ``token.json`` in its own process.
+
+    The interpreter is ``sys.executable``, as ``compaction_command`` uses. ``--config`` and
+    ``--token`` are forwarded when the daemon was given them and left out otherwise, so the
+    child reads the same two files the daemon does. Both are flags of the ``pull``
+    subcommand and go after it, since the parser refuses either one placed before it. The
+    installed daemon job passes neither, so the live argv ends at ``pull`` and the child
+    resolves both from ``HOME``, as the daemon does.
+    """
+    args = [sys.executable, "-m", "lake.token_store", "pull"]
+    if config_path is not None:
+        args += ["--config", str(config_path)]
+    if token_path is not None:
+        args += ["--token", str(token_path)]
+    return args
+
+
+def _spawn_token_pull(args: Sequence[str]) -> object:
+    """Start one token pull and return without waiting. The live ``PullRunner``.
+
+    No environment, working directory or stream is passed, so the child inherits the
+    daemon's, and its ``token_store:`` line lands in the daemon's log. Nothing waits on it.
+    CPython reaps a finished child on the next ``Popen`` the process makes, so at most one
+    finished pull waits as a zombie however long auth death lasts.
+    """
+    import subprocess  # lazy: only the live daemon spawns
+
+    return subprocess.Popen(list(args))
+
+
+def _start_token_pull(runner: PullRunner, args: Sequence[str], slot: datetime) -> None:
+    """Start one token pull, and never take the daemon down.
+
+    This runs from ``on_cycle``, which no wrapper guards, unlike the session-relative
+    jobs ``_dispatched`` wraps. A fork the 2 GiB VM refuses would otherwise end the loop,
+    and the service manager would restart it into the same refusal. So a failed spawn
+    prints one line and the next pull is tried a spacing later. A spawn that started
+    prints one line too, so the daemon's log says why a ``token_store:`` line follows.
+    Both prints are guarded, since a stderr that refuses must not cost the loop either.
+    """
+    try:
+        runner(args)
+    except Exception as exc:  # noqa: BLE001 - a pull that never started costs only itself
+        line = f"token pull did not start: {type(exc).__name__}"
+    else:
+        line = "capture is down on a dead token, so a token pull started"
+    try:
+        print(f"daemon: {slot.isoformat()}: {line}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - nowhere left to report it
+        pass
 
 
 def _dispatched(name: str, job: Callable[[date], None]) -> Callable[[date], None]:
@@ -1355,6 +1423,7 @@ def run_loop_from_config(
     transport: Transport,
     pinger: Pinger,
     compaction_runner: CompactionRunner,
+    pull_runner: PullRunner | None,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -1385,6 +1454,17 @@ def run_loop_from_config(
     ``main`` passes the pair ``outbox.senders`` returns and the real spawn. Every other
     caller supplies its own. Under a ``shadow`` role that pair records each ping and page
     under ``journal/outbox/`` rather than sending it, and nothing in this loop can tell.
+
+    ``pull_runner`` is required for the same reason, and may be ``None``. It spawns
+    ``python -m lake.token_store pull``, which reads the real token parameter and writes
+    the real ``token.json`` (marketlake #702). The cycle hook spawns one on a cycle that
+    ``watchdog.whole_daemon_cause`` reads as ``TOKEN_DEAD``, without waiting for the
+    watchdog's threshold, and then at most once per ``PULL_SPACING`` of slots while such
+    cycles last. The spacing reads the cycle's slot rather than a clock, a good cycle in
+    between does not reset it, and a restart forgets it. A host that re-authed elsewhere
+    therefore resumes capture at the first pull after the token parameter changed, not on
+    the next cycle. ``main`` passes ``None`` under ``token_store: file`` or ``both``, and
+    the cycle hook then pulls nothing.
 
     ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
     defaults to the same file the capture cycle reads, so the two never disagree about
@@ -1763,6 +1843,19 @@ def run_loop_from_config(
             )
 
     out_of_span_line = _OutOfSpanLine()
+    pull_args = token_pull_command(config_path, token_path)
+    # The slot of the last pull this daemon spawned, and the only state the pull keeps. A
+    # restart forgets it, so a successor pulls on its first dead-token cycle.
+    last_pull: datetime | None = None
+
+    def pull_if_token_dead(slot: datetime, result: CycleResult) -> None:
+        nonlocal last_pull
+        if pull_runner is None or whole_daemon_cause(result) != TOKEN_DEAD:
+            return
+        if last_pull is not None and slot - last_pull < PULL_SPACING:
+            return
+        last_pull = slot
+        _start_token_pull(pull_runner, pull_args, slot)
 
     def on_cycle(slot: datetime, result: CycleResult) -> None:
         raise_pages(watchdog.observe(result), slot)
@@ -1780,6 +1873,10 @@ def run_loop_from_config(
         landed_data = any(seg.landed_data for seg in result.segments)
         if landed_data or result.nothing_to_capture:
             deadman.captured(slot)
+        # A dead token, or a token file the cycle could not read, is repaired by a token
+        # newer than this host's, and on a host with no browser only the token parameter
+        # holds one. So the pull goes out on the first such cycle rather than at the page.
+        pull_if_token_dead(slot, result)
         out_of_span_line.observe(slot, result.out_of_span)
         # The vendor's payload changing shape, read off the batches this cycle just built.
         # It pages once when a column starts drifting rather than once a minute for as
@@ -1914,10 +2011,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # elsewhere: the service manager restarts the daemon, under launchd's ``KeepAlive`` or
     # systemd's ``Restart=always``, so a traceback would repeat every few seconds in the
     # log the operator is told to read.
+    #
+    # ``token_store`` is read once here, as ``role`` is, so a change reaches the daemon
+    # through a restart. Under ``store`` or an unknown value the daemon pulls the token
+    # parameter in auth death, and under ``file`` or ``both`` it pulls nothing, because
+    # that host ran the re-auth itself (marketlake #702). An unknown value prints the line
+    # ``mode_of`` gives, the way the re-auth prints it.
     with input_errors_exit("daemon"):
         config = load_config(args.config)
         sends = outbox.senders(config, process="daemon", clock=SystemClock())
         print(f"daemon: role={sends.role}", file=sys.stderr)
+        mode, unknown = token_store.mode_of(config)
+        if unknown is not None:
+            print(f"daemon: {unknown}", file=sys.stderr)
+        pulls = mode in (token_store.STORE, token_store.UNRECOGNISED)
         run_loop_from_config(
             config_path=args.config,
             tickers_path=args.tickers,
@@ -1925,6 +2032,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             transport=sends.transport,
             pinger=sends.pinger,
             compaction_runner=_spawn_compaction,
+            pull_runner=_spawn_token_pull if pulls else None,
             assertion_runner=None if control_plane.is_macos() else _hold_nothing,
         )
     return 0
@@ -1932,14 +2040,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "TICK",
+    "PULL_SPACING",
     "CycleRunner",
     "DaemonHooks",
+    "PullRunner",
     "build_parser",
     "main",
     "next_minute_top",
     "run_loop",
     "run_loop_from_config",
     "skipped_slots",
+    "token_pull_command",
 ]
 
 

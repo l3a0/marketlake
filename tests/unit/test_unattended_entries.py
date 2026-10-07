@@ -10,7 +10,8 @@ capture never starts.
 
 The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one plist per job
 from, so a job added there is covered here with no edit. The compaction child joins it
-with the argv ``daemon.compaction_command`` builds. Each entry runs in process under
+with the argv ``daemon.compaction_command`` builds, and the token pull the daemon spawns in
+auth death with the argv ``daemon.token_pull_command`` builds. Each entry runs in process under
 ``runpy`` with the entry's own arguments, and stops at the config load, because the suite's
 config directory is an empty throwaway. That exit is the first stop between the entry and
 live work. The conftest's network and subprocess guards catch some of what lies past it,
@@ -50,9 +51,15 @@ JOBS = cp.all_jobs(HOST)
 # test.
 COMPACTION = "compaction"
 
+# The second entry the daemon starts for itself: the token pull it spawns in auth death
+# on a ``store`` host (marketlake #702). The installed daemon job passes neither
+# ``--config`` nor ``--token``, so the live argv is the one built from two ``None``s.
+TOKEN_PULL = "token-pull"
+
 # Every unattended entry, as a label and the argv it starts with.
 ENTRIES = [(job.label, job.program_arguments) for job in JOBS] + [
-    (COMPACTION, tuple(daemon.compaction_command(None)))
+    (COMPACTION, tuple(daemon.compaction_command(None))),
+    (TOKEN_PULL, tuple(daemon.token_pull_command(None, None))),
 ]
 
 # Every current entry exits at the config load in well under a second. The deadline is
@@ -183,6 +190,69 @@ def test_the_compaction_child_inherits_the_daemons_environment(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
     argv = daemon.compaction_command(None)
     child = daemon._spawn_compaction(argv)
+
+    assert calls == [((argv,), {})]
+    assert isinstance(child, FakePopen)
+
+
+@pytest.mark.filterwarnings(RUNPY_WARNING)
+def test_the_pull_entry_reads_the_config_the_daemon_forwards(tmp_path, monkeypatch, capsys):
+    # The forwarding branch of ``token_pull_command``. Both flags belong to the ``pull``
+    # subcommand, so an argv that put them before it would exit 2 on argparse's usage line
+    # rather than on this config, and one that dropped ``--config`` would read the default.
+    given = tmp_path / "given.yaml"
+    argv = daemon.token_pull_command(given, tmp_path / "token.json")
+    with pytest.raises(SystemExit) as exited:
+        run_entry(TOKEN_PULL, argv, monkeypatch)
+
+    assert exited.value.code == 2
+    assert capsys.readouterr().err == f"token_store: config file not found: {given}\n"
+
+
+def test_the_daemon_spawns_the_pull_with_the_bare_argv_or_the_flags_it_was_given():
+    # The bare form is what production runs. The forwarded form puts both flags after
+    # ``pull``, in the order ``token_store``'s parser accepts, and each only when given.
+    assert daemon.token_pull_command(None, None) == [
+        sys.executable,
+        "-m",
+        "lake.token_store",
+        "pull",
+    ]
+    assert daemon.token_pull_command("/c.yaml", None) == [
+        sys.executable,
+        "-m",
+        "lake.token_store",
+        "pull",
+        "--config",
+        "/c.yaml",
+    ]
+    assert daemon.token_pull_command(None, "/t.json") == [
+        sys.executable,
+        "-m",
+        "lake.token_store",
+        "pull",
+        "--token",
+        "/t.json",
+    ]
+
+
+def test_the_pull_child_inherits_the_daemons_environment(monkeypatch):
+    # The copy of the compaction case for the pull's spawn, for the same three reasons. An
+    # ``env`` built here would make the fresh-interpreter case's stand-in false, and one that
+    # left out ``HOME`` would send the child to another config and another ``token.json``.
+    # The fake has no ``wait``, so a spawn that waited on the child, and held the daemon's
+    # loop thread for up to two minutes of SSM retries, fails too. Every keyword is refused,
+    # because ``stdout=subprocess.DEVNULL`` would drop the child's ``token_store:`` line from
+    # the daemon's log, which is the only record of what the pull did.
+    calls = []
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    argv = daemon.token_pull_command(None, None)
+    child = daemon._spawn_token_pull(argv)
 
     assert calls == [((argv,), {})]
     assert isinstance(child, FakePopen)
