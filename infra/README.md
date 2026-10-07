@@ -614,6 +614,9 @@ apply between 09:25 and 16:15 ET on a session day, the window
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
 sets for CI's apply.
 
+Once `infra/live/` describes the VM, a laptop plan also needs the two lines in
+[Add the VM's two lines to `live.tfvars`](#add-the-vms-two-lines-to-livetfvars).
+
 Create a worktree at `main`'s head, from the main checkout.
 
 ```bash
@@ -975,8 +978,8 @@ runs the daemon.
    request's `plan` job refuses, and its red result waits on the owner, since `plan` is
    not a required check. A merge with either one unset applies nothing, because the
    `apply` job's refusal exits before `init`. Re-running that apply after both are set
-   applies. Add the same two values to the laptop's `live.tfvars`, as in
-   [the last subsection](#add-the-vms-two-lines-to-livetfvars), which is still to do.
+   applies. CI reads only the secret and the variable, so nothing else is needed before
+   the first apply.
 4. **Check the account.** The account needs a default VPC with a default subnet in
    `us-east-1c`, and no key pair or security group named `marketlake-vm`.
    [The duplicate-name check](#the-duplicate-name-check) covers the names. This command
@@ -1408,10 +1411,12 @@ the same files should still be there.
 
 ### Add the VM's two lines to `live.tfvars`
 
-A laptop plan of `infra/live/`, as in
-[Apply `infra/live/` from the laptop](#apply-infralive-from-the-laptop), needs the two
-values CI reads from `OWNER_SSH_CIDR` and `SSH_PUBLIC_KEY`. Without them it asks for
-both. Each command appends one line to the file step 4 wrote, and reads its value from
+Only a laptop plan or apply of `infra/live/`, as in
+[Apply `infra/live/` from the laptop](#apply-infralive-from-the-laptop), needs these
+lines. CI reads the same two values from `OWNER_SSH_CIDR` and `SSH_PUBLIC_KEY`, so they
+are no step before the first apply. Without them a laptop plan asks for both. The owner
+added both lines on 2026-10-07, so this applies only to a new laptop or a changed
+address. Each command appends one line to the file step 4 wrote, and reads its value from
 the network or the key file, so the address never appears on screen.
 
 ```bash
