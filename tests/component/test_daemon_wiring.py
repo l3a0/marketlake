@@ -1693,14 +1693,15 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("error_class", "title"),
+    ("error_class", "title", "hour", "since"),
     [
-        ("http_429", "Capture down: rate limited"),
-        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead"),
+        # An afternoon outage reads on the 24-hour clock, so 14:00 never reads as 02:00.
+        ("http_429", "Capture down: rate limited", 13, "14:00"),
+        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead", 9, "10:00"),
     ],
 )
 def test_every_cause_page_dates_itself_and_names_the_dead_man_page_to_come(
-    error_class, title, tmp_path
+    error_class, title, hour, since, tmp_path
 ):
     """The design's message table pins the time and the follow-on line on both causes.
 
@@ -1709,14 +1710,14 @@ def test_every_cause_page_dates_itself_and_names_the_dead_man_page_to_come(
     from the page, not from the title or the class, so each cause is driven to the wire.
     """
     rig = _rig(tmp_path)
-    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    clock = ManualClock(start=et(2026, 9, 2, hour, 59, 30))
     _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock, error_class))
 
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
     assert page.title == title
     assert page.body == (
-        f"3 session minutes without a durable cycle since 10:00 ET, failing with {error_class},"
+        f"3 session minutes without a durable cycle since {since} ET, failing with {error_class},"
         " one page for 2 surfaces. Expect Capture dead-man is DOWN in about 5 min:"
         " same outage."
     )
