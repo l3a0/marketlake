@@ -1772,6 +1772,102 @@ def test_a_read_that_decodes_fewer_rows_than_its_groups_hold_is_refused(
     )
 
 
+def test_an_os_error_raised_by_the_decode_names_the_file_and_keeps_its_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Every error class the decode raises is renamed, not only ``ArrowInvalid``.
+
+    A truncated or unreadable file raises ``OSError`` from ``iter_batches``, and
+    ``OSError`` is not a ``ValueError``. A re-raise that caught only ``ValueError`` would
+    pass every footer test above and let this one through without the path.
+    """
+    path = tmp_path / "plain.parquet"
+    pq.write_table(pa.table({"a": [1, 2, 3, 4]}), path, row_group_size=2)
+
+    def broken(self, *args, **kwargs):
+        raise OSError("Couldn't deserialize thrift")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", broken)
+
+    with pytest.raises(OSError) as caught:
+        loader._read(path, filters=ds.field("a") > 1)
+
+    assert type(caught.value) is OSError
+    assert str(caught.value).startswith(f"{path}: ")
+
+
+def test_a_file_truncated_after_its_footer_is_read_raises_rather_than_reading_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The decode reads through the handle that read the footer, and a short file raises.
+
+    The file is cut to half its size after the footer is parsed and before the decode
+    begins. ``pa.OSFile`` reads the bytes from disk at each call, so the decode finds the
+    file too short and raises ``OSError``. A memory-mapped handle returned 1 row and no
+    error for the same cut, which ``_read``'s docstring records among its rejected
+    alternatives.
+    """
+    rows = 200_000
+    path = tmp_path / "truncated.parquet"
+    pq.write_table(
+        pa.table({"a": list(range(rows)), "b": [str(i) for i in range(rows)]}),
+        path,
+        row_group_size=50_000,
+    )
+    real = pq.ParquetFile.iter_batches
+
+    def truncating(self, *args, **kwargs):
+        with open(path, "r+b") as handle:
+            handle.truncate(path.stat().st_size // 2)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", truncating)
+
+    with pytest.raises(OSError):
+        loader._read(path, filters=ds.field("a") >= 0)
+
+
+def test_a_projected_read_that_keeps_no_row_returns_the_file_metadata(tmp_path: Path):
+    """An empty answer carries the file's schema metadata, as ``pq.read_table``'s does.
+
+    A read that keeps no batch builds its table from the schema it projected, so a
+    projection that dropped the metadata would return an empty table no caller could tell
+    from the file's own, except by its metadata.
+    """
+    path = tmp_path / "labelled.parquet"
+    table = pa.table({"a": [1, 2, 3, 4], "b": ["w", "x", "y", "z"]})
+    pq.write_table(table.replace_schema_metadata({b"k": b"v"}), path, row_group_size=2)
+
+    empty = loader._read(path, columns=["a"], filters=ds.field("a") > 99)
+
+    assert empty.num_rows == 0
+    assert empty.schema.metadata == {b"k": b"v"}
+    assert empty.schema.equals(pq.read_table(path, columns=["a"]).schema, check_metadata=True)
+
+
+def test_a_read_that_names_its_columns_ignores_a_name_held_twice_elsewhere(tmp_path: Path):
+    """Only a read of every column refuses a schema that holds a name twice.
+
+    ``pq.read_table`` answers a read of ``a`` from a file holding ``b`` twice, because it
+    looks up only the names it was given. A read that checked every name on every read
+    would refuse what ``pq.read_table`` answers.
+    """
+    path = tmp_path / "doubled.parquet"
+    pq.write_table(
+        pa.Table.from_arrays(
+            [pa.array([1, 2]), pa.array([3, 4]), pa.array([5, 6])], names=["a", "b", "b"]
+        ),
+        path,
+    )
+    expected = pq.read_table(path, columns=["a"], filters=ds.field("a") > 1)
+
+    table = loader._read(path, columns=["a"], filters=ds.field("a") > 1)
+
+    assert table.equals(expected)
+    assert table.column("a").to_pylist() == [2]
+
+
 # -- resolving the lake root -------------------------------------------------
 
 

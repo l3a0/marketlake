@@ -137,9 +137,10 @@ is authoritative for this, and it replaced a single read of every column and eve
    ``row_kind``. The predicate is evaluated over every row, so the pass still sees the
    whole session, and it keeps only the rows the resolution reads. On a chains partition
    that is about 13,000 rows of a day's million.
-2. *The fetch pass* reads the rows the resolve pass chose. It names them to Parquet as a
-   predicate rather than filtering after the fact, so the reader skips what it can prove it
-   does not need.
+2. *The fetch pass* reads the rows the resolve pass chose. It hands them to Parquet as a
+   predicate, which chooses the row groups to decode by their statistics, so the read skips
+   every group it can prove holds none of them. ``_read`` then filters each batch it
+   decodes from the groups it kept.
 
 Four answers therefore stay settled over the whole session, exactly as they were when the
 read pulled every column.
@@ -1988,7 +1989,7 @@ def _read(
        which ``_named_field`` says more about. A read of every column names none, so it
        refuses a schema that holds any name twice, which ``_check_unique_names`` does.
 
-    Six alternatives were measured and rejected.
+    Seven alternatives were measured and rejected.
 
     1. Opening the path twice, once to prune and once to decode. When the file was
        replaced between the opens, the read applied one file's row-group numbers to
@@ -2011,6 +2012,10 @@ def _read(
     6. A resolve pass that reads with ``pq.ParquetFile`` directly. It answered both
        resolutions, but a test's recorder no longer saw the resolve pass, four tests
        failed, and this function would stop being every read of rows this module makes.
+    7. Decoding the predicate's columns first and then fetching only the rows they match.
+       pyarrow has no row-selective read, so the fetch still decoded every page of every
+       column in the groups it kept. It peaked at 613 MiB or more on SPY 2026-09-24, and
+       its third ``_read`` call broke the tests whose recorder counts two calls.
     """
     if filters is None:
         return pq.read_table(path, columns=columns)

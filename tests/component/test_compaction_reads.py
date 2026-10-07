@@ -27,7 +27,8 @@ These cover:
    every group.
 2. A footer that renames a column, stores a chunk under the wrong physical type, or
    declares a chunk one value short raises the same way, though every page decodes and
-   the count matches.
+   the count matches. The message names the row group that holds the damage, and a
+   chunk's type before its value count.
 3. The verify's and the re-tune's peak Arrow memory stay under fixed bounds on a
    400,000-row day, which decoding the whole file at once exceeds by an order of
    magnitude.
@@ -47,6 +48,7 @@ from __future__ import annotations
 import random
 from datetime import date, datetime, time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -79,6 +81,7 @@ from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake
 from tests.support.memory import measured
 from tests.support.pinger import FakePinger
+from tests.unit.test_parquet_footer import fake_footer
 
 # The profile columns, spelled here rather than read from ``compact`` so the reference
 # read below does not move with the code under test.
@@ -362,7 +365,8 @@ def test_a_footer_that_disagrees_with_the_write_raises_and_manifests_nothing(
     2. A chunk stored under a physical type the schema does not name is refused by a
        whole-table read.
     3. A chunk declaring one value short of its row group is refused by a whole-table
-       read, the loader's included.
+       read. The loader's filtered read decodes in batches and trusts the count, so it
+       checks the same rule after its decode, through ``lake.parquet_footer``.
 
     The chunk-type case writes three row groups, because a batched read of a single group
     refuses that chunk on its own.
@@ -417,6 +421,44 @@ def test_each_footer_rewrite_passes_a_batched_count(tmp_path, case):
     else:
         with pytest.raises(pa.ArrowInvalid, match="named bid expected length 3 but got length 2"):
             pq.read_table(path, use_threads=False)
+
+
+def _reader_of(metadata) -> tuple[SimpleNamespace, pa.Schema]:
+    """A re-read file whose schema matches the write, carrying the footer ``metadata``."""
+    schema = pa.schema([("a", pa.int64())])
+    return SimpleNamespace(schema_arrow=schema, metadata=metadata), schema
+
+
+def test_the_verify_names_the_row_group_whose_count_disagrees():
+    """A count that disagrees in the second row group is named as row group 1.
+
+    The verify checks each chunk on its own, so the group it names is the one that holds
+    the damage. A check of one column over every group at once would find the same damage
+    while looking at group 0, and name group 0.
+    """
+    metadata = fake_footer(
+        [(3, [("INT64", 3), ("INT64", 3)]), (3, [("INT64", 3), ("INT64", 2)])],
+        [("INT64", 0), ("INT64", 0)],
+    )
+    reader, written = _reader_of(metadata)
+
+    said = compact._footer_disagreement(reader, written)
+
+    assert said == "row group 1 declares 2 values in c1 for 3 rows"
+
+
+def test_the_verify_names_a_chunk_type_before_its_value_count():
+    """One chunk stored as the wrong type and one value short is named by its type.
+
+    The type is checked first in each chunk, so the message names the rule a whole-table
+    read refuses on first, and the one a filtered read can abort the process over.
+    """
+    metadata = fake_footer([(3, [("FLOAT", 2)])], [("DOUBLE", 0)])
+    reader, written = _reader_of(metadata)
+
+    said = compact._footer_disagreement(reader, written)
+
+    assert said == "row group 0 stores c0 as FLOAT, but the schema says DOUBLE"
 
 
 # -- 3. the verify and the re-tune hold one batch at a time ------------------
