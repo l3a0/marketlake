@@ -1908,6 +1908,68 @@ def test_a_chain_alternating_a_401_and_an_empty_answer_does_not_re_page_the_caus
     }
 
 
+def test_one_surface_landing_data_releases_a_write_failure_from_the_cause():
+    """A single surface landing data proves the vendor answered.
+
+    Only SPY chains lands in the healed minute, while QQQ chains still fails its write.
+    A guard that asked for more than one landed surface would keep the write failure
+    inside the token-dead cause, and it would never page for itself.
+    """
+    cycles = [
+        _cycle(_fail("chains", "SPY", "http_401"), errors=(WRITE_FAILED,), at=_at(minute))
+        for minute in range(3)
+    ] + [_cycle(_seg("chains", "SPY", "data"), errors=(WRITE_FAILED,), at=_at(3))]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [(QQQ_CHAINS, "os_error")],
+    }
+
+
+def test_a_surface_that_lands_data_leaves_every_cause_that_holds_it():
+    """A release reaches a later cause even when an earlier cause no longer holds the surface.
+
+    SPY chains left the token-dead cause when it landed at minute 3, and then joined the
+    rate-limited cause. Stopping at the first cause that does not hold it would keep it in
+    the rate-limited cause after it lands again, so that cause would never re-arm.
+    """
+    a, b = ("chains", "SPY"), ("quotes", "SPY")
+
+    def minute(n: int, a_state: str | None, b_state: str | None) -> CycleResult:
+        def one(key, state):
+            return _seg(*key, "data") if state is None else _fail(*key, state)
+
+        return _cycle(one(a, a_state), one(b, b_state), at=_at(n))
+
+    watchdog = Watchdog()
+    for n in range(3):
+        watchdog.observe(minute(n, "http_401", "http_401"))
+    watchdog.observe(minute(3, None, "http_401"))
+    for n in range(4, 7):
+        watchdog.observe(minute(n, "http_429", "http_429"))
+    assert watchdog._paged_causes == {
+        TOKEN_DEAD_TITLE: {Surface(*b)},
+        "Capture down: rate limited": {Surface(*a), Surface(*b)},
+    }
+    watchdog.observe(minute(7, None, "http_429"))
+    assert watchdog._paged_causes == {
+        TOKEN_DEAD_TITLE: {Surface(*b)},
+        "Capture down: rate limited": {Surface(*b)},
+    }
+
+
+def test_a_cycle_that_touched_nothing_releases_no_cause():
+    """A cycle with no surface in it is evidence about no surface.
+
+    Treating every held surface as retired in that cycle would empty the token-dead cause,
+    and the 401s that follow would page the dead token a second time.
+    """
+    watchdog = Watchdog()
+    cycles = [_write_failing(minute, "http_401") for minute in range(3)]
+    cycles.append(_cycle(at=_at(3)))
+    cycles += [_write_failing(minute, "http_401") for minute in range(4, 7)]
+    assert _per_minute(watchdog, cycles) == {2: [(TOKEN_DEAD_TITLE, "http_401")]}
+
+
 # -- the whole-daemon rule as one public reading (marketlake #702) ---------------------
 
 # Each case is one cycle, and the cause title the rule gives it. The daemon spawns a token
