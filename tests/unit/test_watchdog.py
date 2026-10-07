@@ -1700,6 +1700,70 @@ def test_a_cause_page_is_dated_from_the_death_not_from_one_surface_failing_befor
     assert len(raised) == 2
 
 
+def test_a_cause_that_turns_unanimous_late_is_dated_from_the_first_dead_minute():
+    """The page counts the minutes every surface was down, not the threshold.
+
+    For four minutes the chains fail with ``http_401`` and the quotes with
+    ``vendor_auth_error``. Every surface is down, but two classes are not one cause, so no
+    cause page fires. On the fifth minute both agree. The outage began at 10:00, and the
+    page has to say five minutes since then rather than three minutes counted back from
+    the slot that tipped it (marketlake #747).
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(4):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("quotes", "SPY", "vendor_auth_error"),
+                at=_at(minute),
+            )
+        )
+    assert "Capture down: token dead" not in [page.title for page in raised]
+    raised += watchdog.observe(
+        _cycle(_fail("chains", "SPY", "http_401"), _fail("quotes", "SPY", "http_401"), at=_at(4))
+    )
+    cause = raised[-1]
+    assert (cause.title, cause.minutes, cause.since) == ("Capture down: token dead", 5, _at(0))
+
+
+def test_a_surface_whose_write_failed_still_dates_the_cause():
+    """The smallest count is taken over every failed surface, written or not.
+
+    The chains fail with ``http_401`` for eight minutes. The quotes land data for the first
+    five, then their segment write fails for three, so they record no class. The outage
+    that starves the dead-man began at 10:05, when the quotes stopped landing. Taking the
+    smallest count over only the surfaces that recorded a class would date it from 10:00.
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(5):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"), _seg("quotes", "SPY", "data"), at=_at(minute)
+            )
+        )
+    for minute in range(5, 8):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                errors=(SegmentError("quotes", "SPY", "os_error"),),
+                at=_at(minute),
+            )
+        )
+    cause = raised[-1]
+    assert (cause.title, cause.minutes, cause.since) == ("Capture down: token dead", 3, _at(5))
+
+
+def test_a_cause_page_under_a_lower_threshold_is_dated_from_the_first_dead_minute():
+    """At a threshold of 2 the page fires on the second dead minute and dates from the first."""
+    watchdog = Watchdog(page_minutes=2)
+    raised = []
+    for minute in range(2):
+        raised += watchdog.observe(_roster_401(minute))
+    assert [(page.minutes, page.since) for page in raised] == [(2, _at(0))]
+
+
 def test_a_chain_that_answered_empty_leaves_only_its_own_surface_in_the_cause():
     """The release is the surface's own, and the cause keeps the surfaces still down."""
     watchdog = Watchdog()
