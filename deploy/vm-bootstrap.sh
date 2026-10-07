@@ -25,8 +25,9 @@
 #      to the owner and grows the filesystem to the volume's size;
 #   8. installs the pinned uv as the owner when the installed one differs;
 #   9. runs deploy/linux-install.sh, retrying a transient failure;
-#  10. after the install returns, takes the install lock and, holding it, renders
-#      config.yaml, pulls the Schwab token and applies the roster, each as the owner.
+#  10. after the install returns, renders config.yaml, pulls the Schwab token and
+#      applies the roster, each as the owner and in that order. Each attempt holds the
+#      install lock, and the wait before a retry does not.
 #
 # Every disk step and the install stop the run at once with one line, because a later
 # step on a wrong disk would write the lake where nothing keeps it. A failure in step 10
@@ -265,8 +266,12 @@ fi
 LINE="UUID=$UUID $LAKE_ROOT ext4 defaults,nofail 0 2"
 CURRENT=""
 if [[ -f "$FSTAB" ]]; then
-  # The x keeps any trailing newline, which a command substitution would strip.
-  CURRENT="$(cat -- "$FSTAB"; printf x)"
+  # The x keeps any trailing newline, which a command substitution would strip. The &&
+  # makes a failed read fail the substitution. Joined by ; the status would be printf's,
+  # and an unread fstab would be rewritten holding only the lake's line.
+  if ! CURRENT="$(cat -- "$FSTAB" && printf x)"; then
+    stop "could not read $FSTAB, so it is unchanged"
+  fi
   CURRENT="${CURRENT%x}"
 fi
 DESIRED=""
@@ -285,6 +290,22 @@ if [[ -z "${CURRENT%$'\n'}" ]]; then
   DESIRED=""
 fi
 DESIRED="$DESIRED$LINE"$'\n'
+# findmnt --verify accepts a file holding only the lake's line, so this check is what
+# keeps a rewrite from dropping the root entry and the next boot with it.
+HAS_ROOT=0
+while IFS= read -r line; do
+  read -r first second _ <<< "$line" || true
+  case "${first:-}" in
+    \#*) ;;
+    *)
+      if [[ "${second:-}" == / ]]; then
+        HAS_ROOT=1
+      fi ;;
+  esac
+done <<< "$DESIRED"
+if [[ $HAS_ROOT == 0 ]]; then
+  refuse "$FSTAB has no entry for /, so it is not rewritten and nothing is installed"
+fi
 if [[ "$DESIRED" == "$CURRENT" ]]; then
   say "$FSTAB already mounts the lake volume at $LAKE_ROOT"
 else
@@ -355,10 +376,12 @@ if [[ "${HAVE:-}" == "$UV_VERSION" ]]; then
 else
   # Downloaded first rather than piped into sh, so a cut-off download never runs half a
   # script. sudo's env_reset would drop UV_NO_MODIFY_PATH set before sudo, so env sets it
-  # after.
+  # after. --retry alone skips a failed DNS lookup (exit 6) and a refused connection
+  # (exit 7), and curl 8.5 has no flag for DNS alone, so --retry-all-errors retries
+  # every failure, still at most 5 times.
   say "installing uv $UV_VERSION as $OWNER"
   INSTALLER="$(mktemp)" || stop "could not create a temporary file for the uv installer"
-  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 5 -o "$INSTALLER" \
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-all-errors -o "$INSTALLER" \
       "https://astral.sh/uv/$UV_VERSION/install.sh"; then
     rm -f -- "$INSTALLER"
     stop "could not download the uv $UV_VERSION installer, so nothing is installed"
@@ -399,18 +422,55 @@ done
 
 # Exits 1 and 3 are retried: 3 is credentials the metadata service does not serve yet,
 # and 1 covers a network failure and an AccessDenied while a fresh IAM change spreads.
-# Exit 2 is a refusal. Six tries 20 seconds apart keep both steps together well under
-# the 600 seconds another install waits for the lock this holds.
+# Exit 2 is a refusal.
+#
+# The lock is taken around each attempt, never across the retries, and the 20-second
+# wait runs without it. One attempt against an endpoint that hangs takes about 120
+# seconds: three botocore attempts, each a 10-second connect timeout and a 30-second
+# read timeout. So the lock is held about 120 seconds at a time, under the 600 seconds
+# another install waits for it with flock -w 600. Held across six tries of both steps,
+# it could stay taken about 1,640 seconds.
+#
+# The lock is taken only after the install returns, because the install takes the same
+# lock with flock -w 600, so holding it across the install would make the install wait
+# ten minutes and refuse.
 STEP_TRIES=6
+LOCK_WAIT=600
+mkdir -p "$(dirname "$LOCK")"
+
+# Runs one command holding the install lock, with stdin from the file the first argument
+# names, or the script's own stdin when it is empty. Closing the descriptor releases the
+# lock. HELD reads 0 when another run held the lock for the whole wait, and the command
+# never ran.
+HELD=0
+locked() {
+  local input="$1" rc=0
+  shift
+  HELD=0
+  exec 9>"$LOCK" || stop "could not open the install lock $LOCK"
+  if ! flock -w "$LOCK_WAIT" 9; then
+    exec 9>&-
+    return 1
+  fi
+  HELD=1
+  if [[ -n "$input" ]]; then
+    "$@" < "$input" || rc=$?
+  else
+    "$@" || rc=$?
+  fi
+  exec 9>&-
+  return "$rc"
+}
+
 retried() {
   local label="$1" input="$2" attempt=1 rc
   shift 2
   while :; do
     rc=0
-    if [[ -n "$input" ]]; then
-      as_owner "$PYTHON" "$@" < "$input" || rc=$?
-    else
-      as_owner "$PYTHON" "$@" || rc=$?
+    locked "$input" as_owner "$PYTHON" "$@" || rc=$?
+    if [[ $HELD == 0 ]]; then
+      fail "another run held $LOCK for $LOCK_WAIT seconds, so $label is skipped"
+      return 1
     fi
     case "$rc" in
       0)
@@ -430,31 +490,25 @@ retried() {
   done
 }
 
-# Only after the install returns: the install takes the same lock with flock -w 600, so
-# holding it across the install would make the install wait ten minutes and refuse.
-say "taking the install lock $LOCK"
-mkdir -p "$(dirname "$LOCK")"
-exec 9>"$LOCK"
-if ! flock -w 600 9; then
-  fail "another run held $LOCK for 600 seconds, so config.yaml, the token and the roster are skipped"
-else
-  say "rendering config.yaml as $OWNER"
-  if retried "the config render" "$VM_YAML" -m lake.vm_config render; then
-    # The pull reads config.yaml, so it runs only after a render that succeeded.
-    say "pulling the Schwab token as $OWNER"
-    retried "the token pull" "" -m lake.token_store pull \
-      --token "$OWNER_HOME/.config/marketlake/token.json" || true
-    # The roster needs config.yaml but not the token. A refusal, such as a primary whose
-    # lake is not restored yet, prints its own line and leaves the rest of the run alone.
-    say "applying the roster as $OWNER"
-    roster_rc=0
-    as_owner "$PYTHON" -m lake.roster apply < "$CHECKOUT/config/tickers.yaml" || roster_rc=$?
-    if [[ $roster_rc != 0 ]]; then
-      fail "the roster apply exited $roster_rc"
-    fi
-  else
-    fail "the token pull and the roster are skipped, because both read config.yaml"
+say "rendering config.yaml as $OWNER, holding the install lock $LOCK"
+if retried "the config render" "$VM_YAML" -m lake.vm_config render; then
+  # The pull reads config.yaml, so it runs only after a render that succeeded.
+  say "pulling the Schwab token as $OWNER"
+  retried "the token pull" "" -m lake.token_store pull \
+    --token "$OWNER_HOME/.config/marketlake/token.json" || true
+  # The roster needs config.yaml but not the token. A refusal, such as a primary whose
+  # lake is not restored yet, prints its own line and leaves the rest of the run alone.
+  say "applying the roster as $OWNER"
+  roster_rc=0
+  locked "$CHECKOUT/config/tickers.yaml" as_owner "$PYTHON" -m lake.roster apply \
+    || roster_rc=$?
+  if [[ $HELD == 0 ]]; then
+    fail "another run held $LOCK for $LOCK_WAIT seconds, so the roster apply is skipped"
+  elif [[ $roster_rc != 0 ]]; then
+    fail "the roster apply exited $roster_rc"
   fi
+else
+  fail "the token pull and the roster are skipped, because both read config.yaml"
 fi
 
 if [[ $FAILED != 0 ]]; then

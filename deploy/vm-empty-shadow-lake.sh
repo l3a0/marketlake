@@ -9,7 +9,7 @@
 # a lake that is not empty. This is the only deliberate delete of lake data in the
 # restore steps, and after the cutover the same VM runs as primary, where emptying the
 # lake would delete every minute since the last nightly upload. So it refuses unless all
-# three of these hold:
+# four of these hold:
 #
 #   1. the lake volume named by LAKE_VOLUME_ID in /etc/marketlake/bootstrap.conf is the
 #      filesystem mounted at lake_root, proven by its UUID as vm-bootstrap.sh proves it;
@@ -17,7 +17,10 @@
 #      shadow. An absent file, a file that does not parse and a missing key all refuse,
 #      since an absent role means primary;
 #   3. every loaded com.marketlake.* unit, timers included, is inactive or failed. A
-#      waiting timer counts as active.
+#      waiting timer counts as active;
+#   4. nothing is mounted below lake_root. rm --one-file-system stays out of a mount it
+#      meets while descending, but it empties an entry it was handed that is itself a
+#      mount point.
 #
 # It holds /run/marketlake-install.lock without waiting across the checks and the delete,
 # so a bootstrap or a deploy cannot start units halfway through. Then it removes every
@@ -207,6 +210,16 @@ while read -r unit _load active _ || [[ -n "${unit:-}" ]]; do
 done <<< "$UNITS"
 if [[ -n "$RUNNING" ]]; then
   refuse "these units are not stopped:$RUNNING. Stop every com.marketlake.* unit first, so nothing is deleted"
+fi
+
+# -- 4. nothing is mounted below the lake root -----------------------------------------
+
+# findmnt -R prints the lake root's own line, then one line for each mount below it.
+if ! TARGETS="$(findmnt -n -R -o TARGET "$LAKE_ROOT")"; then
+  refuse "findmnt could not list the mounts at $LAKE_ROOT, so nothing is deleted"
+fi
+if [[ "$TARGETS" != "$LAKE_ROOT" ]]; then
+  refuse "something is mounted below $LAKE_ROOT, so nothing is deleted. Unmount it first"
 fi
 
 # -- the delete ------------------------------------------------------------------------

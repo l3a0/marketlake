@@ -529,6 +529,41 @@ def test_the_line_is_keyed_on_the_mount_point(vm):
     assert "systemctl daemon-reload" in vm.calls()
 
 
+def test_an_unreadable_fstab_stops_and_is_never_rewritten(vm):
+    proc = vm.bootstrap(CAT_FAIL=str(vm.fstab))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"could not read {vm.fstab}" in _one_line(proc, "vm-bootstrap: ")
+    assert vm.fstab.read_text() == ROOT_LINE
+    assert sorted(path.name for path in vm.fstab.parent.iterdir()) == ["fstab", "marketlake"]
+    assert not [line for line in vm.calls() if line.startswith("findmnt --verify")]
+    assert not vm.ran("systemctl")
+    _assert_nothing_installed(vm)
+
+
+@pytest.mark.parametrize(
+    "fstab",
+    # With no space after the #, the commented line's second field is /, so only the
+    # comment rule keeps it from counting.
+    [None, "", "/swap.img none swap sw 0 0\n", "#LABEL=cloudimg-rootfs / ext4 defaults 0 1\n"],
+    ids=["missing", "empty", "no root line", "a commented root line"],
+)
+def test_an_fstab_with_no_root_entry_is_refused(vm, fstab):
+    if fstab is None:
+        vm.fstab.unlink()
+    else:
+        vm.fstab.write_text(fstab)
+    proc = vm.bootstrap()
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "has no entry for /" in _one_line(proc, "vm-bootstrap: ")
+    if fstab is None:
+        assert not vm.fstab.exists()
+    else:
+        assert vm.fstab.read_text() == fstab
+    assert not [line for line in vm.calls() if line.startswith("findmnt --verify")]
+    assert not vm.ran("systemctl")
+    _assert_nothing_installed(vm)
+
+
 def test_an_identical_fstab_is_not_rewritten(vm):
     vm.ext4()
     vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
@@ -582,7 +617,7 @@ def test_uv_is_installed_when_the_version_differs(vm, installed):
     [curl] = vm.ran("curl")
     installer = curl.split(" -o ")[1].split()[0]
     assert curl == (
-        f"curl --proto =https --tlsv1.2 -fsSL --retry 5 -o {installer}"
+        f"curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-all-errors -o {installer}"
         f" https://astral.sh/uv/{UV_VERSION}/install.sh"
     )
     assert f"sudo -u {OWNER} -H env UV_NO_MODIFY_PATH=1 sh {installer}" in vm.calls()
@@ -613,8 +648,28 @@ def test_the_lock_is_taken_only_after_the_install_returns(vm):
     lock = vm.index("flock -w 600 9")
     render = vm.index("venv-python -m lake.vm_config render")
     assert install < lock < render
-    assert vm.ran("flock") == ["flock -w 600 9"]
+    # One lock for each of the render, the pull and the roster.
+    assert vm.ran("flock") == ["flock -w 600 9"] * 3
     assert vm.lock.exists()
+
+
+def test_each_attempt_takes_the_lock_and_the_wait_runs_without_it(vm):
+    proc = vm.bootstrap(RENDER_RCS="3 1 0", PULL_RCS="1 0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The fake sleep marks a wait that inherits the lock's open descriptor, so a lock
+    # held across the retries shows in its line.
+    steps = [line for line in vm.calls() if line.startswith(("flock", "sleep", "venv-python -m"))]
+    render = "venv-python -m lake.vm_config render"
+    pull = f"venv-python -m lake.token_store pull --token {vm.home}/.config/marketlake/token.json"
+    lock = "flock -w 600 9"
+    assert steps == [
+        lock, render, "sleep 20",
+        lock, render, "sleep 20",
+        lock, render,
+        lock, pull, "sleep 20",
+        lock, pull,
+        lock, "venv-python -m lake.roster apply",
+    ]  # fmt: skip
 
 
 def test_a_transient_install_failure_is_retried(vm):
@@ -794,6 +849,7 @@ def test_the_empty_script_keeps_only_lost_and_found(vm):
     assert vm.index("flock -n 9") < calls.index(rm)
     assert f"blkid -p -s UUID -o value {vm.device}" in calls
     assert "systemctl list-units --all --no-legend --plain com.marketlake.*" in calls
+    assert calls.index(f"findmnt -n -R -o TARGET {LAKE_ROOT}") < calls.index(rm)
 
 
 def _no_uuid_anywhere(vm: VM) -> None:
@@ -823,7 +879,14 @@ EMPTY_REFUSALS = [
     ("a timer", lambda vm: _start(vm, "com.marketlake.sunday.timer"), {}, "not stopped"),
     ("lock held", lambda vm: None, {"FLOCK_RC": "1"}, "another run holds"),
     ("list fails", lambda vm: None, {"LIST_UNITS_RC": "1"}, "list-units failed"),
+    ("a submount", lambda vm: _submount(vm), {}, "is mounted below"),
+    ("tree fails", lambda vm: None, {"FINDMNT_TREE_RC": "1"}, "could not list the mounts"),
 ]
+
+
+def _submount(vm: VM) -> None:
+    """Mount something at one of the lake's top-level entries."""
+    (vm.state / "submounts").write_text(f"{LAKE_ROOT}/segments\n")
 
 
 def _role(vm: VM, text: str | None) -> None:
