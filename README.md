@@ -515,8 +515,15 @@ the linter and the test suite.
 uv sync
 uv run ruff check
 uv run ruff format --check
-uv run pytest
+uv run pytest -n 8
 ```
+
+`-n 8` spreads the suite across eight worker processes with
+[pytest-xdist](https://pytest-xdist.readthedocs.io/), which cuts a run of about four
+minutes to under a minute and a half on the development laptop. Leave `-n` off when
+running a single file or test, as in `uv run pytest tests/unit/test_clock_wait.py`.
+Starting the workers costs 2 to 3 seconds, so a small run gains almost nothing. CI runs
+the suite with `-n auto`, one worker per core on its runner.
 
 The infrastructure under `infra/` needs OpenTofu, and applying it needs the AWS CLI. Both
 come from Homebrew.
