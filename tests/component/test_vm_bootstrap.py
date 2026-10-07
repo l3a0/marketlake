@@ -392,10 +392,11 @@ def test_a_volume_that_may_hold_a_lake_is_never_formatted(vm, probe, magic, env,
     line = _one_line(proc, "vm-bootstrap: ")
     assert message in line
     if magic is not None:
-        assert "a damaged lake or an interrupted mkfs. Nothing was formatted." in line
-        assert line.endswith(
-            f"read-only with: dumpe2fs -h -o superblock=32768 -o blocksize=4096 {vm.device}"
+        assert (
+            "a damaged lake, an interrupted mkfs, or a chance match on a fresh volume."
+            " Nothing was formatted." in line
         )
+        assert line.endswith(f"Check it read-only with: e2fsck -n {vm.device}")
     assert not vm.ran("mkfs.ext4")
     assert not vm.ran("systemctl start")
     assert vm.fstab.read_text() == ROOT_LINE

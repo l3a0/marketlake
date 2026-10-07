@@ -1396,7 +1396,7 @@ Each failure prints one line naming the step, and the exit code says how the run
    1. The volume holds something other than ext4.
    2. A read of 4 KiB block 0 or 32768 failed or came back short.
    3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
-      line prints a read-only `dumpe2fs` command, and
+      line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
 3. Exit 1 covers every other failure. A disk step or the install that fails stops the
@@ -1456,39 +1456,58 @@ git clone --branch main https://github.com/l3a0/marketlake.git ~/marketlake
 sudo ~/marketlake/deploy/vm-bootstrap.sh
 ```
 
+A clone cut off partway can leave `~/marketlake` with no valid `HEAD`, and then the
+clone refuses because the directory exists. When
+`git -C ~/marketlake rev-parse --verify HEAD` fails, delete `~/marketlake` and clone
+again.
+
 #### When the lake volume holds an unreadable ext4
 
 The bootstrap refuses with exit 2 when `blkid` finds no filesystem on the lake volume but
-an ext4 superblock sits in 4 KiB block 0 or 32768. Either the volume holds a lake whose
-primary superblock is damaged, or an earlier `mkfs` on it was interrupted. The bootstrap
-has no override for this, so tell the two apart by hand. Read group 1's backup
-superblock, read-only, on the device the bootstrap's line names.
+the ext4 magic sits in 4 KiB block 0 or 32768. The refusal names the block and the
+device. Three things leave a volume that way.
+
+1. A lake whose primary superblock is damaged.
+2. An earlier `mkfs` that was interrupted after it wrote the backup superblocks.
+   `ext2fs_flush` writes the backups before the primary.
+3. A chance match in a fresh volume's random content, about once in 32,768 volumes.
+
+Never run `mkfs.ext4` on this volume, because it erases the volume. The first two
+causes hold an ext4 that `e2fsck` can repair. Check the volume read-only first. `-n`
+opens it read-only and answers no to every question.
 
 ```bash
-sudo dumpe2fs -h -o superblock=32768 -o blocksize=4096 <dev>
+sudo e2fsck -n <dev>
 ```
 
-Read its `Filesystem created:` line, and compare it with the first line of
-`/var/log/cloud-init-output.log`, which marks this instance's first boot. Do not read
-`Last mount time:`, because the kernel updates only the primary superblock on a mount.
+When the primary superblock has a bad magic, fails its checksum or is corrupt, `e2fsck`
+looks for group 1's backup on its own and prints `Superblock invalid, trying backup
+blocks...`. It skips that search when the primary fails in other ways, such as a
+revision too high to read. So read the backup directly as well.
 
-1. **Created before this instance launched.** The volume holds a lake. Repair the primary
-   superblock from the backup, then rerun the bootstrap.
+```bash
+sudo e2fsck -n -b 32768 -B 4096 <dev>
+```
+
+1. **Either check finds a filesystem.** It runs its passes, starting with
+   `Pass 1: Checking inodes, blocks, and sizes`, and lists what it would fix. The volume
+   holds ext4, a damaged lake or an interrupted `mkfs`. Repair the primary from group 1's
+   backup, then rerun the bootstrap.
 
    ```bash
    sudo e2fsck -b 32768 -B 4096 <dev>
    ```
 
-2. **Created during this boot.** An `mkfs` on an empty volume was interrupted.
-   `ext2fs_flush` writes the backups before the primary, so the backup can exist without
-   the primary. Run the `mkfs.ext4` line in `deploy/vm-bootstrap.sh` by hand on `<dev>`,
-   then rerun the bootstrap. Take the flags from the script rather than from here, so
-   the two cannot drift apart.
+2. **Both checks find none.** Each prints that the superblock could not be read or does
+   not describe a valid ext2/ext3/ext4 filesystem. The bytes the guard matched describe no
+   ext4 that `e2fsck` can open, which on a fresh volume is the chance match. Only then
+   clear the block the refusal named, then rerun the bootstrap. This writes 4 KiB of zeros
+   to the volume. If the volume is known to have held a lake, stop and investigate
+   instead.
 
-A clone cut off partway can leave `~/marketlake` with no valid `HEAD`, and then the
-clone refuses because the directory exists. When
-`git -C ~/marketlake rev-parse --verify HEAD` fails, delete `~/marketlake` and clone
-again.
+   ```bash
+   sudo dd if=/dev/zero of=<dev> bs=4096 seek=<block> count=1 conv=fsync
+   ```
 
 ### Restore the lake
 

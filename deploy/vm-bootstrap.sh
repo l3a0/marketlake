@@ -237,12 +237,13 @@ else
     say "the lake volume holds an ext4 filesystem, so it mounts without formatting"
   elif [[ $probe_rc == 2 ]]; then
     # An ext4 superblock holds the magic 53 ef at offset 0x38. Two reads look for it,
-    # each of one 4 KiB block given as block:offset. The primary sits at byte 1080 of
-    # block 0. Group 1's backup starts block 32768, because with -b 4096 below a group
-    # is 8 x 4096 = 32768 blocks and the first data block is 0 (initialize.c, e2fsprogs
-    # 1.47.0), and sparse_super always keeps a backup in group 1. od's spacing differs
-    # between GNU and BSD, so the whitespace goes first. Then anything but four hex
-    # digits is a short read, since od can exit 0 on fewer bytes than it was asked for.
+    # each of one 4 KiB block given as block:offset. The primary starts at byte 1024 of
+    # block 0, so its magic is at byte 1080. Group 1's backup starts block 32768,
+    # because with -b 4096 below a group is 8 x 4096 = 32768 blocks and the first data
+    # block is 0 (initialize.c, e2fsprogs 1.47.0), and sparse_super always keeps a
+    # backup in group 1. od's spacing differs between GNU and BSD, so the whitespace
+    # goes first. Then anything but four hex digits is a short read, since od can exit
+    # 0 on fewer bytes than it was asked for.
     # dd reads the whole block in one bs=4096 read, because smaller reads could take
     # SIGPIPE once od has its two bytes and exits.
     MAGIC_RE='^[0-9a-f]{4}$'
@@ -257,7 +258,7 @@ else
         refuse "the read of 4 KiB block $block of $DEV came back short, so it is not formatted"
       fi
       if [[ "$magic" == 53ef ]]; then
-        refuse "blkid found no filesystem on $DEV, but 4 KiB block $block holds an ext4 superblock, so it is a damaged lake or an interrupted mkfs. Nothing was formatted. infra/README.md says how to tell which. Inspect it read-only with: dumpe2fs -h -o superblock=32768 -o blocksize=4096 $DEV"
+        refuse "blkid found no filesystem on $DEV, but 4 KiB block $block holds an ext4 superblock, so it is a damaged lake, an interrupted mkfs, or a chance match on a fresh volume. Nothing was formatted. infra/README.md says how to tell which. Check it read-only with: e2fsck -n $DEV"
       fi
     done
     # Never -F. mkfs.ext4's own check for an existing filesystem asks only on a
