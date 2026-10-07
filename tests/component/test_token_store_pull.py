@@ -203,7 +203,7 @@ def test_an_unrecognised_credential_source_exits_two(tmp_path, lake_root, capsys
     config = _vm_config(tmp_path, lake_root, bucket_credentials="instance-profile")
 
     assert _pull(config, tmp_path / "token.json") == 2
-    assert "bucket_credentials must be keys or instance_profile" in _one_line(capsys)
+    assert "bucket_credentials must be keys, instance_profile or assume_role" in _one_line(capsys)
 
 
 def test_a_write_that_fails_exits_one_with_one_line(

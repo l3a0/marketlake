@@ -1,4 +1,4 @@
-"""Shared fixtures that expose the four seams and the fixture-lake builder.
+"""Shared fixtures that expose the four seams, the fixture-lake builder and a loopback STS.
 
 It also carries three guards, one redirect, one deletion, one host pin, and one check on
 the outcome. The network guard fails any test that reaches another machine from inside
@@ -94,6 +94,7 @@ from tests.support.config_guard import (  # noqa: E402
     is_protected,
 )
 from tests.support.lake import FixtureLake  # noqa: E402
+from tests.support.sts import StsServer  # noqa: E402
 from tests.support.vendor import CassetteVendor  # noqa: E402
 
 # An inherited ``MARKETLAKE_CONFIG`` is deleted for the same reason the directory above is
@@ -143,6 +144,38 @@ def manual_clock() -> ManualClock:
 def cassette_vendor() -> CassetteVendor:
     """A cassette-backed vendor over the checked-in minimal cassette."""
     return CassetteVendor(load_cassette(CASSETTES / "spy_minimal.json"))
+
+
+# -- the loopback STS, marketlake #737 ------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def sts_server() -> Iterator[StsServer]:
+    """One loopback STS for the whole run, started on first use.
+
+    Session-scoped because its users sit in two tiers' directories, and a server per test
+    would cost a thread and a port each time. ``sts`` resets it before every test.
+    """
+    with StsServer() as server:
+        yield server
+
+
+@pytest.fixture
+def sts(sts_server: StsServer, monkeypatch: pytest.MonkeyPatch) -> StsServer:
+    """The loopback STS, reset, with ``aws_session.STS_ENDPOINT_URL`` pointed at it.
+
+    The proxy variables are deleted in both spellings, because the STS client honours
+    them as the S3 and SSM clients do, and a proxy would carry the assume elsewhere. Apply
+    it test by test or with ``usefixtures`` on a file, never to the whole suite, so a test
+    without it can still show that no STS call happens.
+    """
+    from lake import aws_session  # lazy: the redirect above runs before any ``lake`` import
+
+    sts_server.reset()
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(aws_session, "STS_ENDPOINT_URL", sts_server.url)
+    return sts_server
 
 
 # -- the network guard ---------------------------------------------------------------

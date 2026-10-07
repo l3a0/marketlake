@@ -1124,7 +1124,8 @@ class BackupScrubResult:
     Four more stop a bucket scrub, and only a bucket scrub sets them. They are named
     apart because they send the operator to different repairs.
 
-    - ``bucket_refused``: S3 turned the credentials away, named by the error code. A
+    - ``bucket_refused``: S3 turned the credentials away, or STS refused the role, named by
+      the error code. A
       revoked key or a policy that lost an action is the usual cause, and the repair is
       new credentials or a fixed policy.
     - ``bucket_unreachable``: no usable answer came back, named by the error's type or

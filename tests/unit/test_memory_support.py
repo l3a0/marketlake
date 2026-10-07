@@ -1,4 +1,4 @@
-"""The proxy-pool measurement the #660 and #670 memory tests depend on.
+"""The proxy-pool measurement the #660, #670 and #671 memory tests depend on.
 
 Every memory test reads only ``max_memory()`` inside one ``with``, so none of them notices when
 ``measured`` leaves its proxy installed, forgets it, or wraps the wrong pool. These tests check

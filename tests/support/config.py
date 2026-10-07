@@ -28,7 +28,7 @@ PING_KEY = "secret-key"
 NTFY_TOPIC = "secret-topic"
 # The Schwab pair, two more of the secrets the design names, in the same class as the ping
 # key and the topic. A sweep that checks only the first two passes a command that prints
-# these. The bucket's two key values and the token store's two are the other four, and
+# these. The bucket's two key values and the command key's two are the other four, and
 # only a test that needs them writes them, so this file holds four of the eight.
 SCHWAB_API_KEY = "api-key"
 SCHWAB_APP_SECRET = "app-secret"
@@ -43,9 +43,11 @@ def write_config(
     callback_url: str | None = None,
     role: str | None = None,
     token_store: str | None = None,
-    token_store_access_key_id: str | None = None,
-    token_store_secret_access_key: str | None = None,
+    token_store_role_arn: str | None = None,
     token_store_region: str | None = None,
+    command_access_key_id: str | None = None,
+    command_secret_access_key: str | None = None,
+    bucket_role_arn: str | None = None,
     bucket_credentials: str | None = None,
     bucket_access_key_id: str | None = None,
     bucket_secret_access_key: str | None = None,
@@ -69,9 +71,10 @@ def write_config(
     after ``role:`` exactly as given, so ``""`` writes an empty value that YAML reads as
     null and ``"off"`` writes one that YAML reads as false.
 
-    ``token_store``, the three ``token_store_*`` keys, ``bucket_credentials`` and the
-    three ``bucket_*`` keys are written the same way, each only when given, so a config
-    without them is the ``file`` mode on a path backup that every other test runs as.
+    ``token_store``, its two ``token_store_*`` keys, the command key's two values,
+    ``bucket_credentials``, ``bucket_role_arn`` and the three ``bucket_*`` key settings
+    are written the same way, each only when given, so a config without them is the
+    ``file`` mode on a path backup that every other test runs as.
     """
     target = tmp_path / "ssd" if backup_target is None else backup_target
     target.mkdir(parents=True, exist_ok=True)
@@ -84,9 +87,11 @@ def write_config(
     role_line = "" if role is None else f"role: {role}".rstrip() + "\n"
     optional = {
         "token_store": token_store,
-        "token_store_access_key_id": token_store_access_key_id,
-        "token_store_secret_access_key": token_store_secret_access_key,
+        "token_store_role_arn": token_store_role_arn,
         "token_store_region": token_store_region,
+        "command_access_key_id": command_access_key_id,
+        "command_secret_access_key": command_secret_access_key,
+        "bucket_role_arn": bucket_role_arn,
         "bucket_credentials": bucket_credentials,
         "bucket_access_key_id": bucket_access_key_id,
         "bucket_secret_access_key": bucket_secret_access_key,

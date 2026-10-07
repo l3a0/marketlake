@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and fourteen things are not in one.
+``tofu test`` sees one configuration's plan, and sixteen things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -31,19 +31,25 @@
    decrypted value into the state, which every pull request's plan role can read, and a
    mock provider plans it without complaint. An ephemeral block stores nothing, so it
    stays allowed.
-10. The VM's ``ignore_changes`` list and its ``depends_on``, neither of which a plan
+10. Whether every ``removed`` block forgets its resource without deleting it. A test
+    plans against an empty state, so a ``removed`` block changes nothing there, and one
+    that would delete a user passes every run.
+11. Whether a role the laptop assumes sets anything beyond its name, its trust and its
+    lifecycle. An assert can only name the arguments it knows about, so an added tag or
+    session duration passes every ``tofu test`` run and is refused at the apply.
+12. The VM's ``ignore_changes`` list and its ``depends_on``, neither of which a plan
     shows. Without an ``ignore_changes`` entry, a new AMI or a stop that drops the
     public address plans a replacement of the instance (#686). Without ``depends_on``,
     the first boot can run before the role's grants exist.
-11. Whether two inline policies on one role share a name. ``PutRolePolicy`` on a shared
+13. Whether two inline policies on one role share a name. ``PutRolePolicy`` on a shared
     name makes one overwrite the other, and a mock provider plans both.
-12. Whether the lake volume's zone is one literal that the subnet lookup shares. A
+14. Whether the lake volume's zone is one literal that the subnet lookup shares. A
     variable would offer a change ``prevent_destroy`` refuses, and the mock plans any
     zone.
-13. Arguments that must stay absent. ``disable_api_stop`` makes the attachment's stop
+15. Arguments that must stay absent. ``disable_api_stop`` makes the attachment's stop
     before a detach fail, and a ``kms_key_id`` reads back as an ARN, so every plan
     shows a change.
-14. The shim template's variables. A third one could carry a value into ``user_data``,
+16. The shim template's variables. A third one could carry a value into ``user_data``,
     which anyone who can describe the instance reads, and the plan shows only the
     rendered text.
 
@@ -63,6 +69,7 @@ These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The pars
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 from typing import Any
@@ -77,8 +84,8 @@ _OPTIONS = hcl2.SerializationOptions(
 )
 
 # Price 4 of issue #664: every resource whose loss would lose backups or stop them. The
-# token writer and its policy are here too (#699). CI cannot delete either, so a pull
-# request that renames one fails at plan rather than at apply.
+# laptop's user, its two roles and their policies are here too (#737). CI cannot delete
+# any of them, so a pull request that renames one fails at plan rather than at apply.
 PREVENT_DESTROY = [
     "bootstrap/aws_s3_bucket.state",
     "bootstrap/aws_s3_bucket_versioning.state",
@@ -87,13 +94,18 @@ PREVENT_DESTROY = [
     "live/aws_s3_bucket_server_side_encryption_configuration.backup",
     "live/aws_s3_bucket_public_access_block.backup",
     "live/aws_s3_bucket_lifecycle_configuration.backup",
-    "live/aws_iam_user.backup",
-    "live/aws_iam_user_policy.backup",
-    "live/aws_iam_user.token_writer",
-    "live/aws_iam_user_policy.token_writer",
+    "live/aws_iam_user.command",
+    "live/aws_iam_user_policy.command",
+    "live/aws_iam_role.backup",
+    "live/aws_iam_role_policy.backup",
+    "live/aws_iam_role.token_writer",
+    "live/aws_iam_role_policy.token_writer",
     # The lake volume holds every minute captured since the last nightly upload (#686).
     "live/aws_ebs_volume.lake",
 ]
+
+# The roles marketlake-command assumes, which the apply role may create and never delete.
+COMMAND_ROLES = ["marketlake-backup", "marketlake-token-writer"]
 
 # Every resource type the bootstrap may hold. A new type, such as a second way to
 # attach a policy, fails here until this list and the role checks below account for it.
@@ -244,16 +256,19 @@ def test_configuration_is_only_tf_files(config: str) -> None:
 
 def test_live_role_carries_exactly_its_inline_policies() -> None:
     """The role-side twin of the one-policy-per-user check. The apply role's
-    ``iam:PutRolePolicy`` would apply any third inline policy on marketlake-instance."""
+    ``iam:PutRolePolicy`` would apply any further inline policy on marketlake-instance,
+    marketlake-backup or marketlake-token-writer."""
     policies = sorted(
         (_role_name(body["role"]), address.split(".")[1])
         for address, body in _resources("live").items()
         if address.split(".")[0] == "aws_iam_role_policy"
     )
     assert policies == [
+        ("backup", "backup"),
         ("instance", "instance_config_read"),
         ("instance", "instance_s3"),
         ("instance", "instance_s3_read"),
+        ("token_writer", "token_writer"),
     ]
 
 
@@ -271,11 +286,80 @@ def test_live_role_policy_names_are_distinct() -> None:
     assert ("instance", "backup-bucket-read") in names
 
 
-def test_token_writer_user_sets_only_its_name() -> None:
+def test_command_user_sets_only_its_name() -> None:
     """A path, tags or a permissions boundary changes what the apply role's grant on
-    ``user/marketlake-token-writer`` must allow, and the first apply is refused."""
-    body = _resources("live")["aws_iam_user.token_writer"]
+    ``user/marketlake-command`` must allow, and the first apply is refused."""
+    body = _resources("live")["aws_iam_user.command"]
     assert set(body) <= {"name", "lifecycle"}
+
+
+@pytest.mark.parametrize("address", ["aws_iam_role.backup", "aws_iam_role.token_writer"])
+def test_command_role_sets_only_its_three_arguments(address: str) -> None:
+    """A tag, a description or a ``max_session_duration`` needs an IAM action the apply
+    role's grant on the role does not allow, such as ``iam:TagRole`` or
+    ``iam:UpdateRole``, and the first apply is refused partway through."""
+    body = _resources("live")[address]
+    assert set(body) == {"name", "assume_role_policy", "lifecycle"}
+
+
+@pytest.mark.parametrize("config", ["bootstrap", "live"])
+def test_every_removed_block_keeps_the_resource(config: str) -> None:
+    """A ``removed`` block without ``destroy = false`` plans a delete. The apply role
+    may not delete a user or its policy, so that apply fails partway through, and a
+    bare block forgets but warns. This passes when no ``removed`` block remains, so
+    #741 deletes the blocks without editing it."""
+    for path in sorted((INFRA / config).glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        for block in parsed.get("removed", []):
+            lifecycles = block.get("lifecycle", [])
+            assert [lifecycle.get("destroy") for lifecycle in lifecycles] == [False], (
+                f"infra/{config}/{path.name}'s removed block for {block.get('from')} "
+                "does not carry destroy = false"
+            )
+
+
+# The addresses main's state holds for the laptop's two old users. A removed block that
+# names anything else forgets nothing, and the plan deletes the old address instead.
+_FORGOTTEN = [
+    "aws_iam_user.backup",
+    "aws_iam_user.token_writer",
+    "aws_iam_user_policy.backup",
+    "aws_iam_user_policy.token_writer",
+]
+
+
+def test_rosters_cover_every_command_resource() -> None:
+    """command.tf says all six of its resources carry prevent_destroy. The rosters are
+    the only check on that, so a resource missing from them is checked by nothing."""
+    with (INFRA / "live" / "command.tf").open() as f:
+        parsed = hcl2.load(f, serialization_options=_OPTIONS)
+    addresses = [
+        f"{rtype}.{name}"
+        for block in parsed["resource"]
+        for rtype, named in block.items()
+        for name in named
+    ]
+    assert len(addresses) == 6
+    assert {f"live/{a}" for a in addresses} <= set(PREVENT_DESTROY)
+    roles = sorted(
+        named[name]["name"]
+        for block in parsed["resource"]
+        for rtype, named in block.items()
+        if rtype == "aws_iam_role"
+        for name in named
+    )
+    assert roles == sorted(COMMAND_ROLES)
+
+
+def test_removed_blocks_forget_exactly_the_old_users() -> None:
+    """Either all four old addresses are forgotten, or #741 has deleted every block."""
+    froms = []
+    for path in sorted((INFRA / "live").glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        froms += [block["from"] for block in parsed.get("removed", [])]
+    assert sorted(froms) in ([], [f"${{{a}}}" for a in _FORGOTTEN])
 
 
 def test_bootstrap_holds_only_known_resource_types() -> None:
@@ -394,10 +478,44 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
     assert granted == {
         ("role", "marketlake-instance"),
         ("instance-profile", "marketlake-instance"),
-        ("user", "marketlake-backup"),
-        ("user", "marketlake-token-writer"),
+        ("user", "marketlake-command"),
+        ("role", "marketlake-backup"),
+        ("role", "marketlake-token-writer"),
     }
     assert declared == granted
+
+
+# The actions that would let an apply delete a command role or its policy, and so replace
+# a role with a new trust or stop the nightly upload.
+_ROLE_DELETES = ["iam:DeleteRole", "iam:DeleteRolePolicy"]
+
+
+@pytest.mark.parametrize("role", COMMAND_ROLES)
+@pytest.mark.parametrize("action", _ROLE_DELETES)
+def test_no_allow_deletes_a_command_role(role: str, action: str) -> None:
+    """The apply role is denied ``iam:UpdateAssumeRolePolicy``, so a trust is written
+    only at ``CreateRole``. A grant that deletes the role would let a plan replace it,
+    which writes whatever trust the pull request gave it. Matching is by wildcard on
+    both sides, so ``iam:Delete*`` or ``role/marketlake-*`` counts as a grant, and a
+    ``NotAction`` statement counts as granting everything it does not name."""
+    arn = f"arn:aws:iam::${{local.account_id}}:role/{role}"
+    policy = _jsonencode_argument(_resources("bootstrap")["aws_iam_role_policy.apply"]["policy"])
+    for statement in policy["Statement"]:
+        if statement["Effect"] != "Allow":
+            continue
+        if not any(fnmatch.fnmatchcase(arn, pattern) for pattern in _listed(statement["Resource"])):
+            continue
+        if "NotAction" in statement:
+            granted = not any(
+                fnmatch.fnmatchcase(action.lower(), pattern.lower())
+                for pattern in _listed(statement["NotAction"])
+            )
+        else:
+            granted = any(
+                fnmatch.fnmatchcase(action.lower(), pattern.lower())
+                for pattern in _actions(statement)
+            )
+        assert not granted, f"{statement.get('Sid')} allows {action} on role/{role}"
 
 
 # The condition operators under which an ``iam:PolicyARN`` value grants that ARN. A
@@ -460,8 +578,8 @@ _USER_POLICY_ROUTES = {
 
 def test_each_live_user_carries_exactly_one_inline_policy() -> None:
     """``tofu test`` compares each user's policy by its address, so a second policy on
-    the same user passes it. That would give the token writer more than its one put, or
-    ``marketlake-backup`` an SSM permission."""
+    the same user passes it. That would give ``marketlake-command`` more than its two
+    assumes, and the laptop's key a direct grant that no role's session records."""
     resources = _resources("live")
     assert not {address.split(".")[0] for address in resources} & _USER_POLICY_ROUTES
 

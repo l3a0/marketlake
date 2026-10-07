@@ -43,10 +43,20 @@ shortcut.** Both halves reduce to a per-column null count.
   is equivalent to all-null on the data rows.
 
 Measured on SPY's 2026-09-16 chains partition, 307 MB and 5,307,030 rows, the footer
-answers ``extra`` in 2.0 ms against 0.65 s for the full read, and the whole lake's 29
-sealed partitions answer in 14.1 ms with no column lacking statistics. A column whose
-footer carries no statistics falls back to reading that column alone, because a missing
-statistic must not read as a missing field.
+answers ``extra`` in 2.0 ms, and the whole lake's 29 sealed partitions answer in 14.1 ms
+with no column lacking statistics. A column whose footer carries no statistics falls back
+to reading that column alone, because a missing statistic must not read as a missing field.
+
+**The rows that are read stream, one batch at a time.** The footer cannot answer the rest:
+which rows are data rows, the day's earliest stamp, its ``schema_version`` values, and,
+once ``extra`` carries a value, which columns routed. Decoded whole, those questions cost a
+ticker-day's columns at once. With the overflow gate forced open on SPY 2026-09-28, the old
+read decoded 4,175,641,366 bytes and then filtered them into 4,160,143,244 more. On the
+2 GiB host the same read of SPY 2026-10-02 was killed for memory with and without the
+sweep's cap (marketlake #671). So each partition is read once, in batches, and every
+answer is folded over the batches. The rules the stream follows are
+``battery.read_entitlement``'s, which streamed the entitlement read for the same host, and
+:func:`_batches` names them.
 
 **The fold is across tickers and across fields, and the arithmetic is why.** One vendor
 change reaches every ticker on the surface on the same day, so paging per ticker would
@@ -115,7 +125,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -162,6 +172,15 @@ PAGE_FIELD_CAP = 12
 # more than three days of room. It is bounded at all because a lake whose earlier days
 # were never sealed must not turn one night's check into a walk over the whole calendar.
 BASELINE_LOOKBACK_DAYS = 10
+
+# How many rows each streamed read decodes at once. A batch's memory grows with this number
+# and not with the file, which is what lets a ticker-day fit the 2 GiB host (marketlake
+# #671). It is ``battery``'s entitlement batch size. Measured on the 2 GiB host under the
+# sweep's 1,135 MiB cap, on SPY's 5,340,995-row chains partition of 2026-10-02 rewritten so
+# ``extra`` carried a value on every data row, the open-gate read peaked at 347 to 352 MiB
+# of anonymous memory, where the whole read was killed at about 1.58 GiB. Read at call time,
+# so a test can shrink it and make a small fixture span several batches.
+_READ_BATCH_ROWS = 65_536
 
 
 class DriftUnreadable(Exception):
@@ -289,8 +308,8 @@ class _Footer:
     29 sealed partitions it is empty everywhere, so it is a guard rather than a path the
     ordinary night takes.
 
-    ``absent_column`` is a column the partition does not carry at all. Reading it raises,
-    and counting it as wholly null would page for the shape it cannot be about: a column a
+    ``absent_column`` is a column the partition does not carry at all, so there is nothing
+    to count. Counting it as wholly null would page for the shape it cannot be about: a column a
     partition lacks outright is a rotation's doing, not a vendor's, and the version guard
     is what speaks to that. So it leaves the missing half's candidate set entirely.
     """
@@ -301,9 +320,14 @@ class _Footer:
     absent_column: set[str]
 
 
-def _footer_null_counts(path, columns: Sequence[str]) -> _Footer:
-    """Each column's null count and the partition's row count, from the Parquet footer."""
-    metadata = pq.read_metadata(path)
+def _footer_null_counts(metadata, columns: Sequence[str]) -> _Footer:
+    """Each column's null count and the partition's row count, from the Parquet footer.
+
+    ``metadata`` is the footer of the file :func:`read_surface_day` already holds open, so
+    the gate and the stream read one file. Opened by path here and again for the stream, a
+    partition replaced between the two, by a hand-run recompaction or a restore during the
+    sweep, would be gated on one file and read from another.
+    """
     arrow = metadata.schema.to_arrow_schema()
     counts: dict[str, int] = {}
     unmeasured: set[str] = set()
@@ -347,6 +371,17 @@ def _lookup(overflow: Mapping[str, object], path: journal.ExtraPath) -> object:
     return block.get(path.field)
 
 
+@dataclass(frozen=True)
+class _Evidence:
+    """What one partition says about the day, held apart until its read has finished."""
+
+    retyped: frozenset[str]
+    absent: frozenset[str]
+    lacked: frozenset[str]
+    versions: frozenset[int]
+    first_cycle: str | None
+
+
 def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDay:
     """Fold one surface's partitions for one day into what they say about the payload.
 
@@ -355,9 +390,17 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
     gap rows carry a null on every vendor column by construction, so an all-gap partition
     reads as every field missing at once. Sixteen of the lake's sealed partitions are
     exactly that shape today.
+
+    **A partition's evidence joins the fold only once its read has finished.** Its retypes,
+    its absent and lacked columns, its versions and its earliest stamp stay with
+    :func:`_partition_evidence` until the stream has ended, the decoded rows have matched
+    the footer's count, and any column the footer could not measure has been read. A
+    partition that fails at any of those steps leaves nothing behind, which is what
+    :func:`judge_day` means by "the skipped partition leaves the fold". Folded batch by
+    batch instead, a stream that failed in its last batch would already have added its
+    earlier batches' retypes to the surface.
     """
-    paths = journal.extra_paths(surface)
-    columns = sorted(paths)
+    columns = sorted(journal.extra_paths(surface))
     retyped: set[str] = set()
     absent: dict[str, frozenset[str]] = {}
     lacked: dict[str, frozenset[str]] = {}
@@ -368,111 +411,20 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
 
     for partition in partitions:
         try:
-            footer = _footer_null_counts(partition.path, [*columns, EXTRA_COLUMN, ROW_KIND_COLUMN])
-        except OSError as exc:
-            unreadable.append(f"{partition.relative} did not open: {exc}")
-            continue
-        except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
-            unreadable.append(f"{partition.relative} has no readable footer: {exc}")
-            continue
-
-        rows = footer.rows
-        if rows == 0:
-            continue
-        # The overflow gate, which is ``routed_columns``'s own first gate read off the
-        # footer. An all-null overflow is every cycle the lake has recorded, so this is
-        # the branch the healthy night takes and it opens no rows at all.
-        #
-        # A partition carrying no ``extra`` column at all cannot be asked the retype
-        # question, and ``routed_columns`` would raise on it rather than answer. That is a
-        # rotation's shape, so it is left to the version guard the same way an absent
-        # vendor column is.
-        overflow_nulls = footer.counts.get(EXTRA_COLUMN)
-        needs_rows = EXTRA_COLUMN not in footer.absent_column and (
-            EXTRA_COLUMN in footer.unmeasured or overflow_nulls != rows
-        )
-
-        table = None
-        if needs_rows:
-            try:
-                table = _read_partition(partition, surface)
-                # **Every batch, not the first.** ``pq.read_table`` chunks a table by row
-                # group, and the lake's chains partitions carry five and six of them:
-                # SPY 2026-09-16 is 5,307,030 rows across six, whose first covers
-                # 03:25 to 14:49 UTC. Asking only ``to_batches()[0]`` therefore reads
-                # pre-market to 10:49 ET and calls the rest of the session clean, so a
-                # retype that starts mid-day is silent on both halves at once: the column
-                # is non-null on the morning rows, so it never reaches ``absent`` either,
-                # and the night's report line says nothing drifted.
-                #
-                # That is the failure this producer exists to prevent. The parser's page
-                # fires per response and this one is "the only one of the four that sees a
-                # whole day at once", which it does not do by reading a fifth of the day.
-                #
-                # Folding rather than ``combine_chunks`` is deliberate. Combining would
-                # materialise 5.3 million rows across 73 columns to answer a question each
-                # batch answers on its own, and ``routed_columns``'s two gates make a batch
-                # with an all-null overflow cost almost nothing.
-                for batch in table.to_batches():
-                    retyped.update(journal.routed_columns(surface, batch))
-            except DriftUnreadable as exc:
-                unreadable.append(str(exc))
-                continue
-            except KeyError as exc:
-                # ``routed_columns`` asks every column in ``extra_paths`` for its null
-                # count, so a partition short of one raises rather than answering. A
-                # partition that does not carry the running schema's columns is
-                # compaction's fact, per ``docs/design.md``'s schema policy, and it is
-                # reported rather than guessed at.
-                unreadable.append(f"{partition.relative} does not carry the running schema: {exc}")
-                continue
-            except ValueError as exc:
-                # ``routed_columns`` decodes each populated overflow with a bare
-                # ``json.loads``, so one cell of unparseable JSON raises out of it.
-                # Unconverted, that escapes :func:`judge_day` past the per-surface
-                # containment, and one bad cell on chains takes the quotes comparison down
-                # with it on the same night. ``JSONDecodeError`` subclasses ``ValueError``,
-                # which is what this catches, because the raise is the standard library's
-                # rather than this project's and naming the subclass would bind to it.
-                unreadable.append(
-                    f"{partition.relative} carries an overflow that does not decode: {exc}"
-                )
-                continue
-
-        try:
-            data = _data_rows(partition, surface, table)
+            with _open(partition) as source:
+                evidence = _partition_evidence(source, partition, surface, columns)
         except DriftUnreadable as exc:
             unreadable.append(str(exc))
             continue
-        if data.num_rows == 0:
+        if evidence is None:
             continue
         tickers.append(partition.ticker)
-
-        # A column the footer carries but could not measure is read outright. Reading the
-        # column alone is cheap next to the whole partition, and it keeps an absent
-        # statistic from reading as an absent field.
-        resolved = dict(footer.counts)
-        unmeasured = footer.unmeasured & set(columns)
-        if unmeasured:
-            try:
-                resolved.update(_null_counts_by_read(partition, surface, sorted(unmeasured)))
-            except DriftUnreadable as exc:
-                unreadable.append(str(exc))
-                tickers.pop()
-                continue
-
-        here = {
-            column
-            for column in columns
-            if column not in footer.absent_column and resolved.get(column) == rows
-        }
-        absent[partition.ticker] = frozenset(here)
-        lacked[partition.ticker] = frozenset(footer.absent_column & set(columns))
-
-        stamp, seen_versions = _stamps_and_versions(data)
-        versions.update(seen_versions)
-        if stamp and (first is None or stamp < first):
-            first = stamp
+        retyped.update(evidence.retyped)
+        absent[partition.ticker] = evidence.absent
+        lacked[partition.ticker] = evidence.lacked
+        versions.update(evidence.versions)
+        if evidence.first_cycle and (first is None or evidence.first_cycle < first):
+            first = evidence.first_cycle
 
     return SurfaceDay(
         surface=surface,
@@ -487,38 +439,228 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
     )
 
 
-def _read_partition(partition, surface: str):
-    """The whole partition at the surface's full schema.
+def _open(partition) -> pq.ParquetFile:
+    """The partition's file, opened once for both the footer and the stream.
 
-    ``journal.routed_columns`` refuses a narrower read, though only once it has something to
-        look for. Its first gate returns on an all-null overflow before touching another column,
-        so a pruned batch from a healthy partition answers ``()``. On a batch whose overflow is
-        populated, which is the only kind that reaches here, it asks every column in
-        ``extra_paths`` for its null count: measured against a batch pruned to ``extra`` and
-        ``row_kind`` it raises ``KeyError: 'Field "occ_symbol" does not exist in schema'``.
-
-        So the saving is in not reaching this function, which the overflow gate above does on
-        every partition the lake holds today.
+    ``pre_buffer=False`` is ``battery.read_entitlement``'s setting. Pre-buffering reads a row
+    group's column chunks ahead of the batch being decoded, which raised that read's peak on
+    SPY 2026-09-28 by 16.9 to 21.8 MiB, per
+    ``tests/component/test_battery.py::test_the_read_neither_pre_buffers_nor_threads``.
     """
     try:
-        return pq.read_table(partition.path)
+        return pq.ParquetFile(partition.path, pre_buffer=False)
+    except OSError as exc:
+        raise DriftUnreadable(f"{partition.relative} did not open: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
-        raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+        raise DriftUnreadable(f"{partition.relative} has no readable footer: {exc}") from exc
 
 
-def _read_overflow(partition):
-    """The three columns the first-cycle pass reads, and not the other seventy.
+def _partition_evidence(
+    source: pq.ParquetFile, partition, surface: str, columns: Sequence[str]
+) -> _Evidence | None:
+    """One partition's evidence, or ``None`` when it holds no data row to judge.
 
-    ``_read_partition`` exists because ``journal.routed_columns`` refuses a narrow batch.
-    Nothing here goes through that function: the question is which rows carry a key inside
-    their own overflow, which ``extra``, ``snap_ts`` and ``row_kind`` answer between them.
-    Reading the whole partition again for it is a second full read of a 307 MB file to look
-    at three columns of it.
+    Every failure raises :class:`DriftUnreadable`, whose message starts with the partition,
+    and :func:`read_surface_day` reports it and leaves the partition out of the fold.
     """
     try:
-        return pq.read_table(partition.path, columns=[EXTRA_COLUMN, "snap_ts", ROW_KIND_COLUMN])
+        footer = _footer_null_counts(source.metadata, [*columns, EXTRA_COLUMN, ROW_KIND_COLUMN])
+    except OSError as exc:
+        raise DriftUnreadable(f"{partition.relative} did not open: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
+        raise DriftUnreadable(f"{partition.relative} has no readable footer: {exc}") from exc
+
+    rows = footer.rows
+    if rows == 0:
+        return None
+    # The overflow gate, which is ``routed_columns``'s own first gate read off the footer.
+    # An all-null overflow is every cycle the lake has recorded, so this is the branch the
+    # healthy night takes, and its stream decodes three columns rather than the sixty on
+    # chains and sixty-seven on quotes that an open gate decodes.
+    #
+    # A partition carrying no ``extra`` column at all cannot be asked the retype question,
+    # and ``routed_columns`` would raise on it rather than answer. That is a rotation's
+    # shape, so it is left to the version guard the same way an absent vendor column is.
+    overflow_nulls = footer.counts.get(EXTRA_COLUMN)
+    gate_open = EXTRA_COLUMN not in footer.absent_column and (
+        EXTRA_COLUMN in footer.unmeasured or overflow_nulls != rows
+    )
+
+    routed, data_rows, stamp, seen_versions = _read_rows(
+        source, partition, surface, gate_open=gate_open
+    )
+    if data_rows == 0:
+        return None
+
+    # A column the footer carries but could not measure is read outright. Reading the
+    # column alone is cheap next to the whole partition, and it keeps an absent statistic
+    # from reading as an absent field.
+    resolved = dict(footer.counts)
+    unmeasured = footer.unmeasured & set(columns)
+    if unmeasured:
+        resolved.update(_null_counts_by_read(partition, surface, sorted(unmeasured)))
+
+    here = {
+        column
+        for column in columns
+        if column not in footer.absent_column and resolved.get(column) == rows
+    }
+    return _Evidence(
+        retyped=routed,
+        absent=frozenset(here),
+        lacked=frozenset(footer.absent_column & set(columns)),
+        versions=seen_versions,
+        first_cycle=stamp,
+    )
+
+
+def _read_rows(
+    source: pq.ParquetFile, partition, surface: str, *, gate_open: bool
+) -> tuple[frozenset[str], int, str | None, frozenset[int]]:
+    """The routed columns, data-row count, earliest data stamp and versions, in one pass.
+
+    With the gate closed the pass decodes ``snap_ts``, ``row_kind`` and ``schema_version``.
+    With it open it adds ``extra`` and every vendor column the file carries, because
+    ``journal.routed_columns`` asks each column in ``extra_paths`` for its null count once a
+    batch's overflow is populated. A vendor column the file lacks is left out of the
+    projection rather than refused here, so ``routed_columns`` raises the ``KeyError`` that
+    reads as a partition short of the running schema.
+
+    Each batch runs ``routed_columns`` first, then the data-row filter, then the earliest
+    stamp and the version set. A batch the filter empties goes no further, which is
+    ``battery.read_entitlement``'s rule for the same reason: Arrow picks a kernel by type
+    even for an empty array, so a gap-only batch with a retyped ``snap_ts`` or
+    ``schema_version`` would turn a partition that is skipped into one that is unreadable.
+
+    The kernels sit inside the partition's containment, as ``battery._contained`` puts
+    them, because a retyped pinned column raising out of a kernel is drift, and drift is
+    what this check exists to notice rather than a reason to lose the surface.
+    """
+    required = ["snap_ts", ROW_KIND_COLUMN, "schema_version"]
+    optional: list[str] = []
+    if gate_open:
+        required.append(EXTRA_COLUMN)
+        optional = sorted(journal.extra_paths(surface))
+
+    routed: set[str] = set()
+    data_rows = 0
+    earliest: str | None = None
+    versions: set[int] = set()
+    for batch in _batches(source, partition, required, optional):
+        if gate_open:
+            # **Every batch, not the first.** SPY 2026-09-16 is 5,307,030 rows, which is 81
+            # batches at 65,536 rows. A read that asked only some of them would call the
+            # rest of the session clean, so a retype that starts mid-day is silent
+            # on both halves at once: the column is non-null on the morning rows, so it
+            # never reaches ``absent`` either, and the night's report line says nothing
+            # drifted.
+            #
+            # That is the failure this producer exists to prevent. The parser's page fires
+            # per response and this one is "the only one of the four that sees a whole day
+            # at once", which it does not do by reading a fifth of the day.
+            #
+            # Gap rows go through it too. Its first gate returns on an all-null overflow,
+            # and a gap row's overflow is null by construction, so they cost almost nothing.
+            try:
+                routed.update(journal.routed_columns(surface, batch))
+            except KeyError as exc:
+                # ``routed_columns`` asks every column in ``extra_paths`` for its null
+                # count, so a partition short of one raises rather than answering. A
+                # partition that does not carry the running schema's columns is
+                # compaction's fact, per ``docs/design.md``'s schema policy, and it is
+                # reported rather than guessed at.
+                raise DriftUnreadable(
+                    f"{partition.relative} does not carry the running schema: {exc}"
+                ) from exc
+            except ValueError as exc:
+                # ``routed_columns`` decodes each populated overflow with a bare
+                # ``json.loads``, so one cell of unparseable JSON raises out of it.
+                # Unconverted, that escapes :func:`judge_day` past the per-surface
+                # containment, and one bad cell on chains takes the quotes comparison down
+                # with it on the same night. ``JSONDecodeError`` subclasses ``ValueError``,
+                # which is what this catches, because the raise is the standard library's
+                # rather than this project's and naming the subclass would bind to it.
+                raise DriftUnreadable(
+                    f"{partition.relative} carries an overflow that does not decode: {exc}"
+                ) from exc
+        try:
+            data = batch.filter(pc.equal(batch.column(ROW_KIND_COLUMN), ROW_KIND_DATA))
+            if data.num_rows == 0:
+                continue
+            stamp = pc.min(data.column("snap_ts")).as_py()
+            seen = pc.unique(data.column("schema_version")).to_pylist()
+        except Exception as exc:  # noqa: BLE001 - a kernel refuses a retyped column
+            raise DriftUnreadable(
+                f"{partition.relative} did not read: {type(exc).__name__}: {exc}"
+            ) from exc
+        data_rows += data.num_rows
+        if stamp is not None and (earliest is None or stamp < earliest):
+            earliest = stamp
+        versions.update(value for value in seen if value is not None)
+    return frozenset(routed), data_rows, earliest, frozenset(versions)
+
+
+def _batches(
+    source: pq.ParquetFile, partition, required: Sequence[str], optional: Sequence[str] = ()
+) -> Iterator:
+    """Stream ``required`` and whichever of ``optional`` the file carries, every row counted.
+
+    Each failure raises :class:`DriftUnreadable` as "did not read". The first and third rules
+    are ``battery.read_entitlement``'s, and its docstring gives the third's reasoning. The
+    second is this module's own.
+
+    1. A required column the file lacks is refused before the stream starts.
+       ``iter_batches`` reads past a name the file does not carry and returns the other
+       columns with no error, so the refusal cannot be left to the read.
+    2. Fetching a batch is wrapped on its own, apart from whatever the caller does with the
+       batch. ``pa.ArrowInvalid`` subclasses ``ValueError`` and ``pa.ArrowKeyError``
+       subclasses ``KeyError``, so under the caller's handlers for
+       ``journal.routed_columns`` a batch that failed to decode would read as an overflow
+       that does not decode, or as a partition short of the running schema.
+    3. Every row decoded is counted, and a total that differs from the footer's
+       ``num_rows`` is refused once the stream ends. ``iter_batches`` can end short without
+       raising where ``pq.read_table`` raises, and a short stream reads as a day with no
+       retype after the cut, which is the silent failure the fold over every batch exists
+       to prevent.
+
+    The batch size is read from :data:`_READ_BATCH_ROWS` at call time rather than bound as
+    a default, so a test can shrink it and make a small fixture span several batches.
+    """
+    available = set(source.schema_arrow.names)
+    missing = sorted(name for name in required if name not in available)
+    if missing:
+        raise DriftUnreadable(f"{partition.relative} did not read: missing {', '.join(missing)}")
+    projection = [*required, *(name for name in optional if name in available)]
+    projection = list(dict.fromkeys(projection))
+
+    decoded = 0
+    try:
+        # ``use_threads=False`` is the entitlement read's setting, and a measurement on the
+        # 2 GiB host kept it. With threads, the drift check over SPY and QQQ's 2026-10-02
+        # took 2.1 to 2.3 seconds against 2.8 to 2.9 on the night the gate stays shut, and
+        # SPY's open-gate read took 4.5 to 5.1 against 6.5 to 7.7. They cost 12 to 26 MiB
+        # and 41 to 71 MiB more anonymous memory on the same two reads. Saving under a
+        # second a night is not worth memory the sweep's cap is short of (marketlake #671).
+        batches = source.iter_batches(
+            columns=projection, batch_size=_READ_BATCH_ROWS, use_threads=False
+        )
     except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
         raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+    while True:
+        try:
+            batch = next(batches)
+        except StopIteration:
+            break
+        except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
+            raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+        decoded += batch.num_rows
+        yield batch
+
+    expected = source.metadata.num_rows
+    if decoded != expected:
+        raise DriftUnreadable(
+            f"{partition.relative} did not read: decoded {decoded:,} of {expected:,} rows"
+        )
 
 
 def _null_counts_by_read(partition, surface: str, columns: Sequence[str]) -> dict[str, int]:
@@ -532,70 +674,57 @@ def _null_counts_by_read(partition, surface: str, columns: Sequence[str]) -> dic
     return {name: table.column(name).null_count for name in table.column_names}
 
 
-def _data_rows(partition, surface: str, table):
-    """The partition's data rows alone, as an Arrow table.
-
-    Read off the table when the overflow gate already opened one, and off three columns
-    otherwise. **The filter and the aggregates stay in Arrow**, because a chains partition
-    is millions of rows and ``to_pylist`` on one is not a fraction of the read: measured on
-    SPY 2026-09-16, reading ``row_kind`` costs 35 ms and materialising it as a Python list
-    costs a further 150 ms, against 780 ms for the whole partition. Three columns pulled
-    that way cost about 0.6 s, which is most of a full read to answer three cheap
-    questions.
-    """
-    if table is None:
-        try:
-            table = pq.read_table(
-                partition.path, columns=["snap_ts", ROW_KIND_COLUMN, "schema_version"]
-            )
-        except Exception as exc:  # noqa: BLE001 - pyarrow raises several unrelated types
-            raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
-    return table.filter(pc.equal(table.column(ROW_KIND_COLUMN), ROW_KIND_DATA))
-
-
-def _stamps_and_versions(data) -> tuple[str | None, set[int]]:
-    """The earliest ``snap_ts`` and every ``schema_version`` among a table's data rows."""
-    if data.num_rows == 0:
-        return None, set()
-    earliest = pc.min(data.column("snap_ts")).as_py()
-    column = data.column("schema_version").combine_chunks()
-    versions = {value.as_py() for value in pc.unique(column)}
-    versions.discard(None)
-    return earliest, versions
-
-
-def first_cycle_of(partition, surface: str, field: str, table=None) -> str | None:
-    """The earliest data ``snap_ts`` whose overflow carries ``field``'s vendor key.
+def first_cycle_of(partition, surface: str, fields: Sequence[str]) -> str | None:
+    """The earliest data ``snap_ts`` whose overflow carries any of ``fields``' vendor keys.
 
     ``journal.routed_columns`` refuses this on purpose. Its docstring says it answers which
     column drifted "and deliberately not how many rows carried it or what the value was",
     so the design's "first cycle that saw it" is a row-level question the signature will
     not take and this check owes a pass of its own.
+
+    **One pass serves every field.** A vendor retype populates every row of the payload,
+    and a rotation can move 56 or 63 fields at once. Asked once per field, the pass would
+    decode every row's overflow once per field. So it streams ``extra``, ``snap_ts`` and
+    ``row_kind`` once, decodes each row's overflow at most once, and asks it every field.
+    The earliest stamp across the fields is all the page prints, so a row whose stamp
+    cannot lower the earliest found so far is not decoded at all.
+
+    The stream follows :func:`_batches`'s rules, and a failure to open, decode or count the
+    partition raises :class:`DriftUnreadable`.
     """
-    path = journal.extra_paths(surface).get(field)
-    if path is None:
+    known = journal.extra_paths(surface)
+    paths = [known[field] for field in fields if field in known]
+    if not paths:
         return None
-    if table is None:
-        table = _read_overflow(partition)
-    # Only the rows that carry an overflow can carry the key, and on a drifting partition
-    # that is a fraction of the day. Filtering in Arrow first keeps ``to_pylist`` off every
-    # row whose overflow is null, which is the ordinary row even here.
-    populated = table.filter(pc.is_valid(table.column(EXTRA_COLUMN)))
-    overflows = populated.column(EXTRA_COLUMN).to_pylist()
-    stamps = populated.column("snap_ts").to_pylist()
-    kinds = populated.column(ROW_KIND_COLUMN).to_pylist()
     earliest: str | None = None
-    for raw, stamp, kind in zip(overflows, stamps, kinds, strict=True):
-        if raw is None or stamp is None or kind != ROW_KIND_DATA:
-            continue
-        try:
-            decoded = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(decoded, Mapping) or _lookup(decoded, path) is None:
-            continue
-        if earliest is None or stamp < earliest:
-            earliest = stamp
+    with _open(partition) as source:
+        for batch in _batches(source, partition, [EXTRA_COLUMN, "snap_ts", ROW_KIND_COLUMN]):
+            # Only a data row with a populated overflow can carry the key. Filtering in
+            # Arrow first keeps ``to_pylist`` off every other row, and a gap row's
+            # overflow is null by construction.
+            try:
+                carrying = pc.and_(
+                    pc.is_valid(batch.column(EXTRA_COLUMN)),
+                    pc.equal(batch.column(ROW_KIND_COLUMN), ROW_KIND_DATA),
+                )
+                populated = batch.filter(carrying)
+                overflows = populated.column(EXTRA_COLUMN).to_pylist()
+                stamps = populated.column("snap_ts").to_pylist()
+            except Exception as exc:  # noqa: BLE001 - a kernel refuses a retyped column
+                raise DriftUnreadable(
+                    f"{partition.relative} did not read: {type(exc).__name__}: {exc}"
+                ) from exc
+            for raw, stamp in zip(overflows, stamps, strict=True):
+                if stamp is None or (earliest is not None and stamp >= earliest):
+                    continue
+                try:
+                    decoded = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(decoded, Mapping):
+                    continue
+                if any(_lookup(decoded, path) is not None for path in paths):
+                    earliest = stamp
     return earliest
 
 
@@ -875,21 +1004,18 @@ def _retype_first_cycle(partitions: Sequence, surface: str, fields: Sequence[str
     """
     earliest: str | None = None
     for partition in partitions:
-        table = None
-        for field_name in fields:
-            if table is None:
-                try:
-                    table = _read_overflow(partition)
-                except DriftUnreadable:
-                    # **A partition this cannot read must not cost the page.** The drift is
-                    # already established by the evidence gathered above, and the first cycle
-                    # is a detail of the body. ``read_surface_day`` has already reported the
-                    # partition as skipped, so the failure is on the record rather than
-                    # swallowed, and a page naming the drift with no stamp beats no page.
-                    break
-            stamp = first_cycle_of(partition, surface, field_name, table=table)
-            if stamp is not None and (earliest is None or stamp < earliest):
-                earliest = stamp
+        try:
+            stamp = first_cycle_of(partition, surface, fields)
+        except DriftUnreadable:
+            # **A partition this cannot read must not cost the page.** The drift is already
+            # established by the evidence gathered above, and the first cycle is a detail of
+            # the body. A partition ``read_surface_day`` could not read is already reported
+            # as skipped. One it read and this pass cannot, such as a file replaced between
+            # the two opens, costs only the stamp, and a page naming the drift with no stamp
+            # beats no page.
+            continue
+        if stamp is not None and (earliest is None or stamp < earliest):
+            earliest = stamp
     return earliest
 
 
