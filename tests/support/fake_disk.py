@@ -19,8 +19,9 @@ change it the way the real tools would change a volume.
    magic in that 4 KiB block: byte 1080 of block 0, the primary, and byte 56 of any other
    block, such as 32768, group 1's backup. Its absence prints zeros there, as on a volume
    with no ext4 superblock.
-4. ``mkfs.ext4`` writes all of them, with ``FAKE_NEW_UUID`` as the new filesystem's UUID
-   and the magic ``53 ef`` in blocks 0 and 32768.
+4. ``mkfs.ext4`` writes ``probe`` and ``uuid``, with ``FAKE_NEW_UUID`` as the new
+   filesystem's UUID. It writes no ``magic-<block>``, since once ``probe`` says ext4 the
+   bootstrap mounts without reading the magic again.
 
 ``$STATE/mounted`` holds the UUID of whatever is mounted at the lake root. The fake
 ``systemctl start`` of a ``.mount`` unit writes it from the disk, and ``findmnt`` reads it.
@@ -85,8 +86,6 @@ uuid="${FAKE_NEW_UUID:-11111111-2222-3333-4444-555555555555}"
 printf 'DEVNAME=%s\nLABEL=marketlake\nUUID=%s\nTYPE=ext4\n' "${*: -1}" "$uuid" \
   > "$STATE/disk/probe"
 printf '%s' "$uuid" > "$STATE/disk/uuid"
-printf '\x53\xef' > "$STATE/disk/magic-0"
-printf '\x53\xef' > "$STATE/disk/magic-32768"
 exit 0
 """
 

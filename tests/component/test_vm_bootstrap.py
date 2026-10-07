@@ -357,18 +357,65 @@ def test_an_existing_ext4_mounts_without_mkfs(vm):
     assert (vm.state / "mounted").read_text() == FAKE_UUID
 
 
+# The whole refusal line each case prints, with ``{dev}`` standing for the device path.
+MAGIC_REFUSAL = (
+    "blkid found no filesystem on {dev}, but 4 KiB block {block} holds an ext4 superblock,"
+    " so it is a damaged lake, an interrupted mkfs, or a chance match on a fresh volume."
+    " Nothing was formatted. infra/README.md says how to tell which."
+    " Check it read-only with: e2fsck -n {dev}"
+)
+
+
 @pytest.mark.parametrize(
     ("probe", "magic", "env", "message"),
     [
-        (None, "0", {}, "4 KiB block 0 holds an ext4 superblock"),
-        (None, "32768", {}, "4 KiB block 32768 holds an ext4 superblock"),
-        (None, None, {"DD_FAIL_BLOCK": "0"}, "could not read 4 KiB block 0 of"),
-        (None, None, {"DD_FAIL_BLOCK": "32768"}, "could not read 4 KiB block 32768 of"),
-        (None, None, {"DD_SHORT_BLOCK": "0"}, "the read of 4 KiB block 0 of"),
-        (None, None, {"DD_SHORT_BLOCK": "32768"}, "the read of 4 KiB block 32768 of"),
-        ("UUID=abc\nTYPE=xfs\n", None, {}, "holds something other than ext4 (blkid exit 0)"),
-        ("PTUUID=abc\nPTTYPE=gpt\n", None, {}, "holds something other than ext4 (blkid exit 0)"),
-        (None, None, {"BLKID_RC": "8"}, "holds something other than ext4 (blkid exit 8)"),
+        (None, "0", {}, MAGIC_REFUSAL.replace("{block}", "0")),
+        (None, "32768", {}, MAGIC_REFUSAL.replace("{block}", "32768")),
+        (
+            None,
+            None,
+            {"DD_FAIL_BLOCK": "0"},
+            "could not read 4 KiB block 0 of {dev}, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_FAIL_BLOCK": "32768"},
+            "could not read 4 KiB block 32768 of {dev}, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_SHORT_BLOCK": "0"},
+            "the read of 4 KiB block 0 of {dev} came back short, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_SHORT_BLOCK": "32768"},
+            "the read of 4 KiB block 32768 of {dev} came back short, so it is not formatted",
+        ),
+        (
+            "UUID=abc\nTYPE=xfs\n",
+            None,
+            {},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 0),"
+            " so it is not formatted",
+        ),
+        (
+            "PTUUID=abc\nPTTYPE=gpt\n",
+            None,
+            {},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 0),"
+            " so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"BLKID_RC": "8"},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 8),"
+            " so it is not formatted",
+        ),
     ],
     ids=[
         "the primary's magic",
@@ -390,17 +437,25 @@ def test_a_volume_that_may_hold_a_lake_is_never_formatted(vm, probe, magic, env,
     proc = vm.bootstrap(**env)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     line = _one_line(proc, "vm-bootstrap: ")
-    assert message in line
-    if magic is not None:
-        assert (
-            "a damaged lake, an interrupted mkfs, or a chance match on a fresh volume."
-            " Nothing was formatted." in line
-        )
-        assert line.endswith(f"Check it read-only with: e2fsck -n {vm.device}")
+    assert line == "vm-bootstrap: " + message.replace("{dev}", str(vm.device))
     assert not vm.ran("mkfs.ext4")
     assert not vm.ran("systemctl start")
     assert vm.fstab.read_text() == ROOT_LINE
     _assert_nothing_installed(vm)
+
+
+# Two bytes that share one byte with the magic, or hold both in the wrong order. A
+# comparison that checked only one of the two bytes would match a fresh volume's random
+# content about once in 256 reads at each place, and refuse a volume that holds no lake.
+@pytest.mark.parametrize("block", ["0", "32768"])
+@pytest.mark.parametrize(
+    "near_miss", [b"\x53\x00", b"\x00\xef", b"\xef\x53"], ids=["53 00", "00 ef", "ef 53"]
+)
+def test_two_bytes_that_only_resemble_the_magic_still_format(vm, block, near_miss):
+    vm.disk.joinpath(f"magic-{block}").write_bytes(near_miss)
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.ran("mkfs.ext4")
 
 
 def test_the_uuid_is_read_only_after_mkfs_on_a_fresh_volume(vm):
