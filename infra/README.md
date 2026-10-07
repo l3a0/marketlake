@@ -18,11 +18,13 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    AWS credentials. The plan role reads, and pull requests may assume it. The apply role
    writes, and only the `infra` environment on `main` may assume it. CI cannot apply the
    configuration that creates it, so the owner applies this one from the laptop.
-2. `infra/live/` holds the backup bucket, its IAM user `marketlake-backup`, the instance
-   role `marketlake-instance` with its read of the config parameters, and the IAM user
-   `marketlake-token-writer`, which writes the Schwab token's parameter.
-   `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
-   applies it after a merge to `main` once the owner approves the run.
+2. `infra/live/` holds the backup bucket, the instance role `marketlake-instance` with its
+   read of the config parameters, and the laptop's one IAM user, `marketlake-command`
+   ([#737](https://github.com/l3a0/marketlake/issues/737)). That user can only assume two
+   roles: `marketlake-backup`, which reaches the bucket, and `marketlake-token-writer`,
+   which writes the Schwab token's parameter. `.github/workflows/infra.yml` plans it on
+   each pull request from a branch here, and applies it after a merge to `main` once the
+   owner approves the run.
 
 The laptop also applies any change the apply role may not make, such as the backup
 bucket's versioning or a role's trust policy. A trust policy says who may assume the
@@ -35,13 +37,18 @@ stay out of every tracked file, every issue and every comment.
 2. `<state-bucket>`, the state bucket's name.
 3. `<backup-bucket>`, the backup bucket's name.
 
-`<policy-name>` is the name of `marketlake-backup`'s inline policy. It lives in a
-repository variable, which GitHub does not mask in logs, so it is not a secret. It is
-still written only on the laptop and in GitHub's settings.
+`<policy-name>` is the name of the old `marketlake-backup` user's inline policy. It lives
+in a repository variable, which GitHub does not mask in logs, so it is not a secret. It is
+still written only on the laptop and in GitHub's settings. Since
+[#737](https://github.com/l3a0/marketlake/issues/737) no resource uses it, so any valid
+IAM policy name works until [#741](https://github.com/l3a0/marketlake/issues/741) removes
+the variable.
 
 The rest are read when they are needed.
 
 - `<github-user-id>` is the owner's numeric GitHub id, which step 8 reads.
+- `<backup-key-id>` is the id of the old `marketlake-backup` user's access key, which
+  [Retire the old users](#retire-the-old-users) reads.
 - `<branch>` and `<n>` are the pull request's branch and number.
 - `<run-id>`, `<lock-id>`, `<branch-head>` and `<merge-commit>` are ids that an earlier
   command prints, named where each one appears.
@@ -54,15 +61,22 @@ unreplaced is a redirection in zsh.
 This section records the run for
 [PR #698](https://github.com/l3a0/marketlake/pull/698), merged 2026-10-06, which added
 `infra.yml`. A rerun with `infra.yml` already on `main`, such as a rebuild into a fresh
-account, differs in three steps.
+account, differs in five steps.
 
-1. Step 7 applies the bootstrap from a worktree at `origin/main` rather than at a pull
+1. Step 3 finds no `marketlake-backup` user, so it skips the user lookups.
+2. Steps 4 and 9 take any valid IAM policy name for `<policy-name>`, until
+   [#741](https://github.com/l3a0/marketlake/issues/741) removes the variable.
+3. Step 7 applies the bootstrap from a worktree at `origin/main` rather than at a pull
    request's branch.
-2. Step 10 drops out, since no pull request needs a plan.
-3. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
+4. Step 10 drops out, since no pull request needs a plan.
+5. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
    `gh workflow run infra.yml --repo l3a0/marketlake --ref main`. Its first apply in a
    fresh account also creates `aws_iam_role_policy_attachment.instance_ssm`, which
-   [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run.
+   [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run, and
+   `marketlake-command` with its two roles, which
+   [#737](https://github.com/l3a0/marketlake/issues/737) added. After that apply, create
+   the user's access key and read the roles' ARNs by hand, as
+   [Create the token writer, in order](#create-the-token-writer-in-order) says.
 
 ### 1. Install the tools
 
@@ -111,14 +125,20 @@ does not last from one command to the next. That is why every `aws` command belo
 
 ### 3. Read the values recorded nowhere
 
-Nothing tracked names the backup bucket, the user's policy, or whether the account
-already holds a GitHub OIDC provider, so read each from AWS.
+Nothing tracked names the backup bucket, the old backup user's policy, or whether the
+account already holds a GitHub OIDC provider, so read each from AWS.
 
 List the buckets, to find `<backup-bucket>`.
 
 ```bash
 aws s3api list-buckets --profile marketlake-admin
 ```
+
+The next two commands read the old `marketlake-backup` user, which the recorded run
+imported. [#737](https://github.com/l3a0/marketlake/issues/737) replaced that user with a
+role of the same name and stopped importing it. Once the owner has deleted the user, or in
+a fresh account, there is no user to read, so skip both, and use any valid IAM policy name
+for `<policy-name>` until [#741](https://github.com/l3a0/marketlake/issues/741).
 
 List the IAM users, to confirm `marketlake-backup` exists.
 
@@ -127,8 +147,8 @@ aws iam list-users --profile marketlake-admin
 ```
 
 List the user's inline policies. The one name it prints is `<policy-name>`. An import
-adopts a resource that already exists into the state, rather than creating it. The import
-of the user's policy needs that name, so there is no safe guess.
+adopts a resource that already exists into the state, rather than creating it. The
+recorded run's import of the user's policy needed that name, so there was no safe guess.
 
 ```bash
 aws iam list-user-policies --user-name marketlake-backup --profile marketlake-admin
@@ -197,7 +217,10 @@ EOF
 printf 'bucket = "%s"\n' "<state-bucket>" > ~/.config/marketlake/infra/live.tfbackend
 ```
 
-`live.tfvars` holds the two values the live configuration needs.
+`live.tfvars` holds the two values the live configuration needs. Nothing reads
+`backup_policy_name` since [#737](https://github.com/l3a0/marketlake/issues/737), yet the
+variable still has no default, so it takes any valid IAM policy name until
+[#741](https://github.com/l3a0/marketlake/issues/741) removes it.
 
 ```bash
 cat > ~/.config/marketlake/infra/live.tfvars <<'EOF'
@@ -376,8 +399,10 @@ reads them from five settings.
 2. The secret `AWS_PLAN_ROLE_ARN`, the plan role's ARN, on the repository.
 3. The secret `TF_STATE_BUCKET`, the state bucket's name, on the repository.
 4. The secret `BACKUP_BUCKET`, the backup bucket's name, on the repository.
-5. The variable `BACKUP_POLICY_NAME`, the name of `marketlake-backup`'s inline policy, on
-   the repository.
+5. The variable `BACKUP_POLICY_NAME`, the name of the old `marketlake-backup` user's
+   inline policy, on the repository. CI still refuses an empty value, and nothing reads it
+   since [#737](https://github.com/l3a0/marketlake/issues/737), so any valid IAM policy
+   name works until [#741](https://github.com/l3a0/marketlake/issues/741) removes it.
 
 Each command below takes its value from AWS or from a placeholder, so no value lands in a
 tracked file.
@@ -726,35 +751,212 @@ written in kebab case.
 5. `/marketlake/config/schwab-oauth-token`, the contents of `token.json`.
 
 The code manages no parameter and names only the path. A parameter resource needs its
-value at apply time, so CI would hold every secret, and a data source writes the
-decrypted value into the state. So the owner puts each value from the laptop. `marketlake-instance` reads the path, and neither CI role can. AWS's
-`AmazonSSMManagedInstanceCore`, which [#695](https://github.com/l3a0/marketlake/issues/695)
-attaches, lets the instance role read every parameter in the account, which holds no
-other secret. `marketlake-token-writer` can only overwrite the
-token, which the laptop's weekly re-auth does when its `config.yaml` sets
-`token_store: both` ([#636](https://github.com/l3a0/marketlake/issues/636)).
+value at apply time, so CI would hold every secret, and a data source writes the decrypted
+value into the state. So the owner puts each value from the laptop. `marketlake-instance`
+reads the path, and neither CI role can. AWS's `AmazonSSMManagedInstanceCore`, which
+[#695](https://github.com/l3a0/marketlake/issues/695) attaches, lets the instance role
+read every parameter in the account, which holds no other secret. The role
+`marketlake-token-writer` can only overwrite the token, and only `marketlake-command` may
+assume it ([#737](https://github.com/l3a0/marketlake/issues/737)). The laptop's weekly
+re-auth does that when its `config.yaml` sets `token_store: both`
+([#636](https://github.com/l3a0/marketlake/issues/636)).
 
 ### Create the token writer, in order
 
-The pull request that adds the token writer changes the bootstrap too, so it follows
-[Changing the bootstrap](#changing-the-bootstrap).
+Since [#737](https://github.com/l3a0/marketlake/issues/737) the token writer is a role,
+and the live apply creates it together with the role `marketlake-backup` and the laptop's
+one user, `marketlake-command`, which assumes both. This heading keeps its old name so
+that links to it still work. The pull request that added them changed the bootstrap too,
+so it follows [Changing the bootstrap](#changing-the-bootstrap).
 
 1. Apply the bootstrap from the laptop, from the pull request's branch at its final head,
    as in step 7. That gives the apply role `iam:CreateUser` and `iam:PutUserPolicy` on
-   `marketlake-token-writer`. When the pull request merged first, follow
+   `marketlake-command`, and `iam:CreateRole` and `iam:PutRolePolicy` on the two roles.
+   When the pull request merged first, follow
    [When the merge came before the bootstrap apply](#when-the-merge-came-before-the-bootstrap-apply)
    in place of this step and the next.
 2. Merge, then approve the `tofu apply (live)` run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change), which creates the
-   user and its policy.
-3. Create an access key for `marketlake-token-writer` in the AWS console. The key goes
-   into the laptop's `config.yaml` under
-   [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys, and it
-   stays out of code, so no secret reaches the state.
+   user, the two roles and their policies.
+3. Create an access key for `marketlake-command` in the AWS console. The key goes into the
+   laptop's `config.yaml` as `command_access_key_id` and `command_secret_access_key`, and
+   it stays out of code, so no secret reaches the state.
+4. Write each role's ARN into the laptop's `config.yaml`, `marketlake-backup`'s as
+   `bucket_role_arn` and `marketlake-token-writer`'s as `token_store_role_arn`. An ARN
+   carries the account id, so each command below writes it straight into a copy of the
+   file and prints nothing, and the account id reaches no transcript or log. The copy is
+   renamed into place at the end, because capture reads `config.yaml` every minute and a
+   half-written file would stop it. Make the copy.
 
-Never create the user by hand. The live apply creates it, and its `CreateUser` fails with
-`EntityAlreadyExists` when the user already exists. A rebuild into a fresh account
-creates the token writer's key after its own live apply, then puts all five values below.
+   ```bash
+   cp -p "$HOME/.config/marketlake/config.yaml" "$HOME/.config/marketlake/config.yaml.new"
+   ```
+
+   Add the backup role's ARN.
+
+   ```bash
+   A=$(aws iam get-role --role-name marketlake-backup --query Role.Arn --output text --profile marketlake-admin) && printf 'bucket_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
+   ```
+
+   Add the token writer's ARN.
+
+   ```bash
+   A=$(aws iam get-role --role-name marketlake-token-writer --query Role.Arn --output text --profile marketlake-admin) && printf 'token_store_role_arn: %s\n' "$A" >> "$HOME/.config/marketlake/config.yaml.new"; unset A
+   ```
+
+   Finish the copy's other settings, which
+   [#737](https://github.com/l3a0/marketlake/issues/737)'s step 6 lists, then rename it
+   into place.
+
+   ```bash
+   mv "$HOME/.config/marketlake/config.yaml.new" "$HOME/.config/marketlake/config.yaml"
+   ```
+
+Never create the user or either role by hand. The live apply creates them, and its
+`CreateUser` or `CreateRole` fails with `EntityAlreadyExists` when one already exists. A
+rebuild into a fresh account creates `marketlake-command`'s key and reads both ARNs after
+its own live apply, then puts all five values below.
+
+### Move the laptop onto `marketlake-command`
+
+Before [#737](https://github.com/l3a0/marketlake/issues/737), the laptop's AWS key
+belonged to the user `marketlake-backup`, and the user `marketlake-token-writer` never got
+one. The move runs once, around the merge of
+[#737](https://github.com/l3a0/marketlake/issues/737)'s infra pull request.
+[#737](https://github.com/l3a0/marketlake/issues/737)'s body carries every step and its
+rollback, and this section carries the commands for three of them.
+
+#### Probe the name rule
+
+Before the bootstrap apply, check that a user and a role may share a name, because the
+role `marketlake-backup` arrives while the user `marketlake-backup` still exists. AWS's
+documentation is ambiguous here. If they cannot, the live apply's `CreateRole` fails after
+the merge, and the roles need new names before merging. The probe creates a user and a
+role under one throwaway name, then deletes both. The commands are joined with `;`, so both
+deletes run even when a create fails.
+
+Never use a real role name for the probe. A role made by hand makes the live apply's
+`CreateRole` fail with `EntityAlreadyExists`, and the apply role may not delete it.
+
+```bash
+aws iam create-user --user-name marketlake-name-probe --profile marketlake-admin; aws iam create-role --role-name marketlake-name-probe --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' --profile marketlake-admin; aws iam delete-role --role-name marketlake-name-probe --profile marketlake-admin; aws iam delete-user --user-name marketlake-name-probe --profile marketlake-admin
+```
+
+A `create-role` that prints the new role means the names may be shared. One that fails
+with `EntityAlreadyExists` means they may not. Its `delete-role` then fails with
+`NoSuchEntity`, which is expected.
+
+#### Look the calls up in CloudTrail
+
+After the laptop's bucket `live-check` and a re-auth have run under the roles, look their
+calls up in CloudTrail's event history, allowing about 5 minutes for delivery. Event
+history records management calls only, so it shows each `AssumeRole`,
+`GetBucketVersioning` and `PutParameter`, and never an object read or write. The command
+prints each event's time, its name, the caller's ARN with its account prefix stripped, and
+for an `AssumeRole` the session name. It never prints `roleArn`, which carries the account
+id.
+
+```bash
+for e in AssumeRole GetBucketVersioning PutParameter; do aws cloudtrail lookup-events --region us-east-1 --profile marketlake-admin --lookup-attributes "AttributeKey=EventName,AttributeValue=$e" --max-results 20 --output json | jq -r '.Events[].CloudTrailEvent | fromjson | [.eventTime, .eventName, ((.userIdentity.arn // "-") | sub("^arn:aws:[a-z]+::[0-9]+:"; "")), (.requestParameters.roleSessionName? // "-")] | @tsv'; done
+```
+
+The calls to look for are these three.
+
+1. `AssumeRole` by `user/marketlake-command`, once with the session name
+   `marketlake-bucket` and once with `marketlake-token-put`.
+2. `GetBucketVersioning` by `assumed-role/marketlake-backup/marketlake-bucket`.
+3. `PutParameter` by `assumed-role/marketlake-token-writer/marketlake-token-put`.
+
+The bucket's session is assumed through STS in the bucket client's region, and S3 records
+its calls in the bucket's region. When `bucket_region` is not `us-east-1`, run the command
+again with `--region` set to it, to find the `AssumeRole` for `marketlake-bucket` and the
+`GetBucketVersioning`.
+
+#### Retire the old users
+
+Delete the old users only once three things hold.
+
+1. The bucket check and the re-auth above both passed.
+2. A nightly upload has run under the role, if the laptop's backup target is the bucket by
+   then.
+3. `marketlake-backup`'s key was last used before the switch, by the check below.
+
+CloudTrail's event history never shows an object call, so the key's last use is the only
+record that the nightly job, and the copy of the key that
+[#686](https://github.com/l3a0/marketlake/issues/686) put on the measurement VM, have
+stopped using it. First remove the `bucket_*` key values from the laptop's `config.yaml`
+and from the measurement VM, or terminate that VM.
+
+Read the old key's id. It is `<backup-key-id>` below.
+
+```bash
+aws iam list-access-keys --user-name marketlake-backup --profile marketlake-admin
+```
+
+Read when it was last used. Go on only when `LastUsedDate` is earlier than the switch to
+the role.
+
+```bash
+aws iam get-access-key-last-used --access-key-id "<backup-key-id>" --profile marketlake-admin
+```
+
+Delete the key.
+
+```bash
+aws iam delete-access-key --user-name marketlake-backup --access-key-id "<backup-key-id>" --profile marketlake-admin
+```
+
+List the user's inline policies. The one name it prints is `<policy-name>`.
+
+```bash
+aws iam list-user-policies --user-name marketlake-backup --profile marketlake-admin
+```
+
+```bash
+aws iam delete-user-policy --user-name marketlake-backup --policy-name "<policy-name>" --profile marketlake-admin
+```
+
+`delete-user` fails with `DeleteConflict` while the user keeps an access key, a policy, a
+group, a console password or an MFA device. The first four commands below should each
+print an empty list, and the fifth should fail with `NoSuchEntity`, which means the user
+has no console password.
+
+```bash
+aws iam list-access-keys --user-name marketlake-backup --profile marketlake-admin
+aws iam list-attached-user-policies --user-name marketlake-backup --profile marketlake-admin
+aws iam list-groups-for-user --user-name marketlake-backup --profile marketlake-admin
+aws iam list-mfa-devices --user-name marketlake-backup --profile marketlake-admin
+aws iam get-login-profile --user-name marketlake-backup --profile marketlake-admin
+```
+
+```bash
+aws iam delete-user --user-name marketlake-backup --profile marketlake-admin
+```
+
+The user `marketlake-token-writer` holds no key, and its one policy is
+`put-schwab-oauth-token`.
+
+```bash
+aws iam delete-user-policy --user-name marketlake-token-writer --policy-name put-schwab-oauth-token --profile marketlake-admin
+```
+
+Run the same five checks for it.
+
+```bash
+aws iam list-access-keys --user-name marketlake-token-writer --profile marketlake-admin
+aws iam list-attached-user-policies --user-name marketlake-token-writer --profile marketlake-admin
+aws iam list-groups-for-user --user-name marketlake-token-writer --profile marketlake-admin
+aws iam list-mfa-devices --user-name marketlake-token-writer --profile marketlake-admin
+aws iam get-login-profile --user-name marketlake-token-writer --profile marketlake-admin
+```
+
+```bash
+aws iam delete-user --user-name marketlake-token-writer --profile marketlake-admin
+```
+
+The IAM console's delete of a user is the alternative to these commands. It removes the
+user's keys, policies and other attachments before the user itself. It still waits for
+the `get-access-key-last-used` check above.
 
 ### Put the values
 
@@ -811,17 +1013,23 @@ and tier, and never a value.
 aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --parameter-filters "Key=Path,Values=/marketlake/config"
 ```
 
-### Recover from a leaked token-writer key
+### Recover from a leaked `marketlake-command` key
 
-A put can change more than the value. It can move the parameter to the Advanced tier,
-attach a parameter policy, set an allowed pattern, or store a forged token that the VM's
-pull accepts. So recovery deletes the parameter whatever its listing shows, and a fresh
-re-auth puts the real token back.
+The laptop's one key reaches both roles, so a leaked key can write the token and read and
+overwrite objects in the bucket. Versioning keeps the copy each overwrite replaced, so the
+bucket's recovery is the version recovery by hand that `README.md` describes. The token
+needs more. A put can change more than the value. It can move the parameter to the
+Advanced tier, attach a parameter policy, set an allowed pattern, or store a forged token
+that the VM's pull accepts. So recovery deletes the parameter whatever its listing shows,
+and a fresh re-auth puts the real token back.
 
-1. Deactivate the key for `marketlake-token-writer` in the AWS console.
-2. Create a new access key for the same user, and put it in the laptop's `config.yaml`
-   under [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys.
-3. Delete the parameter.
+1. Deactivate the key for `marketlake-command` in the AWS console. That stops new
+   `AssumeRole` calls at once. A role session issued before it keeps working until it
+   expires, which takes at most an hour, the roles' session limit.
+2. Create a new access key for the same user, and put it in the laptop's `config.yaml` as
+   `command_access_key_id` and `command_secret_access_key`.
+3. Wait until an hour has passed since the deactivation, so no old session can put the
+   token again after the delete. Then delete the parameter.
 
    ```bash
    aws ssm delete-parameter --name /marketlake/config/schwab-oauth-token --profile marketlake-admin --region us-east-1
@@ -843,9 +1051,13 @@ after that hour.
 
 ## Bootstrap changes already known
 
-Two open issues change `infra/bootstrap/`, and each follows the order under
+Three open issues change `infra/bootstrap/`, and each follows the order under
 [Changing the bootstrap](#changing-the-bootstrap). Each issue carries its own scope.
 
 1. [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role.
 2. [#704](https://github.com/l3a0/marketlake/issues/704) widens the apply role's trust to
    a second environment.
+3. [#737](https://github.com/l3a0/marketlake/issues/737) replaces the apply role's grants
+   on the users `marketlake-backup` and `marketlake-token-writer` with `iam:CreateUser`
+   and `iam:PutUserPolicy` on `marketlake-command`, and `iam:CreateRole` and
+   `iam:PutRolePolicy` on the roles `marketlake-backup` and `marketlake-token-writer`.

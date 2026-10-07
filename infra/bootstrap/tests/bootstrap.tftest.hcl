@@ -326,16 +326,19 @@ run "policies_are_exactly_the_reviewed_statements" {
           Resource = ["arn:aws:iam::000000000000:instance-profile/marketlake-instance"]
         },
         {
-          Sid      = "BackupUserWrite"
-          Effect   = "Allow"
-          Action   = ["iam:PutUserPolicy", "iam:TagUser", "iam:UntagUser"]
-          Resource = ["arn:aws:iam::000000000000:user/marketlake-backup"]
-        },
-        {
-          Sid      = "TokenWriterUserWrite"
+          Sid      = "CommandUserWrite"
           Effect   = "Allow"
           Action   = ["iam:CreateUser", "iam:PutUserPolicy"]
-          Resource = ["arn:aws:iam::000000000000:user/marketlake-token-writer"]
+          Resource = ["arn:aws:iam::000000000000:user/marketlake-command"]
+        },
+        {
+          Sid    = "CommandRolesWrite"
+          Effect = "Allow"
+          Action = ["iam:CreateRole", "iam:PutRolePolicy"]
+          Resource = [
+            "arn:aws:iam::000000000000:role/marketlake-backup",
+            "arn:aws:iam::000000000000:role/marketlake-token-writer",
+          ]
         },
         {
           Sid      = "Ec2InHomeRegion"

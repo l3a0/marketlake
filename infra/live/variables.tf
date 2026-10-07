@@ -23,7 +23,7 @@ variable "backup_policy_name" {
 }
 
 variable "adopt_existing" {
-  description = "Import the existing bucket, user and policy. The tests set it to false, because an import crashes tofu test."
+  description = "Import the existing bucket and its settings. The tests set it to false, because an import crashes tofu test."
   type        = bool
   default     = true
   nullable    = false
