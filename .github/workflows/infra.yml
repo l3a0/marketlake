@@ -2,8 +2,10 @@
 #
 # No job here is named `test`, because the ruleset on main requires a check by that
 # name and ci.yml provides it. These checks download a provider of about 750 MB
-# unpacked, so they run only when infra/ or this file changes. infra/README.md carries
-# the owner's steps and the secrets this workflow reads.
+# unpacked, so they run only when this file or anything under infra/ other than Markdown
+# changes. No configuration reads a Markdown file, so a merge that changes only Markdown
+# under infra/ has nothing to apply. infra/ci/apply-is-stale.sh compares the same paths.
+# infra/README.md carries the owner's steps and the secrets this workflow reads.
 #
 # A public repository's logs are readable by anyone, so plan and apply send their
 # human output to /dev/null. Each job writes resource addresses, actions and attribute
@@ -19,19 +21,21 @@ on:
     branches: [main]
     paths:
       - "infra/**"
+      - "!infra/**/*.md"
       - ".github/workflows/infra.yml"
   pull_request:
     paths:
       - "infra/**"
+      - "!infra/**/*.md"
       - ".github/workflows/infra.yml"
   # Reverts console drift without a code change, behind the same approval as a merge.
   # replace_instance also replaces the VM, the only reviewed route to a new instance and
-  # the one a new lake volume needs (#686). A merge that touches infra/ while a dispatch
-  # waits for approval can drop it: the dispatch goes stale and skips, or the push's run
-  # queues in the infra-apply group and cancels it, then applies with no -replace. So
-  # dispatch with no infra/ merge pending. The approval comes before the job plans, so
-  # read the run's summary once it finishes. It shows aws_instance.vm as a replacement,
-  # and if it does not, dispatch again with no infra/ merge pending.
+  # the one a new lake volume needs (#686). A merge that starts a push run while a
+  # dispatch waits for approval can drop it: the dispatch goes stale and skips, or the
+  # push's run queues in the infra-apply group and cancels it, then applies with no
+  # -replace. So dispatch with no such merge pending. The approval comes before the job
+  # plans, so read the run's summary once it finishes. It shows aws_instance.vm as a
+  # replacement, and if it does not, dispatch again with no such merge pending.
   workflow_dispatch:
     inputs:
       replace_instance:
@@ -216,7 +220,7 @@ jobs:
           state="$(infra/ci/apply-is-stale.sh)"
           echo "state=$state" >> "$GITHUB_OUTPUT"
           if [ "$state" = stale ]; then
-            echo "Skipped: a newer commit on main changes infra/, and its own run applies it." \
+            echo "Skipped: a newer commit on main changes a path that starts this workflow, and its own run applies it." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 

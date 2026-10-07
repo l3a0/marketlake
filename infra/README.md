@@ -25,7 +25,9 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    two roles: `marketlake-backup`, which reaches the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
-   applies it after a merge to `main` once the owner approves the run. A manual run can
+   applies it after a merge to `main` once the owner approves the run. Either starts on
+   its own only when the pull request or merge changes the workflow or a file under
+   `infra/` other than Markdown, since no configuration reads Markdown. A manual run can
    also replace the VM, as [The hosted VM](#the-hosted-vm) says.
 
 The laptop also applies any change the apply role may not make, such as the backup
@@ -601,10 +603,12 @@ gh api repos/l3a0/marketlake/environments/infra --jq '[.protection_rules[].type]
 It must still list `required_reviewers` and `branch_policy`. An unprotected environment
 named `infra` runs the same apply, and its run is just as green.
 
-A later merge that touches `infra/` or `infra.yml` while a run waits starts a newer run.
-After its approval, the older run checks `main` again, finds the newer commit, and skips
-itself as stale. The newer run applies everything once the owner approves it. So
-approving waiting runs out of order never applies an older commit last.
+A later merge that changes `infra.yml`, or anything under `infra/` other than Markdown,
+while a run waits starts a newer run. After its approval, the older run checks `main`
+again, finds the newer commit, and skips itself as stale. The newer run applies
+everything once the owner approves it. So approving waiting runs out of order never
+applies an older commit last. A merge that changes only Markdown under `infra/` starts
+no run, and the older run reads it as fresh and applies.
 
 ### 12. End the session
 
@@ -1705,12 +1709,13 @@ gh workflow run infra.yml --repo l3a0/marketlake --ref main -f replace_instance=
 
 Three rules go with it.
 
-1. **Dispatch with no `infra/` merge pending, and merge none while the run waits.** A
-   merge that touches `infra/` or `infra.yml` while the dispatch waits for approval drops
-   it in one of two ways. The dispatch can go stale and skip, with a line saying a newer
-   commit's run applies the change, which is false for a replacement. Or the merge's run
-   queues in the `infra-apply` group and cancels the waiting dispatch. Either way, the
-   merge's run applies without `-replace`.
+1. **Dispatch while no merge that starts an Infra run is pending, and merge none while
+   the run waits.** A merge starts such a run when it changes `infra.yml`, or anything
+   under `infra/` other than Markdown. One that lands while the dispatch waits for
+   approval drops it in one of two ways. The dispatch can go stale and skip, with a line
+   saying a newer commit's run applies the change, which is false for a replacement. Or
+   the merge's run queues in the `infra-apply` group and cancels the waiting dispatch.
+   Either way, the merge's run applies without `-replace`.
 2. **Approve it outside the window above.**
 3. **Confirm the replacement in the run's summary.** The approval comes before the job
    plans, so the summary, "Plan this run applies to infra/live", appears only as the run
@@ -1753,13 +1758,11 @@ refuses. After the home address changes, edit the `owner_ssh_cidr` line in place
 
 ## Bootstrap changes already known
 
-Three open issues change `infra/bootstrap/`, and each follows the order under
-[Changing the bootstrap](#changing-the-bootstrap). Each issue carries its own scope.
+One open issue on the MVP 2 path changes `infra/bootstrap/`.
+[#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role, and follows the
+order under [Changing the bootstrap](#changing-the-bootstrap). The issue carries its own
+scope.
 
-1. [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role.
-2. [#704](https://github.com/l3a0/marketlake/issues/704) widens the apply role's trust to
-   a second environment.
-3. [#737](https://github.com/l3a0/marketlake/issues/737) replaces the apply role's grants
-   on the users `marketlake-backup` and `marketlake-token-writer` with `iam:CreateUser`
-   and `iam:PutUserPolicy` on `marketlake-command`, and `iam:CreateRole` and
-   `iam:PutRolePolicy` on the roles `marketlake-backup` and `marketlake-token-writer`.
+[#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
+also changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to
+accept a second environment, and its body gives the order for that change.
