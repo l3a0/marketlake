@@ -13,10 +13,10 @@ types. The script has three modes, one for each step of the infra workflow that 
    with its keys replaced by ``[…]``, the raw actions list, an import flag and the names
    of the changed attributes. It never holds a value, because anyone signed in can
    download a public repository's artifacts.
-2. ``fetch`` runs on ``main``. It finds the pull request the pushed commit merged,
-   checks that the artifact named for that pull request's head came from this
-   repository's own ``pull_request`` run of the workflow, and writes the reviewed change
-   set to ``--out``. Any failure leaves no file, prints the reason and exits 0, so the
+2. ``fetch`` runs on ``main``. It finds the pull request merged into ``main`` as the
+   pushed commit, checks that the artifact named for that pull request's head came from
+   this repository's own ``pull_request`` run of the workflow, and writes the reviewed
+   change set to ``--out``. Any failure leaves no file, prints the reason and exits 0, so the
    lookup never fails the job.
 3. ``decide`` runs on ``main`` after ``fetch``. It reads ``tofu show -json`` of the plan
    the job is about to apply, checks the four rules, writes ``verdict=apply`` or
@@ -71,11 +71,9 @@ SAFE_ACTIONS = frozenset({"no-op", "create", "update", "read"})
 
 UNSAFE_TYPE_PREFIXES = ("aws_iam_", "aws_kms_")
 
-# A type belongs here only when no change to it can interrupt capture or reach the VM.
-# What a change does to data or access is in the diff, and the merge reviews it.
-# Adding a type is a reviewed one-line change that names why it meets that bar.
-# aws_s3_bucket and aws_s3_bucket_versioning stay off, because the apply role cannot
-# write them.
+# docs/design.md's rule 4, under "Infrastructure, defined", sets the bar a type must
+# meet and gives the reasoning. Adding a type is a reviewed change that names why it
+# meets that bar.
 ALLOWLIST = frozenset(
     {
         "aws_s3_bucket_server_side_encryption_configuration",
@@ -192,12 +190,23 @@ def runner_int(value: str | None) -> int | None:
 def pick_pull_request(
     pulls: Sequence[Mapping[str, Any]], sha: str
 ) -> tuple[Mapping[str, Any] | None, str]:
-    """The one pull request that merged as ``sha``, or ``None`` and the reason."""
-    merged = [pull for pull in pulls if pull.get("merge_commit_sha") == sha]
+    """The one pull request merged into ``main`` as ``sha``, or ``None`` and the reason.
+
+    A match on ``merge_commit_sha`` alone is not a merge. A pull request that never
+    merged can still carry one, its test merge commit, and a pull request merged into
+    another branch has one as well.
+    """
+    merged = [
+        pull
+        for pull in pulls
+        if pull.get("merge_commit_sha") == sha
+        and pull.get("merged_at") is not None
+        and (pull.get("base") or {}).get("ref") == "main"
+    ]
     if not merged:
-        return None, "no pull request merged as this commit"
+        return None, "no pull request merged into main as this commit"
     if len(merged) > 1:
-        return None, "more than one pull request merged as this commit"
+        return None, "more than one pull request merged into main as this commit"
     return merged[0], ""
 
 
@@ -366,11 +375,16 @@ def rules(
     plan: Mapping[str, Any],
     reviewed: ChangeSet | None,
     *,
+    found: str,
     state_bucket: str,
     event: str | None,
     attempt: int | None,
 ) -> list[Rule]:
-    """The four rules' results, in order."""
+    """The four rules' results, in order.
+
+    ``found`` is what ``_read_reviewed`` said of the reviewed file, and rule 1 names it
+    when no reviewed set was read.
+    """
     current = change_set(plan)
     name = "the change set is empty or the reviewed one"
     if not current:
@@ -380,7 +394,7 @@ def rules(
     elif attempt != 1:
         first = Rule(1, name, False, "a re-run is never approved by the merge")
     elif reviewed is None:
-        first = Rule(1, name, False, "no reviewed change set was found")
+        first = Rule(1, name, False, f"the reviewed change set was {found}")
     elif current != reviewed:
         first = Rule(1, name, False, "the change set differs from the reviewed one")
     else:
@@ -427,6 +441,7 @@ def decide(stdin: TextIO, reviewed_path: Path, environ: Mapping[str, str]) -> tu
     results = rules(
         plan,
         reviewed,
+        found=found,
         state_bucket=state_bucket,
         event=environ.get("GITHUB_EVENT_NAME"),
         attempt=runner_int(environ.get("GITHUB_RUN_ATTEMPT")),

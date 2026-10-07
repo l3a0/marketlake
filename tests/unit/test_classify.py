@@ -457,13 +457,21 @@ def test_the_change_set_reads_back_from_its_bytes_equal_to_itself() -> None:
     assert classify.load_change_set(classify.encode(rows)) == rows
 
 
-def test_one_function_writes_the_bytes() -> None:
-    assert classify.encode(REVIEWED_ROWS) == (
-        b'[{"actions":["update"],"address":"aws_s3_bucket_lifecycle_configuration.backup",'
-        b'"attributes":["rule"],"import":false}]\n'
-    )
-    redacted = [{"address": "a[…]", "actions": [], "import": True, "attributes": []}]
-    assert b"\\u2026" in classify.encode(redacted)
+def test_equal_change_sets_encode_to_the_same_bytes_whatever_their_key_order() -> None:
+    # The pull request writes the bytes and main hashes its own, so equal sets must
+    # agree byte for byte however each side happened to build its dicts.
+    rows = [
+        {"address": "a[…]", "actions": ["update"], "import": False, "attributes": ["rule"]},
+        {"address": "b", "actions": ["create"], "import": True, "attributes": []},
+    ]
+    reordered = [dict(reversed(list(row.items()))) for row in rows]
+    assert [list(row) for row in reordered] != [list(row) for row in rows]
+    data = classify.encode(rows)
+    assert classify.encode(reordered) == data
+    assert data.endswith(b"\n")
+    assert classify.load_change_set(data) == rows
+    # The redaction's ellipsis is escaped, so the bytes stay ASCII.
+    assert data.isascii()
 
 
 def test_change_set_mode_writes_the_set_and_prints_the_hash_of_its_bytes(tmp_path: Path) -> None:
@@ -546,17 +554,26 @@ def _fails(tmp_path: Path, routes: dict[str, bytes | Exception], **kwargs: Any) 
 
 
 NO_RUN = "no unexpired artifact came from this repository's own pull request run"
+NO_PULL = "no pull request merged into main as this commit"
+
+# Each names the pushed commit as its merge_commit_sha and still refuses. A pull request
+# that never merged can still carry one, its test merge commit.
+CLOSED_UNMERGED = {**PULLS[0], "merged_at": None}
+MERGED_ELSEWHERE = {**PULLS[0], "base": {**PULLS[0]["base"], "ref": "claude/infra-runbook"}}
 
 
 @pytest.mark.parametrize(
     ("routes", "why"),
     [
-        (_routes(pulls=[]), "no pull request merged as this commit"),
+        (_routes(pulls=[]), NO_PULL),
+        (_routes(pulls=[{**PULLS[0], "merge_commit_sha": HEAD_SHA}]), NO_PULL),
+        (_routes(pulls=[CLOSED_UNMERGED]), NO_PULL),
+        (_routes(pulls=[MERGED_ELSEWHERE]), NO_PULL),
+        (_routes(pulls=[{k: v for k, v in PULLS[0].items() if k != "base"}]), NO_PULL),
         (
-            _routes(pulls=[{**PULLS[0], "merge_commit_sha": HEAD_SHA}]),
-            "no pull request merged as this commit",
+            _routes(pulls=PULLS + PULLS),
+            "more than one pull request merged into main as this commit",
         ),
-        (_routes(pulls=PULLS + PULLS), "more than one pull request merged as this commit"),
         (_routes(artifacts=[]), "no artifact is named for the pull request's head"),
         (_routes(runs={RUN["id"]: _run(head_repository={"id": 999})}), NO_RUN),
         (_routes(runs={RUN["id"]: _run(head_repository=None)}), NO_RUN),
@@ -973,9 +990,15 @@ UPDATE = _plan(_lifecycle(["update"]))
             "found, differs",
             "the change set differs from the reviewed one",
         ),
-        (None, "push", "1", "not found", "no reviewed change set was found"),
-        (b"[{]", "push", "1", "unreadable", "no reviewed change set was found"),
-        (_json([{"address": "a"}]), "push", "1", "unreadable", "no reviewed change set was found"),
+        (None, "push", "1", "not found", "the reviewed change set was not found"),
+        (b"[{]", "push", "1", "unreadable", "the reviewed change set was unreadable"),
+        (
+            _json([{"address": "a"}]),
+            "push",
+            "1",
+            "unreadable",
+            "the reviewed change set was unreadable",
+        ),
         (MATCH, "push", "2", "found, matched", "a re-run is never approved by the merge"),
         (MATCH, "push", "x", "found, matched", "a re-run is never approved by the merge"),
         (
