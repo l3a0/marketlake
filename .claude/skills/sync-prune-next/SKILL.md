@@ -101,14 +101,15 @@ latest events with `list_events`, because a pull request may have opened since
 the worktree was classified.
 
 Check 3 counts only refs that GitHub backs. After step 1, every ref under
-`refs/remotes/origin/` names a branch on GitHub. A ref elsewhere under
-`refs/remotes/` was made locally, for example by
-`git fetch origin pull/N/head:refs/remotes/pr/N`, and proves nothing. Yet
-`git branch -r --contains` lists it like any remote branch, so both loops keep
-only that command's `origin/` lines. On 2026-10-07 this checkout held
-`refs/remotes/pr/492`, `refs/remotes/pr652` and `refs/remotes/audit/pr697`,
-and [#758](https://github.com/l3a0/marketlake/issues/758) found 34 clean
-worktrees whose only evidence was a ref like these.
+`refs/remotes/origin/` names a branch on GitHub. `origin` is this checkout's
+only remote, so a ref elsewhere under `refs/remotes/` was made locally, for
+example by `git fetch origin pull/N/head:refs/remotes/pr/N`, and proves
+nothing. Yet `git branch -r --contains` lists it like any remote branch, so
+both loops keep only that command's `origin/` lines. On 2026-10-07 this
+checkout held five such refs, among them `refs/remotes/pr/492` and
+`refs/remotes/audit/pr697`, and
+[#758](https://github.com/l3a0/marketlake/issues/758) found 34 clean worktrees
+whose only evidence was a ref like these.
 
 Squash merges make the merged-pull-request case common, because the branch's
 commits never reach `main`. GitHub keeps `refs/pull/N/head` for every pull
@@ -124,7 +125,8 @@ cases still fail, and must.
 Check 4 still catches uncommitted files.
 
 The test is ancestry against the head ref, not a pull request's commit list
-and not a search. `gh pr list --search 60ef88e` returns
+and not a search. On 2026-10-07,
+`gh pr list --state merged --search 60ef88e` returned
 [PR #646](https://github.com/l3a0/marketlake/pull/646), whose head ref reaches
 that commit, and [PR #661](https://github.com/l3a0/marketlake/pull/661), whose
 head ref does not. The second matches only because a comment on it quotes the
@@ -146,7 +148,9 @@ sed 's#.*#+refs/pull/&/head:refs/pr-heads/&#' "$MERGED" | git fetch --quiet --st
 ```
 
 A count of exactly 1000 means `gh` cut the list, so raise the limit and fetch
-again.
+again. A count of 0 means `gh` failed, so stop the round. With no refspecs on
+its input, `git fetch --stdin` falls back to the configured refspec and prints
+no failure.
 
 The fetch writes each head to `refs/pr-heads/N`, outside `refs/remotes/`.
 `git branch -r` lists everything under `refs/remotes/`, so heads fetched there
@@ -201,7 +205,9 @@ A branch checked out in no worktree is removable when check 3 holds for its
 head. Git refuses to delete a branch that a worktree has checked out, which
 protects every branch in use. The loop also lists, by full name, each ref under
 `refs/remotes/` outside `origin/`, such as `refs/remotes/pr/492`, since nothing
-on GitHub backs it. This loop runs the same three tests as the one above.
+on GitHub backs it. If a second remote is ever added, exclude its prefix from
+that list as well, or the round deletes refs that remote owns. This loop runs
+the same three tests as the one above.
 
 ```bash
 MERGED="<scratch>/merged-prs.txt"
