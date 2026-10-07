@@ -275,22 +275,28 @@ resource "aws_iam_role_policy" "apply" {
         Resource = ["arn:aws:iam::${local.account_id}:instance-profile/marketlake-instance"]
       },
       {
-        # No iam:DeleteUser and no iam:DeleteUserPolicy. A deleted policy stops the
-        # nightly upload.
-        Sid      = "BackupUserWrite"
-        Effect   = "Allow"
-        Action   = ["iam:PutUserPolicy", "iam:TagUser", "iam:UntagUser"]
-        Resource = ["arn:aws:iam::${local.account_id}:user/marketlake-backup"]
-      },
-      {
-        # infra/live creates this user rather than importing it, so it needs
-        # iam:CreateUser. No iam:DeleteUser or iam:DeleteUserPolicy, so CI can never
-        # remove the token's only writer, and no iam:CreateAccessKey, whose Deny above
-        # keeps the key a hand step.
-        Sid      = "TokenWriterUserWrite"
+        # infra/live creates the laptop's one user (#737). No iam:DeleteUser or
+        # iam:DeleteUserPolicy, so CI can never take away the laptop's only way in, and no
+        # iam:CreateAccessKey, whose Deny above keeps the key a hand step.
+        Sid      = "CommandUserWrite"
         Effect   = "Allow"
         Action   = ["iam:CreateUser", "iam:PutUserPolicy"]
-        Resource = ["arn:aws:iam::${local.account_id}:user/marketlake-token-writer"]
+        Resource = ["arn:aws:iam::${local.account_id}:user/marketlake-command"]
+      },
+      {
+        # The two roles marketlake-command assumes. The provider puts every setting in
+        # CreateRole, and each role sets only its name and trust, so no iam:UpdateRole or
+        # tagging action is needed. No iam:DeleteRole, so no plan can replace a role and
+        # write a new trust through CreateRole. No iam:DeleteRolePolicy, because a deleted
+        # backup policy stops the nightly upload. No iam:PassRole, since no service takes
+        # either role.
+        Sid    = "CommandRolesWrite"
+        Effect = "Allow"
+        Action = ["iam:CreateRole", "iam:PutRolePolicy"]
+        Resource = [
+          "arn:aws:iam::${local.account_id}:role/marketlake-backup",
+          "arn:aws:iam::${local.account_id}:role/marketlake-token-writer",
+        ]
       },
       {
         Sid      = "Ec2InHomeRegion"

@@ -12,7 +12,7 @@ variable "backup_bucket" {
 }
 
 variable "backup_policy_name" {
-  description = "The name of marketlake-backup's inline policy, read from AWS. CI reads it from the BACKUP_POLICY_NAME variable."
+  description = "Unused since marketlake-backup became a role (#737). Any valid policy name passes until #741 removes it. CI reads it from the BACKUP_POLICY_NAME variable."
   type        = string
   nullable    = false
 
@@ -23,7 +23,7 @@ variable "backup_policy_name" {
 }
 
 variable "adopt_existing" {
-  description = "Import the existing bucket, user and policy. The tests set it to false, because an import crashes tofu test."
+  description = "Import the existing bucket and its settings. The tests set it to false, because an import crashes tofu test."
   type        = bool
   default     = true
   nullable    = false

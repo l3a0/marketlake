@@ -18,8 +18,11 @@ The AWS resources it needs are code under `infra/`, written for
 [OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
 except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
-bucket, its IAM user, the instance role the VM will use, and the IAM user that writes the
-Schwab token to the VM's config parameters.
+bucket, the instance role the VM will use, and the laptop's one IAM user,
+`marketlake-command`, with the two roles it assumes
+([#737](https://github.com/l3a0/marketlake/issues/737)). The role `marketlake-backup`
+reaches the bucket, and the role `marketlake-token-writer` writes the Schwab token to the
+VM's config parameters.
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -66,8 +69,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, and the plan and apply
   roles. The owner applies it from the laptop.
-- `infra/live` is the configuration CI applies: the backup bucket, its IAM user, the
-  instance role, and the IAM user that writes the Schwab token.
+- `infra/live` is the configuration CI applies: the backup bucket, the instance role,
+  and the laptop's IAM user `marketlake-command` with the two roles it assumes, one for
+  the bucket and one that writes the Schwab token.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
@@ -102,7 +106,7 @@ The bucket and the IAM principals the laptop signs as are code in `infra/live/`,
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
 files rewritten every night. Partitions keep every version, because with no Object Lock an overwritten
-partition's old version is its only good copy. `infra/live/iam.tf` holds the user's policy,
+partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
@@ -586,8 +590,9 @@ tofu -chdir=infra/live test
 Four things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups or the infrastructure's
-   state, and on the token writer and its policy, which CI cannot delete.
-2. The exact set of policies each bootstrap role and each live IAM user carries.
+   state, and on the laptop's user, its two roles and their policies, which CI cannot
+   delete.
+2. The exact set of policies each bootstrap role and each live IAM user and role carries.
 3. The live backend's state key matching what the apply role may write.
 4. No resource or data source that would store an SSM parameter's value in state.
 
