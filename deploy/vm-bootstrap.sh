@@ -18,7 +18,8 @@
 #      volume after the instance starts;
 #   4. when nothing is mounted at lake_root, makes the bare directory immutable, so
 #      nothing can write the lake onto the root volume, and formats the volume only when
-#      two checks prove it blank;
+#      blkid finds no filesystem and no ext4 superblock sits where this script's mkfs
+#      puts one;
 #   5. writes the fstab line for the volume, keyed on the mount point, atomically;
 #   6. mounts it through systemctl start of its mount unit, which runs e2fsck first;
 #   7. proves the right volume is mounted by its UUID, and only then chowns the lake root
@@ -218,11 +219,12 @@ else
   esac
 
   # The guard has three outcomes. An existing ext4 filesystem mounts as it is, which is
-  # every replacement's path. A volume proven blank by two checks is formatted.
-  # Anything else stops. blkid -p also exits 2 when a probe read fails, so a read error
-  # on a lake volume would look blank to it alone. cmp reads the first MiB, where the
-  # ext4 superblock, an MBR and a GPT header all sit, and exits 1 on a non-zero byte and
-  # 2 on a read error.
+  # every replacement's path. A volume with no ext4 superblock where this script's own
+  # mkfs puts one is formatted. Anything else stops. blkid -p alone is not enough. It
+  # also exits 2 when a probe read fails, and its ext4 prober reads only the primary
+  # superblock and reports nothing when a metadata_csum primary fails its checksum. So
+  # an I/O error or a torn primary on a lake volume would read as no filesystem to it.
+  # A fresh volume is not zeros, so the guard reads for an ext4 magic, not for zeros.
   probe_rc=0
   PROBE="$(blkid -p -o export "$DEV")" || probe_rc=$?
   TYPE=""
@@ -234,16 +236,36 @@ else
   if [[ $probe_rc == 0 && "$TYPE" == ext4 ]]; then
     say "the lake volume holds an ext4 filesystem, so it mounts without formatting"
   elif [[ $probe_rc == 2 ]]; then
-    cmp_rc=0
-    cmp -s -n 1048576 "$DEV" /dev/zero || cmp_rc=$?
-    if [[ $cmp_rc != 0 ]]; then
-      refuse "blkid found no filesystem on $DEV, but its first MiB is not all zero (cmp exit $cmp_rc), so it is not formatted"
-    fi
+    # An ext4 superblock holds the magic 53 ef at offset 0x38. Two reads look for it,
+    # each of one 4 KiB block given as block:offset. The primary starts at byte 1024 of
+    # block 0, so its magic is at byte 1080. Group 1's backup starts block 32768,
+    # because with -b 4096 below a group is 8 x 4096 = 32768 blocks and the first data
+    # block is 0 (initialize.c, e2fsprogs 1.47.0), and sparse_super always keeps a
+    # backup in group 1. od's spacing differs between GNU and BSD, so the whitespace
+    # goes first. Then anything but four hex digits is a short read, since od can exit
+    # 0 on fewer bytes than it was asked for.
+    # dd reads the whole block in one bs=4096 read, because smaller reads could take
+    # SIGPIPE once od has its two bytes and exits.
+    MAGIC_RE='^[0-9a-f]{4}$'
+    for at in 0:1080 32768:56; do
+      block="${at%:*}"
+      if ! magic="$(dd if="$DEV" bs=4096 skip="$block" count=1 status=none |
+        od -An -tx1 -j"${at#*:}" -N2)"; then
+        refuse "could not read 4 KiB block $block of $DEV, so it is not formatted"
+      fi
+      magic="${magic//[[:space:]]/}"
+      if [[ ! "$magic" =~ $MAGIC_RE ]]; then
+        refuse "the read of 4 KiB block $block of $DEV came back short, so it is not formatted"
+      fi
+      if [[ "$magic" == 53ef ]]; then
+        refuse "blkid found no filesystem on $DEV, but 4 KiB block $block holds an ext4 superblock, so it is a damaged lake, an interrupted mkfs, or a chance match on a fresh volume. Nothing was formatted. infra/README.md says how to tell which. Check it read-only with: e2fsck -n $DEV"
+      fi
+    done
     # Never -F. mkfs.ext4's own check for an existing filesystem asks only on a
     # terminal, so under cloud-init it would format silently. Without -F it still
     # refuses a mounted or busy device.
-    say "the lake volume is blank, so it gets an ext4 filesystem"
-    mkfs.ext4 -q -m 0 -L marketlake "$DEV" || stop "mkfs.ext4 failed on $DEV"
+    say "the lake volume holds no ext4 superblock, so it gets an ext4 filesystem"
+    mkfs.ext4 -q -m 0 -b 4096 -L marketlake "$DEV" || stop "mkfs.ext4 failed on $DEV"
     # The fsck unit binds to the by-uuid link, which udev creates after mkfs.
     udevadm settle || stop "udevadm settle failed after mkfs.ext4"
   else

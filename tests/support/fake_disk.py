@@ -4,17 +4,24 @@
 fakes and the ones in ``tests.support.fake_systemd``, with ``MARKETLAKE_INSTALL_ROOT``
 pointed at a temporary directory. The harness ``PATH`` is ``<bin>:/usr/bin:/bin``, so a
 tool missing here would run for real. Every tool either script calls that could touch the
-machine has a fake, including the ones a Mac has, such as ``chown``, ``cmp`` and ``curl``.
+machine has a fake, including the ones a Mac has, such as ``chown``, ``dd`` and ``curl``.
+``od`` runs for real, on what the fake ``dd`` prints.
 
 The fake disk is a directory, ``$STATE/disk``, so a test sets it up once and the fakes
 change it the way the real tools would change a volume.
 
-1. ``probe`` holds what ``blkid -p -o export`` prints. Its absence is a blank volume, on
-   which ``blkid -p`` exits 2. ``BLKID_RC`` forces that probe's exit code.
+1. ``probe`` holds what ``blkid -p -o export`` prints. Its absence is a volume with no
+   filesystem, on which ``blkid -p`` exits 2. ``BLKID_RC`` forces that probe's exit code.
 2. ``uuid`` holds the filesystem UUID that ``blkid -p -s UUID -o value`` prints. Its
-   absence makes that read exit 2 with no output, as a blank device does, so a script
+   absence makes that read exit 2 with no output, as a device with no filesystem does, so a script
    that reads the UUID before ``mkfs.ext4`` has run gets nothing.
-3. ``mkfs.ext4`` writes both, with ``FAKE_NEW_UUID`` as the new filesystem's UUID.
+3. ``magic-<block>`` holds the two bytes ``dd`` prints where an ext4 superblock keeps its
+   magic in that 4 KiB block: byte 1080 of block 0, the primary, and byte 56 of any other
+   block, such as 32768, group 1's backup. Its absence prints zeros there, as on a volume
+   with no ext4 superblock.
+4. ``mkfs.ext4`` writes ``probe`` and ``uuid``, with ``FAKE_NEW_UUID`` as the new
+   filesystem's UUID. It writes no ``magic-<block>``, since once ``probe`` says ext4 the
+   bootstrap mounts without reading the magic again.
 
 ``$STATE/mounted`` holds the UUID of whatever is mounted at the lake root. The fake
 ``systemctl start`` of a ``.mount`` unit writes it from the disk, and ``findmnt`` reads it.
@@ -22,10 +29,11 @@ change it the way the real tools would change a volume.
 util-linux's does. ``$STATE/submounts`` lists the mount points below the lake root, which
 ``findmnt -R`` prints after the lake root's own line.
 
-The other knobs: ``CMP_RC`` is ``cmp``'s exit on a volume with no probe result, since a
-volume with one always differs from zeros. ``FINDMNT_VERIFY_RC`` is the exit of
-``findmnt --verify`` on a file that holds an entry. On an empty or missing file it exits 1
-whatever the knob says, so a test cannot pass against a check looser than the real one.
+The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O error would
+make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
+``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that holds an entry. On
+an empty or missing file it exits 1 whatever the knob says, so a test cannot pass against a
+check looser than the real one.
 ``FINDMNT_TREE_RC`` is the exit of ``findmnt -R``. ``FSTAB_SOURCE`` overrides what
 ``findmnt --fstab`` reads. ``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC``
 fail those tools, and ``INSTALLER_RC`` fails the uv installer the fake ``curl`` writes. That
@@ -81,10 +89,37 @@ printf '%s' "$uuid" > "$STATE/disk/uuid"
 exit 0
 """
 
-FAKE_CMP = r"""#!/bin/bash
-printf 'cmp %s\n' "$*" >> "$LOG"
-if [[ -f "$STATE/disk/probe" ]]; then exit 1; fi
-exit "${CMP_RC:-0}"
+# One 4 KiB block of the fake disk. The two bytes where an ext4 superblock keeps its
+# magic come from magic-<block>, or are zeros. That is byte 1080 of block 0, the primary,
+# and byte 56 of any other block, where a backup superblock starts.
+FAKE_DD = r"""#!/bin/bash
+printf 'dd %s\n' "$*" >> "$LOG"
+block=""
+for arg in "$@"; do
+  case "$arg" in
+    skip=*) block="${arg#skip=}" ;;
+  esac
+done
+if [[ -n "${DD_FAIL_BLOCK:-}" && "$block" == "$DD_FAIL_BLOCK" ]]; then
+  echo "dd: error reading block $block: Input/output error" >&2
+  exit 1
+fi
+offset=56
+if [[ "$block" == 0 ]]; then offset=1080; fi
+size=4096
+# A short read stops one byte into the magic, so od still succeeds on what came back.
+if [[ -n "${DD_SHORT_BLOCK:-}" && "$block" == "$DD_SHORT_BLOCK" ]]; then
+  size=$((offset + 1))
+fi
+{
+  head -c "$offset" /dev/zero
+  if [[ -f "$STATE/disk/magic-$block" ]]; then
+    head -c 2 "$STATE/disk/magic-$block"
+  else
+    head -c 2 /dev/zero
+  fi
+  head -c $((4096 - offset - 2)) /dev/zero
+} | head -c "$size"
 """
 
 FAKE_FINDMNT = r"""#!/bin/bash
@@ -302,7 +337,7 @@ def install_disk_fakes(bin_dir: Path) -> None:
     fakes = {
         "blkid": FAKE_BLKID,
         "mkfs.ext4": FAKE_MKFS,
-        "cmp": FAKE_CMP,
+        "dd": FAKE_DD,
         "findmnt": FAKE_FINDMNT,
         "mount": FAKE_MOUNT,
         "lsattr": FAKE_LSATTR,

@@ -1309,8 +1309,9 @@ describe the instance can read it. The boot takes two steps.
 1. The shim writes the owner and the lake volume's id to
    `/etc/marketlake/bootstrap.conf`, clones `main` into `~/marketlake` as the owner, with
    up to 10 attempts 30 seconds apart, and runs `deploy/vm-bootstrap.sh`.
-2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when two
-   checks prove it blank. It writes the volume's `/etc/fstab` line, and stops when it
+2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when
+   `blkid` finds no filesystem and no ext4 superblock sits where the bootstrap's own
+   `mkfs` puts one. It writes the volume's `/etc/fstab` line, and stops when it
    cannot read the old file or when the new one would hold no entry for `/`. It installs
    the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
    times on any error, and runs `deploy/linux-install.sh`, which starts the units. Then
@@ -1390,8 +1391,14 @@ Each failure prints one line naming the step, and the exit code says how the run
 
 1. Exit 0 means every step passed.
 2. Exit 2 means the bootstrap itself refused, which happens only before the install, such
-   as on a bad `bootstrap.conf`, a lake volume that holds something other than ext4, or
-   an `/etc/fstab` with no entry for `/`.
+   as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`. It also refuses
+   three states of the lake volume, and formats nothing in any of them.
+   1. The volume holds something other than ext4.
+   2. A read of 4 KiB block 0 or 32768 failed or came back short.
+   3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
+      line prints a read-only `e2fsck -n` command, and
+      [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
+      says what to do.
 3. Exit 1 covers every other failure. A disk step or the install that fails stops the
    run at once, and the install's own refusal counts as a failure here.
    A failed render, token pull or roster apply skips only the steps that need it, and
@@ -1453,6 +1460,54 @@ A clone cut off partway can leave `~/marketlake` with no valid `HEAD`, and then 
 clone refuses because the directory exists. When
 `git -C ~/marketlake rev-parse --verify HEAD` fails, delete `~/marketlake` and clone
 again.
+
+#### When the lake volume holds an unreadable ext4
+
+The bootstrap refuses with exit 2 when `blkid` finds no filesystem on the lake volume but
+the ext4 magic sits in 4 KiB block 0 or 32768. The refusal names the block and the
+device. Three things leave a volume that way.
+
+1. A lake whose primary superblock is damaged.
+2. An earlier `mkfs` that was interrupted after it wrote the backup superblocks.
+   `ext2fs_flush` writes the backups before the primary.
+3. A chance match in a fresh volume's random content, about once in 32,768 volumes.
+
+Never run `mkfs.ext4` on this volume, because it erases the volume. The first two
+causes hold an ext4 that `e2fsck` can repair. Check the volume read-only first. `-n`
+opens it read-only and answers no to every question.
+
+```bash
+sudo e2fsck -n <dev>
+```
+
+When the primary superblock has a bad magic, fails its checksum or is corrupt, `e2fsck`
+looks for group 1's backup on its own and prints `Superblock invalid, trying backup
+blocks...`. It skips that search when the primary fails in other ways, such as a
+revision too high to read. So read the backup directly as well.
+
+```bash
+sudo e2fsck -n -b 32768 -B 4096 <dev>
+```
+
+1. **Either check finds a filesystem.** It runs its passes, starting with
+   `Pass 1: Checking inodes, blocks, and sizes`, and lists what it would fix. The volume
+   holds ext4, a damaged lake or an interrupted `mkfs`. Repair the primary from group 1's
+   backup, then rerun the bootstrap.
+
+   ```bash
+   sudo e2fsck -b 32768 -B 4096 <dev>
+   ```
+
+2. **Both checks find none.** Each prints that the superblock could not be read or does
+   not describe a valid ext2/ext3/ext4 filesystem. The bytes the guard matched describe no
+   ext4 that `e2fsck` can open, which on a fresh volume is the chance match. Only then
+   clear the block the refusal named, then rerun the bootstrap. This writes 4 KiB of zeros
+   to the volume. If the volume is known to have held a lake, stop and investigate
+   instead.
+
+   ```bash
+   sudo dd if=/dev/zero of=<dev> bs=4096 seek=<block> count=1 conv=fsync
+   ```
 
 ### Restore the lake
 

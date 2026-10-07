@@ -5,7 +5,7 @@
 under ``/bin/bash`` with ``MARKETLAKE_INSTALL_ROOT`` pointed at a temporary directory and
 every tool they call replaced by a fake from ``tests.support.fake_disk`` and
 ``tests.support.fake_systemd``. The fake disk keeps its state in a directory, so a test
-sets up a blank volume, an existing filesystem or a mounted one, and reads back what the
+sets up a fresh volume, an existing filesystem or a mounted one, and reads back what the
 script did to it. ``deploy/linux-install.sh`` is a fake here too, since
 ``test_control_plane_systemd.py`` runs the real one.
 """
@@ -57,8 +57,8 @@ def _lake_line(uuid: str) -> str:
 class VM:
     """A fake VM: a checkout, the owner's home, an install root and a fake lake volume.
 
-    The volume starts blank and unmounted, the owner has the pinned ``uv``, and every
-    Python step succeeds. A test changes what it needs before it runs a script.
+    The volume starts fresh, with no filesystem, and unmounted, the owner has the pinned
+    ``uv``, and every Python step succeeds. A test changes what it needs before it runs a script.
 
     Every executable is a symlink into ``tools``, which the module builds once. A Mac
     checks each new executable file on its first run, at about 0.2 seconds a file, so
@@ -268,22 +268,23 @@ def test_ci_and_the_bootstrap_read_one_uv_pin():
 # -- the first boot --------------------------------------------------------------------
 
 
-def test_a_first_boot_formats_a_blank_volume_and_installs(vm):
+def test_a_first_boot_formats_a_fresh_volume_and_installs(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert proc.stdout.splitlines()[-1] == "vm-bootstrap: done"
     dev = str(vm.device)
     lake = str(vm.lake)
     calls = vm.calls()
-    # Each step in its order. A blank volume passes both checks before mkfs, the UUID is
-    # read only once mkfs and udev have run, and the chown follows the proof.
+    # Each step in its order. Both superblock reads find no ext4 magic before mkfs, the
+    # UUID is read only once mkfs and udev have run, and the chown follows the proof.
     steps = [
         f"chown root:root {lake}",
         f"chmod 0755 {lake}",
         f"chattr +i {lake}",
         f"blkid -p -o export {dev}",
-        f"cmp -s -n 1048576 {dev} /dev/zero",
-        f"mkfs.ext4 -q -m 0 -L marketlake {dev}",
+        f"dd if={dev} bs=4096 skip=0 count=1 status=none",
+        f"dd if={dev} bs=4096 skip=32768 count=1 status=none",
+        f"mkfs.ext4 -q -m 0 -b 4096 -L marketlake {dev}",
         "udevadm settle",
         f"blkid -p -s UUID -o value {dev}",
         "sync",
@@ -329,7 +330,7 @@ def test_a_second_run_changes_nothing(vm):
     second = vm.bootstrap()
     assert second.returncode == 0, second.stdout + second.stderr
     calls = vm.calls()
-    for tool in ("mkfs.ext4", "cmp", "chattr", "lsattr", "chmod", "mount ", "curl", "udevadm"):
+    for tool in ("mkfs.ext4", "dd ", "chattr", "lsattr", "chmod", "mount ", "curl", "udevadm"):
         assert not vm.ran(tool), (tool, calls)
     assert "chown root:root" not in "\n".join(calls)
     assert not [line for line in calls if line.startswith("findmnt --verify")], calls
@@ -343,7 +344,7 @@ def test_a_second_run_changes_nothing(vm):
     assert (vm.state / "mounted").read_text() == NEW_UUID
 
 
-# -- the blank-volume guard ------------------------------------------------------------
+# -- the format guard ------------------------------------------------------------------
 
 
 def test_an_existing_ext4_mounts_without_mkfs(vm):
@@ -351,41 +352,113 @@ def test_an_existing_ext4_mounts_without_mkfs(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not vm.ran("mkfs.ext4")
-    assert not vm.ran("cmp")
+    assert not vm.ran("dd ")
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
     assert (vm.state / "mounted").read_text() == FAKE_UUID
 
 
+# The whole refusal line each case prints, with ``{dev}`` standing for the device path.
+MAGIC_REFUSAL = (
+    "blkid found no filesystem on {dev}, but 4 KiB block {block} holds an ext4 superblock,"
+    " so it is a damaged lake, an interrupted mkfs, or a chance match on a fresh volume."
+    " Nothing was formatted. infra/README.md says how to tell which."
+    " Check it read-only with: e2fsck -n {dev}"
+)
+
+
 @pytest.mark.parametrize(
-    ("probe", "env", "message"),
+    ("probe", "magic", "env", "message"),
     [
-        (None, {"CMP_RC": "1"}, "its first MiB is not all zero (cmp exit 1)"),
-        (None, {"CMP_RC": "2"}, "its first MiB is not all zero (cmp exit 2)"),
-        ("UUID=abc\nTYPE=xfs\n", {}, "holds something other than ext4 (blkid exit 0)"),
-        ("PTUUID=abc\nPTTYPE=gpt\n", {}, "holds something other than ext4 (blkid exit 0)"),
-        (None, {"BLKID_RC": "8"}, "holds something other than ext4 (blkid exit 8)"),
+        (None, "0", {}, MAGIC_REFUSAL.replace("{block}", "0")),
+        (None, "32768", {}, MAGIC_REFUSAL.replace("{block}", "32768")),
+        (
+            None,
+            None,
+            {"DD_FAIL_BLOCK": "0"},
+            "could not read 4 KiB block 0 of {dev}, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_FAIL_BLOCK": "32768"},
+            "could not read 4 KiB block 32768 of {dev}, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_SHORT_BLOCK": "0"},
+            "the read of 4 KiB block 0 of {dev} came back short, so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"DD_SHORT_BLOCK": "32768"},
+            "the read of 4 KiB block 32768 of {dev} came back short, so it is not formatted",
+        ),
+        (
+            "UUID=abc\nTYPE=xfs\n",
+            None,
+            {},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 0),"
+            " so it is not formatted",
+        ),
+        (
+            "PTUUID=abc\nPTTYPE=gpt\n",
+            None,
+            {},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 0),"
+            " so it is not formatted",
+        ),
+        (
+            None,
+            None,
+            {"BLKID_RC": "8"},
+            "the lake volume at {dev} holds something other than ext4 (blkid exit 8),"
+            " so it is not formatted",
+        ),
     ],
     ids=[
-        "cmp finds data",
-        "cmp read error",
+        "the primary's magic",
+        "the backup's magic",
+        "a read error at block 0",
+        "a read error at block 32768",
+        "a short read at block 0",
+        "a short read at block 32768",
         "another filesystem",
         "a partition table",
         "a probe error",
     ],
 )
-def test_a_volume_not_proven_blank_is_never_formatted(vm, probe, env, message):
+def test_a_volume_that_may_hold_a_lake_is_never_formatted(vm, probe, magic, env, message):
     if probe is not None:
         vm.disk.joinpath("probe").write_text(probe)
+    if magic is not None:
+        vm.disk.joinpath(f"magic-{magic}").write_bytes(b"\x53\xef")
     proc = vm.bootstrap(**env)
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert message in _one_line(proc, "vm-bootstrap: ")
+    line = _one_line(proc, "vm-bootstrap: ")
+    assert line == "vm-bootstrap: " + message.replace("{dev}", str(vm.device))
     assert not vm.ran("mkfs.ext4")
     assert not vm.ran("systemctl start")
     assert vm.fstab.read_text() == ROOT_LINE
     _assert_nothing_installed(vm)
 
 
-def test_the_uuid_is_read_only_after_mkfs_on_a_blank_volume(vm):
+# Two bytes that share one byte with the magic, or hold both in the wrong order. A
+# comparison that checked only one of the two bytes would match a fresh volume's random
+# content about once in 256 reads at each place, and refuse a volume that holds no lake.
+@pytest.mark.parametrize("block", ["0", "32768"])
+@pytest.mark.parametrize(
+    "near_miss", [b"\x53\x00", b"\x00\xef", b"\xef\x53"], ids=["53 00", "00 ef", "ef 53"]
+)
+def test_two_bytes_that_only_resemble_the_magic_still_format(vm, block, near_miss):
+    vm.disk.joinpath(f"magic-{block}").write_bytes(near_miss)
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.ran("mkfs.ext4")
+
+
+def test_the_uuid_is_read_only_after_mkfs_on_a_fresh_volume(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     reads = [i for i, line in enumerate(vm.calls()) if line.startswith("blkid -p -s UUID")]
