@@ -569,9 +569,8 @@ def _late_retype(root: Path) -> SealedPartition:
 def test_a_retype_after_the_first_batch_is_seen(tmp_path: Path, monkeypatch):
     """The read is folded over every batch, and a real partition has many.
 
-    The lake's chains partitions carry five and six row groups: SPY 2026-09-16 is 5,307,030
-    rows whose first row group ends at 10:49 ET. A read that asked only its first batch
-    would read the open and call the rest of the session clean.
+    SPY 2026-09-16 is 5,307,030 rows, which is 81 batches at the production size. A read
+    that asked only its first batch would call the rest of the session clean.
 
     It is the worst shape an alarm can take, because both halves go quiet together. The
     column is non-null on the morning rows, so it never reaches ``absent`` either, and the
@@ -671,6 +670,68 @@ def test_an_open_gate_holds_one_batch_at_a_time_rather_than_the_whole_day(
     assert day.unreadable == ()
     assert day.tickers == ("SPY",)
     assert streamed < STREAMED_MARGIN * whole, f"{streamed:,} bytes against {whole:,} whole"
+
+
+def test_the_first_cycle_pass_holds_one_batch_at_a_time_rather_than_the_whole_day(
+    tmp_path: Path, monkeypatch
+):
+    """The retype night is the night the page is for, and its first-cycle pass reads every
+    partition again. Every row of this fixture routes ``open_interest``, which is a vendor
+    retype's shape, so every data row's overflow is populated and decodable.
+
+    The reference is the three columns the pass reads, decoded whole, which is what it read
+    before it streamed. A pass that gathered every batch before asking them would hold the
+    whole day again and fail here, where a test counting batches would still pass.
+    """
+    partition = _seal(
+        tmp_path, "chains", "SPY", DAY, _table("chains", DAY, count=4_000, route=("open_interest",))
+    )
+    monkeypatch.setattr(battery_drift, "_READ_BATCH_ROWS", 256)
+    columns = [journal.EXTRA_COLUMN, "snap_ts", journal.ROW_KIND_COLUMN]
+
+    with measured() as pool:
+        table = pq.read_table(partition.path, columns=columns, use_threads=False)
+    whole = pool.max_memory()
+    earliest = min(table.column("snap_ts").to_pylist())
+    del table
+    with measured() as pool:
+        stamp = battery_drift.first_cycle_of(partition, "chains", ["open_interest"])
+    streamed = pool.max_memory()
+
+    assert stamp == earliest
+    assert streamed < STREAMED_MARGIN * whole, f"{streamed:,} bytes against {whole:,} whole"
+
+
+def test_the_drift_read_neither_pre_buffers_nor_threads(tmp_path: Path, monkeypatch):
+    """Neither flag changes an answer or moves a small fixture's peak, so the test records the
+    arguments themselves, as ``tests/component/test_battery.py`` does for the entitlement read
+    whose settings these are.
+    """
+    seen: list[tuple[str, dict]] = []
+    real = pq.ParquetFile
+
+    class Recording(real):
+        def __init__(self, *args, **kwargs):
+            seen.append(("open", kwargs))
+            super().__init__(*args, **kwargs)
+
+        def iter_batches(self, *args, **kwargs):
+            seen.append(("iterate", kwargs))
+            return super().iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", Recording)
+    partition = _seal(
+        tmp_path, "chains", "SPY", DAY, _table("chains", DAY, route=("open_interest",))
+    )
+
+    battery_drift.read_surface_day([partition], "chains", DAY)
+    battery_drift.first_cycle_of(partition, "chains", ["open_interest"])
+
+    opens = [kwargs for kind, kwargs in seen if kind == "open"]
+    iterations = [kwargs for kind, kwargs in seen if kind == "iterate"]
+    assert len(opens) == 2 and len(iterations) == 2, "both passes must be recorded"
+    assert all(kwargs.get("pre_buffer") is False for kwargs in opens)
+    assert all(kwargs.get("use_threads") is False for kwargs in iterations)
 
 
 def _cut_streams(monkeypatch, rows: int, cut) -> None:

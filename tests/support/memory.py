@@ -1,7 +1,8 @@
 """A measurement of the most Arrow memory a read holds at once.
 
-Two reads were rebuilt to stream in batches so a ticker-day fits a 2 GiB host: compaction's
-verify and re-tune (marketlake #660) and the battery's entitlement read (marketlake #670).
+Three reads were rebuilt to stream in batches so a ticker-day fits a 2 GiB host: compaction's
+verify and re-tune (marketlake #660), the battery's entitlement read (marketlake #670), and
+the battery's schema-drift read (marketlake #671).
 Their tests bound the peak through :func:`measured`, which installs a proxy pool that counts
 every byte Arrow requests through it.
 

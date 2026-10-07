@@ -306,8 +306,8 @@ class _Footer:
     29 sealed partitions it is empty everywhere, so it is a guard rather than a path the
     ordinary night takes.
 
-    ``absent_column`` is a column the partition does not carry at all. Reading it raises,
-    and counting it as wholly null would page for the shape it cannot be about: a column a
+    ``absent_column`` is a column the partition does not carry at all, so there is nothing
+    to count. Counting it as wholly null would page for the shape it cannot be about: a column a
     partition lacks outright is a rotation's doing, not a vendor's, and the version guard
     is what speaks to that. So it leaves the missing half's candidate set entirely.
     """
@@ -440,9 +440,10 @@ def read_surface_day(partitions: Sequence, surface: str, day: date) -> SurfaceDa
 def _open(partition) -> pq.ParquetFile:
     """The partition's file, opened once for both the footer and the stream.
 
-    ``pre_buffer=False`` is ``battery.read_entitlement``'s setting, for its stated reason:
-    pre-buffering reads a row group's column chunks ahead of the batch being decoded, which
-    raises the peak the stream exists to lower.
+    ``pre_buffer=False`` is ``battery.read_entitlement``'s setting. Pre-buffering reads a row
+    group's column chunks ahead of the batch being decoded, which raised that read's peak on
+    SPY 2026-09-28 by 16.9 to 21.8 MiB, per
+    ``tests/component/test_battery.py::test_the_read_neither_pre_buffers_nor_threads``.
     """
     try:
         return pq.ParquetFile(partition.path, pre_buffer=False)
@@ -472,7 +473,8 @@ def _partition_evidence(
         return None
     # The overflow gate, which is ``routed_columns``'s own first gate read off the footer.
     # An all-null overflow is every cycle the lake has recorded, so this is the branch the
-    # healthy night takes, and its stream decodes three columns rather than sixty.
+    # healthy night takes, and its stream decodes three columns rather than the sixty on
+    # chains and sixty-seven on quotes that an open gate decodes.
     #
     # A partition carrying no ``extra`` column at all cannot be asked the retype question,
     # and ``routed_columns`` would raise on it rather than answer. That is a rotation's
@@ -544,13 +546,12 @@ def _read_rows(
     versions: set[int] = set()
     for batch in _batches(source, partition, required, optional):
         if gate_open:
-            # **Every batch, not the first.** The lake's chains partitions carry five and
-            # six row groups: SPY 2026-09-16 is 5,307,030 rows across six, whose first
-            # covers 03:25 to 14:49 UTC. A read that asked only the first of them would
-            # read pre-market to 10:49 ET and call the rest of the session clean, so a
-            # retype that starts mid-day is silent on both halves at once: the column is
-            # non-null on the morning rows, so it never reaches ``absent`` either, and the
-            # night's report line says nothing drifted.
+            # **Every batch, not the first.** SPY 2026-09-16 is 5,307,030 rows, which is 81
+            # batches at 65,536 rows. A read that asked only some of them would call the
+            # rest of the session clean, so a retype that starts mid-day is silent
+            # on both halves at once: the column is non-null on the morning rows, so it
+            # never reaches ``absent`` either, and the night's report line says nothing
+            # drifted.
             #
             # That is the failure this producer exists to prevent. The parser's page fires
             # per response and this one is "the only one of the four that sees a whole day
@@ -587,7 +588,9 @@ def _read_rows(
             stamp = pc.min(data.column("snap_ts")).as_py()
             seen = pc.unique(data.column("schema_version")).to_pylist()
         except Exception as exc:  # noqa: BLE001 - a kernel refuses a retyped column
-            raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+            raise DriftUnreadable(
+                f"{partition.relative} did not read: {type(exc).__name__}: {exc}"
+            ) from exc
         data_rows += data.num_rows
         if stamp is not None and (earliest is None or stamp < earliest):
             earliest = stamp
@@ -600,9 +603,9 @@ def _batches(
 ) -> Iterator:
     """Stream ``required`` and whichever of ``optional`` the file carries, every row counted.
 
-    These are ``battery.read_entitlement``'s rules, whose docstring gives the reasoning,
-    applied to this module's two reads. Each failure raises :class:`DriftUnreadable` as "did
-    not read".
+    Each failure raises :class:`DriftUnreadable` as "did not read". The first and third rules
+    are ``battery.read_entitlement``'s, and its docstring gives the third's reasoning. The
+    second is this module's own.
 
     1. A required column the file lacks is refused before the stream starts.
        ``iter_batches`` reads past a name the file does not carry and returns the other
@@ -704,7 +707,9 @@ def first_cycle_of(partition, surface: str, fields: Sequence[str]) -> str | None
                 overflows = populated.column(EXTRA_COLUMN).to_pylist()
                 stamps = populated.column("snap_ts").to_pylist()
             except Exception as exc:  # noqa: BLE001 - a kernel refuses a retyped column
-                raise DriftUnreadable(f"{partition.relative} did not read: {exc}") from exc
+                raise DriftUnreadable(
+                    f"{partition.relative} did not read: {type(exc).__name__}: {exc}"
+                ) from exc
             for raw, stamp in zip(overflows, stamps, strict=True):
                 if stamp is None or (earliest is not None and stamp >= earliest):
                     continue
@@ -1001,8 +1006,9 @@ def _retype_first_cycle(partitions: Sequence, surface: str, fields: Sequence[str
             # **A partition this cannot read must not cost the page.** The drift is already
             # established by the evidence gathered above, and the first cycle is a detail of
             # the body. A partition ``read_surface_day`` could not read is already reported
-            # as skipped, so that failure is on the record rather than swallowed, and a page
-            # naming the drift with no stamp beats no page.
+            # as skipped. One it read and this pass cannot, such as a file replaced between
+            # the two opens, costs only the stamp, and a page naming the drift with no stamp
+            # beats no page.
             continue
         if stamp is not None and (earliest is None or stamp < earliest):
             earliest = stamp
