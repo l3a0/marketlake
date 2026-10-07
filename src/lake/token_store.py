@@ -129,7 +129,7 @@ def mode_of(config: Config) -> tuple[str, str | None]:
     return UNRECOGNISED, (
         f"{TOKEN_STORE_KEY} {value!r} is not {FILE!r}, {BOTH!r} or {STORE!r}, so it is "
         "read as the side that cannot cost a token: a re-auth writes token.json and then "
-        f"puts the token parameter if {COMMAND_KEY_ID_KEY}, {COMMAND_SECRET_KEY}, "
+        "puts the token parameter if the two command_* keys, "
         f"{TOKEN_STORE_ROLE_ARN_KEY} and {TOKEN_STORE_REGION_KEY} allow it, and the "
         "scheduled pulls run"
     )
