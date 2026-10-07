@@ -613,7 +613,8 @@ class SystemdUnit:
         2. A timer's service is ``Type=oneshot`` with no ``[Install]`` section. A oneshot
            has no start timeout, so the Sunday job's hours of retries survive.
         3. The daemon alone waits for the network and carries ``OOMPolicy=continue``, so
-           the kernel killing its compaction child does not stop it.
+           the kernel killing its compaction child or its token pull child does not stop
+           it.
         4. ``User=`` is the owner and no ``Group=`` is set, so systemd takes the owner's
            primary group. ``PATH`` is left to systemd's default.
         """

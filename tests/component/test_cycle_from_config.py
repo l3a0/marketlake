@@ -786,8 +786,9 @@ def test_a_token_file_the_build_cannot_use_gaps_every_surface(
     Raised, the build's failure ended the daemon's loop, and the service manager restarted
     it into the same raise every capture minute. Here the cycle returns, with a gap row on
     every surface carrying ``token_file_unreadable``. The watchdog folds that into "token
-    dead", and the daemon pulls on it. The cycle neither lands data nor reports nothing to
-    capture, so the capture dead-man stays unfed and pages as it does for a dead token.
+    dead", and under ``token_store: store`` or an unknown value the daemon pulls on it.
+    The cycle neither lands data nor reports nothing to capture, so the capture dead-man
+    stays unfed and pages as it does for a dead token.
 
     The real ``SchwabVendor.from_token`` runs, so the exception classes are the ones
     production meets rather than ones a stub chose.

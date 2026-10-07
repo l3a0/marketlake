@@ -19,8 +19,8 @@ Three pieces live here.
    it writes the file. ``store`` and any other value make the VM's scheduled pulls run:
    before each Sunday canary attempt, and from the daemon while capture is down on a dead
    token or a token file it cannot read (marketlake #702). An unknown value prints one
-   line and falls to the side
-   that cannot cost a token: the re-auth still writes the file and tries the put.
+   line and falls to the side that cannot cost a token: the re-auth still writes the
+   file and tries the put.
 2. ``push`` is the re-auth's put. It sends the JSON text the login wrote, as a string,
    never a read-back of the file. It signs only as the role ``token_store_role_arn``
    names, which may only put this one parameter, in ``token_store_region``. The command

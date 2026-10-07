@@ -152,8 +152,8 @@ that delay would come anyway, since the interpreter joins a cycle's pool threads
 The production entry reloads config and the token per cycle, so a raise there means a
 broken machine, not a vendor hiccup, and the loop has no channel of its own to report it.
 A token file that cannot be read is the exception: the cycle records every surface as a
-``token_file_unreadable`` gap instead of raising, and the daemon pulls the token parameter
-on it (marketlake #702).
+``token_file_unreadable`` gap instead of raising. Under ``token_store: store`` or an
+unknown value, the daemon then pulls the token parameter on it (marketlake #702).
 The process exits non-zero, the service manager logs it and relaunches it, and the
 successor's startup gap-marking records the minutes lost. A vendor failure never reaches
 here: the cycle resolves it into gap rows and returns normally.
@@ -896,8 +896,8 @@ def _close_fill(
 
     Nothing is built until a fill is actually owed. The vendor is constructed inside
     ``fill_option_close_from_config``, on the call, so a missing token file costs the fill
-    nothing until one is owed, and then costs that fill alone. A
-    missing option close is rare, so that construction normally never happens at all.
+    nothing until one is owed, and then costs that fill alone. A missing option close is
+    rare, so that construction normally never happens at all.
 
     The two provenance tags are the ones the 16:15 cycle would have carried. The close
     tag is ``option_close`` by definition, stamped by the fill itself. The session phase

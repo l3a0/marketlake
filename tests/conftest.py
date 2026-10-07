@@ -57,9 +57,9 @@ from lake.paths import CONFIG_DIR_ENV
 # anything it runs is outside this by design. One test's explicit-``env=`` children do
 # reach real code at a default path: ``tests/component/test_unattended_entries_fresh.py``
 # starts each entry with its launchd job's or systemd unit's own environment, and the
-# compaction child the daemon spawns with the daemon job's. Neither carries a
-# config-directory variable, so ``config.default_config_path()`` resolves under ``HOME``
-# in the child.
+# compaction child and the token pull child the daemon spawns with the daemon job's.
+# None of those carries a config-directory variable, so ``config.default_config_path()``
+# resolves under ``HOME`` in the child, and the pull child's ``token.json`` does too.
 # That test arranges its own redirect by pointing ``HOME`` at a throwaway directory. Any
 # other child that reaches a default path has to do the same.
 #

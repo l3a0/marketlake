@@ -2657,7 +2657,9 @@ def run_cycle_from_config(
     authenticated vendor from the token file, and runs the same core cycle. Every call
     reloads all four inputs: the config, the roster, the token, and the chain plan. Nothing
     is cached across calls. That is the per-cycle re-read the design wants, so a nightly
-    plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
+    plan rewrite takes effect the next minute. A re-auth is picked up the next cycle on
+    the host whose file the re-auth rewrote. A host that receives the token through the
+    token parameter picks it up the cycle after its next pull writes the file.
     The ``schwab-py`` client is built only here, lazily inside ``SchwabVendor.from_token``,
     so importing this module and running the offline suite need neither the library nor a
     real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag``,
