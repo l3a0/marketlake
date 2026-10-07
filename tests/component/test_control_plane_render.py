@@ -26,10 +26,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from lake import aws_session, token_store
 from lake import control_plane as cp
 from lake.metadata import stamp_assertion_pid, stamp_cycle
 from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir, default_token_path
 from lake.tickers import Roster
+from tests.component.test_bucket_instance_profile import METADATA, _Server
+from tests.component.test_token_store_pull import StoreHook
 from tests.support.backup import WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
@@ -669,16 +672,17 @@ class _BrokenTransport:
         raise OSError("network down")
 
 
-def _sunday_lake(tmp_path: Path) -> tuple[Path, Path]:
+def _sunday_lake(tmp_path: Path, **config_values) -> tuple[Path, Path]:
     """A one-partition lake, a config naming it, and the backup copy on the SSD.
 
     The Sunday job scrubs both copies, so a run that should come back clean needs the
     copy to be there. ``write_config`` makes the target directory and this fills it the
     way the close+15 sync would have. A plain file copy, never an ``rsync``: the
-    subprocess guard fails any test that reaches one.
+    subprocess guard fails any test that reaches one. ``config_values`` go to
+    ``write_config`` as they are.
     """
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
-    config = write_config(tmp_path, lake)
+    config = write_config(tmp_path, lake, **config_values)
     mirror_lake(lake, tmp_path / "ssd")
     return lake, config
 
@@ -1221,13 +1225,17 @@ def test_the_linux_self_check_cli_asks_systemd_and_the_clock(tmp_path, monkeypat
     assert seen["label"] == cp.DAEMON_LABEL
 
 
-def _drive_sunday(tmp_path: Path, monkeypatch) -> tuple[int, dict[str, object]]:
+def _drive_sunday(
+    tmp_path: Path, monkeypatch, *, minted: datetime | None = None, **config_values
+) -> tuple[int, dict[str, object]]:
     """Run ``main sunday`` on a healthy lake, recording what reaches ``sunday_run``.
 
     Every live producer on both hosts is replaced, so whichever branch ``main`` takes
     reaches a fake. The real ``sunday_run`` still runs, so the exit code is the job's own.
+    ``minted`` is the local token's mint time, and ``config_values`` go to ``write_config``.
+    The token sits at ``tmp_path / "token.json"``.
     """
-    lake, config = _sunday_lake(tmp_path)
+    lake, config = _sunday_lake(tmp_path, **config_values)
     stamp_assertion_pid(lake, pid=_DAEMON_PID)
     seen: dict[str, object] = {}
     real = cp.sunday_run
@@ -1246,7 +1254,7 @@ def _drive_sunday(tmp_path: Path, monkeypatch) -> tuple[int, dict[str, object]]:
     monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
     monkeypatch.setattr(cp, "systemctl_probe", lambda label: True)
     code = cp.main(
-        ["sunday", "--config", str(config), "--token", str(_token(tmp_path))],
+        ["sunday", "--config", str(config), "--token", str(_token(tmp_path, minted))],
         clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
         calendar=weekday_sessions(date(2026, 8, 31)),
     )
@@ -1276,6 +1284,166 @@ def test_the_linux_sunday_cli_asks_systemd_and_reads_nothing_back(
     assert seen["assertion_probe"] is None
     assert "pmset" not in printed
     assert "time machine" not in printed
+
+
+# -- the token pull's wiring ---------------------------------------------------------
+
+# ``main`` reads ``token_store`` once and hands ``sunday_run`` a pull under ``store`` or an
+# unknown value, whatever the host's role, and ``None`` under ``file`` or ``both``
+# (marketlake #702). The pull writes the job's own ``--token`` file with the job's own
+# clock, and the two exceptions ``token_store.pull`` raises become outcomes, so neither
+# ends the job before the canary, the scrub and the ping.
+
+
+class _RecordedPull:
+    """Stands in for ``token_store.pull`` and records each call's arguments."""
+
+    def __init__(self, result=None, raises=None):
+        self.calls: list[dict[str, object]] = []
+        self.result = result
+        self.raises = raises
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+@pytest.mark.parametrize("role", [None, "shadow"])
+def test_a_store_host_s_sunday_cli_pulls_into_its_own_token_with_its_own_clock(
+    tmp_path, capsys, monkeypatch, role
+):
+    pull = _RecordedPull(token_store.PullResult(token_store.CURRENT, "token.json is current"))
+    monkeypatch.setattr(token_store, "pull", pull)
+    built = []
+    monkeypatch.setattr(token_store, "pull_client", lambda config: built.append(config) or "c")
+
+    code, seen = _drive_sunday(tmp_path, monkeypatch, token_store="store", role=role)
+
+    assert code == 0
+    assert seen["token_pull"] is not None
+    assert len(pull.calls) == 1
+    (call,) = pull.calls
+    assert call["token_path"] == str(tmp_path / "token.json")
+    assert call["clock"] is seen["clock"]
+    # The factory reaches ``pull_client`` through its module when the pull calls it, so the
+    # client is built from this job's config and a replacement there reaches it.
+    assert call["client_factory"]() == "c"
+    assert [config.token_store for config in built] == ["store"]
+    assert "sunday: token pull: token.json is current" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", [None, "file", "both"])
+def test_a_file_or_both_host_s_sunday_cli_pulls_nothing(tmp_path, capsys, monkeypatch, mode):
+    pull = _RecordedPull(raises=AssertionError("a file or both host pulled"))
+    monkeypatch.setattr(token_store, "pull", pull)
+
+    code, seen = _drive_sunday(tmp_path, monkeypatch, token_store=mode)
+
+    assert code == 0
+    assert seen["token_pull"] is None
+    assert pull.calls == []
+    printed = capsys.readouterr().out
+    assert "token pull" not in printed
+    assert "token_store" not in printed
+
+
+def test_an_unknown_token_store_value_prints_its_line_and_pulls(tmp_path, capsys, monkeypatch):
+    pull = _RecordedPull(token_store.PullResult(token_store.CURRENT, "token.json is current"))
+    monkeypatch.setattr(token_store, "pull", pull)
+
+    code, seen = _drive_sunday(tmp_path, monkeypatch, token_store="stroe")
+
+    assert code == 0
+    assert len(pull.calls) == 1
+    printed = capsys.readouterr().out
+    assert "sunday: token_store 'stroe' is not 'file', 'both' or 'store'" in printed
+
+
+def test_a_pull_config_cannot_build_still_runs_the_canary_and_pings(tmp_path, capsys, monkeypatch):
+    # No bucket setting is present, so the real ``pull_client`` refuses the config before
+    # it builds a client, and nothing reaches AWS. The refusal becomes the pull's outcome.
+    canaries = []
+
+    def canary(**kwargs):
+        canaries.append(kwargs["token_path"])
+        return _passing_canary
+
+    monkeypatch.setattr(cp, "token_canary", canary)
+    lake, config = _sunday_lake(tmp_path, token_store="store")
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    pinger = FakePinger()
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    monkeypatch.setattr(cp, "systemctl_probe", lambda label: True)
+    token = _token(tmp_path)
+
+    code = cp.main(
+        ["sunday", "--config", str(config), "--token", str(token)],
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=WEEK_AHEAD,
+    )
+
+    assert code == 0
+    assert canaries == [str(token)]
+    assert pinger.urls == ["https://hc-ping.com/secret-key/sunday"]
+    printed = capsys.readouterr().out
+    pulled = [line for line in printed.splitlines() if line.startswith("sunday: token pull: ")]
+    assert len(pulled) == 1
+    assert "could not build its client (ConfigError: " in pulled[0]
+
+
+def test_a_pull_that_cannot_write_still_runs_the_job(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(token_store, "pull", _RecordedPull(raises=PermissionError("denied")))
+
+    code, _ = _drive_sunday(tmp_path, monkeypatch, token_store="store")
+
+    assert code == 0
+    printed = capsys.readouterr().out
+    token = tmp_path / "token.json"
+    assert f"sunday: token pull: {token} could not be written (PermissionError)" in printed
+
+
+@pytest.fixture
+def instance_metadata(monkeypatch):
+    """The instance metadata service on loopback, as ``test_token_store_pull`` runs it."""
+    with _Server(METADATA) as server:
+        monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
+        yield server
+
+
+def test_a_store_host_s_sunday_pull_writes_the_token_the_coverage_assertion_reads(
+    tmp_path, capsys, monkeypatch, instance_metadata
+):
+    # The VM's own token is last week's. The laptop's re-auth put this week's at 19:30, so
+    # the 20:00 attempt passes only if it pulled before it read the mint.
+    fresh = {
+        "creation_timestamp": et(2026, 8, 30, 19, 30).timestamp(),
+        "token": {"access_token": "ACCESS-SENTINEL", "refresh_token": "REFRESH-SENTINEL"},
+    }
+    hook = StoreHook(json.dumps(fresh)).install(monkeypatch)
+
+    code, _ = _drive_sunday(
+        tmp_path,
+        monkeypatch,
+        minted=LATE_LAST_WEEK,
+        token_store="store",
+        bucket_credentials="instance_profile",
+        bucket_region="us-east-2",
+        role="shadow",
+    )
+
+    assert code == 0
+    assert len(hook.requests) == 1
+    assert json.loads((tmp_path / "token.json").read_text()) == fresh
+    printed = capsys.readouterr().out
+    assert f"sunday: token pull: wrote {tmp_path / 'token.json'}" in printed
+    assert "ACCESS-SENTINEL" not in printed and "REFRESH-SENTINEL" not in printed
 
 
 # -- the two producers the launchd job runs on ---------------------------------------
@@ -3464,3 +3632,110 @@ def test_a_down_daemon_is_reported_as_down_even_with_no_assertion(tmp_path):
     assert outcome.daemon_up is False, "a down daemon reported as up"
     assert outcome.problem is None, "it named the assertion for a daemon that is not there"
     assert outcome.assertion_held is None, "it asked about an assertion before the daemon"
+
+
+# -- the Sunday pull's log line and reminder outcome, per attempt --------------------
+
+
+def _reminder_lines(printed: str) -> list[str]:
+    return [line for line in printed.splitlines() if line.startswith("sunday: reminder: ")]
+
+
+def test_every_attempt_s_log_names_its_own_pull(tmp_path, capsys, monkeypatch):
+    # A stale token retries through the evening, so the job runs seven attempts. Each one
+    # pulled, and the log is the only place the pull's full line goes.
+    failed = token_store.PullResult(
+        token_store.UNREADABLE, "the token parameter could not be used", reason="ParameterNotFound"
+    )
+    pull = _RecordedPull(failed)
+    monkeypatch.setattr(token_store, "pull", pull)
+
+    code, _ = _drive_sunday(tmp_path, monkeypatch, minted=LATE_LAST_WEEK, token_store="store")
+
+    assert code == 1
+    printed = capsys.readouterr().out
+    pulled = [line for line in printed.splitlines() if line.startswith("sunday: token pull: ")]
+    assert len(pull.calls) == 7
+    assert pulled == ["sunday: token pull: the token parameter could not be used"] * 7
+    reminders = _reminder_lines(printed)
+    assert len(reminders) == 3
+    assert all(line.endswith(" Token pull: unreadable (ParameterNotFound).") for line in reminders)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError("denied"), OSError(28, "No space left on device")],
+    ids=["perm", "nospace"],
+)
+def test_a_pull_that_cannot_write_is_named_not_written_on_the_reminder(
+    tmp_path, capsys, monkeypatch, error
+):
+    error.filename = str(tmp_path / "token.json")
+    monkeypatch.setattr(token_store, "pull", _RecordedPull(raises=error))
+
+    code, _ = _drive_sunday(tmp_path, monkeypatch, minted=LATE_LAST_WEEK, token_store="store")
+
+    assert code == 1
+    printed = capsys.readouterr().out
+    token = tmp_path / "token.json"
+    assert f"sunday: token pull: {token} could not be written ({type(error).__name__})" in printed
+    reminders = _reminder_lines(printed)
+    assert len(reminders) == 3
+    assert all(line.endswith(" Token pull: not written.") for line in reminders)
+    assert all(str(tmp_path) not in line for line in reminders)
+
+
+def test_a_pull_config_cannot_build_is_named_config_refused_on_the_reminder(
+    tmp_path, capsys, monkeypatch
+):
+    # The real ``pull_client`` refuses this config, as in the test above. Its message is
+    # computed here from the same config so the whole line can be compared.
+    from lake.config import ConfigError, load_config
+
+    code, seen = _drive_sunday(tmp_path, monkeypatch, minted=LATE_LAST_WEEK, token_store="store")
+
+    with pytest.raises(ConfigError) as refused:
+        token_store.pull_client(load_config(tmp_path / "config.yaml"))
+    assert code == 1
+    printed = capsys.readouterr().out
+    token = tmp_path / "token.json"
+    pulled = [line for line in printed.splitlines() if line.startswith("sunday: token pull: ")]
+    assert (
+        pulled
+        == [
+            "sunday: token pull: the token parameter was not read, because config.yaml could not "
+            f"build its client (ConfigError: {refused.value}), so {token} was left as it was"
+        ]
+        * 7
+    )
+    reminders = _reminder_lines(printed)
+    assert len(reminders) == 3
+    assert all(line.endswith(" Token pull: config refused.") for line in reminders)
+
+
+def test_a_sunday_cli_with_no_token_flag_pulls_into_the_default_token(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path / "cfg"))
+    pull = _RecordedPull(token_store.PullResult(token_store.CURRENT, "token.json is current"))
+    monkeypatch.setattr(token_store, "pull", pull)
+    lake, config = _sunday_lake(tmp_path, token_store="store")
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    monkeypatch.setattr(cp, "read_pmset_schedule", lambda: REPEAT_ONLY)
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr(cp, "token_canary", lambda **kwargs: _passing_canary)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    monkeypatch.setattr(cp, "systemctl_probe", lambda label: True)
+
+    cp.main(
+        ["sunday", "--config", str(config)],
+        clock=ManualClock(start=SUNDAY_20),
+        calendar=WEEK_AHEAD,
+    )
+
+    capsys.readouterr()
+    assert pull.calls
+    assert {call["token_path"] for call in pull.calls} == {str(default_token_path())}
