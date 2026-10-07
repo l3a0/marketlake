@@ -36,6 +36,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import os
 from collections import Counter
@@ -51,7 +52,7 @@ from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import write_chain_plan
 from lake.config import ConfigError
 from lake.schwab import is_transient_failure
-from lake.vendor import VendorResponse
+from lake.vendor import Vendor, VendorResponse
 from tests.support.calendar import et
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -942,11 +943,39 @@ def test_the_stand_in_is_never_retried_and_closes_quietly():
     assert not is_transient_failure(refused.value)
     assert type(refused.value).__mro__[1] is Exception
     capture._close_vendor(vendor)
-    for call in (
-        lambda: vendor.get_chain("SPY"),
-        lambda: vendor.get_minute_bars("SPY", start=FIRST_MINUTE, end=FIRST_MINUTE),
-        lambda: vendor.get_daily_bars("SPY", start=FIRST_MINUTE, end=FIRST_MINUTE),
-        vendor.token_mint_time,
-    ):
-        with pytest.raises(capture.TokenFileUnreadable):
-            call()
+
+
+def _protocol_methods() -> list[str]:
+    """Every public method the ``Vendor`` protocol declares, read off the protocol itself."""
+    return sorted(
+        name
+        for name, member in vars(Vendor).items()
+        if not name.startswith("_") and inspect.isfunction(member)
+    )
+
+
+def test_the_protocol_read_finds_the_methods_the_cycle_calls():
+    # The test below iterates the protocol. Read wrong, it would iterate nothing and pass.
+    assert {"get_chain", "get_quotes", "token_mint_time"} <= set(_protocol_methods())
+
+
+@pytest.mark.parametrize("name", _protocol_methods())
+def test_the_stand_in_defines_and_refuses_every_vendor_method(name):
+    # The stand-in defines each method itself rather than answering through
+    # ``__getattr__``, and each one raises ``TokenFileUnreadable``. The list comes from the
+    # protocol, so a method added to ``Vendor`` later fails here until the stand-in has
+    # it. The call carries the protocol's own required arguments, so a stand-in whose
+    # signature drifted from the protocol's fails too.
+    assert name in vars(capture._UnreadableTokenVendor)
+    vendor = capture._token_file_unreadable(FileNotFoundError("gone"))
+    args: list[object] = []
+    kwargs: dict[str, object] = {}
+    for parameter in list(inspect.signature(getattr(Vendor, name)).parameters.values())[1:]:
+        if parameter.default is not inspect.Parameter.empty:
+            continue
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+            kwargs[parameter.name] = object()
+        else:
+            args.append(object())
+    with pytest.raises(capture.TokenFileUnreadable):
+        getattr(vendor, name)(*args, **kwargs)
