@@ -28,13 +28,14 @@ git worktree list
 
 The log shows what merged since the last round, which is what moves the board.
 
-`--prune` drops a remote-tracking ref only when its branch was deleted on
-GitHub. This repo deletes a branch when its pull request merges, so a merged
-branch's remote ref goes at this step. That also means check 3 below rarely
-finds a merged commit on a remote branch, and the merged pull request's
-`headRefOid` is what proves it safe. A branch whose pull request closed
-unmerged stays on GitHub. Deleting it is the owner's call, and this skill
-leaves it alone.
+`--prune` deletes every ref under `refs/remotes/origin/` that has no branch
+behind it on GitHub, including one made there by hand. So after this step,
+every ref under `refs/remotes/origin/` names a branch GitHub holds. This repo
+deletes a branch when its pull request merges, so a merged branch's remote ref
+goes at this step. That also means check 3 below rarely finds a merged commit
+on a remote branch, and the merged pull request's head ref is what proves it
+safe. A branch whose pull request closed unmerged stays on GitHub. Deleting it
+is the owner's call, and this skill leaves it alone.
 
 Fast-forward the main checkout only when it is clean and on `main`, since a
 session may be using it. `git -C` keeps the shell where it is, which matters
@@ -70,14 +71,9 @@ A worktree is removable only when all five of these hold.
 3. **Its `HEAD` commit is safe.** Test the worktree's `HEAD` itself, not only
    its branch, because a worktree with no branch checked out holds commits that
    no branch names. The commit is safe when `origin/main` contains it, when a
-   remote branch contains it (`git branch -r --contains`), or when it equals
-   the `headRefOid` of a merged pull request. Squash merges make the last case
-   common, because the branch's commit never reaches `main`. Test that last case
-   by exact comparison against the list of merged heads. A
-   `gh pr list --search <sha>` matches any commit inside a pull request, not
-   only its head, so it does not test what this check states. `60ef88e`
-   matched [PR #646](https://github.com/l3a0/marketlake/pull/646), whose head
-   is `f1ecb4c`.
+   branch on `origin` contains it, or when a merged pull request's head ref,
+   `refs/pull/N/head`, contains it. The text just before the loops below says
+   why each case counts and which refs do not.
 4. **It holds no uncommitted changes.** `git status --porcelain` is empty.
    That listing omits ignored files, which `git worktree remove` deletes
    silently. `--ignored` shows them. Caches such as `.venv/` and
@@ -104,35 +100,94 @@ session as stuck, re-run `gh pr list --state open --limit 1000` and read its
 latest events with `list_events`, because a pull request may have opened since
 the worktree was classified.
 
-Check 3's last case needs the heads of the merged pull requests. Fetch them
-once into a file, so both loops below read the same list. A shell variable
-would not reach the second loop, because each Bash tool call starts a new
-shell. Replace `<scratch>` with the scratch directory in this block and the two
-after it.
+Check 3 counts only refs that GitHub backs. After step 1, every ref under
+`refs/remotes/origin/` names a branch on GitHub. A ref elsewhere under
+`refs/remotes/` was made locally, for example by
+`git fetch origin pull/N/head:refs/remotes/pr/N`, and proves nothing. Yet
+`git branch -r --contains` lists it like any remote branch, so both loops keep
+only that command's `origin/` lines. On 2026-10-07 this checkout held
+`refs/remotes/pr/492`, `refs/remotes/pr652` and `refs/remotes/audit/pr697`,
+and [#758](https://github.com/l3a0/marketlake/issues/758) found 34 clean
+worktrees whose only evidence was a ref like these.
+
+Squash merges make the merged-pull-request case common, because the branch's
+commits never reach `main`. GitHub keeps `refs/pull/N/head` for every pull
+request, through the merge and the deletion of its branch. A ref keeps every
+commit it reaches, so removing a worktree on any of them loses nothing. Two
+cases still fail, and must.
+
+1. A commit force-pushed out of a pull request. The final head ref does not
+   reach it, and GitHub may collect it.
+2. A commit made on a worktree after the pull request's last push. Nothing on
+   GitHub holds it.
+
+Check 4 still catches uncommitted files.
+
+The test is ancestry against the head ref, not a pull request's commit list
+and not a search. `gh pr list --search 60ef88e` returns
+[PR #646](https://github.com/l3a0/marketlake/pull/646), whose head ref reaches
+that commit, and [PR #661](https://github.com/l3a0/marketlake/pull/661), whose
+head ref does not. The second matches only because a comment on it quotes the
+hash. A search reads text, while ancestry asks whether a ref GitHub keeps still
+reaches the commit.
+
+The last case needs the numbers and head refs of the merged pull requests.
+Fetch them once, so both loops below read the same ones. A shell variable would
+not reach the second loop, because each Bash tool call starts a new shell.
+Replace `<scratch>` with the scratch directory in this block and the two after
+it.
 
 ```bash
-MERGED="<scratch>/merged-heads.txt"
-gh pr list --repo l3a0/marketlake --state merged --limit 1000 --json headRefOid --jq '.[].headRefOid' > "$MERGED"
+MERGED="<scratch>/merged-prs.txt"
+gh pr list --repo l3a0/marketlake --state merged --limit 1000 --json number --jq '.[].number' > "$MERGED"
 wc -l < "$MERGED"
+git for-each-ref --format='delete %(refname)' refs/pr-heads/ | git update-ref --stdin
+sed 's#.*#+refs/pull/&/head:refs/pr-heads/&#' "$MERGED" | git fetch --quiet --stdin origin || echo "FETCH FAILED: stop the round"
 ```
 
 A count of exactly 1000 means `gh` cut the list, so raise the limit and fetch
 again.
 
+The fetch writes each head to `refs/pr-heads/N`, outside `refs/remotes/`.
+`git branch -r` lists everything under `refs/remotes/`, so heads fetched there
+would read as remote branches and rebuild the trap above.
+
+The block deletes every ref under `refs/pr-heads/` before it fetches, because
+a head left by an earlier fetch can be stale. One fetched while its pull
+request was open still reaches any commit a later force-push dropped, and the
+loops' merged-number filter accepts it once the pull request merges. One
+missing ref on GitHub aborts the whole fetch, which then writes nothing, so
+without the delete every stale head would survive a failed fetch. With it, a
+failed fetch leaves no heads, and the merged-pull-request case finds nothing
+rather than something false. The `+` on each refspec is a second guard. It
+lets the fetch overwrite a head the delete missed, where git would otherwise
+refuse to move a ref to a commit that does not descend from it.
+
+If the fetch fails, stop the round. The loops would report no worktree safe
+through a merged pull request, which loses nothing but tells the owner nothing.
+Find why the fetch failed and rerun this block.
+
 This prints what checks 3 to 5 need for every worktree.
 
 ```bash
-MERGED="<scratch>/merged-heads.txt"
+MERGED="<scratch>/merged-prs.txt"
 git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r w; do
   if ! h=$(git -C "$w" rev-parse HEAD 2>/dev/null) || [ "$(git -C "$w" rev-parse --show-toplevel 2>/dev/null)" != "$w" ]; then
     echo "$w unreadable, skipped"; continue
   fi
-  safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | head -1 | tr -d ' ')
-  grep -qxF "$h" "$MERGED" && safe="$safe merged-pr-head"
+  safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | grep -e '^ *origin/' | head -1 | tr -d ' ')
+  pr=$(git for-each-ref --contains "$h" --format='%(refname:lstrip=2)' refs/pr-heads/ | grep -xF -f "$MERGED" | head -1)
+  [ -n "$pr" ] && safe="$safe merged-pr/$pr"
   echo "$w head=${h:0:7} branch=$(git -C "$w" branch --show-current) safe=[${safe}] dirty=$(git -C "$w" status --porcelain | wc -l | tr -d ' ') ignored=$(git -C "$w" status --porcelain --ignored | grep -c '^!!')"
 done
 git worktree list --porcelain | grep -B3 '^locked'
 ```
+
+`git for-each-ref --contains` runs the ancestry test of
+`git merge-base --is-ancestor` against every fetched head in one call, rather
+than one process per head. The `grep -xF -f "$MERGED"` keeps only the merged
+numbers, so an open pull request's head that someone fetched into
+`refs/pr-heads/` does not count.
 
 A worktree printed as unreadable has a directory that is gone or a `.git` file
 that is broken. Its `HEAD` cannot be read, so none of the tests can pass for
@@ -144,15 +199,19 @@ checkout's `HEAD` as its own.
 
 A branch checked out in no worktree is removable when check 3 holds for its
 head. Git refuses to delete a branch that a worktree has checked out, which
-protects every branch in use. This loop runs the same three tests as the one
-above.
+protects every branch in use. The loop also lists, by full name, each ref under
+`refs/remotes/` outside `origin/`, such as `refs/remotes/pr/492`, since nothing
+on GitHub backs it. This loop runs the same three tests as the one above.
 
 ```bash
-MERGED="<scratch>/merged-heads.txt"
-git branch --format='%(refname:short)' | grep -v -e '^main$' -e '^(HEAD' -e '^(no branch' | while read -r b; do
+MERGED="<scratch>/merged-prs.txt"
+{ git branch --format='%(refname:short)' | grep -v -e '^main$' -e '^(HEAD' -e '^(no branch'
+  git for-each-ref --format='%(refname)' refs/remotes/ | grep -v -e '^refs/remotes/origin/'
+} | while read -r b; do
   h=$(git rev-parse "$b")
-  safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | head -1 | tr -d ' ')
-  grep -qxF "$h" "$MERGED" && safe="$safe merged-pr-head"
+  safe=$( { git merge-base --is-ancestor "$h" origin/main && echo main; } || git branch -r --contains "$h" | grep -e '^ *origin/' | head -1 | tr -d ' ')
+  pr=$(git for-each-ref --contains "$h" --format='%(refname:lstrip=2)' refs/pr-heads/ | grep -xF -f "$MERGED" | head -1)
+  [ -n "$pr" ] && safe="$safe merged-pr/$pr"
   echo "$b ${h:0:7} ahead=$(git rev-list --count origin/main.."$h") safe=[${safe}]"
 done
 ```
@@ -170,11 +229,15 @@ form keeps `main` in the list, and `main` then reads as safe to delete.
 Then remove with the commands that refuse to lose work. `git worktree remove`
 without `--force` refuses a worktree holding modified or untracked files, and
 that refusal is a check worth keeping. Use `git branch -D` only on a branch
-whose head passed check 3.
+whose head passed check 3. A name the branch loop printed with the
+`refs/remotes/` prefix is a ref, not a branch. Delete it with
+`git update-ref -d` on the same evidence, and keep and report one whose commit
+fails check 3.
 
 ```bash
 git worktree remove <path>
 git branch -D <branch>
+git update-ref -d <refs/remotes/...>
 git worktree prune
 ```
 
