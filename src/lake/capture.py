@@ -2626,6 +2626,19 @@ def _token_file_unreadable(exc: BaseException) -> _UnreadableTokenVendor:
     return _UnreadableTokenVendor(build_error)
 
 
+def _names_token_file(exc: OSError, token_path: str | Path) -> bool:
+    """Whether ``exc`` was raised reading the token file itself.
+
+    ``SchwabVendor.from_token`` reads the file at ``Path(token_path)``, and an ``OSError``
+    from that read names it in ``filename``. Any other file the build opens, such as the CA
+    bundle httpx loads, names that file instead, or none at all.
+    """
+    filename = exc.filename
+    if not isinstance(filename, str | bytes | os.PathLike):
+        return False
+    return Path(os.fsdecode(filename)) == Path(token_path)
+
+
 def run_cycle_from_config(
     *,
     clock: Clock | None = None,
@@ -2673,9 +2686,12 @@ def run_cycle_from_config(
     ``KeyError`` or ``TypeError``. Raised here, any of them ended the daemon's loop, and the
     service manager restarted it into the same raise every capture minute. So the cycle
     runs against ``_UnreadableTokenVendor`` instead, and every surface gaps as
-    ``token_file_unreadable``. The watchdog folds that into "Capture down: token dead",
-    and the daemon pulls the token parameter on it. Only the build is caught. A raise from
-    the config, the roster or the cycle itself still ends the call as before.
+    ``token_file_unreadable``. The watchdog folds that into "Capture down: token dead".
+    Under ``token_store: store`` or an unknown value, the daemon pulls the token parameter
+    on it. Only the build is caught, and an ``OSError`` only when it names the token file,
+    since the build reads other files too, such as the CA bundle httpx loads. Any other
+    ``OSError``, and a raise from the config, the roster or the cycle itself, still ends
+    the call as before.
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
@@ -2691,7 +2707,14 @@ def run_cycle_from_config(
         vendor = SchwabVendor.from_token(
             resolved_token, api_key=api_key, app_secret=app_secret, clock=resolved_clock
         )
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except OSError as exc:
+        # Only the token file's own read. httpx loads its CA bundle while the client is
+        # built, so a missing ``SSL_CERT_FILE`` raises ``FileNotFoundError`` here too, and
+        # a pull cannot repair that. It ends the call as it did before marketlake #702.
+        if not _names_token_file(exc, resolved_token):
+            raise
+        vendor = _token_file_unreadable(exc)
+    except (ValueError, KeyError, TypeError) as exc:
         vendor = _token_file_unreadable(exc)
     abandoned: list[Future] = []
     try:

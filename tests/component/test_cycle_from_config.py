@@ -35,6 +35,7 @@ Two boundaries are worth naming, because the design's claim is wider than this f
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from collections import Counter
@@ -823,14 +824,27 @@ def test_a_token_file_the_build_cannot_use_gaps_every_surface(
     assert str(tmp_path) not in err
 
 
-@pytest.mark.parametrize("raised", [OSError, ValueError, KeyError, TypeError])
+def _os_error_on(path: Path) -> OSError:
+    return OSError(errno.EIO, "the build refused", str(path))
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(_os_error_on, id="OSError"),
+        pytest.param(lambda path: ValueError("the build refused"), id="ValueError"),
+        pytest.param(lambda path: KeyError("the build refused"), id="KeyError"),
+        pytest.param(lambda path: TypeError("the build refused"), id="TypeError"),
+    ],
+)
 def test_each_class_the_build_can_raise_is_recorded_as_a_gap(tmp_path, monkeypatch, raised):
     # The four the build is caught for, each from a stub so a class the real file read
     # never raises today, such as ``attach_timing``'s own ``TypeError``, is covered too.
+    # The ``OSError`` names the token file, as the real read's does.
     rig = _rig(tmp_path, SPY_ONLY)
 
     def refuse(path: Path) -> _Vendor:
-        raise raised("the build refused")
+        raise raised(path)
 
     _wire(monkeypatch, rig, refuse)
 
@@ -854,6 +868,58 @@ def test_a_build_failure_outside_the_four_still_raises(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="not a file problem"):
         _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+
+@pytest.mark.parametrize("other", ["cacert.pem", None], ids=["another-file", "no-file"])
+def test_an_os_error_that_does_not_name_the_token_file_still_raises(tmp_path, monkeypatch, other):
+    # The build reads more than the token file. An ``OSError`` from any other file, or
+    # from no file, is not something a token pull repairs, so it ends the call as before
+    # rather than paging "token dead" and spawning pulls that cannot help.
+    rig = _rig(tmp_path, SPY_ONLY)
+
+    def refuse(path: Path) -> _Vendor:
+        if other is None:
+            raise OSError(errno.EIO, "the build refused")
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(tmp_path / other))
+
+    _wire(monkeypatch, rig, refuse)
+
+    with pytest.raises(OSError, match="the build refused|No such file"):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+
+
+# authlib's ``OAuth2Client.__del__`` deletes a ``session`` the failed constructor never set,
+# and the collector reports that as an unraisable ``AttributeError``. It is the library's
+# cleanup of the half-built client, not something this test checks.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_a_missing_ca_bundle_raises_rather_than_reading_as_a_bad_token(
+    tmp_path, monkeypatch, capsys
+):
+    # The real build with a good token file. httpx loads the CA bundle ``SSL_CERT_FILE``
+    # names while the client is built, so a missing one raises ``FileNotFoundError`` from
+    # inside ``from_token``. That is a broken machine, and caught it would log "the token
+    # file could not be read", page "token dead" and spawn pulls that cannot repair it.
+    rig = _rig(tmp_path, SPY_ONLY)
+    # A token ``schwab-py`` builds a client from, unexpired, so the build refreshes nothing.
+    token = {
+        "access_token": "access",
+        "refresh_token": FRESH,
+        "token_type": "Bearer",
+        "expires_at": FRESH_MINTED + 30 * 60,
+    }
+    rig.token.write_text(json.dumps({"creation_timestamp": FRESH_MINTED, "token": token}))
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: load_chain_plan(rig.plan))
+    missing = tmp_path / "no-such-ca-bundle.pem"
+    monkeypatch.setenv("SSL_CERT_FILE", str(missing))
+
+    def no_cycle(*args, **kwargs):
+        raise AssertionError("the build succeeded, so the cycle would reach the network")
+
+    monkeypatch.setattr(capture, "run_cycle", no_cycle)
+
+    with pytest.raises(FileNotFoundError):
+        _cycle(rig, ManualClock(start=FIRST_MINUTE))
+    assert "token file" not in capsys.readouterr().err
 
 
 def test_a_config_that_will_not_load_still_raises_beside_a_missing_token(tmp_path, monkeypatch):

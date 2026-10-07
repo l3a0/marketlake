@@ -3379,7 +3379,7 @@ def test_a_missing_token_file_heals_on_the_cycle_after_the_pull_writes_it(tmp_pa
         def from_token(path, *, api_key, app_secret, clock=None):
             # The real build's first act is the file read, and this is what it raises.
             if not Path(path).exists():
-                raise FileNotFoundError(2, "No such file or directory")
+                raise FileNotFoundError(2, "No such file or directory", str(path))
             return vendor
 
     monkeypatch.setattr(capture, "SchwabVendor", _NeedsTheFile)
