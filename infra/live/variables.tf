@@ -43,8 +43,10 @@ variable "owner_ssh_cidr" {
   # Sensitive, so the owner's address stays out of plan output. It still sits in state
   # as plain text, and the plan role can read it through ec2:DescribeSecurityGroups.
   # The provider refuses an IPv6 CIDR, or one with host bits set, but its error prints
-  # the address, and a plan's errors reach CI's public log. This validation refuses
-  # both first, with a message that names no value.
+  # the address, and a plan's errors reach CI's public log. The first validation refuses
+  # both before the provider sees them, with a message that names no value. The second refuses a prefix shorter
+  # than /16, so 0.0.0.0/0 cannot open SSH to the whole internet. A home address is a
+  # /32, and /16 leaves room for a provider's range.
   description = "The owner's address that may SSH to the VM, as an IPv4 CIDR such as a /32. CI reads it from the OWNER_SSH_CIDR repository secret."
   type        = string
   sensitive   = true
@@ -53,6 +55,11 @@ variable "owner_ssh_cidr" {
   validation {
     condition     = can(cidrnetmask(var.owner_ssh_cidr)) && try(cidrhost(var.owner_ssh_cidr, 0) == split("/", var.owner_ssh_cidr)[0], false)
     error_message = "owner_ssh_cidr must be an IPv4 CIDR with no host bits set, such as a /32."
+  }
+
+  validation {
+    condition     = try(tonumber(split("/", var.owner_ssh_cidr)[1]) >= 16, false)
+    error_message = "owner_ssh_cidr must have a prefix of /16 or longer, such as a /32."
   }
 }
 

@@ -55,14 +55,21 @@ path answers only when the instance has ``instance_metadata_tags`` enabled, whic
    missing name listed there, and a render that read only ``Parameters`` would write a
    file missing a key, which #699's pass 3 found. A wrong region shows up here too, as
    every name at once.
-9. A fetched value is empty, or has whitespace at either end.
-10. The merged mapping fails ``Config.from_mapping``. The daemon loads ``config.yaml``
+9. ``Parameters`` names one parameter twice. Which of the two values would win depends
+   on the order of the answer, so neither is used.
+10. A fetched value is empty, or has whitespace at either end.
+11. The merged mapping fails ``Config.from_mapping``. The daemon loads ``config.yaml``
     every cycle, so a file that fails to load costs capture.
-11. ``backup_target`` is not an ``s3://`` target, or has a ``bucket_target_problems``
+12. ``backup_target`` is not an ``s3://`` target, or has a ``bucket_target_problems``
     problem, or the config has a ``bucket_credential_problems`` problem. Loading never
     refuses a backup setting, by design, so a target without its scheme would load as a
     relative path. The render is a job rather than the capture path, so it applies the
     bucket jobs' strict checks.
+
+A refusal is raised outside the handler that caught its cause, as ``config.load_config``
+does, so neither its ``__cause__`` nor its ``__context__`` holds a YAML error. PyYAML
+quotes the offending line, and a secret pasted into the settings would ride along in any
+traceback that printed the chain.
 
 **No value reaches any output.** A line names a parameter, the tag or a key and never
 what it holds. An AWS ``ClientError`` is reported by its error code alone and a
@@ -82,13 +89,19 @@ on any HTTP error other than the 404 above.
 **The write is atomic and private.** The temp file sits beside the target and is created
 at mode 0600 with ``O_EXCL``, rather than chmodded after the secrets land. It is fsynced
 and renamed into place, so the daemon's next load sees the whole old file or the whole
-new one. The YAML comes from ``yaml.safe_dump``, because a secret written by hand can
-parse back as another type. ``tickers._write_atomically`` and ``reauth.write_token`` do
-not fit as they stand: neither creates its file at 0600, and ``write_token`` writes JSON.
+new one. The directory is fsynced after the rename, so the new name survives a crash. An
+interrupt during the write removes the temp file too, which is why the cleanup catches
+``BaseException``. The YAML comes from ``yaml.safe_dump``, because a secret written by
+hand can parse back as another type. ``tickers._write_atomically`` and
+``reauth.write_token`` do not fit as they stand: neither creates its file at 0600, and
+``write_token`` writes JSON.
 A missing config directory is created at mode 0700. A file that already parses to the
 same mapping is not rewritten. It is reported as ``unchanged`` when its mode is 0600, and
 otherwise chmodded to 0600 and reported as ``tightened``, because a file holding four
-secrets must not stay readable by others just because its content matched.
+secrets must not stay readable by others just because its content matched. A symbolic
+link at ``config.yaml`` is never read or chmodded through. The render writes a new file
+over it, so ``os.replace`` replaces the link itself and the file it pointed at keeps its
+content and mode.
 
 **The line names the keys whose values changed.** The daemon builds its senders once, at
 start, so a changed ``role`` reaches it only through a restart. Each compaction starts a
@@ -113,6 +126,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -337,10 +351,14 @@ def _parse_settings(payload: bytes) -> dict[str, Any]:
         raise RenderRefused(
             f"the settings are over {SETTINGS_MAX_BYTES} bytes, so they are not config/vm.yaml"
         )
+    # The refusal is raised after the handler, so the parse error is not its context.
+    parsed_ok = True
     try:
         parsed = yaml.safe_load(payload.decode("utf-8"))
     except (UnicodeDecodeError, yaml.YAMLError):
-        raise RenderRefused("the settings are not UTF-8 YAML") from None
+        parsed_ok = False
+    if not parsed_ok:
+        raise RenderRefused("the settings are not UTF-8 YAML")
     if not isinstance(parsed, dict):
         raise RenderRefused("the settings are not a YAML mapping")
     # Every key in config.yaml is text. A key YAML reads as a number would load and be
@@ -387,9 +405,15 @@ def _parameter_values(response: object) -> dict[str, str]:
         names = sorted(str(name) for name in invalid)
         raise RenderRefused(f"SSM has no parameter named {names}")
     found = {}
+    repeated = set()
     for parameter in body.get("Parameters") or []:
         if isinstance(parameter, dict):
-            found[parameter.get("Name")] = parameter.get("Value")
+            name = parameter.get("Name")
+            if name in found:
+                repeated.add(str(name))
+            found[name] = parameter.get("Value")
+    if repeated:
+        raise RenderRefused(f"SSM returned {sorted(repeated)} more than once")
     values = {}
     for name, key in PARAMETERS:
         if name not in found:
@@ -414,15 +438,19 @@ def _check_tag(value: object) -> str:
 
 def _check_config(merged: Mapping[str, Any]) -> None:
     """Refuse a merged mapping the daemon could not load, or a bucket job would refuse."""
+    # The refusal is raised after the handler, so the load error is not its context.
+    failure = None
     try:
         config = Config.from_mapping(merged)
     except ConfigError as exc:
-        raise RenderRefused(f"the merged config does not load ({exc})") from None
+        failure = str(exc)
     except Exception as exc:
         # Loading can raise more than ``ConfigError``. A ``lake_root`` of ``~nobody/lake``
         # raises ``RuntimeError`` from ``expanduser``, which the daemon's own load would
         # raise every cycle. Only the type is named, since the message can quote a value.
-        raise RenderRefused(f"the merged config does not load ({type(exc).__name__})") from None
+        failure = type(exc).__name__
+    if failure is not None:
+        raise RenderRefused(f"the merged config does not load ({failure})")
     target = config.backup_target
     if not isinstance(target, BucketTarget):
         raise RenderRefused("backup_target is not an s3:// bucket target")
@@ -445,7 +473,20 @@ def _same(left: object, right: object) -> bool:
 
 
 def _existing(target: Path) -> tuple[str, Mapping[Any, Any] | None]:
-    """What sits at ``target`` now: ``absent``, ``unreadable``, or ``present`` and its mapping."""
+    """What sits at ``target`` now and its mapping, if it is a file that holds one.
+
+    The state is ``absent``, ``a symbolic link``, ``unreadable`` or ``present``. A link is
+    never read through, so the render writes over it rather than reporting it unchanged
+    and chmodding the file it points at.
+    """
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unreadable", None
+    if stat.S_ISLNK(info.st_mode):
+        return "a symbolic link", None
     try:
         text = target.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -462,7 +503,11 @@ def _existing(target: Path) -> tuple[str, Mapping[Any, Any] | None]:
 
 
 def _write(target: Path, text: str) -> None:
-    """Write ``text`` to ``target`` through a 0600 temp file, an fsync and one rename."""
+    """Write ``text`` to ``target`` through a 0600 temp file, an fsync and one rename.
+
+    The directory is fsynced after the rename, so the new name survives a crash. A
+    ``KeyboardInterrupt`` or any other exit during the write removes the temp file.
+    """
     target.parent.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
     tmp = temp_write_path(target, os.getpid())
     # A temp file left by a crash under the same pid would make ``O_EXCL`` refuse every
@@ -479,6 +524,12 @@ def _write(target: Path, text: str) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+    # The standard directory fsync, as ``journal`` takes it for a new segment.
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def render(
@@ -507,6 +558,9 @@ def render(
     from botocore.exceptions import BotoCoreError, ClientError  # lazy: only a render needs it
 
     target = Path(config_path) if config_path is not None else default_config_path()
+    # Every refusal is recorded in its handler and raised after it, so the exception that
+    # reaches the caller carries no ``__context__``.
+    refusal = None
     try:
         if (geteuid or os.geteuid)() == 0:
             raise RenderRefused(
@@ -516,7 +570,9 @@ def render(
         settings = _parse_settings(payload)
         region = _check_settings(settings)
     except RenderRefused as exc:
-        raise _refused(target, str(exc)) from None
+        refusal = str(exc)
+    if refusal is not None:
+        raise _refused(target, refusal)
 
     try:
         backup_target = _check_tag(tag_reader())
@@ -530,7 +586,9 @@ def render(
     except TagLookupFailed as exc:
         return _failed(target, f"the {BACKUP_TARGET_TAG} tag could not be read (HTTP {exc.status})")
     except RenderRefused as exc:
-        raise _refused(target, str(exc)) from None
+        refusal = str(exc)
+    if refusal is not None:
+        raise _refused(target, refusal)
 
     try:
         client = client_factory(region)
@@ -556,11 +614,14 @@ def render(
         merged = {**settings, **_parameter_values(response), BACKUP_TARGET_KEY: backup_target}
         _check_config(merged)
     except RenderRefused as exc:
-        raise _refused(target, str(exc)) from None
+        refusal = str(exc)
+    if refusal is not None:
+        raise _refused(target, refusal)
 
     state, previous = _existing(target)
     if previous is not None and _same(previous, merged):
-        mode = target.stat().st_mode & 0o777
+        # ``lstat``, so a link that appeared since ``_existing`` looked is not read through.
+        mode = os.lstat(target).st_mode & 0o777
         if mode == FILE_MODE:
             return RenderResult(UNCHANGED, f"unchanged: {target} already holds this config")
         os.chmod(target, FILE_MODE)
@@ -594,6 +655,12 @@ def _wrote_line(
             line += (
                 ". The role it held cannot be read, so restart the daemon if it is running, "
                 "since it reads the role only at start"
+            )
+        elif state == "a symbolic link":
+            line += (
+                ". The render does not read through a link, so the role it held was not "
+                "compared. Restart the daemon if it is running, since it reads the role "
+                "only at start"
             )
         return line
     # The old file is compared by the text of its keys, since a hand edit can leave a key
@@ -646,12 +713,13 @@ def _read_stdin() -> bytes:
             "standard input is closed; pipe the settings in, as in "
             "'python -m lake.vm_config render < config/vm.yaml'"
         )
+    # The refusal is raised after the handler, so the read error is not its context.
+    failure = None
     try:
         return stdin.buffer.read(SETTINGS_MAX_BYTES + 1)
     except OSError as exc:
-        raise RenderRefused(
-            f"cannot read the settings from standard input ({type(exc).__name__})"
-        ) from None
+        failure = type(exc).__name__
+    raise RenderRefused(f"cannot read the settings from standard input ({failure})")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

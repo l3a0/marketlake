@@ -612,3 +612,74 @@ run "a_cidr_with_host_bits_fails_validation" {
 
   expect_failures = [var.owner_ssh_cidr]
 }
+
+# A home address is a /32. A prefix shorter than /16 opens SSH to far more than one
+# owner, and 0.0.0.0/0 opens it to everyone.
+run "an_open_cidr_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "0.0.0.0/0"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_eight_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/8"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_fifteen_fails_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/15"
+  }
+
+  expect_failures = [var.owner_ssh_cidr]
+}
+
+run "a_slash_sixteen_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "10.0.0.0/16"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["10.0.0.0/16"])]
+    error_message = "A /16 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_twenty_four_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.0/24"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.0/24"])]
+    error_message = "A /24 does not reach the ingress rule."
+  }
+}
+
+run "a_slash_thirty_two_passes_validation" {
+  command = plan
+
+  variables {
+    owner_ssh_cidr = "203.0.113.7/32"
+  }
+
+  assert {
+    condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.7/32"])]
+    error_message = "A /32 does not reach the ingress rule."
+  }
+}
