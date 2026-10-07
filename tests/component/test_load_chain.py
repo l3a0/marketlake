@@ -37,6 +37,7 @@ test says which.
 from __future__ import annotations
 
 import json
+import os
 import random
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -66,6 +67,7 @@ from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_f
 from tests.support.config import write_config
 from tests.support.config_guard import is_protected
 from tests.support.lake import FixtureLake, sample_chains_table
+from tests.support.memory import measured
 
 # The full session and the half day. Both are real sessions on the exchange calendar,
 # though nothing in the loader reads one.
@@ -740,6 +742,29 @@ def test_an_option_close_tag_on_two_cycles_is_refused(fixture_lake: FixtureLake)
         load_chain("SPY", HALF_DAY, lake_root=root)
 
 
+@pytest.mark.parametrize("stamp", ["2026-11-27T13:15:00", None])
+def test_a_tagged_row_whose_snap_ts_names_no_instant_is_refused(
+    fixture_lake: FixtureLake, stamp: str | None
+):
+    """The close of record is one instant, and a tagged row that names none cannot join it.
+
+    The close cycle here is the put at 13:15 ET and a call whose stamp lost its offset, or
+    never had one. Counting the unreadable stamp as a second cycle would report two cycles
+    where one is broken, and dropping it would return half the close as the whole.
+    """
+    rows = [
+        {**_data("2026-11-27T18:15:00+00:00", CALL, close_tag="option_close"), "snap_ts": stamp},
+        _data("2026-11-27T18:15:00+00:00", PUT, close_tag="option_close"),
+    ]
+    fixture_lake.with_chains("SPY", HALF_DAY, sample_chains_table(rows))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+
+    with pytest.raises(LoadError, match="cannot be read as an instant") as caught:
+        load_chain("SPY", HALF_DAY, lake_root=root)
+    assert str(stamp) in str(caught.value)
+
+
 # -- the partition itself ----------------------------------------------------
 
 
@@ -864,7 +889,9 @@ class _Reads:
 
     A correct predicate returns the rows a full read would, so no assertion on a returned
     table can tell whether one happened, and a wall-clock timing is not a test. This
-    records the arguments and hands the real read through.
+    records the arguments and answers with ``pq.read_table``, which returns the rows the
+    real read returns but none of its batching, footer checks or re-raise. A test that
+    does not take the ``reads`` fixture runs the real read.
     """
 
     def __init__(self) -> None:
@@ -876,13 +903,21 @@ class _Reads:
 
     @property
     def resolve(self) -> dict:
-        """The pass that reads columns over the whole partition."""
+        """The pass that names the columns it resolves against.
+
+        A minute read names no rows, and a close-of-record read also names the rows its
+        resolution reads, which are the tagged ones and any with no ``row_kind``.
+        """
         return next(call for call in self.calls if call["columns"] is not None)
 
     @property
     def fetch(self) -> dict:
-        """The pass that reads rows, named to Parquet as a predicate."""
-        return next(call for call in self.calls if call["filters"] is not None)
+        """The pass that reads every column of the rows chosen, named to Parquet as a predicate.
+
+        It is the call that names no columns, since the close-of-record resolve pass now
+        carries a predicate too.
+        """
+        return next(call for call in self.calls if call["columns"] is None)
 
     @property
     def unrestricted(self) -> list[dict]:
@@ -1122,8 +1157,9 @@ def test_a_resolution_that_finds_nothing_says_so_rather_than_reporting_the_proje
 def test_the_read_honours_the_columns_it_is_given(fixture_lake: FixtureLake):
     """The seam records what the loader asked for, and this checks the asking is honoured.
 
-    Every other test about the two passes replaces ``_read`` with a recorder, so the real
-    body runs in none of them. A rewrite of that body that dropped the projection, such as
+    The tests above that assert what the two passes ask for replace ``_read`` with a
+    recorder, so the real body runs in none of them. The memory test below runs it. A
+    rewrite of that body that dropped the projection, such as
     a switch to ``ds.dataset(path).to_table(filter=...)``, would return the same rows and
     read the whole partition to do it. Nothing about a returned table would show it.
     """
@@ -1137,6 +1173,603 @@ def test_the_read_honours_the_columns_it_is_given(fixture_lake: FixtureLake):
     assert columns.num_rows == pq.ParquetFile(path).metadata.num_rows
     assert _snaps(filtered) == {"2026-09-14T13:30:00+00:00"}
     assert filtered.column_names == pq.read_schema(path).names
+
+    nothing = loader._read(
+        path,
+        columns=["snap_ts", "row_kind"],
+        filters=ds.field("snap_ts").isin(["2026-09-14T09:00:00+00:00"]),
+    )
+    assert nothing.num_rows == 0
+    assert nothing.schema.equals(columns.schema, check_metadata=True)
+
+
+# The memory test's session: one untagged data row per minute of the day, repeated, and the
+# close of record on two rows at the end. Compaction's default row group holds all of it, so
+# a read that decodes a kept group whole decodes every row.
+_MEMORY_MINUTES = 390
+_MEMORY_REPEATS = 512
+
+# The most Arrow memory a close-of-record read of that session may reach, in bytes. The read
+# peaked at about 4.7 MiB with batches of 8,192 rows, and at about 9.3 MiB with batches of
+# 16,384, so the bound also fixes ``loader._READ_BATCH_ROWS``.
+_CLOSE_READ_PEAK_BOUND = 8 * 2**20
+
+
+def _memory_lake(fixture_lake: FixtureLake) -> Path:
+    minutes = [
+        _data(f"2026-09-14T{13 + (m + 30) // 60:02d}:{(m + 30) % 60:02d}:00+00:00", CALL)
+        for m in range(_MEMORY_MINUTES)
+    ]
+    day = pa.concat_tables([sample_chains_table(minutes)] * _MEMORY_REPEATS)
+    close = sample_chains_table(
+        [
+            _data("2026-09-14T20:15:00+00:00", CALL, close_tag="option_close"),
+            _data("2026-09-14T20:15:00+00:00", PUT, close_tag="option_close"),
+        ]
+    )
+    fixture_lake.with_chains("SPY", FULL_DAY, pa.concat_tables([day, close]))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    return fixture_lake.build()
+
+
+def test_a_close_of_record_read_stays_inside_a_batch(fixture_lake: FixtureLake):
+    """Both passes of a close-of-record read decode a batch at a time, never a row group.
+
+    The session sits in one row group, as compaction writes a real day, and only two of
+    its rows are the close of record. A resolve pass reading its three columns over every
+    row, or a fetch decoding the kept group whole before filtering it, reaches several
+    times the bound. The real ``_read`` runs here, since the recorder the other tests use
+    replaces it.
+
+    Each proxy is installed before its read opens the file, because a proxy installed
+    afterwards counts nothing, and :func:`measured` keeps it referenced for the life of the
+    process. A whole read of the same file comes first and must exceed the bound, so a
+    pyarrow that decoded a row group lean could not leave this test passing with nothing
+    to catch. A proxy's peak cannot be reset, so the whole read gets its own.
+    """
+    root = _memory_lake(fixture_lake)
+
+    with measured() as whole:
+        pq.read_table(root / FULL_PARTITION, use_threads=False)
+    with measured() as proxy:
+        table = load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert whole.max_memory() > _CLOSE_READ_PEAK_BOUND
+    assert sorted(table.column("occ_symbol").to_pylist()) == [CALL, PUT]
+    assert proxy.max_memory() < _CLOSE_READ_PEAK_BOUND
+
+
+class _Fragment:
+    """A fragment that runs ``before`` each time it is asked to choose row groups.
+
+    A fragment made from a path opens the file only when it chooses, not when it is made.
+    """
+
+    def __init__(self, fragment, before) -> None:
+        self._fragment = fragment
+        self._before = before
+
+    def split_by_row_group(self, *args, **kwargs):
+        self._before()
+        return self._fragment.split_by_row_group(*args, **kwargs)
+
+
+def test_a_partition_replaced_mid_read_is_read_whole_from_the_file_opened(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """A filtered read chooses row groups and decodes them from one open file.
+
+    Three files hold the same session in different orders, so the close of record sits in
+    a different row group of each, as a hand-run recompaction could leave it. The partition
+    is replaced by the next of them each time the read reaches for the file: building the
+    ``ParquetFile``, making a fragment, and choosing row groups. A read holding one open
+    file gets the same rows whichever file it opened. A read that opens the path twice gets
+    one file's row-group numbers applied to another, whichever order it opens them in.
+    """
+    minutes = [_data(f"2026-09-14T14:{minute:02d}:00+00:00", CALL) for minute in range(20)]
+    close = [
+        _data("2026-09-14T20:15:00+00:00", CALL, close_tag="option_close"),
+        _data("2026-09-14T20:15:00+00:00", PUT, close_tag="option_close"),
+    ]
+    orders = [minutes + close, close + minutes, minutes[:10] + close + minutes[10:]]
+    fixture_lake.with_chains("SPY", FULL_DAY, sample_chains_table(orders[0]), row_group_size=10)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    path = root / "chains" / "ticker=SPY" / f"date={FULL_DAY}.parquet"
+    replacement = path.with_name("replacement.parquet")
+
+    reading: list[Path] = []
+    replaced: list[int] = []
+
+    def replace() -> None:
+        replaced.append(len(replaced) + 1)
+        rows = orders[len(replaced) % len(orders)]
+        pq.write_table(sample_chains_table(rows), replacement, row_group_size=10)
+        replacement.replace(path)
+
+    class ParquetFile(pq.ParquetFile):
+        def __init__(self, *args, **kwargs):
+            if reading:
+                replace()
+            super().__init__(*args, **kwargs)
+
+    class ParquetFileFormat(ds.ParquetFileFormat):
+        def make_fragment(self, *args, **kwargs):
+            fragment = super().make_fragment(*args, **kwargs)
+            if not reading:
+                return fragment
+            replace()
+            return _Fragment(fragment, replace)
+
+    real_read = loader._read
+
+    def read(at, **kwargs):
+        reading.append(at)
+        try:
+            return real_read(at, **kwargs)
+        finally:
+            reading.pop()
+
+    monkeypatch.setattr(pq, "ParquetFile", ParquetFile)
+    monkeypatch.setattr(ds, "ParquetFileFormat", ParquetFileFormat)
+    monkeypatch.setattr(loader, "_read", read)
+
+    table = load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert len(replaced) >= 3
+    assert sorted(table.column("occ_symbol").to_pylist()) == [CALL, PUT]
+    assert _snaps(table) == {"2026-09-14T20:15:00+00:00"}
+
+
+def _damaged(fixture_lake: FixtureLake, damage) -> Path:
+    """The full session's lake, with ``damage`` applied to the partition's bytes."""
+    root = _lake(fixture_lake)
+    path = root / FULL_PARTITION
+    path.write_bytes(damage(path.read_bytes()))
+    return path
+
+
+def _trailing_magic(raw: bytes) -> bytes:
+    """The file's last byte flipped, so the footer no longer ends in ``PAR1``."""
+    return raw[:-1] + bytes([raw[-1] ^ 0xFF])
+
+
+def _column_name(raw: bytes) -> bytes:
+    """The footer's first copy of ``occ_symbol`` given a first byte that is not UTF-8.
+
+    The first copy is the schema's, which the reader decodes into a Python string.
+    """
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    at = raw.index(b"occ_symbol", footer)
+    return raw[:at] + bytes([raw[at] ^ 0xFF]) + raw[at + 1 :]
+
+
+def test_a_damaged_footer_names_the_partition_and_keeps_its_class(fixture_lake: FixtureLake):
+    """An error found through the open file names the file, as one found through a path does.
+
+    The 18:30 sweep prints a refused piece's class and message and no traceback, and a
+    split walk prints no ticker or day. A reader handed an open file reports damage without
+    saying which file, so the read puts the path in front of the message. Every handler
+    catches by class, so the class is the one the reader raised.
+    """
+    path = _damaged(fixture_lake, _trailing_magic)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=path.parents[2])
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert "magic bytes" in str(caught.value)
+
+
+def test_a_class_that_cannot_take_the_path_is_raised_as_it_was(fixture_lake: FixtureLake):
+    """A column name that is not UTF-8 raises ``UnicodeDecodeError``, which needs five arguments.
+
+    Building one from a message alone raises ``TypeError``, which no handler expects. So
+    this class keeps its own message, and the path goes into a note instead, where only a
+    traceback shows it.
+    """
+    path = _damaged(fixture_lake, _column_name)
+
+    with pytest.raises(UnicodeDecodeError) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=path.parents[2])
+
+    assert type(caught.value) is UnicodeDecodeError
+    assert any(str(path) in note for note in caught.value.__notes__)
+
+
+def test_a_damaged_footer_is_reported_by_the_file_and_not_by_a_buffer(
+    fixture_lake: FixtureLake,
+):
+    """The open file reaches the reader before the dataset fragment reads it.
+
+    A fragment made from an open handle reads the footer when it chooses row groups, and
+    its errors then name the source ``'<Buffer>'``, which is nothing on disk. Built after
+    the ``ParquetFile``, the fragment never meets a footer the reader has not already
+    refused, so the message carries the path alone. Only a read of every column chooses
+    row groups, which is the fetch's read. Through ``load_chain`` the resolve pass refuses
+    this footer first, so the test reads as the fetch does.
+    """
+    path = _damaged(fixture_lake, _trailing_magic)
+    tag = ds.field("close_tag").isin(["option_close"])
+    with pa.OSFile(str(path)) as handle, pytest.raises(pa.ArrowInvalid, match="'<Buffer>'"):
+        ds.ParquetFileFormat().make_fragment(handle).split_by_row_group(filter=tag)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        loader._read(path, filters=tag)
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert "'<Buffer>'" not in str(caught.value)
+    assert str(caught.value).startswith(f"{path}: ")
+
+
+def _open_on(path: Path) -> int:
+    """How many of this process's descriptors are open on ``path``'s file.
+
+    Each entry of ``/dev/fd`` is matched by device and inode through ``os.fstat``. On Linux
+    an entry is a link that ``os.readlink`` resolves to the path, but on macOS it is a
+    device node that resolves to nothing, so comparing the file's identity is what works
+    on both. An entry that closed after the listing, such as the listing's own, is skipped.
+    """
+    target = os.stat(path)
+    count = 0
+    for entry in os.listdir("/dev/fd"):
+        try:
+            opened = os.fstat(int(entry))
+        except OSError:
+            continue
+        if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino):
+            count += 1
+    return count
+
+
+def test_a_kept_exception_holds_no_partition_open(fixture_lake: FixtureLake):
+    """A failed read closes its file, even while the exception it raised is kept.
+
+    A traceback keeps the failing frame's locals alive, so a handle the read opened without
+    closing stays open as long as anyone holds the exception. A caller that collects
+    refusals, as the sweep's walks do, would then hold one descriptor per damaged read.
+    """
+    path = _damaged(fixture_lake, _trailing_magic)
+    root = path.parents[2]
+    with pa.OSFile(str(path)):
+        assert _open_on(path) == 1
+    before = _open_on(path)
+    kept = []
+
+    for _ in range(100):
+        with pytest.raises(pa.ArrowInvalid) as caught:
+            load_chain("SPY", FULL_DAY, lake_root=root)
+        kept.append(caught.value)
+
+    assert len(kept) == 100
+    assert before == 0
+    assert _open_on(path) == 0
+
+
+def _chunk_metadata(raw: bytes) -> bytes:
+    """The footer's ``occ_symbol`` column chunk with the header of its metadata field flipped.
+
+    The footer names ``occ_symbol`` first in the schema and next in the chunk's own
+    metadata, which opens with the field header ``0x1c`` and then the type's ``0x15``. A
+    reader no longer finds that field, so the chunk reads as holding no values.
+    """
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    schema_copy = raw.index(b"occ_symbol", footer)
+    chunk_copy = raw.index(b"occ_symbol", schema_copy + 1)
+    at = raw.rindex(b"\x1c\x15", footer, chunk_copy)
+    return raw[:at] + bytes([raw[at] ^ 0xFF]) + raw[at + 1 :]
+
+
+def test_a_column_that_decodes_short_refuses_the_read(fixture_lake: FixtureLake):
+    """A kept column chunk that records fewer values than its row group's rows is an error.
+
+    The damaged chunk records no values. Reading the file whole raises on the mismatch. A
+    batched read stops at the shortest column and raises nothing, so it would return the
+    close of record as an empty table. Once the decode is done, the read compares each kept
+    group's row count with the value count of every column it decoded, and names the file.
+    """
+    path = _damaged(fixture_lake, _chunk_metadata)
+    metadata = pq.ParquetFile(path).metadata
+    names = [metadata.schema.column(i).name for i in range(metadata.num_columns)]
+    assert metadata.num_row_groups == 1
+    assert metadata.row_group(0).column(names.index("occ_symbol")).num_values == 0
+    rows = metadata.num_rows
+    with pytest.raises(pa.ArrowInvalid, match="expected length"):
+        pq.read_table(path)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=path.parents[2])
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert f"row group 0 holds {rows} rows" in str(caught.value)
+    assert "its column occ_symbol holds 0 values" in str(caught.value)
+
+
+def _compact_i64(value: int) -> bytes:
+    """``value`` as Thrift's compact protocol writes a 64-bit integer: zigzag, then varint."""
+    value = (value << 1) ^ (value >> 63)
+    out = bytearray()
+    while value >= 0x80:
+        out.append(value & 0x7F | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _row_group_rows(raw: bytes, group: int, rows: int) -> bytes:
+    """The footer with row group ``group``'s ``num_rows`` written as ``rows``.
+
+    A row group's footer entry writes ``total_byte_size`` and then ``num_rows``, each
+    behind the field header ``0x16``. Matching both values finds the one group. The file's
+    own total and every column chunk's ``num_values`` keep the true count.
+    """
+    held = pq.ParquetFile(pa.BufferReader(raw)).metadata.row_group(group)
+    lead = b"\x16" + _compact_i64(held.total_byte_size) + b"\x16"
+    old, new = _compact_i64(held.num_rows), _compact_i64(rows)
+    assert len(old) == len(new)
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    assert raw.count(lead + old, footer) == 1
+    at = raw.index(lead + old, footer) + len(lead)
+    return raw[:at] + new + raw[at + len(old) :]
+
+
+@pytest.mark.parametrize(
+    ("group", "counts"), [(2, [4, 4, 3, 2]), (3, [4, 4, 4, 1])], ids=["first-kept", "last-kept"]
+)
+def test_a_row_group_whose_row_count_was_lowered_refuses_the_read(
+    fixture_lake: FixtureLake, group: int, counts: list[int]
+):
+    """A kept row group whose footer records one row too few is an error, not a short answer.
+
+    The full session is written four rows to a group, so its option close sits in the third
+    group and the fourth. Lowering either kept group's ``num_rows`` by one leaves every
+    column's ``num_values`` and the file's total as they were. Reading the file whole still
+    returns every row. A batched read decodes the group one row short and raises nothing,
+    so it would drop the call from the close of record, and a count of the rows decoded
+    agrees with the damaged field it reads. The read compares the two counts in the footer
+    once the decode is done.
+
+    The 09:30 minute keeps only the first two groups, so its read answers as before.
+    """
+    fixture_lake.with_chains("SPY", FULL_DAY, sample_chains_table(FULL_ROWS), row_group_size=4)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    path = root / FULL_PARTITION
+    opening = load_chain("SPY", FULL_DAY, "09:30", lake_root=root)
+    held = counts[group] + 1
+    path.write_bytes(_row_group_rows(path.read_bytes(), group, counts[group]))
+    metadata = pq.ParquetFile(path).metadata
+    assert [metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)] == counts
+    assert metadata.num_rows == len(FULL_ROWS)
+    assert pq.read_table(path).num_rows == len(FULL_ROWS)
+    batches = pq.ParquetFile(path).iter_batches(row_groups=[group])
+    assert sum(batch.num_rows for batch in batches) == counts[group]
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert f"row group {group} holds {counts[group]} rows by the file's metadata" in str(
+        caught.value
+    )
+    assert f"holds {held} values" in str(caught.value)
+    assert load_chain("SPY", FULL_DAY, "09:30", lake_root=root).equals(opening)
+
+
+def test_a_list_column_does_not_refuse_a_healthy_read(tmp_path: Path):
+    """A list column records a value per element, so its count is not compared with the rows.
+
+    Four rows holding six elements write ``num_values`` of 6 for the list's leaf. The lake
+    writes no list column today. A check that compared it would refuse every read of a
+    healthy file that carried one.
+    """
+    path = tmp_path / "listed.parquet"
+    pq.write_table(pa.table({"n": [1, 2, 3, 4], "l": [[1, 2, 3], [], None, [4]]}), path)
+    metadata = pq.ParquetFile(path).metadata
+    assert metadata.row_group(0).column(1).num_values == 6
+
+    table = loader._read(path, filters=ds.field("n") > 1)
+
+    assert table.column("n").to_pylist() == [2, 3, 4]
+
+
+def _tag_minimum(raw: bytes) -> bytes:
+    """The footer's minimum ``close_tag`` statistic raised from ``option_close``.
+
+    The session's tags are ``option_close`` and ``spot_close``, so the minimum is the only
+    copy of ``option_close`` in the footer. Written as ``pption_close`` it still sorts
+    below the maximum, and pruning by it rules out every row group for the close of
+    record.
+    """
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    assert raw.count(b"option_close", footer) == 1
+    at = raw.index(b"option_close", footer)
+    return raw[:at] + b"p" + raw[at + 1 :]
+
+
+def test_a_damaged_tag_statistic_refuses_rather_than_answering_empty(fixture_lake: FixtureLake):
+    """Statistics that rule out the close of record make the read raise, not return no rows.
+
+    The resolve pass reads no statistics, so it still finds the tagged rows. The fetch
+    prunes by the damaged statistic and decodes nothing. The answer's row count is then
+    compared with the resolve pass's, and the read raises. A resolve pass that pruned too
+    would refuse with ``NoOptionClose``, which records damage as a day with no close.
+    """
+    tagged = FULL_ROWS[-5:]
+    fixture_lake.with_chains("SPY", FULL_DAY, sample_chains_table(tagged))
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    path = root / FULL_PARTITION
+    path.write_bytes(_tag_minimum(path.read_bytes()))
+    assert pq.read_table(path).num_rows == len(tagged)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert "found 2 rows the answer is made of, and the fetch returned 0" in str(caught.value)
+
+
+def _snap_minimum(raw: bytes) -> bytes:
+    """The footer's minimum ``snap_ts`` statistic moved from 10:31 ET to 19:31 ET.
+
+    The full session's earliest spelling is the straddle's ``2026-09-14T10:31:00-04:00``,
+    and the footer holds it once, as the minimum. Raised past both spellings of 10:31, it
+    rules the session's only row group out of a 10:31 read.
+    """
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    old = b"2026-09-14T10:31:00-04:00"
+    assert raw.count(old, footer) == 1
+    at = raw.index(old, footer)
+    return raw[:at] + b"2026-09-14T19:31:00-04:00" + raw[at + len(old) :]
+
+
+def test_a_damaged_minute_statistic_refuses_rather_than_answering_empty(
+    fixture_lake: FixtureLake,
+):
+    """The same comparison holds a minute read to the rows its resolve pass counted.
+
+    A minute's resolve pass reads ``snap_ts`` and ``row_kind`` over the whole session with
+    no statistics, so it counts the minute's three data rows across both spellings. The
+    fetch prunes by the damaged minimum and decodes nothing.
+    """
+    path = _damaged(fixture_lake, _snap_minimum)
+    assert pq.read_table(path).num_rows == len(FULL_ROWS)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, "10:31", lake_root=path.parents[2])
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert "found 3 rows the answer is made of, and the fetch returned 0" in str(caught.value)
+
+
+def test_an_answer_holding_rows_the_resolve_pass_never_counted_is_refused(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """The comparison is an equality, so an answer holding more rows than counted refuses too.
+
+    The two passes open the partition one after the other. A hand-run recompaction or
+    restore that replaces it between them hands the fetch a file the resolve pass never
+    read, and the resolve pass's answers, such as how many absence markers explain the
+    close, then describe a different file. Here the replacement's close of record holds a
+    third contract, so the fetch returns three rows where the resolve pass counted two.
+    """
+    root = _lake(fixture_lake)
+    path = root / FULL_PARTITION
+    replacement = path.with_name("replacement.parquet")
+    extra = _data("2026-09-14T16:15:00-04:00", STRADDLE, close_tag="option_close")
+    pq.write_table(sample_chains_table([*FULL_ROWS, extra]), replacement)
+    real_read = loader._read
+
+    def read(at, **kwargs):
+        table = real_read(at, **kwargs)
+        if kwargs.get("columns") is not None:
+            replacement.replace(path)
+        return table
+
+    monkeypatch.setattr(loader, "_read", read)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert not replacement.exists()
+    assert str(caught.value).startswith(f"{path}: ")
+    assert "found 2 rows the answer is made of, and the fetch returned 3" in str(caught.value)
+
+
+def test_damage_the_read_never_decodes_refuses_nothing(fixture_lake: FixtureLake):
+    """The footer check compares only the row groups a read keeps and the columns it decodes.
+
+    The full session is written four rows to a group, and the first group's ``occ_symbol``
+    chunk records no values. The close of record's resolve pass decodes three other columns
+    in every group, and its fetch keeps only the groups that hold a close tag, so neither
+    pass decodes the damaged chunk and the close answers as it did. A check over every
+    column of every group would refuse a read that nothing in it touched.
+    """
+    fixture_lake.with_chains("SPY", FULL_DAY, sample_chains_table(FULL_ROWS), row_group_size=4)
+    fixture_lake.with_reference("schema_versions", _ledger_table())
+    root = fixture_lake.build()
+    path = root / FULL_PARTITION
+    healthy = load_chain("SPY", FULL_DAY, lake_root=root)
+    path.write_bytes(_chunk_metadata(path.read_bytes()))
+    metadata = pq.ParquetFile(path).metadata
+    names = [metadata.schema.column(i).name for i in range(metadata.num_columns)]
+    occ = names.index("occ_symbol")
+    assert metadata.row_group(0).column(occ).num_values == 0
+    for group in range(1, metadata.num_row_groups):
+        held = metadata.row_group(group)
+        assert held.column(occ).num_values == held.num_rows
+    with pytest.raises(pa.ArrowInvalid):
+        pq.read_table(path)
+
+    assert load_chain("SPY", FULL_DAY, lake_root=root).equals(healthy)
+
+
+def test_the_footer_counts_are_compared_only_after_the_decode(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """The footer's counts are read only once the kept groups have decoded.
+
+    Reading a column chunk's metadata from a footer whose level histogram is damaged
+    throws an exception nothing catches, and the process aborts. The decode reads the
+    same metadata and raises ``OSError`` instead. So the read decodes first, and a footer
+    damaged that way never reaches the comparison. An abort cannot be caught in the test's
+    own process, so this asserts the order.
+    """
+    root = _lake(fixture_lake)
+    order: list[str] = []
+    compare = loader._check_row_counts
+
+    def recording(*args, **kwargs):
+        order.append("compare")
+        return compare(*args, **kwargs)
+
+    class ParquetFile(pq.ParquetFile):
+        def iter_batches(self, *args, **kwargs):
+            order.append("decode")
+            yield from super().iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_check_row_counts", recording)
+    monkeypatch.setattr(pq, "ParquetFile", ParquetFile)
+
+    load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert order == ["decode", "compare", "decode", "compare"]
+
+
+def test_a_read_that_decodes_fewer_rows_than_its_groups_hold_is_refused(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """The rows decoded are counted after the footer's counts agree, and a short stream refuses.
+
+    No damage found so far gets past the footer's counts and still decodes short, so the
+    stream here drops the last row of its last batch itself. The read compares the rows it
+    decoded with the rows the kept groups hold, and names the file.
+    """
+    root = _lake(fixture_lake)
+    path = root / FULL_PARTITION
+
+    class ParquetFile(pq.ParquetFile):
+        def iter_batches(self, *args, **kwargs):
+            batches = list(super().iter_batches(*args, **kwargs))
+            yield from batches[:-1]
+            yield batches[-1].slice(0, batches[-1].num_rows - 1)
+
+    monkeypatch.setattr(pq, "ParquetFile", ParquetFile)
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_chain("SPY", FULL_DAY, lake_root=root)
+
+    assert str(caught.value).startswith(f"{path}: ")
+    assert (
+        f"hold {len(FULL_ROWS)} rows by the file's metadata, and {len(FULL_ROWS) - 1} decoded"
+        in str(caught.value)
+    )
 
 
 # -- resolving the lake root -------------------------------------------------

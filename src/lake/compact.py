@@ -182,6 +182,7 @@ from lake.manifest import (
     sha256_bytes,
     sha256_file,
 )
+from lake.parquet_footer import count_disagreement
 from lake.paths import (
     CHAINS,
     DATE_PREFIX,
@@ -333,10 +334,11 @@ def _footer_disagreement(reader: pq.ParquetFile, written: pa.Schema) -> str | No
        written name finds nothing.
     2. Each column chunk's physical type. A whole-table read refuses a chunk whose type
        disagrees with the schema, and a filtered read, which decodes the chunk's
-       statistics by that type, hangs on it.
-    3. Each column chunk's value count. A whole-table read, the loader's included, sizes
-       each column by it, so a count that disagrees with its row group refuses the
-       partition there.
+       statistics by that type, can hang on it or abort the process.
+    3. Each column chunk's value count. A whole-table read sizes each column by it, so a
+       count that disagrees with its row group refuses the partition there. The loader's
+       filtered read decodes in batches and trusts the count, so it checks the same rule
+       after its decode, and the rule lives in ``lake.parquet_footer``, which both call.
 
     All three are metadata, so checking them decodes nothing. The chunk's statistics are
     never read here, because reading them from a chunk with the wrong type aborts the
@@ -354,11 +356,13 @@ def _footer_disagreement(reader: pq.ParquetFile, written: pa.Schema) -> str | No
                     f"row group {i} stores {column.path_in_schema} as "
                     f"{column.physical_type}, but the schema says {leaf.physical_type}"
                 )
-            # A leaf with no repetition holds one value per row, null or not.
-            if not leaf.max_repetition_level and column.num_values != group.num_rows:
+            # Checked one chunk at a time, after its physical type, so a footer that
+            # breaks both rules in different chunks names the same one it always did.
+            disagreement = count_disagreement(metadata, [i], [j])
+            if disagreement is not None:
                 return (
-                    f"row group {i} declares {column.num_values} values in "
-                    f"{column.path_in_schema} for {group.num_rows} rows"
+                    f"row group {i} declares {disagreement.values} values in "
+                    f"{column.path_in_schema} for {disagreement.rows} rows"
                 )
     return None
 
