@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import traceback
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from botocore.exceptions import (
@@ -32,8 +33,9 @@ from lake.aws_session import (
     build_client,
     source_from_bucket_credentials,
 )
-from lake.bucket import client_from_config
-from lake.config import Config, ConfigError, Secret, require_bucket_settings
+from lake.bucket import client_from_config, live_check
+from lake.config import BucketTarget, Config, ConfigError, Secret, require_bucket_settings
+from tests.support.bucket import FakeS3
 from tests.support.clock import ManualClock
 
 ACCOUNT_ID = "111122223333"
@@ -401,3 +403,120 @@ def test_a_build_on_a_key_pair_still_takes_no_sts():
         client_config={},
     )
     assert client._request_signer._credentials.access_key == COMMAND_KEY_ID
+
+
+# What the PR #744 mutation lens found the suite did not hold. Each test below failed
+# under a mutant that every other test let through.
+
+
+@pytest.mark.parametrize("source", ["keys", "instance_profile"])
+def test_a_malformed_role_arn_does_not_refuse_another_credential_path(source):
+    # A stale bucket_role_arn left in the file must not refuse the keys rollback or the
+    # VM's instance profile, whose token pull shares this check.
+    extra = (
+        {"bucket_access_key_id": "AKIDOLD", "bucket_secret_access_key": "old"}
+        if source == "keys"
+        else {"command_access_key_id": None, "command_secret_access_key": None}
+    )
+    require_bucket_settings(_config(bucket_credentials=source, bucket_role_arn="garbage", **extra))
+
+
+@pytest.mark.parametrize(
+    "arn", [f"{BUCKET_ROLE} trailing words", f"{BUCKET_ROLE}\nsecond line", f"x{BUCKET_ROLE}"]
+)
+def test_a_role_arn_with_text_around_it_is_refused(arn):
+    with pytest.raises(ConfigError):
+        require_bucket_settings(_config(bucket_role_arn=arn))
+    problems = token_store.credential_problems(
+        _config(token_store_role_arn=arn, token_store_region="us-east-1")
+    )
+    assert problems and "token_store_role_arn" in problems[0]
+
+
+def test_a_padded_role_arn_loads_stripped():
+    config = _config(bucket_role_arn=f"  {BUCKET_ROLE}  ", token_store_role_arn=f" {BUCKET_ROLE} ")
+    assert config.bucket_role_arn == BUCKET_ROLE
+    assert config.token_store_role_arn == BUCKET_ROLE
+
+
+def test_the_source_refuses_a_missing_role_arn_on_its_own():
+    with pytest.raises(ConfigError) as refused:
+        source_from_bucket_credentials(_config(bucket_role_arn=None))
+    assert "bucket_role_arn" in str(refused.value)
+
+
+def test_an_answer_missing_a_value_is_a_refusal():
+    with pytest.raises(_AssumeRoleFailed) as failed:
+        _refresh(_answer(NOW + timedelta(hours=1), SessionToken=""))()
+    assert failed.value.transient is False
+
+
+def test_a_428_is_a_refusal():
+    with pytest.raises(_AssumeRoleFailed) as failed:
+        _refresh(_sts_error("Unknown", 428))()
+    assert failed.value.transient is False
+
+
+def test_the_sts_client_signs_with_the_command_secret():
+    # The loopback STS never verifies a signature, so a swapped secret would pass every
+    # request there and fail every one in production.
+    sts = client_from_config(_config())._request_signer._credentials._refresh_using.sts
+    assert sts._request_signer._credentials.secret_key == COMMAND_SECRET
+
+
+def test_the_sts_refusal_line_names_the_policy_and_the_trust():
+    failure = token_store.PushFailed("AccessDenied", token_store.ASSUMING)
+    line = token_store.push_failure_line(Path("/t/token.json"), failure)
+    assert "STS refused" in line
+    assert "marketlake-command's policy or the role's trust does not allow it" in line
+
+
+def test_the_unknown_mode_line_names_the_token_role():
+    _, line = token_store.mode_of(_config(token_store="sideways"))
+    assert line is not None and "token_store_role_arn" in line
+
+
+LIVE = BucketTarget(bucket="lake-backup", prefix="live-check")
+
+
+def _live(client):
+    lines: list[str] = []
+    return live_check(client, LIVE, stamp="20261005T230000Z", out=lines.append), lines
+
+
+def test_the_live_check_lists_under_its_own_prefix():
+    # A listing of the whole bucket would lose the probe past the first page.
+    client = FakeS3()
+    _live(client)
+    listed = [kwargs for name, kwargs in client.calls if name == "list_objects_v2"]
+    assert listed == [
+        {"Bucket": "lake-backup", "Prefix": "live-check/live-check-20261005T230000Z/"}
+    ]
+
+
+def test_a_listing_without_the_probe_fails_grant_five():
+    class _ListsOthers(FakeS3):
+        def list_objects_v2(self, **kwargs):
+            return {"Contents": [{"Key": "live-check/other"}], "IsTruncated": False}
+
+    passed, lines = _live(_ListsOthers())
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 5 ") for line in lines)
+
+
+def test_an_error_that_is_not_aws_reaches_the_caller_from_a_grant():
+    class _Broken(FakeS3):
+        def get_bucket_versioning(self, **kwargs):
+            raise RuntimeError("bug")
+
+    with pytest.raises(RuntimeError):
+        _live(_Broken())
+
+
+def test_an_unavailable_sts_at_check_one_is_raised_before_any_line():
+    client = FakeS3()
+    client.fail_with = _AssumeRoleFailed("ServiceUnavailable", transient=True)
+    lines: list[str] = []
+    with pytest.raises(_AssumeRoleFailed):
+        live_check(client, LIVE, stamp="s", out=lines.append)
+    assert lines == []
