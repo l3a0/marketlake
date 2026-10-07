@@ -1185,19 +1185,19 @@ runs the daemon.
    needs no put, because the apply sets the `marketlake:backup-target` tag that carries
    it. In a rebuild into a fresh account, every parameter goes in before the first live
    apply, as [Create the token writer, in order](#create-the-token-writer-in-order) says.
-2. **Make the token's weekly put work before the first boot.** The token parameter is
-   already filled: the owner put `/marketlake/config/schwab-oauth-token` at version 1 on
-   2026-10-06. [#737](https://github.com/l3a0/marketlake/issues/737)'s pull requests,
+2. **Make the token's weekly put work before the first boot.** Done on 2026-10-07. The
+   owner put `/marketlake/config/schwab-oauth-token` at version 1 on 2026-10-06.
+   [#737](https://github.com/l3a0/marketlake/issues/737)'s pull requests,
    [PR #743](https://github.com/l3a0/marketlake/pull/743) and
    [PR #744](https://github.com/l3a0/marketlake/pull/744), merged on 2026-10-07, and
    [PR #743](https://github.com/l3a0/marketlake/pull/743)'s live apply ran the same day.
-   Once the laptop runs under `marketlake-command`, the re-auth's weekly put goes through
-   the role `marketlake-token-writer`, and no key for a token writer user exists. Until
-   then, the owner puts the token after each re-auth with the admin session's `file://`
-   command in [Put the values](#put-the-values). The laptop should run under
-   `marketlake-command` before the VM's first boot. Without it or the admin put, nothing
-   puts a newer token, and the VM's copy expires after its first week. The VM only pulls
-   the token, through its instance role, so
+   The laptop then moved onto `marketlake-command`, with `bucket_credentials:
+   assume_role` and `token_store: both` in its `config.yaml`, and its re-auth put version
+   2 of the token through the role `marketlake-token-writer`. So the weekly put reaches
+   the parameter with no key for a token writer user. What remains of
+   [#737](https://github.com/l3a0/marketlake/issues/737) is its step 8, deleting the old
+   users once their keys go idle, which the VM does not wait on. The VM only pulls the
+   token, through its instance role, so
    [#737](https://github.com/l3a0/marketlake/issues/737) changes nothing on the VM.
 
    The order of the merges matters.
