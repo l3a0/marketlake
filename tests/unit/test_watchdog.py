@@ -1835,3 +1835,17 @@ def test_a_dead_token_and_an_unreadable_token_file_are_one_outage():
             )
         )
     assert [page.title for page in raised] == ["Capture down: token dead"]
+
+
+def test_a_cycle_whose_every_write_failed_names_no_cause_and_does_not_raise():
+    # A full disk fails every segment write, so the cycle touches every surface through
+    # ``errors`` alone and records no class at all. The rule reads that as no cause rather
+    # than taking a class out of an empty set, and the watchdog keeps counting.
+    errors = (SegmentError("chains", "SPY", "os_error"), SegmentError("quotes", "SPY", "os_error"))
+    assert whole_daemon_cause(_cycle(errors=errors)) is None
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(_cycle(errors=errors, at=_at(minute)))
+    assert "Capture down: token dead" not in [page.title for page in raised]
+    assert watchdog.count("chains", "SPY") == 3

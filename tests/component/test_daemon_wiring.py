@@ -3410,3 +3410,52 @@ def test_a_missing_token_file_heals_on_the_cycle_after_the_pull_writes_it(tmp_pa
     assert rig.pinger.urls == [CAPTURE_URL] * 2
     # Healed inside the watchdog's threshold, so "token dead" never paged.
     assert all(message.title != "Capture down: token dead" for message in rig.transport.sent)
+
+
+def test_a_pull_that_fails_with_any_exception_costs_the_pull_and_not_the_daemon(tmp_path, capsys):
+    # ``Popen`` raises more than ``OSError``: a ``SubprocessError`` or a ``ValueError`` from
+    # a bad argument end the loop just as surely if the guard catches only the fork's class.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+
+    def refuse() -> None:
+        raise RuntimeError("no child")
+
+    rig.pulls.then(refuse)
+    ticks: list[datetime] = []
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_cycles(DEAD, DEAD),
+        hooks=daemon.DaemonHooks(on_tick=ticks.append),
+    )
+
+    assert len(ticks) == 2, "the loop died on the failed spawn"
+    err = capsys.readouterr().err.splitlines()
+    assert any(line.endswith("token pull did not start: RuntimeError") for line in err)
+
+
+def test_the_pull_line_names_its_slot_in_iso_form(tmp_path, capsys):
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=1, cycle_runner=_cycles(DEAD))
+
+    line = "capture is down on a dead token, so a token pull started"
+    assert f"daemon: 2026-09-02T10:00:00-04:00: {line}" in capsys.readouterr().err.splitlines()
+
+
+def test_the_pull_spacing_reads_slots_even_when_a_cycle_overruns(tmp_path, capsys):
+    # The spacing is measured between slots. A cycle that ran long, so the clock reads five
+    # minutes past the last pull's slot when the hook runs, is still one slot after it.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        if slot == et(2026, 9, 2, 10, 1):
+            clock.advance(5 * 60)
+        return _failing(slot, "http_401", "http_401")
+
+    _run(rig, clock, ticks=2, cycle_runner=runner)
+
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0)]

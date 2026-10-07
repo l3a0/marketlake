@@ -1639,3 +1639,25 @@ def test_main_with_no_arguments_forwards_three_unset_paths(tmp_path, monkeypatch
     assert seen["token_path"] is None
     # The topic came from the file the variable names, so ``main`` read that config.
     assert seen["transport"]._topic == NTFY_TOPIC
+
+
+def test_a_pull_line_the_stderr_refuses_costs_nothing(monkeypatch):
+    # ``_start_token_pull`` runs from ``on_cycle``, which nothing guards, so a stderr that
+    # refuses the line must not raise into the loop, on either the started or the failed path.
+    class _Refusing:
+        def write(self, text: str) -> int:
+            raise OSError(5, "Input/output error")
+
+        def flush(self) -> None:
+            raise OSError(5, "Input/output error")
+
+    slot = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
+    calls: list[list[str]] = []
+
+    def refuse(args):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(daemon.sys, "stderr", _Refusing())
+    daemon._start_token_pull(calls.append, ["pull"], slot)
+    daemon._start_token_pull(refuse, ["pull"], slot)
+    assert calls == [["pull"]]
