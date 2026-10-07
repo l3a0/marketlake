@@ -17,8 +17,9 @@ job instead.
    ``infra/``, which no configuration reads. The exclusion follows ``infra/**``, since
    GitHub's later positive match would include the file again. Running
    ``infra/ci/apply-is-stale.sh`` against a fake ``git`` shows that it compares exactly
-   the trigger's paths. A stale run skips only because the newer commit started its own
-   run, so a path the script compares and the trigger skips would strand a change.
+   the trigger's paths, in the trigger's order. A stale run skips only because the
+   newer commit started its own run, so a path the script compares and the trigger
+   skips would strand a change.
 6. ``infra/ci/apply-is-stale.sh`` is committed executable, or the freshness step fails.
 7. Every ``infra/live`` variable with no default reaches both plan steps, and each
    one's secret or repository variable is in both refusals of an empty input. A missing
@@ -153,6 +154,20 @@ esac
 """
 
 
+def _pathspec(trigger_path: str) -> str:
+    """The ``git diff`` pathspec for one trigger entry.
+
+    A directory's ``/**`` becomes the directory itself, and any other positive entry is
+    used as written. An exclusion uses git's glob magic, where ``**/`` also matches no
+    directory at all, as GitHub's ``**`` does.
+    """
+    if trigger_path.startswith("!"):
+        return f":(exclude,glob){trigger_path[1:]}"
+    if trigger_path.endswith("/**"):
+        return trigger_path.removesuffix("**")
+    return trigger_path
+
+
 def test_the_freshness_script_compares_exactly_the_paths_that_start_a_run(
     tmp_path: Path,
 ) -> None:
@@ -183,11 +198,10 @@ def test_the_freshness_script_compares_exactly_the_paths_that_start_a_run(
 
     paths = _trigger_paths("push")
     # A skip is safe only when the newer commit started its own run, so the script
-    # leaves out exactly what the trigger leaves out, under git's glob magic, where
-    # `**/` also matches no directory at all, as GitHub's `**` does.
-    excluded = [f":(exclude,glob){path[1:]}" for path in paths if path.startswith("!")]
-    assert excluded, "the trigger excludes nothing"
-    assert sorted(compared) == sorted(["infra/", ".github/workflows/infra.yml", *excluded])
+    # compares exactly the trigger's paths, in the trigger's order, since GitHub applies
+    # the patterns in turn and a later positive entry includes a file again.
+    assert any(path.startswith("!") for path in paths), "the trigger excludes nothing"
+    assert compared == [_pathspec(path) for path in paths]
     # One event alone excluding a path would start a plan with no apply, or the reverse.
     assert _trigger_paths("pull_request") == paths
     for path in paths:

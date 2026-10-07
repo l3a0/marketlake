@@ -25,10 +25,10 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    two roles: `marketlake-backup`, which reaches the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
-   applies it after a merge to `main` once the owner approves the run. Either runs only
-   when the change reaches the workflow or a file under `infra/` other than Markdown,
-   since no configuration reads Markdown. A manual run can also replace the VM, as
-   [The hosted VM](#the-hosted-vm) says.
+   applies it after a merge to `main` once the owner approves the run. Either starts on
+   its own only when the pull request or merge changes the workflow or a file under
+   `infra/` other than Markdown, since no configuration reads Markdown. A manual run can
+   also replace the VM, as [The hosted VM](#the-hosted-vm) says.
 
 The laptop also applies any change the apply role may not make, such as the backup
 bucket's versioning or a role's trust policy. A trust policy says who may assume the
@@ -1734,7 +1734,11 @@ refuses. After the home address changes, edit the `owner_ssh_cidr` line in place
 
 ## Bootstrap changes already known
 
-One open issue changes `infra/bootstrap/`.
+One open issue on the MVP 2 path changes `infra/bootstrap/`.
 [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role, and follows the
 order under [Changing the bootstrap](#changing-the-bootstrap). The issue carries its own
 scope.
+
+[#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
+also changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to
+accept a second environment, and its body gives the order for that change.

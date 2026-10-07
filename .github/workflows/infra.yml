@@ -3,8 +3,8 @@
 # No job here is named `test`, because the ruleset on main requires a check by that
 # name and ci.yml provides it. These checks download a provider of about 750 MB
 # unpacked, so they run only when this file or anything under infra/ other than Markdown
-# changes. No configuration reads a Markdown file, so a merge that changes only the
-# runbook has nothing to apply. infra/ci/apply-is-stale.sh compares the same paths.
+# changes. No configuration reads a Markdown file, so a merge that changes only Markdown
+# under infra/ has nothing to apply. infra/ci/apply-is-stale.sh compares the same paths.
 # infra/README.md carries the owner's steps and the secrets this workflow reads.
 #
 # A public repository's logs are readable by anyone, so plan and apply send their
@@ -220,7 +220,7 @@ jobs:
           state="$(infra/ci/apply-is-stale.sh)"
           echo "state=$state" >> "$GITHUB_OUTPUT"
           if [ "$state" = stale ]; then
-            echo "Skipped: a newer commit on main changes a path this workflow runs on, and its own run applies it." \
+            echo "Skipped: a newer commit on main changes a path that starts this workflow, and its own run applies it." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
