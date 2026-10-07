@@ -96,45 +96,69 @@ Backup section carries the reasoning, and
 restore. Switching back is one setting: put the path back in `backup_target`. A path target
 keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 
-The bucket and the IAM user whose key the laptop uses are code in `infra/live/`, and
+The bucket and the IAM principals the laptop signs as are code in `infra/live/`, and
 [infra/README.md](infra/README.md) says how to apply them.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
 the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
 files rewritten every night. Partitions keep every version, because with no Object Lock an overwritten
-partition's old version is its only good copy. `infra/live/iam.tf` holds the user's policy,
+partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
 which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
 `s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
 
-Two steps stay by hand on the key path, which is how the laptop signs its requests, and
-nothing here names a real account, bucket, or key. A hosted VM takes its credentials from
-an instance profile instead, and the procedure after the steps says what changes for it.
+The laptop holds one AWS key, the IAM user `marketlake-command`'s, which can do nothing but
+assume two roles: `marketlake-backup` for the bucket, and `marketlake-token-writer` for the
+token put below ([#737](https://github.com/l3a0/marketlake/issues/737)). The bucket client signs as `marketlake-backup`, with credentials
+that last an hour and refresh on their own. Two steps stay by hand, and nothing here names
+a real account, bucket, or key. A hosted VM takes its credentials from an instance profile
+instead, and the procedure after the steps says what changes for it.
 
-1. Create an access key for the user `marketlake-backup` in the AWS console. The key stays
-   out of code, so no secret reaches the infrastructure's state.
-2. Put the key in `config.yaml`, run the first upload, restore the whole lake once from
-   the bucket with the `restore` command below, and only then change `backup_target`.
+1. Create an access key for the user `marketlake-command` in the AWS console. The key stays
+   out of code, so no secret reaches the infrastructure's state. A key made minutes ago may
+   not be active yet.
+2. Put the key and the role's ARN in `config.yaml`, run the first upload, restore the whole
+   lake once from the bucket with the `restore` command below, and only then change
+   `backup_target`.
 
 The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target` ends in
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
 examples below use the placeholder bucket `example-lake-backup`.
 
-Step 2's keys in `config.yaml`. On the key path the three `bucket_` keys may sit beside a
-path `backup_target`, which is how the first upload runs before the switch.
+Read the role's ARN in your own shell, under the admin profile, and write it straight into
+the copy of `config.yaml` you are editing, so the account id it carries reaches no
+transcript or log:
+
+```bash
+aws iam get-role --role-name marketlake-backup --query Role.Arn --output text --profile marketlake-admin
+```
+
+Step 2's settings in `config.yaml`. They may sit beside a path `backup_target`, which is
+how the first upload runs before the switch. Edit the file as a copy and rename it into
+place, outside a session, because capture reloads it every minute and a half-written save
+stops capture.
 
 ```yaml
-bucket_access_key_id: <access key id>
-bucket_secret_access_key: <secret access key>
+bucket_credentials: assume_role
+command_access_key_id: <access key id>
+command_secret_access_key: <secret access key>
+bucket_role_arn: <the role's ARN>
 bucket_region: <region, like us-east-2>
 # Last, after the first upload and one restore have both passed:
 backup_target: s3://example-lake-backup/lake
 ```
 
-On the key path the client is built from those three values alone, never from
-`~/.aws/` or an `AWS_*` environment variable. Loading `config.yaml` never checks them,
-`bucket_credentials` or the bucket's name, so a mistyped value fails the backup, the
-first upload or the Sunday scrub that uses it, each with one line naming the key, and
-never stops capture.
+`bucket_credentials: keys`, which an absent key means, signs with `bucket_access_key_id`
+and `bucket_secret_access_key` instead, the key of the IAM user the laptop used before
+[#737](https://github.com/l3a0/marketlake/issues/737). Those two may stay in the file beside `assume_role`, unread, so setting `keys`
+again is the rollback.
+
+The client is built from `config.yaml` alone, never from `~/.aws/` or an `AWS_*`
+environment variable. On the assume-role path the command key signs only STS's
+`AssumeRole`, and the first request is where the role is assumed, so a refused assume
+fails that request as one line naming the command key and `bucket_role_arn`. Loading
+`config.yaml` never checks these settings, `bucket_credentials` or the bucket's name, so a
+mistyped value fails the backup, the first upload or the Sunday scrub that uses it, each
+with one line naming the key, and never stops capture.
 
 A hosted VM in the bucket's AWS account signs with short-lived credentials from an
 instance profile, an IAM role attached to the instance, so no long-lived key sits on it
@@ -143,14 +167,14 @@ two steps change as follows.
 
 1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
    profile `marketlake-instance`, whose S3 policy carries the same four actions as the
-   laptop's key and stays off until the cutover turns it on, and
+   laptop's role and stays off until the cutover turns it on, and
    [#686](https://github.com/l3a0/marketlake/issues/686) has the VM require metadata
    tokens.
 2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy
    time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s cloud-init and
    [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the parameters
    [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
-   It names the source beside the region and holds neither key field.
+   It names the source beside the region and holds no key field.
 
    ```yaml
    bucket_credentials: instance_profile
@@ -167,7 +191,7 @@ The client asks the instance metadata service for credentials only when `config.
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
 never from `~/.aws/`, an `AWS_*` variable or a boto config file, and it sends the lookup
 through no proxy. An absent
-`bucket_credentials` means `keys`, the laptop's path. A host where the setting finds no
+`bucket_credentials` means `keys`. A host where the setting finds no
 credentials, such as a VM with no instance profile or a laptop that carries the setting
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: keys` in `config.yaml`.
@@ -181,7 +205,10 @@ either.
    plan. It writes three probe objects and names the prefix to delete by hand, since the
    bucket's credentials cannot delete. They also cannot read an old version, so behavior
    3's read-back of the first version fails with them, and the check says to confirm in
-   the console that the probe key shows two versions.
+   the console that the probe key shows two versions. Three more lines prove the read
+   grants the scrub and the restore need: a `ListObjectsV2` under the probe's prefix,
+   `GetBucketVersioning`, and a plain `GetObject` of the probe. So one run covers all four
+   of the role's S3 actions, even while `backup_target` is still a path.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
    an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,
@@ -316,20 +343,29 @@ One key in each host's `config.yaml` says what the host does with the token:
 | `store` | `token.json`, then the parameter | the VM |
 
 Any other value prints one line naming it, writes `token.json`, and puts the parameter
-when the keys below allow it. The put signs with three more keys, which hold the access key
-of the IAM user that may only put this one parameter
-([#699](https://github.com/l3a0/marketlake/issues/699)). They never fall back to the
-`bucket_*` keys, whose user holds no grant to put it:
+when the keys below allow it. The put signs only as the role `marketlake-token-writer`,
+which may only put this one parameter, and the command key from the bucket section above
+assumes it ([#737](https://github.com/l3a0/marketlake/issues/737)). The put never falls back to the `bucket_*` keys. Read the role's ARN
+the way that section reads the bucket's role, straight into the copy of `config.yaml`:
+
+```bash
+aws iam get-role --role-name marketlake-token-writer --query Role.Arn --output text --profile marketlake-admin
+```
+
+`token_store_region` is the parameter's region, `us-east-1`, which the role's grant names,
+and not the bucket's:
 
 ```yaml
 token_store: both
-token_store_access_key_id: <access key id>
-token_store_secret_access_key: <secret access key>
-token_store_region: <the bucket's region>
+command_access_key_id: <access key id>
+command_secret_access_key: <secret access key>
+token_store_role_arn: <the role's ARN>
+token_store_region: us-east-1
 ```
 
 Under `both` or `store`, a missing or malformed key stops `reauth.sh` with exit 2 before the
-browser opens. A put that succeeds adds a line to the sign-off block naming the parameter's
+browser opens. Set `both` only once these keys are in place, because a refusal there costs
+the week's login until they are. A put that succeeds adds a line to the sign-off block naming the parameter's
 version number:
 
 ```text
@@ -338,14 +374,19 @@ version number:
 
 The laptop has no grant to read the parameter, so that line is the only proof at the
 terminal that it changed. Exit 3 means `token.json` was written and the parameter was not.
-Its one line names the token's path and the fix. A refused or unknown key is fixed in the
-`token_store_*` keys, and another login fails the same way until it is. Any other error is
-fixed by running `reauth.sh` again.
+Its one line names the token's path and the fix, which depends on the step that failed.
+
+1. STS refused the assume, shown as `(AssumeRole <code>)`. The command key or the role's
+   policy and trust are the fix, and a key made minutes ago may not be active yet. Another
+   login fails the same way until the assume works.
+2. SSM denied the put after a good assume. Check `token_store_role_arn` and
+   `token_store_region`, since the role's grant names the parameter in us-east-1 only.
+3. Any other error is fixed by running `reauth.sh` again.
 
 The first `both` re-auth comes before the VM's first boot, in this order:
 
-1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists,
-   and its access key is in the three `token_store_*` keys in the laptop's `config.yaml`.
+1. `marketlake-command` and the role `marketlake-token-writer` exist, and the command key,
+   `token_store_role_arn` and `token_store_region` are in the laptop's `config.yaml`.
 2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
    older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a
    word.
@@ -353,11 +394,13 @@ The first `both` re-auth comes before the VM's first boot, in this order:
    it every minute and a broken edit stops capture.
 4. Run `reauth.sh` once, and check that it printed a version number.
 
-To rotate the put-only key:
+To rotate the command key:
 
-1. Put the new key in the `token_store_*` keys.
-2. Run `reauth.sh`, and see the version line.
-3. Deactivate the old key.
+1. Create a second access key for `marketlake-command`.
+2. Put it in `command_access_key_id` and `command_secret_access_key`.
+3. Run `reauth.sh` and the bucket's `live-check`, and see both succeed.
+4. Deactivate the old key. A role session the old key already started stays valid until
+   it expires, within the hour.
 
 The VM copies the parameter with one command, run as the account that runs the daemon,
 because a run as root leaves a `token.json` the daemon cannot read:

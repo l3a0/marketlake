@@ -87,8 +87,9 @@ from lake.config import (
 from lake.paths import default_token_path
 from lake.token_epoch import epoch_second_to_utc
 
-# The parameter's name. marketlake #699 grants the VM's instance role read on it, and
-# marketlake #737 grants the token-writer role write on it, and nothing else.
+# The parameter's name. marketlake #699 grants the VM's instance role read on it.
+# marketlake #737 grants write on it to the role ``marketlake-token-writer`` alone, which
+# only ``marketlake-command``'s key may assume. Nothing else reaches it.
 PARAMETER_NAME = "/marketlake/config/schwab-oauth-token"
 
 # The standard tier's limit on a parameter's value, in bytes. ``token.json`` is about 800.
