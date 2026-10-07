@@ -30,6 +30,14 @@ What one run does, in the design's own order.
 6. The dated report file under ``reports/``.
 7. The digest, at priority 2.
 
+**The disk-runway check runs ahead of step 1**, right after the schema-version check and
+before any walk, and on a holiday too. ``lake.runway`` computes the runway and this job is
+its second consumer after the dashboard's Lake panel. Under ``runway.HEADROOM_WEEKS`` it
+files an ``action`` line, and under ``runway.PAGE_FLOOR_WEEKS`` it also pages, once per run
+and every night it stays that short, with no state kept between runs. Running first means
+the page goes out even when a later raise loses the report file, and it puts the line at
+the top of the digest, which is truncated at ``DIGEST_BYTE_CAP``. Marketlake #438.
+
 The battery is ``lake.battery``, at step 3 above. Marketlake #406 built its spine and the
 real-time entitlement check, and marketlake #407 added the other three to the same module. The
 job scopes the run to the session it is about, and trading-calendar coverage is outside that
@@ -96,6 +104,7 @@ offline in a test, with no network and no shelling out.
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -105,7 +114,7 @@ from pathlib import Path
 
 from lake import control_plane, outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
-from lake.alert import Message, Publisher, undelivered
+from lake.alert import REFUSED, Message, Publisher, undelivered
 from lake.bars import (
     CLOSE_VALUE_ABSENT,
     BackfillReport,
@@ -149,9 +158,11 @@ from lake.report import (
     write_nightly,
 )
 from lake.runner import PING_FAILURES, Pinger, escalate_ping_failure
+from lake.runway import Runway, assess
 from lake.schema_versions import check_running_version
 from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import SecurityMasterError
+from lake.session import COMPACTION_DELAY
 from lake.splits import SplitReport, detect_splits
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor
@@ -164,6 +175,21 @@ NIGHTLY_PRIORITY = 2
 
 # What a holiday no-op sends, verbatim from the design's message table.
 HOLIDAY_BODY = "Holiday, no session"
+
+# The disk-runway page's wire shape, per the design's message table. The title takes the
+# house form for a path that can lose captured minutes: a full lake volume stops compaction
+# from sealing, and the day's journal lives on the same volume. It pages at the default
+# ``alert.PAGE_PRIORITY``, which ``Message`` carries without being told.
+DISK_RUNWAY_EVENT = "sweep_disk_runway"
+DISK_RUNWAY_TITLE = "Capture at risk: lake disk runway short"
+
+# Where the page sends the operator, by heading rather than by URL: the runbook's step that
+# grows the lake volume through a reviewed pull request.
+DISK_RUNWAY_REPAIR = "infra/README.md, Rerun the bootstrap, A larger lake volume"
+
+# Bytes in a GiB. The report line and the page print GiB because the Lake panel's
+# ``bytes()`` divides by 1024, so the three surfaces print the same figure for one disk.
+_GIB = 1 << 30
 
 # The design's budget for the digest: one screen, under this many bytes. The digest carries
 # counts and the report file carries the detail, which is what makes the budget hold on a
@@ -719,6 +745,103 @@ def digest_body(nightly: Nightly) -> str:
     return encoded[:room].decode("utf-8", "ignore") + ellipsis
 
 
+def _runway_figures(runway: Runway) -> tuple[str, str]:
+    """The count and date, then the free space, the reserve and the rate, as two phrases.
+
+    Neither carries ``": "``. ``report.redacted`` keeps only the first two fields of a line
+    split on it, so a number after a second one would vanish from the report file and the
+    digest. The rate takes two places because a session is well under one GiB.
+    """
+    days = runway.capture_days_left
+    unit = "capture day" if days == 1 else "capture days"
+    filled = runway.exhausts_on.isoformat() if runway.exhausts_on is not None else "undated"
+    free = runway.free if runway.free is not None else 0
+    return (
+        f"{days} {unit} left, fills {filled}",
+        f"{free / _GIB:.1f} GiB free less a {runway.reserve / _GIB:.1f} GiB journal reserve,"
+        f" at {runway.peak / _GIB:.2f} GiB a session",
+    )
+
+
+def _page_disk_runway(publisher: Publisher, runway: Runway, *, now: datetime) -> None:
+    """Page that the runway is under the floor, and echo it to stderr.
+
+    No path, no URL and no value from the config directory, per the design's rules for
+    every body, and well under its 1,000-byte budget whatever the numbers are. The echo
+    follows ``battery.page_delayed_feed``: stderr carries the body unless the publisher
+    refused it for carrying a secret, because printing it then would undo the redaction.
+    """
+    count, space = _runway_figures(runway)
+    body = f"{count}: {space}. Grow the lake volume: {DISK_RUNWAY_REPAIR}."
+    delivery = publisher.publish(
+        Message(event=DISK_RUNWAY_EVENT, title=DISK_RUNWAY_TITLE, body=body), now=now
+    )
+    if delivery.reason == REFUSED:
+        print("sweep: disk-runway page refused: it carried a secret", file=sys.stderr)
+        return
+    print(f"sweep: {DISK_RUNWAY_TITLE}: {body}", file=sys.stderr)
+    if not delivery.sent:
+        kept = "written down" if delivery.recorded else "lost"
+        print(f"sweep: disk-runway page not sent: {delivery.reason}, {kept}", file=sys.stderr)
+
+
+def _check_disk_runway(
+    lake_root: Path,
+    *,
+    day: date,
+    now: datetime,
+    calendar: Calendar,
+    publisher: Publisher | None,
+    report: ReportLines,
+) -> None:
+    """File the runway in the nightly report when short or unreadable, and page under the floor.
+
+    The value is ``lake.runway``'s and is never recomputed here, so the panel and this line
+    read the same number off the same rule.
+
+    A reading that failed is a line rather than a pass. ``assess`` raises nothing for a bad
+    read: it names a device that would not read in ``space_error`` and counts the paths the
+    walk could not read in ``usage.refused``, and ``short`` reads False in both cases. So
+    each of those files its own ``action`` line, and so does anything ``assess`` lets
+    through. A healthy night files nothing.
+
+    The page goes through the publisher, never through ``problems``. A problem withholds the
+    ping, which healthchecks would report as missing bars, and it pages only on the
+    transition to down, so a runway that stayed short would never page again and would hide
+    a real sweep failure behind it. ``publisher`` is ``None`` only in a test, the guard
+    ``battery.judge``'s delayed-feed page carries. The page goes out every night the runway
+    stays critical: the sweep is its own process and runs once a night, so it cannot spend
+    a capture page's place under ``alert.DEFAULT_DAILY_CAP``.
+    """
+    try:
+        runway = assess(lake_root, today=day, calendar=calendar)
+        if runway.space_error is not None:
+            report.add(f"disk runway unreadable: {runway.space_error}", ACTION)
+        usage = runway.usage
+        if usage.refused > 0:
+            # Each named refusal carries its own ``": "``, so it is rewritten as
+            # ``quotes (PermissionError)`` to keep the count inside the second field.
+            named = []
+            for refusal in usage.refusals:
+                where, separator, kind = refusal.partition(": ")
+                named.append(f"{where} ({kind})" if separator else refusal)
+            more = usage.refused - len(named)
+            if more > 0:
+                named.append(f"{more} more")
+            noun = "path" if usage.refused == 1 else "paths"
+            report.add(
+                f"disk runway walk refused: {usage.refused} {noun}, {', '.join(named)}",
+                ACTION,
+            )
+        if runway.short:
+            count, space = _runway_figures(runway)
+            report.add(f"disk runway short: {count}, {space}", ACTION)
+        if runway.critical and publisher is not None:
+            _page_disk_runway(publisher, runway, now=now)
+    except Exception as exc:  # noqa: BLE001 - a runway that cannot be read must not cost the record
+        report.add(f"disk runway unreadable: {type(exc).__name__}: {exc}", ACTION)
+
+
 def _friday_wake(
     *,
     now: datetime,
@@ -860,6 +983,20 @@ def sweep(
     version_check = check_running_version(root)
     if not version_check.ok:
         report.add(version_check.summary, ACTION)
+
+    # **Marketlake #438: the disk runway**, once the day's journal has been compacted. Before
+    # then the growing journal is already missing from free space and the full journal
+    # reserve comes off as well, so a catch-up run mid-session would read 9 to 13 sessions
+    # short and could page falsely. The moment is the option close plus
+    # ``COMPACTION_DELAY``, the one compaction waits for, rather than the equity close, since
+    # a run between 16:00 and 16:30 would still read today's journal. A day with no session
+    # has no journal to wait for, and the ``not session`` arm short-circuits first because
+    # ``option_close`` refuses a non-session. Gating on ``today in usage.unsealed`` instead
+    # would silence the night a compaction failed, which is a night this check is for.
+    if not session or calendar.option_close(day) + COMPACTION_DELAY <= now:
+        _check_disk_runway(
+            root, day=day, now=now, calendar=calendar, publisher=publisher, report=report
+        )
 
     if session:
         closed = calendar.session_close(day) <= now
@@ -1323,6 +1460,9 @@ def main(
 
 __all__ = [
     "DIGEST_BYTE_CAP",
+    "DISK_RUNWAY_EVENT",
+    "DISK_RUNWAY_REPAIR",
+    "DISK_RUNWAY_TITLE",
     "HOLIDAY_BODY",
     "NIGHTLY_EVENT",
     "NIGHTLY_PRIORITY",

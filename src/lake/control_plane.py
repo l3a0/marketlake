@@ -2506,16 +2506,19 @@ def sunday_maintenance(
     page for the assertion when the daemon itself is the failure would send them to the
     wrong one.
 
-    Four duties the design gives the Sunday run are not built here. Each is named so
+    Three duties the design gives the Sunday run are not built here. Each is named so
     the gap is a decision rather than an oversight.
 
     1. Regenerate the weekday wake alarm when the machine's timezone has moved. That
        is a ``pmset`` write, so it needs the operator's sudoers grant at run time.
     2. Check ``exchange_calendars`` for a package update, per the design's provenance
        rule that the library learns schedule changes only through releases.
-    3. Check the disk runway, free space over trailing growth, and flag the nightly
-       report under a few weeks of headroom.
-    4. Rotate the logs.
+    3. Rotate the logs.
+
+    The disk-runway check was a fourth, and it moved rather than being built here. The
+    Sunday job writes no nightly report, and the weekday sweep in ``lake.sweep`` does, so
+    the sweep files the runway there every weekday evening and pages under the floor
+    (marketlake #438).
 
     Neither ``canary`` nor ``backup_target`` has a default, and for one reason. A caller
     that left either out would be told the weekend's auth check passed, or that the
