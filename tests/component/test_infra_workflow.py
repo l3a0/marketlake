@@ -24,6 +24,12 @@ plan, and ``apply`` waits for the owner's approval in ``infra`` otherwise.
 8. The validate job runs ``tofu test`` on both configurations.
 9. Both triggers watch ``infra/`` and the workflow itself.
 10. ``infra/ci/apply-is-stale.sh`` is committed executable, or the freshness step fails.
+11. Only ``apply-auto`` runs in ``infra-auto``, and only ``push``, ``pull_request`` and
+    ``workflow_dispatch`` start ``infra.yml``. A trigger that runs with ``main``'s ref
+    would reach the apply role through ``infra-auto`` with no click.
+12. Each long step in ``apply-auto`` has a timeout of its own, and their sum is below
+    the job's. A job that reaches its own timeout ends cancelled, which ``apply`` may
+    not see.
 """
 
 from __future__ import annotations
@@ -38,7 +44,8 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = ROOT / ".github" / "workflows" / "infra.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
+WORKFLOW = WORKFLOWS / "infra.yml"
 STALE_SCRIPT = "infra/ci/apply-is-stale.sh"
 FRESH = "steps.freshness.outputs.state == 'fresh'"
 APPLY_IF_SAFE = f"{FRESH} && steps.classify.outputs.verdict == 'apply'"
@@ -232,9 +239,8 @@ def test_the_change_set_goes_up_under_the_name_the_lookup_reads() -> None:
     assert member and "/" not in member
     plan = workflow["jobs"]["plan"]
     (upload,) = [step for step in plan["steps"] if "upload-artifact" in step.get("uses", "")]
-    assert upload["uses"].startswith(
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-    )
+    # Pinned to a commit, whichever one Dependabot last bumped it to.
+    assert re.fullmatch(r"actions/upload-artifact@[0-9a-f]{40}", upload["uses"])
     settings = upload["with"]
     assert (
         settings["name"]
@@ -299,3 +305,51 @@ def test_the_freshness_script_is_executable() -> None:
     ).stdout
     assert staged.split()[0] == "100755"
     assert os.access(ROOT / STALE_SCRIPT, os.X_OK)
+
+
+def _environment(job: dict[str, Any]) -> str | None:
+    """The environment a job names, written as a string or as ``{name: ...}``."""
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        return environment.get("name")
+    return environment
+
+
+def test_only_the_no_click_job_runs_in_infra_auto() -> None:
+    files = sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
+    assert WORKFLOW in files
+    named = []
+    for path in files:
+        with path.open() as f:
+            jobs = yaml.safe_load(f)["jobs"]
+        for name, job in jobs.items():
+            if "infra-auto" in str(_environment(job)):
+                named.append((path.name, name))
+    assert named == [("infra.yml", "apply-auto")]
+
+
+def test_only_push_pull_request_and_a_manual_run_start_the_workflow() -> None:
+    # pull_request_target, workflow_run and issue_comment run with main's ref, so any of
+    # them would reach the apply role through infra-auto with no click.
+    assert set(_workflow()[True]) == {"push", "pull_request", "workflow_dispatch"}
+
+
+def _long_steps(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The steps that init, plan, apply or look up the reviewed change set."""
+    return [
+        step
+        for step in job["steps"]
+        if {sub for sub, _ in _tofu_calls({"steps": [step]})} & {"init", "plan", "apply"}
+        or "infra/ci/classify.py fetch" in step.get("run", "")
+    ]
+
+
+def test_each_long_no_click_step_times_out_before_the_job_does() -> None:
+    job = _workflow()["jobs"]["apply-auto"]
+    steps = _long_steps(job)
+    assert len(steps) == 4
+    for step in steps:
+        minutes = step.get("timeout-minutes")
+        assert isinstance(minutes, int) and minutes > 0, step["name"]
+    total = sum(step.get("timeout-minutes", 0) for step in job["steps"])
+    assert total < job["timeout-minutes"]

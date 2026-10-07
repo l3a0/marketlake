@@ -578,6 +578,17 @@ gh api repos/l3a0/marketlake/environments/infra --jq '[.protection_rules[].type]
 It must still list `required_reviewers` and `branch_policy`. An unprotected environment
 named `infra` runs the same apply, and its run is just as green.
 
+Then confirm that `infra-auto` still deploys from `main` alone. The first command must
+print `["branch_policy"]`, and the second must print `["main"]`.
+
+```bash
+gh api repos/l3a0/marketlake/environments/infra-auto --jq '[.protection_rules[].type]'
+```
+
+```bash
+gh api repos/l3a0/marketlake/environments/infra-auto/deployment-branch-policies --jq '[.branch_policies[].name]'
+```
+
 A later merge that touches `infra/` or `infra.yml` while a run waits starts a newer run.
 After its approval, the older run checks `main` again, finds the newer commit, and skips
 itself as stale. The newer run applies everything, with no click or once the owner

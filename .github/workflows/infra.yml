@@ -190,7 +190,11 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A job that reaches its own limit ends cancelled, and GitHub's documentation does
+    # not say whether apply's !cancelled() is then true. So each long step below has a
+    # limit of its own, which fails the step and the job, and apply then runs. The step
+    # limits sum to less than this one, which leaves time for the steps without one.
+    timeout-minutes: 40
     # No reviewers, deploys from main only, and holds its own copy of the apply role's
     # ARN. The classifier decides whether the plan applies here.
     environment: infra-auto
@@ -250,6 +254,7 @@ jobs:
 
       - name: Initialise
         if: steps.freshness.outputs.state == 'fresh'
+        timeout-minutes: 8
         env:
           TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
         run: |
@@ -259,6 +264,7 @@ jobs:
 
       - name: Plan
         if: steps.freshness.outputs.state == 'fresh'
+        timeout-minutes: 8
         env:
           TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
           TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
@@ -277,6 +283,7 @@ jobs:
       # the job: a failure writes no file and names its reason in the summary.
       - name: Find the reviewed change set
         if: steps.freshness.outputs.state == 'fresh'
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -299,6 +306,7 @@ jobs:
       - name: Apply
         id: apply
         if: steps.freshness.outputs.state == 'fresh' && steps.classify.outputs.verdict == 'apply'
+        timeout-minutes: 8
         run: |
           tofu -chdir=infra/live apply -input=false -lock-timeout=5m \
             "$RUNNER_TEMP/live.tfplan" > /dev/null
