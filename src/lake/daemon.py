@@ -1818,7 +1818,17 @@ def run_loop_from_config(
             # class to name. One class is not recorded anywhere: ``contracts_absent``, a
             # chain that answered with no contract, which the watchdog derives and the
             # lake never carries (marketlake #326).
+            #
+            # A cause page also says since when, in ET, and ends with a line telling the
+            # operator that the ``capture`` dead-man's DOWN is coming for the same outage,
+            # as the design's message table pins for token dead and rate limited. Both key
+            # on ``since``, which only a cause page sets, and never on the class, because a
+            # per-surface page can carry ``http_401`` while the dead-man stays fed. The zone
+            # is a literal ET, since ``%Z`` prints EDT half the year. The body is plain
+            # text, so the check's name carries no backticks (marketlake #747).
             body = f"{page.minutes} session minutes without a durable cycle"
+            if page.since is not None:
+                body = f"{body} since {page.since.astimezone(MARKET_TZ).strftime('%H:%M')} ET"
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
             # A folded page says how much it folded, the rule compaction's drift page
@@ -1837,6 +1847,8 @@ def run_loop_from_config(
             if len(page.surfaces) > 1:
                 folded = "tickers" if page.sampler_collapse else "surfaces"
                 body = f"{body}, one page for {len(page.surfaces)} {folded}"
+            if page.since is not None:
+                body = f"{body}. Expect Capture dead-man is DOWN in about 5 min: same outage."
             publisher.publish(
                 Message(event="capture_down", title=page.title, body=body),
                 now=now,
