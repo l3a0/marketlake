@@ -175,9 +175,11 @@ BASELINE_LOOKBACK_DAYS = 10
 
 # How many rows each streamed read decodes at once. A batch's memory grows with this number
 # and not with the file, which is what lets a ticker-day fit the 2 GiB host (marketlake
-# #671). It is ``battery``'s entitlement batch size, measured there on SPY 2026-09-28, and
-# no separate measurement has set it for this read. Read at call time, so a test can shrink
-# it and make a small fixture span several batches.
+# #671). It is ``battery``'s entitlement batch size. Measured on the 2 GiB host under the
+# sweep's 1,135 MiB cap, on SPY's 5,340,995-row chains partition of 2026-10-02 rewritten so
+# ``extra`` carried a value on every data row, the open-gate read peaked at 347 to 352 MiB
+# of anonymous memory, where the whole read was killed at about 1.58 GiB. Read at call time,
+# so a test can shrink it and make a small fixture span several batches.
 _READ_BATCH_ROWS = 65_536
 
 
@@ -633,10 +635,12 @@ def _batches(
 
     decoded = 0
     try:
-        # ``use_threads=False`` is the entitlement read's setting, kept until a measurement
-        # on the VM chooses. Threads trade time for memory, and this read runs every night,
-        # so the choice belongs to the nightly path's wall time and peak measured at both
-        # settings, per marketlake #671.
+        # ``use_threads=False`` is the entitlement read's setting, and a measurement on the
+        # 2 GiB host kept it. With threads, the drift check over SPY and QQQ's 2026-10-02
+        # took 2.1 to 2.3 seconds against 2.8 to 2.9 on the night the gate stays shut, and
+        # SPY's open-gate read took 4.5 to 5.1 against 6.5 to 7.7. They cost 12 to 26 MiB
+        # and 41 to 71 MiB more anonymous memory on the same two reads. Saving under a
+        # second a night is not worth memory the sweep's cap is short of (marketlake #671).
         batches = source.iter_batches(
             columns=projection, batch_size=_READ_BATCH_ROWS, use_threads=False
         )
