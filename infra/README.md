@@ -422,22 +422,26 @@ gh variable set BACKUP_POLICY_NAME --body "<policy-name>" --repo l3a0/marketlake
 
 The owner's address comes from AWS's address echo service, which answers with the
 address the request came from. The command pipes it straight into the secret, so it
-never appears on screen or in shell history. The plan refuses an IPv6 address and a CIDR
-with host bits set, with a message that names no value.
+never appears on screen or in shell history. The plan refuses an IPv6 address, a CIDR
+with host bits set, and a prefix shorter than `/16`, each with a message that names no
+value. The `/16` floor keeps a pasted `0.0.0.0/0` from opening SSH to the whole internet,
+and still leaves room for a provider's range.
 
 ```bash
 printf '%s/32' "$(curl -fsS https://checkip.amazonaws.com)" | gh secret set OWNER_SSH_CIDR --repo l3a0/marketlake
 ```
 
-The VM's key pair takes a public key the laptop generates once. Skip this command when
-`~/.ssh/marketlake-vm` already exists.
+The VM's key pair takes the public half of the laptop's existing key,
+`~/.ssh/marketlake_vm.pub`, which also reaches the measurement VM. The owner set the
+variable from it on 2026-10-07. If the key does not exist, as in a rebuild on a new
+laptop, generate it first with this command.
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/marketlake-vm -C marketlake-vm
+ssh-keygen -t ed25519 -f ~/.ssh/marketlake_vm -C marketlake_vm
 ```
 
 ```bash
-gh variable set SSH_PUBLIC_KEY --body "$(cat ~/.ssh/marketlake-vm.pub)" --repo l3a0/marketlake
+gh variable set SSH_PUBLIC_KEY --body "$(cat ~/.ssh/marketlake_vm.pub)" --repo l3a0/marketlake
 ```
 
 Then check the names against what the workflow reads. This lists every secret and
@@ -603,6 +607,13 @@ from the laptop under the admin profile. Three things set this apply apart from 
 3. It must come from `main`'s head. A checkout that predates a merged change reads the
    same state and plans that change away.
 
+With no approval gate, two rules that an approval would enforce fall to the owner. Once
+the VM exists, start it if it is stopped, as in
+[Start a stopped instance](#start-a-stopped-instance), before running any plan. Never
+apply between 09:25 and 16:15 ET on a session day, the window
+[Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
+sets for CI's apply.
+
 Create a worktree at `main`'s head, from the main checkout.
 
 ```bash
@@ -754,25 +765,32 @@ at the end, unchanged. Nothing about EC2 changed.
 
 The hosted VM's `config.yaml` is written at deploy time from SSM Parameter Store, so a VM
 can be rebuilt and a secret rotated without logging in to it
-([#699](https://github.com/l3a0/marketlake/issues/699)). Six `SecureString` parameters
-sit under `/marketlake/config/`. Each one but the token is the `config.yaml` key it
-fills, written in kebab case.
+([#699](https://github.com/l3a0/marketlake/issues/699)). Five `SecureString` parameters
+sit under `/marketlake/config/`, the four secrets and the token. Each one but the token
+is the `config.yaml` key it fills, written in kebab case.
 
 1. `/marketlake/config/schwab-api-key`, for `schwab_api_key`.
 2. `/marketlake/config/schwab-app-secret`, for `schwab_app_secret`.
 3. `/marketlake/config/healthchecks-ping-key`, for `healthchecks_ping_key`.
 4. `/marketlake/config/ntfy-topic`, for `ntfy_topic`.
 5. `/marketlake/config/schwab-oauth-token`, the contents of `token.json`.
-6. `/marketlake/config/backup-target`, for `backup_target`. The owner puts the laptop's
-   own value, `s3://<backup-bucket>/lake`
-   ([#686](https://github.com/l3a0/marketlake/issues/686)). It is not a secret, but it
-   names the bucket, which no tracked file may. A `SecureString` lets the same put
-   command serve it, and changes nothing about who can read it.
+
+The VM's `backup_target` is not a parameter. It arrives as the instance tag
+`marketlake:backup-target`, which `infra/live/vm.tf` sets to `s3://<backup-bucket>/lake`
+from the bucket variable OpenTofu already holds, by the owner's decision of 2026-10-07
+([#686](https://github.com/l3a0/marketlake/issues/686)). The instance serves its tags
+through instance metadata, because `vm.tf` sets `instance_metadata_tags`, and the render
+reads the tag there. So no hand step puts the bucket's name, and a bucket change reaches
+the VM with the apply that changes the tag in place. Nothing reads a
+`/marketlake/config/backup-target` parameter, so one put before that decision is a
+leftover.
 
 `python -m lake.vm_config render < config/vm.yaml` writes the VM's `config.yaml`. It
-joins the five parameters other than the token with the tracked `config/vm.yaml`, which
+joins the four secret parameters and the tag with the tracked `config/vm.yaml`, which
 holds the settings that are not secret. The token goes to `token.json` through its own
-pull ([#636](https://github.com/l3a0/marketlake/issues/636)).
+pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A missing tag makes the
+render refuse with exit 2 and a line naming the fix in `vm.tf`. Metadata that does not
+answer gives exit 3, and any other HTTP error from it gives exit 1.
 
 The code manages no parameter and names only the path. A parameter resource needs its
 value at apply time, so CI would hold every secret, and a data source writes the
@@ -799,15 +817,18 @@ The pull request that adds the token writer changes the bootstrap too, so it fol
 3. Create an access key for `marketlake-token-writer` in the AWS console. The key goes
    into the laptop's `config.yaml` under
    [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys, and it
-   stays out of code, so no secret reaches the state.
+   stays out of code, so no secret reaches the state. The owner decided on 2026-10-06
+   that this key will not be created, and
+   [#737](https://github.com/l3a0/marketlake/issues/737) replaces this step.
 
 Never create the user by hand. The live apply creates it, and its `CreateUser` fails with
 `EntityAlreadyExists` when the user already exists.
 
-A rebuild into a fresh account puts all six values below before its first live apply,
-because that apply also creates the VM, and the VM's first boot reads them. The puts need
-only the admin session, not the token writer. A token writer's key, when one is made,
-comes after the live apply that creates the user.
+A rebuild into a fresh account puts all five values below before its first live apply,
+because that apply also creates the VM, and the VM's first boot reads them. The bucket's
+name needs no put, because the same apply sets the instance tag that carries it. The puts
+need only the admin session, not the token writer. A token writer's key, when one is
+made, comes after the live apply that creates the user.
 
 ### Put the values
 
@@ -819,7 +840,7 @@ because a parameter once put as Advanced never moves back to Standard, and
 Standard, so its puts would then fail. Each also passes `--overwrite`, so a re-run
 replaces the value instead of failing with `ParameterAlreadyExists`.
 
-Each of the four secrets and the backup target is read from the keyboard into a variable.
+Each of the four secrets is read from the keyboard into a variable.
 A value typed on the command line lands in shell history. A value kept in a file picks up
 the editor's trailing newline, and the put stores that newline as part of the secret.
 `read -rs` echoes nothing and writes nothing to disk, and `unset` drops the value after
@@ -848,13 +869,8 @@ printf 'Healthchecks ping key: '; read -rs V && echo && printf '%s' "$V" | aws s
 printf 'ntfy topic: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/ntfy-topic --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
 ```
 
-The backup target is the laptop's own `backup_target`, `s3://<backup-bucket>/lake`. The
-VM's render refuses a value that is not an `s3://` target or that has whitespace at
-either end, and keeps the VM's existing `config.yaml` when it does.
-
-```bash
-printf 'Backup target: '; read -rs V && echo && printf '%s' "$V" | aws ssm put-parameter --name /marketlake/config/backup-target --value file:///dev/stdin --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1; unset V
-```
+The backup target has no put. The instance tag in
+[The config parameters](#the-config-parameters) carries it.
 
 The token comes from its file, which `src/lake/reauth.py`'s `write_token` writes with no
 trailing newline. Skip this put when
@@ -865,7 +881,7 @@ token.
 aws ssm put-parameter --name /marketlake/config/schwab-oauth-token --value "file://$HOME/.config/marketlake/token.json" --type SecureString --tier Standard --overwrite --profile marketlake-admin --region us-east-1
 ```
 
-Optionally, check that all six landed. The listing shows each parameter's name, type
+Optionally, check that all five landed. The listing shows each parameter's name, type
 and tier, and never a value.
 
 ```bash
@@ -873,6 +889,10 @@ aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --para
 ```
 
 ### Recover from a leaked token-writer key
+
+The owner decided on 2026-10-06 that the token writer's key will not be created, and
+[#737](https://github.com/l3a0/marketlake/issues/737) replaces the step that made it. So
+this procedure applies only to a key that exists.
 
 A put can change more than the value. It can move the parameter to the Advanced tier,
 attach a parameter policy, set an allowed pattern, or store a forged token that the VM's
@@ -919,28 +939,41 @@ runs the daemon.
 
 ### The owner's steps, in order
 
-1. **Put the backup target.** Put `/marketlake/config/backup-target` beside the four
-   secrets, with its command in [Put the values](#put-the-values). The VM's render
-   refuses to write `config.yaml` without it. In a rebuild into a fresh account, every
-   parameter goes in before the first live apply, as
-   [Create the token writer, in order](#create-the-token-writer-in-order) says.
+1. **Check the five parameters.** The four secrets and the token each sit in their
+   `SecureString` parameter, with the commands in [Put the values](#put-the-values). The
+   VM's render refuses to write `config.yaml` while a secret is missing. The bucket's name
+   needs no put, because the apply sets the `marketlake:backup-target` tag that carries
+   it. In a rebuild into a fresh account, every parameter goes in before the first live
+   apply, as [Create the token writer, in order](#create-the-token-writer-in-order) says.
 2. **Make the token's weekly put work before the first boot.** The token parameter is
    already filled: the owner put `/marketlake/config/schwab-oauth-token` at version 1 on
-   2026-10-06. No key for `marketlake-token-writer` will exist, so the re-auth's weekly
-   put goes through the laptop identity that
-   [#737](https://github.com/l3a0/marketlake/issues/737) adds.
-   [#737](https://github.com/l3a0/marketlake/issues/737) merges and runs before the VM's
-   first boot. Without it nothing puts a newer token, and the VM's copy expires after its
-   first week. The VM only pulls the token, through its instance role, so
-   [#737](https://github.com/l3a0/marketlake/issues/737) changes nothing on the VM.
-3. **Set the two CI inputs before the VM's pull request is planned.** Generate the SSH
-   key, then set the `OWNER_SSH_CIDR` secret and the `SSH_PUBLIC_KEY` variable, with the
-   commands in [step 9](#9-set-the-secrets-and-the-variables). Until both are set, the
-   pull request's `plan` job refuses, and its red result waits on the owner, since `plan`
-   is not a required check. A merge with either one unset applies nothing, because the
+   2026-10-06. Once [#737](https://github.com/l3a0/marketlake/issues/737) merges, no key
+   for `marketlake-token-writer` will exist, and the re-auth's weekly put goes through the
+   laptop identity [#737](https://github.com/l3a0/marketlake/issues/737) adds. Until
+   then, the owner puts the token after each re-auth with the admin session's `file://`
+   command in [Put the values](#put-the-values).
+   [#737](https://github.com/l3a0/marketlake/issues/737) should merge and run before the
+   VM's first boot. Without it or the admin put, nothing puts a newer token, and the VM's
+   copy expires after its first week. The VM only pulls the token, through its instance
+   role, so [#737](https://github.com/l3a0/marketlake/issues/737) changes nothing on the
+   VM.
+
+   The order of the merges matters.
+   [#737](https://github.com/l3a0/marketlake/issues/737)'s infra pull request must merge
+   and apply before [PR #742](https://github.com/l3a0/marketlake/pull/742) merges. An
+   approved `infra` apply carries all of `main`, so once
+   [PR #742](https://github.com/l3a0/marketlake/pull/742) is on `main`, any approved
+   apply, [#737](https://github.com/l3a0/marketlake/issues/737)'s included, creates the
+   VM and starts its first boot.
+3. **Set the two CI inputs before the VM's pull request is planned.** The owner set the
+   `OWNER_SSH_CIDR` secret and the `SSH_PUBLIC_KEY` variable on 2026-10-07, the variable
+   from the existing `~/.ssh/marketlake_vm.pub`. A rebuild sets them with the commands
+   in [step 9](#9-set-the-secrets-and-the-variables). Until both are set, the pull
+   request's `plan` job refuses, and its red result waits on the owner, since `plan` is
+   not a required check. A merge with either one unset applies nothing, because the
    `apply` job's refusal exits before `init`. Re-running that apply after both are set
    applies. Add the same two values to the laptop's `live.tfvars`, as in
-   [the last subsection](#add-the-vms-two-lines-to-livetfvars).
+   [the last subsection](#add-the-vms-two-lines-to-livetfvars), which is still to do.
 4. **Check the account.** The account needs a default VPC with a default subnet in
    `us-east-1c`, and no key pair or security group named `marketlake-vm`.
    [The duplicate-name check](#the-duplicate-name-check) covers the names. This command
@@ -955,6 +988,17 @@ runs the daemon.
    before anything is created. The zone is a literal in the code. The measurement VM,
    `marketlake-measure`, runs in it, so the zone is known to offer `t4g.small` in this
    account.
+
+   The image lookup in `infra/live/vm.tf` names Ubuntu's images by a pattern nobody has
+   checked against Canonical's published list. Before approving the first apply, check
+   that it finds an image. The command prints the newest matching image's name.
+
+   ```bash
+   aws ec2 describe-images --owners 099720109477 --filters Name=name,Values='ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*' --query 'sort_by(Images,&CreationDate)[-1].Name' --output text --profile marketlake-admin --region us-east-1
+   ```
+
+   `None`, or an error, means the pattern matches no image. Then the plan fails at the
+   `data "aws_ami"` lookup, and the pattern in `vm.tf` needs a reviewed fix.
 5. **Approve the apply on the evening before
    [#638](https://github.com/l3a0/marketlake/issues/638)'s shadow day**, outside
    [the approval window](#replace-the-instance-and-the-approval-window). Two things set
@@ -977,8 +1021,8 @@ runs the daemon.
 
    Whether the VM keeps capturing between the shadow day and the cutover is
    [#638](https://github.com/l3a0/marketlake/issues/638)'s call.
-6. **Terminate `marketlake-measure` once the new VM runs.** It was installed by hand,
-   and the code does not import it.
+6. **Terminate `marketlake-measure` once the new VM runs.** The owner installed it by
+   hand, and the code does not import it.
 
 A home address that changes locks SSH out until an approved apply updates the rule. Set
 the secret again with step 9's command, update the line in `live.tfvars`, start a manual
@@ -988,7 +1032,14 @@ outside the window.
 ### Create the VM
 
 The approved apply of the VM's pull request creates the VM. The pull request's plan
-summary should show these six creates, and no destroy or replace.
+summary is expected to show these six creates, and no destroy or replace. This table is
+a prediction rather than an observation. The pull request's plans before 2026-10-07
+stopped at the check for empty inputs, because the two CI inputs in step 3 were not yet
+set, so check the table against the first plan that runs past it. The count comes from
+the code: the five
+resources in `vm.tf`, and the read half from the instance role's split. The
+`marketlake:backup-target` tag is an argument of `aws_instance.vm`, so it adds no
+resource.
 
 | Address | Action |
 | --- | --- |
@@ -1003,18 +1054,24 @@ The read half of the instance role's S3 policy is the one IAM change. The write 
 `s3:PutObject` alone, stays off until
 [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover turns it on.
 
-At first boot, cloud-init runs the shim that `infra/live/user-data.sh.tftpl` renders. It
-carries nothing secret, because anyone who can describe the instance can read it. The
-boot takes two steps.
+At first boot, cloud-init runs the shim that `infra/live/user-data.sh.tftpl` renders. A
+shim here is a short script whose only job is to hand over to the tracked bootstrap. It
+is the instance's `user_data`, and it carries nothing secret, because anyone who can
+describe the instance can read it. The boot takes two steps.
 
 1. The shim writes the owner and the lake volume's id to
    `/etc/marketlake/bootstrap.conf`, clones `main` into `~/marketlake` as the owner, with
    up to 10 attempts 30 seconds apart, and runs `deploy/vm-bootstrap.sh`.
 2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when two
-   checks prove it blank. It installs the `uv` version `.tool-versions` pins and runs
-   `deploy/linux-install.sh`, which starts the units. Then, holding the install lock, it
-   renders `config.yaml` from `config/vm.yaml` and the parameters, pulls the token, and
-   applies the roster.
+   checks prove it blank. It writes the volume's `/etc/fstab` line, and stops when it
+   cannot read the old file or when the new one would hold no entry for `/`. It installs
+   the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
+   times on any error, and runs `deploy/linux-install.sh`, which starts the units. Then
+   it renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
+   token, and applies the roster. It takes the install lock around each attempt of
+   these steps and releases it during the 20 seconds it waits before a retry. One attempt
+   against a metadata service that hangs holds the lock about 120 seconds, well under the
+   600 seconds another install waits for it.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
@@ -1025,7 +1082,7 @@ Read the first boot on the apply's evening. Find the address as in
 [Find the VM's address](#find-the-vms-address), then open a session from the laptop.
 
 ```bash
-ssh -i ~/.ssh/marketlake-vm ubuntu@"<vm-address>"
+ssh -i ~/.ssh/marketlake_vm ubuntu@"<vm-address>"
 ```
 
 On the VM, cloud-init's summary says `status: done` for a boot whose script exited 0.
@@ -1080,15 +1137,25 @@ work that is already done, so a second run under the same conditions changes not
 sudo ~/marketlake/deploy/vm-bootstrap.sh
 ```
 
-It exits 0 when every step passed, 1 when a step failed and 2 when it refused, with one
-line naming the step. A disk step or the install stops the run at once. A failed render,
-token pull or roster apply skips only the steps that need it, so read every line, not
-only the last.
+Each failure prints one line naming the step, and the exit code says how the run ended.
+
+1. Exit 0 means every step passed.
+2. Exit 2 means the bootstrap itself refused, which happens only before the install, such
+   as on a bad `bootstrap.conf`, a lake volume that holds something other than ext4, or
+   an `/etc/fstab` with no entry for `/`.
+3. Exit 1 covers every other failure. A disk step or the install that fails stops the
+   run at once, and the install's own refusal counts as a failure here.
+   A failed render, token pull or roster apply skips only the steps that need it, and
+   the run then ends with exit 1, even when the step itself refused with its own exit 2.
+
+So read every line, not only the last.
 
 Three things call for a rerun.
 
-1. **A parameter was missing at first boot.** The render refused, and the daemon
-   restarts every ten seconds without a `config.yaml`. Put the parameter, then rerun.
+1. **A parameter or the tag was missing at first boot.** The render refused, the
+   bootstrap ended with exit 1, and the daemon restarts every ten seconds without a
+   `config.yaml`. Put a missing parameter, or fix a missing tag in `infra/live/vm.tf`
+   through an approved apply, as the render's line says. Then rerun.
 2. **Code merged after the apply.** Nothing pulls on its own until
    [#676](https://github.com/l3a0/marketlake/issues/676). After the close, pull as the
    owner, rerun, and restart, because the install restarts nothing. Timers start fresh
@@ -1191,17 +1258,21 @@ lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of
 `deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of lake data. After the
 cutover the same VM runs `role: primary`, where emptying the lake would delete every
 minute since the last nightly upload. So it refuses, and deletes nothing, unless all
-three of these hold:
+four of these hold:
 
 1. The lake volume is the filesystem mounted at `/srv/marketlake`, proven by its UUID.
 2. The owner's `config.yaml` sets `role` to exactly `shadow`. An absent file or key
    refuses, since no `role` means primary.
 3. Every loaded `com.marketlake.*` unit is `inactive` or `failed`. A waiting timer counts
    as active.
+4. Nothing is mounted below `/srv/marketlake`. The delete stays out of a mount it meets
+   on the way down, but it would empty a mount point sitting directly in the lake root,
+   so it refuses one anywhere below it. Unmount it first.
 
-It holds the install lock across the checks and the delete, so a concurrent bootstrap
-cannot start units halfway through. It then deletes everything in the lake root except
-`lost+found`.
+It takes the install lock without waiting, and refuses when another run holds it. It
+keeps the lock across the checks and the delete, so a concurrent bootstrap cannot start
+units halfway through. It then deletes everything in the lake root except `lost+found`,
+without crossing into another filesystem.
 
 Under either role, avoid Sunday 20:00 to 23:00 ET, while the Sunday job runs
 ([#683](https://github.com/l3a0/marketlake/issues/683)). A replacement also drops
@@ -1249,7 +1320,7 @@ aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture Nam
 A new address goes in the `HostName` of the laptop's `~/.ssh/config` entry, which the
 root README's
 [Reach the dashboard on a hosted VM](../README.md#reach-the-dashboard-on-a-hosted-vm)
-shows, with `IdentityFile ~/.ssh/marketlake-vm` beside it. A replacement also brings a
+shows, with `IdentityFile ~/.ssh/marketlake_vm` beside it. A replacement also brings a
 new host key. When ssh refuses an address because a different key was seen there before,
 clear the old key with `ssh-keygen -R "<vm-address>"`.
 
@@ -1257,9 +1328,9 @@ clear the old key with `ssh-keygen -R "<vm-address>"`.
 
 The code creates a key pair and a security group, both named `marketlake-vm`. A key
 pair's name is unique in a region, and a security group's in a VPC, so one made in the
-console under the same name fails the apply at that resource. The measurement VM's key
-pair and security group were made in the console, with names recorded nowhere, so check
-before the first apply. Each command should print nothing.
+console under the same name fails the apply at that resource. The owner made the
+measurement VM's key pair and security group in the console, with names recorded nowhere,
+so check before the first apply. Each command should print nothing.
 
 ```bash
 aws ec2 describe-key-pairs --filters Name=key-name,Values=marketlake-vm --query 'KeyPairs[].KeyName' --output text --profile marketlake-admin --region us-east-1
@@ -1308,8 +1379,10 @@ Three rules go with it.
 2. **Approve it outside the window above.**
 3. **Confirm the replacement in the run's summary.** The approval comes before the job
    plans, so the summary, "Plan this run applies to infra/live", appears only as the run
-   applies, and is read once the run ends. It should list `aws_instance.vm` as `replace`,
-   with `aws_volume_attachment.lake` replaced beside it. When it lists no replacement,
+   applies. Read it once the run ends. It is expected to list `aws_instance.vm` as
+   `replace`, with `aws_volume_attachment.lake` replaced beside it. No run has shown this
+   summary yet, because no dispatch has run against a VM that exists. When
+   it lists no replacement,
    the instance was not replaced, so dispatch again.
 
 The new instance boots through the same shim. Its bootstrap finds the existing ext4
@@ -1335,7 +1408,7 @@ printf 'owner_ssh_cidr = "%s/32"\n' "$(curl -fsS https://checkip.amazonaws.com)"
 ```
 
 ```bash
-printf 'ssh_public_key = "%s"\n' "$(cat ~/.ssh/marketlake-vm.pub)" >> ~/.config/marketlake/infra/live.tfvars
+printf 'ssh_public_key = "%s"\n' "$(cat ~/.ssh/marketlake_vm.pub)" >> ~/.config/marketlake/infra/live.tfvars
 ```
 
 Run each once. A second run adds a second line for the same name, which OpenTofu

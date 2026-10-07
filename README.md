@@ -67,8 +67,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   tracked `config/vm.yaml` because it writes `config.yaml`.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
-- `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml` and
-  five SSM parameters, refusing and keeping the old file when any input is wrong.
+- `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
+  four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
+  keeping the old file when any input is wrong.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
@@ -88,8 +89,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   the lake volume, installs `uv` and the units, renders `config.yaml`, pulls the token
   and applies the roster. It is safe to run again over SSH.
 - `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
-  It refuses unless the lake volume is mounted, `role` is `shadow` and every unit is
-  stopped.
+  It refuses unless the lake volume is mounted, `role` is `shadow`, every unit is
+  stopped and nothing is mounted below the lake root.
 - `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
   and `python -m lake.roster apply` copies it onto a host.
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
@@ -171,17 +172,19 @@ two steps change as follows.
 2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy
    time, by [#686](https://github.com/l3a0/marketlake/issues/686)'s bootstrap and
    [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy, from the tracked
-   `config/vm.yaml` and the parameters
-   [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store.
-   It names the source beside the region and holds neither key field.
+   `config/vm.yaml`, the parameters
+   [#699](https://github.com/l3a0/marketlake/issues/699) keeps in SSM Parameter Store,
+   and the instance tag that names the bucket. The file names the source beside the
+   region and holds neither key field.
 
    ```yaml
    bucket_credentials: instance_profile
    bucket_region: <region, like us-east-1>
    ```
 
-3. The rest of step 2, the first upload, the restore and the `backup_target` change,
-   follows the cutover order on [#638](https://github.com/l3a0/marketlake/issues/638).
+3. The VM's `backup_target` names the bucket from its first boot, through that tag. The
+   rest of step 2, the first upload and the restore, follows the cutover order on
+   [#638](https://github.com/l3a0/marketlake/issues/638).
    Run `first-upload` only on the host whose lake the bucket should hold, because it
    replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
    IAM role's write half is turned on, since the check writes probe objects.
@@ -370,6 +373,8 @@ The first `both` re-auth comes before the VM's first boot, in this order:
 
 1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists,
    and its access key is in the three `token_store_*` keys in the laptop's `config.yaml`.
+   The owner decided on 2026-10-06 that this key will not be created, and
+   [#737](https://github.com/l3a0/marketlake/issues/737) replaces this step.
 2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
    older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a
    word.
