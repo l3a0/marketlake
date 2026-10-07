@@ -1267,21 +1267,35 @@ function cardOrder(by, planOf) {
     a.n - b.n;
 }
 
-function flightCols({ by, planOf, workOn, prOf }) {
-  const stateOf = c => ({
-    plan: planOf.get(c.n),
-    busy: workOn.get(c.n),
-    /* A finished plan behind an open blocker is not a card with no builder, it
-       is a card nobody can start. The column's test asked only whether a plan
-       existed, which the skill's own text predicted would put such a card under
-       a heading offering it to a builder, and noted that no card had reached the
-       case because every `PLANNED` entry so far carried an empty `needs`. Issue
-       138 is the first that does not. Left alone it would have read "waits on
-       #124" and "ready to build" on one card, which is check 6: a marker and a
-       position answering one question two ways. */
-    blocked: c.needs.some(b => by.has(b)),
-    pr: (prOf.get(c.n) || []).find(x => x.state === "open")
-  });
+/* The state each card is placed by. It is a function of its own so the note
+   under the columns reads the same blocked test the columns do, rather than a
+   copy of the rule that could drift from it. */
+function flightState({ by, planOf, workOn, prOf }) {
+  return c => {
+    /* marketlake: the open blockers by number, not only whether any exist,
+       because the owner's sentence names them. */
+    const waits = c.needs.filter(b => by.has(b));
+    return {
+      plan: planOf.get(c.n),
+      busy: workOn.get(c.n),
+      waits,
+      /* A finished plan behind an open blocker is not a card with no builder, it
+         is a card nobody can start. The column's test asked only whether a plan
+         existed, which the skill's own text predicted would put such a card under
+         a heading offering it to a builder, and noted that no card had reached the
+         case because every `PLANNED` entry so far carried an empty `needs`. Issue
+         138 is the first that does not. Left alone it would have read "waits on
+         #124" and "ready to build" on one card, which is check 6: a marker and a
+         position answering one question two ways. */
+      blocked: waits.length > 0,
+      pr: (prOf.get(c.n) || []).find(x => x.state === "open")
+    };
+  };
+}
+
+function flightCols(ctx) {
+  const stateOf = flightState(ctx);
+  const { by, planOf } = ctx;
   const cols = FLOW.map(() => []);
   TRACKER.forEach(c => {
     const s = stateOf(c);
@@ -1315,15 +1329,37 @@ function inFlight(ctx) {
      the stages reorders the sentence with them. An index written here by hand
      is an index that outlives the arrangement it was counted from. */
   const ns2 = cs => andlist(cs.map(c => "#" + c.n));
+  const stateOf = flightState(ctx);
   const say = {
-    /* One sentence again. This split into settled and still-running for a while,
+    /* No settled and still-running split. This sentence carried one for a while,
        which was the note coping with a column that should not have held an
        unsettled branch in the first place. `handedOver` fixed that above, so
        every card here has green checks by construction and the second half could
        only ever be empty. A note working around a wrong test is a second place
        for the rule to live, which is defect 5. */
-    owner: col => `<b>${ns2(col)} ${col.length === 1 ? "is" : "are"} yours</b>, reviewed, ` +
-      `checks green, and waiting on nothing else`,
+    /* marketlake: a reviewed, green card can still wait on an open issue, and
+       the column never asks, on purpose. Its heading says the next move is the
+       owner's, which stays true: the review can happen now, and only the merge
+       waits. So the split here is not a note working around a wrong test. It
+       says what the column deliberately leaves to the card. On 2026-10-07 issue
+       686 had PR 742 reviewed and green while it waited on issue 702, and this
+       sentence called it waiting on nothing else, which invited a merge that
+       would start an infra apply ahead of the work it depends on. */
+    owner: col => {
+      const free = col.filter(c => !stateOf(c).blocked);
+      const held = col.filter(c => stateOf(c).blocked);
+      const parts = [];
+      if (free.length) parts.push(`<b>${ns2(free)} ${free.length === 1 ? "is" : "are"} yours</b>, ` +
+        `reviewed, checks green, and waiting on nothing else`);
+      /* One clause per card, because each names its own blockers. */
+      held.forEach(c => {
+        const ws = andlist(stateOf(c).waits.map(b => "#" + b));
+        parts.push(`<b>#${c.n} is${parts.length ? " also" : ""} yours</b>, reviewed and checks green, ` +
+          `and waits on ${ws}, so it merges only after ${ws} ` +
+          `${stateOf(c).waits.length === 1 ? "closes" : "close"}`);
+      });
+      return parts.join(". ");
+    },
     /* Two different things keep a card here, and calling both "unreviewed" is
        the note contradicting the card above it, which reports the checks. So the
        reason is read per card rather than assumed. */
