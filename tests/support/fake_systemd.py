@@ -30,7 +30,9 @@ units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
 which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
-fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. The
+fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. Its
+home field is ``FAKE_GETENT_HOME`` when that is set, even to nothing, and ``FAKE_HOME``
+otherwise. The
 fake ``sudo`` clears the environment as the real one does. It keeps only ``PATH``,
 ``LOG``, ``STATE``, ``TOOLS``, every ``FAKE_*`` variable, the exit-code knobs named
 ``*_RC`` and ``*_RCS``, and the fake ``git``'s ``IS_REPO``, ``BRANCH`` and ``DIRTY``. It
@@ -278,7 +280,7 @@ exec /usr/bin/env -i "${keep[@]}" "$@"
 FAKE_GETENT = """#!/bin/bash
 printf 'getent %s\\n' "$*" >> "$LOG"
 if [[ "$1" == "passwd" && ( "$2" == "$FAKE_OWNER" || "$2" == 1000 ) ]]; then
-  echo "$FAKE_OWNER:x:1000:1000:Some One:$FAKE_HOME:/bin/bash"
+  echo "$FAKE_OWNER:x:1000:1000:Some One:${FAKE_GETENT_HOME-$FAKE_HOME}:/bin/bash"
   exit 0
 fi
 exit 2

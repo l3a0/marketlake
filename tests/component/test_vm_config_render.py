@@ -646,10 +646,13 @@ def test_the_temp_file_is_synced_before_the_rename_and_the_directory_after(
     SsmHook().install(monkeypatch)
     config_dir.mkdir(parents=True)
     events: list[tuple[str, int]] = []
+    sizes: list[int] = []
     real_fsync, real_replace = os.fsync, os.replace
 
     def fsync(fd):
-        events.append(("fsync", os.fstat(fd).st_ino))
+        info = os.fstat(fd)
+        events.append(("fsync", info.st_ino))
+        sizes.append(info.st_size)
         return real_fsync(fd)
 
     def replace(src, dst):
@@ -662,6 +665,9 @@ def test_the_temp_file_is_synced_before_the_rename_and_the_directory_after(
     assert _render(monkeypatch, _settings_bytes()) == 0
     assert [name for name, _ in events] == ["fsync", "replace", "fsync"]
     assert events[0][1] == events[1][1]
+    # The text is flushed out of Python's buffer first, or the fsync syncs an empty file.
+    written = (config_dir / CONFIG_FILE).read_bytes()
+    assert sizes[0] == len(written) > 0
     # The last sync is of the directory, so the rename itself survives a crash.
     assert events[2][1] == config_dir.stat().st_ino
 
@@ -839,12 +845,20 @@ def test_a_primary_role_is_accepted(monkeypatch, capsys, metadata, config_dir, n
     assert yaml.safe_load((config_dir / CONFIG_FILE).read_text())["role"] == "primary"
 
 
-def test_running_as_root_refuses_before_any_request(monkeypatch, capsys, metadata, config_dir):
+@pytest.mark.parametrize(
+    "payload",
+    # Settings the render would refuse too, so only a root check that runs first names root.
+    [_settings_bytes(), _settings_bytes(role="Shadow")],
+    ids=["good settings", "bad settings"],
+)
+def test_running_as_root_refuses_before_any_request(
+    monkeypatch, capsys, metadata, config_dir, payload
+):
     hook = SsmHook().install(monkeypatch)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     before = _existing(config_dir)
 
-    assert _render(monkeypatch, _settings_bytes()) == 2
+    assert _render(monkeypatch, payload) == 2
 
     assert "runs as root" in _assert_refused(capsys, config_dir, before)
     assert hook.requests == [] and metadata.requests == []
@@ -962,6 +976,20 @@ TAG_REFUSALS = {
         True,
     ),
 }
+
+
+def test_a_target_with_two_problems_names_both(monkeypatch, capsys, metadata, config_dir, not_root):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tags[TAG] = f"s3://{BUCKET.upper()}/../lake"
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    assert "backup_target names no valid bucket" in line
+    assert "backup_target has a prefix holding . or .." in line
+    assert BUCKET.upper() not in line
+    assert len(hook.requests) == 1
 
 
 @pytest.mark.parametrize(("value", "expected", "fetched"), TAG_REFUSALS.values(), ids=TAG_REFUSALS)

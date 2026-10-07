@@ -513,6 +513,9 @@ def test_the_line_is_keyed_on_the_mount_point(vm):
     vm.fstab.write_text(
         ROOT_LINE
         + f"# UUID=old {LAKE_ROOT} was the first volume\n"
+        # With no space after the #, the second field is the mount point, so only the
+        # comment rule keeps this line.
+        + f"#UUID=old {LAKE_ROOT} ext4 defaults 0 0\n"
         + f"UUID={OTHER_UUID} {LAKE_ROOT} ext4 defaults 0 2\n"
         + "/swap.img none swap sw 0 0\n"
         + f"UUID={OTHER_UUID} {LAKE_ROOT}/sub ext4 defaults 0 2\n"
@@ -522,6 +525,7 @@ def test_the_line_is_keyed_on_the_mount_point(vm):
     assert vm.fstab.read_text() == (
         ROOT_LINE
         + f"# UUID=old {LAKE_ROOT} was the first volume\n"
+        + f"#UUID=old {LAKE_ROOT} ext4 defaults 0 0\n"
         + "/swap.img none swap sw 0 0\n"
         + f"UUID={OTHER_UUID} {LAKE_ROOT}/sub ext4 defaults 0 2\n"
         + _lake_line(FAKE_UUID)
@@ -620,7 +624,14 @@ def test_uv_is_installed_when_the_version_differs(vm, installed):
         f"curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-all-errors -o {installer}"
         f" https://astral.sh/uv/{UV_VERSION}/install.sh"
     )
-    assert f"sudo -u {OWNER} -H env UV_NO_MODIFY_PATH=1 sh {installer}" in vm.calls()
+    # mktemp makes the file in the test's temporary directory, so the check below that it
+    # is empty afterwards checks something.
+    assert f"mktemp {installer}" in vm.calls()
+    assert installer.startswith(f"{vm.temp}/")
+    # mktemp makes the file 0600 and root's, so the owner reads it only after the chmod.
+    run = f"sudo -u {OWNER} -H env UV_NO_MODIFY_PATH=1 sh {installer}"
+    assert vm.index(f"chmod 0644 {installer}") < vm.index(run)
+    assert "uv-installer mode -rw-r--r--" in vm.calls()
     assert "uv-installer UV_NO_MODIFY_PATH=1" in vm.calls()
     assert vm.index("uv-installer UV_NO_MODIFY_PATH=1") < vm.index(
         f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}"
@@ -634,8 +645,38 @@ def test_a_failed_uv_download_stops_before_the_install(vm):
     proc = vm.bootstrap(CURL_RC="22")
     assert proc.returncode == 1
     assert "could not download" in _one_line(proc, "vm-bootstrap: ")
+    assert [line for line in vm.ran("mktemp ") if line.startswith(f"mktemp {vm.temp}/")]
     assert list(vm.temp.iterdir()) == []
     _assert_nothing_installed(vm, chowned=True)
+
+
+def test_a_failed_uv_installer_stops_and_leaves_no_file(vm):
+    vm.set_uv(None)
+    proc = vm.bootstrap(INSTALLER_RC="1")
+    assert proc.returncode == 1
+    assert f"the uv {UV_VERSION} installer failed" in _one_line(proc, "vm-bootstrap: ")
+    [curl] = vm.ran("curl")
+    installer = curl.split(" -o ")[1].split()[0]
+    assert installer.startswith(f"{vm.temp}/")
+    assert "uv-installer UV_NO_MODIFY_PATH=1" in vm.calls()
+    assert not Path(installer).exists()
+    assert list(vm.temp.iterdir()) == []
+    _assert_nothing_installed(vm, chowned=True)
+
+
+@pytest.mark.parametrize(
+    "pin",
+    # The second's version starts with a plain x.y.z, so only an anchored end refuses it.
+    ["python 3.12.4\n", f"uv {UV_VERSION}/../x\n"],
+    ids=["no uv line", "a version with a tail"],
+)
+def test_a_tool_versions_without_a_plain_uv_pin_is_refused(vm, pin):
+    (vm.checkout / ".tool-versions").write_text(pin)
+    proc = vm.bootstrap()
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "must pin uv as a line 'uv <x.y.z>'" in _one_line(proc, "vm-bootstrap: ")
+    assert not vm.ran("curl")
+    assert not vm.ran("linux-install")
 
 
 # -- the install, the lock and the retries ---------------------------------------------
@@ -715,6 +756,8 @@ def test_a_render_refusal_is_final_and_skips_what_reads_config(vm):
     assert not vm.ran("venv-python -m lake.token_store")
     assert not vm.ran("venv-python -m lake.roster")
     assert "the config render exited 2, which is not retried" in proc.stderr
+    skipped = "the token pull and the roster are skipped, because both read config.yaml"
+    assert f"vm-bootstrap: {skipped}" in proc.stderr.splitlines()
 
 
 def test_the_render_retries_are_bounded(vm):
@@ -766,21 +809,33 @@ def _vm_yaml(text: str):
     return lambda vm: (vm.checkout / "config" / "vm.yaml").write_text(text)
 
 
+_PRODUCTION_NOT_ROOT = {cp.INSTALL_ROOT_ENV: "", cp.INSTALL_TEST_ENV: "", "FAKE_UID": "1000"}
+_VOLUME_TWICE = f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\nLAKE_VOLUME_ID={VOLUME_ID}\n"
+_NOT_A_NAME = "must set OWNER to an account name"
+
 PREFLIGHT = [
     ("not root", lambda vm: None, {"FAKE_UID": "1000"}, "run this as root"),
+    # A production run sets neither variable, so the test-root guard must let it reach the
+    # root check, where it stops.
+    ("production, not root", lambda vm: None, _PRODUCTION_NOT_ROOT, "run this as root"),
     ("leaked root", lambda vm: None, {cp.INSTALL_TEST_ENV: ""}, "only a test may set"),
     ("no conf", lambda vm: vm.conf.unlink(), {}, "is missing"),
     ("unknown key", _conf(f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\nX=1\n"), {}, "unknown key"),
     ("no volume", _conf(f"OWNER={OWNER}\n"), {}, "LAKE_VOLUME_ID to a volume id"),
     ("bad volume", _conf(f"OWNER={OWNER}\nLAKE_VOLUME_ID=vol-XYZ\n"), {}, "volume id"),
+    ("volume with a tail", _conf(f"OWNER={OWNER}\nLAKE_VOLUME_ID=vol-0abcXYZ\n"), {}, "volume id"),
+    ("volume twice", _conf(_VOLUME_TWICE), {}, "sets LAKE_VOLUME_ID twice"),
     ("twice", _conf(f"OWNER={OWNER}\nOWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\n"), {}, "twice"),
     ("bad owner", _conf(f"OWNER=a b\nLAKE_VOLUME_ID={VOLUME_ID}\n"), {}, "account name"),
     ("no account", _conf(f"OWNER=nobody-here\nLAKE_VOLUME_ID={VOLUME_ID}\n"), {}, "no account"),
-    ("a uid", _conf(f"OWNER=1000\nLAKE_VOLUME_ID={VOLUME_ID}\n"), {}, "account name"),
+    # getent resolves 1000 too, so only the name rule prints this exact line.
+    ("a uid", _conf(f"OWNER=1000\nLAKE_VOLUME_ID={VOLUME_ID}\n"), {}, _NOT_A_NAME),
+    ("no home", lambda vm: None, {"FAKE_GETENT_HOME": ""}, "has no home directory"),
     ("not key=value", _conf("$(touch /tmp/x)\n"), {}, "not KEY=VALUE"),
     ("relative root", _vm_yaml("lake_root: srv/marketlake\n"), {}, "absolute path"),
     ("spaced root", _vm_yaml("lake_root: /srv/market lake\n"), {}, "absolute path"),
     ("dotted root", _vm_yaml("lake_root: /srv/../etc\n"), {}, ". or .."),
+    ("a dot component", _vm_yaml("lake_root: /srv/./marketlake\n"), {}, ". or .."),
     ("no root key", _vm_yaml("role: shadow\n"), {}, "could not read a lake_root"),
     ("root not a string", _vm_yaml("lake_root: [1]\n"), {}, "could not read a lake_root"),
 ]
@@ -803,6 +858,17 @@ def test_a_bad_host_is_refused_before_any_disk_step(vm, script, setup, env, mess
     calls = vm.calls()
     for tool in ("blkid", "findmnt", "mkfs", "chattr", "chown", "systemctl", "flock", "rm "):
         assert not vm.ran(tool), (tool, calls)
+    assert vm.fstab.read_text() == ROOT_LINE
+
+
+@pytest.mark.parametrize("script", [BOOTSTRAP, EMPTY], ids=lambda path: path.name)
+def test_an_argument_is_refused_before_anything_runs(vm, script):
+    vm.ext4()
+    vm.mount()
+    proc = vm.run([str(vm.checkout / "deploy" / script.name), "--help"])
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "takes no arguments" in _one_line(proc, f"{script.stem}: ")
+    assert vm.calls() == []
     assert vm.fstab.read_text() == ROOT_LINE
 
 
@@ -874,6 +940,7 @@ EMPTY_REFUSALS = [
     ("unparsable", lambda vm: _role(vm, "role: [shadow\n"), {}, "does not parse"),
     ("no role", lambda vm: _role(vm, "lake_root: /srv/marketlake\n"), {}, "sets no role"),
     ("primary", lambda vm: _role(vm, "role: primary\n"), {}, "does not set role to shadow"),
+    ("capitalised", lambda vm: _role(vm, "role: Shadow\n"), {}, "does not set role to shadow"),
     ("a list", lambda vm: _role(vm, "role: [shadow]\n"), {}, "does not set role to shadow"),
     ("a daemon", lambda vm: _start(vm, "com.marketlake.daemon.service"), {}, "not stopped"),
     ("a timer", lambda vm: _start(vm, "com.marketlake.sunday.timer"), {}, "not stopped"),
@@ -920,3 +987,31 @@ def test_a_waiting_timer_names_itself_in_the_refusal(vm):
     line = _one_line(proc, "vm-empty-shadow-lake: ")
     assert "com.marketlake.sunday.timer" in line
     assert "com.marketlake.daemon.service" not in line
+
+
+def test_no_loaded_units_lets_the_delete_proceed(vm):
+    """With no unit loaded, list-units prints nothing, which is no running unit."""
+    _shadow(vm)
+    units = vm.root / cp.SYSTEMD_UNIT_DIR.lstrip("/")
+    for unit in units.iterdir():
+        unit.unlink()
+    proc = vm.empty()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _lake_entries(vm) == ["lost+found", "lost+found/#12"]
+
+
+@pytest.mark.parametrize("script", [BOOTSTRAP, EMPTY], ids=lambda path: path.name)
+@pytest.mark.parametrize(
+    "conf",
+    [
+        f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}",
+        f"OWNER={OWNER}\n\nLAKE_VOLUME_ID={VOLUME_ID}\n",
+    ],
+    ids=["no final newline", "a blank line"],
+)
+def test_a_conf_the_parser_accepts_runs(vm, script, conf):
+    _shadow(vm)
+    vm.conf.write_text(conf)
+    proc = vm.run([str(vm.checkout / "deploy" / script.name)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.splitlines()[-1].startswith(f"{script.stem}: done")

@@ -28,7 +28,9 @@ volume with one always differs from zeros. ``FINDMNT_VERIFY_RC`` is the exit of
 whatever the knob says, so a test cannot pass against a check looser than the real one.
 ``FINDMNT_TREE_RC`` is the exit of ``findmnt -R``. ``FSTAB_SOURCE`` overrides what
 ``findmnt --fstab`` reads. ``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC``
-fail those tools. ``CAT_FAIL`` names a file
+fail those tools, and ``INSTALLER_RC`` fails the uv installer the fake ``curl`` writes. That
+installer refuses to run, as the owner would fail to read it, unless its mode lets others
+read it, and it logs the mode it found. ``CAT_FAIL`` names a file
 the fake ``cat`` fails to read, as an I/O error would make it. ``$STATE/immutable`` lists
 the directories ``chattr +i`` has marked.
 
@@ -39,6 +41,8 @@ real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, w
 Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to its line when it inherits
 an open descriptor 9, which is the one the scripts lock the install lock through, so a
 test sees a wait that holds the lock.
+``mktemp`` with no template makes its file in ``$TMPDIR``, as GNU's does and a Mac's does
+not, and logs the path it made.
 """
 
 from __future__ import annotations
@@ -191,12 +195,29 @@ version="${url#https://astral.sh/uv/}"
 version="${version%%/*}"
 # The installer the URL names, as a script that writes a uv answering that version.
 cat > "$out" <<EOF
+mode="\$(ls -ln "\$0" | cut -c1-10)"
+printf 'uv-installer mode %s\n' "\$mode" >> "\$LOG"
+case "\$mode" in
+  -??????r??) ;;
+  *) echo "sh: \$0: Permission denied" >&2; exit 126 ;;
+esac
 printf 'uv-installer UV_NO_MODIFY_PATH=%s\n' "\$UV_NO_MODIFY_PATH" >> "\$LOG"
+if [ -n "\${INSTALLER_RC:-}" ]; then exit "\$INSTALLER_RC"; fi
 mkdir -p "\$FAKE_HOME/.local/bin"
 rm -f "\$FAKE_HOME/.local/bin/uv"
 printf '#!/bin/bash\necho "uv $version (fake 2026-01-01)"\n' > "\$FAKE_HOME/.local/bin/uv"
 chmod 755 "\$FAKE_HOME/.local/bin/uv"
 EOF
+"""
+
+# mktemp with no template makes its file in $TMPDIR, as GNU's does. A Mac's ignores
+# $TMPDIR there, so a test checking the temporary directory would check nothing. The
+# path is logged, so a test can find the file whatever made it.
+FAKE_MKTEMP = r"""#!/bin/bash
+if [[ $# -eq 0 ]]; then set -- "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"; fi
+path="$(/usr/bin/mktemp "$@")" || exit $?
+printf 'mktemp %s\n' "$path" >> "$LOG"
+echo "$path"
 """
 
 FAKE_LOGGED = """#!/bin/bash
@@ -288,6 +309,7 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "chattr": FAKE_CHATTR,
         "systemd-escape": FAKE_ESCAPE,
         "curl": FAKE_CURL,
+        "mktemp": FAKE_MKTEMP,
         "chown": FAKE_LOGGED.format(name="chown", rc=0),
         "sync": FAKE_LOGGED.format(name="sync", rc=0),
         "udevadm": FAKE_LOGGED.format(name="udevadm", rc='"${UDEVADM_RC:-0}"'),

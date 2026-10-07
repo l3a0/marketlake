@@ -150,12 +150,13 @@ class Host:
     def checkout(self) -> Path:
         return self.home / "marketlake"
 
-    def run(self, **env: str) -> tuple[subprocess.CompletedProcess[str], int]:
-        """Run the shim, returning its result and the pid of the bash that ran it."""
+    def run(self, umask: int = 0o022, **env: str) -> tuple[subprocess.CompletedProcess[str], int]:
+        """Run the shim under ``umask``, returning its result and the pid of its bash."""
         proc = subprocess.Popen(
             ["/bin/bash", str(self.script)],
             env={**self.env, **env},
             cwd=self.cwd,
+            umask=umask,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -275,7 +276,8 @@ def test_the_shim_carries_only_the_owner_and_the_volume_id():
 
 
 def test_bootstrap_conf_holds_the_two_lines_before_the_clone(host):
-    proc, pid = host.run()
+    # cloud-init's umask is not promised, so the modes must not depend on it.
+    proc, pid = host.run(umask=0o077)
     _assert_handed_over(host, proc, pid)
     assert host.conf.read_text() == f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\n"
     assert host.conf.stat().st_mode & 0o777 == 0o644
@@ -294,6 +296,17 @@ def test_bootstrap_conf_is_rewritten_over_a_loose_one(host):
     _assert_handed_over(host, proc, pid)
     assert host.conf.read_text() == f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\n"
     assert host.conf.stat().st_mode & 0o777 == 0o644
+
+
+def test_a_conf_directory_that_cannot_be_made_stops_before_the_clone(host):
+    """A file where the directory goes makes the first step fail, so the shim stops there."""
+    host.conf_dir.parent.mkdir(parents=True)
+    host.conf_dir.write_text("not a directory\n")
+    proc, _ = host.run()
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert not host.ran("sudo"), host.calls()
+    assert not host.ran("vm-bootstrap"), host.calls()
+    assert host.conf_dir.read_text() == "not a directory\n"
 
 
 # -- the clone -------------------------------------------------------------------------
