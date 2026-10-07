@@ -11,8 +11,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # The whole job takes well under a minute today. This ceiling sits far above
-    # that, so it only fires on a hang, and it replaces GitHub's six-hour default.
+    # This ceiling sits far above the job's usual run time, so it only fires on a
+    # hang, and it replaces GitHub's six-hour default.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -32,5 +32,15 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check
 
-      - name: Run the test suite
+      # A pull request runs the suite across cores, and a push to main runs it in one
+      # process. pytest-xdist ignores how a worker process exits once its last test has
+      # reported, so a crash at interpreter shutdown, such as a segfault while Arrow
+      # frees memory, leaves a parallel run green where a serial run exits 139. The
+      # serial run on main is what still turns that crash red, one merge late (#746).
+      - name: Run the test suite across cores
+        if: github.event_name == 'pull_request'
+        run: uv run pytest -n auto
+
+      - name: Run the test suite in one process
+        if: github.event_name != 'pull_request'
         run: uv run pytest
