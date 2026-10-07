@@ -1738,3 +1738,5 @@ One open issue changes `infra/bootstrap/`.
 [#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role, and follows the
 order under [Changing the bootstrap](#changing-the-bootstrap). The issue carries its own
 scope.
+
+<!-- throwaway T1 for PR 762, closed unmerged -->
