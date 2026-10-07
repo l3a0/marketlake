@@ -20,20 +20,26 @@ Five decisions are worth reading before the code.
    files. It is also the tree with no pruning step, since a held finding files again
    every night it survives, so the divergence grows. ``st_blocks`` is in 512-byte units
    by POSIX convention whatever the filesystem's own block size is.
-2. **The growth rate is the busiest sealed day in the window, not the mean.** Measured
-   over the live lake, the same bytes give a runway from 2,059 days to 20,647 depending
-   only on what the rate is divided by, because capture began partway through the window
-   and the idle days before it drag any mean down. Every such error lengthens the runway,
-   and a check that flags short headroom never fires if its rate is too low. The mean over
-   sealed days that wrote bytes is reported beside the peak so a reader sees the spread.
-   A day in ``Usage.unsealed`` sets neither. It is still journal segments, uncompressed and
-   9 to 13 times the partition it becomes, whether because the session is still open or
-   because its compaction failed. Read as the busiest day and multiplied by the journal
-   reserve below, it would page every night for the whole window. Its bytes still count
-   against free space, because they are on the disk. The price is named: one anomalous
-   sealed day, a backfill or a reseal, shortens the runway and can flag or page early. A
-   false page costs an operator a look at the Lake panel, while a missed one costs the
-   disk, and a minute lost to a full disk is gone forever.
+2. **The growth rate is the busiest day's sealed bytes in the window, not the mean.**
+   Measured over the live lake, the same bytes give a runway from 2,059 days to 20,647
+   depending only on what the rate is divided by, because capture began partway through
+   the window and the idle days before it drag any mean down. Every such error lengthens
+   the runway, and a check that flags short headroom never fires if its rate is too low.
+   The mean over the days with sealed bytes is reported beside the peak so a reader sees
+   the spread. A day's sealed bytes are its dated bytes less its journal segments, which
+   ``Usage.journal_bytes`` carries. A segment is uncompressed and 9 to 13 times the
+   partition it becomes, whether because the session is still open or because compaction
+   refused it. Read as part of the busiest day and multiplied by the journal reserve
+   below, it would page every night for the whole window. Its bytes still count against
+   free space, because they are on the disk. The segments come off rather than the whole
+   day, because compaction refuses one ticker-day at a time and seals the rest. Dropping
+   every day in ``Usage.unsealed`` whole let one 4 KB leftover segment hide that day's
+   whole sealed set from the rate, and twenty such days on a full disk read no runway and
+   paged nothing. Mid-session today's sealed bytes are about zero, so today
+   does not set the rate. The price is named: one anomalous sealed day, a backfill or a
+   reseal, shortens the runway and can flag or page early. A false page costs an operator
+   a look at the Lake panel, while a missed one costs the disk, and a minute lost to a
+   full disk is gone forever.
 3. **The runway's unit is capture days, so anything in weeks or years goes through the
    calendar.** Growth happens on sessions. 2,059 capture days is 8.2 years over a
    252-session year, not the 5.6 a division by 365 would give. So the exhaustion date is
@@ -113,10 +119,10 @@ HEADROOM_WEEKS = 3
 # test has the same shape as ``short``'s: a date comparison, never a converted count.
 PAGE_FLOOR_WEEKS = 2
 
-# How many sessions of the busiest sealed day come off free space to hold a session's
-# journal before the runway is counted. Module docstring decision 5 gives the measurement:
-# the journal's peak ran 9 to 13 times the sealed day it compacts into, and this takes the
-# top of that range.
+# How many sessions of the busiest day's sealed bytes come off free space to hold a
+# session's journal before the runway is counted. Module docstring decision 5 gives the
+# measurement: the journal's peak ran 9 to 13 times the sealed day it compacts into, and
+# this takes the top of that range.
 JOURNAL_RESERVE_SESSIONS = 13
 
 # ``st_blocks`` is counted in 512-byte units by POSIX, whatever the filesystem's own
@@ -179,16 +185,18 @@ class Usage:
     against a 566 MB a day rate today, five hundredths of one percent, and nothing says
     it stays that way.
 
-    ``unsealed`` names the days some of whose bytes are still journal segments. The timing
-    file never counts toward it, since it outlives the seal on purpose, and counting it
-    would show every day since timing began as unsealed forever. A day's
+    ``unsealed`` names the days some of whose bytes are still journal segments, and
+    ``journal_bytes`` carries how many of each such day's bytes those segments are. The
+    timing file never counts toward either, since it outlives the seal on purpose, and
+    counting it would show every day since timing began as unsealed forever. A day's
     bytes are not stable: mid-session it is Arrow IPC under ``journal/date=<D>/`` and
     after close+15 it is one compressed Parquet partition, and compaction appends the
     manifest entry before it unlinks the segments, so for a moment a day is both. Both
     readings run high, which shortens the runway rather than lengthening it, so neither
     is worth engineering around. The flag is carried for two reasons. A growth figure that
     visibly drops at 16:30 needs an explanation where a reader will see it, and the rate is
-    taken over sealed days only, for the reason the module docstring's decision 2 gives.
+    taken off each day's sealed bytes, its ``day_bytes`` less its ``journal_bytes``, for
+    the reason the module docstring's decision 2 gives.
 
     ``refusals`` names what would not read, capped at ``NAMED_REFUSALS`` with
     ``refused`` holding the true count.
@@ -197,6 +205,7 @@ class Usage:
     entries: tuple[Entry, ...]
     day_bytes: Mapping[date, int]
     unsealed: frozenset[date]
+    journal_bytes: Mapping[date, int]
     dated: int
     undated: int
     files: int
@@ -208,17 +217,23 @@ class Usage:
         """Every allocated byte the walk reached, dated and undated together."""
         return self.dated + self.undated
 
+    def sealed_bytes(self, day: date) -> int:
+        """A day's bytes less its journal segments, which is what the growth rate reads."""
+        return self.day_bytes.get(day, 0) - self.journal_bytes.get(day, 0)
+
 
 @dataclass(frozen=True)
 class Runway:
     """The whole answer: the device, the lake, the rate, and how long that leaves.
 
-    ``capture_days_left`` and ``exhausts_on`` are both ``None`` when the window measured
-    no growth, which is a real case rather than an exotic one: a fresh root, a lake read
-    before its first capture day, or a window capture was down through. A rate of zero
-    renders as no runway at all and never as a large one, because a runway goes unbounded
-    exactly when capture has stopped, and a panel painting that as healthy would go quiet
-    at the one moment something is wrong.
+    ``capture_days_left`` and ``exhausts_on`` are both ``None`` when no day in the window
+    has sealed bytes, which is a real case rather than an exotic one. It covers a fresh
+    root, a lake read before its first capture day, a window capture was down through, a
+    lake's first session before close+15 seals it, and a window in which compaction refused
+    every ticker on every day. A rate of zero renders as no runway at all and never as a
+    large one. A young lake waiting on its first seal is healthy. A stopped capture and a
+    compaction that seals nothing are not, and a panel painting either as a long runway
+    would go quiet at the one moment something is wrong.
 
     ``free`` and ``capacity`` are ``None`` with ``space_error`` naming the class when the
     device would not read, which happens for a root that is not there. That is contained
@@ -234,8 +249,9 @@ class Runway:
     ``reserve`` is the journal reserve, ``JOURNAL_RESERVE_SESSIONS`` times ``peak``, which
     came off ``free`` before ``capture_days_left`` was counted. It is carried so a reader
     can see why free space and the capture-day count disagree. ``peak``, ``peak_day``,
-    ``mean`` and ``capture_days`` are read over sealed days only, while ``window_days``
-    lists every day in the window, unsealed ones included.
+    ``mean`` and ``capture_days`` are read off each day's sealed bytes, its dated bytes
+    less its journal segments. ``window_days`` lists each day's dated bytes, journal
+    included.
     """
 
     free: int | None
@@ -258,8 +274,8 @@ class Runway:
     def short(self) -> bool:
         """Whether the headroom is under ``HEADROOM_WEEKS``, which the nightly report flags.
 
-        A runway that outran the horizon is not short, and neither is one no growth was
-        measured for. Both leave ``exhausts_on`` unset, and neither is a reason to flag.
+        A runway that outran the horizon is not short, and neither is one no sealed growth
+        was measured for. Both leave ``exhausts_on`` unset, and neither is a reason to flag.
         """
         if self.exhausts_on is None:
             return False
@@ -337,6 +353,7 @@ def walk(lake_root: Path | str) -> Usage:
     entry_files: dict[str, int] = {}
     day_bytes: dict[date, int] = {}
     unsealed: set[date] = set()
+    journal_bytes: dict[date, int] = {}
     dated = undated = files = refused = 0
     refusals: list[str] = []
 
@@ -414,6 +431,7 @@ def walk(lake_root: Path | str) -> Usage:
                 day_bytes[day] = day_bytes.get(day, 0) + size
                 if entry == JOURNAL_DIR and not timing:
                     unsealed.add(day)
+                    journal_bytes[day] = journal_bytes.get(day, 0) + size
 
     entries = tuple(
         Entry(name=name, bytes=entry_bytes[name], files=entry_files[name])
@@ -423,6 +441,7 @@ def walk(lake_root: Path | str) -> Usage:
         entries=entries,
         day_bytes=dict(sorted(day_bytes.items())),
         unsealed=frozenset(unsealed),
+        journal_bytes=dict(sorted(journal_bytes.items())),
         dated=dated,
         undated=undated,
         files=files,
@@ -481,11 +500,11 @@ def assess(
     ``today`` is the caller's own session date rather than a wall-clock read, because
     nothing in this module reads a clock, the same rule the dashboard keeps.
 
-    The rate is the busiest sealed day in the window. The mean rides beside it,
-    denominated by the sealed days that actually wrote bytes rather than by the window's
-    width, because a day that captured nothing is not a day the lake grew slowly on. The
-    journal reserve comes off free space before the count, and a disk with less free space
-    than the reserve reads zero capture days rather than a negative count.
+    The rate is the busiest day's sealed bytes in the window. The mean rides beside it,
+    denominated by the days with sealed bytes rather than by the window's width, because
+    a day that captured nothing is not a day the lake grew slowly on. The journal reserve
+    comes off free space before the count, and a disk with less free space than the
+    reserve reads zero capture days rather than a negative count.
 
     Nothing here raises for a lake or a device it cannot read. Both readings report as
     values, for one reason: the caller is a panel where an escape becomes a 500 saying
@@ -504,9 +523,11 @@ def assess(
 
     start = today - timedelta(days=window_days - 1)
     window = tuple((day, size) for day, size in usage.day_bytes.items() if start <= day <= today)
-    # Sealed days only, per module docstring decision 2. An unsealed day's bytes are on the
-    # disk and already missing from ``free``, so leaving it out of the rate drops nothing.
-    capturing = [(day, size) for day, size in window if size > 0 and day not in usage.unsealed]
+    # Each day's sealed bytes, per module docstring decision 2. Its journal segments are on
+    # the disk and already missing from ``free``, so leaving them out of the rate drops
+    # nothing, while the rest of the day still counts.
+    sealed = ((day, usage.sealed_bytes(day)) for day, _size in window)
+    capturing = [(day, size) for day, size in sealed if size > 0]
     peak_day, peak = max(capturing, key=lambda item: item[1]) if capturing else (None, 0)
     mean = sum(size for _day, size in capturing) // len(capturing) if capturing else None
     reserve = JOURNAL_RESERVE_SESSIONS * peak

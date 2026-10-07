@@ -4491,9 +4491,11 @@ def test_the_growth_rate_is_the_busiest_day_and_the_mean_rides_beside_it(root: P
     # The finding the module exists around. The mean is denominated by the days that wrote
     # bytes rather than by the window's width, and the runway is taken off the peak,
     # because every way of understating the rate lengthens the runway and a check that
-    # flags short headroom never fires if its rate is too low. Both are over sealed days
-    # only: the fixture's Monday is all journal and is its largest day, which is the shape
-    # that would make the panel read short every afternoon (marketlake #438).
+    # flags short headroom never fires if its rate is too low. Both are over each day's
+    # sealed bytes: the fixture's Monday is mostly journal and is its largest day, which is
+    # the shape that would make the panel read short every afternoon (marketlake #438).
+    # Monday also carries one sealed quotes partition, and that partition still counts, so
+    # three days have sealed bytes: Thursday, Friday and Monday.
     payload = service_over(root).run_query("lake", {})
     days = payload["days"]
     assert days
@@ -4501,7 +4503,8 @@ def test_the_growth_rate_is_the_busiest_day_and_the_mean_rides_beside_it(root: P
     assert sealed
     assert payload["peak_bytes"] == max(sealed)
     assert payload["peak_bytes"] < max(day["bytes"] for day in days)
-    assert payload["capture_days"] == len(sealed)
+    assert len(sealed) == 2
+    assert payload["capture_days"] == 3
     assert payload["mean_bytes"] <= payload["peak_bytes"]
     # Thirteen sessions of the peak are the journal reserve, which comes off free first.
     assert payload["capture_days_left"] == max(
@@ -4529,8 +4532,9 @@ def test_a_journal_day_is_flagged_unsealed_on_the_panel(fixture_lake: FixtureLak
 
 
 def test_a_lake_with_no_growth_in_the_window_reports_no_runway(fixture_lake: FixtureLake):
-    # A runway goes unbounded exactly when capture has stopped, so a large number there
-    # would go quiet at the one moment something is wrong. It is also the division by zero.
+    # No sealed growth means capture stopped, compaction sealed nothing, or the lake is too
+    # young to have sealed a session. A large number there would go quiet at the one moment
+    # something is wrong in the first two. It is also the division by zero.
     root = fixture_lake.build()
     (root / "manifest.jsonl").write_text("")
     payload = service_over(root).run_query("lake", {})

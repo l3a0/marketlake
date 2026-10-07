@@ -261,10 +261,11 @@ def test_a_day_outside_the_window_sets_no_rate(tmp_path: Path, monkeypatch: pyte
 def test_no_growth_reports_no_runway_rather_than_an_unbounded_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # Reachable three ways: a fresh root, a lake read before its first capture day, and a
-    # window capture was down through. A runway goes unbounded exactly when capture has
-    # stopped, so reporting a large number there would go quiet at the one moment
-    # something is wrong. It is also the division by zero.
+    # Reachable when no day in the window has sealed bytes: a fresh root, a lake read
+    # before its first seal, a window capture was down through, and a window in which
+    # compaction refused every ticker every day. The last two are failures, so reporting a
+    # large number there would go quiet at the one moment something is wrong. It is also
+    # the division by zero.
     _write(tmp_path, "manifest.jsonl", 10)
     _stub_space(monkeypatch, free=10_000_000)
     result = assess(tmp_path, today=date(2026, 9, 17), calendar=_weekday_calendar(MONDAY, 400))
@@ -376,6 +377,7 @@ def test_the_usage_total_is_its_two_halves(tmp_path: Path):
         entries=(),
         day_bytes={},
         unsealed=frozenset(),
+        journal_bytes={},
         dated=7,
         undated=5,
         files=0,
@@ -898,39 +900,123 @@ def test_the_reserve_is_thirteen_sessions_of_the_busiest_sealed_day(
     assert result.reserve > 0
 
 
-def test_an_unsealed_day_larger_than_every_sealed_one_sets_no_rate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """A journal day is uncompressed and 9 to 13 times the partition it becomes.
+def test_a_day_that_is_all_journal_sets_no_rate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A journal segment is uncompressed and 9 to 13 times the partition it becomes.
 
-    Mid-session it is today's journal, and after a failed compaction it is a day whose
-    segments stayed behind. Read as the busiest day and multiplied by the reserve, it would
-    page every night for the whole window. So the rate is the busiest sealed day, and the
-    unsealed day is still listed in the window, because its bytes are real.
+    Mid-session it is today's journal, and after compaction refused every ticker it is a day
+    whose segments all stayed behind. Read as the busiest day and multiplied by the reserve,
+    it would page every night for the whole window. A day that is nothing but segments has
+    no sealed bytes, so it sets no rate, and it is still listed in the window, because its
+    bytes are real. Every size is a whole number of 4,096-byte blocks, so the allocated
+    bytes equal the written ones and the figures below are literals.
     """
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_000)
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 20_000)
-    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 900_000)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 40_960)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 20_480)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 901_120)
     _stub_space(monkeypatch, free=1 << 40)
     result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     sizes = dict(result.window_days)
-    assert sizes[date(2026, 9, 16)] > sizes[date(2026, 9, 14)]
+    assert sizes[date(2026, 9, 16)] == 901_120
+    assert result.usage.journal_bytes == {date(2026, 9, 16): 901_120}
     assert result.peak_day == date(2026, 9, 14)
-    assert result.peak == sizes[date(2026, 9, 14)]
+    assert result.peak == 40_960
     assert result.capture_days == 2
-    assert result.mean is not None and result.mean <= result.peak
+    assert result.mean == 30_720
 
 
 def test_a_sealed_day_still_sets_the_rate_beside_an_unsealed_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # The other side: the filter drops the journal day and nothing else, so a sealed day
-    # larger than the journal is still the peak.
-    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 900_000)
-    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 40_000)
+    # The other side: the segments come off and nothing else, so a sealed day larger than
+    # the journal is still the peak.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 901_120)
+    _write(tmp_path, "journal/date=2026-09-16/surface=chains/ticker=SPY/seg-a.arrows", 40_960)
     _stub_space(monkeypatch, free=1 << 40)
     result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
     assert result.peak_day == date(2026, 9, 14)
+    assert result.peak == 901_120
+
+
+def test_a_leftover_segment_leaves_its_days_sealed_bytes_in_the_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Compaction refuses one ticker-day at a time and seals the rest.
+
+    So a day can carry a whole sealed set beside one small segment compaction left behind.
+    Dropping every such day from the rate read twenty weekdays of 602,112 sealed bytes, each
+    beside a 4,096-byte leftover segment, as no growth at all. On a full disk that was no
+    runway, not short, not critical, and no page. Taking each day's sealed bytes instead
+    gives the 602,112-byte rate, so a full disk fills today and pages, and one with sixteen
+    sessions past the reserve does neither.
+    """
+    day = MONDAY
+    written = 0
+    while written < 20:
+        if day.weekday() < 5:
+            _write(tmp_path, f"chains/ticker=SPY/date={day.isoformat()}.parquet", 602_112)
+            _write(
+                tmp_path,
+                f"journal/date={day.isoformat()}/surface=chains/ticker=QQQ/seg-a.arrows",
+                4_096,
+            )
+            written += 1
+        day += timedelta(days=1)
+    today = date(2026, 10, 9)
+    calendar = _weekday_calendar(MONDAY, 400)
+
+    _stub_space(monkeypatch, free=0)
+    full = assess(tmp_path, today=today, calendar=calendar)
+    assert len(full.usage.unsealed) == 20
+    assert full.peak == 602_112
+    assert full.mean == 602_112
+    assert full.capture_days == 20
+    assert full.reserve == 7_827_456
+    assert full.capture_days_left == 0
+    assert full.exhausts_on == today
+    assert full.short is True
+    assert full.critical is True
+
+    _stub_space(monkeypatch, free=602_112 * (16 + 13))
+    roomy = assess(tmp_path, today=today, calendar=calendar)
+    assert roomy.capture_days_left == 16
+    assert roomy.short is False
+    assert roomy.critical is False
+
+
+def test_the_busiest_day_sets_the_peak_at_its_sealed_size_beside_a_leftover_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The busiest day is the one carrying the leftover. Dropping it whole would hand the
+    # peak to the next day down, 200,704 bytes, and counting the segment would read
+    # 405,504. Its sealed bytes are 401,408, and that is the peak.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-14.parquet", 200_704)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 401_408)
+    _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-16.parquet", 102_400)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert dict(result.window_days)[date(2026, 9, 15)] == 405_504
+    assert result.peak_day == date(2026, 9, 15)
+    assert result.peak == 401_408
+    assert result.reserve == 5_218_304
+    assert result.capture_days == 3
+    assert result.mean == 234_837
+
+
+def test_a_timing_file_counts_as_its_days_growth_and_not_as_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # ``journal/timing/date=D.jsonl`` sits under ``journal/`` but is not a segment. It
+    # outlives the seal and is real growth, so it stays in the day's sealed bytes. Reading
+    # it as journal would take 8,192 bytes off the rate here.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-15.parquet", 401_408)
+    _write(tmp_path, "journal/timing/date=2026-09-15.jsonl", 8_192)
+    _write(tmp_path, "journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 4_096)
+    _stub_space(monkeypatch, free=1 << 40)
+    result = assess(tmp_path, today=date(2026, 9, 16), calendar=_weekday_calendar(MONDAY, 400))
+    assert result.usage.journal_bytes == {date(2026, 9, 15): 4_096}
+    assert result.usage.day_bytes[date(2026, 9, 15)] == 413_696
+    assert result.peak == 409_600
 
 
 # -- what the walk skips at the root -----------------------------------------
