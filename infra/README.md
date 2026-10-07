@@ -1318,14 +1318,18 @@ describe the instance can read it. The boot takes two steps.
    `mkfs` puts one. It writes the volume's `/etc/fstab` line, and stops when it
    cannot read the old file or when the new one would hold no entry for `/`. It installs
    the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
-   times on any error, and runs `deploy/linux-install.sh`, which starts the units. Then
-   it renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
+   times on any error. Then it syncs the environment with
+   `deploy/linux-install.sh --sync-only`, which starts nothing. From that environment it
+   renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
    token, and applies the roster. It takes the install lock around each attempt of
    these steps and releases it during the 20 seconds it waits before a retry. One
    attempt against an SSM endpoint that hangs holds the lock about 160 seconds, four
    botocore attempts of up to 40 seconds each, well under the 600 seconds another
    install waits for it. A metadata read cannot hang that long, because each request
-   to the metadata service times out after a second.
+   to the metadata service times out after a second. Last, it runs
+   `deploy/linux-install.sh` again without the flag, which installs and starts the
+   units, so the residents start with their config already in place. That install runs
+   even when a config step failed.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
@@ -1345,10 +1349,25 @@ On the VM, cloud-init's summary says `status: done` for a boot whose script exit
 cloud-init status --long
 ```
 
-The bootstrap's own lines sit at the end of cloud-init's log.
+Each step prints lines that start with its own name, and a step that refuses says why
+on one of them. The bootstrap's lines start `vm-bootstrap:`, and each install's lines start
+`linux-install:`. The config steps print `vm_config:`, `token_store:` and `roster:`
+lines. Inside the last install, the render of the units prints `render:` lines and the
+rendered `install.sh` prints `install.sh:` lines. This search shows every one of them.
 
 ```bash
-tail -n 40 /var/log/cloud-init-output.log
+grep -E '^(vm-bootstrap|linux-install|render|install\.sh|vm_config|token_store|roster): ' /var/log/cloud-init-output.log
+```
+
+The rendered `install.sh` also prints lines that carry no step's name. Before each
+command it runs, it prints the command on a line that starts `+`, and it closes by
+reading back each resident's state on indented lines such as `  ActiveState=active`.
+The search above leaves those out, so print the log from the line that starts the last
+install to the end. That shows the last install whole, its read-back included, and the
+bootstrap's closing line.
+
+```bash
+sed -n '/^vm-bootstrap: installing and starting the units/,$p' /var/log/cloud-init-output.log
 ```
 
 The daemon prints its role at every start, so its journal should hold
@@ -1394,19 +1413,22 @@ sudo ~/marketlake/deploy/vm-bootstrap.sh
 Each failure prints one line naming the step, and the exit code says how the run ended.
 
 1. Exit 0 means every step passed.
-2. Exit 2 means the bootstrap itself refused, which happens only before the install, such
-   as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`. It also refuses
-   three states of the lake volume, and formats nothing in any of them.
+2. Exit 2 means the bootstrap itself refused, which happens only before the first
+   install, such as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`.
+   It also refuses three states of the lake volume, and formats nothing in any of them.
    1. The volume holds something other than ext4.
    2. A read of 4 KiB block 0 or 32768 failed or came back short.
    3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
       line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
-3. Exit 1 covers every other failure. A disk step or the install that fails stops the
-   run at once, and the install's own refusal counts as a failure here.
-   A failed render, token pull or roster apply skips only the steps that need it, and
-   the run then ends with exit 1, even when the step itself refused with its own exit 2.
+3. Exit 1 covers every other failure. A disk step that fails stops the run at once,
+   and so does the first install, the one that syncs the environment, even when it
+   refused with its own exit 2. A failed render, token pull or roster apply skips only
+   the steps that need it, and the run then ends with exit 1, even when the step itself
+   refused with its own exit 2. The last install, the one that starts the units, runs
+   whatever those steps returned. When it fails, its line says whether a rerun installs
+   and starts the units, and the run ends with exit 1 the same way.
 
 So read every line, not only the last.
 
@@ -1612,7 +1634,9 @@ that replaces the instance is unaffected, because the new instance starts on its
 plan that replaces only `aws_volume_attachment.lake`, such as one that changes its
 `device_name`, leaves the VM stopped. After such an apply, start the instance with the
 two commands above. The volume's `/etc/fstab` line mounts it at boot, and the units
-start once it is mounted.
+start once it is mounted, provided the bootstrap's last install has run. A first boot cut
+off before that install left no unit enabled, so nothing starts. Then
+[rerun the bootstrap](#rerun-the-bootstrap).
 
 ### Find the VM's address
 

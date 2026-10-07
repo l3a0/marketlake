@@ -4,18 +4,19 @@
 # Usage, as root, from any directory:
 #
 #     sudo deploy/linux-install.sh --owner <account> --lake-mount <path> [--config <path>]
+#         [--sync-only]
 #
 # The host's first-boot setup and the deploy job both call this, and nothing else
-# installs. It is safe to run again on a host that already has it, and it renders the
-# units afresh from this checkout every time it runs. In order, it:
+# installs. It is safe to run again on a host that already has it, and every run without
+# --sync-only renders the units afresh from this checkout. In order, it:
 #
 #   1. refuses unless it runs as root, --owner names an account by its name rather
-#      than its uid, and --lake-mount is given. The flag is required because every run
-#      re-renders, so a run that left it out would strip the units' wait for the lake's
-#      volume;
+#      than its uid, and --lake-mount is given. The flag is required because a run
+#      without --sync-only re-renders, so a run that left it out would strip the units'
+#      wait for the lake's volume;
 #   2. takes /run/marketlake-install.lock, waiting up to 600 seconds, and holds it to
 #      the end, so two runs cannot interleave and leave the older commit installed;
-#   3. as the owner, runs uv sync in this checkout;
+#   3. as the owner, runs uv sync in this checkout. With --sync-only it stops here;
 #   4. as the owner, renders into a fresh systemd.new beside
 #      <owner home>/.local/state/marketlake/systemd and swaps it into place;
 #   5. runs the rendered install.sh, which copies the units, reloads systemd, and
@@ -28,6 +29,11 @@
 # Each step prints a `linux-install: <step>` line first, so a caller reading the log can
 # tell which step a nonzero exit came from. A refusal is one `linux-install:` line on
 # stderr and exit 2.
+#
+# --sync-only is for deploy/vm-bootstrap.sh. The bootstrap needs the venv to render
+# config.yaml, and it installs the units only after that, so the residents never start
+# before their config exists. With the flag, this prints `linux-install: done` right
+# after the sync, and renders and starts nothing.
 #
 # MARKETLAKE_INSTALL_ROOT prefixes every system path this and install.sh write, the lock
 # included. It is for tests only, and is refused unless MARKETLAKE_INSTALL_TEST=1 is set.
@@ -47,6 +53,7 @@ refuse() {
 OWNER=""
 LAKE_MOUNT=""
 CONFIG=""
+SYNC_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --owner|--lake-mount|--config)
@@ -59,8 +66,11 @@ while [[ $# -gt 0 ]]; do
         --config) CONFIG="$2" ;;
       esac
       shift 2 ;;
+    --sync-only)
+      SYNC_ONLY=1
+      shift ;;
     *)
-      refuse "unknown argument $1. Usage: linux-install.sh --owner <account> --lake-mount <path> [--config <path>]" ;;
+      refuse "unknown argument $1. Usage: linux-install.sh --owner <account> --lake-mount <path> [--config <path>] [--sync-only]. Only vm-bootstrap.sh passes --sync-only" ;;
   esac
 done
 
@@ -118,6 +128,10 @@ fi
 # uv by absolute path, because sudo's secure_path leaves ~/.local/bin out.
 say "syncing the environment in $CHECKOUT as $OWNER"
 as_owner "$OWNER_HOME/.local/bin/uv" sync --frozen --no-dev
+if [[ $SYNC_ONLY == 1 ]]; then
+  say "done"
+  exit 0
+fi
 
 # A killed run can leave either directory behind, and the render must start empty.
 say "rendering the units into $NEW as $OWNER"

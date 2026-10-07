@@ -776,7 +776,9 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     home = tmp_path / "home"
     uv = home / ".local" / "bin" / "uv"
     uv.parent.mkdir(parents=True)
-    uv.write_text('#!/bin/bash\nprintf \'uv %s in %s\\n\' "$*" "$PWD" >> "$LOG"\n')
+    uv.write_text(
+        '#!/bin/bash\nprintf \'uv %s in %s\\n\' "$*" "$PWD" >> "$LOG"\nexit "${UV_RC:-0}"\n'
+    )
     uv.chmod(0o755)
     return checkout, home
 
@@ -825,7 +827,8 @@ def test_the_entry_point_is_tracked_executable():
             ["--owner", OWNER, "--lake-mount", "/srv/lake", "--bogus"],
             {},
             "linux-install: unknown argument --bogus. Usage: linux-install.sh --owner"
-            " <account> --lake-mount <path> [--config <path>]\n",
+            " <account> --lake-mount <path> [--config <path>] [--sync-only]."
+            " Only vm-bootstrap.sh passes --sync-only\n",
         ),
         (
             ["--owner", OWNER, "--lake-mount"],
@@ -866,6 +869,79 @@ def test_the_entry_point_refuses_before_it_renders(argv, env, message, tmp_path)
     calls = harness.calls()
     assert not [line for line in calls if line.startswith(("uv ", "systemctl "))], calls
     assert not (home / ".local" / "state").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Last, so a parser that wanted a value after the flag would refuse it, and first,
+        # so one that took the next argument as its value would leave --owner unread.
+        ["--owner", OWNER, "--lake-mount", "/srv/lake", "--sync-only"],
+        ["--sync-only", "--owner", OWNER, "--lake-mount", "/srv/lake"],
+    ],
+    ids=["flag last", "flag first"],
+)
+def test_sync_only_syncs_under_the_lock_and_installs_nothing(argv, tmp_path):
+    """The bootstrap's first call: the venv the config steps run from, and no unit.
+
+    The units start only from a run without the flag, after config.yaml exists.
+    """
+    proc, harness, checkout, home = _entry(tmp_path, *argv)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = harness.calls()
+    sync = f"uv sync --frozen --no-dev in {checkout}"
+    assert "flock -w 600 9" in calls
+    assert sync in calls
+    assert calls.index("flock -w 600 9") < calls.index(sync)
+    # The sync runs as the owner, and nothing else goes through sudo.
+    assert _sudo_calls(harness) == [
+        f"sudo -u {OWNER} -H {home}/.local/bin/uv sync --frozen --no-dev"
+    ]
+    assert not (home / ".local" / "state").exists()
+    assert not [line for line in calls if line.startswith("systemctl")], calls
+    assert not harness.unit_dir.exists()
+    assert proc.stdout.splitlines()[-1] == "linux-install: done"
+
+
+@pytest.mark.parametrize("flag", [[], ["--sync-only"]], ids=["install", "sync only"])
+def test_a_failed_sync_exits_1_and_goes_no_further(flag, tmp_path):
+    """The bootstrap retries exit 1 as a refused proxy during uv sync, so it must see it."""
+    proc, harness, _, home = _entry(
+        tmp_path, "--owner", OWNER, "--lake-mount", "/srv/lake", *flag, UV_RC="1"
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "linux-install: done" not in proc.stdout.splitlines()
+    assert not (home / ".local" / "state").exists()
+    assert not [line for line in harness.calls() if line.startswith("systemctl")]
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "message"),
+    [
+        (
+            ["--owner", OWNER, "--lake-mount", "/srv/lake"],
+            {"FAKE_UID": "1000"},
+            "linux-install: run this as root, for example with sudo\n",
+        ),
+        (
+            ["--owner", OWNER],
+            {},
+            "linux-install: --lake-mount is required: the lake's mount point, or lake_root"
+            " when the lake sits on the root volume\n",
+        ),
+        (
+            ["--owner", "1000", "--lake-mount", "/srv/lake"],
+            {},
+            f"linux-install: --owner 1000 is the uid of {OWNER}. Give the account name\n",
+        ),
+    ],
+    ids=["not root", "no lake mount", "a uid for the owner"],
+)
+def test_sync_only_refuses_what_a_full_install_refuses(argv, env, message, tmp_path):
+    proc, harness, _, _ = _entry(tmp_path, *argv, "--sync-only", **env)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stderr == message
+    assert not [line for line in harness.calls() if line.startswith("uv ")]
 
 
 def test_the_lock_refusal_names_the_wait(tmp_path):
