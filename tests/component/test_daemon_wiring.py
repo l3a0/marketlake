@@ -1639,11 +1639,12 @@ def test_a_surface_page_names_the_class_it_is_failing_with(tmp_path):
 
 
 class _WholeDaemonFailure:
-    """A cycle runner whose every cycle fails both surfaces with one auth class."""
+    """A cycle runner whose every cycle fails both surfaces with one whole-daemon class."""
 
-    def __init__(self, rig: _Rig, clock: ManualClock):
+    def __init__(self, rig: _Rig, clock: ManualClock, error_class: str = "http_401"):
         self._rig = rig
         self._clock = clock
+        self._error_class = error_class
 
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
@@ -1656,7 +1657,7 @@ class _WholeDaemonFailure:
                 partition=f"{surface}/ticker=XYZ/date=2026-09-02/segment.arrows",
                 row_kind=journal.ROW_KIND_GAP,
                 rows=1,
-                error_class="http_401",
+                error_class=self._error_class,
                 fetched_at=None,
                 data_rows=0,
             )
@@ -1681,9 +1682,43 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
     assert page.event == "capture_down"
     assert page.title == "Capture down: token dead"
     # Two surfaces of one ticker, folded into this page. It counts surfaces rather than
-    # tickers, because a cause takes both surfaces of every ticker down together.
+    # tickers, because a cause takes both surfaces of every ticker down together. The
+    # first slot is 10:00, and the page says so, then names the dead-man's DOWN that the
+    # same outage sends next (marketlake #747).
     assert page.body == (
-        "3 session minutes without a durable cycle, failing with http_401, one page for 2 surfaces"
+        "3 session minutes without a durable cycle since 10:00 ET, failing with http_401,"
+        " one page for 2 surfaces. Expect Capture dead-man is DOWN in about 5 min:"
+        " same outage."
+    )
+
+
+@pytest.mark.parametrize(
+    ("error_class", "title"),
+    [
+        ("http_429", "Capture down: rate limited"),
+        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead"),
+    ],
+)
+def test_every_cause_page_dates_itself_and_names_the_dead_man_page_to_come(
+    error_class, title, tmp_path
+):
+    """The design's message table pins the time and the follow-on line on both causes.
+
+    The rate limit is the second row that carries them, and an unreadable token file
+    reaches the token-dead page by its own class (marketlake #702). The body is composed
+    from the page, not from the title or the class, so each cause is driven to the wire.
+    """
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock, error_class))
+
+    (page,) = rig.transport.sent
+    assert page.event == "capture_down"
+    assert page.title == title
+    assert page.body == (
+        f"3 session minutes without a durable cycle since 10:00 ET, failing with {error_class},"
+        " one page for 2 surfaces. Expect Capture dead-man is DOWN in about 5 min:"
+        " same outage."
     )
 
 

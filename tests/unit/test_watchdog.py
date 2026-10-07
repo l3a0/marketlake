@@ -593,6 +593,8 @@ def test_a_dead_token_pages_once_naming_auth_rather_than_the_roster():
     assert [p.title for p in raised] == ["Capture down: token dead"]
     assert raised[0].cause == "http_401"
     assert len(raised[0].surfaces) == 4
+    # The page fires on the third dead minute and is dated from the first (marketlake #747).
+    assert (raised[0].minutes, raised[0].since) == (3, _at(0))
 
 
 def test_the_whole_daemon_cause_path_reads_the_threshold_live():
@@ -655,6 +657,9 @@ def test_one_dead_surface_is_still_a_surface_page():
         )
     assert [p.title for p in raised] == ["Capture down: SPY chains"]
     assert raised[0].cause == "http_500"
+    # Only a cause page is dated, because only it always rides a minute that feeds the
+    # dead-man nothing (marketlake #747).
+    assert raised[0].since is None
 
 
 def test_mixed_failure_classes_are_not_one_cause():
@@ -1655,11 +1660,44 @@ def test_a_chain_that_answered_empty_leaves_the_cause_so_the_next_death_pages():
     assert watchdog.count("chains", "SPY") == 7
     for minute in range(7, 10):
         raised += watchdog.observe(_roster_401(minute))
-    assert [(page.title, page.minutes, page.cause) for page in raised] == [
-        ("Capture down: token dead", 3, "http_401"),
-        ("Capture down: SPY chains", 4, CONTRACTS_ABSENT),
-        ("Capture down: token dead", 10, "http_401"),
+    # The second death began at minute 7, so its page counts 3 minutes from 10:07. The
+    # empty chain's own count of 10 reaches back into the first outage and the minutes
+    # between, when the token worked (marketlake #747).
+    assert [(page.title, page.minutes, page.cause, page.since) for page in raised] == [
+        ("Capture down: token dead", 3, "http_401", _at(0)),
+        ("Capture down: SPY chains", 4, CONTRACTS_ABSENT, None),
+        ("Capture down: token dead", 3, "http_401", _at(7)),
     ]
+
+
+def test_a_cause_page_is_dated_from_the_death_not_from_one_surface_failing_before_it():
+    """The cause page counts the run in which none of its surfaces landed data.
+
+    One chain failing its own class for half an hour before the token dies has a count
+    that reaches back to 10:00. Dating the cause from it would tell the operator the token
+    died at 10:00 and that capture had been down since then, when every other surface
+    landed data until 10:30. The dead-man is fed until 10:30 too, so the smallest count is
+    the one that matches the outage the follow-on line names (marketlake #747).
+    """
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(30):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_500"),
+                _seg("chains", "QQQ", "data"),
+                _seg("quotes", "SPY", "data"),
+                _seg("quotes", "QQQ", "data"),
+                at=_at(minute),
+            )
+        )
+    assert [(page.title, page.since) for page in raised] == [("Capture down: SPY chains", None)]
+    for minute in range(30, 34):
+        raised += watchdog.observe(_roster_401(minute))
+    assert watchdog.count("chains", "SPY") == 34
+    cause = raised[-1]
+    assert (cause.title, cause.minutes, cause.since) == ("Capture down: token dead", 3, _at(30))
+    assert len(raised) == 2
 
 
 def test_a_chain_that_answered_empty_leaves_only_its_own_surface_in_the_cause():
