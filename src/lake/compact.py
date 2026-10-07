@@ -163,7 +163,7 @@ import pyarrow.parquet as pq
 from lake import bucket, journal, outbox
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
-from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH, ChainPlan, Window, load_chain_plan
+from lake.chain_plan import ChainPlan, Window, default_chain_plan_path, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import BucketTarget, GuardConstants, input_errors_exit, load_config
 
@@ -2049,7 +2049,7 @@ def compact(
     ping_url: str | None = None,
     publisher: Publisher | None = None,
     guards: GuardConstants | None = None,
-    plan_path: Path | str = DEFAULT_CHAIN_PLAN_PATH,
+    plan_path: Path | str | None = None,
 ) -> CompactionResult:
     """Run the close+15 job: sweep, seal, re-tune, back up, ping.
 
@@ -2087,6 +2087,9 @@ def compact(
     object, so omitting it can never reach a real phone. What a run without one loses is
     only the page. The finding is still filed under ``reports/schema_drift/`` or
     ``reports/damaged_segments/`` and still named on stderr.
+
+    ``plan_path`` defaults to ``chain_plan.default_chain_plan_path()``, resolved when the
+    re-tune runs rather than when this module was imported.
     """
     if pinger is not None and ping_url is None:
         raise ValueError("a pinger needs a ping_url")
@@ -2196,7 +2199,7 @@ def compact(
                 chains_by_day[latest_day],
                 latest_day,
                 guards=guards,
-                plan_path=plan_path,
+                plan_path=default_chain_plan_path() if plan_path is None else plan_path,
                 # Without this the re-tune reads a refused ticker's absent rows as zero
                 # contracts and can merge its windows away. Containing the seal's blast
                 # radius must not widen the re-tune's onto a profile it knows is partial.
@@ -2433,7 +2436,7 @@ def main(
                 secrets=config.page_secrets(),
             ),
             guards=config.guards,
-            plan_path=args.plan if args.plan is not None else DEFAULT_CHAIN_PLAN_PATH,
+            plan_path=args.plan,
         )
     except bucket.BucketRefusal as exc:
         # Only the bucket form raises this, so the path form keeps its own behavior for

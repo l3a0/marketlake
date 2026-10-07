@@ -24,6 +24,7 @@ from types import ModuleType
 import pytest
 
 from lake import reauth
+from lake.paths import CONFIG_DIR_ENV
 from tests.support.config import write_config
 
 CALLBACK = "https://127.0.0.1:8182"
@@ -257,19 +258,20 @@ def test_main_exits_one_when_the_flow_writes_nothing_over_a_live_token(
 def test_main_without_a_token_argument_falls_back_to_the_module_default(
     tmp_path, lake_root, monkeypatch
 ):
-    """Omitting ``--token`` uses ``DEFAULT_TOKEN_PATH`` rather than anything else.
+    """Omitting ``--token`` uses ``lake.paths.default_token_path()`` rather than anything else.
 
-    The constant is redirected here so no real token is ever touched. What this states is
-    the wiring: the entry's fallback is that constant, and the path it names is what
-    reaches the flow. The constant's own value is stated in the unit tests, where it is
-    compared against the path the vendor reads a token back from.
+    The config directory is redirected here so no real token is ever touched. What this
+    states is the wiring: the entry's fallback is that resolver, called when the entry
+    runs, and the path it names is what reaches the flow. The resolver's own value is
+    stated in the unit tests, where it is compared against the path the vendor reads a
+    token back from.
     """
     config = _config(tmp_path, lake_root)
     redirected = tmp_path / "elsewhere" / "token.json"
     flow = FakeLoginFlow()
     _install_seam(monkeypatch, flow)
     _at_a_terminal(monkeypatch)
-    monkeypatch.setattr(reauth, "DEFAULT_TOKEN_PATH", redirected)
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(redirected.parent))
 
     assert reauth.main(["--config", str(config)]) == 0
 

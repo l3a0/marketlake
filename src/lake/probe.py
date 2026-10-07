@@ -46,7 +46,8 @@ from datetime import date
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake.schwab import DEFAULT_TOKEN_PATH, client_from_token
+from lake.paths import default_token_path
+from lake.schwab import client_from_token
 
 # The window brackets, in expirations from the front of the chain. Each names how many
 # expirations past the first the bracket reaches, so the body-size growth is visible.
@@ -291,7 +292,7 @@ def render_report(report: ChainSizeReport) -> str:
 
 
 def _client_from_token(
-    token_path: str | Path = DEFAULT_TOKEN_PATH,
+    token_path: str | Path | None = None,
     *,
     api_key: str,
     app_secret: str,
@@ -303,8 +304,11 @@ def _client_from_token(
     probe can run while the daemon does, and ``schwab-py``'s own writer would leave the
     file empty for a moment under the daemon's next read. That builder imports
     ``schwab-py`` lazily, so ``import lake.probe`` and the whole unit suite run without the
-    library. This factory runs only in the by-hand live check.
+    library. This factory runs only in the by-hand live check. A ``None`` path resolves
+    to ``lake.paths.default_token_path()`` when this runs.
     """
+    if token_path is None:
+        token_path = default_token_path()
     return client_from_token(token_path, api_key=api_key, app_secret=app_secret)
 
 
@@ -326,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token",
-        default=str(DEFAULT_TOKEN_PATH),
+        default=str(default_token_path()),
         help="Path to the Schwab token file. Defaults to the design's standard location.",
     )
     return parser

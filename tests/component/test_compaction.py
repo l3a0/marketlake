@@ -1178,6 +1178,30 @@ def test_main_runs_the_job_from_config_with_injected_seams(
     assert not plan_path.exists()
 
 
+def test_main_writes_the_re_tuned_plan_to_the_plan_it_was_given(lake_root, tmp_path, monkeypatch):
+    # A hand run names ``--plan`` to keep the re-tune off the machine's own plan file. The
+    # day's profile forces a split, so a ``main`` that dropped the flag would write the
+    # split plan to the default path instead.
+    default_dir = tmp_path / "default"
+    monkeypatch.setenv("MARKETLAKE_CONFIG_DIR", str(default_dir))
+    config = write_config(tmp_path, lake_root)
+    plan_path = tmp_path / "given" / "chain_plan.json"
+    table = _profile_table(DEFAULT_CHAIN_PLAN, DAY, {0: 2600, 1: 1000}, snap_ts=_snap(DAY, 0))
+    _segment(lake_root, "chains", "SPY", DAY, table, start_ts="a")
+    monkeypatch.setattr("lake.compact.RsyncBackup", lambda: FakeBackup([]))
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger([]))
+
+    code = main(
+        ["--config", str(config), "--plan", str(plan_path)],
+        clock=_clock_at(DAY, 16, 30),
+        calendar=_calendar(),
+    )
+
+    assert code == 0
+    assert load_chain_plan(plan_path) != DEFAULT_CHAIN_PLAN
+    assert not default_dir.exists()
+
+
 def test_main_recompact_is_the_human_repair(lake_root, tmp_path, capsys):
     config = write_config(tmp_path, lake_root)
     partition, rel = _manifested_day(lake_root, rows=1)

@@ -45,8 +45,8 @@ def default_tickers_path() -> Path:
     imported ``lake`` and only then pointed ``HOME`` or ``MARKETLAKE_CONFIG_DIR`` at a
     throwaway kept the real directory, and on 2026-10-06 a probe doing exactly that
     overwrote a host's live roster. Resolved here, the environment at the moment of the
-    read or the write decides. The other config-directory defaults still bind at import,
-    and marketlake #715 will convert them.
+    read or the write decides. The token, config and chain-plan defaults resolve the same
+    way.
     """
     return config_dir() / TICKERS_FILE
 

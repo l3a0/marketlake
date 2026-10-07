@@ -94,13 +94,21 @@ from lake.chain_plan import ChainPlanError
 from lake.paths import CONFIG_FILE, LakePaths, config_dir
 from lake.tickers import TickersError
 
-# The machine-local config file. Overridable by argument or this environment variable,
-# so a test points the loader at a throwaway file.
-# The path is fixed when this module is imported, so a process that sets HOME or
-# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
-# will resolve it at call time instead.
-DEFAULT_CONFIG_PATH = config_dir() / CONFIG_FILE
+# Overrides the machine-local config file's default path, so a test points the loader at
+# a throwaway file.
 CONFIG_PATH_ENV = "MARKETLAKE_CONFIG"
+
+
+def default_config_path() -> Path:
+    """The machine-local config file's default path, resolved through ``paths.config_dir``.
+
+    It is resolved on every call, so the environment at the moment of the read decides.
+    A module constant would be fixed when this module is imported, and a process that
+    pointed ``HOME`` or ``MARKETLAKE_CONFIG_DIR`` at a throwaway afterwards would keep
+    reading the real directory.
+    """
+    return config_dir() / CONFIG_FILE
+
 
 # The healthchecks host. Pings go by slug, in the form ``hc-ping.com/<ping-key>/<slug>``.
 # The config holds the one rotatable ping key, never six immutable UUID URLs.
@@ -799,7 +807,7 @@ def load_config(
     is raised outside that handler, so the quoted line is on neither the traceback nor
     the exception's ``__context__``.
     """
-    resolved = _resolve_path(path, env, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH)
+    resolved = _resolve_path(path, env, CONFIG_PATH_ENV)
     if not resolved.exists():
         raise ConfigError(f"config file not found: {resolved}")
     mapping = _parse_yaml(_read_text(resolved, "config"))
@@ -870,14 +878,12 @@ def _resolve_path(
     path: str | Path | None,
     env: Mapping[str, str] | None,
     env_key: str,
-    default: Path,
 ) -> Path:
     """Resolve a config path: explicit argument, then env var, then the default.
 
     An argument and an environment override are whatever a person typed, so both may
-    carry a ``~`` and both are expanded. ``default`` comes from ``lake.paths`` already
-    resolved, so it is returned as it is. A caller passing an unexpanded default would
-    get it back unexpanded.
+    carry a ``~`` and both are expanded. The default comes from ``lake.paths`` already
+    resolved, at the moment this runs, and only when neither of the others names a file.
     """
     if path is not None:
         return Path(path).expanduser()
@@ -885,4 +891,4 @@ def _resolve_path(
     override = env.get(env_key)
     if override:
         return Path(override).expanduser()
-    return default
+    return default_config_path()

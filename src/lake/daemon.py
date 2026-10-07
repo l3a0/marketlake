@@ -205,13 +205,13 @@ from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import CHAINS_SURFACE
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
+from lake.paths import default_token_path
 from lake.reference_read import read_or_none
 from lake.report import write_close_guard
 from lake.runner import Pinger
 from lake.schema_drift import SchemaDriftObserver
 from lake.schema_drift import page as page_schema_drift
 from lake.schema_versions import check_running_version
-from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, SecurityMasterError, master_path
 from lake.session import (
     CAPTURE_PHASES,
@@ -1120,13 +1120,15 @@ def _idle_stamp(
         config = load_config(config_path)
     except ConfigError:
         return None
-    token = Path(token_path) if token_path is not None else DEFAULT_TOKEN_PATH
 
     def stamp(slot: datetime) -> None:
         if session_clock.in_capture_window():
             return
         try:
             roster = load_tickers(tickers_path)
+            # Resolved on each stamp rather than once at daemon start, the way the capture
+            # cycle resolves its own token path.
+            token = Path(token_path) if token_path is not None else default_token_path()
             minted = read_token_mint(token)
         except Exception:  # noqa: BLE001 - the stamp is the least important thing here
             # Deliberately broad. `load_tickers` now folds every way its file can fail

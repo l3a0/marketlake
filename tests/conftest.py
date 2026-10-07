@@ -25,7 +25,6 @@ import os
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
@@ -35,14 +34,13 @@ from pathlib import Path
 import pytest
 
 from lake.paths import CONFIG_DIR_ENV
-from tests.support.config_defaults import modules_building_a_default
 
 # -- the config-directory redirect -------------------------------------------------------
 
 # Every guard in this file is a monkeypatch, so each holds inside this process and
 # nowhere else. A child the suite spawns has none of them. That limit bit during the
 # config-directory guard's own review: a test spawned a child running
-# ``lake.reauth.write_token`` at ``DEFAULT_TOKEN_PATH``, nothing in the child refused
+# ``lake.reauth.write_token`` at the default token path, nothing in the child refused
 # it, and a stub landed on a working Schwab token. Nothing in the suite reaches the real
 # directory from a child today, and the next test that spawns one starts from the same
 # place.
@@ -60,28 +58,22 @@ from tests.support.config_defaults import modules_building_a_default
 # reach real code at a default path: ``tests/component/test_unattended_entries_fresh.py``
 # starts each entry with its launchd job's or systemd unit's own environment, and the
 # compaction child the daemon spawns with the daemon job's. Neither carries a
-# config-directory variable, so ``DEFAULT_CONFIG_PATH`` is bound under ``HOME`` when the
-# child imports ``lake.config``.
+# config-directory variable, so ``config.default_config_path()`` resolves under ``HOME``
+# in the child.
 # That test arranges its own redirect by pointing ``HOME`` at a throwaway directory. Any
 # other child that reaches a default path has to do the same.
 #
-# The export sits above the rest of this file's imports because four defaults in the
-# package are built from ``config_dir`` when their module is imported. Exporting the
-# variable after ``lake.reauth`` had been imported would move nothing a caller uses.
-# ``lake.paths`` is safe to import first, since it only spells the variable's name and
-# builds no default from it. The check below enforces that rather than trusting the
-# line's position, because moving the export down this file is harmless until the day an
-# import above it binds a default, and by then the damage is a default pointing at the
-# live token with nothing to say so.
+# This process moves with its children rather than staying behind. Every default path in
+# the package is a resolver called when it is used, so the in-process export is what
+# keeps every resolver the suite calls off the real directory. Without it, a test that
+# omits a path would read the real config, and only the guard below would stand between
+# its write and the live token. A later edit that "simplifies" the export to children
+# only would bring that back.
 #
-# This process moves with its children rather than staying behind. Two assertions bind a
-# module's bound default to a later ``config_dir()`` call, one in
-# ``tests/unit/test_paths.py`` and one in
-# ``tests/component/test_control_plane_render.py``. They are what would catch a module
-# that spelled the config directory its own way. A redirect reaching only children would
-# put a real-directory default beside a throwaway ``config_dir()``, and the only way to
-# keep those two assertions green would be to loosen them, which discards the rule they
-# exist to hold.
+# The export still sits above the rest of this file's imports. Nothing in the package
+# resolves a default at import any more, and
+# ``tests/unit/test_config_defaults_scanner.py`` fails if something starts to, but a
+# variable set before anything else runs needs no argument about import order.
 #
 # An inherited value is replaced rather than honoured. It is whatever a person exported,
 # so it can name anything the real directory included, and where the suite's children
@@ -90,25 +82,6 @@ from tests.support.config_defaults import modules_building_a_default
 # None of this stands in for the guard below. The guard settles what it protects from
 # ``Path.home()`` and never reads this variable, on purpose, so a test that names the
 # real path by hand still fails rather than slipping past a redirect that path ignores.
-# The modules that build a module-level default from ``config_dir``. Each binds its
-# constant at import, so one already in ``sys.modules`` here has bound it against
-# whatever the environment said before this file ran.
-#
-# Read out of ``src/lake`` rather than typed, because a new default added there would
-# otherwise be outside this check with nothing to say so. The scanner imports nothing,
-# which it has to avoid: importing one of these modules is the very act this guards
-# against. ``tests.support.config_defaults`` reaches only ``ast`` and ``pathlib``, so it
-# is safe to import ahead of the export below.
-_BINDS_A_DEFAULT = modules_building_a_default()
-_ALREADY_BOUND = [name for name in _BINDS_A_DEFAULT if name in sys.modules]
-if _ALREADY_BOUND:
-    raise RuntimeError(
-        f"{', '.join(_ALREADY_BOUND)} was imported before tests/conftest.py set "
-        f"{CONFIG_DIR_ENV}, so its default is bound to the real config directory and no "
-        "redirect can move it. Import it after this file, or move this export above "
-        "whatever pulled it in."
-    )
-
 _THROWAWAY_CONFIG_DIR = tempfile.mkdtemp(prefix="marketlake-suite-config-")
 os.environ[CONFIG_DIR_ENV] = _THROWAWAY_CONFIG_DIR
 atexit.register(shutil.rmtree, _THROWAWAY_CONFIG_DIR, ignore_errors=True)
@@ -423,10 +396,7 @@ def _host_is_macos() -> Iterator[None]:
     """Pin every test to the macOS host unless it asks for ``on_linux``.
 
     The fixture holds its own ``MonkeyPatch``, for the reason ``_no_network`` does: a test
-    calling ``monkeypatch.undo()`` must not disarm it. It imports ``control_plane`` inside
-    its body, because that module builds a default from the config directory, and a
-    module-level import above the export at the top of this file would trip
-    ``_ALREADY_BOUND``.
+    calling ``monkeypatch.undo()`` must not disarm it.
     """
     from lake import control_plane
 

@@ -50,11 +50,10 @@ from lake import capture, close_guard, daemon, journal, schema_drift
 from lake.alert import Publisher
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan
-from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, GuardConstants
+from lake.config import CONFIG_PATH_ENV, GuardConstants, default_config_path
 from lake.manifest import latest_entries
-from lake.paths import LakePaths
+from lake.paths import LakePaths, default_token_path
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SchemaDriftObserver
-from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import OPTION_CLOSE, SessionClock
 from lake.tickers import TICKERS_PATH_ENV, Roster, default_tickers_path
@@ -714,7 +713,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path,
         monkeypatch.setenv(TICKERS_PATH_ENV, str(tickers))
         # The loaders find this test's files through the variables alone. A file at a
         # default path would be found without them.
-        for default in (DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH):
+        for default in (default_config_path(), default_tickers_path(), default_token_path()):
             assert not default.exists()
             assert not is_protected(default)
     given = (None, None, None) if unset else (str(config), str(tickers), str(token))
@@ -767,7 +766,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path,
     assert {read.path for read in reads.of("load_config")} == {given[0]}
     assert {read.path for read in reads.of("load_tickers")} == {given[1]}
     token_reads = {str(read.path) for read in reads.of("read_token_mint", FROM_TOKEN)}
-    assert token_reads == {str(DEFAULT_TOKEN_PATH) if unset else str(token)}
+    assert token_reads == {str(default_token_path()) if unset else str(token)}
     assert "lake.capture.fill_option_close_from_config" in reads.callers("load_config")
     assert "lake.capture.fill_option_close_from_config" in reads.callers(FROM_TOKEN)
 

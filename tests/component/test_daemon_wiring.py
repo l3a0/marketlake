@@ -97,13 +97,12 @@ from lake.capture import CycleResult, SegmentError, SegmentOutcome
 from lake.capture_spans import CaptureSpans, spans_path
 from lake.chain_plan import ChainPlan, load_chain_plan
 from lake.compact import COMPACTION_SLUG, compact, write_chain_plan
-from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, GuardConstants
+from lake.config import CONFIG_PATH_ENV, GuardConstants, default_config_path
 from lake.deadman import CAPTURE_SLUG
-from lake.paths import LakePaths
+from lake.paths import LakePaths, default_token_path
 from lake.runner import PING_REFUSED_EVENT
 from lake.schema_drift import SCHEMA_DRIFT_EVENT, SCHEMA_DRIFT_TITLE
 from lake.schema_versions import check_running_version, ledger_path
-from lake.schwab import DEFAULT_TOKEN_PATH
 from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TICKERS_PATH_ENV, TickersError, default_tickers_path
@@ -3063,7 +3062,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     monkeypatch.setenv(TICKERS_PATH_ENV, str(rig.tickers))
     # The loaders find the rig through the variables alone. A file at a default path
     # would be found without them.
-    for default in (DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH):
+    for default in (default_config_path(), default_tickers_path(), default_token_path()):
         assert not default.exists()
         assert not is_protected(default)
     reads = PathReads.install(monkeypatch)
@@ -3101,7 +3100,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
     loads = reads.of("load_config", "load_tickers")
     assert [read for read in loads if read.path is not None] == []
     tokens = reads.of("read_token_mint", FROM_TOKEN)
-    assert [read for read in tokens if read.path != DEFAULT_TOKEN_PATH] == []
+    assert [read for read in tokens if read.path != default_token_path()] == []
     assert rig.compaction.calls == [daemon.compaction_command(None)]
     # Every read site the loop forwards a path to runs at least once in this run, so a
     # mangled path at any of them reaches the lists above. Each reader is checked on its

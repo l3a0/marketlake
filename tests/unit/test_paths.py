@@ -11,13 +11,12 @@ from __future__ import annotations
 
 from datetime import date
 from fnmatch import fnmatchcase
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
 from lake import control_plane as cp
-from lake.chain_plan import DEFAULT_CHAIN_PLAN_PATH
-from lake.config import DEFAULT_CONFIG_PATH
 from lake.paths import (
     ACTIONS,
     BARS,
@@ -38,12 +37,12 @@ from lake.paths import (
     PartitionRef,
     SegmentRef,
     config_dir,
+    default_token_path,
     parse_date_dir,
     parse_partition_rel,
     parse_segment_rel,
 )
-from lake.schwab import DEFAULT_TOKEN_PATH
-from lake.tickers import default_tickers_path
+from tests.support.config_defaults import resolvers
 from tests.support.lake import FixtureLake
 
 ROOT = Path("/lake")
@@ -452,27 +451,54 @@ def test_the_variable_is_spelled_the_way_the_design_doc_names_it():
     assert CONFIG_DIR_ENV == "MARKETLAKE_CONFIG_DIR"
 
 
-@pytest.mark.parametrize(
-    ("default", "name"),
-    [
-        (DEFAULT_CONFIG_PATH, CONFIG_FILE),
-        (default_tickers_path(), TICKERS_FILE),
-        (DEFAULT_TOKEN_PATH, TOKEN_FILE),
-        (DEFAULT_CHAIN_PLAN_PATH, CHAIN_PLAN_FILE),
-    ],
-)
-def test_every_machine_file_sits_in_the_excluded_directory(default, name):
+# Every resolver of a config-directory default, read out of ``src/lake`` rather than typed
+# here, so a new one is checked without anyone remembering to add it.
+RESOLVERS = resolvers()
+
+# Which file each resolver names. The pairing is the claim, so it is typed here. Its key
+# set is checked against the scan above, so a resolver added, removed or renamed in
+# ``src/lake`` fails that check rather than dropping out of the pairing.
+RESOLVER_FILES = {
+    ("lake.chain_plan", "default_chain_plan_path"): CHAIN_PLAN_FILE,
+    ("lake.config", "default_config_path"): CONFIG_FILE,
+    ("lake.paths", "default_token_path"): TOKEN_FILE,
+    ("lake.tickers", "default_tickers_path"): TICKERS_FILE,
+}
+
+
+def _resolve(module: str, name: str) -> Path:
+    return getattr(import_module(module), name)()
+
+
+def test_the_resolver_scan_is_not_empty():
+    # The floor under the two parametrized tests below, which pass vacuously over nothing.
+    assert ("lake.paths", "default_token_path") in RESOLVERS
+
+
+def test_every_resolver_the_scan_finds_is_paired_with_its_file():
+    assert set(RESOLVERS) == set(RESOLVER_FILES)
+
+
+def test_each_machine_file_has_one_resolver():
+    # The four files the config directory holds, each named once.
+    files = sorted(RESOLVER_FILES.values())
+    assert files == sorted([CONFIG_FILE, TICKERS_FILE, TOKEN_FILE, CHAIN_PLAN_FILE])
+
+
+@pytest.mark.parametrize(("module", "name"), RESOLVERS)
+def test_every_machine_file_sits_in_the_excluded_directory(module, name):
+    # An exact name, never membership in the set of four. Two resolvers that swapped
+    # their files would each still name one of the four.
+    default = _resolve(module, name)
     assert default.parent == config_dir()
-    assert default.name == name
+    assert default.name == RESOLVER_FILES[(module, name)]
 
 
-@pytest.mark.parametrize(
-    "default",
-    [DEFAULT_CONFIG_PATH, default_tickers_path(), DEFAULT_TOKEN_PATH, DEFAULT_CHAIN_PLAN_PATH],
-)
-def test_every_default_comes_back_resolved(default):
+@pytest.mark.parametrize(("module", "name"), RESOLVERS)
+def test_every_default_comes_back_resolved(module, name):
     # One convention. An unexpanded "~" path looks usable and is not, because open()
     # would create a literal "~" directory rather than failing.
+    default = _resolve(module, name)
     assert default.is_absolute()
     assert "~" not in str(default)
 
@@ -482,7 +508,8 @@ def test_the_control_plane_renderer_agrees_with_the_shared_rule():
     # directory the same way a running process does.
     assert cp.default_config_dir("/Users/alice") == str(config_dir("/Users/alice"))
     assert cp.default_token_path("/Users/alice") == str(config_dir("/Users/alice") / TOKEN_FILE)
+    assert cp.default_token_path("/Users/alice") == str(default_token_path("/Users/alice"))
     # For this user's own home, the renderer's spelling and the module rule's fallback
-    # agree. config_dir(env={}) rather than DEFAULT_TOKEN_PATH, because that constant
+    # agree. config_dir(env={}) rather than default_token_path(), because that resolver
     # honours the override and this claim is about the home-relative default.
     assert cp.default_token_path(str(Path.home())) == str(config_dir(env={}) / TOKEN_FILE)

@@ -63,7 +63,8 @@ from datetime import datetime
 from pathlib import Path
 
 from lake.cassette import Cassette, Interaction, dump_cassette
-from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor
+from lake.paths import default_token_path
+from lake.schwab import SchwabVendor
 from lake.vendor import (
     BAR_FREQS,
     BARS_ENDPOINT,
@@ -195,16 +196,16 @@ def record_cassette(
     quote_batches: Sequence[Sequence[str]] = (),
     bar_requests: Sequence[BarRequest] = (),
     *,
-    token_path: str | Path = DEFAULT_TOKEN_PATH,
+    token_path: str | Path | None = None,
     vendor_factory: VendorFactory = SchwabVendor.from_token,
 ) -> Cassette:
     """Record a cassette by building a vendor and calling it for each interaction.
 
     ``api_key`` and ``app_secret`` are the resolved credentials, injected as plain
     strings. ``token_path`` is the token file to authenticate with, the fixed
-    convention by default. ``vendor_factory`` builds the vendor from those three, so
-    a test injects a factory that returns a fake-client vendor and never touches the
-    network. ``chain_symbols`` are the underlyings to record full chains for. Each
+    convention by default, resolved when this runs. ``vendor_factory`` builds the vendor
+    from those three, so a test injects a factory that returns a fake-client vendor and
+    never touches the network. ``chain_symbols`` are the underlyings to record full chains for. Each
     ``quote_batches`` entry is one batched quote request, a list of symbols recorded
     together the way the shared sampler batches them. Each ``bar_requests`` entry is one
     price-history window, recorded through whichever per-frequency vendor method its
@@ -215,6 +216,8 @@ def record_cassette(
     read off the built vendor and stamped in, so the replayed fake reports it. A
     vendor with no mint time simply omits it.
     """
+    if token_path is None:
+        token_path = default_token_path()
     vendor = vendor_factory(token_path, api_key=api_key, app_secret=app_secret)
 
     interactions: list[Interaction] = []
@@ -333,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token",
-        default=str(DEFAULT_TOKEN_PATH),
+        default=str(default_token_path()),
         help="Path to the Schwab token file. Defaults to the design's standard location.",
     )
     return parser

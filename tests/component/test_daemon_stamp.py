@@ -167,6 +167,47 @@ def test_the_sunday_re_auth_reaches_the_panel_the_same_night(tmp_path):
     assert read_metadata(lake_root).token_minted_at == minted
 
 
+def test_an_idle_stamp_resolves_the_default_token_when_it_stamps(tmp_path, monkeypatch):
+    # The daemon runs for days, so a token path resolved once when the hook is built
+    # would keep naming whatever directory the environment named at start. The override
+    # moves after the hook exists and before the first stamp, and the stamp must read
+    # the token where it now points.
+    started = tmp_path / "started"
+    moved = tmp_path / "moved"
+    started.mkdir()
+    moved.mkdir()
+    _token(started, MINTED)
+    minted = et(2026, 9, 6, 20, 30)
+    _token(moved, minted)
+    monkeypatch.setenv("MARKETLAKE_CONFIG_DIR", str(started))
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY: {options: true, chain_cadence: 1m}\n")
+    counted = [0]
+
+    def move_then_one_tick() -> bool:
+        counted[0] += 1
+        monkeypatch.setenv("MARKETLAKE_CONFIG_DIR", str(moved))
+        return counted[0] <= 1
+
+    daemon.run_loop_from_config(
+        config_path=str(config),
+        tickers_path=str(tickers),
+        clock=ManualClock(start=et(2026, 9, 6, 20, 45)),
+        calendar=weekday_sessions(WEEK, NEXT_WEEK),
+        assertion_runner=lambda args: None,
+        transport=Broken(),
+        pinger=FakePinger(),
+        compaction_runner=lambda args: None,
+        cycle_runner=_no_cycle,
+        should_continue=move_then_one_tick,
+    )
+
+    assert read_metadata(lake_root).token_minted_at == minted
+
+
 def test_the_stamp_never_carries_token_material(tmp_path):
     # The stamp is a fact about a secret file. The file itself holds a token, and the
     # whole lake is read by a service and synced to a backup disk.

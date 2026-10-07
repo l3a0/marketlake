@@ -57,7 +57,7 @@ from lake import daemon
 from lake.alert import NtfyTransport
 from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult
-from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, ConfigError
+from lake.config import CONFIG_PATH_ENV, ConfigError, default_config_path
 from lake.control_plane import assertion_window, caffeinate_args
 from lake.runner import UrllibPinger
 from lake.session import CAPTURE_PHASES, SessionClock, SessionPhase
@@ -1582,8 +1582,8 @@ def test_main_with_no_arguments_forwards_three_unset_paths(tmp_path, monkeypatch
     monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, lake_root)))
     # The config is found through the variable alone. A file at the default path would
     # be found without it.
-    assert not DEFAULT_CONFIG_PATH.exists()
-    assert not is_protected(DEFAULT_CONFIG_PATH)
+    assert not default_config_path().exists()
+    assert not is_protected(default_config_path())
     seen: dict[str, object] = {}
 
     def fake_run_loop_from_config(**kwargs) -> None:

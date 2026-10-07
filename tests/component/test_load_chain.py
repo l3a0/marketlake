@@ -48,7 +48,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import loader
-from lake.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, ConfigError
+from lake.config import CONFIG_PATH_ENV, ConfigError, default_config_path
 from lake.extra_projection import ExtraProjectionError
 from lake.loader import (
     LoadError,
@@ -1248,15 +1248,15 @@ def test_an_unconfigured_machine_raises_config_error_naming_the_file():
     ``tests/component/test_suite_config_dir_redirect.py``, which spawns a child that did.
 
     The second assertion says the file this did name is a throwaway rather than anything
-    under the real config directory. It reads a constant ``lake.config`` binds at import,
-    so it covers conftest's config-directory redirect rather than the resolution this test
-    is about.
+    under the real config directory. It reads ``config.default_config_path()``, which
+    resolves through conftest's config-directory redirect, so it covers that redirect
+    rather than the resolution this test is about.
     """
     with pytest.raises(ConfigError) as caught:
         load_chain("SPY", HALF_DAY)
 
-    assert str(DEFAULT_CONFIG_PATH) in str(caught.value)
-    assert not is_protected(DEFAULT_CONFIG_PATH)
+    assert str(default_config_path()) in str(caught.value)
+    assert not is_protected(default_config_path())
 
 
 def test_the_old_positional_root_is_a_type_error_at_the_call(tmp_path: Path, monkeypatch):

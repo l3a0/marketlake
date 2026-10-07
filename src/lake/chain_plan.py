@@ -40,14 +40,21 @@ from pathlib import Path
 
 from lake.paths import CHAIN_PLAN_FILE, config_dir
 
-# The machine-owned plan file, beside ``token.json`` in the config dir. It is
-# *machine-derived* rather than hand config: the nightly job writes it, so no job ever
-# rewrites the hand-owned ``config.yaml``. Absent on a fresh machine, which is fine, since
-# ``load_chain_plan`` falls back to the built-in default.
-# The path is fixed when this module is imported, so a process that sets HOME or
-# MARKETLAKE_CONFIG_DIR afterwards still resolves the real directory. marketlake #715
-# will resolve it at call time instead.
-DEFAULT_CHAIN_PLAN_PATH = config_dir() / CHAIN_PLAN_FILE
+
+def default_chain_plan_path() -> Path:
+    """The machine-owned plan file's default path, beside ``token.json`` in the config dir.
+
+    The plan is *machine-derived* rather than hand config: the nightly job writes it, so
+    no job ever rewrites the hand-owned ``config.yaml``. It is absent on a fresh machine,
+    which is fine, since ``load_chain_plan`` falls back to the built-in default.
+
+    It is resolved through ``paths.config_dir`` on every call, so the environment at the
+    moment of the read or the write decides. A module constant would be fixed when this
+    module is imported, and a process that pointed ``HOME`` or ``MARKETLAKE_CONFIG_DIR``
+    at a throwaway afterwards would still rewrite the real plan.
+    """
+    return config_dir() / CHAIN_PLAN_FILE
+
 
 # One window: a start day-offset and an end day-offset, the end ``None`` on the open tail.
 Window = tuple[int, "int | None"]
@@ -155,16 +162,19 @@ def _plan_from_mapping(data: object) -> ChainPlan:
     return ChainPlan(tuple(windows))
 
 
-def load_chain_plan(path: str | Path = DEFAULT_CHAIN_PLAN_PATH) -> ChainPlan:
+def load_chain_plan(path: str | Path | None = None) -> ChainPlan:
     """Read and validate the plan file, falling back to the built-in default.
+
+    ``path`` defaults to ``default_chain_plan_path()``, resolved when this runs.
 
     This is a hot-path read, so it never raises. A missing file, an unreadable file,
     malformed JSON, or a plan that fails the tiling invariant all resolve to
     ``DEFAULT_CHAIN_PLAN``. So a fresh machine with no plan file and a machine with a
-    corrupt one both capture with the measured default.
+    corrupt one both capture with the measured default. The default path is resolved
+    inside that fallback too, so a home that cannot be found falls back the same way.
     """
     try:
-        raw = Path(path).read_text()
+        raw = Path(default_chain_plan_path() if path is None else path).read_text()
         return _plan_from_mapping(json.loads(raw))
     except Exception:
         return DEFAULT_CHAIN_PLAN
@@ -172,9 +182,9 @@ def load_chain_plan(path: str | Path = DEFAULT_CHAIN_PLAN_PATH) -> ChainPlan:
 
 __all__ = [
     "DEFAULT_CHAIN_PLAN",
-    "DEFAULT_CHAIN_PLAN_PATH",
     "ChainPlan",
     "ChainPlanError",
     "Window",
+    "default_chain_plan_path",
     "load_chain_plan",
 ]

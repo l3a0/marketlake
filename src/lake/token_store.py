@@ -76,7 +76,7 @@ from lake.config import (
     is_region_name,
     load_config,
 )
-from lake.paths import TOKEN_FILE, config_dir
+from lake.paths import default_token_path
 from lake.token_epoch import epoch_second_to_utc
 
 # The parameter's name. marketlake #699 grants the VM's instance role read on it and the
@@ -454,16 +454,6 @@ def _unreadable(target: Path, why: str) -> PullResult:
     )
 
 
-def _default_token_path() -> Path:
-    """The standard token path, resolved when the command runs rather than at import.
-
-    So a ``MARKETLAKE_CONFIG_DIR`` set for the process is honoured wherever this module
-    was imported. marketlake #715 moves the package to one call-time helper, and this is
-    the one line that switches to it.
-    """
-    return config_dir() / TOKEN_FILE
-
-
 def _build_parser():
     import argparse
 
@@ -499,7 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     owner, so a run as root leaves a token the daemon cannot read.
     """
     args = _build_parser().parse_args(argv)
-    token_path = Path(args.token).expanduser() if args.token else _default_token_path()
+    token_path = Path(args.token).expanduser() if args.token else default_token_path()
     with input_errors_exit("token_store"):
         config = load_config(args.config)
         try:

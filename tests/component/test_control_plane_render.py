@@ -28,8 +28,7 @@ import pytest
 
 from lake import control_plane as cp
 from lake.metadata import stamp_assertion_pid, stamp_cycle
-from lake.paths import TOKEN_FILE, config_dir
-from lake.schwab import DEFAULT_TOKEN_PATH
+from lake.paths import CONFIG_DIR_ENV, TOKEN_FILE, config_dir, default_token_path
 from lake.tickers import Roster
 from tests.support.backup import WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
@@ -264,17 +263,18 @@ def test_the_three_consumers_name_one_file(tmp_path, capsys):
     sunday = plistlib.loads((out / "com.marketlake.sunday.plist").read_bytes())
     assert sunday["ProgramArguments"][-2:] == ["--token", token]
     # The daemon writes it. It carries no --token, so it resolves the path from the
-    # HOME its plist sets, through schwab's own spelling of the same rule. Binding the
-    # two spellings is the daemon leg of the invariant. Asserting control_plane's
+    # HOME its plist sets, through lake.paths.default_token_path. Binding the two
+    # spellings is the daemon leg of the invariant. Asserting control_plane's
     # helper against itself would pass while the daemon read another file entirely.
     daemon = plistlib.loads((out / "com.marketlake.daemon.plist").read_bytes())
     assert daemon["EnvironmentVariables"]["HOME"] == "/Users/someone"
     assert "--token" not in daemon["ProgramArguments"]
-    # config_dir rather than this process's own home: DEFAULT_TOKEN_PATH honours
-    # MARKETLAKE_CONFIG_DIR, and this leg is about schwab spelling the shared rule.
+    # config_dir rather than this process's own home: default_token_path() honours
+    # MARKETLAKE_CONFIG_DIR, and this leg is about the vendor's resolver spelling the
+    # shared rule.
     # The renderer's leg of the same rule is asserted on the line below and in
     # test_paths.test_the_control_plane_renderer_agrees_with_the_shared_rule.
-    assert str(DEFAULT_TOKEN_PATH) == str(config_dir() / TOKEN_FILE)
+    assert str(default_token_path()) == str(config_dir() / TOKEN_FILE)
     assert cp.default_token_path(daemon["EnvironmentVariables"]["HOME"]) == token
     # The exclusion protects the directory holding it.
     assert "tmutil addexclusion /Users/someone/.config/marketlake" in capsys.readouterr().out
@@ -722,6 +722,51 @@ def test_sunday_cli_scrubs_the_configured_lake_and_pings(tmp_path, capsys, monke
     assert pushes.sent == []
     printed = capsys.readouterr().out
     assert "secret-key" not in printed
+
+
+def test_the_sunday_cli_without_a_token_reads_the_override_s_token(tmp_path, monkeypatch):
+    """A by-hand ``sunday`` with no ``--token`` uses the token in ``MARKETLAKE_CONFIG_DIR``.
+
+    The canary it feeds builds a real vendor, which can refresh the token it is given. A
+    fallback spelled from ``HOME`` would hand it the live token while the override was
+    exported. ``HOME`` moves to a temporary directory too, so that spelling resolves under
+    it here rather than under the real home, and the two answers differ.
+    """
+    lake, config = _sunday_lake(tmp_path)
+    stamp_assertion_pid(lake, pid=_DAEMON_PID)
+    override = tmp_path / "override"
+    override.mkdir()
+    token = _token(override)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(override))
+    canaries = []
+
+    def canary(**kwargs):
+        canaries.append(kwargs["token_path"])
+        return _passing_canary
+
+    monkeypatch.setattr(
+        cp,
+        "read_pmset_schedule",
+        lambda: "Repeating power events:\n  wakepoweron at 8:25AM weekdays only\n",
+    )
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
+    monkeypatch.setattr(cp, "token_canary", canary)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: _Pushes())
+    monkeypatch.setattr(cp, "read_exclusions", _excluded)
+    monkeypatch.setattr(cp, "launchctl_probe", lambda label: True)
+    monkeypatch.setattr(cp, "pmset_assertions_probe", lambda pid: True)
+    code = cp.main(
+        ["sunday", "--config", str(config)],
+        clock=ManualClock(start=et(2026, 8, 30, 20, 0)),
+        calendar=weekday_sessions(date(2026, 8, 31)),
+    )
+
+    assert canaries == [str(token)]
+    # The mint is read from the same file, so a run that found the token pings.
+    assert code == 0
 
 
 def test_the_sunday_cli_scrubs_the_configured_backup_target(tmp_path, capsys, monkeypatch):

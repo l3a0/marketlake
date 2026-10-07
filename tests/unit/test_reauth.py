@@ -24,12 +24,14 @@ import builtins
 import inspect
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
 
 from lake import reauth as m
-from lake.paths import temp_write_path
+from lake.paths import CONFIG_DIR_ENV, temp_write_path
+from tests.support.config import write_config
 
 # Stand-ins, chosen so a leak is greppable. None is a real value and none ever reaches a
 # tracked file beyond this one, which is the point of picking them rather than quoting a
@@ -401,17 +403,43 @@ def test_the_writer_makes_the_config_directory_when_it_is_missing(tmp_path):
 # -- where the token goes --------------------------------------------------------------
 
 
-def test_the_default_token_path_is_where_the_vendor_reads_a_token_back():
+def test_the_default_token_path_is_where_the_vendor_reads_a_token_back(tmp_path, monkeypatch):
     """The re-auth must write where ``SchwabVendor.from_token`` looks.
 
-    Both spell the design's standard location, and they spell it separately: this module
-    builds it from ``lake.paths`` so it needs nothing from the vendor layer. Two
-    spellings can drift, and a drift would land a fresh token somewhere capture never
-    reads, which looks exactly like a re-auth that did not happen.
+    Both reach the design's standard location through ``lake.paths.default_token_path``,
+    and this module reaches it without importing the vendor layer. A drift between the
+    two would land a fresh token somewhere capture never reads, which looks exactly like
+    a re-auth that did not happen. So a re-auth given no token path writes, and a vendor
+    given no token path reads the same file back, by the mint time it carries.
     """
-    from lake.schwab import DEFAULT_TOKEN_PATH as VENDOR_TOKEN_PATH
+    from lake.schwab import SchwabVendor
 
-    assert m.DEFAULT_TOKEN_PATH == VENDOR_TOKEN_PATH
+    monkeypatch.setenv(CONFIG_DIR_ENV, str(tmp_path / "config"))
+    config = write_config(tmp_path, tmp_path / "lake", callback_url=CALLBACK)
+    live = {
+        "creation_timestamp": FRESH_TOKEN["creation_timestamp"],
+        "token": {
+            "access_token": "fake-access-token",
+            "refresh_token": "fake-refresh-token",
+            "token_type": "Bearer",
+            "expires_at": int(time.time()) + 1800,
+        },
+    }
+
+    def no_store(_config):
+        raise AssertionError("the token store is off in this config, so nothing builds a client")
+
+    report = m.reauth_from_config(
+        login_flow=RecordingFlow(token=live),
+        store_client_factory=no_store,
+        stdin_is_tty=True,
+        config_path=config,
+    )
+    assert report.token_written
+    assert report.token_path == tmp_path / "config" / "token.json"
+
+    vendor = SchwabVendor.from_token(api_key=API_KEY, app_secret=APP_SECRET)
+    assert vendor.token_mint_time().timestamp() == FRESH_TOKEN["creation_timestamp"]
 
 
 # -- what it prints --------------------------------------------------------------------

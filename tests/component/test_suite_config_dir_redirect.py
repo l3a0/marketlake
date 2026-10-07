@@ -12,9 +12,9 @@ is the file, which the directory redirect cannot move, and ``load_config`` reads
 These tests drive the redirect from both sides, and the deletion from the child side. One
 side is a child spawned the plain way, with no environment arranged for it, which is the
 shape a test writes without thinking about the config directory at all. The other side is
-this process, whose module-level defaults move with the children rather than staying
-behind. Which constants those are is read out of ``src/lake`` rather than written down
-here, so a new one joins without anyone remembering to come back.
+this process, whose defaults move with the children rather than staying behind. Which
+resolvers those are is read out of ``src/lake`` rather than written down here, so a new
+one joins without anyone remembering to come back.
 
 A child handed an explicit ``env=`` is outside the redirect, since it carries only what
 that mapping names, and so is anything the rendered ``reauth.sh`` runs, since that script
@@ -48,7 +48,6 @@ from tests.component.test_config_dir_override import (
     assert_the_scan_found_something,
 )
 from tests.conftest import _THROWAWAY_CONFIG_DIR
-from tests.support.config_defaults import modules_building_a_default
 from tests.support.config_guard import is_protected
 
 # The repo root. A child that imports the ``tests`` package needs it on ``sys.path``, and
@@ -63,12 +62,12 @@ THROWAWAY = Path(_THROWAWAY_CONFIG_DIR)
 # spells it this way.
 REAL_CONFIG_DIR = Path.home().joinpath(*CONFIG_DIR_PARTS)
 
-# The same defaults ``_DEFAULTS`` asks a child about, read in this process instead. Both
-# come from one scan of ``src/lake``, so a new default added to the package joins both
-# without anyone editing either file, which is what the two hand-written lists here used
-# to get wrong.
+# The same resolvers ``_DEFAULTS`` asks a child about, called in this process instead.
+# Both come from one scan of ``src/lake``, so a new default added to the package joins
+# both without anyone editing either file, which is what the two hand-written lists here
+# used to get wrong.
 PARENT_DEFAULTS = {
-    f"{module}.{name}": Path(getattr(import_module(module), name)) for module, name in DEFAULT_PAIRS
+    f"{module}.{name}": getattr(import_module(module), name) for module, name in DEFAULT_PAIRS
 }
 
 
@@ -117,7 +116,7 @@ def test_a_child_that_arranges_nothing_resolves_into_the_throwaway():
 def test_a_child_writing_its_default_token_lands_in_the_throwaway():
     """The incident reproduced from a child, with nothing arranged for it.
 
-    On 2026-09-13 a by-hand run wrote ``DEFAULT_TOKEN_PATH`` and the working token it
+    On 2026-09-13 a by-hand run wrote the default token path and the working token it
     replaced was gone. The same write from a child during the guard's own review did it
     again. ``write_token`` is the function the login flow's callback lands in, driven
     here at the default it would have used, in a child handed no environment and no path.
@@ -131,11 +130,13 @@ def test_a_child_writing_its_default_token_lands_in_the_throwaway():
     script = f"""
 import json
 from pathlib import Path
-from lake.reauth import DEFAULT_TOKEN_PATH, write_token
-redirected = DEFAULT_TOKEN_PATH.parent == Path({str(THROWAWAY)!r})
+from lake.paths import default_token_path
+from lake.reauth import write_token
+target = default_token_path()
+redirected = target.parent == Path({str(THROWAWAY)!r})
 if redirected:
-    write_token(DEFAULT_TOKEN_PATH, {{"creation_timestamp": 3, "token": {{"refresh_token": "x"}}}})
-print(json.dumps({{"written": str(DEFAULT_TOKEN_PATH), "redirected": redirected}}))
+    write_token(target, {{"creation_timestamp": 3, "token": {{"refresh_token": "x"}}}})
+print(json.dumps({{"written": str(target), "redirected": redirected}}))
 """
     result = _inheriting_child(script)
     written = Path(result["written"])
@@ -198,12 +199,9 @@ def test_an_inherited_config_file_is_deleted_rather_than_honoured():
     it is given no lake root.
 
     A child is the only place this can be asked, for the reason the sibling gives: importing
-    ``tests.conftest`` is what runs the deletion, and this process already ran it once. That
-    also fixes how the child names the variable. It has to read the value before importing
-    ``tests.conftest``, and importing ``lake.config`` to get the name would bind that
-    module's default against the sentinel directory, which ``tests/conftest.py`` refuses to
-    import after. So the parent interpolates the name and the child spells no import of its
-    own.
+    ``tests.conftest`` is what runs the deletion, and this process already ran it once. The
+    parent interpolates the variable's name, so the child reads the value before it imports
+    anything from ``lake``.
     """
     sentinel = "/tmp/marketlake-inherited-config-that-must-not-survive.yaml"
     script = f"""
@@ -228,69 +226,20 @@ print(json.dumps({{"before": before, "after": os.environ.get(name)}}))
 
 
 def test_the_redirect_moved_every_default_in_this_process_too():
-    """The parent moves with its children, which is what keeps two spellings together.
+    """The parent moves with its children, so every resolver the suite calls is redirected.
 
-    ``tests/unit/test_paths.py`` and ``tests/component/test_control_plane_render.py``
-    each assert that a module's bound default and a later ``config_dir()`` call name one
-    directory. A redirect reaching only children would split those apart.
-
-    This is also what notices an import-order regression, and it is the second of two
-    things that do. ``tests/conftest.py`` refuses to import at all when one of the
-    default-building modules is already in ``sys.modules``, which is the rule itself. This
-    assertion catches the consequence from the other end, including a way in that the
-    check cannot see, such as a default rebound after the fact.
+    A test that omits a path reaches a resolver in this process. With the export reaching
+    only children, that resolver would answer with the real directory, and a write the
+    guard missed would land on the live token.
     """
     assert_the_scan_found_something()
-    for name, default in PARENT_DEFAULTS.items():
+    for name, resolver in PARENT_DEFAULTS.items():
+        default = resolver()
         assert default.parent == THROWAWAY, (
-            f"{name} is bound to {default.parent}. The redirect in tests/conftest.py has "
-            "to be set before any import that builds a default from config_dir, so check "
-            "what moved above it."
+            f"{name} resolved to {default.parent}. The redirect in tests/conftest.py has "
+            "to reach this process as well as its children."
         )
     assert config_dir() == THROWAWAY
-
-
-def test_the_import_order_check_reads_the_scan():
-    """The check has to be looking at the modules the scan found, not at a list of its own.
-
-    Setting ``_BINDS_A_DEFAULT`` to an empty tuple leaves the whole suite green, because
-    the condition it feeds never fires on a healthy run. This is what notices.
-    """
-    from tests import conftest
-
-    assert conftest._BINDS_A_DEFAULT == modules_building_a_default()
-    assert conftest._BINDS_A_DEFAULT, "an empty list would make the check below fire never"
-
-
-def test_conftest_refuses_to_import_once_a_default_has_already_bound():
-    """The refusal itself, driven in a child, because a healthy run never reaches it.
-
-    A process that imports one of these modules first has bound that module's default
-    against whatever the environment said then, and no redirect can move it afterwards.
-    Importing ``tests.conftest`` there has to fail loudly rather than export a variable
-    that moves nothing.
-    """
-    script = "import lake.reauth\nimport tests.conftest\n"
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode != 0, proc.stdout
-    assert "lake.reauth" in proc.stderr
-    assert CONFIG_DIR_ENV in proc.stderr
-
-    # The other direction, so this cannot pass because importing conftest always fails.
-    clean = subprocess.run(
-        [sys.executable, "-c", "import tests.conftest\n"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert clean.returncode == 0, clean.stderr
 
 
 def test_the_redirect_does_not_disarm_the_guard():

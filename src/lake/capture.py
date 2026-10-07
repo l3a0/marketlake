@@ -80,8 +80,9 @@ from lake.config import GuardConstants, load_config
 from lake.lock import lake_lock
 from lake.manifest import append_entries, sha256_file
 from lake.metadata import stamp_cycle
+from lake.paths import default_token_path
 from lake.reference_read import read_or_none
-from lake.schwab import DEFAULT_TOKEN_PATH, SchwabVendor, is_transient_failure
+from lake.schwab import SchwabVendor, is_transient_failure
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError, master_path
 from lake.session import OPTION_CLOSE, OPTION_CLOSE_GUARD, TICK
 from lake.tickers import Roster, load_tickers
@@ -2577,7 +2578,7 @@ def run_cycle_from_config(
     live = set(live_roster.symbols)
     out_of_span = tuple(entry.ticker for entry in roster.enabled if entry.ticker not in live)
     vendor = SchwabVendor.from_token(
-        token_path if token_path is not None else DEFAULT_TOKEN_PATH,
+        token_path if token_path is not None else default_token_path(),
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,
@@ -3020,7 +3021,7 @@ def fill_option_close_from_config(
     config = load_config(config_path)
     resolved_clock = clock if clock is not None else SystemClock()
     vendor = SchwabVendor.from_token(
-        token_path if token_path is not None else DEFAULT_TOKEN_PATH,
+        token_path if token_path is not None else default_token_path(),
         api_key=config.schwab_api_key.reveal(),
         app_secret=config.schwab_app_secret.reveal(),
         clock=resolved_clock,

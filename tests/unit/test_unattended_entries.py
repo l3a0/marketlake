@@ -89,8 +89,8 @@ def run_entry(label, argv, monkeypatch) -> None:
     # The entry is stopped only by the missing config. A config found here would start
     # the daemon's loop, the dashboard's server, or a job's live seams.
     assert config.CONFIG_PATH_ENV not in os.environ
-    assert not config.DEFAULT_CONFIG_PATH.exists()
-    assert not is_protected(config.DEFAULT_CONFIG_PATH)
+    assert not config.default_config_path().exists()
+    assert not is_protected(config.default_config_path())
 
     def too_slow(signum, frame):
         pytest.fail(f"{label} ran {DEADLINE_SECONDS}s without exiting at the config load")
@@ -122,7 +122,7 @@ def test_the_entry_reaches_main_through_its_guard(label, argv, monkeypatch, caps
     # real config on every relaunch.
     _, _, module, *args = argv
     label = stderr_label(module, args)
-    expected = f"{label}: config file not found: {config.DEFAULT_CONFIG_PATH}\n"
+    expected = f"{label}: config file not found: {config.default_config_path()}\n"
     assert capsys.readouterr().err == expected
 
 
