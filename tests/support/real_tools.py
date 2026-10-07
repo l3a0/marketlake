@@ -5,6 +5,9 @@ A few checks can only be made by the tool that will read the files on the host, 
 on no Mac. So a test that needs it skips where the tool is absent, which is every Mac,
 and fails where it is absent under ``CI``. A skip on CI would leave the check silently
 unrun on the one machine that can make it.
+
+Disk tools such as ``blkid`` and ``mkfs.ext4`` live in ``/usr/sbin`` or ``/sbin``, which
+a user's ``PATH`` can leave out, so those two directories are searched after ``PATH``.
 """
 
 from __future__ import annotations
@@ -14,11 +17,14 @@ import shutil
 
 import pytest
 
+SBIN = "/usr/sbin:/sbin"
+
 
 def require_tool(name: str) -> str:
-    """The path of ``name`` on ``PATH``. Skips the test when it is absent, or fails it
-    when it is absent and ``CI`` is set, as GitHub Actions sets it."""
-    path = shutil.which(name)
+    """The path of ``name`` on ``PATH``, or else in ``/usr/sbin`` or ``/sbin``. Skips the
+    test when it is absent, or fails it when it is absent and ``CI`` is set, as GitHub
+    Actions sets it."""
+    path = shutil.which(name) or shutil.which(name, path=SBIN)
     if path is not None:
         return path
     if os.environ.get("CI"):

@@ -1309,8 +1309,9 @@ describe the instance can read it. The boot takes two steps.
 1. The shim writes the owner and the lake volume's id to
    `/etc/marketlake/bootstrap.conf`, clones `main` into `~/marketlake` as the owner, with
    up to 10 attempts 30 seconds apart, and runs `deploy/vm-bootstrap.sh`.
-2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when two
-   checks prove it blank. It writes the volume's `/etc/fstab` line, and stops when it
+2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when
+   `blkid` finds no filesystem and no ext4 superblock sits where the bootstrap's own
+   `mkfs` puts one. It writes the volume's `/etc/fstab` line, and stops when it
    cannot read the old file or when the new one would hold no entry for `/`. It installs
    the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
    times on any error, and runs `deploy/linux-install.sh`, which starts the units. Then
@@ -1390,8 +1391,14 @@ Each failure prints one line naming the step, and the exit code says how the run
 
 1. Exit 0 means every step passed.
 2. Exit 2 means the bootstrap itself refused, which happens only before the install, such
-   as on a bad `bootstrap.conf`, a lake volume that holds something other than ext4, or
-   an `/etc/fstab` with no entry for `/`.
+   as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`. It also refuses
+   three states of the lake volume, and formats nothing in any of them.
+   1. The volume holds something other than ext4.
+   2. A read of 4 KiB block 0 or 32768 failed or came back short.
+   3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
+      line prints a read-only `dumpe2fs` command, and
+      [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
+      says what to do.
 3. Exit 1 covers every other failure. A disk step or the install that fails stops the
    run at once, and the install's own refusal counts as a failure here.
    A failed render, token pull or roster apply skips only the steps that need it, and
@@ -1448,6 +1455,35 @@ git clone --branch main https://github.com/l3a0/marketlake.git ~/marketlake
 ```bash
 sudo ~/marketlake/deploy/vm-bootstrap.sh
 ```
+
+#### When the lake volume holds an unreadable ext4
+
+The bootstrap refuses with exit 2 when `blkid` finds no filesystem on the lake volume but
+an ext4 superblock sits in 4 KiB block 0 or 32768. Either the volume holds a lake whose
+primary superblock is damaged, or an earlier `mkfs` on it was interrupted. The bootstrap
+has no override for this, so tell the two apart by hand. Read group 1's backup
+superblock, read-only, on the device the bootstrap's line names.
+
+```bash
+sudo dumpe2fs -h -o superblock=32768 -o blocksize=4096 <dev>
+```
+
+Read its `Filesystem created:` line, and compare it with the first line of
+`/var/log/cloud-init-output.log`, which marks this instance's first boot. Do not read
+`Last mount time:`, because the kernel updates only the primary superblock on a mount.
+
+1. **Created before this instance launched.** The volume holds a lake. Repair the primary
+   superblock from the backup, then rerun the bootstrap.
+
+   ```bash
+   sudo e2fsck -b 32768 -B 4096 <dev>
+   ```
+
+2. **Created during this boot.** An `mkfs` on an empty volume was interrupted.
+   `ext2fs_flush` writes the backups before the primary, so the backup can exist without
+   the primary. Run the `mkfs.ext4` line in `deploy/vm-bootstrap.sh` by hand on `<dev>`,
+   then rerun the bootstrap. Take the flags from the script rather than from here, so
+   the two cannot drift apart.
 
 A clone cut off partway can leave `~/marketlake` with no valid `HEAD`, and then the
 clone refuses because the directory exists. When
