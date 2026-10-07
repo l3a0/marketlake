@@ -12,6 +12,7 @@ from datetime import date
 
 import pytest
 
+from lake import chain_plan
 from lake.chain_plan import (
     DEFAULT_CHAIN_PLAN,
     ChainPlan,
@@ -136,3 +137,15 @@ def test_load_returns_the_default_on_a_wrong_shape(tmp_path):
     path = tmp_path / "chain_plan.json"
     _write(path, {"plan": []})
     assert load_chain_plan(path) is DEFAULT_CHAIN_PLAN
+
+
+def test_load_returns_the_default_when_the_default_path_cannot_be_resolved(monkeypatch):
+    # Every capture cycle calls the loader with no path, so the default is resolved on the
+    # capture path. ``Path.home()`` raises ``RuntimeError`` when no home can be found, and
+    # a cycle that raised there would lose its minute rather than capture with the
+    # built-in plan.
+    def no_home() -> None:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(chain_plan, "default_chain_plan_path", no_home)
+    assert load_chain_plan() is DEFAULT_CHAIN_PLAN

@@ -211,6 +211,20 @@ def test_a_file_naming_only_a_resolver_is_still_read(tmp_path):
             "from lake.paths import config_dir\n"
             "for _ in range(0):\n    pass\nelse:\n    D = config_dir() / 'x'\n",
         ),
+        (
+            "while-else",
+            "from lake.paths import config_dir\n"
+            "while False:\n    pass\nelse:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "try-else",
+            "from lake.paths import config_dir\n"
+            "try:\n    pass\nexcept OSError:\n    pass\nelse:\n    D = config_dir() / 'x'\n",
+        ),
+        (
+            "augmented",
+            "from lake.paths import config_dir\nD = ()\nD += (config_dir() / 'x',)\n",
+        ),
     ],
 )
 def test_a_constant_bound_under_a_top_level_block_is_found(tmp_path, name, source):
@@ -239,6 +253,15 @@ def test_a_chained_assignment_names_every_target(tmp_path):
         {"probe.py": "from lake.paths import config_dir\nA = B = config_dir() / 'x'\n"},
     )
     assert bindings_at_import(root) == (("lake.probe", "A"), ("lake.probe", "B"))
+
+
+def test_an_assignment_that_binds_no_name_is_still_found(tmp_path):
+    """A subscript target binds no plain name, and the path it stores is fixed all the same."""
+    root = _package(
+        tmp_path / "lake",
+        {"probe.py": "from lake.paths import config_dir\nD = {}\nD['x'] = config_dir() / 'x'\n"},
+    )
+    assert bindings_at_import(root) == (("lake.probe", "<assignment>"),)
 
 
 def test_two_constants_in_one_module_are_both_found(tmp_path):
@@ -412,6 +435,14 @@ def _scan(tmp_path: Path, source: str) -> Path:
             "except ImportError:\n    pass\n"
             "P = _wrap()\n"
         ),
+        # The same under the ``except`` clause, the fallback shape.
+        (
+            "try:\n    pass\n"
+            "except ImportError:\n    def _wrap():\n        return config_dir()\n"
+            "P = _wrap()\n"
+        ),
+        # An async wrapper run to completion at import.
+        "import asyncio\nasync def _wrap():\n    return config_dir()\nP = asyncio.run(_wrap())\n",
     ],
 )
 def test_a_wrapper_called_at_import_is_found(tmp_path, source):
@@ -493,6 +524,8 @@ def test_path_home_at_import_is_found(tmp_path, source):
     [
         # Inside a function body, which runs when called.
         "def where():\n    return Path.home() / 'x'\n",
+        # The same for an async function, whose body runs when it is awaited.
+        "async def where():\n    return Path.home() / 'x'\n",
         # An attribute read, not a call.
         "class Host:\n    home = '/h'\nH = Host.home\n",
         # A home method on something that is not a Path.
@@ -572,6 +605,8 @@ def test_a_resolver_reached_through_an_alias_or_the_module_is_listed(tmp_path):
     [
         # An inline default in an ordinary function.
         "def load(path=None):\n    return path or config_dir() / 'x'\n",
+        # The same through an alias made on import.
+        "from lake.paths import config_dir as cd\ndef load():\n    return cd() / 'x'\n",
         # A resolver named any other way, such as a private one.
         "def _default_token_path():\n    return config_dir() / 'token.json'\n",
         # A resolver nested inside another function is not module-level.
