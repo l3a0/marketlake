@@ -60,7 +60,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from lake.calendar import MARKET_TZ
-from lake.capture import CycleResult, SegmentOutcome
+from lake.capture import TOKEN_FILE_UNREADABLE, CycleResult, SegmentOutcome
 from lake.journal import QUOTES_SURFACE, ROW_KIND_DATA
 
 # What the design pins as the page threshold, in consecutive session minutes without a
@@ -72,14 +72,20 @@ DEFAULT_PAGE_MINUTES = 3
 # them. Each gaps every ticker on every surface at once, so the per-surface fan-out
 # would page the roster and name nothing. The design puts auth death and sustained rate
 # limiting in this deliverable for exactly that reason.
+TOKEN_DEAD = "Capture down: token dead"
+
 _WHOLE_DAEMON_CAUSES = {
-    "http_401": "Capture down: token dead",
-    "http_403": "Capture down: token dead",
+    "http_401": TOKEN_DEAD,
+    "http_403": TOKEN_DEAD,
     # The other shape of a dead token. When the refresh fails no request goes out, so
     # there is no status to record and the vendor raises instead. ``schwab`` collapses
     # every such raise onto one class the lake owns, so this maps one string rather
     # than a list of the library's exception names.
-    "vendor_auth_error": "Capture down: token dead",
+    "vendor_auth_error": TOKEN_DEAD,
+    # A token file the cycle could not read at all: missing, unreadable, or not a token
+    # (marketlake #702). The page's body names the class, which tells this apart from a
+    # token Schwab refused, and a pull from the token parameter repairs either.
+    TOKEN_FILE_UNREADABLE: TOKEN_DEAD,
     "http_429": "Capture down: rate limited",
 }
 
@@ -154,6 +160,76 @@ class Page:
     tickers: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _Tally:
+    """One cycle read the way every counter reads it.
+
+    ``touched`` is every surface the cycle wrote a segment for or could not journal.
+    ``failed`` is the touched surfaces that landed no data row. ``recorded`` is the class
+    each failed segment is failing with, per :func:`_failure_class`. A surface whose
+    segment could not be written is failed and touched but has no entry there, because a
+    write failure says nothing about what the vendor did.
+    """
+
+    touched: frozenset[Surface]
+    failed: frozenset[Surface]
+    recorded: dict[Surface, str | None]
+
+
+def _tally(result: CycleResult) -> _Tally:
+    """Read one cycle into what it touched, what failed, and the class each failure recorded."""
+    produced: set[Surface] = set()
+    touched: set[Surface] = set()
+    for segment in result.segments:
+        key = Surface(segment.surface, segment.ticker)
+        touched.add(key)
+        if segment.landed_data:
+            produced.add(key)
+    for error in result.errors:
+        touched.add(Surface(error.surface, error.ticker))
+    failed = touched - produced
+    recorded: dict[Surface, str | None] = {
+        Surface(segment.surface, segment.ticker): _failure_class(segment)
+        for segment in result.segments
+        if Surface(segment.surface, segment.ticker) in failed
+    }
+    return _Tally(frozenset(touched), frozenset(failed), recorded)
+
+
+def _whole_daemon_title(tally: _Tally) -> str | None:
+    """The cause's title when the tally is one whole-daemon failure, and ``None`` otherwise."""
+    if not tally.failed or tally.failed != tally.touched or len(tally.touched) < 2:
+        return None
+    classes = {error_class for error_class in tally.recorded.values() if error_class is not None}
+    if len(classes) != 1:
+        return None
+    return _WHOLE_DAEMON_CAUSES.get(classes.pop())
+
+
+def whole_daemon_cause(result: CycleResult) -> str | None:
+    """The title of the one cause that took this whole cycle down, or ``None``.
+
+    Three things have to hold.
+
+    1. The cycle touched at least two surfaces, because one surface cannot be the whole
+       daemon by itself.
+    2. Every touched surface failed, because one surface landing rows proves the vendor
+       answered that minute.
+    3. The classes the failed segments recorded come to exactly one, and
+       ``_WHOLE_DAEMON_CAUSES`` names it.
+
+    A chain that answered with no contract counts as ``contracts_absent`` and breaks the
+    unanimity. A surface whose segment could not be written records no class and does not.
+
+    This reads one cycle and no threshold, so it says what the cycle was rather than
+    whether a page is owed. The watchdog's page decision reads it, and so does the daemon,
+    which spawns a token pull on a cycle whose cause is ``TOKEN_DEAD`` without waiting for
+    the page (marketlake #702). One rule serving both keeps the pull and the page from
+    disagreeing about which cycles are a dead token.
+    """
+    return _whole_daemon_title(_tally(result))
+
+
 class Watchdog:
     """Counters for every ticker and surface, and the pages they raise.
 
@@ -214,27 +290,16 @@ class Watchdog:
         whatever else this minute owes, a cause page included, because a clamp and a dead
         token have different repairs.
         """
-        produced: set[Surface] = set()
-        touched: set[Surface] = set()
-        for segment in result.segments:
-            key = Surface(segment.surface, segment.ticker)
-            touched.add(key)
-            if segment.landed_data:
-                produced.add(key)
-        for error in result.errors:
-            touched.add(Surface(error.surface, error.ticker))
+        tally = _tally(result)
+        touched = set(tally.touched)
+        failed = set(tally.failed)
+        recorded = tally.recorded
         self._roll(result.snap_ts)
         self._drop_departed(touched, result.out_of_span)
-        failed = touched - produced
-        for key in produced:
+        for key in touched - failed:
             self._reset(key)
         for key in sorted(failed, key=str):
             self._counts[key] = self._counts.get(key, 0) + 1
-        recorded: dict[Surface, str | None] = {
-            Surface(segment.surface, segment.ticker): _failure_class(segment)
-            for segment in result.segments
-            if Surface(segment.surface, segment.ticker) in failed
-        }
         # A surface that answered and brought nothing is not failing for any cause's
         # reason, so it leaves every cause that named it, before any cause is asked
         # whether it is still live this minute.
@@ -249,7 +314,7 @@ class Watchdog:
         self._release_retired(touched)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
-        cause = self._whole_daemon(recorded, failed, touched, threshold)
+        cause = self._whole_daemon(tally, threshold)
         if cause is not None:
             return cause + out_of_span
         return self._pages(failed, touched, threshold=threshold, classes=classes) + out_of_span
@@ -335,13 +400,7 @@ class Watchdog:
             )
         ]
 
-    def _whole_daemon(
-        self,
-        recorded: dict[Surface, str | None],
-        failed: set[Surface],
-        touched: set[Surface],
-        threshold: int,
-    ) -> list[Page] | None:
+    def _whole_daemon(self, tally: _Tally, threshold: int) -> list[Page] | None:
         """One page naming the cause, when every surface failed the same way.
 
         The refresh token dies every seven days by design, and a dead token gaps chains
@@ -362,21 +421,18 @@ class Watchdog:
         carries both, so counting by class would page the same outage a second time under
         the same title when the vendor changed how it said no.
 
-        ``recorded`` is the class each failed segment is failing with, ``contracts_absent``
-        included, so a chain that answered 200 with no contract counts against unanimity.
-        That answer proves at least one of its requests authenticated and got through, so
-        the cycle is not one cause. A surface whose segment could not be written is left out,
-        because a write failure says nothing about what the vendor did.
+        Which cycles count is :func:`whole_daemon_cause`'s rule, read here off the same
+        tally ``observe`` counted, so the page and the daemon's token pull cannot drift. A
+        chain that answered 200 with no contract counts against unanimity as
+        ``contracts_absent``. That answer proves at least one of its requests authenticated
+        and got through, so the cycle is not one cause.
         """
-        if not failed or failed != touched or len(touched) < 2:
-            return None
-        classes = {error_class for error_class in recorded.values() if error_class is not None}
-        if len(classes) != 1:
-            return None
-        error_class = classes.pop()
-        title = _WHOLE_DAEMON_CAUSES.get(error_class)
+        title = _whole_daemon_title(tally)
         if title is None:
             return None
+        failed = tally.failed
+        # The rule passed, so the failed segments recorded exactly one class.
+        error_class = next(c for c in tally.recorded.values() if c is not None)
         if title in self._paged_causes:
             return []
         if any(self._counts.get(key, 0) < threshold for key in failed):
@@ -622,7 +678,9 @@ class Watchdog:
 __all__ = [
     "CONTRACTS_ABSENT",
     "DEFAULT_PAGE_MINUTES",
+    "TOKEN_DEAD",
     "Page",
     "Surface",
     "Watchdog",
+    "whole_daemon_cause",
 ]

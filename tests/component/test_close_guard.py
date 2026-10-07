@@ -186,6 +186,7 @@ def test_the_daemon_answers_the_close_tag_hook_from_the_calendar(tmp_path):
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=three,
     )
     # 15:59, 16:00, 16:01. A bare daemon answers None for every slot, so this checks that
@@ -668,6 +669,7 @@ def test_the_guard_writes_the_close_minutes_before_gap_marking_claims_them(tmp_p
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=once,
     )
 
@@ -895,6 +897,7 @@ def test_the_daemon_gives_the_guard_live_spans_and_the_master(tmp_path):
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=six,
     )
 

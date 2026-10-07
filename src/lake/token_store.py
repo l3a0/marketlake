@@ -16,9 +16,11 @@ Three pieces live here.
 
 1. ``mode_of`` reads the per-host ``token_store`` key. ``file`` keeps the token in
    ``token.json`` alone. ``both`` and ``store`` make the re-auth put the parameter after
-   it writes the file. ``store`` and any other value make the VM's scheduled pulls run,
-   which marketlake #702 adds. An unknown value prints one line and falls to the side
-   that cannot cost a token: the re-auth still writes the file and tries the put.
+   it writes the file. ``store`` and any other value make the VM's scheduled pulls run:
+   before each Sunday canary attempt, and from the daemon while capture is down on a dead
+   token or a token file it cannot read (marketlake #702). An unknown value prints one
+   line and falls to the side that cannot cost a token: the re-auth still writes the
+   file and tries the put.
 2. ``push`` is the re-auth's put. It sends the JSON text the login wrote, as a string,
    never a read-back of the file. It signs only as the role ``token_store_role_arn``
    names, which may only put this one parameter, in ``token_store_region``. The command
@@ -544,7 +546,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``store older`` and ``unreadable``, and 3 for ``no credentials``. A config problem
     exits 2 with one line. It builds the real client itself and takes no seam. It does
     not read ``token_store``: running it is the decision, and the gate belongs to the
-    scheduled calls that marketlake #702 adds. It reads no ``role`` either, so it runs on
+    scheduled calls, the Sunday job's and the daemon's (marketlake #702), which each read
+    ``mode_of`` before they pull. It reads no ``role`` either, so it runs on
     a shadow host, as the VM's first boot is.
 
     Run it as the account that runs the daemon. ``os.replace`` keeps the temp file's

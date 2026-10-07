@@ -2530,6 +2530,115 @@ def run_cycle(
     return cycle.run()
 
 
+class TokenFileUnreadable(Exception):
+    """The token file could not be built into a client, so this cycle fetched nothing.
+
+    It subclasses ``Exception`` directly, so ``is_transient_failure`` never matches it and
+    no window or quote batch is sent again. Its message names the build's exception class
+    and nothing else, because the class is what decides the repair.
+    """
+
+
+# The gap class every surface records on a cycle whose token file could not be read. It is
+# ``_error_class`` of the exception above, spelled once so the watchdog maps the same string.
+TOKEN_FILE_UNREADABLE = _snake_case(TokenFileUnreadable.__name__)
+
+
+class _UnreadableTokenVendor:
+    """The vendor a cycle runs on when the token file could not be built into one.
+
+    Every ``Vendor`` method is defined and raises ``TokenFileUnreadable``, so every
+    surface writes a gap row carrying ``token_file_unreadable``, as any raised fetch does.
+    The cycle then neither lands data nor reports ``nothing_to_capture``, so the capture
+    dead-man goes unfed and pages as it would for a dead token. ``_stamp`` already swallows
+    a raising ``token_mint_time``, so the cycle skips its metadata stamp.
+
+    Each method is written out rather than answered by ``__getattr__``. ``_close_vendor``
+    reads ``close`` with ``getattr`` in the cycle's ``finally``, and an attribute lookup
+    that raised there would bring the crash back from the ``finally``. ``close`` is
+    defined too, and does nothing, since there is no client to close.
+    """
+
+    def __init__(self, build_error: str) -> None:
+        self._build_error = build_error
+
+    def _refused(self) -> TokenFileUnreadable:
+        return TokenFileUnreadable(f"token file not read: {self._build_error}")
+
+    def get_chain(
+        self,
+        symbol: str,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        strike_count: int | None = None,
+    ) -> VendorResponse:
+        raise self._refused()
+
+    def get_quotes(self, symbols: Sequence[str]) -> VendorResponse:
+        raise self._refused()
+
+    def get_minute_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        raise self._refused()
+
+    def get_daily_bars(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+        extended_hours: bool | None = None,
+        previous_close: bool | None = None,
+    ) -> VendorResponse:
+        raise self._refused()
+
+    def token_mint_time(self) -> datetime:
+        raise self._refused()
+
+    def close(self) -> None:
+        """Nothing to close: no client was built."""
+
+
+def _token_file_unreadable(exc: BaseException) -> _UnreadableTokenVendor:
+    """The stand-in vendor for a failed build, after one line naming the build's class.
+
+    The gap class alone cannot tell a missing file from one owned by root, which a pull
+    run as root leaves, or from a corrupt one, and each needs a different repair. So the
+    daemon's log gets the class, and only the class, the way the Sunday canary prints its
+    own failure. A message could carry the token's path or a fragment of its contents.
+    The price is up to one line a minute while it lasts.
+    """
+    build_error = type(exc).__name__
+    _say_built(
+        lambda: (
+            f"capture: the token file could not be read ({build_error}), so this cycle "
+            f"gaps every surface as {TOKEN_FILE_UNREADABLE}"
+        )
+    )
+    return _UnreadableTokenVendor(build_error)
+
+
+def _names_token_file(exc: OSError, token_path: str | Path) -> bool:
+    """Whether ``exc`` was raised reading the token file itself.
+
+    ``SchwabVendor.from_token`` reads the file at ``Path(token_path)``, and an ``OSError``
+    from that read names it in ``filename``. Any other file the build opens, such as the CA
+    bundle httpx loads, names that file instead, or none at all.
+    """
+    filename = exc.filename
+    if not isinstance(filename, str | bytes | os.PathLike):
+        return False
+    return Path(os.fsdecode(filename)) == Path(token_path)
+
+
 def run_cycle_from_config(
     *,
     clock: Clock | None = None,
@@ -2548,7 +2657,9 @@ def run_cycle_from_config(
     authenticated vendor from the token file, and runs the same core cycle. Every call
     reloads all four inputs: the config, the roster, the token, and the chain plan. Nothing
     is cached across calls. That is the per-cycle re-read the design wants, so a nightly
-    plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
+    plan rewrite takes effect the next minute. A re-auth is picked up the next cycle on
+    the host whose file the re-auth rewrote. A host that receives the token through the
+    token parameter picks it up the cycle after its next pull writes the file.
     The ``schwab-py`` client is built only here, lazily inside ``SchwabVendor.from_token``,
     so importing this module and running the offline suite need neither the library nor a
     real token. A test drives ``run_cycle`` directly with fakes instead. ``close_tag``,
@@ -2570,6 +2681,19 @@ def run_cycle_from_config(
     nothing sooner either: a probe with httpx 0.28.1 closed a client one second into a
     request, and the request still ran to its 30s read timeout. So the close waits, and an
     abandoned request's sockets close at most that long after the bound.
+
+    A token file the build cannot use costs the minute and never the daemon (marketlake
+    #702). A missing file raises ``FileNotFoundError``, one the account cannot read
+    ``PermissionError``, and one that is not ``schwab-py``'s token ``ValueError``,
+    ``KeyError`` or ``TypeError``. Raised here, any of them ended the daemon's loop, and the
+    service manager restarted it into the same raise every capture minute. So the cycle
+    runs against ``_UnreadableTokenVendor`` instead, and every surface gaps as
+    ``token_file_unreadable``. The watchdog folds that into "Capture down: token dead".
+    Under ``token_store: store`` or an unknown value, the daemon pulls the token parameter
+    on it. Only the build is caught, and an ``OSError`` only when it names the token file,
+    since the build reads other files too, such as the CA bundle httpx loads. Any other
+    ``OSError``, and a raise from the config, the roster or the cycle itself, still ends
+    the call as before.
     """
     config = load_config(config_path)
     roster = load_tickers(tickers_path)
@@ -2577,12 +2701,23 @@ def run_cycle_from_config(
     live_roster = _live_roster(roster, config.lake_root, resolved_clock.now())
     live = set(live_roster.symbols)
     out_of_span = tuple(entry.ticker for entry in roster.enabled if entry.ticker not in live)
-    vendor = SchwabVendor.from_token(
-        token_path if token_path is not None else default_token_path(),
-        api_key=config.schwab_api_key.reveal(),
-        app_secret=config.schwab_app_secret.reveal(),
-        clock=resolved_clock,
-    )
+    resolved_token = token_path if token_path is not None else default_token_path()
+    api_key = config.schwab_api_key.reveal()
+    app_secret = config.schwab_app_secret.reveal()
+    vendor: Vendor
+    try:
+        vendor = SchwabVendor.from_token(
+            resolved_token, api_key=api_key, app_secret=app_secret, clock=resolved_clock
+        )
+    except OSError as exc:
+        # Only the token file's own read. httpx loads its CA bundle while the client is
+        # built, so a missing ``SSL_CERT_FILE`` raises ``FileNotFoundError`` here too, and
+        # a pull cannot repair that. It ends the call as it did before marketlake #702.
+        if not _names_token_file(exc, resolved_token):
+            raise
+        vendor = _token_file_unreadable(exc)
+    except (ValueError, KeyError, TypeError) as exc:
+        vendor = _token_file_unreadable(exc)
     abandoned: list[Future] = []
     try:
         return run_cycle(
@@ -3044,12 +3179,14 @@ def fill_option_close_from_config(
 
 __all__ = [
     "REQUEST_ABANDONED",
+    "TOKEN_FILE_UNREADABLE",
     "ChainFetch",
     "FillResult",
     "CycleResult",
     "SegmentError",
     "RequestAbandoned",
     "SegmentOutcome",
+    "TokenFileUnreadable",
     "cycle_deadline",
     "fetch_chain",
     "fill_option_close",

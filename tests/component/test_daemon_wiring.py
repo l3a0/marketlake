@@ -8,13 +8,14 @@ here drives the production entry and watches the far end of one binding, apart f
 case under item 15, which watches the reads instead.
 
 Each runs that entry with a manual clock, a fake calendar, and a throwaway config,
-roster, and lake on disk. The three seams that reach past the process are faked: the
-ntfy transport, the health-check pinger, and the backup's ``rsync``. A page sent from a
-test is a page a person receives, and a sync from one copies a throwaway lake onto the
-machine running the suite. So the tier is component: the daemon over real files, with the
+roster, and lake on disk. The four seams that reach past the process are faked: the
+ntfy transport, the health-check pinger, the backup's ``rsync``, and the token pull. A
+page sent from a test is a page a person receives, a sync from one copies a throwaway
+lake onto the machine running the suite, and a pull from one reads the real token
+parameter. So the tier is component: the daemon over real files, with the
 clock, the calendar, the network, and the backup still fake.
 
-Fifteen bindings are covered here.
+Sixteen bindings are covered here.
 
 1. The skipped-slot hook reaches the gap marker, so a live stall records the minutes it
    slept through.
@@ -72,6 +73,10 @@ Fifteen bindings are covered here.
     that will not load by standing down in silence. So this case records the path each
     config, roster and token read receives, and every one has to be ``None`` or the
     default token path.
+16. The cycle hook spawns a token pull on a cycle the watchdog's rule reads as a dead
+    token, on the first such cycle and then at most once every five minutes of slots
+    (marketlake #702). A token file the cycle cannot read is one such cycle, so a missing
+    file heals on the cycle after the pull writes it.
 """
 
 from __future__ import annotations
@@ -214,9 +219,31 @@ class _Compactions:
         return None
 
 
+class _Pulls:
+    """A ``PullRunner`` that records each spawn instead of starting a child.
+
+    ``then`` makes every spawn also run a step in-process after recording it, which is how
+    a test stands in for what the child does, such as writing the token, or for a spawn
+    that raises.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self._then: Callable[[], None] | None = None
+
+    def then(self, step: Callable[[], None]) -> None:
+        self._then = step
+
+    def __call__(self, args: Sequence[str]) -> object:
+        self.calls.append(list(args))
+        if self._then is not None:
+            self._then()
+        return None
+
+
 @dataclass(frozen=True)
 class _Rig:
-    """The throwaway machine one daemon run reads, and the fakes for its three endpoints."""
+    """The throwaway machine one daemon run reads, and the fakes for its four endpoints."""
 
     lake_root: Path
     config: Path
@@ -226,6 +253,7 @@ class _Rig:
     transport: _Recording
     pinger: FakePinger
     compaction: _Compactions
+    pulls: _Pulls
 
 
 def _rig(
@@ -257,6 +285,7 @@ def _rig(
         transport=_Recording(),
         pinger=FakePinger(),
         compaction=_Compactions(),
+        pulls=_Pulls(),
     )
 
 
@@ -280,8 +309,12 @@ def _run(
     ticks: int,
     cycle_runner=None,
     hooks: daemon.DaemonHooks | None = None,
+    pulls: bool = True,
 ) -> None:
     """Run the production entry over ``ticks`` minutes of the fake calendar's week.
+
+    ``pulls`` left true hands the loop the rig's pull recorder. False hands it ``None``,
+    which is the host whose ``token_store`` is ``file`` or ``both``.
 
     ``cycle_runner`` left unset is the real one, the closure over the capture entry.
     The power assertion is a seam for a reason: left to its default it spawns the real
@@ -302,6 +335,7 @@ def _run(
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls if pulls else None,
         cycle_runner=cycle_runner,
         hooks=hooks,
         should_continue=_stop_after(ticks),
@@ -2024,6 +2058,7 @@ def test_a_holiday_still_runs_the_job_so_its_check_is_fed(tmp_path):
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(2),
     )
@@ -2051,6 +2086,7 @@ def test_a_weekend_owes_the_job_nothing(tmp_path):
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(2),
     )
@@ -2403,6 +2439,7 @@ def test_a_compaction_spawn_that_raises_costs_the_seal_and_not_the_session(tmp_p
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=_boom,
+        pull_runner=rig.pulls,
         cycle_runner=_no_cycle,
         hooks=hooks,
         should_continue=_stop_after(4),
@@ -2493,6 +2530,7 @@ def _assertion_run(rig, clock, *, ticks: int, runner, hooks=None) -> None:
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls,
         cycle_runner=_no_cycle,
         hooks=hooks,
         should_continue=_stop_after(ticks),
@@ -2619,6 +2657,7 @@ def test_a_page_the_transport_refuses_is_not_retried_every_minute(tmp_path, caps
         transport=refusing,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(4),
     )
@@ -3086,6 +3125,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
         transport=rig.transport,
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
+        pull_runner=rig.pulls,
         hooks=daemon.DaemonHooks(
             on_tick=stall,
             on_cycle=lambda slot, result: cycles.append(slot),
@@ -3133,3 +3173,308 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
         assert not missing, f"{reader} never read by {sorted(missing)}"
     for reader in ("load_config", "load_tickers", FROM_TOKEN):
         assert "lake.capture.run_cycle_from_config" in reads.callers(reader), reader
+
+
+# -- 16. the cycle hook spawns a token pull in auth death (marketlake #702) --------------
+
+
+def _failing(slot: datetime, chains: str | None, quotes: str | None) -> CycleResult:
+    """One SPY cycle whose chains and quotes each failed with a class, or landed for ``None``."""
+
+    def segment(surface: str, error_class: str | None) -> SegmentOutcome:
+        if error_class is None:
+            return _segment(journal.ROW_KIND_DATA, Path("unused"), surface, "SPY")
+        gapped = _segment(journal.ROW_KIND_GAP, Path("unused"), surface, "SPY")
+        return replace(gapped, error_class=error_class)
+
+    return CycleResult(
+        snap_ts=slot,
+        segments=(segment(journal.CHAINS_SURFACE, chains), segment(journal.QUOTES_SURFACE, quotes)),
+    )
+
+
+def _cycles(*minutes: tuple[str | None, str | None]):
+    """A cycle runner answering the minutes in order, each a pair of chains and quotes classes."""
+    queue = list(minutes)
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        chains, quotes = queue.pop(0)
+        return _failing(slot, chains, quotes)
+
+    return runner
+
+
+def _pulled_at(err: str) -> list[datetime]:
+    """The slots the daemon's log says a pull started on."""
+    marker = ": capture is down on a dead token, so a token pull started"
+    return [
+        datetime.fromisoformat(line.removeprefix("daemon: ").removesuffix(marker))
+        for line in err.splitlines()
+        if line.endswith(marker)
+    ]
+
+
+DEAD = ("http_401", "http_401")
+LIVE = (None, None)
+
+
+def test_a_dead_token_spawns_a_pull_on_its_first_cycle_before_any_page(tmp_path, capsys):
+    """The pull goes out on the first dead minute, not at the watchdog's threshold.
+
+    The watchdog pages "token dead" after 3 minutes. On a host with no browser the repair
+    is a newer token in the token parameter, so waiting for the page would add three
+    minutes to every outage a re-auth elsewhere had already fixed. The argv carries the
+    daemon's own two files after ``pull``, so the child reads what the daemon reads.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    pages_at_pull: list[int] = []
+    rig.pulls.then(lambda: pages_at_pull.append(len(rig.transport.sent)))
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=3, cycle_runner=_cycles(DEAD, DEAD, DEAD))
+
+    assert rig.pulls.calls == [
+        [
+            sys.executable,
+            "-m",
+            "lake.token_store",
+            "pull",
+            "--config",
+            str(rig.config),
+            "--token",
+            str(rig.token),
+        ]
+    ]
+    assert pages_at_pull == [0]
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0)]
+    # The page still goes out at the threshold, since nothing healed capture here.
+    assert [message.title for message in rig.transport.sent] == ["Capture down: token dead"]
+
+
+def test_a_dead_token_that_lasts_pulls_at_most_once_every_five_minutes_of_slots(tmp_path, capsys):
+    # A pull's SSM client gives up after about two minutes, so five minutes apart keeps two
+    # spawns from overlapping, and an outage that lasts the session spawns about 78.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=11, cycle_runner=_cycles(*[DEAD] * 11))
+
+    assert _pulled_at(capsys.readouterr().err) == [
+        et(2026, 9, 2, 10, 0),
+        et(2026, 9, 2, 10, 5),
+        et(2026, 9, 2, 10, 10),
+    ]
+    assert len(rig.pulls.calls) == 3
+
+
+def test_a_good_cycle_between_two_dead_ones_does_not_reset_the_spacing(tmp_path, capsys):
+    # The spacing reads slots alone. A token that flaps between dead and live would
+    # otherwise spawn a pull on every dead minute after a live one.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=6, cycle_runner=_cycles(DEAD, LIVE, DEAD, DEAD, DEAD, DEAD))
+
+    assert _pulled_at(capsys.readouterr().err) == [
+        et(2026, 9, 2, 10, 0),
+        et(2026, 9, 2, 10, 5),
+    ]
+
+
+def test_a_restart_forgets_the_spacing_and_pulls_on_its_first_dead_cycle(tmp_path, capsys):
+    # The last pull's slot lives in one run of the loop, not in the module. So a daemon
+    # restarted two minutes after its predecessor pulled pulls on its own first dead
+    # minute, inside the five minutes the predecessor would have waited.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    _run(
+        rig, ManualClock(start=et(2026, 9, 2, 9, 59, 30)), ticks=2, cycle_runner=_cycles(DEAD, DEAD)
+    )
+    first = _pulled_at(capsys.readouterr().err)
+    _run(
+        rig, ManualClock(start=et(2026, 9, 2, 10, 1, 30)), ticks=2, cycle_runner=_cycles(DEAD, DEAD)
+    )
+    second = _pulled_at(capsys.readouterr().err)
+
+    assert first == [et(2026, 9, 2, 10, 0)]
+    assert second == [et(2026, 9, 2, 10, 2)]
+    assert len(rig.pulls.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "minute",
+    [
+        pytest.param(("http_401", None), id="quotes-landed"),
+        pytest.param((None, "http_401"), id="chains-landed"),
+        pytest.param(("http_401", "vendor_auth_error"), id="two-classes"),
+        pytest.param(("http_500", "http_500"), id="not-an-auth-class"),
+        pytest.param(("http_429", "http_429"), id="rate-limited"),
+    ],
+)
+def test_a_cycle_that_is_not_one_dead_token_spawns_no_pull(minute, tmp_path, capsys):
+    # One surface landing rows proves the token authenticated that minute, and two classes
+    # are two failures, so neither is the watchdog's "token dead" and neither pulls.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_cycles(*[minute] * 4))
+
+    assert rig.pulls.calls == []
+    assert _pulled_at(capsys.readouterr().err) == []
+
+
+def test_a_dead_token_on_one_surface_alone_spawns_no_pull(tmp_path):
+    # The default roster touches one surface, and the rule needs two, as the page does.
+    rig = _rig(tmp_path)
+    dead = replace(_segment(journal.ROW_KIND_GAP, tmp_path), error_class="http_401")
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=4,
+        cycle_runner=lambda *, slot, close_tag, session_phase: CycleResult(slot, (dead,)),
+    )
+
+    assert rig.pulls.calls == []
+
+
+def test_a_pull_that_does_not_start_costs_the_pull_and_not_the_daemon(tmp_path, capsys):
+    """The cycle hook has no guard around it, so the spawn guards itself.
+
+    A fork the 2 GiB VM refuses would otherwise end the loop, and the service manager
+    would restart it into the same refusal. The spawn prints one line, the loop keeps
+    ticking, and the next pull is tried five minutes of slots later.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+
+    def refuse() -> None:
+        raise OSError(12, "Cannot allocate memory")
+
+    rig.pulls.then(refuse)
+    ticks: list[datetime] = []
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=6,
+        cycle_runner=_cycles(*[DEAD] * 6),
+        hooks=daemon.DaemonHooks(on_tick=ticks.append),
+    )
+
+    assert len(ticks) == 6, "the loop died on the failed spawn"
+    assert len(rig.pulls.calls) == 2
+    refused = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.endswith("token pull did not start: OSError")
+    ]
+    assert len(refused) == 2
+
+
+def test_a_host_that_pulls_nothing_runs_the_same_outage_without_a_spawn(tmp_path, capsys):
+    # ``None`` is the ``file`` or ``both`` host, which ran the re-auth itself. The outage
+    # still pages, and nothing is spawned or printed about a pull.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=6, cycle_runner=_cycles(*[DEAD] * 6), pulls=False)
+
+    assert rig.pulls.calls == []
+    assert "token pull" not in capsys.readouterr().err
+    assert [message.title for message in rig.transport.sent] == ["Capture down: token dead"]
+
+
+def test_a_missing_token_file_heals_on_the_cycle_after_the_pull_writes_it(tmp_path, monkeypatch):
+    """Done-when 4 end to end, through the production cycle runner.
+
+    The token file is missing, which is a VM whose first-boot pull failed. Each cycle
+    records ``token_file_unreadable`` on every surface instead of ending the daemon, so
+    the cycle hook reads the minute as a dead token and spawns a pull. The fake runner
+    stands in for the child and writes the token, and the next cycle builds its vendor
+    from the file and captures. The roster carries options, so the cycle touches two
+    surfaces. The equity-only default touches one and never pulls.
+    """
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    monkeypatch.setattr(capture, "load_chain_plan", lambda: load_chain_plan(rig.plan))
+    write_chain_plan(ONE_WINDOW, rig.plan)
+    vendor = _PlanVendor()
+
+    class _NeedsTheFile:
+        @staticmethod
+        def from_token(path, *, api_key, app_secret, clock=None):
+            # The real build's first act is the file read, and this is what it raises.
+            if not Path(path).exists():
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return vendor
+
+    monkeypatch.setattr(capture, "SchwabVendor", _NeedsTheFile)
+    assert not rig.token.exists()
+    rig.pulls.then(lambda: rig.token.write_text("{}"))
+    results: list[CycleResult] = []
+    # A long grace, because ``wait`` returns as soon as the cycle's futures finish. The
+    # default lets a slow machine move the clock past the bound mid-cycle, and the healed
+    # minute then gaps as ``request_abandoned``. A healthy run pays nothing for it.
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30), grace=30.0)
+    _run(
+        rig,
+        clock,
+        ticks=3,
+        hooks=daemon.DaemonHooks(on_cycle=lambda slot, result: results.append(result)),
+    )
+
+    assert len(rig.pulls.calls) == 1
+    first, healed, after = results
+    assert {(seg.surface, seg.error_class) for seg in first.segments} == {
+        (journal.CHAINS_SURFACE, "token_file_unreadable"),
+        (journal.QUOTES_SURFACE, "token_file_unreadable"),
+    }
+    # ``_PlanVendor`` refuses every chain window with a 400, so the quotes are what land.
+    for result in (healed, after):
+        assert result.segment(journal.QUOTES_SURFACE, "SPY").landed_data
+    # The dead minute fed the dead-man nothing, and each healed minute fed it.
+    assert rig.pinger.urls == [CAPTURE_URL] * 2
+    # Healed inside the watchdog's threshold, so "token dead" never paged.
+    assert all(message.title != "Capture down: token dead" for message in rig.transport.sent)
+
+
+def test_a_pull_that_fails_with_any_exception_costs_the_pull_and_not_the_daemon(tmp_path, capsys):
+    # ``Popen`` raises more than ``OSError``: a ``SubprocessError`` or a ``ValueError`` from
+    # a bad argument end the loop just as surely if the guard catches only the fork's class.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+
+    def refuse() -> None:
+        raise RuntimeError("no child")
+
+    rig.pulls.then(refuse)
+    ticks: list[datetime] = []
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(
+        rig,
+        clock,
+        ticks=2,
+        cycle_runner=_cycles(DEAD, DEAD),
+        hooks=daemon.DaemonHooks(on_tick=ticks.append),
+    )
+
+    assert len(ticks) == 2, "the loop died on the failed spawn"
+    err = capsys.readouterr().err.splitlines()
+    assert any(line.endswith("token pull did not start: RuntimeError") for line in err)
+
+
+def test_the_pull_line_names_its_slot_in_iso_form(tmp_path, capsys):
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=1, cycle_runner=_cycles(DEAD))
+
+    line = "capture is down on a dead token, so a token pull started"
+    assert f"daemon: 2026-09-02T10:00:00-04:00: {line}" in capsys.readouterr().err.splitlines()
+
+
+def test_the_pull_spacing_reads_slots_even_when_a_cycle_overruns(tmp_path, capsys):
+    # The spacing is measured between slots. A cycle that ran long, so the clock reads five
+    # minutes past the last pull's slot when the hook runs, is still one slot after it.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        if slot == et(2026, 9, 2, 10, 1):
+            clock.advance(5 * 60)
+        return _failing(slot, "http_401", "http_401")
+
+    _run(rig, clock, ticks=2, cycle_runner=runner)
+
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0)]

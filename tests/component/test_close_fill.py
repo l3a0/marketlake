@@ -744,6 +744,7 @@ def test_the_daemon_hands_the_guard_a_fill_that_lands_the_close(unset, tmp_path,
         transport=FakeTransport(),
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=six,
     )
 
@@ -1686,6 +1687,7 @@ def test_the_daemon_shares_one_drift_observer_between_its_cycles_and_its_fill(
         transport=transport,
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
+        pull_runner=None,
         should_continue=six,
     )
 
