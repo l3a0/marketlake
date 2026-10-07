@@ -1,7 +1,8 @@
 """The tracked VM settings, ``config/vm.yaml``, say what the hosted VM runs as.
 
-``python -m lake.vm_config render < config/vm.yaml`` merges this file with five SSM
-parameters into the VM's ``config.yaml``, marketlake #686. cloud-init's first boot and
+``python -m lake.vm_config render < config/vm.yaml`` merges this file with four SSM
+parameters and the instance's ``marketlake:backup-target`` tag into the VM's
+``config.yaml``, marketlake #686. cloud-init's first boot and
 #676's deploy both read it, so a change here reaches the VM through a reviewed pull
 request and nowhere else.
 """
@@ -41,7 +42,8 @@ def test_the_vm_runs_as_a_shadow():
 def test_the_settings_hold_exactly_the_five_keys():
     settings = _settings()
     assert set(settings) == KEYS
-    assert not set(settings) & vm_config.PARAMETER_KEYS
+    assert not set(settings) & vm_config.FILLED_KEYS
+    assert "backup_target" not in settings
 
 
 def test_the_settings_are_what_the_vm_needs():

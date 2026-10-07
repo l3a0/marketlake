@@ -50,6 +50,12 @@
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
 
+One check here a plan could make: the instance's tag keys. The instance serves its tags
+through instance metadata, where EC2 refuses a key holding a ``/`` or a space, and the
+config render reads the backup target there. ``infra.yml`` runs ``tofu test`` only when
+``infra/`` changes, and a mock provider plans any key, so the rule sits here, where every
+pull request's required ``test`` job runs it.
+
 These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The parse is
 ``python-hcl2``'s, which keeps a function call such as ``jsonencode({...})`` as text, so
 :func:`_jsonencode_argument` parses the call's argument as HCL on its own.
@@ -585,3 +591,19 @@ def test_shim_template_takes_only_the_owner_and_the_volume_id() -> None:
     assert match, f"user_data is not a templatefile() of the shim, got {user_data[:60]!r}"
     passed = set(re.findall(r"(\w+)\s*=", match.group(1)))
     assert passed == {"owner", "lake_volume_id"}
+
+
+# Letters, digits and ``+ - = . _ : @``. That leaves out ``/`` and the space, the two
+# characters EC2 refuses in a tag key the metadata service serves.
+_METADATA_TAG_KEY = re.compile(r"[A-Za-z0-9+\-=._:@]+")
+
+
+def test_instance_tag_keys_are_ones_instance_metadata_can_serve() -> None:
+    """With ``instance_metadata_tags`` enabled, EC2 refuses to launch or tag an instance
+    whose tag key holds a ``/`` or a space, since the metadata service serves each key as
+    a path. The config render reads ``marketlake:backup-target`` there, so a key that
+    breaks the endpoint stops the first boot's render. A mock provider plans any key."""
+    tags = _resources("live")["aws_instance.vm"]["tags"]
+    assert "marketlake:backup-target" in tags
+    for key in tags:
+        assert _METADATA_TAG_KEY.fullmatch(key), f"the instance tag key {key!r} has a / or space"

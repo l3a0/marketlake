@@ -30,8 +30,8 @@ handing the entry a flow. Its second seam is the token parameter's AWS client, w
 ``reauth_from_config`` takes as a factory and ``token_store.push`` and ``token_store.pull``
 take as a client and a factory. ``reauth.main`` and ``token_store.main`` build both
 themselves, so a test answers the client through botocore's event hooks instead.
-``vm_config.render`` takes a factory for its own SSM client too, and ``vm_config.main``
-builds it.
+``vm_config.render`` takes a factory for its own SSM client and a reader for its
+instance tag too, and ``vm_config.main`` builds both.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
@@ -94,6 +94,7 @@ REQUIRED = [
     (token_store.push, "client"),
     (token_store.pull, "client_factory"),
     (vm_config.render, "client_factory"),
+    (vm_config.render, "tag_reader"),
     (bucket.nightly_upload, "client"),
     (bucket.first_upload, "client"),
     (bucket.bucket_scrub, "client"),
@@ -128,6 +129,7 @@ FORBIDDEN = [
     (token_store.main, "client_factory"),
     (vm_config.main, "client"),
     (vm_config.main, "client_factory"),
+    (vm_config.main, "tag_reader"),
     (bucket.main, "client"),
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),

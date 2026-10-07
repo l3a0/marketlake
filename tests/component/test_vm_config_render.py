@@ -1,11 +1,13 @@
 """``python -m lake.vm_config render`` across its real boundaries, marketlake #686.
 
-The real ``main`` reads the settings on standard input, builds its own SSM client signed
-by the instance profile, and writes ``config.yaml`` into the config directory. The
-metadata service runs on loopback, the one ``tests/component/test_bucket_instance_profile.py``
-uses, reached through ``aws_session.METADATA_BASE_URL``. ``main`` builds the client
-through ``vm_config.render_client``, which a test wraps to answer ``GetParameters`` with a
-``before-send`` hook, so no request reaches AWS.
+The real ``main`` reads the settings on standard input, reads the backup target from the
+instance's ``marketlake:backup-target`` tag, builds its own SSM client signed by the
+instance profile, and writes ``config.yaml`` into the config directory. The metadata
+service runs on loopback, the one ``tests/component/test_bucket_instance_profile.py``
+uses, reached through ``aws_session.METADATA_BASE_URL``. :class:`_TagServer` extends it to
+serve instance tags. ``main`` builds the client through ``vm_config.render_client``, which
+a test wraps to answer ``GetParameters`` with a ``before-send`` hook, so no request reaches
+AWS.
 
 Every value the hook serves is a sentinel, and every test that reads the output checks
 that none of them reached it. The exit codes are what the first boot's retry reads: 0
@@ -17,7 +19,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sys
+import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -28,7 +32,7 @@ from botocore.awsrequest import AWSResponse
 from lake import aws_session, vm_config
 from lake.config import load_config
 from lake.paths import CONFIG_DIR_ENV, CONFIG_FILE, temp_write_path
-from tests.component.test_bucket_instance_profile import METADATA, _Server
+from tests.component.test_bucket_instance_profile import METADATA, TOKEN, _Server
 
 API_KEY = "API-KEY-SENTINEL-4a1f"
 APP_SECRET = "APP-SECRET-SENTINEL-77c2"
@@ -39,15 +43,19 @@ TARGET = f"s3://{BUCKET}/lake"
 ERROR_MESSAGE = "ERROR-MESSAGE-SENTINEL-91aa"
 SENTINELS = (API_KEY, APP_SECRET, PING_KEY, TOPIC, BUCKET, ERROR_MESSAGE)
 
-# The five names and the values the hook serves for them. Written out rather than read
+# The four names and the values the hook serves for them. Written out rather than read
 # from ``vm_config.PARAMETERS``, so a renamed parameter fails here.
 VALUES = {
     "/marketlake/config/schwab-api-key": API_KEY,
     "/marketlake/config/schwab-app-secret": APP_SECRET,
     "/marketlake/config/healthchecks-ping-key": PING_KEY,
     "/marketlake/config/ntfy-topic": TOPIC,
-    "/marketlake/config/backup-target": TARGET,
 }
+
+# The tag that carries the backup target, and the path the metadata service serves it at.
+TAG = "marketlake:backup-target"
+TAG_PATH = f"/latest/meta-data/tags/instance/{TAG}"
+TOKEN_PATH = "/latest/api/token"
 
 SETTINGS = {
     "role": "shadow",
@@ -133,9 +141,57 @@ class SsmHook:
         return json.loads(self.requests[0].body)
 
 
+class _TagServer(_Server):
+    """The shared loopback metadata service, which also serves the instance's tags.
+
+    The shared server answers 404 to every path it does not know, so this one wraps its
+    handler rather than changing it for the token pull's tests. A ``GET`` of a tag path
+    is recorded like any other request. It answers 401 without the shared server's token,
+    ``tag_status`` when that is set, the tag's value from ``tags`` when the key is there,
+    and 404 otherwise, which is what EC2 answers for a missing tag or for an instance
+    with ``instance_metadata_tags`` disabled. A value may be bytes, so a test can serve
+    bytes that are not UTF-8.
+    """
+
+    def __init__(self, creds: dict[str, str], tags: dict[str, str | bytes]) -> None:
+        super().__init__(creds)
+        self.tags = dict(tags)
+        self.tag_status: int | None = None
+        server = self
+        shared = self.httpd.RequestHandlerClass
+
+        class Handler(shared):
+            def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
+                prefix = "/latest/meta-data/tags/instance/"
+                if not self.path.startswith(prefix):
+                    return super().do_GET()
+                server.requests.append(("GET", self.path, dict(self.headers)))
+                key = urllib.parse.unquote(self.path[len(prefix) :])
+                if self.headers.get("x-aws-ec2-metadata-token") != TOKEN:
+                    self._answer_bytes(401, b"")
+                elif server.tag_status is not None:
+                    self._answer_bytes(server.tag_status, b"")
+                elif key in server.tags:
+                    value = server.tags[key]
+                    self._answer_bytes(200, value if isinstance(value, bytes) else value.encode())
+                else:
+                    self._answer_bytes(404, b"")
+
+            def _answer_bytes(self, status: int, data: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd.RequestHandlerClass = Handler
+
+    def tag_requests(self) -> list[tuple[str, str, dict[str, str]]]:
+        return [request for request in self.requests if request[1] == TAG_PATH]
+
+
 @pytest.fixture
-def metadata(monkeypatch) -> Iterator[_Server]:
-    with _Server(METADATA) as server:
+def metadata(monkeypatch) -> Iterator[_TagServer]:
+    with _TagServer(METADATA, {TAG: TARGET, "marketlake:host": "capture"}) as server:
         monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
         yield server
 
@@ -224,7 +280,7 @@ def test_the_tracked_settings_render(monkeypatch, capsys, metadata, config_dir, 
     assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == EXPECTED
 
 
-def test_the_render_asks_for_the_five_names_once_with_decryption(
+def test_the_render_asks_for_the_four_names_once_with_decryption(
     monkeypatch, capsys, metadata, config_dir, not_root
 ):
     hook = SsmHook().install(monkeypatch)
@@ -234,6 +290,56 @@ def test_the_render_asks_for_the_five_names_once_with_decryption(
     assert len(hook.requests) == 1
     assert hook.requests[0].headers["X-Amz-Target"].decode() == "AmazonSSM.GetParameters"
     assert hook.body() == {"Names": list(VALUES), "WithDecryption": True}
+    assert len(hook.body()["Names"]) == 4
+    assert "/marketlake/config/backup-target" not in hook.body()["Names"]
+
+
+def test_the_backup_target_comes_from_the_tag_with_an_imdsv2_token(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    assert yaml.safe_load((config_dir / CONFIG_FILE).read_text())["backup_target"] == TARGET
+    tag_reads = metadata.tag_requests()
+    assert len(tag_reads) == 1
+    headers = {key.lower(): value for key, value in tag_reads[0][2].items()}
+    assert headers["x-aws-ec2-metadata-token"] == TOKEN
+    tokens = [r for r in metadata.requests if r[0] == "PUT" and r[1] == TOKEN_PATH]
+    assert tokens, metadata.requests
+    for _, _, sent in tokens:
+        sent = {key.lower(): value for key, value in sent.items()}
+        assert int(sent["x-aws-ec2-metadata-token-ttl-seconds"]) > 0
+
+
+def test_the_tag_follows_the_value_the_instance_carries(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    # A second bucket, so a render that wrote a constant rather than the tag fails here.
+    SsmHook().install(monkeypatch)
+    metadata.tags[TAG] = "s3://another-sentinel-bucket/lake"
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written["backup_target"] == "s3://another-sentinel-bucket/lake"
+
+
+def test_a_proxy_in_the_environment_does_not_carry_the_tag_lookup(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    # Nothing listens on the proxy's port, so a lookup sent through it never answers.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, f"http://127.0.0.1:{port}")
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+    assert len(metadata.tag_requests()) == 1
 
 
 def test_the_client_is_signed_by_the_instance_profile_in_the_settings_region(
@@ -595,9 +701,11 @@ _CREDENTIALS = "the settings' bucket_credentials must be exactly instance_profil
 SETTINGS_REFUSALS = {
     "a parameter's key": (_settings_bytes(ntfy_topic="tracked"), "set ['ntfy_topic']"),
     "two parameters' keys": (
-        _settings_bytes(backup_target="/x", schwab_api_key="k"),
-        "set ['backup_target', 'schwab_api_key']",
+        _settings_bytes(ntfy_topic="t", schwab_api_key="k"),
+        "set ['ntfy_topic', 'schwab_api_key']",
     ),
+    # The tag fills backup_target, so the settings may not set it either.
+    "the tag's key": (_settings_bytes(backup_target=TARGET), "set ['backup_target']"),
     "no role": (_settings_bytes(role=_DROP), "role must be exactly"),
     "a capitalised role": (_settings_bytes(role="Shadow"), "role must be exactly"),
     "a role with a space": (_settings_bytes(role="primary "), "role must be exactly"),
@@ -688,8 +796,8 @@ def _without(name: str) -> dict[str, str]:
 
 PARAMETER_REFUSALS = {
     "one invalid name": (
-        SsmHook(invalid=("/marketlake/config/backup-target",)),
-        "SSM has no parameter named ['/marketlake/config/backup-target']",
+        SsmHook(invalid=("/marketlake/config/ntfy-topic",)),
+        "SSM has no parameter named ['/marketlake/config/ntfy-topic']",
     ),
     "every name invalid, as a wrong region gives": (
         SsmHook(invalid=tuple(VALUES)),
@@ -710,24 +818,12 @@ PARAMETER_REFUSALS = {
         "the parameter /marketlake/config/ntfy-topic is empty or not text",
     ),
     "a trailing newline": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"{TARGET}\n"}),
-        "the parameter /marketlake/config/backup-target has whitespace",
+        SsmHook({**VALUES, "/marketlake/config/ntfy-topic": f"{TOPIC}\n"}),
+        "the parameter /marketlake/config/ntfy-topic has whitespace",
     ),
     "a leading space": (
         SsmHook({**VALUES, "/marketlake/config/schwab-api-key": f" {API_KEY}"}),
         "the parameter /marketlake/config/schwab-api-key has whitespace",
-    ),
-    "a target that is a path": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"{BUCKET}/lake"}),
-        "backup_target is not an s3:// bucket target",
-    ),
-    "a target naming no valid bucket": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"s3://{BUCKET.upper()}/lake"}),
-        "backup_target names no valid bucket",
-    ),
-    "a target whose prefix climbs": (
-        SsmHook({**VALUES, "/marketlake/config/backup-target": f"s3://{BUCKET}/../lake"}),
-        "backup_target has a prefix holding . or ..",
     ),
 }
 
@@ -743,7 +839,139 @@ def test_parameters_the_render_cannot_use_refuse(
 
     line = _assert_refused(capsys, config_dir, before)
     assert expected in line
+
+
+# Each tag value, the refusal it gives, and whether the parameters were read first. The
+# empty and padded values are refused before any credential is fetched. The bucket
+# checks run on the merged config, after the parameters.
+TAG_REFUSALS = {
+    "an empty value": ("", "the marketlake:backup-target tag is empty or not text", False),
+    "a trailing newline": (
+        f"{TARGET}\n",
+        "the marketlake:backup-target tag has whitespace at its start or end",
+        False,
+    ),
+    "a leading space": (
+        f" {TARGET}",
+        "the marketlake:backup-target tag has whitespace at its start or end",
+        False,
+    ),
+    "bytes that are not UTF-8": (
+        b"s3://" + BUCKET.encode() + b"/\xfflake",
+        "the marketlake:backup-target tag is not UTF-8 text",
+        False,
+    ),
+    "a target that is a path": (
+        f"{BUCKET}/lake",
+        "backup_target is not an s3:// bucket target",
+        True,
+    ),
+    "a target naming no valid bucket": (
+        f"s3://{BUCKET.upper()}/lake",
+        "backup_target names no valid bucket",
+        True,
+    ),
+    "a target whose prefix climbs": (
+        f"s3://{BUCKET}/../lake",
+        "backup_target has a prefix holding . or ..",
+        True,
+    ),
+}
+
+
+@pytest.mark.parametrize(("value", "expected", "fetched"), TAG_REFUSALS.values(), ids=TAG_REFUSALS)
+def test_a_tag_the_render_cannot_use_refuses_and_is_never_printed(
+    monkeypatch, capsys, metadata, config_dir, not_root, value, expected, fetched
+):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tags[TAG] = value
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    assert expected in line
     assert BUCKET.upper() not in line
+    assert len(hook.requests) == (1 if fetched else 0)
+
+
+@pytest.mark.parametrize("cause", ["no tag", "tags disabled"])
+def test_a_tag_the_metadata_service_does_not_serve_refuses_naming_the_fix(
+    monkeypatch, capsys, metadata, config_dir, not_root, cause
+):
+    """EC2 answers 404 both for an instance with no such tag and for one whose
+    ``instance_metadata_tags`` is disabled, so the line names both fixes. A retry
+    cannot fix either, so it is a refusal rather than ``no credentials``."""
+    hook = SsmHook().install(monkeypatch)
+    if cause == "no tag":
+        del metadata.tags[TAG]
+    else:
+        metadata.tag_status = 404
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    path = config_dir / CONFIG_FILE
+    assert _assert_refused(capsys, config_dir, before) == (
+        f"vm_config: refused, and {path} was left as it was: the instance metadata serves "
+        "no marketlake:backup-target tag. Either the instance has no such tag or its "
+        "instance_metadata_tags is disabled, so set both in infra/live/vm.tf and apply"
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+@pytest.mark.parametrize("status", [500, 401, 403])
+def test_any_other_http_error_on_the_tag_exits_one(
+    monkeypatch, capsys, metadata, config_dir, not_root, status
+):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tag_status = status
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 1
+
+    path = config_dir / CONFIG_FILE
+    assert path.read_bytes() == before
+    assert _one_line(capsys) == (
+        f"vm_config: failed: the marketlake:backup-target tag could not be read "
+        f"(HTTP {status}), so {path} was left as it was"
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+def test_a_metadata_service_that_does_not_answer_exits_three(
+    monkeypatch, capsys, config_dir, not_root
+):
+    # Nothing listens on this port, which is what the render meets off the VM.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setattr(aws_session, "METADATA_BASE_URL", f"http://127.0.0.1:{port}/")
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    line = _one_line(capsys)
+    assert line.startswith(
+        "vm_config: no credentials: the instance metadata service did not answer the "
+        "marketlake:backup-target tag lookup ("
+    )
+    assert hook.regions == [] and hook.requests == []
+
+
+def test_a_refused_token_exits_three(monkeypatch, capsys, metadata, config_dir, not_root):
+    metadata.mode = "refuse_token"
+    hook = SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert (config_dir / CONFIG_FILE).read_bytes() == before
+    assert "tag lookup (token HTTP 403)" in _one_line(capsys)
+    assert metadata.tag_requests() == []
+    assert hook.requests == []
 
 
 CONFIG_REFUSALS = {

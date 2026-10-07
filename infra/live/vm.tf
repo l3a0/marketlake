@@ -124,11 +124,13 @@ resource "aws_instance" "vm" {
   associate_public_ip_address = true
 
   # IMDSv2 only (#663). A hop limit of 1 keeps the metadata service's answers, the
-  # role's credentials among them, from crossing a further network hop.
+  # role's credentials among them, from crossing a further network hop. The tags are
+  # served too, because the config render reads marketlake:backup-target from them.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
     http_put_response_hop_limit = 1
+    instance_metadata_tags      = "enabled"
   }
 
   # Named because an account can change the T4g default, and nothing records that.
@@ -150,10 +152,18 @@ resource "aws_instance" "vm" {
     lake_volume_id = aws_ebs_volume.lake.id
   })
 
-  # #676 conditions ssm:SendCommand on the marketlake:host tag.
+  # #676 conditions ssm:SendCommand on the marketlake:host tag. The config render reads
+  # marketlake:backup-target through instance metadata, by the owner's decision of
+  # 2026-10-07, so the bucket reaches the VM from the variable OpenTofu already holds
+  # rather than from a parameter put by hand. A bucket change updates the tag in place.
+  #
+  # With instance_metadata_tags enabled, EC2 refuses a tag key holding a / or a space,
+  # because the metadata service serves each key as a path. Every key here complies, and
+  # tests/component/test_infra_config.py fails on one that does not.
   tags = {
-    Name              = "marketlake"
-    "marketlake:host" = "capture"
+    Name                       = "marketlake"
+    "marketlake:host"          = "capture"
+    "marketlake:backup-target" = "s3://${var.backup_bucket}/lake"
   }
 
   # The first boot's SSM agent and config render need both grants in place.
