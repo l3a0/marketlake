@@ -43,8 +43,8 @@ The rest are read when they are needed.
 
 - `<github-user-id>` is the owner's numeric GitHub id, which step 8 reads.
 - `<branch>` and `<n>` are the pull request's branch and number.
-- `<run-id>` and `<lock-id>` are ids that an earlier command prints, named where each one
-  appears.
+- `<run-id>`, `<lock-id>`, `<branch-head>` and `<merge-commit>` are ids that an earlier
+  command prints, named where each one appears.
 
 Every placeholder on a command line sits inside double quotes, because a bare `<x>` left
 unreplaced is a redirection in zsh.
@@ -471,6 +471,10 @@ Merge the pull request. Then the owner approves the `tofu apply (live)` run in t
 Actions tab, outside 09:25 to 16:15 ET, so an apply never runs while the market is open
 and the daemon is capturing.
 
+A run that waits for approval waits in the `infra` environment. To approve it, open the
+run in the Actions tab, click **Review deployments**, tick `infra`, then click **Approve
+and deploy**. Only the owner clicks these, as step 8 says.
+
 After the first green apply, two runs confirm that nothing is left to change.
 
 1. A manual run of `infra.yml` on `main` waits for the owner's approval like any other
@@ -634,6 +638,79 @@ request does not change. Every checkout reads the same backend file in
 change away, and OpenTofu gives no warning. After the merge, plan the bootstrap from
 `main`'s merge commit, as in step 11, and expect no changes.
 
+### When the merge came before the bootstrap apply
+
+A bootstrap pull request can merge before its bootstrap apply, as
+[PR #719](https://github.com/l3a0/marketlake/pull/719) did on 2026-10-06. Its
+`tofu apply (live)` run then waits for approval in the `infra` environment. Leave that
+run waiting when its live change needs a permission the bootstrap change adds. The run
+uses the apply role's old permissions, so it applies what the old role allows and fails
+on each call it does not. Approved first,
+[PR #719](https://github.com/l3a0/marketlake/pull/719)'s run would have created
+`aws_iam_role_policy.instance_config_read` and failed at `iam:CreateUser`.
+
+The rule above, to apply from the branch's final head, assumes the apply comes before
+the merge. After the merge, apply the bootstrap from the merge commit instead, in this
+order.
+
+1. Read the pull request's final head and its merge commit. They are `<branch-head>` and
+   `<merge-commit>` below.
+
+   ```bash
+   gh pr view "<n>" --repo l3a0/marketlake --json headRefOid,mergeCommit --jq '.headRefOid, .mergeCommit.oid'
+   ```
+
+2. Make the worktree at the merge commit, from the main checkout. A merge deletes the
+   branch, so fetch the head from the pull request's own ref. When a worktree for this
+   pull request already exists, remove it first, as in step 12.
+
+   ```bash
+   git fetch origin main "pull/<n>/head"
+   ```
+
+   ```bash
+   git worktree add --detach "$HOME/marketlake-infra-<n>" "<merge-commit>"
+   ```
+
+3. Compare the bootstrap at the two commits. An empty diff means the merge commit carries
+   the bootstrap the pull request reviewed. A difference comes from another merge, and the
+   plan must still change nothing this pull request does not change.
+
+   ```bash
+   git -C "$HOME/marketlake-infra-<n>" diff "<branch-head>" "<merge-commit>" -- infra/bootstrap
+   ```
+
+4. Run step 7's `init`, `plan` and `apply` commands, and read the plan before the
+   apply. Skip step 7's worktree and head checks, which the steps above replace.
+5. Approve the waiting run, as in
+   [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change).
+
+A run approved before the bootstrap apply has failed, and [Recovery](#recovery)
+covers what a failed apply leaves behind. Once the bootstrap is applied, start a new run
+with step 11's `gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and
+approve it as in step 11.
+
+### Reading a statement inserted into a policy
+
+OpenTofu 1.13 shows a statement inserted into an inline policy's `Statement` list as a
+change to the statement that held its slot. The statements after it can then show as
+changed, removed and added again, though none of them changed. To check such a plan,
+collect the old side of every entry shown as changed or removed, and the new side of
+every entry shown as changed or added. Match the two sets by `Sid` and compare each
+pair. When the only statement without a twin is the new one, the only real change is the
+insertion.
+
+A statement inserted just before the last one shows the shortest form of this. The last
+statement's slot changes into the new statement, and the last statement is added again
+at the end.
+
+[PR #719](https://github.com/l3a0/marketlake/pull/719)'s bootstrap plan read
+`Plan: 0 to add, 1 to change, 0 to destroy`. The pull request inserted
+`TokenWriterUserWrite` before `Ec2InHomeRegion` in `aws_iam_role_policy.apply`. The plan
+showed `Ec2InHomeRegion`'s slot changing into `TokenWriterUserWrite`, with its `Action`,
+`Condition`, `Resource` and `Sid` all marked changed, and `Ec2InHomeRegion` added again
+at the end, unchanged. Nothing about EC2 changed.
+
 ## The config parameters
 
 The hosted VM's `config.yaml` is written at deploy time from SSM Parameter Store, so a VM
@@ -664,9 +741,12 @@ The pull request that adds the token writer changes the bootstrap too, so it fol
 
 1. Apply the bootstrap from the laptop, from the pull request's branch at its final head,
    as in step 7. That gives the apply role `iam:CreateUser` and `iam:PutUserPolicy` on
-   `marketlake-token-writer`.
-2. Merge, then approve the `tofu apply (live)` run, which creates the user and its
-   policy.
+   `marketlake-token-writer`. When the pull request merged first, follow
+   [When the merge came before the bootstrap apply](#when-the-merge-came-before-the-bootstrap-apply)
+   in place of this step and the next.
+2. Merge, then approve the `tofu apply (live)` run, as in
+   [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change), which creates the
+   user and its policy.
 3. Create an access key for `marketlake-token-writer` in the AWS console. The key goes
    into the laptop's `config.yaml` under
    [#636](https://github.com/l3a0/marketlake/issues/636)'s `token_store_*` keys, and it
