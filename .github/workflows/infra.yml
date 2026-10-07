@@ -25,7 +25,18 @@ on:
       - "infra/**"
       - ".github/workflows/infra.yml"
   # Reverts console drift without a code change, behind the same approval as a merge.
+  # replace_instance also replaces the VM, the only reviewed route to a new instance and
+  # the one a new lake volume needs (#686). A merge that touches infra/ while a dispatch
+  # waits for approval can drop it: the dispatch goes stale and skips, or the push's run
+  # queues in the infra-apply group and cancels it, then applies with no -replace. So
+  # dispatch with no infra/ merge pending, and check that the approved plan's summary
+  # shows aws_instance.vm as a replacement.
   workflow_dispatch:
+    inputs:
+      replace_instance:
+        description: "Replace the VM (aws_instance.vm). The lake volume is kept."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -112,9 +123,11 @@ jobs:
           TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
           BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
           BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
+          OWNER_SSH_CIDR: ${{ secrets.OWNER_SSH_CIDR }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
           missing=0
-          for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
+          for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
@@ -146,6 +159,8 @@ jobs:
         env:
           TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
           TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
+          TF_VAR_owner_ssh_cidr: ${{ secrets.OWNER_SSH_CIDR }}
+          TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
           tofu -chdir=infra/live plan -input=false -lock=false \
             -out="$RUNNER_TEMP/live.tfplan" > /dev/null
@@ -180,9 +195,11 @@ jobs:
           TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
           BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
           BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
+          OWNER_SSH_CIDR: ${{ secrets.OWNER_SSH_CIDR }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
           missing=0
-          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME; do
+          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
@@ -224,13 +241,22 @@ jobs:
           tofu -chdir=infra/live init -input=false -lockfile=readonly \
             -backend-config="$RUNNER_TEMP/live.tfbackend"
 
+      # The replace_instance input adds one -replace, which names only the instance. A
+      # push has no inputs, so its plan replaces nothing.
       - name: Plan
         if: steps.freshness.outputs.state == 'fresh'
         env:
           TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
           TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
+          TF_VAR_owner_ssh_cidr: ${{ secrets.OWNER_SSH_CIDR }}
+          TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
+          REPLACE_INSTANCE: ${{ inputs.replace_instance }}
         run: |
-          tofu -chdir=infra/live plan -input=false -lock-timeout=5m \
+          replace=()
+          if [ "$REPLACE_INSTANCE" = true ]; then
+            replace=(-replace=aws_instance.vm)
+          fi
+          tofu -chdir=infra/live plan -input=false -lock-timeout=5m "${replace[@]}" \
             -out="$RUNNER_TEMP/live.tfplan" > /dev/null
 
       - name: Summarise the plan

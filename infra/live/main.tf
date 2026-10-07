@@ -1,8 +1,7 @@
-# What CI applies: the backup bucket, its IAM user, the instance role, and the user that
-# writes the Schwab token. The apply role in infra/bootstrap/roles.tf grants writes on
-# exactly these. infra/README.md
-# carries the runbook, and docs/design.md's "Infrastructure, defined" carries the
-# reasoning.
+# What CI applies: the backup bucket, its IAM user, the instance role, the user that
+# writes the Schwab token, and the hosted VM with its lake volume. The apply role in
+# infra/bootstrap/roles.tf grants writes on exactly these. infra/README.md carries the
+# runbook, and docs/design.md's "Infrastructure, defined" carries the reasoning.
 
 terraform {
   required_version = "~> 1.13"

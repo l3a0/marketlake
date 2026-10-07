@@ -32,9 +32,65 @@ variable "adopt_existing" {
 variable "instance_s3_enabled" {
   # The cutover pull request for #638 flips this default to true, and inverts the test
   # that asserts it is off. CI passes no value for it, so only this default turns the
-  # policy on in CI.
-  description = "Give marketlake-instance the backup bucket's four S3 actions."
+  # write half on in CI.
+  description = "Give marketlake-instance s3:PutObject on the backup bucket, the write half of its S3 access. The read half is always on."
   type        = bool
   default     = false
+  nullable    = false
+}
+
+variable "owner_ssh_cidr" {
+  # Sensitive, so the owner's address stays out of plan output. It still sits in state
+  # as plain text, and the plan role can read it through ec2:DescribeSecurityGroups.
+  # The provider refuses an IPv6 CIDR, or one with host bits set, but its error prints
+  # the address, and a plan's errors reach CI's public log. This validation refuses
+  # both first, with a message that names no value.
+  description = "The owner's address that may SSH to the VM, as an IPv4 CIDR such as a /32. CI reads it from the OWNER_SSH_CIDR repository secret."
+  type        = string
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition     = can(cidrnetmask(var.owner_ssh_cidr)) && try(cidrhost(var.owner_ssh_cidr, 0) == split("/", var.owner_ssh_cidr)[0], false)
+    error_message = "owner_ssh_cidr must be an IPv4 CIDR with no host bits set, such as a /32."
+  }
+}
+
+variable "ssh_public_key" {
+  # EC2 imports RSA and ED25519 keys, whose OpenSSH form starts with ssh-.
+  description = "The OpenSSH public key for the VM's key pair. CI reads it from the SSH_PUBLIC_KEY repository variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = startswith(var.ssh_public_key, "ssh-")
+    error_message = "ssh_public_key must be an OpenSSH public key starting with ssh-."
+  }
+}
+
+variable "instance_type" {
+  # Unmeasured until #633's sizing verdict lands. A change stops and starts the
+  # instance.
+  description = "The VM's instance type."
+  type        = string
+  default     = "t4g.small"
+  nullable    = false
+}
+
+variable "root_volume_gib" {
+  # Not measured. The root holds the checkout, the venv, uv's cache and the journal.
+  description = "The VM's root volume size, in GiB."
+  type        = number
+  default     = 16
+  nullable    = false
+}
+
+variable "lake_volume_gib" {
+  # From a 7.9 GB lake growing 0.58 GB a night, 30 GiB holds roughly 40 more sessions,
+  # derived rather than measured. A larger size modifies the volume in place, and the
+  # bootstrap's resize2fs grows the filesystem to match.
+  description = "The lake volume's size, in GiB."
+  type        = number
+  default     = 30
   nullable    = false
 }
