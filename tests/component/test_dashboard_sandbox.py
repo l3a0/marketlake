@@ -3,13 +3,15 @@
 These open the dashboard's connection over a throwaway lake and try to break out of it.
 The one real boundary is the filesystem DuckDB reads, so the tier is component. Every
 case checks one clause of the design's sandbox: reads outside ``lake_root`` fail, reads
-inside work, the two resource caps are applied, and once the configuration is locked
-nothing can widen any of it.
+inside work, the two resource caps are applied, DuckDB's external file cache is off, and
+once the configuration is locked nothing can widen any of it.
 
-The caps are part of the sandbox, not a separate concern. The service shares a laptop
-with the minutely capture daemon, so the connection takes a small fixed share rather
-than the machine default of every core and most of RAM. Both caps must land before the
-lock, because a locked configuration refuses every later ``SET``.
+The caps are part of the sandbox, not a separate concern. The service shares its host
+with the minutely capture daemon, a laptop or a 2-core, 1.8 GiB VM, so the connection
+takes a small fixed share rather than the machine default of every core and most of RAM.
+The file cache is off because it keeps Parquet bytes a query read until the memory cap
+forces them out. The two caps and the file cache setting must all land before the lock,
+because a locked configuration refuses every later ``SET``.
 
 Every case here must distinguish a sandboxed connection from an unsandboxed one. The
 standard is a mutation: replace ``open_lake_connection`` with a bare ``duckdb.connect()``
@@ -59,7 +61,7 @@ def _rendered_memory_limit(setting: str) -> str:
     """DuckDB's own rendering of a memory limit, as ``current_setting`` reports it.
 
     DuckDB stores ``memory_limit`` as bytes and renders it back in binary units at one
-    decimal place, so the configured ``2GB`` reads as ``1.8 GiB``. Comparing byte counts
+    decimal place, so the configured ``128MB`` reads as ``122.0 MiB``. Comparing byte counts
     across the two spellings needs a tolerance, and a tolerance wide enough to absorb
     that rounding also accepts a drift away from the configured value. So the comparison
     runs in DuckDB's own spelling instead: an unsandboxed connection renders the
@@ -197,3 +199,54 @@ def test_neither_cap_can_be_raised_after_the_lock(lake_root: Path, statement: st
     threads, memory = con.execute(_CAPS_SQL).fetchone()
     assert threads == QUERY_THREADS
     assert memory == _rendered_memory_limit(QUERY_MEMORY_LIMIT)
+
+
+# The caps as literals, in DuckDB's own rendering. The tests above compare against the
+# imported constants, so they pass whatever value the constants hold. These fail when a
+# constant drifts. ``128MB`` is 128,000,000 bytes, which DuckDB renders as ``122.0 MiB``.
+_THREADS = 1
+_MEMORY_LIMIT = "122.0 MiB"
+
+
+def test_the_caps_are_one_thread_and_128mb(lake_root: Path):
+    con = open_lake_connection(lake_root)
+    assert con.execute(_CAPS_SQL).fetchone() == (_THREADS, _MEMORY_LIMIT)
+    # The service runs each request on a cursor, so the literal caps must reach it too.
+    assert con.cursor().execute(_CAPS_SQL).fetchone() == (_THREADS, _MEMORY_LIMIT)
+
+
+_FILE_CACHE_SQL = "SELECT current_setting('enable_external_file_cache')"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["SET enable_external_file_cache = true", "RESET enable_external_file_cache"],
+)
+def test_the_file_cache_is_off_and_cannot_be_turned_back_on(lake_root: Path, statement: str):
+    # DuckDB turns the cache on by default, and an unlocked connection accepts both
+    # statements, so each half fails on a bare ``duckdb.connect()``.
+    con = open_lake_connection(lake_root)
+    cursor = con.cursor()
+    assert cursor.execute(_FILE_CACHE_SQL).fetchone() == (False,)
+    with pytest.raises(duckdb.InvalidInputException, match=_LOCKED):
+        con.execute(statement)
+    with pytest.raises(duckdb.InvalidInputException, match=_LOCKED):
+        cursor.execute(statement)
+    assert cursor.execute(_FILE_CACHE_SQL).fetchone() == (False,)
+
+
+def test_a_parquet_read_leaves_nothing_in_the_file_cache(fixture_lake):
+    # The setting reading false is not the same claim as no bytes being kept, so this
+    # reads a partition through a cursor, the way a request does, and asks DuckDB what
+    # the cache holds afterwards. With the cache on, the same read leaves a nonzero count.
+    root = fixture_lake.with_chains("SPY", "2026-08-24").build()
+    partition = fixture_lake.partition_path("chains", "SPY", "2026-08-24")
+    cursor = open_lake_connection(root).cursor()
+    # The positive control: the read returns the fixture's row, so a zero below is the
+    # cache being off and not the read failing to happen.
+    rows = cursor.execute("SELECT * FROM read_parquet(?)", [str(partition)]).fetchall()
+    assert len(rows) == 1
+    cached = cursor.execute(
+        "SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag = 'EXTERNAL_FILE_CACHE'"
+    ).fetchone()
+    assert cached == (0,)

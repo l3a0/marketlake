@@ -162,13 +162,19 @@ PANEL_SURFACES = (CHAINS, QUOTES)
 # The capture cadence. One slot per minute, matching the design's minutely loop.
 SLOT = timedelta(minutes=1)
 
-# The connection's resource caps. The service shares a laptop with the minutely capture
-# daemon, and the capture loop's minute budget owns the machine. The dashboard is the
-# guest, so it takes a small fixed share rather than the machine default, which is every
-# core and most of RAM. Both must be set before ``lock_configuration``, because a locked
-# configuration refuses every later ``SET``.
-QUERY_THREADS = 2
-QUERY_MEMORY_LIMIT = "2GB"
+# The connection's resource caps. The service shares its host with the minutely capture
+# daemon, a laptop or a 2-core, 1.8 GiB VM, and the capture loop's minute budget owns the
+# machine. The dashboard is the guest, so it takes a small fixed share rather than the
+# machine default, which is every core and most of RAM. One thread leaves the VM's second
+# core to capture. The memory cap is a fixed value rather than a fraction of the host,
+# because what a query needs is set by the roster and the 30-day window, not by the
+# host's size. 128MB covers two tabs refreshing at once up to about 20 tickers.
+# ``open_lake_connection`` also turns DuckDB's external file cache off. That cache keeps
+# Parquet bytes it has read until the cap forces them out, so it was what a large cap
+# bought. marketlake #672 records the measurements. Every cap must be set before
+# ``lock_configuration``, because a locked configuration refuses every later ``SET``.
+QUERY_THREADS = 1
+QUERY_MEMORY_LIMIT = "128MB"
 
 # The most sessions the Now walk looks back for a data cycle, per ticker and surface.
 # The walk stops at the first day with one, so a healthy ticker costs one day's read. A
@@ -277,7 +283,7 @@ class QueryParameterError(ValueError):
 def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
     """Open the DuckDB sandbox over one lake root and return it.
 
-    The connection is in-memory. Six ``SET`` statements make it a capped sandbox.
+    The connection is in-memory. Seven ``SET`` statements make it a capped sandbox.
 
     1. ``temp_directory`` is cleared. DuckDB adds its own spill directory to the
        allow-list by default, so leaving it set puts a second entry on the list beside
@@ -287,7 +293,9 @@ def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
        attaches are refused everywhere except under the allowed directory.
     4. ``threads`` is capped at ``QUERY_THREADS``.
     5. ``memory_limit`` is capped at ``QUERY_MEMORY_LIMIT``.
-    6. ``lock_configuration`` is turned on. No later ``SET`` can undo any of the five
+    6. ``enable_external_file_cache`` is turned off, so Parquet bytes a query read are not
+       kept in memory after it.
+    7. ``lock_configuration`` is turned on. No later ``SET`` can undo any of the six
        settings above.
 
     DuckDB constrains the order in three places, not one. Several orders satisfy all
@@ -298,7 +306,8 @@ def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
     2. ``allowed_directories`` must be set before external access goes off, for the same
        reason: DuckDB refuses to change the list once it is off.
     3. ``lock_configuration`` must come last, because a locked configuration refuses
-       every later ``SET``. That is why the two caps come before it and not after.
+       every later ``SET``. That is why the two caps and the file cache come before it
+       and not after.
 
     The root is resolved first so the Python-side listing and DuckDB's own path check
     agree. DuckDB canonicalizes every path it opens, so a symlink inside the lake that
@@ -312,6 +321,7 @@ def open_lake_connection(lake_root: Path | str) -> duckdb.DuckDBPyConnection:
     con.execute("SET enable_external_access = false")
     con.execute("SET threads = ?", [QUERY_THREADS])
     con.execute("SET memory_limit = ?", [QUERY_MEMORY_LIMIT])
+    con.execute("SET enable_external_file_cache = false")
     con.execute("SET lock_configuration = true")
     return con
 
