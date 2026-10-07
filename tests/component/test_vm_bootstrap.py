@@ -765,7 +765,7 @@ def test_a_tool_versions_without_a_plain_uv_pin_is_refused(vm, pin):
 # -- the install, the lock and the retries ---------------------------------------------
 
 
-def test_the_lock_is_taken_only_after_the_install_returns(vm):
+def test_the_lock_is_taken_only_between_the_two_installs(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     lock = vm.index("flock -w 600 9")
@@ -813,7 +813,7 @@ def test_a_transient_install_failure_is_retried(vm):
     ],
     ids=["refusal", "every attempt"],
 )
-def test_an_install_that_keeps_failing_stops_the_bootstrap(vm, rcs, runs, line):
+def test_a_sync_that_keeps_failing_stops_the_bootstrap(vm, rcs, runs, line):
     proc = vm.bootstrap(INSTALL_RCS=rcs)
     assert proc.returncode == 1
     assert line in proc.stderr
@@ -849,9 +849,9 @@ STEP_9_LINES = ("exited 2, a refusal", "exited 1 on all 5 attempts")
             "0 2",
             1,
             "the install that starts the units did not finish, because"
-            " deploy/linux-install.sh exited 2, which no retry fixes. The linux-install:"
-            " line above says why, and when it names the install lock, a rerun of the"
-            " bootstrap installs and starts the units",
+            " deploy/linux-install.sh exited 2, which no retry fixes. The lines above it"
+            " say why, and when one names the install lock, a rerun of the bootstrap"
+            " installs and starts the units",
         ),
     ],
     ids=["every attempt", "refusal"],

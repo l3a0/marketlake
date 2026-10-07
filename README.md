@@ -354,10 +354,11 @@ TZ=America/New_York journalctl -u com.marketlake.daemon
 ```
 
 On the hosted VM, `deploy/vm-bootstrap.sh` runs this install at first boot, after it has
-rendered `config.yaml`, pulled the token and applied the roster, so the residents start
-with their config in place. [The hosted VM](infra/README.md#the-hosted-vm) in the
-infrastructure runbook says how to create the VM, rerun the bootstrap and restore its
-lake. The design doc's Deployment section carries the reasoning for each unit setting.
+rendered `config.yaml`, pulled the token and applied the roster, so after a render that
+succeeded the residents start with their config in place.
+[The hosted VM](infra/README.md#the-hosted-vm) in the infrastructure runbook says how to
+create the VM, rerun the bootstrap and restore its lake. The design doc's Deployment
+section carries the reasoning for each unit setting.
 
 ## Carry the Schwab token to a hosted VM
 

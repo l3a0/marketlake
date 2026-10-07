@@ -1345,12 +1345,25 @@ On the VM, cloud-init's summary says `status: done` for a boot whose script exit
 cloud-init status --long
 ```
 
-The bootstrap's lines start `vm-bootstrap:`, and each install's lines start
-`linux-install:`. The last install prints its read-back of the units after the config
-steps, so they do not sit at the end of cloud-init's log. Search for them instead.
+Each step prints lines that start with its own name, and a step that refuses says why
+on one of them. The bootstrap's lines start `vm-bootstrap:`, and each install's lines start
+`linux-install:`. The config steps print `vm_config:`, `token_store:` and `roster:`
+lines. Inside the last install, the render of the units prints `render:` lines and the
+rendered `install.sh` prints `install.sh:` lines. This search shows every one of them.
 
 ```bash
-grep -E '^(vm-bootstrap|linux-install): ' /var/log/cloud-init-output.log
+grep -E '^(vm-bootstrap|linux-install|render|install\.sh|vm_config|token_store|roster): ' /var/log/cloud-init-output.log
+```
+
+The rendered `install.sh` also prints lines that carry no step's name. Before each
+command it runs, it prints the command on a line that starts `+`, and it closes by
+reading back each resident's state on indented lines such as `  ActiveState=active`.
+The search above leaves those out, so print the log from the line that starts the last
+install to the end. That shows the last install whole, its read-back included, and the
+bootstrap's closing line.
+
+```bash
+sed -n '/^vm-bootstrap: installing and starting the units/,$p' /var/log/cloud-init-output.log
 ```
 
 The daemon prints its role at every start, so its journal should hold

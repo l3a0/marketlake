@@ -565,7 +565,7 @@ install_retried
 case "$INSTALL_RC" in
   0) ;;
   1) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited 1 on each of $INSTALL_TRIES tries. A rerun of the bootstrap installs and starts the units" ;;
-  *) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited $INSTALL_RC, which no retry fixes. The linux-install: line above says why, and when it names the install lock, a rerun of the bootstrap installs and starts the units" ;;
+  *) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited $INSTALL_RC, which no retry fixes. The lines above it say why, and when one names the install lock, a rerun of the bootstrap installs and starts the units" ;;
 esac
 
 if [[ $FAILED != 0 ]]; then
