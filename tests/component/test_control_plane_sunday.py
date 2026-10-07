@@ -1086,6 +1086,36 @@ def test_a_failed_pull_with_coverage_passing_sends_nothing(fixture_lake):
     assert pinger.urls == [URL]
 
 
+def test_a_slow_pull_does_not_move_its_attempt_into_the_next_hour(fixture_lake):
+    # Each pull takes 15 minutes. The attempts start at 20:50, 21:20, 21:50, 22:20 and
+    # 22:50, so they owe reminders in the 20, 21 and 22 o'clock hours. An attempt that took
+    # its moment after the pull would read 21:05, 21:35, 22:05, 22:35 and 23:05, and the
+    # 20:00 hour's reminder would never go out.
+    root = _clean_lake(fixture_lake)
+    clock = ManualClock(start=et(2026, 8, 30, 20, 50))
+
+    def slow_pull():
+        clock.sleep(15 * 60)
+        return _pulled(token_store.CURRENT)
+
+    sent = []
+    outcomes = cp.sunday_run(
+        lake_root=root,
+        backup_target=_backup_of(root),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=_Mints(STALE_MINT),
+        canary=_passing_canary,
+        token_pull=slow_pull,
+        reminder_sink=sent.append,
+    )
+    assert len(outcomes) == 5
+    assert len(sent) == 3
+
+
 def test_a_pull_failing_after_the_hour_s_reminder_is_named_by_the_next_hour_s(fixture_lake):
     # The 20:00 reminder goes out while the pull is still current. The operator re-auths
     # at 20:15 and the pull fails from 20:30 on. The one-an-hour rule drops the 20:30
