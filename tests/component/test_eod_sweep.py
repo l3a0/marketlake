@@ -3386,7 +3386,12 @@ def _stub_free(monkeypatch: pytest.MonkeyPatch, free: int) -> None:
 
 
 def _sealed_peak(monkeypatch: pytest.MonkeyPatch, root: Path) -> int:
-    """The busiest sealed day this lake shows the check, read before the run writes anything."""
+    """The rate's peak this lake shows the check, read before the run writes anything.
+
+    The lake holds sealed partitions and no journal, so the rate's peak and the busiest
+    sealed day are one figure, and the reserve is thirteen of it. That is what lets the
+    tests write free space as the peak times the sessions plus thirteen.
+    """
     _stub_free(monkeypatch, 0)
     calendar = weekday_sessions(MONDAY, NEXT_MONDAY)
     peak = runway.assess(root, today=SESSION, calendar=calendar).peak
