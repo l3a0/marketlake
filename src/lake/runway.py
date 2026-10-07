@@ -2,15 +2,17 @@
 
 Two consumers read this module and it is deliberately a leaf, importing only the standard
 library, :mod:`lake.calendar` and :mod:`lake.paths`. The dashboard's Lake panel renders
-what it returns. The Sunday run's third duty flags the nightly report when the headroom
-runs short, which is marketlake #438. One computation with two consumers is the point:
-two independent ones would drift, and a panel and an alarm disagreeing about how long the
-disk lasts is worse than either being wrong alone.
+what it returns. The evening sweep, :mod:`lake.sweep`, files an ``action`` line in the
+nightly report when the headroom runs under ``HEADROOM_WEEKS`` and pages when it runs under
+``PAGE_FLOOR_WEEKS``, which is marketlake #438. One computation with two consumers is the
+point: two independent ones would drift, and a panel and an alarm disagreeing about how
+long the disk lasts is worse than either being wrong alone.
 
-It could not live in :mod:`lake.dashboard`. That module already reads
-``lake.control_plane``, so a Sunday duty reading back into it would close a cycle.
+That is also why it is a module of its own rather than a part of :mod:`lake.dashboard`.
+The sweep has no reason to import the dashboard's DuckDB query layer to read a number off
+the disk, and a computation living in one consumer invites the other to grow a copy.
 
-Four decisions are worth reading before the code.
+Five decisions are worth reading before the code.
 
 1. **The bytes are allocated blocks, never file sizes.** What fills a disk is blocks. A
    4 KiB block holds a 165-byte nightly report as surely as a 4 KiB one, and the lake's
@@ -18,16 +20,20 @@ Four decisions are worth reading before the code.
    files. It is also the tree with no pruning step, since a held finding files again
    every night it survives, so the divergence grows. ``st_blocks`` is in 512-byte units
    by POSIX convention whatever the filesystem's own block size is.
-2. **The growth rate is the busiest day in the window, not the mean.** Measured over the
-   live lake, the same bytes give a runway from 2,059 days to 20,647 depending only on
-   what the rate is divided by, because capture began partway through the window and the
-   idle days before it drag any mean down. Every such error lengthens the runway, and a
-   check that flags short headroom never fires if its rate is too low. The mean over days
-   that wrote bytes is reported beside the peak so a reader sees the spread. The price is
-   named: one anomalous day, a backfill or a reseal, shortens the runway and can flag
-   early. A report-tier finding sends no message of its own, so a false flag costs a line
-   an operator reads, while a missed flag costs the disk, and a minute lost to a full
-   disk is gone forever.
+2. **The growth rate is the busiest sealed day in the window, not the mean.** Measured
+   over the live lake, the same bytes give a runway from 2,059 days to 20,647 depending
+   only on what the rate is divided by, because capture began partway through the window
+   and the idle days before it drag any mean down. Every such error lengthens the runway,
+   and a check that flags short headroom never fires if its rate is too low. The mean over
+   sealed days that wrote bytes is reported beside the peak so a reader sees the spread.
+   A day in ``Usage.unsealed`` sets neither. It is still journal segments, uncompressed and
+   9 to 13 times the partition it becomes, whether because the session is still open or
+   because its compaction failed. Read as the busiest day and multiplied by the journal
+   reserve below, it would page every night for the whole window. Its bytes still count
+   against free space, because they are on the disk. The price is named: one anomalous
+   sealed day, a backfill or a reseal, shortens the runway and can flag or page early. A
+   false page costs an operator a look at the Lake panel, while a missed one costs the
+   disk, and a minute lost to a full disk is gone forever.
 3. **The runway's unit is capture days, so anything in weeks or years goes through the
    calendar.** Growth happens on sessions. 2,059 capture days is 8.2 years over a
    252-session year, not the 5.6 a division by 365 would give. So the exhaustion date is
@@ -41,16 +47,31 @@ Four decisions are worth reading before the code.
    only ``f_frsize`` is the one ``f_bavail`` is counted in. Multiplying by ``f_bsize``
    instead overstates free space 256 times, in the same direction as the mean above, and
    the wrapper applies the right one.
+5. **A session's journal is reserved off free space before the runway is counted.** The
+   rate sees only sealed Parquet, but every session first lands under ``lake_root`` as an
+   uncompressed journal that compaction frees only at close+15, and nothing records its
+   size. The measured peaks ran 9 to 13 times a sealed day: 7.5 GB on 2026-10-06 against a
+   599.3 MB sealed upload that night. So ``JOURNAL_RESERVE_SESSIONS`` times the busiest
+   sealed day comes off ``free`` first, and a disk with less free space than that reads
+   zero capture days. A multiple follows the roster as it grows, where a byte count would
+   go stale. The whole reserve comes off every time, with no credit for a journal already
+   on the disk, so mid-session the panel reads up to 13 sessions short until compaction
+   frees the journal. That is the price. A credit would lengthen the runway on exactly the
+   night a compaction failed and left its journal stuck, when tomorrow still needs the
+   full reserve.
 
 **Nothing here raises for a lake it cannot read.** The dashboard turns any escape into a
 500 for the whole panel, which would throw away the refusal lines this module exists to
 report. So a directory that will not list and a file that will not stat are values in
 :class:`Usage`, not exceptions. The walk is ``os.walk`` with an ``onerror`` handler and
 never ``Path.rglob``, which drops an unreadable directory and reports nothing at all. A
-file that vanishes between the listing and the stat is a different thing and is skipped
-silently: compaction prunes an emptied directory while holding the lake lock, so a file
-the walk just saw is gone every weekday at close+15 on a lake behaving exactly as
-designed.
+file or a directory that vanishes between the listing and the read is a different thing
+and is skipped silently: compaction prunes an emptied directory while holding the lake
+lock, so a path the walk just saw is gone every weekday at close+15 on a lake behaving
+exactly as designed. The root itself vanishing is still a refusal. ``lost+found`` at the
+root is skipped before it is listed. On the hosted VM ``lake_root`` is the volume's mount
+point, where ``mkfs.ext4`` leaves that directory owned by root at mode 0700, so every walk
+would otherwise report a refusal that names nothing about the lake.
 """
 
 from __future__ import annotations
@@ -63,12 +84,19 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from lake.calendar import Calendar
-from lake.paths import JOURNAL_DIR, JSONL_SUFFIX, PARQUET_SUFFIX, TIMING_DIR, parse_date_dir
+from lake.paths import (
+    JOURNAL_DIR,
+    JSONL_SUFFIX,
+    LOST_AND_FOUND,
+    PARQUET_SUFFIX,
+    TIMING_DIR,
+    parse_date_dir,
+)
 
 # How many trailing calendar days the growth rate is measured over. It matches the
 # History panel's window so the page's two spans read alike to a human, and the two
-# constants are independent in code because this module is a leaf and cannot read that
-# one without becoming the cycle the module docstring describes.
+# constants are independent in code because this module is a leaf and does not import the
+# dashboard.
 GROWTH_WINDOW_DAYS = 30
 
 # The headroom the design calls "a few weeks". Below this the runway is short, which the
@@ -77,6 +105,19 @@ GROWTH_WINDOW_DAYS = 30
 # weeks is a design constant no measurement moves. The free bytes it resolves to differ
 # per machine. The weeks do not.
 HEADROOM_WEEKS = 3
+
+# The headroom under which a short runway also pages, rather than only filing a line in the
+# nightly report. ``HEADROOM_WEEKS`` was set for a laptop with years of headroom, where a
+# line was enough. The hosted VM keeps the lake on a dedicated volume measured in weeks, so
+# under this floor the report line is too slow a way to learn that capture is at risk. The
+# test has the same shape as ``short``'s: a date comparison, never a converted count.
+PAGE_FLOOR_WEEKS = 2
+
+# How many sessions of the busiest sealed day come off free space to hold a session's
+# journal before the runway is counted. Module docstring decision 5 gives the measurement:
+# the journal's peak ran 9 to 13 times the sealed day it compacts into, and this takes the
+# top of that range.
+JOURNAL_RESERVE_SESSIONS = 13
 
 # ``st_blocks`` is counted in 512-byte units by POSIX, whatever the filesystem's own
 # block size is. It is spelled once.
@@ -145,8 +186,9 @@ class Usage:
     after close+15 it is one compressed Parquet partition, and compaction appends the
     manifest entry before it unlinks the segments, so for a moment a day is both. Both
     readings run high, which shortens the runway rather than lengthening it, so neither
-    is worth engineering around. The flag is carried because a growth figure that visibly
-    drops at 16:30 needs an explanation where a reader will see it.
+    is worth engineering around. The flag is carried for two reasons. A growth figure that
+    visibly drops at 16:30 needs an explanation where a reader will see it, and the rate is
+    taken over sealed days only, for the reason the module docstring's decision 2 gives.
 
     ``refusals`` names what would not read, capped at ``NAMED_REFUSALS`` with
     ``refused`` holding the true count.
@@ -188,6 +230,12 @@ class Runway:
     outruns the schedule the calendar knows or the walk's own bound. That horizon is about
     a year, and a runway inside it is exactly the case the headroom test cares about, so
     nothing the alarm needs is ever unanswerable.
+
+    ``reserve`` is the journal reserve, ``JOURNAL_RESERVE_SESSIONS`` times ``peak``, which
+    came off ``free`` before ``capture_days_left`` was counted. It is carried so a reader
+    can see why free space and the capture-day count disagree. ``peak``, ``peak_day``,
+    ``mean`` and ``capture_days`` are read over sealed days only, while ``window_days``
+    lists every day in the window, unsealed ones included.
     """
 
     free: int | None
@@ -199,6 +247,7 @@ class Runway:
     window_days: tuple[tuple[date, int], ...]
     peak_day: date | None
     peak: int
+    reserve: int
     capture_days: int
     mean: int | None
     capture_days_left: int | None
@@ -215,6 +264,18 @@ class Runway:
         if self.exhausts_on is None:
             return False
         return self.exhausts_on <= self.window_end + timedelta(weeks=HEADROOM_WEEKS)
+
+    @property
+    def critical(self) -> bool:
+        """Whether the headroom is under ``PAGE_FLOOR_WEEKS``, which the evening sweep pages.
+
+        The same shape as :attr:`short`, one threshold lower, so a critical runway is
+        always a short one. With no date both read False, which is why the sweep files its
+        own line for a reading that failed.
+        """
+        if self.exhausts_on is None:
+            return False
+        return self.exhausts_on <= self.window_end + timedelta(weeks=PAGE_FLOOR_WEEKS)
 
 
 def _day_of(parts: Sequence[str]) -> date | None:
@@ -264,7 +325,12 @@ def walk(lake_root: Path | str) -> Usage:
     A missing root reports as a refusal rather than as an empty lake, because ``os.walk``
     hands its ``onerror`` the ``FileNotFoundError`` naming the top directory. That
     distinction matters: an absent ``reports/`` is a true zero, and an absent
-    ``lake_root`` is a panel pointed at nothing.
+    ``lake_root`` is a panel pointed at nothing. A directory below the root that is gone by
+    the time it is listed is the other thing: compaction pruned it, and it is skipped.
+
+    ``lost+found`` at the root is dropped before it is listed, for the reason the module
+    docstring gives. One anywhere else is not the filesystem's, so it is walked and an
+    unreadable one is still refused.
     """
     root = Path(lake_root).resolve()
     entry_bytes: dict[str, int] = {}
@@ -298,7 +364,25 @@ def walk(lake_root: Path | str) -> Usage:
         where_name = "the lake root" if name in ("", ".") else name
         refusals.append(f"{where_name}: {type(exc).__name__}")
 
-    for parent, _dirs, names in os.walk(root, onerror=lambda exc: refuse(root, exc)):
+    def listing_failed(exc: OSError) -> None:
+        """Refuse a directory that would not list, unless compaction pruned it first.
+
+        ``_prune_empty`` in compaction removes an emptied ``journal/date=<D>/`` while the
+        walk may already have listed its parent, and ``os.walk`` hands that loss here as a
+        ``FileNotFoundError``. It is the directory form of the vanished file skipped below.
+        The root is the exception, and so is a failure naming no path at all, because
+        neither can be told apart from a lake that is not there.
+        """
+        filename = getattr(exc, "filename", None)
+        if isinstance(exc, FileNotFoundError) and filename is not None and Path(filename) != root:
+            return
+        refuse(root, exc)
+
+    top = os.fspath(root)
+    for parent, dirs, names in os.walk(root, onerror=listing_failed):
+        if parent == top and LOST_AND_FOUND in dirs:
+            # Pruned in place, which is how ``os.walk`` is told not to descend.
+            dirs.remove(LOST_AND_FOUND)
         for name in names:
             path = Path(parent) / name
             try:
@@ -397,9 +481,11 @@ def assess(
     ``today`` is the caller's own session date rather than a wall-clock read, because
     nothing in this module reads a clock, the same rule the dashboard keeps.
 
-    The rate is the busiest day in the window. The mean rides beside it, denominated by
-    the days that actually wrote bytes rather than by the window's width, because a day
-    that captured nothing is not a day the lake grew slowly on.
+    The rate is the busiest sealed day in the window. The mean rides beside it,
+    denominated by the sealed days that actually wrote bytes rather than by the window's
+    width, because a day that captured nothing is not a day the lake grew slowly on. The
+    journal reserve comes off free space before the count, and a disk with less free space
+    than the reserve reads zero capture days rather than a negative count.
 
     Nothing here raises for a lake or a device it cannot read. Both readings report as
     values, for one reason: the caller is a panel where an escape becomes a 500 saying
@@ -418,15 +504,20 @@ def assess(
 
     start = today - timedelta(days=window_days - 1)
     window = tuple((day, size) for day, size in usage.day_bytes.items() if start <= day <= today)
-    capturing = [(day, size) for day, size in window if size > 0]
+    # Sealed days only, per module docstring decision 2. An unsealed day's bytes are on the
+    # disk and already missing from ``free``, so leaving it out of the rate drops nothing.
+    capturing = [(day, size) for day, size in window if size > 0 and day not in usage.unsealed]
     peak_day, peak = max(capturing, key=lambda item: item[1]) if capturing else (None, 0)
     mean = sum(size for _day, size in capturing) // len(capturing) if capturing else None
+    reserve = JOURNAL_RESERVE_SESSIONS * peak
 
     capture_days_left: int | None = None
     exhausts_on: date | None = None
     beyond = False
     if peak > 0 and free is not None:
-        capture_days_left = free // peak
+        # Clamped, because free space under the reserve would otherwise read as a negative
+        # count, and the panel prints it.
+        capture_days_left = max(0, (free - reserve) // peak)
         exhausts_on, beyond = _exhaustion(capture_days_left, today, calendar)
 
     return Runway(
@@ -439,6 +530,7 @@ def assess(
         window_days=window,
         peak_day=peak_day,
         peak=peak,
+        reserve=reserve,
         capture_days=len(capturing),
         mean=mean,
         capture_days_left=capture_days_left,

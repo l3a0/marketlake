@@ -1179,13 +1179,16 @@
         "Read the Now panel for whether capture is running.", "note");
     } else if (lake.beyond_horizon) {
       line = el("p",
-        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
-          "capture days") + " at the window's busiest day. That runs past the calendar's " +
+        bytes(lake.free) + " free, less a " + bytes(lake.reserve_bytes) +
+        " journal reserve, is " + plural(lake.capture_days_left, "capture day",
+          "capture days") + " at the window's busiest sealed day. That runs past the " +
+        "calendar's " +
         "horizon, so there is no date for it, and it is not the " +
         lake.headroom_weeks + " weeks the nightly report flags.");
     } else {
       line = el("p",
-        bytes(lake.free) + " free is " + plural(lake.capture_days_left, "capture day",
+        bytes(lake.free) + " free, less a " + bytes(lake.reserve_bytes) +
+        " journal reserve, is " + plural(lake.capture_days_left, "capture day",
           "capture days") + ", exhausted " + lake.exhausts_on + ".",
         lake.short ? "alarm" : null);
       if (lake.short) {
@@ -1194,6 +1197,15 @@
       }
     }
     box.appendChild(line);
+    if (lake.capture_days_left !== null) {
+      // The reserve holds a session's journal, which lands uncompressed under the lake
+      // root and is freed only when compaction seals it at close+15. Nothing records its
+      // size, so it is a multiple of the busiest sealed day.
+      box.appendChild(el("p",
+        "The journal reserve is " + bytes(lake.reserve_bytes) + ", room for one " +
+        "session's uncompressed journal before compaction seals it. It comes off in " +
+        "full even mid-session, when today's journal already fills part of it.", "muted"));
+    }
     if (!lake.space_error) {
       box.appendChild(el("p",
         "Free space is the whole device's, not the lake's allowance: " + bytes(lake.free) +
@@ -1244,7 +1256,8 @@
   // spread is visible rather than asserted.
   function renderGrowth(lake) {
     byId("growth-note").textContent =
-      lake.capture_days ? plural(lake.capture_days, "day", "days") + " with bytes" : "";
+      lake.capture_days ? plural(lake.capture_days, "sealed day", "sealed days") +
+        " with bytes" : "";
     var box = byId("growth");
     clear(box);
     if (!lake.days.length) {
@@ -1252,8 +1265,10 @@
       return;
     }
     box.appendChild(el("p",
-      "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", which sets the " +
-      "runway. Mean " + bytes(lake.mean_bytes) + " over the days that wrote bytes. " +
+      "Peak " + bytes(lake.peak_bytes) + " on " + lake.peak_day + ", the busiest sealed " +
+      "day, which sets the runway. An unsealed day below can be larger, because it is " +
+      "still uncompressed journal. Mean " + bytes(lake.mean_bytes) + " over the sealed " +
+      "days that wrote bytes. " +
       "A mean over all " + lake.window_days + " calendar days would be lower still, and " +
       "a rate that is too low lengthens the runway rather than shortening it."));
     var wrap = el("div", null, "table-wrap");

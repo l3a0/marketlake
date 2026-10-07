@@ -123,6 +123,14 @@ REPORTS_DIR = "reports"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
+# The one entry a fresh ext4 filesystem holds at its root. On the hosted VM ``lake_root``
+# is the lake volume's mount point, so the directory sits beside the surfaces, owned by
+# root at mode 0700. A restore may find it in an empty destination and still count the
+# destination as empty, and the disk-runway walk skips it rather than reporting it refused
+# every night. It is spelled here because ``lake.runway`` imports only this module and
+# the calendar, and ``lake.bucket`` reads the same name.
+LOST_AND_FOUND = "lost+found"
+
 # The daemon's journal metadata stamp, written by ``lake.metadata``. It sits at the
 # journal root rather than inside a ``date=`` directory, because compaction prunes a
 # sealed day's directories once they are empty and a file inside one would keep that
@@ -554,6 +562,7 @@ __all__ = [
     "JOURNAL_DIR",
     "JOURNAL_METADATA_FILE",
     "JSONL_SUFFIX",
+    "LOST_AND_FOUND",
     "MANIFEST_FILE",
     "OUTBOX_DIR",
     "PARQUET_SUFFIX",

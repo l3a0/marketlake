@@ -4491,14 +4491,30 @@ def test_the_growth_rate_is_the_busiest_day_and_the_mean_rides_beside_it(root: P
     # The finding the module exists around. The mean is denominated by the days that wrote
     # bytes rather than by the window's width, and the runway is taken off the peak,
     # because every way of understating the rate lengthens the runway and a check that
-    # flags short headroom never fires if its rate is too low.
+    # flags short headroom never fires if its rate is too low. Both are over sealed days
+    # only: the fixture's Monday is all journal and is its largest day, which is the shape
+    # that would make the panel read short every afternoon (marketlake #438).
     payload = service_over(root).run_query("lake", {})
     days = payload["days"]
     assert days
-    assert payload["peak_bytes"] == max(day["bytes"] for day in days)
-    assert payload["capture_days"] == sum(1 for day in days if day["bytes"] > 0)
+    sealed = [day["bytes"] for day in days if not day["unsealed"] and day["bytes"] > 0]
+    assert sealed
+    assert payload["peak_bytes"] == max(sealed)
+    assert payload["peak_bytes"] < max(day["bytes"] for day in days)
+    assert payload["capture_days"] == len(sealed)
     assert payload["mean_bytes"] <= payload["peak_bytes"]
-    assert payload["capture_days_left"] == payload["free"] // payload["peak_bytes"]
+    # Thirteen sessions of the peak are the journal reserve, which comes off free first.
+    assert payload["capture_days_left"] == max(
+        0, (payload["free"] - 13 * payload["peak_bytes"]) // payload["peak_bytes"]
+    )
+
+
+def test_the_panel_carries_the_journal_reserve_it_took_off_free_space(root: Path):
+    # The page prints "free, less a journal reserve", so the reserve has to be in the
+    # payload, and it has to be the one ``capture_days_left`` was counted after.
+    payload = service_over(root).run_query("lake", {})
+    assert payload["reserve_bytes"] == 13 * payload["peak_bytes"]
+    assert payload["reserve_bytes"] > 0
 
 
 def test_a_journal_day_is_flagged_unsealed_on_the_panel(fixture_lake: FixtureLake):
