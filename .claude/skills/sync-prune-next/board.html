@@ -1,0 +1,1448 @@
+<title>Marketlake Build Board</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --ground: #F2F5F7;
+    --panel: #FFFFFF;
+    --panel-2: #E9EEF2;
+    --ink: #17202A;
+    --muted: #55636F;
+    --faint: #83919E;
+    --line: #DCE3E9;
+    --rule: #C2CCD6;
+    --accent: #2F5D8C;
+    --accent-soft: #DEE9F4;
+    --exact: #1C6B4B;
+    --exact-soft: #D9EDE3;
+    --gap: #8E6310;
+    --gap-soft: #F6E9CD;
+    --wait: #7A4E86;
+    --wait-soft: #EDE1F2;
+    --far: #8C3A34;
+    --far-soft: #F5DEDC;
+    --idle: #6E7A85;
+    --idle-soft: #E5EAEE;
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E141A; --panel: #161D25; --panel-2: #1C242D;
+      --ink: #E3EAF1; --muted: #93A1AF; --faint: #74828F; --line: #252E38; --rule: #36414D;
+      --accent: #78ADDC; --accent-soft: #14283C;
+      --exact: #5DBE93; --exact-soft: #0F2820;
+      --gap: #D6A448; --gap-soft: #2F2513;
+      --wait: #BD98CC; --wait-soft: #261A2B;
+      --far: #DD8880; --far-soft: #2D1715;
+      --idle: #8494A2; --idle-soft: #1F272F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0E141A; --panel: #161D25; --panel-2: #1C242D;
+    --ink: #E3EAF1; --muted: #93A1AF; --faint: #74828F; --line: #252E38; --rule: #36414D;
+    --accent: #78ADDC; --accent-soft: #14283C;
+    --exact: #5DBE93; --exact-soft: #0F2820;
+    --gap: #D6A448; --gap-soft: #2F2513;
+    --wait: #BD98CC; --wait-soft: #261A2B;
+    --far: #DD8880; --far-soft: #2D1715;
+    --idle: #8494A2; --idle-soft: #1F272F;
+  }
+
+  body { background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 56px; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+  a:hover { border-bottom-color: currentColor; }
+  a:focus-visible, [tabindex]:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .mast { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; }
+  .mast h1 { font-size: 1.5rem; font-weight: 600; letter-spacing: -0.015em; }
+  .mast .sub { color: var(--muted); font-size: 0.875rem; }
+  .strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 8px; }
+  .chip { font-family: var(--mono); font-size: 0.75rem; padding: 5px 10px; border: 1px solid var(--line);
+          background: var(--panel); border-radius: 4px; color: var(--muted); }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .chip.live { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+  .sec { margin-top: 38px; }
+  .sec > header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px;
+                  border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 16px; }
+  .sec h2 { font-size: 0.8125rem; font-family: var(--mono); font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.09em; color: var(--accent); }
+  .sec .note { font-size: 0.8125rem; color: var(--faint); }
+  .sec .note b { color: var(--muted); font-weight: 600; }
+
+  /* ---- build order: dependency stages ---- */
+  .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+  .col > .ch { border-top: 2px solid var(--rule); padding-top: 7px; display: flex;
+               align-items: baseline; gap: 7px; flex-wrap: wrap; }
+  .col > .ch .t { font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink); }
+  .col > .ch .c { font-family: var(--mono); font-size: 0.6875rem; color: var(--faint); }
+  .col > .ch .d { flex-basis: 100%; font-size: 0.6875rem; color: var(--faint); }
+  .col.k0 > .ch { border-top-color: var(--exact); }
+  .col.k1 > .ch { border-top-color: var(--accent); }
+  .col.k2 > .ch { border-top-color: var(--wait); }
+  .col.k3 > .ch { border-top-color: var(--far); }
+  /* The flow columns are stages rather than depths, so they take their own
+     colours: green where the ball is nobody's yet, blue while a session holds
+     it, amber while a review is owed, and the accent again when it is the
+     owner's move. */
+  .col.f-owner > .ch { border-top-color: var(--exact); }
+  .col.f-mine > .ch { border-top-color: var(--gap); }
+  .col.f-building > .ch { border-top-color: var(--accent); }
+  .col.f-planned > .ch { border-top-color: var(--wait); }
+  .col .empty { font-size: 0.75rem; color: var(--faint); font-style: italic;
+                border: 1px dashed var(--line); border-radius: 6px; padding: 10px; }
+
+  .tk { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px 9px;
+        background: var(--panel); display: flex; flex-direction: column; gap: 4px;
+        cursor: pointer; transition: opacity .12s, border-color .12s; }
+  .tk:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .tk .r1 { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .tk .id { font-family: var(--mono); font-size: 0.75rem; font-weight: 600; }
+  .tk .sl { font-family: var(--mono); font-size: 0.625rem; color: var(--faint);
+            border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+  /* The tracker's own labels, carried across rather than re-invented, because a
+     second vocabulary for the same thing is a second thing to keep in step.
+     Each takes its colour from the hue GitHub stores for that label, so a
+     reader moving between the two surfaces is looking at the same chip. */
+  .tk .lbs { display: flex; flex-wrap: wrap; gap: 4px; }
+  .tk .lbs b { font-family: var(--mono); font-size: 0.5625rem; font-weight: 600;
+               text-transform: uppercase; letter-spacing: 0.06em; border-radius: 3px;
+               padding: 1px 5px; border: 1px solid currentColor; }
+  .tk .lb { font-size: 0.8125rem; line-height: 1.35; }
+  .tk .wo { font-size: 0.6875rem; color: var(--faint); font-family: var(--mono); }
+  .tk.k-ready { border-left: 3px solid var(--exact); }
+  .tk.k-deferred { border-style: dashed; background: none; }
+  .tk.k-deferred .lb, .tk.k-decision .lb, .tk.k-parent .lb { color: var(--muted); }
+  .tk.k-decision { border-left: 3px solid var(--gap); }
+  .tk.k-data { border-style: dashed; background: none; border-left: 3px solid var(--far); }
+  /* A parent that builds nothing takes the idle grey, the same ink the loops'
+     column uses for work nothing is owed on. It keeps a solid border, because a
+     dashed one already means deferred and a second dashed kind would collapse
+     two different reasons into one look. */
+  .tk.k-parent { border-left: 3px solid var(--idle); background: none; }
+  /* An open pull request is a state of its own, so it colours the three borders
+     the kind stripe does not use rather than overwriting the kind stripe. */
+  .tk.has-pr { border-top-color: var(--accent); border-right-color: var(--accent);
+                border-bottom-color: var(--accent); }
+  .tk .pr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 6px;
+            font-family: var(--mono); font-size: 0.6875rem; color: var(--muted); }
+  /* A card somebody is already on is not a card to pick up, and it is not a
+     pull request either, because nothing is written yet. It gets the wait
+     colour, which the board already uses for work that is not free to start. */
+  .tk.busy { box-shadow: inset 3px 0 0 0 var(--wait); }
+  .tk .wk { font-family: var(--mono); font-size: 0.6875rem; color: var(--wait); }
+  /* A card whose plan has been executed against the code is a different thing
+     from a card whose body is still a hypothesis, and the difference is what
+     decides whether it can be handed to a builder. It is drawn as a filled
+     corner rather than another border, because the borders are spoken for. */
+  .tk.plan-build { box-shadow: inset 0 3px 0 0 var(--exact); }
+  .tk.plan-decide { box-shadow: inset 0 3px 0 0 var(--gap); }
+  .tk .pl { font-family: var(--mono); font-size: 0.6875rem; }
+  .tk .pl.build { color: var(--exact); }
+  .tk .pl.decide { color: var(--gap); }
+  /* Where a card sits in the priority order, as a mark rather than a paragraph.
+     Restating the argument here was one surface too many and made a ranked card
+     three times the height of its neighbours. A card with no mark is not ranked
+     at all, and a deferred one drops its mark rather than showing a number its
+     position contradicts. */
+  .tk .rk { font-family: var(--mono); font-size: 0.625rem; font-weight: 600;
+            color: var(--accent); background: var(--accent-soft);
+            border-radius: 3px; padding: 0 5px; }
+  .tk .pr .sep { color: var(--rule); }
+  .tk .pr .ck.ok { color: var(--exact); }
+  .tk .pr .ck.bad { color: var(--far); }
+  .tk .pr .ck.run { color: var(--gap); }
+  .tk .pr .ck.none { color: var(--faint); }
+  .tk .pr .nolink { flex-basis: 100%; color: var(--faint); }
+  .board.picking .tk { opacity: .26; }
+  .board.picking .tk.on { opacity: 1; border-color: var(--accent); }
+  .board.picking .tk.root { opacity: 1; border-color: var(--accent);
+                            box-shadow: 0 0 0 2px var(--accent-soft); }
+
+  .chainbar { margin-top: 12px; font-size: 0.75rem; color: var(--muted); display: flex;
+              align-items: center; gap: 10px; flex-wrap: wrap; min-height: 1.6em; }
+  .chainbar button { font: inherit; font-family: var(--mono); font-size: 0.6875rem;
+                     color: var(--accent); background: none; border: 1px solid var(--accent);
+                     border-radius: 3px; padding: 2px 8px; cursor: pointer; }
+  .chainbar .hint { color: var(--faint); }
+  /* marketlake: the line that says how many cards the default view hides, and the
+     button that shows them. It borrows the chain bar's button, so it reads as the
+     same kind of control. */
+  .more { margin-bottom: 14px; font-size: 0.75rem; color: var(--muted); display: flex;
+          align-items: center; gap: 10px; flex-wrap: wrap; }
+  .more button { font: inherit; font-family: var(--mono); font-size: 0.6875rem;
+                 color: var(--accent); background: none; border: 1px solid var(--accent);
+                 border-radius: 3px; padding: 2px 8px; cursor: pointer; }
+  /* marketlake: the milestone selector under the strip. It filters every card
+     section at once, so it sits above all of them rather than in one. */
+  .msbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+           margin: 4px 0 12px; font-size: 0.8125rem; color: var(--muted); }
+  .msbar label { font-family: var(--mono); font-size: 0.75rem; font-weight: 600;
+                 text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink); }
+  .msbar select { font: inherit; font-family: var(--mono); font-size: 0.75rem; color: var(--ink);
+                  background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
+                  padding: 4px 8px; max-width: 100%; }
+  .msbar .cnt { font-family: var(--mono); font-size: 0.75rem; color: var(--faint); }
+  .chainbar .hid { flex-basis: 100%; color: var(--gap); }
+  .key { display: flex; flex-wrap: wrap; gap: 9px 16px; margin-top: 12px;
+         font-size: 0.75rem; color: var(--muted); align-items: center; }
+  .key span { display: inline-flex; align-items: center; gap: 6px; }
+  .key i { width: 22px; height: 12px; border-radius: 3px; border: 1px solid var(--line);
+           background: var(--panel); flex: none; }
+  .key i.ready { border-left: 3px solid var(--exact); }
+  .key i.decision { border-left: 3px solid var(--gap); }
+  .key i.deferred { border-style: dashed; background: none; }
+  .key i.data { border-style: dashed; background: none; border-left: 3px solid var(--far); }
+  .key i.parent { border-left: 3px solid var(--idle); background: none; }
+  .key i.has-pr { border-top-color: var(--accent); border-right-color: var(--accent);
+                   border-bottom-color: var(--accent); }
+  .key i.busy { box-shadow: inset 3px 0 0 0 var(--wait); }
+  .key i.plan-build { box-shadow: inset 0 3px 0 0 var(--exact); }
+  .key i.plan-decide { box-shadow: inset 0 3px 0 0 var(--gap); }
+  /* The one swatch that carries a glyph rather than a colour, because the mark
+     it stands for is a number and an empty block would not be recognisable as
+     the thing on the card. The glyph is a letter rather than a digit on
+     purpose. A digit here reads as a position and points at whichever card is
+     currently sitting on it. */
+  .key i.rk { width: auto; min-width: 22px; height: auto; border: none;
+              background: var(--accent-soft); color: var(--accent);
+              font-family: var(--mono); font-size: 0.625rem; font-weight: 600;
+              font-style: normal; padding: 0 5px; text-align: center; line-height: 1.55; }
+  .key i.rk::before { content: "n"; }
+
+  .board.flow { grid-template-columns: repeat(5, 1fr); }
+  @media (max-width: 1100px) { .board.flow { grid-template-columns: repeat(3, 1fr); } }
+  /* The loops' column takes the idle grey, because a card under one is the least
+     finished thing the section draws and nothing about it is owed to anybody. */
+  .col.f-planning > .ch { border-top-color: var(--idle); }
+  @media (max-width: 900px) { .board { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 540px) { .board { grid-template-columns: 1fr; } }
+
+  .caveat { margin-top: 18px; border-left: 3px solid var(--accent); background: var(--panel);
+            border-radius: 0 5px 5px 0; padding: 12px 15px; font-size: 0.8125rem; color: var(--muted); }
+  .caveat b { color: var(--ink); font-weight: 600; }
+  .caveat + .caveat { margin-top: 10px; }
+  .caveat.warn { border-left-color: var(--gap); }
+
+  footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid var(--line);
+           font-size: 0.75rem; color: var(--faint); }
+  footer p { margin: 0 0 8px; max-width: 76ch; }
+  footer p:last-child { margin-bottom: 0; }
+  footer b { color: var(--muted); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <div class="mast">
+    <h1>Marketlake Build Board</h1>
+    <span class="sub">the order of work on the capture-first option-chain lake</span>
+  </div>
+  <div class="strip" id="strip"></div>
+  <!-- marketlake: the milestone filter (owner asked 2026-10-05). -->
+  <div class="msbar" id="msbar"><label for="mssel">Milestone</label><select id="mssel"></select>
+    <span class="cnt" id="mscount"></span></div>
+  <div class="caveat warn" id="source" hidden></div>
+  <p class="note" style="margin:0 0 4px;font-size:0.8125rem;color:var(--faint)">What each deliverable is for lives in <a href="https://github.com/l3a0/marketlake/blob/main/docs/design.md" target="_blank" rel="noopener">the design doc</a>, and the slice order in <a href="https://github.com/l3a0/marketlake/blob/main/docs/build-plan.md" target="_blank" rel="noopener">the build plan</a>. The order below follows the repository's ranking rule: capture reliability first, then what makes the lake usable, and evidence from real use over any ranking made in advance.</p>
+
+  <section class="sec" id="flightsec">
+    <header>
+      <h2>In flight</h2>
+      <span class="note">the five states between a plan being written and a merge, <b>most finished
+        on the left</b>. A card here is somebody's already, and the column says whose move it is.</span>
+    </header>
+    <div class="board flow" id="flow"></div>
+    <div class="chainbar" id="flowchain"></div>
+    <div class="key" id="flowkey"></div>
+    <div class="caveat" id="flownote"></div>
+  </section>
+
+  <section class="sec" id="ordersec">
+    <header>
+      <h2>Build order</h2>
+      <span class="note" id="ordernote"></span>
+    </header>
+    <div class="more" id="more"></div>
+    <div class="board" id="board"></div>
+    <div class="chainbar" id="chainbar"></div>
+    <div class="key" id="key"></div>
+    <div class="caveat" id="boardnote"></div>
+    <div class="caveat warn" id="untracked" hidden></div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const ISS = "https://github.com/l3a0/marketlake/issues/";
+const PRU = "https://github.com/l3a0/marketlake/pull/";
+
+/* The renderer below is the Quantitative Trading Build Board's, line for line,
+   except where a comment starts with "marketlake:". Its other comments cite the
+   quantitative-trading repository's issues and pull requests, not this one's, so
+   a number in those comments is not a marketlake issue.
+
+   marketlake: the data lives in the artifact's database, in one document at
+   DOC, and a sync writes that document rather than republishing the page. That
+   is what lets two planning sessions update the board without overwriting each
+   other: each write names the version it was based on and is refused if the
+   document moved. The page subscribes once and redraws on every write.
+
+   marketlake: FALLBACK carries no board data. A copy of the document used to
+   sit here, and a copy goes stale silently: the old board's read as current
+   while nine days out of date. Until a live document arrives, or when the
+   database cannot be reached, the page draws only the banner under the strip,
+   which says why there is nothing to show.
+
+   The document's shape is { schema, state, prs, working, planned, next,
+   untracked, tracker }, and each field is what the constant of the same name
+   held on the Quantitative Trading page. `usable` below is the whole contract
+   the page checks before adopting a document. */
+const DOC = "board/data";
+/* marketlake: `none` tells render() there is no board to draw. Every section
+   below states facts about the tracker, so any stand-in document, however
+   empty, makes the page assert facts it does not have. A stand-in card also
+   drew as a real issue #0. So the page draws nothing but the banner until a
+   document passes `usable`, and NONE stays true until then. */
+const FALLBACK = { none: true };
+let NONE = true;
+
+let STATE, PRS, WORKING, PLANNED, NEXT, UNTRACKED, TRACKER, NEXT_SORTED;
+let SOURCE = { live: false, why: "loading" };
+
+/* marketlake: the build order shows only the ranked cards unless the reader asks
+   for the rest, because a board carrying every open issue ran to a hundred and
+   fifty cards in one column. The choice is remembered per browser and nowhere
+   else. */
+let SHOW_ALL = false;
+try { SHOW_ALL = localStorage.getItem("marketlake-board-all") === "1"; } catch (e) { SHOW_ALL = false; }
+let SHOWN = 0, HIDDEN = 0;
+let CHAIN_ESC = null;
+
+/* marketlake: the milestone filter. MS_PREF is what the reader chose, kept per
+   browser. MS is what the page draws, which falls back to the default whenever
+   the choice names a milestone the tracker no longer carries, without
+   forgetting the choice. The default is MVP 2 while that milestone has open
+   issues, and every milestone otherwise. The filter decides only what is drawn.
+   Depth, blockers and the tracer still read the whole tracker, so a card keeps
+   its column and its "waits on" line when its blocker sits in another milestone. */
+const MS_ALL = "All", MS_DEFAULT = "MVP 2", MS_KEY = "marketlake-board-ms";
+let MS_PREF = null;
+try { MS_PREF = localStorage.getItem(MS_KEY); } catch (e) { MS_PREF = null; }
+let MS = MS_ALL;
+let MS_OPTS = "";
+const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
+
+function usable(d) {
+  return !!(d && d.state && typeof d.state.main === "string" && d.state.lake && d.state.suite &&
+    d.state.issues && Array.isArray(d.tracker) && d.tracker.length && Array.isArray(d.next) &&
+    Array.isArray(d.prs) && Array.isArray(d.working) && Array.isArray(d.planned));
+}
+
+/* A delivered snapshot is frozen, so the page works on a clone. */
+function adopt(src) {
+  NONE = !!src.none; /* marketlake: only FALLBACK carries it. */
+  if (NONE) return;
+  const d = JSON.parse(JSON.stringify(src));
+  STATE = d.state; PRS = d.prs; WORKING = d.working; PLANNED = d.planned;
+  NEXT = d.next; UNTRACKED = d.untracked || []; TRACKER = d.tracker;
+  NEXT_SORTED = NEXT.slice().sort((a, b) =>
+    a.band - b.band ||
+    (a.order || 50) - (b.order || 50) ||
+    READY_RANK[a.ready] - READY_RANK[b.ready] ||
+    a.issue - b.issue);
+}
+
+/* The banner is empty while the page shows live data, and says what it is
+   showing otherwise. It never guesses at why a view cannot reach the database,
+   because the platform deliberately does not say. */
+function source() {
+  const el = document.getElementById("source");
+  if (!el) return;
+  if (SOURCE.live) { el.hidden = true; el.innerHTML = ""; return; }
+  /* marketlake: a function, because STATE is unset while the page has no
+     data, and only the stopped line with live data behind it names an age. */
+  const age = () => `measured ${esc(ago(STATE.updatedAt))} against <span class="mono">${esc(STATE.main)}</span>`;
+  /* marketlake: the page carries no copy of the board, so the lines that used
+     to name the copy's age say there is no board data instead. */
+  const copy = `no board data`;
+  const lines = {
+    loading: `<b>Showing ${copy}.</b> The live board has not arrived yet, and the page carries no copy of its own.`,
+    none: `<b>Showing ${copy}.</b> This view cannot reach the live board, and the page carries no copy of its own.`,
+    empty: `<b>Showing ${copy}.</b> The live board holds no document yet.`,
+    shape: `<b>Showing ${copy}.</b> The live board's document is missing fields this page needs, so it was not used.`,
+    stopped: `<b>Live updates stopped${SOURCE.code ? ` (${esc(SOURCE.code)})` : ""}.</b> ` +
+      (SOURCE.had ? `What is shown is the last live data, ${age()}. Reload to reconnect.`
+                  : `Showing ${copy}.`)
+  };
+  el.innerHTML = lines[SOURCE.why] || lines.none;
+  /* marketlake: shown at once. The loading line used to wait four seconds, so a
+     load that connects at once never flashed a warning. That wait suited a page
+     with a copy of the board to show meanwhile. This page has nothing to show
+     while loading, so the wait left a blank page with no word of why. The price
+     is that a normal load shows the loading line until the board arrives. */
+  el.hidden = false;
+}
+
+/* marketlake: the button above the board, so it shows before the reader scrolls
+   past every card (owner asked 2026-09-27). */
+function more() {
+  const el = document.getElementById("more");
+  if (!el) return;
+  if (!HIDDEN && !SHOW_ALL) { el.innerHTML = ""; return; }
+  /* marketlake: both counts are within the chosen milestone, so the line says so. */
+  const where = MS === MS_ALL ? "" : ` in ${esc(MS)}`;
+  el.innerHTML = SHOW_ALL
+    ? `<span>Showing all ${SHOWN} open issues${where} not in flight.</span>` +
+      `<button type="button" data-toggle>Show only the ranked cards</button>`
+    : `<span>Showing the ${SHOWN} ranked ${SHOWN === 1 ? "card" : "cards"}${where}. ` +
+      `${HIDDEN} other open ${HIDDEN === 1 ? "issue" : "issues"}${where} ${HIDDEN === 1 ? "is" : "are"} not in the ` +
+      `priority order.</span>` +
+      `<button type="button" data-toggle>Show all ${SHOWN + HIDDEN}</button>`;
+  el.onclick = e => {
+    if (!e.target.matches("[data-toggle]")) return;
+    SHOW_ALL = !SHOW_ALL;
+    try { localStorage.setItem("marketlake-board-all", SHOW_ALL ? "1" : "0"); } catch (err) { /* per-browser only */ }
+    render();
+  };
+}
+
+/* marketlake: resolves MS and draws the selector. It runs before the cards in
+   render(), because every section reads MS. The options are rebuilt only when
+   the set of milestones changes, so a live redraw does not reset a select the
+   reader has open. */
+function msbar() {
+  const counts = new Map();
+  TRACKER.forEach(c => counts.set(c.ms, (counts.get(c.ms) || 0) + 1));
+  const names = [...counts.keys()].sort((a, b) =>
+    (a === "no milestone") - (b === "no milestone") || String(a).localeCompare(String(b)));
+  const valid = MS_PREF === MS_ALL || counts.has(MS_PREF);
+  MS = valid ? MS_PREF : (counts.has(MS_DEFAULT) ? MS_DEFAULT : MS_ALL);
+  const shown = MS === MS_ALL ? TRACKER.length : counts.get(MS);
+  const sel = document.getElementById("mssel");
+  if (sel) {
+    const opts = [[MS_ALL, TRACKER.length], ...names.map(n => [n, counts.get(n)])]
+      .map(([v, k]) => `<option value="${esc(v)}">${esc(v)} (${k})</option>`).join("");
+    if (opts !== MS_OPTS) { sel.innerHTML = opts; MS_OPTS = opts; }
+    sel.value = MS;
+    sel.onchange = () => {
+      MS_PREF = sel.value;
+      try { localStorage.setItem(MS_KEY, MS_PREF); } catch (err) { /* per-browser only */ }
+      render();
+    };
+  }
+  const cnt = document.getElementById("mscount");
+  if (cnt) cnt.textContent = `${num(shown)} of ${num(TRACKER.length)} open`;
+}
+
+const READY_RANK = { build: 0, decide: 1, plan: 2 };
+/* marketlake: NEXT_SORTED is computed in adopt(), because the ranking can arrive
+   from the database after the page has loaded. */
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const num = n => Number(n || 0).toLocaleString("en-US");
+const plu = (n, w) => n + " " + w + (n === 1 ? "" : /(s|x|ch|sh)$/.test(w) ? "es" : "s");
+/* One join, two conjunctions. A set of things that all hold takes "and", and a
+   set of alternatives takes "or". The reasons a card is not free are
+   alternatives, and reading them joined by "and" said one card needed a
+   decision and was deferred at the same time. */
+const joinwith = (w, xs) => xs.length < 2 ? (xs[0] || "")
+  : xs.slice(0, -1).join(", ") + " " + w + " " + xs[xs.length - 1];
+const andlist = xs => joinwith("and", xs);
+const orlist = xs => joinwith("or", xs);
+
+/* A rollup is folded to the worst thing in it, because a board reader deciding
+   whether a branch is ready needs the blocker rather than the tally. An entry
+   still running and an empty rollup each read as themselves rather than as a
+   pass, so nothing unfinished is drawn as green.
+
+   Two words pass. "success" is a check that ran and passed, and "skipped" is
+   GitHub's SKIPPED, a job whose condition kept it from running. The infra
+   workflow's `tofu apply (live)` job is skipped on every pull request by
+   design, because it runs only on main. Syncs had no word for SKIPPED, so
+   they wrote that job as "neutral", which kept every reviewed, green pull
+   request touching infra/ out of the owner's column.
+
+   Every other word is unsettled, "neutral" and any word this page does not
+   know alike. The fold used to count only the words it knew to be bad and
+   called the rest green, so a sync that wrote a typo such as "sucess" drew a
+   pass. Now a word has to be known good to pass, and an unknown one reads as
+   "reported neither way" until someone teaches the page what it means.
+
+   A rollup of nothing but skipped checks is not green either. Every check
+   standing aside means nothing built the branch, which is the same reason an
+   empty rollup does not pass. This repo's `test` job has no condition and
+   runs on every pull request, so the case has not been seen, and when it
+   comes it reads as unbuilt rather than as passing. */
+function checkword(rollup) {
+  if (!rollup || !rollup.length) return ["none", "no checks reported"];
+  const c = k => rollup.filter(([, s]) => s === k).length;
+  const bad = c("failure"), run = c("running"), ok = c("success"), skip = c("skipped");
+  const neu = rollup.length - bad - run - ok - skip;
+  if (bad) return ["bad", plu(bad, "check") + " failing" +
+    (run ? ", " + plu(run, "check") + " still running" : "")];
+  if (run) return ["run", plu(run, "check") + " still running"];
+  if (neu) return ["none", plu(neu, "check") + " reported neither way"];
+  if (!ok) return ["none", plu(skip, "check") + " skipped and none ran"];
+  return ["ok", "checks green"];
+}
+
+/* A stamp ahead of the reader's clock is reported rather than rounded away.
+   Every branch below rounds a negative age up into "just now", so a page stamped
+   into the future says it was measured just now and goes on saying it however
+   stale it gets. That is the one sentence this page exists to get right, since
+   it is the only warning a reader has that nothing here refreshes itself, and it
+   failed silently in the direction that reads as healthy.
+
+   It is not hypothetical and not one session's slip. Two consecutive published
+   versions carried it, stamped 20:22Z and 21:52Z against a clock reading 19:26Z,
+   and both read "measured just now" while live. Two minutes of slack absorbs
+   ordinary skew between the machine that measured and the machine reading. */
+function ago(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!isFinite(ms)) return "";
+  const m = Math.round(ms / 60000);
+  if (m < -2) return "at a stamp ahead of this clock, so its age cannot be read";
+  if (m < 1) return "just now";
+  if (m < 60) return m + " min ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
+}
+
+function strip() {
+  const s = STATE;
+  document.getElementById("strip").innerHTML = [
+    `<span class="chip"><b>${s.issues.open}</b> open issues</span>`,
+    `<span class="chip live" id="stamp">measured ${esc(ago(s.updatedAt))}</span>`
+  ].join("");
+  const u = document.getElementById("untracked");
+  if (u && UNTRACKED.length) {
+    u.hidden = false;
+    u.innerHTML = `<b>Not on the tracker, so no card shows it.</b> ` + UNTRACKED.map(esc).join(" ");
+  }
+}
+
+/* All that is left of a twenty-paragraph footer. The narrative was a second
+   telling of what the cards already say, and it went. This sentence did not,
+   because the page has no way to refresh itself and a page that does not say so
+   reads as live. */
+function stamped() {
+  /* The decay warning names the states that can actually decay, rather than
+     listing every one of them whenever any is present. A review posted since
+     the stamp can only be misread as owed while some open branch is still
+     unreviewed, so that clause is dropped once none is. Otherwise the page
+     warns about a staleness no card on it can have, which is defect 1 in a
+     smaller form.
+
+     A running session decays faster than either of the other two, and it was
+     the one this list did not name. The list was built from `PRS` alone, so
+     four sessions under the Building column and no branch open drew no warning
+     at all. `WORKING` has carried the reason in its own comment since it was
+     written, that a session ends without telling anyone, and a comment renders
+     nowhere. This is the surface that says what the page cannot know, so the
+     sentence belongs here. */
+  const open = PRS.filter(p => p.state === "open");
+  const decay = [];
+  if (WORKING.length) decay.push("a session that has ended since then still reads as running");
+  if (open.length) decay.push("a check that has gone green or red since then still reads here as it read then");
+  if (open.some(p => !p.reviewed)) decay.push("a review posted since then still reads as owed");
+  document.getElementById("foot").innerHTML =
+    `<p>Measured by hand against <span class="mono">main</span> at ` +
+    `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub, ` +
+    `so every figure on it is current as of the stamp above rather than live.` +
+    (decay.length ? ` The In flight section decays fastest: ${andlist(decay)}.` : ``) +
+    `</p>`;
+}
+
+/* ---- the tracker, as a dependency graph ----
+
+   Horizontal position is dependency depth and nothing else. It says what must
+   clear before a card can start, never when anything will happen, and every
+   card is the same width so no length reads as a duration.
+
+   `kind` is orthogonal to depth. A card can be startable today and still be
+   something nobody should start: deferred under the ranking rule, or a decision
+   that needs the owner rather than a session. Collapsing the two would put
+   "read the book" and "write the recorder" in the same bucket. */
+/* marketlake: TRACKER is read from the document; see adopt(). */
+
+const COLS = [
+  ["Ready now", "nothing open blocks these"],
+  ["Behind one", "one thing has to land first"],
+  ["Behind two or more", "deepest last"],
+  ["Waiting on the world", "history that has to accrue, so not a backlog"]
+];
+/* One colour per tracker label, so the page and GitHub show the same chip.
+   Two diverge on purpose, and the rule is readability rather than fidelity: a
+   label colour on GitHub is a chip background, while here it is text. GitHub's
+   `enhancement` is `a2eeef` and its `deferred` is `ededed`, both too pale to
+   read as text on white, so each is darkened here. `question` is the third and
+   newest of them: GitHub stores `d876e3`, which reaches 2.3 to 1 against white
+   and is darkened here to 5.6 to 1. A label with no entry falls back to the
+   faint ink rather than being dropped, because a new label is information and a
+   missing colour is not a reason to hide it. */
+const LABEL_HUE = {
+  bug: "#d73a4a", documentation: "#0075ca", enhancement: "#2F7F86",
+  test: "#5319e7", deferred: "#6E7A85", question: "#9B3BA8",
+  github_actions: "var(--ink)"
+};
+
+/* A fifth kind. Issue 16 was split into three and its body now says it builds
+   nothing itself, keeping only the rules its children obey. That is neither
+   work, nor deferred, nor a decision, nor blocked on data, and calling it any of
+   those puts a card in the first column reading as something a session can take.
+   The word is on the card because the depth graph cannot say it: nothing blocks
+   a parent, so depth alone would call it free. */
+const KINDWORD = { ready: "", decision: "needs a decision, not a session",
+                   deferred: "deferred on purpose", data: "",
+                   parent: "a parent, which builds nothing itself" };
+/* The same two facts as a sentence, for the card's label. They are not the same
+   string because the visible line is a fragment under a card and the label is
+   read aloud in sequence, so it needs a subject and a verb. Prefixing "It " to
+   `KINDWORD` gave "It deferred on purpose", which is what happens when one
+   phrase is reused in two grammars. This sits beside `KINDWORD` rather than in
+   the template so the pair moves together when a kind is added. */
+const KINDSAYS = { ready: "", decision: "It needs a decision, not a session.",
+                   deferred: "It is deferred on purpose.", data: "",
+                   parent: "It is a parent, and builds nothing itself." };
+
+function buildOrder() {
+  const by = new Map(TRACKER.map(c => [c.n, c]));
+  /* The ranking used to be its own section listing the same cards a second
+     time. It was one list too many and it went. What a card kept is the
+     position, as a chip, and the link to its issue.
+
+     This comment used to say the argument for each position was written on the
+     card itself. It is not, and it never was after that section went: the card
+     renders the number and nothing else. The argument lives in `NEXT`'s `why`,
+     which the page does not render, and that is said there rather than claimed
+     here. */
+  const rankWhy = new Map(NEXT_SORTED.map(it => [it.issue, it]));
+  const rankPos = new Map(NEXT_SORTED.map((it, i) => [it.issue, i]));
+  const planOf = new Map(PLANNED.map(x => [x.n, x]));
+  const workOn = new Map(WORKING.map(w => [w.n, w]));
+  /* Grouped rather than keyed one-to-one, because two pull requests can be open
+     against one issue and a Map would keep only the last. That case is the one
+     a board reader most needs, since merge order decides which lands and
+     neither body can know it. */
+  const prOf = new Map();
+  PRS.forEach(p => {
+    if (!prOf.has(p.issue)) prOf.set(p.issue, []);
+    prOf.get(p.issue).push(p);
+  });
+
+  /* One expression decides whether a card shows a plan marker, and both the card
+     and the legend call it. They used to be two expressions encoding one rule,
+     which agreed until defect 11 changed the card's and not the legend's. That
+     is defect 5 in a second place rather than anything about render against
+     data: the data is the source of truth, and the marker is a function of the
+     data plus one suppression rule, so the only safe arrangement is that the
+     rule exists once.
+
+     What the rule says is that the marker answers one question, whether the
+     card can be handed to a builder, and it goes the moment that answer stops
+     being the reader's to act on. A branch is that. So is a build session,
+     which is the same handover an hour earlier and was leaving the card saying
+     it was ready to build directly above a line saying somebody was building
+     it. A decompose loop is not, because it revises the plan rather than
+     carrying it out, so a card under one is still waiting for a builder. An
+     entry with no kind is a decompose loop, which is the default this array has
+     always carried. */
+  const carriedOut = c => prOf.has(c.n) || (workOn.get(c.n) || {}).kind === "build";
+  const planMarker = c => carriedOut(c) ? null : (planOf.get(c.n) || null);
+  /* The same arrangement as `planMarker`, for the same reason. The card and the
+     legend have to agree about whether a position is drawn, and the way they
+     stay agreed is that the rule exists once. It is short enough to look safe
+     to inline twice, which is exactly how `planMarker` drifted.
+
+     What it suppresses is the position on a deferred card. The sort forces such
+     a card last whatever the ranking says, so a chip reading 6 above a card
+     reading last is two answers to one question. A deferred card is in the
+     ranking only to record that it is deliberately not being done, which the
+     dashed border and the kind word already say. */
+  const rankMark = c => c.kind === "deferred" ? null : (rankWhy.get(c.n) || null);
+  /* A third thing the marker can mean, and it arrived the first time a loop ran
+     on a card that had already exited one. Issue 122's card read "ready to
+     build" under a heading saying the plan was still being written, which is
+     check 6: a card contradicting where it sits.
+
+     Suppressing the marker would have been worse. The plan really was run
+     against the code, and a second loop re-measures that rather than doubting
+     it: 122's verdict was taken at 036876a and four merges landed after it. So
+     the marker keeps its swatch and says what is true of it now, which is
+     neither of the two things it used to be able to say. */
+  const remeasuring = c => {
+    const w = workOn.get(c.n);
+    return !!(w && w.kind !== "build" && planOf.has(c.n));
+  };
+
+  /* A card in flight is drawn once, in the section that says whose move it is,
+     and left out of the depth columns. Showing it twice is what made the note
+     below say a card was free to pick up two sentences after saying nobody
+     should start it. */
+  const flight = flightOf({ by, planOf, workOn, prOf });
+  /* marketlake: only the ranked cards unless the reader asked for all. `rankMark`
+     already leaves out a deferred card, so a deferral written on an issue still
+     keeps it off the default view. */
+  /* marketlake: and only the chosen milestone. */
+  const open = TRACKER.filter(c => !flight.has(c.n) && inMs(c));
+  /* marketlake: under one chosen milestone a parent in it shows too. A parent
+     builds nothing, so it is never ranked, and the ranked-only view would always
+     hide the card its children name as what they serve. */
+  const rest = open.filter(c => SHOW_ALL || rankMark(c) || (MS !== MS_ALL && c.kind === "parent"));
+  SHOWN = rest.length; HIDDEN = open.length - rest.length;
+  /* Relaxed to a fixed point rather than resolved in one walk, so a card ends up
+     right of everything it waits on however the list happens to be ordered. */
+  const depth = new Map(TRACKER.map(c => [c.n, 0]));
+  for (let pass = 0; pass < 12; pass++) {
+    let moved = false;
+    TRACKER.forEach(c => {
+      const d = c.needs.filter(b => by.has(b)).reduce((m, b) => Math.max(m, depth.get(b) + 1), 0);
+      if (d !== depth.get(c.n)) { depth.set(c.n, d); moved = true; }
+    });
+    if (!moved) break;
+  }
+
+  const feeds = new Map();
+  TRACKER.forEach(c => c.needs.forEach(b => {
+    if (!feeds.has(b)) feeds.set(b, []);
+    feeds.get(b).push(c.n);
+  }));
+
+  const bucket = [[], [], [], []];
+  rest.forEach(c => {
+    if (c.kind === "data") { bucket[3].push(c); return; }
+    bucket[Math.min(depth.get(c.n), 2)].push(c);
+  });
+  /* Within a column, a card with an executed plan sorts above one without,
+     because depth says what may be started and this says what can be handed
+     over. Ties fall back to the issue number, which is stable. */
+  bucket.forEach(col => col.sort(cardOrder(by, planOf)));
+
+  const host = document.getElementById("board");
+  host.innerHTML = bucket.map((col, k) => {
+    const cards = col.map(card).join("");
+    return `<div class="col k${k}">
+      <div class="ch"><span class="t">${COLS[k][0]}</span><span class="c">${col.length}</span>
+        <span class="d">${COLS[k][1]}</span></div>${cards}</div>`;
+  }).join("");
+
+  function card(c) {
+      const ps = prOf.get(c.n) || [];
+      const p = ps[0];
+      const waits = c.needs.filter(b => by.has(b));
+      const soft = (c.after || []).filter(b => by.has(b));
+      const note = waits.length
+        ? `waits on ${waits.map(b => `<a href="${ISS}${b}" target="_blank" rel="noopener">#${b}</a>`).join(" ")}`
+        : "";
+      /* The kind word gets its own line rather than sharing the blocker's. The
+         two used to be one slot holding whichever applied, so a blocker silently
+         hid the kind. That was invisible while every blocked card was ordinary
+         work, whose kind word is empty. Issue 16 is the case that exposed it: a
+         parent blocked by its three children read as "waits on #135 #136 #137"
+         and nothing else, so a reader would take it for work that frees up when
+         they land, which is the opposite of what it is.
+
+         A pull request still suppresses it, and that is the one suppression
+         there was ever a reason for: a card saying it needs a decision, under a
+         branch that already made one, is two answers to one question. A blocker
+         is not an answer to what kind of thing the card is. */
+      const kindword = p ? "" : (KINDWORD[c.kind] || "");
+      /* "nothing blocks it" is only true when nothing does. The clause was
+         written when `after` and `needs` had never appeared on one card, so it
+         asserted the absence of a blocker as part of announcing an ordering.
+         Issue 138 carries both, and the card read "waits on #124" directly above
+         "nothing blocks it", which is two sentences contradicting each other on
+         one card. The ordering is the part that is always true, so that is what
+         is always said, and the absence of a blocker is said only when the line
+         above has not just named one. */
+      const softnote = soft.length
+        ? `<div class="wo">${waits.length ? "it should also land after" :
+            "nothing blocks it, and it should land after"} ${
+            soft.map(b => `<a href="${ISS}${b}" target="_blank" rel="noopener">#${b}</a>`).join(" ")}</div>`
+        : "";
+      let prline = "";
+      ps.forEach(p => {
+        const ck = checkword(p.rollup);
+        /* A merged pull request reports the review state it carried when it
+           merged, which says nothing useful once it is in, so the state word
+           takes that slot instead. */
+        const right = p.state === "merged"
+          ? `<span class="rv">merged</span>`
+          : `<span class="rv">${esc(p.review)}</span>`;
+        /* `Part of` registers no closing link on purpose, because the issue
+           keeps what the branch does not do. That is the rule working rather
+           than the code-span defect this warning was written for, so it is
+           said plainly instead of being warned about. */
+        const loose = p.partOf
+          ? `<span class="nolink">part of #${c.n}, which stays open for what this does not do</span>`
+          : p.linked ? "" : `<span class="nolink">${p.state === "merged"
+          ? `merged with no closing link, so #${c.n} is still open and has to be closed by hand`
+          : `no closing link registered, so merging will leave #${c.n} open`}</span>`;
+        prline += `<div class="pr">
+          <a href="${PRU}${p.pr}" target="_blank" rel="noopener">PR #${p.pr}</a>
+          <span class="sep">&middot;</span><span class="ck ${ck[0]}">${esc(ck[1])}</span>
+          <span class="sep">&middot;</span>${right}
+          ${loose}
+        </div>`;
+      });
+      const wk = workOn.get(c.n);
+      /* A finished plan stops being news once somebody is carrying it out,
+         which `planMarker` above decides and explains. The sort still reads
+         `planOf` rather than the marker, so a planned card keeps its position
+         whether or not the marker is drawn. */
+      const pn = planMarker(c);
+      const rank = rankMark(c);
+      /* The label carries every visible line that says whether the card can be
+         started. It used to carry none of them, so a card reading "waits on #122"
+         read to a screen reader as a card waiting on nothing, and a deferred card
+         read as ordinary work. Three lines were missing rather than one, which is
+         why all three are here: the blocker, the measured ordering, and the kind
+         word. The skill's harness strips attributes before printing, so it cannot
+         see this surface at all and a rule added here is checked by reading the
+         template. Issue 134 records that. */
+      const says = [];
+      if (waits.length) says.push(`It waits on ${andlist(waits.map(b => "issue " + b))}.`);
+      if (soft.length) says.push((waits.length ? `It should also land after ` :
+        `Nothing blocks it, and it should land after `) +
+        `${andlist(soft.map(b => "issue " + b))}.`);
+      if (!p && KINDSAYS[c.kind]) says.push(KINDSAYS[c.kind]);
+      return `<div class="tk k-${c.kind}${p ? " has-pr" : ""}${wk ? " busy" : ""}${
+        pn ? " plan-" + pn.ready : ""}" data-n="${c.n}" tabindex="0" role="button"
+        aria-label="Issue ${c.n}. ${esc(c.label)}.${says.length ? " " + esc(says.join(" ")) : ""}${p ? ` Pull request ${p.pr} is ${p.state} against it.` : ""}${wk ? ` A session is working it: ${esc(wk.what)}.` : ""}${
+          pn ? ` Its plan is complete after ${plu(pn.passes, "pass")}.` +
+            /* The label says what the visible line says. It used to read "ready
+               to decide", which is not a state, while the line under the card
+               read "waits on an owner call". An owner call is owed whatever else
+               blocks the card, and only the handover to a builder is not, so the
+               two branches differ. The harness strips attributes, so this
+               surface is checked by reading the template, which issue 134
+               records. */
+            (remeasuring(c) ? ` A second loop is re-measuring that plan.`
+              : pn.ready === "decide" ? ` It waits on a question only the owner can answer.`
+              : waits.length ? "" : ` It is ready to build.`) : ""
+        }${rank ? ` It is number ${rankPos.get(c.n) + 1} in the priority order.` : ""} Show what this connects to.">
+        <div class="r1">
+          <a class="id" href="${ISS}${c.n}" target="_blank" rel="noopener">#${c.n}</a>
+          <span class="sl">${esc(c.ms)}</span>
+          ${rank ? `<span class="rk" title="priority order">${rankPos.get(c.n) + 1}</span>` : ""}
+        </div>
+        <div class="lb">${esc(c.label)}</div>
+        ${(c.labels || []).length ? `<div class="lbs">${c.labels
+          .map(l => `<b style="color:${LABEL_HUE[l] || "var(--faint)"}">${esc(l)}</b>`)
+          .join("")}</div>` : ""}
+        ${note ? `<div class="wo">${note}</div>` : ""}
+        ${softnote}
+        ${kindword ? `<div class="wo">${kindword}</div>` : ""}
+        ${pn ? `<div class="pl ${pn.ready}">plan complete, ${plu(pn.passes, "pass")}${
+          remeasuring(c) ? ", being re-measured"
+            : pn.ready === "decide" ? ", waits on an owner call"
+            : waits.length ? "" : ", ready to build"}</div>` : ""}
+
+        ${wk ? `<div class="wk">${esc(wk.what)}</div>` : ""}
+        ${prline}
+      </div>`;
+  }
+
+  /* Crossing arrows across four columns are harder to read than one chain on
+     demand, so the links are traced by picking a card.
+
+     marketlake: one chain spans both sections. A card in flight is drawn only
+     under In flight, so a tracer confined to the build order could neither be
+     started from #548 nor light it up as what #565 waits on. Both grids take
+     the same highlight, and each section carries its own copy of the chain
+     line so the answer shows beside whichever card was picked. */
+  const bar = document.getElementById("chainbar");
+  const hosts = [host, document.getElementById("flow")].filter(Boolean);
+  const bars = [bar, document.getElementById("flowchain")].filter(Boolean);
+  const say = html => bars.forEach(b => { b.innerHTML = html; });
+  const unpick = () => hosts.forEach(h => {
+    h.classList.remove("picking");
+    h.querySelectorAll(".tk").forEach(e => e.classList.remove("on", "root"));
+  });
+  const reach = (start, map) => {
+    const seen = new Set(), stack = [start];
+    while (stack.length) {
+      const id = stack.pop();
+      (map.get(id) || []).forEach(nx => { if (!seen.has(nx)) { seen.add(nx); stack.push(nx); } });
+    }
+    return seen;
+  };
+  const needsMap = new Map(TRACKER.map(c => [c.n, c.needs.filter(b => by.has(b))]));
+  const clear = () => {
+    unpick();
+    say(`<span class="hint">Pick a card to trace what it waits on and what waits on it.</span>`);
+  };
+  const pick = n => {
+    const up = reach(n, needsMap), down = reach(n, feeds);
+    if (!up.size && !down.size) {
+      say(`<span><b>#${n}</b> is linked to nothing else here, so it can be taken on its own.</span>` +
+        `<button type="button" data-clear>Clear</button>`);
+      unpick();
+      return;
+    }
+    hosts.forEach(h => {
+      h.classList.add("picking");
+      h.querySelectorAll(".tk").forEach(e => {
+        const v = +e.dataset.n;
+        e.classList.toggle("root", v === n);
+        e.classList.toggle("on", up.has(v) || down.has(v));
+      });
+    });
+    const bits = [];
+    if (up.size) bits.push(`waits on ${up.size}`);
+    if (down.size) bits.push(`${down.size} waiting on it`);
+    say(`<span><b>#${n}</b> &middot; ${bits.join(" &middot; ")}</span>` +
+      `<button type="button" data-clear>Clear</button>` + hiddenLinks(up, down)); /* marketlake: name undrawn links. */
+  };
+  /* marketlake: the counts above cover the whole chain, but a filter can leave a
+     link in it undrawn. Each undrawn link is named here with the reason, so a
+     filter never hides a blocker without saying so. */
+  function hiddenLinks(up, down) {
+    const drawn = new Set();
+    hosts.forEach(h => h.querySelectorAll(".tk").forEach(e => drawn.add(+e.dataset.n)));
+    const tag = v => `<a href="${ISS}${v}" target="_blank" rel="noopener">#${v}</a>`;
+    const other = v => !inMs(by.get(v));
+    const lines = [];
+    const group = (set, dir) => {
+      const gone = [...set].filter(v => !drawn.has(v)).sort((a, b) => a - b);
+      const ms = gone.filter(other), rk = gone.filter(v => !other(v));
+      if (ms.length) lines.push(dir === "up"
+        ? `It waits on ${andlist(ms.map(v => `${tag(v)} (${esc(by.get(v).ms)})`))}, in another milestone, so the ${esc(MS)} filter hides ${ms.length === 1 ? "it" : "them"}.`
+        : `${andlist(ms.map(v => `${tag(v)} (${esc(by.get(v).ms)})`))} ${ms.length === 1 ? "waits" : "wait"} on it from another milestone, so the ${esc(MS)} filter hides ${ms.length === 1 ? "it" : "them"}.`);
+      if (rk.length) lines.push(dir === "up"
+        ? `It waits on ${andlist(rk.map(tag))}, hidden because only the ranked cards are showing.`
+        : `${andlist(rk.map(tag))} ${rk.length === 1 ? "waits" : "wait"} on it, hidden because only the ranked cards are showing.`);
+    };
+    group(up, "up"); group(down, "down");
+    return lines.length ? `<span class="hid">${lines.join(" ")}</span>` : "";
+  }
+  let cur = null;
+  hosts.forEach(h => {
+    h.onclick = e => {
+      if (e.target.closest("a")) return;
+      const card = e.target.closest(".tk");
+      if (!card) return;
+      const n = +card.dataset.n;
+      if (cur === n) { cur = null; clear(); } else { cur = n; pick(n); }
+    };
+    h.onkeydown = e => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const card = e.target.closest(".tk"); if (!card) return;
+      e.preventDefault(); card.click();
+    };
+  });
+  bars.forEach(b => { b.onclick = e => { if (e.target.matches("[data-clear]")) { cur = null; clear(); } }; });
+  /* marketlake: every redraw used to add another Escape listener, each holding
+     the grids of the draw that made it. One slot, replaced on each draw. */
+  if (CHAIN_ESC) document.removeEventListener("keydown", CHAIN_ESC);
+  CHAIN_ESC = e => { if (e.key === "Escape" && cur !== null) { cur = null; clear(); } };
+  document.addEventListener("keydown", CHAIN_ESC);
+  clear();
+
+  inFlight({ by, planOf, workOn, prOf, card });
+
+  /* Each key lists what its own section actually drew. A fixed list would
+     describe cards that are not under it, which is what happened the moment
+     the pull requests moved to In flight. */
+  const legend = (id, pairs) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = pairs.map(([c, w]) =>
+      `<span><i class="${c}"></i>${esc(w)}</span>`).join("");
+  };
+  const drew = (set, f) => set.some(f);
+  /* Declared here rather than beside the flow legend, because both legends call
+     it and the rule has to exist once. That is the same arrangement `planMarker`
+     and `rankMark` already carry, and for the same reason.
+
+     This legend drew no plan marker at all while the depth board was drawing
+     them, which is defect 6 read the other way round: a legend accounting for
+     fewer marks than its own cards. It bites on a `PLANNED` card an open
+     blocker keeps out of the In flight section, and issues 15 and 138 are the
+     first two to reach that state, because until one existed every planned card
+     was either free or already carried. The CSS for both swatches was written
+     when the marker was, so only the two entries were missing. */
+  const marked = r => c => !remeasuring(c) && (planMarker(c) || {}).ready === r;
+  /* The build marker's gloss is read off the cards that drew it rather than
+     fixed, for the same reason `remeasured` below reads its swatch off one.
+     This legend sits under the depth board, and a planned card is down there
+     only when something blocks it: one with nothing in its way is drawn in the
+     In flight section instead. So "ready to hand to a builder" was wrong under
+     this board every time it appeared, while the swatch itself was right. The
+     harness caught it on #138, planned at eleven passes and waiting on #124,
+     under a legend offering it to a builder. The card had never said that,
+     because the visible line drops the phrase when a blocker is named above
+     it, so the legend was the only surface making the claim. */
+  const buildWord = set => {
+    const cs = set.filter(marked("build"));
+    if (!cs.length) return null;
+    return ["plan-build", cs.some(c => !c.needs.some(b => by.has(b)))
+      ? "plan run against the code, ready to hand to a builder"
+      : "plan run against the code, with a blocker still in front of it"];
+  };
+  /* The swatch is read off the card that drew it rather than fixed here, so a
+     re-measured `decide` card would not be advertised with the `build` colour.
+     Only the wording is new: the mark itself is the one the plan already had. */
+  const remeasured = set => {
+    const c = set.find(remeasuring);
+    return c ? ["plan-" + planOf.get(c.n).ready,
+      "plan run against the code, and a second loop re-measuring it"] : null;
+  };
+  legend("key", [
+    /* First, because it is the only mark on a card that was shipped with no
+       gloss anywhere a reader could see. It carried `title="priority order"`,
+       which is a hover tooltip, so it did not exist on a touch screen and
+       nobody discovered it on a desktop either. The `aria-label` spelled it out
+       in full, which left a screen reader better informed than a sighted
+       reader. Two readings of the page in one afternoon asked what the number
+       was, and the second asked why a card showing 3 sat to the right of one
+       showing 4. Both are this entry. */
+    ...(drew(rest, c => rankMark(c))
+      ? [["rk", "where it sits in the order work should land, so a blocker ranks just ahead of what it frees"]] : []),
+    ...(drew(rest, c => c.kind === "ready") ? [["ready", "work a session can take"]] : []),
+    ...(drew(rest, c => c.kind === "decision") ? [["decision", "needs the owner, not a session"]] : []),
+    ...(drew(rest, c => c.kind === "deferred")
+      ? [["deferred", "deferred on purpose, under the ranking rule"]] : []),
+    ...(drew(rest, c => c.kind === "data") ? [["data", "waiting on the world, so not a backlog"]] : []),
+    ...(drew(rest, c => c.kind === "parent")
+      ? [["parent", "a parent whose children carry the work"]] : []),
+    ...(buildWord(rest) ? [buildWord(rest)] : []),
+    ...(drew(rest, marked("decide"))
+      ? [["plan-decide", "plan finished, one question left for the owner"]] : []),
+    ...(remeasured(rest) ? [remeasured(rest)] : []),
+    ...(drew(rest, c => prOf.has(c.n)) ? [["has-pr", "a pull request carries it"]] : []),
+    ...(drew(rest, c => workOn.has(c.n))
+      ? [["busy", "a session is on it now, so nobody should start it again"]] : [])
+  ]);
+  const flown = TRACKER.filter(c => flight.has(c.n) && inMs(c)); /* marketlake: the chosen milestone. */
+  /* Both legends call the same `planMarker` the cards do, so neither can
+     advertise a marker none of them drew. This one once did, offering "ready to
+     hand to a builder" for a card whose pull request had retired that line,
+     because the suppression rule was written out a second time here. */
+  legend("flowkey", [
+    /* The chip is drawn here too, so the gloss is too. A legend that explains a
+       mark under one section and not under the other is the fixed-list defect
+       with an extra step. */
+    ...(drew(flown, c => rankMark(c))
+      ? [["rk", "where it sits in the order work should land, so a blocker ranks just ahead of what it frees"]] : []),
+    ...(buildWord(flown) ? [buildWord(flown)] : []),
+    ...(drew(flown, marked("decide"))
+      ? [["plan-decide", "plan finished, one question left for the owner"]] : []),
+    ...(remeasured(flown) ? [remeasured(flown)] : []),
+    ...(drew(flown, c => prOf.has(c.n)) ? [["has-pr", "a pull request carries it"]] : []),
+    /* Drawn here as well as on the board below, because only two of the five
+       headings account for it. A card whose branch is open and whose session is
+       still running carries the same mark under a heading that says nothing
+       about sessions. */
+    ...(drew(flown, c => workOn.has(c.n))
+      ? [["busy", "a session is on it now, so nobody should start it again"]] : [])
+  ]);
+
+  /* The section's own heading note, computed rather than typed, because it names
+     the keys the sort actually uses and any of them can empty. It read "priority,
+     then how finished the plan is" while `NEXT` held nothing but a deferred card,
+     which draws no position at all, so the page advertised a ranking no card on
+     it showed. It also had the two keys the wrong way round: `cardOrder` compares
+     `planRank` before `rankOf`. That is defect 1 and defect 5 at once, in the
+     page's furniture rather than in a card, which is why neither the harness nor
+     a reader caught it.
+
+     `planRank` is one comparison covering two facts. Only the readiness half is a
+     key here. The deferred half gets its own sentence, because it is an override
+     rather than a tiebreak and because a key carrying its own comma breaks the
+     join around it: "deferred on purpose, which sorts last" and "the issue
+     number" came back as one clause reading "which sorts last and the issue
+     number". Keep every key a phrase with no comma in it. */
+  const ranked = rest.filter(c => rankMark(c));
+  const inRest = f => rest.some(f);
+  /* The columns are depth, and a reader who takes them for priority meets a
+     card numbered 3 sitting to the right of one numbered 4 and reads it as a
+     contradiction. It is not one. The number is the order work should land in,
+     and a blocker is ranked immediately ahead of what it frees, so a chain can
+     run across the columns rather than down one. #124 at 1 and #138 at 2 were
+     the last such pair, until #124 merged as ad3db18 and left nothing ranked
+     behind anything.
+
+     The sentence below names the cards actually in that position rather than
+     describing the situation in general, so it leaves when they do, which is
+     what it has just done, and it
+     names them in the order it is explaining rather than in the order `rest`
+     happens to hold. The preceding sentence used to rule out only dates, which
+     is the misreading nobody made. A reader asked about priority within a
+     minute of meeting the chips.
+
+     One name for one thing. The key in the list above is called priority, so
+     the sentence says the number is that priority rather than introducing a
+     second word for it. */
+  const rankedBehind = ranked.filter(c => c.needs.some(b => by.has(b)))
+    .sort((a, b) => rankPos.get(a.n) - rankPos.get(b.n));
+  const keys = [];
+  if (inRest(c => planOf.has(c.n))) keys.push("how finished the plan is");
+  if (ranked.length) keys.push("priority");
+  if (inRest(c => (c.after || []).some(b => by.has(b))))
+    keys.push("an ordering somebody measured");
+  keys.push("the issue number");
+  document.getElementById("ordernote").innerHTML =
+    `what can be started today, and what is behind what. Horizontal position is ` +
+    `<b>dependency, never a date and never priority</b>. Within a column the order is ` +
+    `<b>${andlist(keys)}</b>. ` +
+    (rankedBehind.length
+      ? `The number on a card is that priority. It orders what should land rather than ` +
+        `what a session can start, so a card can sit further right than one carrying a ` +
+        `higher number. A blocker ranks just ahead of what it frees. ` +
+        `${andlist(rankedBehind.map(c => `<b>#${c.n}</b>`))} ` +
+        `${rankedBehind.length === 1 ? "is" : "are"} in that position today. `
+      : ``) +
+    (inRest(c => c.kind === "deferred")
+      ? `Anything deferred on purpose sorts last whatever the rest of that says. ` : ``) +
+    (ranked.length ? `` : `Priority is not a key today, because nothing left in the ranking ` +
+      `is a card anybody can take. `) +
+    `Pick a card to trace its chain.`;
+
+  /* Counted rather than written down, because both numbers move whenever a card
+     lands and a sentence that has to be remembered is a sentence that goes stale. */
+  const ready = bucket[0].filter(c => c.kind === "ready");
+  /* The graph's depth is read off the buckets rather than asserted, because a
+     sentence naming a column is a sentence that goes false the moment the
+     column empties. Closing issue 1 emptied the third one in a single merge. */
+  const deep = bucket[2].length;
+  /* Subtracted rather than listed alongside, because a card somebody is already
+     on is not work this reader can take, and a count that includes it is the
+     sentence disagreeing with the one under it. */
+  /* Anything already carried is subtracted, not only a session. An open pull
+     request says the work is written, which is a stronger reason not to start
+     it than a session that may still end in nothing. */
+  const free = ready.filter(c => !workOn.has(c.n) && !prOf.has(c.n));
+  /* The reasons a first-column card is not free are listed from the cards that
+     are actually there, because a fixed list of three keeps offering reasons
+     after the cards carrying them have gone. */
+  const held = bucket[0].filter(c => !free.includes(c));
+  const why = [];
+  if (held.some(c => c.kind === "decision")) why.push("need a decision rather than a session");
+  if (held.some(c => c.kind === "deferred")) why.push("be deferred on purpose");
+  if (held.some(c => c.kind === "parent")) why.push("be a parent whose children carry the work");
+  if (held.some(c => workOn.has(c.n))) why.push("already have somebody on it");
+  if (held.some(c => prOf.has(c.n))) why.push("already be written and waiting on a review");
+  /* Every card tied at the top rather than whichever one sorted first. Taking
+     [0] off a descending sort names one card and calls it "the single card",
+     which is true only while nothing ties it. Closing issue 51 left #69 and #88
+     freeing two apiece, and the sentence went on claiming one of them was
+     alone. A count of zero drops the clause instead of reading "at 0 others",
+     which is what it would say the moment the graph flattens. */
+  /* marketlake: only the chosen milestone's cards are named, though each still
+     counts everything it frees across the whole tracker. */
+  const reachable = TRACKER.filter(inMs).map(c => ({ n: c.n, k: reach(c.n, feeds).size }));
+  const most = Math.max(0, ...reachable.map(x => x.k));
+  const unblocks = reachable.filter(x => x.k === most);
+  /* The card that frees the most can be one the In flight section drew rather
+     than one of the columns this sentence sits under, because the depth graph
+     counts every blocker while the board draws only what nothing is carrying.
+     Naming it with no explanation sends a reader hunting for it in a column it
+     is not in. Issue 152 is the first to reach that state, on the day an owner
+     ruling made it issue 124's blocker while its own loop was still running. */
+  const flownTop = unblocks.filter(x => flight.has(x.n));
+  /* The plan markers and the pull requests moved to the In flight section, which
+     is the single authority for both. This note keeps only what the depth graph
+     itself knows, so the two cannot say different things about one card. */
+  document.getElementById("boardnote").innerHTML =
+    `<b>${free.length} cards are free for a session to take today</b>, out of ${bucket[0].length} in the ` +
+    `first column: ${free.map(c => "#" + c.n).join(", ")}. ` +
+    (held.length
+      ? `${plu(held.length, "card")} there ${held.length === 1 ? "is" : "are"} not free, ` +
+        `because a card can ${orlist(why)}, and depth alone does not say what to pick. `
+      : "") +
+    (deep
+      /* The verb agrees with the count rather than assuming it. `plu` handles the
+         noun and left the verb fixed, which read "1 card sit" the first time a
+         single card reached the third column. That is defect 8 in a second
+         place, so the agreement is written wherever a count leads a verb. */
+      ? `${plu(deep, "card")} ${deep === 1 ? "sits" : "sit"} behind two or more, ` +
+        `which is the deepest the graph goes. `
+      : `Nothing sits behind more than one thing any more, so the graph is one level deep. `) +
+    (most
+      ? (unblocks.length === 1
+          ? `<b>#${unblocks[0].n} is the single card whose landing frees the most</b>, at ${most} others. `
+          : `<b>${andlist(unblocks.map(x => "#" + x.n))} each free ${most} others</b>, and nothing frees more. `)
+      : `No card here is waiting on another, so nothing is freed by landing anything. `) +
+    (flownTop.length
+      ? `${andlist(flownTop.map(x => "#" + x.n))} ${flownTop.length === 1 ? "is" : "are"} in the ` +
+        `In flight section above rather than in a column here. `
+      : ``) +
+    `The fourth column is not a backlog, because nothing in it is waiting on anyone's time.`;
+}
+
+/* The five states a card passes through between a plan being written and a
+   merge. Each is decided by something observable rather than by a label somebody
+   has to remember to move: whether a pull request exists, whether a review of it
+   has been posted, whether its checks settled, and what kind of session is on
+   it. A card lands in exactly one, and the tests run in order, so a pull request
+   always outranks the session that produced it. Once a branch exists, the branch
+   is the state.
+
+   They read left to right from most finished to least, which is the opposite of
+   the order the work happens in and the right way round for the question the
+   section answers: what is nearly done, and what is barely started.
+
+   The first two columns are the point of it. "Waiting on your review" is the
+   only one where the next move is not mine. "Waiting on my review" is work this
+   project's own rules count as unfinished, because a pull request the owner has
+   not seen reviewed is not handed over. */
+/* A branch is handed over when both halves are done, not one. `CLAUDE.md` says
+   a pull request is not handed over until its checks have run and settled, so a
+   review on its own does not move a card into the owner's column. It did once,
+   and the card read "2 checks still running" under a heading saying the next
+   move was theirs, which invites a merge of a branch that can still go red.
+
+   `checkword` returns "ok" only when every entry succeeded or was skipped and
+   at least one succeeded. So four states all stay on this side: a check still
+   running, a check that failed, a check that reported neither way, and nothing
+   built at all. The last is not an oversight. A conflicting pull request gets
+   no run created, which `CLAUDE.md` records as its own failure mode, and a
+   branch nothing built is not one to hand over either. A rollup where every
+   check was skipped counts as nothing built. */
+const handedOver = p => p.reviewed && checkword(p.rollup)[0] === "ok";
+/* marketlake: a build session that still holds its card has not handed the
+   pull request over, whatever the review flag and the checks say. The sync
+   skill promised that a `working` entry of kind build keeps a card out of the
+   owner's queue, and this page did not check it. On 2026-10-06 PR 713 reached
+   the owner's column with three of four review lenses posted, because a
+   partial review comment had set `reviewed`. */
+const heldByBuild = s => !!(s.busy && s.busy.kind === "build");
+const ownersMove = s => s.pr && handedOver(s.pr) && !heldByBuild(s);
+
+/* Five stages rather than four, because a session is not one state. A decompose
+   loop and a build session are both somebody working, and they end in different
+   things: a loop ends in a sharper plan and a builder ends in a branch. Drawing
+   both under a heading reading "Building" said the wrong thing about five cards
+   at once, so the loops get their own column at the far right, where the work is
+   least finished. `kind` on a `WORKING` entry is what separates them, and an
+   entry without one counts as a loop. */
+const FLOW = [
+  { t: "Waiting on your review", tone: "owner", d: "reviewed, and its checks settled green, so the next move is not mine",
+    has: (c, s) => ownersMove(s) },
+  { t: "Waiting on my review", tone: "mine", d: "a branch exists and still owes a review or a green check",
+    has: (c, s) => s.pr && !ownersMove(s) },
+  { t: "Building", tone: "building", d: "a build session is on it and no branch has appeared",
+    has: (c, s) => !s.pr && s.busy && s.busy.kind === "build" },
+  { t: "Planned, no builder", tone: "planned", d: "a plan run against the code, nothing blocking it, and nobody on it",
+    has: (c, s) => s.plan && !s.pr && !s.busy && !s.blocked },
+  { t: "Being planned", tone: "planning", d: "a decompose loop is running, so the plan is still being written",
+    has: (c, s) => !s.pr && s.busy && s.busy.kind !== "build" }
+];
+
+/* One ordering rule, shared by both sections. Sorting a column is the same
+   question wherever the column is drawn: readiness first, then whatever the
+   ranking decided, then an ordering somebody measured, then the issue number.
+   Two sorts written separately are two sorts that can disagree about one pair,
+   which is what put issue 2 ahead of issue 41 in the grid while the ranking
+   put issue 41 first. */
+function cardOrder(by, planOf) {
+  const nextRank = new Map(NEXT_SORTED.map((it, i) => [it.issue, i]));
+  const rankOf = n => nextRank.has(n) ? nextRank.get(n) : 999;
+  /* A card deferred on purpose sorts last whatever the ranking says about it,
+     because the ranking only covers the top of the list and everything it omits
+     falls back to one number. Without this, issue 10 sat fourth in a column of
+     twenty-five for the sole reason that the ranking mentions it at all. */
+  const planRank = n => {
+    const c = by.get(n);
+    if (c && c.kind === "deferred") return 3;
+    const x = planOf.get(n);
+    return x ? (x.ready === "build" ? 0 : 1) : 2;
+  };
+  const softDepth = n => {
+    const c = by.get(n);
+    return c && (c.after || []).some(b => by.has(b)) ? 1 : 0;
+  };
+  return (a, b) =>
+    planRank(a.n) - planRank(b.n) ||
+    rankOf(a.n) - rankOf(b.n) ||
+    softDepth(a.n) - softDepth(b.n) ||
+    a.n - b.n;
+}
+
+function flightCols({ by, planOf, workOn, prOf }) {
+  const stateOf = c => ({
+    plan: planOf.get(c.n),
+    busy: workOn.get(c.n),
+    /* A finished plan behind an open blocker is not a card with no builder, it
+       is a card nobody can start. The column's test asked only whether a plan
+       existed, which the skill's own text predicted would put such a card under
+       a heading offering it to a builder, and noted that no card had reached the
+       case because every `PLANNED` entry so far carried an empty `needs`. Issue
+       138 is the first that does not. Left alone it would have read "waits on
+       #124" and "ready to build" on one card, which is check 6: a marker and a
+       position answering one question two ways. */
+    blocked: c.needs.some(b => by.has(b)),
+    pr: (prOf.get(c.n) || []).find(x => x.state === "open")
+  });
+  const cols = FLOW.map(() => []);
+  TRACKER.forEach(c => {
+    const s = stateOf(c);
+    const i = FLOW.findIndex(f => f.has(c, s));
+    if (i >= 0) cols[i].push(c);
+  });
+  cols.forEach(col => col.sort(cardOrder(by, planOf)));
+  return cols;
+}
+
+/* The same split the section draws, as a set, so the depth board leaves out
+   exactly what this section shows and neither can drift from the other. */
+function flightOf(ctx) {
+  return new Set(flightCols(ctx).flat().map(c => c.n));
+}
+
+function inFlight(ctx) {
+  const { card } = ctx;
+  /* marketlake: drawn for the chosen milestone only. flightOf() still reads the
+     whole tracker, so a card in flight never falls into the board below. */
+  const cols = flightCols(ctx).map(col => col.filter(inMs));
+
+  document.getElementById("flow").innerHTML = cols.map((col, k) => `
+    <div class="col f-${FLOW[k].tone}">
+      <div class="ch"><span class="t">${esc(FLOW[k].t)}</span><span class="c">${col.length}</span>
+        <span class="d">${esc(FLOW[k].d)}</span></div>
+      ${col.length ? col.map(card).join("") : `<div class="empty">nothing here</div>`}
+    </div>`).join("");
+
+  /* Written by walking the columns in the order they are drawn, so reordering
+     the stages reorders the sentence with them. An index written here by hand
+     is an index that outlives the arrangement it was counted from. */
+  const ns2 = cs => andlist(cs.map(c => "#" + c.n));
+  const say = {
+    /* One sentence again. This split into settled and still-running for a while,
+       which was the note coping with a column that should not have held an
+       unsettled branch in the first place. `handedOver` fixed that above, so
+       every card here has green checks by construction and the second half could
+       only ever be empty. A note working around a wrong test is a second place
+       for the rule to live, which is defect 5. */
+    owner: col => `<b>${ns2(col)} ${col.length === 1 ? "is" : "are"} yours</b>, reviewed, ` +
+      `checks green, and waiting on nothing else`,
+    /* Two different things keep a card here, and calling both "unreviewed" is
+       the note contradicting the card above it, which reports the checks. So the
+       reason is read per card rather than assumed. */
+    mine: col => {
+      const openPr = c => (ctx.prOf.get(c.n) || []).find(x => x.state === "open");
+      const unreviewed = col.filter(c => !openPr(c).reviewed);
+      const green = c => checkword(openPr(c).rollup)[0] === "ok";
+      const unsettled = col.filter(c => openPr(c).reviewed && !green(c));
+      /* marketlake: reviewed and green, but a build session still holds it. */
+      const held = col.filter(c => openPr(c).reviewed && green(c));
+      const parts = [];
+      if (unreviewed.length) parts.push(`${ns2(unreviewed)} ` +
+        `${unreviewed.length === 1 ? "is" : "are"} written and unreviewed`);
+      if (unsettled.length) parts.push(`${ns2(unsettled)} ` +
+        `${unsettled.length === 1 ? "is reviewed and its checks have" : "are reviewed and their checks have"} ` +
+        `not settled green`);
+      if (held.length) parts.push(`${ns2(held)} ` +
+        `${held.length === 1 ? "is" : "are"} still held by ${held.length === 1 ? "its" : "their"} build session`);
+      return parts.join(", and ") + `, which this project's rules count as ` +
+        `unfinished rather than as handed over`;
+    },
+    building: col => `${ns2(col)} ${col.length === 1 ? "has a build session" : "have build sessions"} on ` +
+      `${col.length === 1 ? "it" : "them"} and no branch yet`,
+    planning: col => `${ns2(col)} ${col.length === 1 ? "is" : "are"} under a decompose loop, so what ` +
+      `comes back is a sharper plan and possibly new cards rather than a branch`,
+    planned: col => {
+      const owed = col.filter(c => (ctx.planOf.get(c.n) || {}).ready === "decide");
+      const free = col.filter(c => !owed.includes(c));
+      const parts = [];
+      if (free.length) parts.push(`${ns2(free)} ${free.length === 1 ? "is" : "are"} planned and ` +
+        `free for anyone to pick up`);
+      /* "too" only reads if the free sentence went first, and that one drops out
+         whenever every planned card is waiting on the owner. */
+      if (owed.length) parts.push(`${ns2(owed)} ${owed.length === 1 ? "is" : "are"} planned` +
+        `${free.length ? " too" : ""}, and ${owed.length === 1 ? "waits" : "wait"} on a question ` +
+        `only the owner can answer`);
+      return parts.join(". ");
+    }
+  };
+  const bits = cols
+    .map((col, k) => col.length ? say[FLOW[k].tone](col) : "")
+    .filter(Boolean);
+
+  /* A missing closing link is a fact about a branch, so it is reported where the
+     branches are rather than under a board that no longer draws them. */
+  const withPr = cols.filter((_, k) => FLOW[k].tone === "owner" || FLOW[k].tone === "mine").flat();
+  const openPrs = c => (ctx.prOf.get(c.n) || []).filter(x => x.state === "open");
+  const loose = withPr.filter(c => openPrs(c).some(x => !x.linked && !x.partOf));
+  if (loose.length) bits.push(`<b>GitHub registered no closing link for ` +
+    `${andlist(loose.map(c => "PR #" + openPrs(c)[0].pr))}</b>, so merging would leave ` +
+    `${ns2(loose)} open`);
+  const contested = withPr.filter(c => openPrs(c).length > 1);
+  if (contested.length) bits.push(`<b>${ns2(contested)} carries more than one open branch</b>, ` +
+    `and merge order decides which lands while neither body can know it`);
+
+  /* An ordering between two cards only becomes a decision once both are branches,
+     because until then nothing can be merged in the wrong order. So it is said
+     here, in the pull requests' own words, rather than only on the card. */
+  const pairs = [];
+  withPr.forEach(c => (c.after || []).forEach(b => {
+    const first = withPr.find(x => x.n === b);
+    if (first) pairs.push([openPrs(first)[0], openPrs(c)[0], first, c]);
+  }));
+  pairs.forEach(([a, z, ca, cz]) => bits.push(
+    `<b>PR #${a.pr} merges before PR #${z.pr}</b>, because #${cz.n} should land after #${ca.n}. ` +
+    `Nothing enforces that, so it is the order they are merged in and not something a check ` +
+    `will catch`));
+
+  document.getElementById("flownote").innerHTML = bits.length
+    ? bits.join(". ") + `. Every other card is in the board below, where the question is what is ` +
+      `behind what rather than whose move it is.`
+    : MS === MS_ALL ? `Nothing is in flight. Every card is in the board below.`
+      : `Nothing in ${esc(MS)} is in flight. Its cards are in the board below.`; /* marketlake */
+}
+
+/* marketlake: msbar() first, because every section reads the MS it resolves.
+   With no board data only the banner is drawn, and the selector, both card
+   sections and the footer are hidden, since each states facts about the
+   tracker. The platform's page wrapper makes `hidden` win over a section's own
+   display rule. */
+function render() {
+  ["msbar", "flightsec", "ordersec", "foot"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = NONE;
+  });
+  if (NONE) { source(); return; }
+  strip(); msbar(); source(); buildOrder(); more(); stamped();
+}
+adopt(FALLBACK);
+render();
+
+/* marketlake: subscribe once. A snapshot that fails `usable` is not adopted, so
+   a half-written or old-shaped document leaves the last good data on screen. */
+(async () => {
+  let db = null;
+  try { db = await window.claude?.use?.("db"); } catch (e) { db = null; }
+  if (!db) { SOURCE = { live: false, why: "none" }; source(); return; }
+  let had = false;
+  try {
+    db.doc(DOC).onSnapshot(snap => {
+      if (!snap || !snap.exists) {
+        SOURCE = had ? { live: false, why: "stopped", had, code: "document removed" } : { live: false, why: "empty" };
+        source(); return;
+      }
+      const d = snap.data();
+      if (!usable(d)) { SOURCE = had ? { live: false, why: "stopped", had, code: "unreadable document" } : { live: false, why: "shape" }; source(); return; }
+      adopt(d); had = true; SOURCE = { live: true }; render();
+    }, err => {
+      SOURCE = { live: false, why: "stopped", had, code: err && err.code };
+      source();
+    });
+  } catch (e) {
+    SOURCE = { live: false, why: "stopped", had, code: e && e.code };
+    source();
+  }
+})();
+
+setInterval(() => {
+  const el = document.getElementById("stamp");
+  if (el && !NONE) el.textContent = "measured " + ago(STATE.updatedAt);
+}, 60000);
+</script>

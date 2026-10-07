@@ -9,8 +9,10 @@ uses, and check three things.
 1. A refresh publishes the file atomically, at mode 0600, and an interrupted one leaves the
    old token readable.
 2. Two clients refresh once between them, and the second adopts what the first wrote. That
-   holds whether or not the token endpoint rotates the refresh token, which nothing has
-   measured for Schwab.
+   holds whether or not the token endpoint rotates the refresh token. marketlake #633
+   measured Schwab on 2026-10-05: a refresh left the refresh token unchanged, and a
+   refresh on one host did not revoke the other, so these tests cover the case Schwab
+   does not take today as well as the one it does.
 3. A client adopts the file's mint time with its token, so a later refresh never writes an
    older mint time back.
 

@@ -5,7 +5,7 @@ short-lived credentials from the EC2 instance metadata service rather than a key
 ``config.yaml``, marketlake #663. These tests cross a real HTTP boundary, so they live
 here rather than beside ``tests/unit/test_bucket_client.py``, which opens no socket.
 A server on ``127.0.0.1`` plays the metadata service, reached through the
-``bucket.METADATA_BASE_URL`` seam, because the build removes
+``aws_session.METADATA_BASE_URL`` seam, because the build removes
 ``AWS_EC2_METADATA_SERVICE_ENDPOINT`` with every other ``AWS_*`` variable. The suite's
 socket guard in ``tests/conftest.py`` allows loopback and refuses the real metadata
 address. A ``before-send`` hook answers in place of S3, so no request reaches AWS.
@@ -40,7 +40,7 @@ import botocore.utils
 import pytest
 from botocore.awsrequest import AWSResponse
 
-from lake import bucket
+from lake import aws_session
 from lake.bucket import BucketSettingsInvalid, client_from_config, connect
 from lake.config import Config, ConfigError
 from tests.component.test_bucket_scrub import _sunday_cli, _uploaded
@@ -72,8 +72,9 @@ class _Server:
     answers the token request with a 403, which is what a service that requires tokens
     and turns this caller away does. ``role_500_once`` answers the first role listing
     with a 500 and every later one as ``ok`` does, and ``role_500`` answers every role
-    listing with a 500. ``null_body``, ``bad_expiration`` and ``no_key_id`` answer the
-    credentials request with what only a broken or impersonated service would send.
+    listing with a 500. ``null_body``, ``bad_expiration``, ``no_key_id`` and
+    ``empty_secret`` answer the credentials request with what only a broken or
+    impersonated service would send.
     """
 
     def __init__(self, creds: dict[str, str]) -> None:
@@ -123,6 +124,8 @@ class _Server:
                         body["Expiration"] = "not a time"
                     elif server.mode == "no_key_id":
                         body["AccessKeyId"] = None
+                    elif server.mode == "empty_secret":
+                        body["SecretAccessKey"] = ""
                     self._answer(200, "null" if server.mode == "null_body" else json.dumps(body))
                 else:
                     self._answer(404, "")
@@ -155,7 +158,7 @@ def _role_listings(server: _Server) -> int:
 def metadata(monkeypatch) -> Iterator[_Server]:
     """The metadata service, with the client's base URL pointed at it."""
     with _Server(METADATA) as server:
-        monkeypatch.setattr(bucket, "METADATA_BASE_URL", server.url)
+        monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
         yield server
 
 
@@ -303,7 +306,7 @@ def test_a_role_listing_that_always_fails_is_asked_twice_and_no_more(metadata, h
     with pytest.raises(ConfigError) as refused:
         client_from_config(_config())
     _assert_both_fixes(str(refused.value), "none returned")
-    # A literal rather than ``bucket.METADATA_ATTEMPTS``, so a changed constant cannot
+    # A literal rather than ``aws_session.METADATA_ATTEMPTS``, so a changed constant cannot
     # move the expectation with it.
     assert _role_listings(metadata) == 2
 
@@ -316,7 +319,7 @@ def test_a_service_that_never_answers_refuses_within_the_timeout(monkeypatch):
         listener.bind(("127.0.0.1", 0))
         listener.listen(8)
         port = listener.getsockname()[1]
-        monkeypatch.setattr(bucket, "METADATA_BASE_URL", f"http://127.0.0.1:{port}/")
+        monkeypatch.setattr(aws_session, "METADATA_BASE_URL", f"http://127.0.0.1:{port}/")
         started = time.monotonic()
         with pytest.raises(ConfigError) as refused:
             client_from_config(_config())
@@ -369,6 +372,7 @@ LOOKUP_FAILURES = [
     pytest.param("null_body", "TypeError", id="null-body"),
     pytest.param("bad_expiration", "ParserError", id="bad-expiration"),
     pytest.param("no_key_id", "incomplete credentials", id="no-key-id"),
+    pytest.param("empty_secret", "incomplete credentials", id="empty-secret"),
 ]
 
 
@@ -402,7 +406,7 @@ def test_an_unreachable_service_refuses_the_same_way(monkeypatch):
     # A port with nothing listening, the way a laptop answers the metadata address.
     with _Server(METADATA) as gone:
         url = gone.url
-    monkeypatch.setattr(bucket, "METADATA_BASE_URL", url)
+    monkeypatch.setattr(aws_session, "METADATA_BASE_URL", url)
     with pytest.raises(ConfigError) as refused:
         client_from_config(_config())
     _assert_both_fixes(str(refused.value), "MetadataRetrievalError")

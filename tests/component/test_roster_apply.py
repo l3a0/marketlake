@@ -21,6 +21,7 @@ from lake import roster as roster_cli
 from lake.config import ConfigError
 from lake.paths import CONFIG_DIR_ENV
 from lake.roster import REPLACED, UNCHANGED, RosterError, apply
+from lake.security_master import master_path
 from lake.tickers import (
     TICKERS_PATH_ENV,
     TickersError,
@@ -319,7 +320,17 @@ def test_the_default_path_follows_the_config_directory_on_every_call(tmp_path, m
 
 @pytest.fixture
 def config_path(tmp_path) -> Path:
-    return write_config(tmp_path / "cfg", tmp_path / "lake")
+    # A shadow host whose lake holds no reference files, so the lake check skips and these
+    # tests reach the steps around it. ``test_roster_lake_check.py`` drives the check.
+    return write_config(tmp_path / "cfg", tmp_path / "lake", role="shadow")
+
+
+def _skipped(lake: Path) -> str:
+    """The line the lake check prints when it skips on a shadow host with an empty lake."""
+    return (
+        f"roster: lake check skipped, because {master_path(lake)} does not exist "
+        "and this host's role is shadow\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -420,7 +431,8 @@ def test_main_prints_replaced_then_unchanged(tmp_path, config_path, monkeypatch,
     _run_main(monkeypatch, HAND_FORMATTED)
     _run_main(monkeypatch, HAND_FORMATTED)
     out = capsys.readouterr().out
-    assert out == f"roster: {REPLACED} {target}\nroster: {UNCHANGED} {target}\n"
+    skipped = _skipped(tmp_path / "lake")
+    assert out == (f"{skipped}roster: {REPLACED} {target}\n{skipped}roster: {UNCHANGED} {target}\n")
     assert target.read_bytes() == HAND_FORMATTED
 
 
@@ -536,7 +548,7 @@ def test_a_fresh_process_writes_the_path_the_loader_reads(tmp_path):
     # redirect, so both resolve the directory from HOME the way a host's processes do.
     home = tmp_path / "home"
     config_dir = home / ".config" / "marketlake"
-    write_config(config_dir, tmp_path / "lake")
+    write_config(config_dir, tmp_path / "lake", role="shadow")
     env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
 
     applied = subprocess.run(
@@ -548,7 +560,9 @@ def test_a_fresh_process_writes_the_path_the_loader_reads(tmp_path):
     )
     assert applied.returncode == 0, applied.stderr
     expected = config_dir / "tickers.yaml"
-    assert applied.stdout.decode() == f"roster: {REPLACED} {expected}\n"
+    assert (
+        applied.stdout.decode() == f"{_skipped(tmp_path / 'lake')}roster: {REPLACED} {expected}\n"
+    )
 
     loaded = subprocess.run(
         [
@@ -594,7 +608,7 @@ def test_a_redirect_made_after_import_moves_the_roster(tmp_path):
     late_home = tmp_path / "late"
     early_home.mkdir()
     late_dir = late_home / ".config" / "marketlake"
-    write_config(late_dir, tmp_path / "lake")
+    write_config(late_dir, tmp_path / "lake", role="shadow")
     applied = subprocess.run(
         [sys.executable, "-c", _LATE_REDIRECT, str(late_home)],
         input=HAND_FORMATTED,
@@ -603,7 +617,7 @@ def test_a_redirect_made_after_import_moves_the_roster(tmp_path):
         check=False,
     )
     assert applied.returncode == 0, applied.stderr
-    assert applied.stdout.decode() == f"{REPLACED}\n"
+    assert applied.stdout.decode() == f"{_skipped(tmp_path / 'lake')}{REPLACED}\n"
     assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
     assert list(early_home.rglob("*")) == []
 
@@ -646,10 +660,10 @@ def test_a_late_redirect_of_home_alone_moves_the_roster(tmp_path):
     late_home = tmp_path / "late"
     early_home.mkdir()
     late_dir = late_home / ".config" / "marketlake"
-    config = write_config(late_dir, tmp_path / "lake")
+    config = write_config(late_dir, tmp_path / "lake", role="shadow")
     applied = _apply_in_child({"HOME": str(early_home)}, config, f"HOME={late_home}")
     assert applied.returncode == 0, applied.stderr
-    assert applied.stdout.decode() == f"{REPLACED}\n"
+    assert applied.stdout.decode() == f"{_skipped(tmp_path / 'lake')}{REPLACED}\n"
     assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
     assert list(early_home.rglob("*")) == []
 
@@ -660,9 +674,9 @@ def test_a_late_config_directory_override_alone_moves_the_roster(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     late_dir = tmp_path / "late"
-    config = write_config(tmp_path / "cfg", tmp_path / "lake")
+    config = write_config(tmp_path / "cfg", tmp_path / "lake", role="shadow")
     applied = _apply_in_child({"HOME": str(home)}, config, f"{CONFIG_DIR_ENV}={late_dir}")
     assert applied.returncode == 0, applied.stderr
-    assert applied.stdout.decode() == f"{REPLACED}\n"
+    assert applied.stdout.decode() == f"{_skipped(tmp_path / 'lake')}{REPLACED}\n"
     assert (late_dir / "tickers.yaml").read_bytes() == HAND_FORMATTED
     assert list(home.rglob("*")) == []

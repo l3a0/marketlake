@@ -274,7 +274,7 @@ class SlugEscalation:
 #    an orphan on the backup. And a temp holds a whole partition's bytes, so the copy
 #    costs real space and real sync time.
 # 2. The config directory, holding ``token.json`` and ``config.yaml``. The token is a
-#    full brokerage credential and ``config.yaml`` holds four to six secrets. The design's
+#    full brokerage credential and ``config.yaml`` holds four to eight secrets. The design's
 #    rule is that neither may ride onto a backup disk that lacks FileVault. That
 #    directory sits outside the sync root today by construction, so this pattern
 #    matches nothing and costs nothing. It is here so the rule holds by exclusion

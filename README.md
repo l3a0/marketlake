@@ -18,7 +18,8 @@ The AWS resources it needs are code under `infra/`, written for
 [OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
 except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
-bucket, its IAM user, and the instance role the VM will use.
+bucket, its IAM user, the instance role the VM will use, and the IAM user that writes the
+Schwab token to the VM's config parameters.
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -55,13 +56,18 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/outbox.py` is the one place the ntfy transport and the healthchecks pinger
   are built. Under the config's `role: shadow` it builds recorders instead, which write
   each ping and page to `journal/outbox/` rather than sending it.
+- `src/lake/aws_session.py` is the one place an AWS client is built. It builds the
+  bucket's client and the token parameter's from `config.yaml` alone, never from an
+  `AWS_*` variable or `~/.aws/`.
+- `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
+  parameter: the re-auth's put and the VM's pull.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, and the plan and apply
   roles. The owner applies it from the laptop.
-- `infra/live` is the configuration CI applies: the backup bucket, its IAM user, and the
-  instance role.
+- `infra/live` is the configuration CI applies: the backup bucket, its IAM user, the
+  instance role, and the IAM user that writes the Schwab token.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
@@ -294,6 +300,86 @@ The steps that follow the install, and their order, are the hosted VM runbook in
 [#686](https://github.com/l3a0/marketlake/issues/686). The design doc's Deployment section
 carries the reasoning for each unit setting.
 
+## Carry the Schwab token to a hosted VM
+
+The VM has no browser, so it cannot run the weekly Schwab login. The laptop's re-auth puts
+the token into the SSM parameter `/marketlake/config/schwab-oauth-token`, and the VM copies
+it into its own `token.json`. The design's Auth section carries the reasoning, and
+[#636](https://github.com/l3a0/marketlake/issues/636) carries the plan.
+
+One key in each host's `config.yaml` says what the host does with the token:
+
+| `token_store` | `reauth.sh` writes | Used by |
+| --- | --- | --- |
+| absent or `file` | `token.json` | the laptop before the VM exists |
+| `both` | `token.json`, then the parameter | the laptop once the VM exists |
+| `store` | `token.json`, then the parameter | the VM |
+
+Any other value prints one line naming it, writes `token.json`, and puts the parameter
+when the keys below allow it. The put signs with three more keys, which hold the access key
+of the IAM user that may only put this one parameter
+([#699](https://github.com/l3a0/marketlake/issues/699)). They never fall back to the
+`bucket_*` keys, whose user holds no grant to put it:
+
+```yaml
+token_store: both
+token_store_access_key_id: <access key id>
+token_store_secret_access_key: <secret access key>
+token_store_region: <the bucket's region>
+```
+
+Under `both` or `store`, a missing or malformed key stops `reauth.sh` with exit 2 before the
+browser opens. A put that succeeds adds a line to the sign-off block naming the parameter's
+version number:
+
+```text
+  parameter:     /marketlake/config/schwab-oauth-token version <n>
+```
+
+The laptop has no grant to read the parameter, so that line is the only proof at the
+terminal that it changed. Exit 3 means `token.json` was written and the parameter was not.
+Its one line names the token's path and the fix. A refused or unknown key is fixed in the
+`token_store_*` keys, and another login fails the same way until it is. Any other error is
+fixed by running `reauth.sh` again.
+
+The first `both` re-auth comes before the VM's first boot, in this order:
+
+1. The put-only user from [#699](https://github.com/l3a0/marketlake/issues/699) exists,
+   and its access key is in the three `token_store_*` keys in the laptop's `config.yaml`.
+2. The laptop's checkout carries this code. `reauth.sh` runs the checkout's Python, and
+   older code ignores `token_store`, writes the file, puts nothing, and exits 0 without a
+   word.
+3. Set `token_store: both`. Edit `config.yaml` outside a session, because capture reloads
+   it every minute and a broken edit stops capture.
+4. Run `reauth.sh` once, and check that it printed a version number.
+
+To rotate the put-only key:
+
+1. Put the new key in the `token_store_*` keys.
+2. Run `reauth.sh`, and see the version line.
+3. Deactivate the old key.
+
+The VM copies the parameter with one command, run as the account that runs the daemon,
+because a run as root leaves a `token.json` the daemon cannot read:
+
+```bash
+uv run python -m lake.token_store pull [--config <path>] [--token <path>]
+```
+
+It reads the parameter with the instance profile, as the bucket client does, and writes
+`token.json` only when the local file is absent or unreadable, or the parameter was minted
+later. It prints one line and exits with one of four codes:
+
+1. 0 when it wrote the file or found it current.
+2. 1 when the parameter is older, unusable, or minted more than an hour in the future, or
+   when `token.json` could not be written.
+3. 2 for a mistake in `config.yaml`.
+4. 3 when the instance profile is not serving credentials yet, which is worth retrying.
+
+The VM's first boot runs it
+([#686](https://github.com/l3a0/marketlake/issues/686)), and
+[#702](https://github.com/l3a0/marketlake/issues/702) runs it after that.
+
 ## Reach the dashboard on a hosted VM
 
 The dashboard binds the loopback address and serves only requests whose `Host` names
@@ -363,7 +449,19 @@ host still reads `~/.config/marketlake/tickers.yaml`, and
 does not parse, one with no enabled ticker, a host with no `config.yaml`, and a run as
 root. It replaces the host's file when the bytes differ, leaves it alone when they match,
 and prints which. It never restarts the daemon, which reads the new roster on its next
-cycle. On the VM, the boot render
+cycle.
+
+Before any write, and even when the bytes match, `apply` checks the roster against the
+host's lake ([#692](https://github.com/l3a0/marketlake/issues/692)). It refuses a roster
+that leaves out a ticker whose capture span is open, has that ticker disabled, or turns
+its `options` off while the span records options. The refusal prints the entry to add or
+the two ways to fix it, and leaves the host's roster as it was. It also refuses when a
+reference file under `lake_root` cannot be read, or is missing on any host whose `role`
+is not exactly `shadow`, since that means an unmounted or unrestored lake. A pass prints
+how many open spans it checked. On a host whose `role` is exactly `shadow`, a missing
+security master or capture spans file skips the check, and the skip says so.
+
+On the VM, the boot render
 ([#686](https://github.com/l3a0/marketlake/issues/686)) and the post-close deploy
 ([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once they are built.
 
@@ -391,13 +489,14 @@ steps, and the order matters.
    `lake.onboard` the same evening. Capture keeps an enabled ticker the security master
    cannot resolve yet, so a forgotten onboard loses no minute.
 2. **To retire,** run `lake.retire` after the close, then merge the roster pull request
-   before 09:30 ET. Never merge the retire pull request before `lake.retire` has run.
-   `apply` does not yet check the roster against the lake, so it copies an early merge
-   onto the host, and the ticker silently stops being captured with no page. The check
-   that would refuse that copy arrives with
-   [#692](https://github.com/l3a0/marketlake/issues/692). The other mistake is loud. Run
-   first and left unmerged, the next apply puts the entry back, and the daemon pages
-   during the session that an enabled ticker sits outside every span.
+   before 09:30 ET. A retire pull request merged before `lake.retire` has run is refused
+   by the lake check, because the ticker's span is still open. A host that already has a
+   roster keeps it and keeps capturing the ticker. A host with no roster yet, such as a
+   rebuilt instance, gets nothing written, so its daemon stays down until the capture
+   dead-man pages. Either way the refusal says to run `lake.retire` after the close and
+   deploy again. The other order is loud too. Run first and left unmerged,
+   the next apply puts the entry back, and the daemon pages during the session that an
+   enabled ticker sits outside every span.
 
 ## Apply the infrastructure
 
@@ -441,19 +540,21 @@ tofu -chdir=infra/live validate
 tofu -chdir=infra/live test
 ```
 
-Three things those checks cannot see are covered by `uv run pytest` instead.
+Four things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups or the infrastructure's
-   state.
-2. The exact set of policies each bootstrap role carries.
+   state, and on the token writer and its policy, which CI cannot delete.
+2. The exact set of policies each bootstrap role and each live IAM user carries.
 3. The live backend's state key matching what the apply role may write.
+4. No resource or data source that would store an SSM parameter's value in state.
 
 ### Keep development runs off the real config directory
 
 `~/.config/marketlake/` holds the live Schwab token, and several commands default to it.
-`python -m lake.reauth` with no `--token` writes the standard location, which is right
-for the weekly ritual and wrong for anyone exercising the tool. On 2026-09-13 that is how
-a stub reached the production token path and a working token was lost.
+`python -m lake.reauth` and `python -m lake.token_store pull` with no `--token` write the
+standard location, which is right for the weekly ritual and the VM's pull and wrong for
+anyone exercising either tool. On 2026-09-13 that is how a stub reached the production
+token path and a working token was lost.
 
 `MARKETLAKE_CONFIG_DIR` moves the whole directory for one process. Set it and the run
 cannot reach the real token, the real `config.yaml`, or the real roster, whatever it is

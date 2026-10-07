@@ -2563,9 +2563,10 @@ def run_cycle_from_config(
     The vendor is closed once the cycle's last request is done, not when the cycle returns
     (marketlake #597). The cycle returns at its bound with abandoned requests still running,
     and one of them may be refreshing the token, since the refresh runs inside a request.
-    Closing the client under it discards the response, which for a refresh is the new token,
-    and if Schwab rotates the refresh token on each refresh, which nothing here has
-    measured, the file would keep one Schwab has superseded. Closing sooner would stop
+    Closing the client under it discards the response, which for a refresh is the new token.
+    marketlake #633 measured that a refresh leaves the refresh token unchanged, so today
+    that costs one more refresh. If Schwab ever rotated the refresh token on each refresh,
+    the file would keep one Schwab has superseded. Closing sooner would stop
     nothing sooner either: a probe with httpx 0.28.1 closed a client one second into a
     request, and the request still ran to its 30s read timeout. So the close waits, and an
     abandoned request's sockets close at most that long after the bound.
@@ -2649,14 +2650,19 @@ def _live_roster(roster: Roster, lake_root: Path | str, now: datetime) -> Roster
 
     A missing master or spans file widens rather than narrows: every enabled entry is
     captured, the same as before capture spans existed. A missing reference file must
-    never stop capture, the same rule every other reader of these two files follows. A
-    ticker the master cannot resolve is kept for the same reason: losing the clamp only
-    ever widens what gets captured.
+    never stop capture, the same rule every reader of these two files on the capture path
+    follows. A ticker the master cannot resolve is kept for the same reason: losing the
+    clamp only ever widens what gets captured.
 
     Absent and unreadable widen alike, and only the absent one is quiet. A reference file
     that is there and cannot be read prints one line through ``reference_read``, stamped
     with ``now``, when it first fails and when it next reads (marketlake #536). This runs
     every cycle, so a line per call would be about 400 a session for one standing denial.
+
+    ``lake.roster.check_lake`` is the deliberate exception to the missing-file rule. It
+    runs when a roster is applied, outside the capture loop, and refuses a missing file
+    unless the host's role is exactly shadow. docs/design.md gives the reason under "The
+    roster is config as code" in its Deployment section.
     """
     enabled = roster.enabled
     master = read_or_none(

@@ -1,5 +1,6 @@
-# What CI applies: the backup bucket, its IAM user, and the instance role. The apply
-# role in infra/bootstrap/roles.tf grants writes on exactly these. infra/README.md
+# What CI applies: the backup bucket, its IAM user, the instance role, and the user that
+# writes the Schwab token. The apply role in infra/bootstrap/roles.tf grants writes on
+# exactly these. infra/README.md
 # carries the runbook, and docs/design.md's "Infrastructure, defined" carries the
 # reasoning.
 
@@ -28,4 +29,11 @@ terraform {
 # role needs no S3 tagging action.
 provider "aws" {
   region = "us-east-1"
+}
+
+# The SSM parameter ARNs in iam.tf name the account, and no tracked file may.
+data "aws_caller_identity" "current" {}
+
+locals {
+  account_id = data.aws_caller_identity.current.account_id
 }

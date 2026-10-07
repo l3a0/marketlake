@@ -426,8 +426,14 @@ def test_the_default_token_path_is_where_the_vendor_reads_a_token_back(tmp_path,
         },
     }
 
+    def no_store(_config):
+        raise AssertionError("the token store is off in this config, so nothing builds a client")
+
     report = m.reauth_from_config(
-        login_flow=RecordingFlow(token=live), stdin_is_tty=True, config_path=config
+        login_flow=RecordingFlow(token=live),
+        store_client_factory=no_store,
+        stdin_is_tty=True,
+        config_path=config,
     )
     assert report.token_written
     assert report.token_path == tmp_path / "config" / "token.json"
@@ -463,3 +469,14 @@ def test_the_report_prints_the_callback_and_the_token_path(tmp_path):
     assert CALLBACK in rendered
     assert str(token) in rendered
     assert "token landed:  yes" in rendered
+
+
+def test_the_writer_keeps_the_text_it_wrote_which_is_the_files_bytes(tmp_path):
+    # The token parameter's put sends this text, so it must be exactly what landed.
+    token = tmp_path / "token.json"
+    writer = m.token_writer(token)
+    assert writer.text is None
+    writer(FRESH_TOKEN)
+    assert writer.text == token.read_text()
+    assert json.loads(writer.text) == FRESH_TOKEN
+    assert m.write_token(tmp_path / "other.json", OLD_TOKEN) == json.dumps(OLD_TOKEN)

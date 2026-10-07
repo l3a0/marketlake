@@ -11,16 +11,19 @@ what to capture and is tracked in the repository as ``config/tickers.yaml``. Thi
 loads the machine-local half.
 The roster lives in ``lake.tickers``.
 
-Four of the values are always secrets, and two more join them once the bucket's access
-key is added. The healthchecks ping key builds the health-ping URLs. The ntfy topic is
+Four of the values are always secrets, and up to four more join them, so the file holds
+four to eight. The healthchecks ping key builds the health-ping URLs. The ntfy topic is
 an unauthenticated channel that anyone holding the name can read and spoof. The Schwab
 API key and app secret are the static app-registration inputs ``schwab-py`` needs to
 build the client and refresh the token. The bucket's access key id and secret access
 key sign every request to the backup bucket on the key path, and ``lake.bucket`` builds
 its client from these two values alone. A host whose ``bucket_credentials`` is
 ``instance_profile`` carries neither, because its credentials come from the EC2
-instance metadata service instead. The rotating token itself is not here. It lives at
-``~/.config/marketlake/token.json`` and is handled elsewhere. Every secret is wrapped
+instance metadata service instead. The token store's access key id and secret access
+key sign the weekly re-auth's put of the token parameter, and only the host that runs
+the re-auth carries them. The Schwab token itself is not here. Each refresh replaces its
+access token and leaves its refresh token unchanged, as marketlake #633 measured. It
+lives at ``~/.config/marketlake/token.json`` and is handled elsewhere. Every secret is wrapped
 in ``Secret``, which redacts itself in every log, repr, and traceback. The one caller
 that must use a raw value calls ``reveal``. So a stray ``print(config)`` or a logged
 exception never leaks any of them.
@@ -63,6 +66,11 @@ asks it for senders. A
 refusal here would land inside the capture cycle, which loads this file every minute, so
 a typo made mid-session would stop capture until someone fixed the file. The daemon reads
 the role only at start, so a check every minute would protect nothing.
+
+A third is ``token_store``, which says what this host does with the Schwab token:
+``file``, ``both`` or ``store``, marketlake #636. It is stored the way ``role`` is, and
+``lake.token_store.mode_of`` decides what it means. The three ``token_store_*`` keys
+beside it are optional too, and only the re-auth checks them, for the same reason.
 
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
@@ -145,6 +153,18 @@ _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 # ``botocore`` refuses a malformed name only when the client is built, with an error
 # that is not a ``ConfigError``, so the check runs first and names the key instead.
 _REGION = re.compile(r"[a-z]{2,4}(-[a-z]+)+-\d+")
+
+# The token-store keys, marketlake #636. ``token_store`` says what this host does with the
+# Schwab token, and ``lake.token_store.mode_of`` reads it. ``file``, the default when the
+# key is absent, keeps the token in ``token.json`` alone. The three keys after it hold the
+# put-only key the weekly re-auth signs its put with, and the region the parameter lives
+# in. They never fall back to the ``bucket_*`` keys.
+TOKEN_STORE_KEY = "token_store"
+TOKEN_STORE_FILE = "file"
+TOKEN_STORE_KEY_ID_KEY = "token_store_access_key_id"
+TOKEN_STORE_SECRET_KEY = "token_store_secret_access_key"
+TOKEN_STORE_REGION_KEY = "token_store_region"
+TOKEN_STORE_KEYS = (TOKEN_STORE_KEY_ID_KEY, TOKEN_STORE_SECRET_KEY, TOKEN_STORE_REGION_KEY)
 
 # The host-role key, spelled once. ``lake.outbox`` names it in the line it prints for a
 # value it does not recognise.
@@ -328,6 +348,15 @@ def bucket_credential_problems(config: Config) -> list[str]:
     return problems
 
 
+def is_region_name(value: str) -> bool:
+    """Whether ``value`` has the shape of an AWS region name, such as ``us-east-2``.
+
+    ``require_bucket_settings`` checks ``bucket_region`` with it, and the token store
+    checks its own regions with it too, so the two cannot disagree about a name.
+    """
+    return _REGION.fullmatch(value) is not None
+
+
 def require_bucket_settings(config: Config, target: BucketTarget | None = None) -> BucketTarget:
     """The strict checks a bucket job runs before it builds a client, or a ``ConfigError``.
 
@@ -352,7 +381,7 @@ def require_bucket_settings(config: Config, target: BucketTarget | None = None) 
     problems = bucket_target_problems(target)
     problems.extend(bucket_credential_problems(config))
     region = config.bucket_region
-    if region is not None and not _REGION.fullmatch(region):
+    if region is not None and not is_region_name(region):
         problems.append(f"{BUCKET_REGION_KEY} {region!r} is not an AWS region name like us-east-2")
     if problems:
         raise ConfigError(". ".join(problems))
@@ -640,6 +669,14 @@ class Config:
     # checks it, through ``bucket_credential_problems``. It stays out of the repr,
     # because a key named for credentials invites a pasted secret.
     bucket_credentials: str = field(default=CREDENTIALS_FROM_KEYS, repr=False)
+    # The ``token_store`` string as the file held it, or the ``repr`` of any other value,
+    # the way ``role`` is stored. An absent key is ``file``. ``lake.token_store.mode_of``
+    # decides what the value means. It keeps its repr, unlike ``bucket_credentials``,
+    # because it names a mode rather than where a credential comes from.
+    token_store: str = TOKEN_STORE_FILE
+    token_store_access_key_id: Secret | None = None
+    token_store_secret_access_key: Secret | None = None
+    token_store_region: str | None = None
 
     def paths(self) -> LakePaths:
         """The lake path builder rooted at ``lake_root``. The DATA_DIR-to-paths bridge."""
@@ -657,11 +694,17 @@ class Config:
         """The values a page must never carry, for every ``Publisher`` that sends one.
 
         The healthchecks ping key and the ntfy topic always, and the bucket's two key
-        values when the file holds them. One method rather than a tuple at every
-        construction site, so a secret added here reaches every publisher at once.
+        values and the token store's two key values when the file holds them. One method
+        rather than a tuple at every construction site, so a secret added here reaches
+        every publisher at once.
         """
         values = [self.healthchecks_ping_key.reveal(), self.ntfy_topic.reveal()]
-        for secret in (self.bucket_access_key_id, self.bucket_secret_access_key):
+        for secret in (
+            self.bucket_access_key_id,
+            self.bucket_secret_access_key,
+            self.token_store_access_key_id,
+            self.token_store_secret_access_key,
+        ):
             if secret is not None:
                 values.append(secret.reveal())
         return tuple(values)
@@ -677,7 +720,9 @@ class Config:
         value as usual. ``role`` is stored as read when it is a string and as its
         ``repr`` otherwise, and a mapping without it yields ``ROLE_ABSENT``.
         ``bucket_credentials`` is stored the same way, and a mapping without it yields
-        ``keys``.
+        ``keys``. ``token_store`` is stored the same way too, and a mapping without it
+        yields ``file``. Keys this method does not name are ignored, so a config written
+        for newer code loads in older code unchanged.
         """
         missing = [key for key in _REQUIRED_KEYS if mapping.get(key) is None]
         if missing:
@@ -685,6 +730,8 @@ class Config:
         backup_target = parse_backup_target(mapping["backup_target"])
         key_id = _optional_text(mapping.get(BUCKET_KEY_ID_KEY))
         secret_key = _optional_text(mapping.get(BUCKET_SECRET_KEY))
+        store_key_id = _optional_text(mapping.get(TOKEN_STORE_KEY_ID_KEY))
+        store_secret_key = _optional_text(mapping.get(TOKEN_STORE_SECRET_KEY))
         return cls(
             lake_root=Path(str(mapping["lake_root"])).expanduser(),
             backup_target=backup_target,
@@ -703,6 +750,16 @@ class Config:
                 if BUCKET_CREDENTIALS_KEY in mapping
                 else CREDENTIALS_FROM_KEYS
             ),
+            token_store=(
+                _role_text(mapping[TOKEN_STORE_KEY])
+                if TOKEN_STORE_KEY in mapping
+                else TOKEN_STORE_FILE
+            ),
+            token_store_access_key_id=None if store_key_id is None else Secret(store_key_id),
+            token_store_secret_access_key=(
+                None if store_secret_key is None else Secret(store_secret_key)
+            ),
+            token_store_region=_optional_text(mapping.get(TOKEN_STORE_REGION_KEY)),
         )
 
 
@@ -742,7 +799,7 @@ def load_config(
     passes ``path`` or an ``env`` mapping to point the loader at a throwaway file.
 
     A parse failure names the file and nothing else. PyYAML quotes the offending line
-    back in its message, and four to six of this file's values are secrets, so a stray quote
+    back in its message, and four to eight of this file's values are secrets, so a stray quote
     on the ping-key line would put that key in the error. A scheduled job's stdout and
     stderr go to the service manager's log, a file under launchd and the journal under
     systemd, so an uncaught traceback leaves the key in that log.
@@ -765,7 +822,7 @@ def _parse_yaml(text: str) -> object | None:
     """The parsed YAML, or ``None`` when ``text`` is not YAML at all.
 
     The parse error stays inside this function and is never re-raised. Its message
-    quotes the offending source line, and this file holds four to six secrets, so letting it
+    quotes the offending source line, and this file holds four to eight secrets, so letting it
     out would put one of them wherever the caller's error lands. An empty file and a
     ``null`` document both parse to an empty mapping, so ``None`` means the parse
     failed and nothing else.

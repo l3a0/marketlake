@@ -117,7 +117,13 @@ def flow(api_key, app_secret, callback_url, token_path, *, token_write_func, **k
     return "a client this command discards"
 
 
-report = lake.reauth.reauth_from_config(login_flow=flow, stdin_is_tty=True)
+def no_store(config):
+    raise AssertionError("the token store is off in this config, so nothing builds a client")
+
+
+report = lake.reauth.reauth_from_config(
+    login_flow=flow, store_client_factory=no_store, stdin_is_tty=True
+)
 out["report"] = {
     "token_path": str(report.token_path),
     "callback_url": report.callback_url,
