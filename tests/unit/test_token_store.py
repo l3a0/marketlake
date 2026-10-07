@@ -648,6 +648,12 @@ def _pull(store: Store, token: Path) -> token_store.PullResult:
 def _assert_no_token_in(result: token_store.PullResult) -> None:
     assert ACCESS not in result.line and REFRESH not in result.line
     assert "\n" not in result.line
+    # The reason rides the Sunday reminder to the phone, so it carries neither a token byte
+    # nor the token's path, which the line names.
+    reason = "" if result.reason is None else result.reason
+    assert ACCESS not in reason and REFRESH not in reason
+    assert "\n" not in reason
+    assert "token.json" not in reason
 
 
 def test_the_pull_asks_for_the_decrypted_parameter_signed_by_the_bucket_key(tmp_path):
@@ -797,6 +803,63 @@ def test_an_empty_parameter_is_named_empty(tmp_path):
     result = _pull(Store(""), tmp_path / "token.json")
     assert result.outcome == "unreadable"
     assert "(the parameter is empty)" in result.line
+    assert result.reason == "the parameter is empty"
+
+
+def _wrote_over_absent(tmp_path: Path) -> token_store.PullResult:
+    return _pull(Store(_token()), tmp_path / "token.json")
+
+
+def _wrote_over_unreadable(tmp_path: Path) -> token_store.PullResult:
+    token = tmp_path / "token.json"
+    token.write_text("not json at all")
+    return _pull(Store(_token()), token)
+
+
+def _wrote_over_earlier(tmp_path: Path) -> token_store.PullResult:
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(_token(minted=MINTED - 604800)))
+    return _pull(Store(_token()), token)
+
+
+def _current(tmp_path: Path) -> token_store.PullResult:
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(_token()))
+    return _pull(Store(_token()), token)
+
+
+def _store_older(tmp_path: Path) -> token_store.PullResult:
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(_token(minted=MINTED + 60)))
+    return _pull(Store(_token()), token)
+
+
+def _no_credentials(tmp_path: Path) -> token_store.PullResult:
+    def factory():
+        raise aws_session._MetadataLookupFailed("none returned")
+
+    return token_store.pull(client_factory=factory, token_path=tmp_path / "token.json", clock=CLOCK)
+
+
+@pytest.mark.parametrize(
+    ("drive", "outcome"),
+    [
+        (_wrote_over_absent, "wrote"),
+        (_wrote_over_unreadable, "wrote"),
+        (_wrote_over_earlier, "wrote"),
+        (_current, "current"),
+        (_store_older, "store older"),
+        (_no_credentials, "no credentials"),
+    ],
+    ids=lambda value: getattr(value, "__name__", value),
+)
+def test_only_an_unreadable_pull_carries_a_reason(tmp_path, drive, outcome):
+    # ``pull`` keeps a local named ``reason`` on its ``wrote`` branch, saying what the local
+    # file was. It names the local file's state, not the parameter's, and must not reach
+    # the field the Sunday reminder reads.
+    result = drive(tmp_path)
+    assert result.outcome == outcome
+    assert result.reason is None
 
 
 # ``UnrecognizedClientException`` is not in SSM's model, so botocore raises the generic
@@ -809,6 +872,7 @@ def test_an_aws_error_is_unreadable_by_its_code_alone(tmp_path, code):
     result = _pull(store, tmp_path / "token.json")
     assert result.outcome == "unreadable"
     assert f"({code})" in result.line
+    assert result.reason == code
     _assert_no_token_in(result)
 
 
@@ -820,6 +884,7 @@ def test_a_role_that_cannot_be_assumed_is_unreadable_not_a_traceback(tmp_path):
     result = _pull(store, tmp_path / "token.json")
     assert result.outcome == "unreadable"
     assert "(AssumeRole AccessDenied)" in result.line
+    assert result.reason == "AssumeRole AccessDenied"
     assert not (tmp_path / "token.json").exists()
 
 
@@ -898,6 +963,7 @@ def test_a_mint_time_two_hours_ahead_writes_nothing_over_an_absent_file(tmp_path
     result = _pull_at_now(Store(_token(minted=_minted_at(timedelta(hours=2)))), token)
     assert result.outcome == "unreadable"
     assert "in the future" in result.line
+    assert result.reason == "its mint time is in the future"
     assert token_store.EXIT_CODES[result.outcome] == 1
     assert not token.exists()
     _assert_no_token_in(result)

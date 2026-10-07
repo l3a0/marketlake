@@ -427,6 +427,31 @@ The VM's first boot runs it
 ([#686](https://github.com/l3a0/marketlake/issues/686)), and
 [#702](https://github.com/l3a0/marketlake/issues/702) runs it after that.
 
+A pull that fails on a Sunday canary attempt rides that evening's re-auth reminder as
+`Token pull: <outcome>`, and an `unreadable` pull adds its reason in parentheses. The
+pull's full line, which names the token's path, goes only to the Sunday job's log. Each
+outcome the reminder can carry asks for one fix:
+
+1. `store older`: the VM's `token.json` was minted later than the parameter. No scheduled
+   writer produces that, only a token or a parameter version placed by hand. Run
+   `reauth.sh` on the laptop under `both`, and check that it printed a version number.
+2. `unreadable (ParameterNotFound)`: the laptop never put the token. The same fix.
+3. `unreadable` with a phrase about the value, such as `the parameter is empty`,
+   `the parameter is not JSON`, or one naming a missing token or mint time: the put
+   carried a bad value. The same fix. For `its mint time is in the future`, check the
+   VM's clock first.
+4. `unreadable (AccessDeniedException)` or `unreadable (AssumeRole <code>)`: the pull is
+   not signing as the instance role, which can read the parameter. Check that the VM's
+   `config.yaml` says `bucket_credentials: instance_profile`.
+5. `unreadable` with a botocore class name, or `no credentials`: the network or the
+   instance metadata service. The next attempt retries, and only the same outcome on every
+   attempt calls for an SSH session.
+6. `config refused`: the VM's bucket settings in `config.yaml` could not build the pull's
+   client. Fix them, then run the pull by hand.
+7. `not written`: the token's directory or file does not belong to the daemon's account,
+   which is what a pull run as root leaves. Return it to that account, then run the pull
+   by hand.
+
 ## Reach the dashboard on a hosted VM
 
 The dashboard binds the loopback address and serves only requests whose `Host` names

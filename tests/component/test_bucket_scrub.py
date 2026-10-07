@@ -702,6 +702,7 @@ def _sunday_run(lake: Path, client: FakeS3, *, mints, canary=lambda: True):
         ping_url=URL,
         mint_reader=mints,
         canary=canary,
+        token_pull=None,
     )
     return outcomes, pinger
 

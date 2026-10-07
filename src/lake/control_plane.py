@@ -85,12 +85,13 @@ that sets it and its own firing. Before that Friday nothing has set it, so a Mon
 catch-up run reports nothing missing. The weekday repeat alarm is always expected.
 
 Every seam is injected: the clock, the calendar, the daemon probe, the clock-sync probe,
-the schedule reader, the pinger, the canary, the alert transport, and the caffeinate
-runner. The whole module
-runs offline in a test. Two of those seams reach the outside world when they fall back
-to their production default. The canary quotes one symbol through the vendor, and the
-transport POSTs the re-auth reminder to ntfy. Both are built by the ``sunday`` command
-line alone, so a test that drives it passes its own for each.
+the schedule reader, the pinger, the canary, the token pull, the alert transport, and the
+caffeinate runner. The whole module
+runs offline in a test. Three of those seams reach the outside world when they fall back
+to their production default. The canary quotes one symbol through the vendor, the token
+pull reads the token parameter from SSM, and the transport POSTs the re-auth reminder to
+ntfy. All three are built by the ``sunday`` command line alone, so a test that drives it
+passes its own for each.
 """
 
 from __future__ import annotations
@@ -106,11 +107,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from lake import outbox, paths
+from lake import outbox, paths, token_store
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
-from lake.config import CALLBACK_KEY, BucketTarget, input_errors_exit, load_config
+from lake.config import (
+    CALLBACK_KEY,
+    BucketTarget,
+    Config,
+    ConfigError,
+    input_errors_exit,
+    load_config,
+)
 from lake.manifest import (
     RESTORE_EPOCH,
     BackupReader,
@@ -2368,6 +2376,10 @@ class SundayOutcome:
     ``backup`` is ``None`` when the backup scrub was skipped, which only a shadow host
     does, and ``report`` then carries ``BACKUP_SCRUB_SKIPPED``.
 
+    ``pull`` is what this attempt's token pull did, set by ``sunday_run``, which runs the
+    pull. It is ``None`` when no pull ran, which is a host whose ``token_store`` is
+    ``file`` or ``both``, or a caller of ``sunday_maintenance`` alone.
+
     ``daemon_page`` is the page this attempt found owed for a dead daemon or an unheld
     assertion, or ``None`` when nothing was checked or the daemon was healthy. Its text
     is also named in ``report``, matching every other report-tier finding, but it does
@@ -2387,6 +2399,7 @@ class SundayOutcome:
     report: tuple[str, ...] = ()
     daemon_page: Message | None = None
     restore: RestoreResult | None = None
+    pull: token_store.PullResult | None = None
 
 
 def restore_week(now: datetime) -> int:
@@ -2723,6 +2736,73 @@ CANARY_RETRY = timedelta(minutes=30)
 # loop calls it once per attempt. That is what lets a mid-evening re-login be seen.
 MintReader = Callable[[], datetime | None]
 
+# Copies the token parameter into the Sunday job's ``token.json`` when it is newer, and
+# says what happened. The retry loop calls it once per attempt, before the mint is read,
+# so a re-auth put on the laptop at 20:40 reaches the 21:00 attempt's coverage assertion
+# and canary. The production one is ``main``'s closure over ``token_store.pull``. It is
+# ``None`` on a host whose ``token_store`` is ``file`` or ``both``, which pulls nothing.
+TokenPull = Callable[[], token_store.PullResult]
+
+# The two outcomes the ``sunday`` command's pull adds to ``token_store``'s five. The pull
+# raises in two cases rather than returning, and the Sunday job turns each into an
+# outcome, so a pull never ends the job and the canary, the scrub and the ping still run.
+# ``config.yaml``'s bucket settings could not build the SSM client.
+PULL_CONFIG_REFUSED = "config refused"
+# ``token.json`` could not be written, or its directory could not be searched.
+PULL_NOT_WRITTEN = "not written"
+
+# The pull outcomes the reminder stays silent about. Either one leaves ``token.json``
+# holding the parameter's token, so a reminder that fires anyway owes nothing new.
+_QUIET_PULLS = frozenset({token_store.WROTE, token_store.CURRENT})
+
+
+def _naming_the_pull(reminder: ReauthReminder, pulled: token_store.PullResult) -> ReauthReminder:
+    """``reminder`` with a failed pull's outcome appended, or ``reminder`` unchanged.
+
+    The outcome name always goes on, and an ``unreadable`` pull's ``reason`` goes in
+    parentheses after it, because the reason decides which fix applies and README maps
+    each one to its fix. ``PullResult.line`` never goes on, because it names the token's
+    path, and the design keeps everything from the config directory off the wire but the
+    mint date.
+    """
+    if pulled.outcome in _QUIET_PULLS:
+        return reminder
+    named = pulled.outcome if pulled.reason is None else f"{pulled.outcome} ({pulled.reason})"
+    return replace(reminder, body=f"{reminder.body} Token pull: {named}.")
+
+
+def _sunday_token_pull(config: Config, token_path: str, clock: Clock) -> TokenPull:
+    """The ``sunday`` command's pull: ``token_store.pull`` into the job's own token file.
+
+    ``token_store.pull_client`` is looked up through its module on every call rather than
+    bound here, so a test that replaces it there reaches this closure as it reaches
+    ``token_store.main``. The two exceptions ``pull`` raises become outcomes with one line
+    each, as ``token_store.main`` turns them into exit codes, so a pull never ends the job.
+    ``ConfigError``'s message is the operator line ``token_store.main`` prints for it, and
+    an ``OSError`` is named by its class alone.
+    """
+
+    def pull() -> token_store.PullResult:
+        try:
+            return token_store.pull(
+                client_factory=lambda: token_store.pull_client(config),
+                token_path=token_path,
+                clock=clock,
+            )
+        except ConfigError as exc:
+            return token_store.PullResult(
+                PULL_CONFIG_REFUSED,
+                f"the token parameter was not read, because config.yaml could not build "
+                f"its client (ConfigError: {exc}), so {token_path} was left as it was",
+            )
+        except OSError as exc:
+            return token_store.PullResult(
+                PULL_NOT_WRITTEN, f"{token_path} could not be written ({type(exc).__name__})"
+            )
+
+    return pull
+
+
 # Reads the daemon's journal stamp afresh. The retry loop calls it once per attempt, the
 # same reason ``MintReader`` is a reader rather than a value: the daemon restamps a new
 # pid when it re-takes a lost ``caffeinate``, and a pid cached at the start of the evening
@@ -2767,6 +2847,7 @@ def sunday_run(
     ping_url: str,
     mint_reader: MintReader,
     canary: CanaryCall,
+    token_pull: TokenPull | None,
     retry: timedelta = CANARY_RETRY,
     exclusion_targets: Sequence[str] = (),
     exclusion_reader: ExclusionReader | None = None,
@@ -2799,6 +2880,17 @@ def sunday_run(
     one attempt and returns. That covers the Monday catch-up launchd fires for a wake
     missed over the weekend, where retrying all day would page nobody sooner. Every
     attempt comes back, in order, so the caller can report them all.
+
+    ``token_pull`` runs on every attempt, before the mint is read, so the mint, the
+    coverage assertion and the canary all read the file it may have just written. It runs
+    after the attempt's own moment is taken, so a slow pull cannot move the attempt into
+    the next hour and past the reminder's hour rule. It is required and may be ``None``,
+    which pulls nothing. Its result rides the outcome, and a reminder that goes out names
+    a failed one. The one-an-hour rule still decides which reminders go out, so a pull
+    that fails at 20:30 after the 20:00 reminder went out is named first at 21:00. Letting
+    a new pull outcome past that rule would raise the evening's ceiling from three
+    reminders to six, to name a failure 30 minutes sooner. A failed pull with coverage
+    passing sends nothing, because the local token covers the week.
 
     ``reminder_sink`` is called unguarded, because surviving a failed delivery is the
     publisher's contract rather than every caller's. ``reminder_publisher`` is the
@@ -2847,6 +2939,8 @@ def sunday_run(
     saved_restore: RestoreResult | None = None
     while True:
         attempt_now = clock.now()
+        # Before the mint is read, so this attempt reads whatever the pull wrote.
+        pulled = token_pull() if token_pull is not None else None
         # One reading per attempt, so the pid and the instant the page reasons about
         # come from the same file at the same moment.
         stamp = stamp_reader() if stamp_reader is not None else JournalMetadata()
@@ -2880,14 +2974,18 @@ def sunday_run(
             and restored.restored
         ):
             saved_restore = restored
+        if pulled is not None:
+            outcome = replace(outcome, pull=pulled)
         # One reminder an hour. Later attempts in the same hour owe nothing, so the
-        # outcome records only the one that went out.
+        # outcome records only the one that went out. That one names a failed pull.
         hour = attempt_now.astimezone(MARKET_TZ).hour
         if outcome.reminder is not None:
             if hour in reminded:
                 outcome = replace(outcome, reminder=None)
             else:
                 reminded.add(hour)
+                if pulled is not None:
+                    outcome = replace(outcome, reminder=_naming_the_pull(outcome.reminder, pulled))
                 if reminder_sink is not None:
                     reminder_sink(outcome.reminder)
         if outcome.daemon_page is not None and not daemon_paged:
@@ -4640,11 +4738,12 @@ def main(
     """The ``python -m lake.control_plane`` entry. Returns a process exit code.
 
     Every seam that reaches past this process is built here, not accepted. The healthchecks
-    GET, the ntfy POST, the vendor canary, the ``launchctl``, ``pmset`` and ``tmutil`` reads
-    on macOS, and the ``systemctl`` and ``timedatectl`` reads on Linux all shell out or go
-    to the network. ``is_macos`` picks which set the two jobs wire. A ``main`` that accepted
-    them let a test omit one and reach the real effect. So ``main`` builds them, and a test
-    drives the ``self_check`` or ``sunday_run`` helper directly, which requires its seams.
+    GET, the ntfy POST, the vendor canary, the token parameter's read, the ``launchctl``,
+    ``pmset`` and ``tmutil`` reads on macOS, and the ``systemctl`` and ``timedatectl`` reads
+    on Linux all shell out or go to the network. ``is_macos`` picks which set the two jobs
+    wire. A ``main`` that accepted them let a test omit one and reach the real effect. So
+    ``main`` builds them, and a test drives the ``self_check`` or ``sunday_run`` helper
+    directly, which requires its seams.
     The two senders are the exception to "built here". They come from ``outbox.senders``,
     the only construction site the package has for either, and are still never accepted.
     Under a ``shadow`` role they record rather than send, and the Sunday job skips the
@@ -4723,6 +4822,17 @@ def main(
         # The reminder's delivery, and the refused-ping page's. The secrets are the
         # values that must never reach a phone, checked against the message itself.
         sends = outbox.senders(config, process="sunday", clock=run_clock)
+        # The token pull. A ``store`` host and one whose value is unknown pull on every
+        # attempt, whatever their role, so the shadow VM's file follows the laptop's
+        # re-auth. A ``file`` or ``both`` host is the laptop, which pulls nothing.
+        token_mode, unknown_mode = token_store.mode_of(config)
+        if unknown_mode is not None:
+            print(f"sunday: {unknown_mode}")
+        token_pull = (
+            _sunday_token_pull(config, token_path, run_clock)
+            if token_mode in (token_store.STORE, token_store.UNRECOGNISED)
+            else None
+        )
         publisher = Publisher(
             lake_root=config.lake_root,
             transport=sends.transport,
@@ -4763,6 +4873,7 @@ def main(
                 app_secret=config.schwab_app_secret.reveal(),
             ),
             mint_reader=read_mint,
+            token_pull=token_pull,
             reminder_sink=reminder_publisher(publisher=publisher, clock=run_clock),
             # The same publisher the reminder pushes through. A refused ping is a page,
             # not a reminder, so it goes out as one.
@@ -4784,6 +4895,9 @@ def main(
         for number, outcome in enumerate(outcomes, start=1):
             if len(outcomes) > 1:
                 print(f"sunday: attempt {number} of {len(outcomes)}")
+            # The pull's full line, path and all, which the reminder never carries.
+            if outcome.pull is not None:
+                print(f"sunday: token pull: {outcome.pull.line}")
             for problem in outcome.problems:
                 print(f"sunday: {problem}")
             for line in outcome.report:

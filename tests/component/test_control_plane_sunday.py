@@ -21,7 +21,10 @@ import urllib.error
 from datetime import date, timedelta
 from pathlib import Path
 
+import pytest
+
 from lake import control_plane as cp
+from lake import token_store
 from lake.alert import Publisher
 from lake.metadata import JournalMetadata, stamp_assertion_pid
 from tests.support.backup import FAIL, WRONG, FakeBackupReader, mirror_lake
@@ -564,6 +567,7 @@ def _retry_run(
     schedule=REPEAT_ONLY,
     reminder_sink=None,
     backup_reader=None,
+    token_pull=None,
 ):
     clock = ManualClock(start=start)
     pinger = FakePinger()
@@ -577,6 +581,7 @@ def _retry_run(
         ping_url=URL,
         mint_reader=mints,
         canary=canary if canary is not None else _passing_canary,
+        token_pull=token_pull,
         reminder_sink=reminder_sink,
         backup_reader=backup_reader,
     )
@@ -764,6 +769,7 @@ def test_the_retry_loop_gives_a_failed_ping_another_chance(fixture_lake):
         ping_url=URL,
         mint_reader=_Mints(FRESH_MINT),
         canary=_passing_canary,
+        token_pull=None,
     )
     assert len(outcomes) == 7
     assert len(pinger.urls) == 7
@@ -912,6 +918,196 @@ def test_a_failing_canary_names_both_halves(fixture_lake):
     assert outcome.reminder.body == (
         "The throwaway call and the coverage assertion failed. Token minted 2026-08-27."
     )
+
+
+# -- the token pull -------------------------------------------------------------------
+
+# On a ``store`` host each attempt copies the token parameter into ``token.json`` before
+# it reads the mint, so a re-auth put on the laptop mid-evening reaches the next
+# attempt's coverage assertion and canary (marketlake #702). A reminder that goes out
+# names a failed pull by its outcome, and an ``unreadable`` one by its reason too, but
+# never by the pull's line, which carries the token's path.
+
+PULL_PATH = "/home/someone/.config/marketlake/token.json"
+
+
+def _pulled(outcome, reason=None):
+    """A pull result whose line names the token's path, as every real line does."""
+    return token_store.PullResult(outcome, f"{outcome}: {PULL_PATH}", reason=reason)
+
+
+class _Pulls:
+    """Hands back one pull result per attempt, repeating the last once the list runs out."""
+
+    def __init__(self, *results, events=None):
+        self.results = list(results)
+        self.calls = 0
+        self.events = events
+
+    def __call__(self):
+        if self.events is not None:
+            self.events.append("pull")
+        result = self.results[min(self.calls, len(self.results) - 1)]
+        self.calls += 1
+        return result
+
+
+def test_each_attempt_pulls_before_it_reads_the_mint_and_runs_the_canary(fixture_lake):
+    events = []
+    mints = _Mints(STALE_MINT, FRESH_MINT)
+
+    def mint():
+        events.append("mint")
+        return mints()
+
+    def canary():
+        events.append("canary")
+        return True
+
+    outcomes, _, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=mint,
+        canary=canary,
+        token_pull=_Pulls(_pulled(token_store.CURRENT), events=events),
+    )
+    assert len(outcomes) == 2
+    assert events == ["pull", "mint", "canary"] * 2
+
+
+def test_the_mint_and_the_canary_read_the_file_the_pull_wrote(fixture_lake):
+    # The laptop's re-auth reached the parameter at 19:30. The local file still holds last
+    # week's token until the pull copies the new one over it, so an attempt that read the
+    # mint or ran the canary before pulling would fail at 20:00 and retry at 20:30.
+    held = {"mint": STALE_MINT}
+
+    def pull():
+        held["mint"] = FRESH_MINT
+        return _pulled(token_store.WROTE)
+
+    canaries = []
+
+    def canary():
+        canaries.append(held["mint"])
+        return held["mint"] == FRESH_MINT
+
+    sent = []
+    outcomes, pinger, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=lambda: held["mint"],
+        canary=canary,
+        reminder_sink=sent.append,
+        token_pull=pull,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].covered is True and outcomes[0].canary_passed is True
+    assert outcomes[0].pull.outcome == token_store.WROTE
+    assert canaries == [FRESH_MINT]
+    assert pinger.urls == [URL]
+    assert sent == []
+
+
+def test_with_no_pull_nothing_is_pulled_and_the_reminder_is_unchanged(fixture_lake):
+    sent = []
+    outcomes, _, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(STALE_MINT),
+        reminder_sink=sent.append,
+        token_pull=None,
+    )
+    assert all(o.pull is None for o in outcomes)
+    assert [r.body for r in sent] == ["The coverage assertion failed. Token minted 2026-08-27."] * 3
+
+
+@pytest.mark.parametrize(
+    ("pulled", "named"),
+    [
+        (_pulled(token_store.UNREADABLE, "ParameterNotFound"), "unreadable (ParameterNotFound)"),
+        (
+            _pulled(token_store.UNREADABLE, "AssumeRole AccessDenied"),
+            "unreadable (AssumeRole AccessDenied)",
+        ),
+        (_pulled(token_store.STORE_OLDER), "store older"),
+        (_pulled(token_store.NO_CREDENTIALS), "no credentials"),
+        (_pulled(cp.PULL_CONFIG_REFUSED), "config refused"),
+        (_pulled(cp.PULL_NOT_WRITTEN), "not written"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else value.outcome,
+)
+def test_a_reminder_names_a_failed_pull_and_never_its_line(fixture_lake, pulled, named):
+    sent = []
+    outcomes, _, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(STALE_MINT),
+        reminder_sink=sent.append,
+        token_pull=_Pulls(pulled),
+    )
+    assert len(sent) == 3
+    assert all(
+        r.body == f"The coverage assertion failed. Token minted 2026-08-27. Token pull: {named}."
+        for r in sent
+    )
+    assert all(PULL_PATH not in r.body for r in sent)
+    # The outcome carries the reminder that went out, so the job's log prints the same text.
+    assert [o.reminder for o in outcomes if o.reminder is not None] == sent
+    assert all(o.pull is pulled for o in outcomes)
+
+
+@pytest.mark.parametrize("quiet", [token_store.WROTE, token_store.CURRENT])
+def test_a_reminder_says_nothing_of_a_pull_that_left_the_parameter_s_token(fixture_lake, quiet):
+    sent = []
+    _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(STALE_MINT),
+        reminder_sink=sent.append,
+        token_pull=_Pulls(_pulled(quiet)),
+    )
+    assert [r.body for r in sent] == ["The coverage assertion failed. Token minted 2026-08-27."] * 3
+
+
+def test_a_failed_pull_with_coverage_passing_sends_nothing(fixture_lake):
+    # The local token covers the week, so the evening owes no reminder, and the pull's
+    # failure reaches only the job's log.
+    sent = []
+    outcomes, pinger, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(FRESH_MINT),
+        reminder_sink=sent.append,
+        token_pull=_Pulls(_pulled(token_store.UNREADABLE, "ParameterNotFound")),
+    )
+    assert sent == []
+    assert len(outcomes) == 1 and outcomes[0].pinged is True
+    assert outcomes[0].pull.outcome == token_store.UNREADABLE
+    assert pinger.urls == [URL]
+
+
+def test_a_pull_failing_after_the_hour_s_reminder_is_named_by_the_next_hour_s(fixture_lake):
+    # The 20:00 reminder goes out while the pull is still current. The operator re-auths
+    # at 20:15 and the pull fails from 20:30 on. The one-an-hour rule drops the 20:30
+    # reminder, so that failure reaches only the job's log, and 21:00 names it first.
+    failed = _pulled(token_store.UNREADABLE, "the parameter is not JSON")
+    sent = []
+    outcomes, _, _ = _retry_run(
+        _clean_lake(fixture_lake),
+        start=SUNDAY_20,
+        mints=_Mints(STALE_MINT),
+        reminder_sink=sent.append,
+        token_pull=_Pulls(_pulled(token_store.CURRENT), failed),
+    )
+    assert len(outcomes) == 7
+    assert outcomes[1].pull is failed and outcomes[1].reminder is None
+    assert [r.body for r in sent] == [
+        "The coverage assertion failed. Token minted 2026-08-27.",
+        "The coverage assertion failed. Token minted 2026-08-27. "
+        "Token pull: unreadable (the parameter is not JSON).",
+        "The coverage assertion failed. Token minted 2026-08-27. "
+        "Token pull: unreadable (the parameter is not JSON).",
+    ]
 
 
 # -- the daemon-liveness page ---------------------------------------------------------
@@ -1142,6 +1338,7 @@ def test_the_same_failure_on_a_retry_does_not_page_twice(fixture_lake):
         ping_url=URL,
         mint_reader=_Mints(STALE_MINT),
         canary=_passing_canary,
+        token_pull=None,
         daemon_probe=lambda label: False,
         publisher=_publisher(root, transport),
     )
@@ -1171,6 +1368,7 @@ def test_the_retry_loop_carries_the_stamp_instant_rather_than_the_wall_clock(fix
         ping_url=URL,
         mint_reader=_Mints(FRESH_MINT),
         canary=_passing_canary,
+        token_pull=None,
         daemon_probe=lambda label: True,
         assertion_probe=lambda pid: True,
         stamp_reader=lambda: JournalMetadata(stamped_at=SUNDAY_20 - timedelta(hours=6)),
@@ -1218,6 +1416,7 @@ def test_the_assertion_pid_is_read_fresh_each_retry(fixture_lake):
         ping_url=URL,
         mint_reader=mints,
         canary=_passing_canary,
+        token_pull=None,
         daemon_probe=lambda label: True,
         assertion_probe=held,
         stamp_reader=read_stamp,
@@ -1247,6 +1446,7 @@ def test_a_refused_page_keeps_its_body_off_stderr(fixture_lake, capsys):
         ping_url=URL,
         mint_reader=_Mints(FRESH_MINT),
         canary=_passing_canary,
+        token_pull=None,
         daemon_probe=lambda label: False,
         # A publisher configured to treat the daemon label as a secret, so the page
         # this run raises is refused the way a page carrying a real one would be.

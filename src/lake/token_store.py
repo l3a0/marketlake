@@ -335,10 +335,18 @@ EXIT_CODES = {WROTE: 0, CURRENT: 0, STORE_OLDER: 1, UNREADABLE: 1, NO_CREDENTIAL
 
 @dataclass(frozen=True)
 class PullResult:
-    """What a pull did, and the one line it prints. Neither carries the token."""
+    """What a pull did, and the one line it prints. Neither carries the token.
+
+    ``reason`` says why an ``unreadable`` pull could not use the parameter, and is
+    ``None`` on every other outcome. It is an AWS error code, a botocore class name,
+    ``AssumeRole <code>``, or a fixed phrase about the value, so it carries neither the
+    token's path nor a token byte. That is what lets the Sunday reminder carry it where
+    ``line``, which names the path, cannot go.
+    """
 
     outcome: str
     line: str
+    reason: str | None = None
 
 
 def pull_client(config: Config) -> Any:
@@ -504,6 +512,7 @@ def _unreadable(target: Path, why: str) -> PullResult:
     return PullResult(
         UNREADABLE,
         f"the token parameter could not be used ({why}), so {target} was left as it was",
+        reason=why,
     )
 
 
