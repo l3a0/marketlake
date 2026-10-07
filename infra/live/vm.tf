@@ -4,10 +4,10 @@
 
 locals {
   # A literal rather than a variable, because the lake volume carries prevent_destroy,
-  # and changing its zone would replace it. The owner confirms this zone before the
-  # first apply. The measurement VM's zone is proven to offer t4g.small with a default
-  # subnet.
-  zone = "us-east-1a"
+  # and changing its zone would replace it. The measurement VM runs in this zone, so it
+  # is proven to offer t4g.small in this account. Whether it has a default subnet is
+  # still the owner's to confirm before the first apply.
+  zone = "us-east-1c"
 }
 
 # 099720109477 is Canonical's public publisher account, not the owner's. The name

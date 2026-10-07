@@ -14,7 +14,7 @@ mock_provider "aws" {
   # the zone in vm.tf fails every run until this moves with it.
   mock_data "aws_ec2_instance_type_offerings" {
     defaults = {
-      locations = ["us-east-1a"]
+      locations = ["us-east-1c"]
     }
   }
 
@@ -399,8 +399,8 @@ run "lake_volume_sits_in_a_zone_that_offers_the_instance_type" {
     condition = [
       aws_ebs_volume.lake.availability_zone,
       data.aws_subnet.default.availability_zone,
-    ] == ["us-east-1a", "us-east-1a"]
-    error_message = "The lake volume and the instance's subnet are not both in us-east-1a."
+    ] == ["us-east-1c", "us-east-1c"]
+    error_message = "The lake volume and the instance's subnet are not both in us-east-1c."
   }
 
   assert {
