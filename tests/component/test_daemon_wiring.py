@@ -3278,6 +3278,25 @@ def test_a_good_cycle_between_two_dead_ones_does_not_reset_the_spacing(tmp_path,
     ]
 
 
+def test_a_restart_forgets_the_spacing_and_pulls_on_its_first_dead_cycle(tmp_path, capsys):
+    # The last pull's slot lives in one run of the loop, not in the module. So a daemon
+    # restarted two minutes after its predecessor pulled pulls on its own first dead
+    # minute, inside the five minutes the predecessor would have waited.
+    rig = _rig(tmp_path, roster=WITH_OPTIONS)
+    _run(
+        rig, ManualClock(start=et(2026, 9, 2, 9, 59, 30)), ticks=2, cycle_runner=_cycles(DEAD, DEAD)
+    )
+    first = _pulled_at(capsys.readouterr().err)
+    _run(
+        rig, ManualClock(start=et(2026, 9, 2, 10, 1, 30)), ticks=2, cycle_runner=_cycles(DEAD, DEAD)
+    )
+    second = _pulled_at(capsys.readouterr().err)
+
+    assert first == [et(2026, 9, 2, 10, 0)]
+    assert second == [et(2026, 9, 2, 10, 2)]
+    assert len(rig.pulls.calls) == 2
+
+
 @pytest.mark.parametrize(
     "minute",
     [
