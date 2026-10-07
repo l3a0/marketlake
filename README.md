@@ -89,8 +89,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   units from the checkout and installs them. `deploy/vm-bootstrap.sh` calls it at the
   VM's first boot, and every deploy calls it.
 - `deploy/vm-bootstrap.sh` takes the VM from a fresh boot to a running daemon: it mounts
-  the lake volume, installs `uv` and the units, renders `config.yaml`, pulls the token
-  and applies the roster. It is safe to run again over SSH.
+  the lake volume, installs `uv`, syncs the environment, renders `config.yaml`, pulls
+  the token, applies the roster, and only then installs and starts the units. It is safe
+  to run again over SSH.
 - `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
   It refuses unless the lake volume is mounted, `role` is `shadow`, every unit is
   stopped and nothing is mounted below the lake root.
@@ -352,8 +353,9 @@ time:
 TZ=America/New_York journalctl -u com.marketlake.daemon
 ```
 
-On the hosted VM, `deploy/vm-bootstrap.sh` runs this install at first boot, then the
-steps that follow it, in order. [The hosted VM](infra/README.md#the-hosted-vm) in the
+On the hosted VM, `deploy/vm-bootstrap.sh` runs this install at first boot, after it has
+rendered `config.yaml`, pulled the token and applied the roster, so the residents start
+with their config in place. [The hosted VM](infra/README.md#the-hosted-vm) in the
 infrastructure runbook says how to create the VM, rerun the bootstrap and restore its
 lake. The design doc's Deployment section carries the reasoning for each unit setting.
 

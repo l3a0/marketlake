@@ -825,7 +825,8 @@ def test_the_entry_point_is_tracked_executable():
             ["--owner", OWNER, "--lake-mount", "/srv/lake", "--bogus"],
             {},
             "linux-install: unknown argument --bogus. Usage: linux-install.sh --owner"
-            " <account> --lake-mount <path> [--config <path>]\n",
+            " <account> --lake-mount <path> [--config <path>] [--sync-only]."
+            " Only vm-bootstrap.sh passes --sync-only\n",
         ),
         (
             ["--owner", OWNER, "--lake-mount"],
@@ -866,6 +867,38 @@ def test_the_entry_point_refuses_before_it_renders(argv, env, message, tmp_path)
     calls = harness.calls()
     assert not [line for line in calls if line.startswith(("uv ", "systemctl "))], calls
     assert not (home / ".local" / "state").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Last, so a parser that wanted a value after the flag would refuse it, and first,
+        # so one that took the next argument as its value would leave --owner unread.
+        ["--owner", OWNER, "--lake-mount", "/srv/lake", "--sync-only"],
+        ["--sync-only", "--owner", OWNER, "--lake-mount", "/srv/lake"],
+    ],
+    ids=["flag last", "flag first"],
+)
+def test_sync_only_syncs_under_the_lock_and_installs_nothing(argv, tmp_path):
+    """The bootstrap's first call: the venv the config steps run from, and no unit.
+
+    The units start only from a run without the flag, after config.yaml exists.
+    """
+    proc, harness, checkout, home = _entry(tmp_path, *argv)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = harness.calls()
+    sync = f"uv sync --frozen --no-dev in {checkout}"
+    assert "flock -w 600 9" in calls
+    assert sync in calls
+    assert calls.index("flock -w 600 9") < calls.index(sync)
+    # The sync runs as the owner, and nothing else goes through sudo.
+    assert _sudo_calls(harness) == [
+        f"sudo -u {OWNER} -H {home}/.local/bin/uv sync --frozen --no-dev"
+    ]
+    assert not (home / ".local" / "state").exists()
+    assert not [line for line in calls if line.startswith("systemctl")], calls
+    assert not harness.unit_dir.exists()
+    assert proc.stdout.splitlines()[-1] == "linux-install: done"
 
 
 def test_the_lock_refusal_names_the_wait(tmp_path):

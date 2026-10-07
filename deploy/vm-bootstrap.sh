@@ -25,16 +25,22 @@
 #   7. proves the right volume is mounted by its UUID, and only then chowns the lake root
 #      to the owner and grows the filesystem to the volume's size;
 #   8. installs the pinned uv as the owner when the installed one differs;
-#   9. runs deploy/linux-install.sh, retrying a transient failure;
-#  10. after the install returns, renders config.yaml, pulls the Schwab token and
-#      applies the roster, each as the owner and in that order. Each attempt holds the
-#      install lock, and the wait before a retry does not.
+#   9. runs deploy/linux-install.sh --sync-only, which builds the venv the next step runs
+#      from and installs no unit, retrying a transient failure;
+#  10. renders config.yaml, pulls the Schwab token and applies the roster, each as the
+#      owner and in that order. Each attempt holds the install lock, and the wait before
+#      a retry does not;
+#  11. runs deploy/linux-install.sh again without the flag, whatever step 10 returned,
+#      retrying a transient failure the same way. That install enables and starts the
+#      residents and the timers, so on a render that succeeded they start with their
+#      config already in place.
 #
-# Every disk step and the install stop the run at once with one line, because a later
-# step on a wrong disk would write the lake where nothing keeps it. A failure in step 10
-# prints one line, skips only the steps that need what failed, and makes the run exit 1
-# at the end. A refusal, when the script declines on purpose, exits 2. No line prints a
-# config value, and the script never runs with set -x.
+# Every disk step and step 9's install stop the run at once with one line, because a
+# later step on a wrong disk would write the lake where nothing keeps it. A failure in
+# step 10 prints one line, skips only the steps that need what failed, and makes the run
+# exit 1 at the end. A final failure in step 11 prints one line and makes the run exit 1
+# the same way. A refusal, when the script declines on purpose, exits 2. No line prints
+# a config value, and the script never runs with set -x.
 #
 # docs/design.md and issue #686 carry the reasoning for each step.
 #
@@ -419,26 +425,36 @@ fi
 
 # -- the install -----------------------------------------------------------------------
 
-# Exit 1 is retried, since a refused proxy during uv sync exits 1. The install's own
-# refusals exit 2, which no retry fixes.
+# Both installs, the sync here and the one that starts the units at the end, run through
+# this. Exit 1 is retried, since a refused proxy during uv sync exits 1. The install's
+# own refusals exit 2, which no retry fixes. INSTALL_RC holds the last attempt's exit,
+# and each caller decides what a failure means.
 INSTALL_TRIES=5
-attempt=1
-while :; do
-  rc=0
-  "$CHECKOUT/deploy/linux-install.sh" --owner "$OWNER" --lake-mount "$LAKE_ROOT" || rc=$?
-  if [[ $rc == 0 ]]; then
-    break
-  fi
-  if [[ $rc != 1 ]]; then
-    stop "deploy/linux-install.sh exited $rc, a refusal, so the bootstrap stops"
-  fi
-  if [[ $attempt -ge $INSTALL_TRIES ]]; then
-    stop "deploy/linux-install.sh exited 1 on all $INSTALL_TRIES attempts, so the bootstrap stops"
-  fi
-  say "deploy/linux-install.sh exited 1, retrying in 30 seconds (attempt $attempt of $INSTALL_TRIES)"
-  sleep 30
-  attempt=$((attempt + 1))
-done
+INSTALL_RC=0
+install_retried() {
+  local attempt=1
+  while :; do
+    INSTALL_RC=0
+    "$CHECKOUT/deploy/linux-install.sh" --owner "$OWNER" --lake-mount "$LAKE_ROOT" "$@" \
+      || INSTALL_RC=$?
+    if [[ $INSTALL_RC != 1 || $attempt -ge $INSTALL_TRIES ]]; then
+      return 0
+    fi
+    say "deploy/linux-install.sh exited 1, retrying in 30 seconds (attempt $attempt of $INSTALL_TRIES)"
+    sleep 30
+    attempt=$((attempt + 1))
+  done
+}
+
+# The config steps below run from the venv, so the sync comes first. The units wait for
+# the last step, so the residents never start before config.yaml exists.
+say "syncing the environment as $OWNER"
+install_retried --sync-only
+case "$INSTALL_RC" in
+  0) ;;
+  1) stop "deploy/linux-install.sh exited 1 on all $INSTALL_TRIES attempts, so the bootstrap stops" ;;
+  *) stop "deploy/linux-install.sh exited $INSTALL_RC, a refusal, so the bootstrap stops" ;;
+esac
 
 # -- config, token, roster -------------------------------------------------------------
 
@@ -456,9 +472,10 @@ done
 # across all six attempts of both steps and the 20-second waits between them, it could
 # stay taken about 2,100 seconds.
 #
-# The lock is taken only after the install returns, because the install takes the same
-# lock with flock -w 600, so holding it across the install would make the install wait
-# ten minutes and refuse.
+# Neither install runs under the lock, neither the sync before these steps nor the
+# install after them. linux-install.sh takes the same lock with flock -w 600 on a new
+# open of the file, so holding it across an install would make the install wait ten
+# minutes and refuse.
 STEP_TRIES=6
 LOCK_WAIT=600
 mkdir -p "$(dirname "$LOCK")"
@@ -535,6 +552,21 @@ if retried "the config render" "$VM_YAML" -m lake.vm_config render; then
 else
   fail "the token pull and the roster are skipped, because both read config.yaml"
 fi
+
+# -- the units -------------------------------------------------------------------------
+
+# This runs whatever the steps above returned. After a failed render the residents fall
+# into the restart loop a missing config.yaml causes, and each restart reads the config
+# again, so they come up on their own once it is rendered. The run still exits 1. A
+# failure here is not a stop, so the end check below still prints its line last. The
+# words differ from step 9's on purpose, so each line names its own install.
+say "installing and starting the units"
+install_retried
+case "$INSTALL_RC" in
+  0) ;;
+  1) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited 1 on each of $INSTALL_TRIES tries. A rerun of the bootstrap installs and starts the units" ;;
+  *) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited $INSTALL_RC, which no retry fixes. The linux-install: line above says why, and when it names the install lock, a rerun of the bootstrap installs and starts the units" ;;
+esac
 
 if [[ $FAILED != 0 ]]; then
   stop "finished with a failed step, listed above"
