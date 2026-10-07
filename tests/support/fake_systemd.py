@@ -17,6 +17,10 @@ a test too.
 4. ``restart`` of a unit that cannot start exits 1, as ``Type=exec`` makes it.
 5. ``show`` answers each property the scripts read. ``NeedDaemonReload`` reads ``yes``
    while a unit file differs from the copy taken at the last ``daemon-reload``.
+6. ``start`` of a ``.mount`` unit mounts the fake disk in ``tests.support.fake_disk``,
+   succeeds again while it is mounted, and fails for a unit named in ``FAIL_START``.
+7. ``list-units`` prints one plain line per ``com.marketlake.*`` unit with its active
+   state, and a started timer reads ``active waiting``.
 
 ``FAIL_START`` names units whose interpreter cannot start. ``RESTART_MODE`` picks what a
 restart does: ``new`` brings a new pid, ``same`` leaves the pid alone, ``never`` leaves no
@@ -168,6 +172,45 @@ case "$cmd" in
     next_pid > "$STATE/pid/$1"
     : > "$STATE/restarted-$1"
     printf '%s' "${RESTART_DELAY:-0}" > "$STATE/pending/$1"
+    exit 0 ;;
+  start)
+    # A mount unit mounts the fake disk's filesystem, recording its UUID where the fake
+    # findmnt reads it. Starting an active unit succeeds whatever is mounted, as
+    # systemd's does, and a unit named in FAIL_START fails.
+    if [[ "$1" == *.mount ]]; then
+      if fails_to_start "$1"; then
+        echo "Job for $1 failed. See \"systemctl status $1\" for details." >&2
+        exit 1
+      fi
+      if [[ -f "$STATE/mounted" ]]; then exit 0; fi
+      if [[ ! -f "$STATE/disk/uuid" ]]; then
+        echo "Job for $1 failed: no filesystem." >&2
+        exit 1
+      fi
+      cp "$STATE/disk/uuid" "$STATE/mounted"
+      exit 0
+    fi
+    if ! start "$1"; then exit 1; fi
+    exit 0 ;;
+  list-units)
+    # Every com.marketlake.* unit with a file, a process or a failure, one plain line
+    # each, as --all --no-legend --plain prints them. A started timer reads as waiting.
+    [[ -n "${LIST_UNITS_RC:-}" ]] && exit "$LIST_UNITS_RC"
+    names=""
+    for f in "$UNIT_DIR"/com.marketlake.* "$STATE"/pid/com.marketlake.* \
+        "$STATE"/failed/com.marketlake.*; do
+      if [[ -e "$f" ]]; then names="$names ${f##*/}"; fi
+    done
+    for name in $(printf '%s\n' $names | sort -u); do
+      if [[ -f "$STATE/pid/$name" ]]; then
+        sub=running; [[ "$name" == *.timer ]] && sub=waiting
+        echo "$name loaded active $sub $name"
+      elif [[ -f "$STATE/failed/$name" ]]; then
+        echo "$name loaded failed failed $name"
+      else
+        echo "$name loaded inactive dead $name"
+      fi
+    done
     exit 0 ;;
   show)
     for arg in "$@"; do
