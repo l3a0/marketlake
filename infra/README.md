@@ -643,10 +643,11 @@ change away, and OpenTofu gives no warning. After the merge, plan the bootstrap 
 A bootstrap pull request can merge before its bootstrap apply, as
 [PR #719](https://github.com/l3a0/marketlake/pull/719) did on 2026-10-06. Its
 `tofu apply (live)` run then waits for approval in the `infra` environment. Leave that
-run waiting. It runs with the apply role's old permissions, so it fails at the first call
-the old role may not make, after applying what it could. Approved first,
+run waiting when its live change needs a permission the bootstrap change adds. The run
+uses the apply role's old permissions, so it applies what the old role allows and fails
+on each call it does not. Approved first,
 [PR #719](https://github.com/l3a0/marketlake/pull/719)'s run would have created
-`aws_iam_role_policy.instance_config_read` and then failed at `iam:CreateUser`.
+`aws_iam_role_policy.instance_config_read` and failed at `iam:CreateUser`.
 
 The rule above, to apply from the branch's final head, assumes the apply comes before
 the merge. After the merge, apply the bootstrap from the merge commit instead, in this
@@ -660,7 +661,8 @@ order.
    ```
 
 2. Make the worktree at the merge commit, from the main checkout. A merge deletes the
-   branch, so fetch the head from the pull request's own ref.
+   branch, so fetch the head from the pull request's own ref. When a worktree for this
+   pull request already exists, remove it first, as in step 12.
 
    ```bash
    git fetch origin main "pull/<n>/head"
@@ -683,17 +685,24 @@ order.
 5. Approve the waiting run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change).
 
-A run approved before the bootstrap apply has already failed, and [Recovery](#recovery)
+A run approved before the bootstrap apply has failed, and [Recovery](#recovery)
 covers what a failed apply leaves behind. Once the bootstrap is applied, start a new run
 with step 11's `gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and
 approve it as in step 11.
 
 ### Reading a statement inserted into a policy
 
-A plan lines up an inline policy's `Statement` list by position. A statement inserted in
-the middle therefore shows as a change to the statement that held that slot, plus that
-statement added again at the end. Compare the two. When the statement added at the end
-matches the one shown as changed, the only real change is the insertion.
+OpenTofu 1.13 shows a statement inserted into an inline policy's `Statement` list as a
+change to the statement that held its slot. The statements after it can then show as
+changed, removed and added again, though none of them changed. To check such a plan,
+collect the old side of every entry shown as changed or removed, and the new side of
+every entry shown as changed or added. Match the two sets by `Sid` and compare each
+pair. When the only statement without a twin is the new one, the only real change is the
+insertion.
+
+A statement inserted just before the last one shows the shortest form of this. The last
+statement's slot changes into the new statement, and the last statement is added again
+at the end.
 
 [PR #719](https://github.com/l3a0/marketlake/pull/719)'s bootstrap plan read
 `Plan: 0 to add, 1 to change, 0 to destroy`. The pull request inserted
