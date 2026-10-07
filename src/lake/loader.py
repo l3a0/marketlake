@@ -13,9 +13,9 @@ the lake stores, and ``.to_pandas()`` is one call for anyone who wants a frame.
 
 ``load_contract`` is a third door onto the same machinery, marketlake #266. It answers a
 different question: not the chain at one minute, but one contract's whole session. Its
-selection is a single OCC symbol, supplied by the caller instead of resolved off a
-whole-partition scan, so it skips the resolve pass described below and reads the
-partition once rather than twice. It shares everything past that: the path build, the
+selection is a single OCC symbol, supplied by the caller instead of resolved by the resolve
+pass described below, so it skips that pass and reads the partition once rather than
+twice. It shares everything past that: the path build, the
 spelling check, the quarantine guard, the overflow projection, and the final filter to
 data rows. It orders its answer by the instant each row's ``snap_ts`` names rather than
 by the partition's own layout, for the same reason the fetch predicate never trusts that
@@ -132,10 +132,15 @@ is authoritative for this, and it replaced a single read of every column and eve
 1. *The resolve pass* reads over the whole partition the columns this read resolves
    against. Both resolutions read ``snap_ts`` and ``row_kind``, and the close of record
    reads ``close_tag`` as well. Naming a column to Parquet makes it a requirement of the
-   layout, so a minute read does not name a column it never asks about.
-2. *The fetch pass* reads the rows the resolve pass chose. It names them to Parquet as a
-   predicate rather than filtering after the fact, so the reader skips what it can prove it
-   does not need.
+   layout, so a minute read does not name a column it never asks about. The close of
+   record also names its rows, marketlake #669: those carrying its tag, and any with no
+   ``row_kind``. The predicate is evaluated over every row, so the pass still sees the
+   whole session, and it keeps only the rows the resolution reads. On a chains partition
+   that is about 13,000 rows of a day's million.
+2. *The fetch pass* reads the rows the resolve pass chose. It hands them to Parquet as a
+   predicate, which chooses the row groups to decode by their statistics, so the read skips
+   every group it can prove holds none of them. ``_read`` then filters each batch it
+   decodes from the groups it kept.
 
 Four answers therefore stay settled over the whole session, exactly as they were when the
 read pulled every column.
@@ -144,6 +149,22 @@ read pulled every column.
 2. How many absence markers explain an empty answer.
 3. Which ``snap_ts`` values cannot be read as an instant at all.
 4. Whether any row carries no ``row_kind``.
+
+The close of record's predicate keeps each of the four whole, because it keeps every row
+one of them reads. ``_at_close`` reads the tagged data rows and their stamps,
+``_tagged_gaps`` counts the tagged rows that are not data, and the null check counts the
+rows with no ``row_kind``.
+
+A read given a predicate decodes a batch of rows at a time rather than a row group,
+marketlake #669. That covers both passes of a close-of-record read and every fetch, and
+leaves only a minute's resolve pass reading its two columns whole. Compaction writes row
+groups of up to 1,048,576 rows. A fetch that decoded its kept group whole, in every column,
+before filtering it peaked at 869.9 MiB of Arrow memory to return the 13,028 rows of SPY's
+2026-09-24 close of record, and the whole read at 1,283.8 MiB. The 18:30 sweep's split
+detection makes this read once per sealed session, on a host with about 1,135 MiB to spare.
+So a filtered read decodes ``_READ_BATCH_ROWS`` rows at a time and filters each batch
+before the next. ``_read`` states the rules that keep that read answering what a whole read
+answered.
 
 Pruning row groups asks nothing of the writer. Parquet skips a row group only when its
 statistics prove no row in it can match, and it filters whatever it did read. So ordering
@@ -171,11 +192,15 @@ whole.
 
 Measured on the 5,260,136-row SPY partition of 2026-09-14, best of five warm runs, the two
 passes cost 0.21 seconds for an intraday minute and 0.13 for the close of record, against
-1.76 and 1.73 for the single full read they replace. The durable figure is the compressed
-bytes each pass touches, because that one does not move with what the page cache happens to
-hold. The resolve pass reads 0.1 MiB of the partition's 288.9. The fetch reads the row
-groups the predicate keeps, which is 57.6 MiB for that minute and 1.5 for the close of
-record.
+1.76 and 1.73 for the single full read they replace. Those timings predate the batched read
+of marketlake #669. The compressed bytes each pass touches do not move with what the page
+cache happens to hold. The resolve pass reads 0.1 MiB of the partition's 288.9. The fetch
+reads the row groups the predicate keeps, which is 57.6 MiB for that minute and 1.5 for the
+close of record. Compressed bytes do not bound memory, because what a read holds is what it
+decodes. Before the batched read, the close of record's fetch touched only that 1.5 MiB but
+decoded its kept row group whole, and on SPY's 2026-09-24 partition the same fetch peaked
+at 869.9 MiB of Arrow memory. Batched, the whole close-of-record read of that day, both passes,
+peaks at 97.2 MiB.
 
 What the loader adds is the decision about the projection's report. A version the ledger
 holds no shape for, a value a column refused, and a column a vendor retype routed into the
@@ -283,6 +308,7 @@ from lake.config import load_config
 from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import latest_quarantine_by_check, withholding
 from lake.occ_mapping import instruments_holding
+from lake.parquet_footer import count_disagreement
 from lake.paths import BARS, CHAINS, PARQUET_SUFFIX, QUOTES, LakePaths, parse_date_dir
 from lake.schema_versions import SchemaVersionLedger, ledger_path
 from lake.security_master import ID_TYPE_OCC, SecurityMaster, master_path
@@ -308,6 +334,15 @@ ROW_KIND_DATA = journal.ROW_KIND_DATA
 # against ``close_tag``.
 MINUTE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN)
 CLOSE_COLUMNS = (SNAP_TS_COLUMN, ROW_KIND_COLUMN, CLOSE_TAG_COLUMN)
+
+# How many rows a filtered ``_read`` decodes at a time, in both passes of a close-of-record
+# read and in every fetch. A row group is decoded in batches of this many rows and each
+# batch is filtered before the next, so a read's peak follows this number rather than the
+# row group's size. It is a constant rather than a keyword on ``_read`` because a test
+# replaces ``_read`` with a recorder that takes no such keyword. The memory bound in
+# ``test_a_close_of_record_read_stays_inside_a_batch`` fails at twice this size, so a change
+# to one is a change to the other.
+_READ_BATCH_ROWS = 8_192
 
 # An ET wall-clock minute, ``HH:MM`` on a 24-hour clock and nothing else.
 _SNAP_SHAPE = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
@@ -1710,8 +1745,15 @@ def _load_surface(
         surface=surface,
     )
 
-    resolving = CLOSE_COLUMNS if snap is None else MINUTE_COLUMNS
-    resolved = _read(path, columns=list(resolving))
+    if snap is None:
+        resolved = _read(
+            path,
+            columns=list(CLOSE_COLUMNS),
+            filters=ds.field(CLOSE_TAG_COLUMN).isin([close_tag])
+            | ds.field(ROW_KIND_COLUMN).is_null(),
+        )
+    else:
+        resolved = _read(path, columns=list(MINUTE_COLUMNS))
     is_data = pc.equal(resolved.column(ROW_KIND_COLUMN), ROW_KIND_DATA)
     if is_data.null_count:
         raise LoadError(
@@ -1724,20 +1766,42 @@ def _load_surface(
         selection = _at_close(resolved, data, ticker, day_text, close_tag, no_close_error)
     else:
         selection = _at_minute(resolved, data, ticker, day_text, snap)
+    # The answer must hold as many rows as the resolve pass found. The fetch prunes row
+    # groups by statistics and the resolve pass reads none, so a damaged statistic that
+    # prunes away the group holding the answer would otherwise return an empty table with
+    # no error. The count is taken over the resolve pass's data rows, which hold every row
+    # either selection can admit: the tagged ones for the close of record, and all of them
+    # for a minute. If marketlake #684 narrows the minute resolve pass, this count has to
+    # move with it.
+    resolved_rows = (
+        pc.sum(
+            pc.is_in(data.column(selection.column), value_set=pa.array(selection.values))
+        ).as_py()
+        or 0
+    )
 
-    return _fetch_selection(path, root, selection, ticker, day_text, surface, check_row_kind=False)
+    answer = _fetch_selection(
+        path, root, selection, ticker, day_text, surface, check_row_kind=False
+    )
+    if answer.num_rows != resolved_rows:
+        raise pa.ArrowInvalid(
+            f"{path}: the resolve pass found {resolved_rows} rows the answer is made of, "
+            f"and the fetch returned {answer.num_rows}"
+        )
+    return answer
 
 
 class _Selection(NamedTuple):
     """The rows an answer is made of, as a column and the values it admits there.
 
-    ``load_chain`` and ``load_quotes`` each resolve one of these off a whole-partition
-    scan. ``load_contract`` supplies one directly, since an OCC symbol needs no
-    resolving, and skips that scan. Either way, one predicate builds the fetch and one
-    filter trims what came back. The values are the spellings a resolve pass found
-    rather than a canonical form where one runs, which is what keeps a partition holding
-    two spellings of one instant answerable whole; a supplied selection carries just the
-    one value the caller asked for.
+    ``load_chain`` and ``load_quotes`` each resolve one of these in a resolve pass that
+    evaluates every row of the partition. A minute read scans its two columns whole, and
+    a close-of-record read keeps only the rows its predicate names. ``load_contract``
+    supplies one directly, since an OCC symbol needs no resolving, and skips that pass.
+    Either way, one predicate builds the fetch and one filter trims what came back. The
+    values are the spellings a resolve pass found rather than a canonical form where one
+    runs, which is what keeps a partition holding two spellings of one instant answerable
+    whole; a supplied selection carries just the one value the caller asked for.
     """
 
     column: str
@@ -1859,9 +1923,211 @@ def _read(
 
     A correct predicate returns the rows a full read would, so nothing about a result says
     whether one happened, and a wall-clock timing is not a test. This is one function so a
-    test can replace it and assert on what it was asked for.
+    test can replace it and assert on what it was asked for. The batch size is the module
+    constant ``_READ_BATCH_ROWS`` rather than a keyword for the same reason, because the
+    recorder that replaces this takes no such keyword.
+
+    A read given no ``filters`` is ``pq.read_table``. A read given ``filters`` decodes
+    ``_READ_BATCH_ROWS`` rows at a time with ``ParquetFile.iter_batches`` and filters each
+    batch before the next, so its peak follows the batch rather than the row group,
+    marketlake #669. ``iter_batches`` takes no filter and prunes nothing, so the read
+    chooses its row groups itself. Only a read of every column, which is the fetch, chooses
+    them by statistics. A read that names its columns decodes every row group and reads no
+    statistics, as the resolve pass did before it named its rows. Pruning by the statistics
+    of a damaged footer can end the process, and pruning the resolve pass ended it on 14
+    damaged footers where a whole read raised or answered. The price is time, because the
+    close resolve pass decodes three columns in every row group. Split detection over the
+    lake took 6.4 to 6.8 seconds, against 5.4 before.
+
+    The read keeps pyarrow's defaults for ``pre_buffer`` on the ``ParquetFile`` and
+    ``use_threads`` on the batches, so column chunks are fetched ahead and the columns of a
+    batch decode in parallel. Turning both off saved resident memory and about doubled the
+    time. Split detection took 13.5 to 14.9 seconds at 508 to 561 MiB resident with both
+    off, against 7.2 to 8.7 seconds at 658 to 667 MiB with the defaults, at the same 97.2
+    MiB of Arrow memory. Both fit the 18:30 sweep's memory budget, and only the defaults
+    leave a year of split detection inside its time.
+
+    A read that keeps no batch returns the file's schema and metadata, projected to
+    ``columns``, as ``pq.read_table`` does. Five rules keep the batched read answering what
+    ``pq.read_table`` answered.
+
+    1. The file is opened once. One ``pa.OSFile`` builds the ``ParquetFile`` and then the
+       dataset fragment that chooses the row groups, so the row-group numbers and the
+       decode come from the same file. The ``ParquetFile`` comes first, because choosing
+       the row groups reads the footer, and a fragment made from a handle words its errors
+       with ``'<Buffer>'`` where the path belongs.
+    2. The handle closes when the read returns or raises. A traceback keeps the failing
+       frame's locals alive, so a kept exception would otherwise hold the file open.
+    3. An error raised after the open names the file. A handle's errors do not, and the
+       18:30 sweep prints only a refused piece's class and message. So the read re-raises
+       the same class with the path at the front of the message, which every handler that
+       catches by class still catches. A class that cannot be rebuilt from a message alone,
+       such as ``UnicodeDecodeError``, is re-raised unchanged with the path as a note. A
+       rebuilt ``OSError`` drops ``errno`` and ``filename``, which nothing in ``src/lake``
+       reads.
+    4. After the decode, the read checks the footer and counts the rows, and raises
+       ``ArrowInvalid`` when either disagrees. ``iter_batches`` trusts two footer counts
+       that ``pq.read_table`` cross-checks, and a flipped byte that lowers either one makes
+       it return a short table, or torn rows, with no error.
+
+       1. Each kept row group's ``num_rows`` must equal the ``num_values`` of every flat
+          column the read decodes. ``_check_row_counts`` checks this through
+          ``lake.parquet_footer``, the rule compaction checks at seal.
+       2. The rows decoded must equal the kept groups' summed ``num_rows``. No damage
+          found reaches this once the first check passes, so it stands behind the first
+          against a short stream the footer does not explain.
+
+       Both run after the decode, not before it. Reading a chunk's metadata from a footer
+       whose level histogram is damaged throws a C++ exception nothing catches, and the
+       process aborts. On those files the decode itself raises ``OSError`` first, as
+       ``pq.read_table`` does. One class moves: a lowered ``num_values`` that
+       ``pq.read_table`` sometimes refused with ``OSError`` raises ``ArrowInvalid`` here,
+       the class it raises for the commoner case of a count of zero.
+    5. A filter names only columns the read returns. A batch holds only the columns it
+       decoded, so a filter on any other column raises ``ArrowInvalid``. A named column the
+       file lacks, or holds twice, raises ``ArrowInvalid`` too, as ``pq.read_table`` does,
+       which ``_named_field`` says more about. A read of every column names none, so it
+       refuses a schema that holds any name twice, which ``_check_unique_names`` does.
+
+    Seven alternatives were measured and rejected.
+
+    1. Opening the path twice, once to prune and once to decode. When the file was
+       replaced between the opens, the read applied one file's row-group numbers to
+       another and returned 0 rows with no error. No automatic run replaces a manifested
+       partition, but a hand-run recompaction or restore during the 18:30 sweep can.
+    2. A ``pa.memory_map`` handle. It cut the Arrow pool to 40.6 MiB on 2026-09-24 and
+       left resident memory where it was. A file truncated in place between pruning and
+       decoding returned 1 row and no error through it, where ``pa.OSFile`` raised
+       ``OSError: File too short``.
+    3. No statistics pruning anywhere. It removed the 41 damaged footers whose pruning
+       aborts the process, on each of which a whole read hung instead. But the fetch then
+       decoded all 73 columns of every row group, at 270 to 331 MiB of pool and 1.7 to 3.1
+       seconds a read.
+    4. A check of each chunk's physical type before pruning. It turned those aborts into
+       refusals, but it refused 217 reads that a whole read answered correctly. marketlake
+       #694 holds that question.
+    5. A lake-relative path in the re-raise. It kept absolute paths out of the sweep's
+       stdout, but nothing that leaves the machine carries the absolute path, so it fixed
+       nothing, and it would hard-code a partition's last three path parts here.
+    6. A resolve pass that reads with ``pq.ParquetFile`` directly. It answered both
+       resolutions, but a test's recorder no longer saw the resolve pass, four tests
+       failed, and this function would stop being every read of rows this module makes.
+    7. Decoding the predicate's columns first and then fetching only the rows they match.
+       pyarrow has no row-selective read, so the fetch still decoded every page of every
+       column in the groups it kept. It peaked at 613 MiB or more on SPY 2026-09-24, and
+       its third ``_read`` call broke the tests whose recorder counts two calls.
     """
-    return pq.read_table(path, columns=columns, filters=filters)
+    if filters is None:
+        return pq.read_table(path, columns=columns)
+    with pa.OSFile(str(path)) as handle:
+        try:
+            parquet = pq.ParquetFile(handle)
+            if columns is None:
+                fragment = ds.ParquetFileFormat().make_fragment(handle)
+                kept = [
+                    group.id
+                    for piece in fragment.split_by_row_group(filter=filters)
+                    for group in piece.row_groups
+                ]
+            else:
+                kept = list(range(parquet.metadata.num_row_groups))
+            schema = parquet.schema_arrow
+            if columns is None:
+                _check_unique_names(schema)
+            else:
+                schema = pa.schema(
+                    [_named_field(schema, name) for name in columns], metadata=schema.metadata
+                )
+            pieces = []
+            decoded = 0
+            if kept:
+                for batch in parquet.iter_batches(
+                    batch_size=_READ_BATCH_ROWS,
+                    row_groups=kept,
+                    columns=columns,
+                ):
+                    decoded += batch.num_rows
+                    piece = pa.Table.from_batches([batch]).filter(filters)
+                    if piece.num_rows:
+                        pieces.append(piece)
+            _check_row_counts(parquet.metadata, kept, columns)
+            expected = sum(parquet.metadata.row_group(group).num_rows for group in kept)
+            if decoded != expected:
+                raise pa.ArrowInvalid(
+                    f"row groups {kept} hold {expected} rows by the file's metadata, "
+                    f"and {decoded} decoded"
+                )
+        except Exception as exc:
+            try:
+                named = type(exc)(f"{path}: {exc}")
+            except Exception:
+                named = None
+            if type(named) is not type(exc):
+                exc.add_note(f"While reading {path}")
+                raise
+            raise named from exc
+    if not pieces:
+        return schema.empty_table()
+    return pa.concat_tables(pieces)
+
+
+def _named_field(schema: pa.Schema, name: str) -> pa.Field:
+    """The one field ``name`` names, or the ``ArrowInvalid`` ``pq.read_table`` raises for it.
+
+    ``Schema.field`` raises ``KeyError`` when the schema holds no field by that name and
+    when it holds two, and ``ParquetFile.iter_batches`` reads past a name it cannot find
+    without raising. ``KeyError`` is not a ``ValueError``, so a footer that misnamed
+    ``close_tag`` would escape the dividends walk's ``except ValueError`` rather than file
+    one finding, where ``pq.read_table`` raised ``ArrowInvalid`` for the same file. The
+    count is checked here rather than a ``KeyError`` caught, so no ``KeyError`` raised for
+    another reason is relabelled.
+    """
+    found = schema.get_all_field_indices(name)
+    if len(found) != 1:
+        kind = "Multiple matches" if found else "No match"
+        raise pa.ArrowInvalid(f"{kind} for FieldRef.Name({name}) in the file's schema")
+    return schema.field(found[0])
+
+
+def _check_unique_names(schema: pa.Schema) -> None:
+    """Refuse a schema that holds a name twice, with the error ``pq.read_table`` raises.
+
+    A read of every column looks no name up, so ``_named_field`` never sees a name the
+    schema holds twice, and ``iter_batches`` decodes both columns without a word. A quotes
+    partition holding ``bid`` twice then came back as a table with two ``bid`` columns,
+    where ``pq.read_table`` raised ``ArrowInvalid`` with "Multiple matches".
+    """
+    names = schema.names
+    if len(set(names)) != len(names):
+        twice = next(name for name in names if names.count(name) > 1)
+        raise pa.ArrowInvalid(f"Multiple matches for FieldRef.Name({twice}) in the file's schema")
+
+
+def _check_row_counts(
+    metadata: pq.FileMetaData, kept: list[int], columns: list[str] | None
+) -> None:
+    """Refuse a kept row group whose row count disagrees with a column it decodes.
+
+    ``lake.parquet_footer`` states the rule, and compaction checks it over every row group
+    at seal. This checks it again at read time, so damage after the seal cannot return a
+    short table. Only the kept groups and the columns the read decodes are compared, so
+    damage the read never touches refuses nothing. The file's own total is not compared.
+    Pruning means the read never sums every group, and a damaged total changes no row a
+    read returns. A column is named from the schema, because a damaged chunk's
+    ``path_in_schema`` can read as empty.
+    """
+    leaves = [
+        leaf
+        for leaf in range(metadata.num_columns)
+        if columns is None or metadata.schema.column(leaf).path.split(".")[0] in columns
+    ]
+    found = count_disagreement(metadata, kept, leaves)
+    if found is not None:
+        raise pa.ArrowInvalid(
+            f"row group {found.group} holds {found.rows} rows by the file's metadata, "
+            f"and its column {metadata.schema.column(found.leaf).path} holds "
+            f"{found.values} values"
+        )
 
 
 def _predicate(selection: _Selection, carried: Sequence[str]) -> ds.Expression:

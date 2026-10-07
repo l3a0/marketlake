@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from lake.loader import (
@@ -380,3 +382,76 @@ def test_the_two_loaders_do_not_share_a_close_tag(fixture_lake: FixtureLake):
 
     assert _tags(chains_table) == {"option_close"}
     assert _tags(quotes_table) == {"spot_close"}
+
+
+# -- a footer that misnames a column ---------------------------------------------------------
+
+
+def _misnamed_close_tag(raw: bytes) -> bytes:
+    """The footer's first copy of ``close_tag`` spelled ``close_taf``.
+
+    The first copy is the schema's, which is the name a read asks for. The column chunk's
+    own copy follows it and is left as it was, so every column still decodes.
+    """
+    footer = len(raw) - 8 - int.from_bytes(raw[-8:-4], "little")
+    at = raw.index(b"close_tag", footer) + len("close_ta")
+    return raw[:at] + bytes([raw[at] ^ 0x01]) + raw[at + 1 :]
+
+
+def test_a_footer_that_misnames_close_tag_refuses_the_close_as_arrow_invalid(
+    fixture_lake: FixtureLake,
+):
+    """A close read of a partition whose footer has no ``close_tag`` raises ``ArrowInvalid``.
+
+    ``pq.read_table`` raised ``ArrowInvalid`` for a column the file lacks. The dividends walk
+    files any ``ValueError`` as one finding for the ticker-day, and ``ArrowInvalid`` is one.
+    ``Schema.field`` raises ``KeyError`` for the same name, which is not, so a read that
+    let it through would take the whole 18:30 sweep down instead. The message starts with
+    the path, because the sweep prints the class and the message and no traceback.
+    """
+    root = _lake(fixture_lake, FULL_ROWS)
+    path = root / QUOTES_PARTITION
+    path.write_bytes(_misnamed_close_tag(path.read_bytes()))
+    assert "close_taf" in pq.read_schema(path).names
+    assert "close_tag" not in pq.read_schema(path).names
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_quotes("SPY", FULL_DAY, lake_root=root)
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert "FieldRef.Name(close_tag)" in str(caught.value)
+
+
+@pytest.mark.parametrize("column", ["snap_ts", "close_tag", "bid"])
+def test_a_partition_that_holds_a_column_twice_refuses_the_close_as_arrow_invalid(
+    fixture_lake: FixtureLake, column: str
+):
+    """A close read of a partition whose schema holds a name twice raises ``ArrowInvalid``.
+
+    ``pq.read_table`` raised ``ArrowInvalid`` with "Multiple matches" for a name the schema
+    holds twice. ``Schema.field`` raises ``KeyError`` for it, as it does for a name the
+    schema lacks, so the resolve pass's lookup counts the matches rather than taking the
+    first. ``close_tag`` sits in the resolve pass's filter, which raises the same error on
+    its own, so only ``snap_ts`` shows the count is checked. The fetch names no columns and
+    looks no name up, so ``bid``, which no read names, shows that the fetch refuses a schema
+    whose names are not unique. The message starts with the path, because the sweep prints
+    the class and the message and no traceback.
+    """
+    root = _lake(fixture_lake, FULL_ROWS)
+    path = root / QUOTES_PARTITION
+    table = pq.read_table(path)
+    pq.write_table(table.append_column(column, table.column(column)), path)
+    assert len(pq.read_schema(path).get_all_field_indices(column)) == 2
+    # pyarrow itself decodes both copies, so the refusal below is the loader's. A pyarrow
+    # that began refusing the name on its own would fail here rather than pass below.
+    with pq.ParquetFile(path) as parquet:
+        batch = next(parquet.iter_batches(use_threads=False))
+    assert len(batch.schema.get_all_field_indices(column)) == 2
+
+    with pytest.raises(pa.ArrowInvalid) as caught:
+        load_quotes("SPY", FULL_DAY, lake_root=root)
+
+    assert type(caught.value) is pa.ArrowInvalid
+    assert str(caught.value).startswith(f"{path}: ")
+    assert f"Multiple matches for FieldRef.Name({column})" in str(caught.value)
