@@ -781,9 +781,7 @@ from the bucket variable OpenTofu already holds, by the owner's decision of 2026
 ([#686](https://github.com/l3a0/marketlake/issues/686)). The instance serves its tags
 through instance metadata, because `vm.tf` sets `instance_metadata_tags`, and the render
 reads the tag there. So no hand step puts the bucket's name, and a bucket change reaches
-the VM with the apply that changes the tag in place. Nothing reads a
-`/marketlake/config/backup-target` parameter, so one put before that decision is a
-leftover.
+the VM with the apply that changes the tag in place.
 
 `python -m lake.vm_config render < config/vm.yaml` writes the VM's `config.yaml`. It
 joins the four secret parameters and the tag with the tracked `config/vm.yaml`, which
