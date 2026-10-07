@@ -6,8 +6,9 @@ the approved apply job, so these run in ``ci.yml``'s required ``test`` job inste
 
 1. Every apply step after the freshness check runs only on a fresh commit. A dropped
    or misspelt condition applies a superseded commit.
-2. The apply job needs the ``infra`` environment's approval, and a second run waits
-   rather than cancelling one halfway, which would leave its lock behind.
+2. The apply job runs only on a push or a dispatch on ``main``, needs the ``infra``
+   environment's approval, and a second run waits rather than cancelling one halfway,
+   which would leave its lock behind.
 3. Every ``tofu plan`` and ``tofu apply`` sends its output to ``/dev/null``, because the
    repository's logs are public and that output carries values.
 4. The validate job runs ``tofu test`` on both configurations.
@@ -20,7 +21,10 @@ the approved apply job, so these run in ``ci.yml``'s required ``test`` job inste
 8. The ``replace_instance`` dispatch input is a boolean that is off by default, reaches
    the apply job's one ``tofu plan`` line through ``env:``, and names only
    ``aws_instance.vm``. A second address would let a dispatch replace the lake volume's
-   attachment, which stops the instance and never starts it.
+   attachment, which stops the instance and never starts it. Running the step's script
+   shows that the plan gets ``-replace`` only when the input is ``true``. A push renders
+   the input empty, so a condition that let the empty value through would replace the VM
+   on every merge to ``infra/``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import hcl2
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +85,14 @@ def test_every_apply_step_after_the_freshness_check_needs_a_fresh_commit() -> No
     assert "apply" in [subcommand for subcommand, _ in _tofu_calls({"steps": after})]
     for step in after:
         assert step.get("if") == FRESH, step.get("name", step.get("uses"))
+
+
+def test_the_apply_job_runs_only_on_a_push_or_a_dispatch_on_main() -> None:
+    condition = " ".join(_workflow()["jobs"]["apply"]["if"].split())
+    assert condition == (
+        "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
+        " && github.ref == 'refs/heads/main'"
+    )
 
 
 def test_the_apply_job_waits_for_approval_and_never_cancels_a_run() -> None:
@@ -189,3 +202,58 @@ def test_replace_instance_names_only_the_instance_and_only_on_dispatch() -> None
     # No other script in the workflow replaces anything.
     scripts = [step.get("run", "") for job in workflow["jobs"].values() for step in job["steps"]]
     assert sum(script.count("-replace") for script in scripts) == 1
+
+
+# tofu as the Plan step calls it. It writes one argument per line, since the step sends
+# stdout to /dev/null.
+_FAKE_TOFU = """#!/bin/bash
+printf '%s\\n' "$@" > "$TOFU_ARGV"
+"""
+
+
+@pytest.mark.parametrize(
+    ("value", "replaces"),
+    [("", False), ("false", False), ("true", True)],
+    ids=["push", "dispatch-false", "dispatch-true"],
+)
+def test_the_apply_plan_replaces_the_instance_only_when_the_input_is_true(
+    tmp_path: Path, value: str, replaces: bool
+) -> None:
+    plan = _step(_workflow()["jobs"]["apply"], "Plan")
+    script = tmp_path / "plan.sh"
+    script.write_text(plan["run"])
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tofu = bin_dir / "tofu"
+    tofu.write_text(_FAKE_TOFU)
+    tofu.chmod(0o755)
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    argv_log = tmp_path / "argv"
+
+    env = {name: f"stub-{name}" for name in plan["env"]}
+    env.update(
+        REPLACE_INSTANCE=value,
+        RUNNER_TEMP=str(runner_temp),
+        TOFU_ARGV=str(argv_log),
+        PATH=f"{bin_dir}:/usr/bin:/bin",
+    )
+    # GitHub runs a `shell: bash` step as `bash --noprofile --norc -eo pipefail {0}`.
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+    argv = argv_log.read_text().splitlines()
+    assert _tofu_subcommand(shlex.join(["tofu", *argv])) == "plan"
+    assert f"-out={runner_temp}/live.tfplan" in argv
+    # An empty array must expand to no word at all, not to an empty argument.
+    assert "" not in argv
+    assert [arg for arg in argv if arg.startswith("-replace")] == (
+        ["-replace=aws_instance.vm"] if replaces else []
+    )

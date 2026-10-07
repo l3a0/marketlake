@@ -29,8 +29,9 @@ on:
   # the one a new lake volume needs (#686). A merge that touches infra/ while a dispatch
   # waits for approval can drop it: the dispatch goes stale and skips, or the push's run
   # queues in the infra-apply group and cancels it, then applies with no -replace. So
-  # dispatch with no infra/ merge pending, and check that the approved plan's summary
-  # shows aws_instance.vm as a replacement.
+  # dispatch with no infra/ merge pending. The approval comes before the job plans, so
+  # read the run's summary once it finishes. It shows aws_instance.vm as a replacement,
+  # and if it does not, dispatch again with no infra/ merge pending.
   workflow_dispatch:
     inputs:
       replace_instance:
