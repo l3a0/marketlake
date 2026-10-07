@@ -1,0 +1,17 @@
+# The hosted VM's non-secret settings, marketlake #686.
+#
+# The VM's config.yaml is rendered from this file plus five SSM parameters, by
+# `python -m lake.vm_config render < config/vm.yaml`. cloud-init's first boot runs that
+# render, and #676's deploy runs it again after each pull, so a reviewed pull request is
+# the one way these settings change. The parameters carry the four secrets and the
+# backup target, which no tracked file may name.
+#
+# #638's cutover flips `role` to primary here, in its own pull request.
+#
+# `lake_root` is the lake volume's mount point. It changes only with a replacement of the
+# instance, because a kept instance's fstab line would still name the old path.
+role: shadow
+lake_root: /srv/marketlake
+token_store: store
+bucket_credentials: instance_profile
+bucket_region: us-east-1
