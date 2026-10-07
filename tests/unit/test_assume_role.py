@@ -113,6 +113,10 @@ MALFORMED_ARNS = [
     f"arn:aws:iam::{ACCOUNT_ID}:role/",
     f"arn:aws:iam::{ACCOUNT_ID}:role/ops/",
     f"arn:aws:iam::{ACCOUNT_ID}:role/{'n' * 65}",
+    f"arn:aws:iam::{ACCOUNT_ID}:role//",
+    f"arn:aws:iam::{ACCOUNT_ID}:role/r\u00e9le",
+    "arn:aws:iam::\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669\u0660\u0661\u0662:role/x",
+    f"arn:awsjunk:iam::{ACCOUNT_ID}:role/marketlake-backup",
 ]
 
 
