@@ -1278,6 +1278,7 @@ function flightState({ by, planOf, workOn, prOf }) {
     return {
       plan: planOf.get(c.n),
       busy: workOn.get(c.n),
+      waits,
       /* A finished plan behind an open blocker is not a card with no builder, it
          is a card nobody can start. The column's test asked only whether a plan
          existed, which the skill's own text predicted would put such a card under
@@ -1286,7 +1287,6 @@ function flightState({ by, planOf, workOn, prOf }) {
          138 is the first that does not. Left alone it would have read "waits on
          #124" and "ready to build" on one card, which is check 6: a marker and a
          position answering one question two ways. */
-      waits,
       blocked: waits.length > 0,
       pr: (prOf.get(c.n) || []).find(x => x.state === "open")
     };
@@ -1331,7 +1331,7 @@ function inFlight(ctx) {
   const ns2 = cs => andlist(cs.map(c => "#" + c.n));
   const stateOf = flightState(ctx);
   const say = {
-    /* One sentence again. This split into settled and still-running for a while,
+    /* No settled and still-running split. This sentence carried one for a while,
        which was the note coping with a column that should not have held an
        unsettled branch in the first place. `handedOver` fixed that above, so
        every card here has green checks by construction and the second half could
