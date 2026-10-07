@@ -223,8 +223,8 @@ else
   # mkfs puts one is formatted. Anything else stops. blkid -p alone is not enough. It
   # also exits 2 when a probe read fails, and its ext4 prober reads only the primary
   # superblock and reports nothing when a metadata_csum primary fails its checksum. So
-  # an I/O error or a torn primary on a lake volume would read as no filesystem to it. A fresh
-  # volume is not zeros, so the guard reads for an ext4 magic rather than for zeros.
+  # an I/O error or a torn primary on a lake volume would read as no filesystem to it.
+  # A fresh volume is not zeros, so the guard reads for an ext4 magic, not for zeros.
   probe_rc=0
   PROBE="$(blkid -p -o export "$DEV")" || probe_rc=$?
   TYPE=""
@@ -243,7 +243,8 @@ else
     # 1.47.0), and sparse_super always keeps a backup in group 1. od's spacing differs
     # between GNU and BSD, so the whitespace goes first. Then anything but four hex
     # digits is a short read, since od can exit 0 on fewer bytes than it was asked for.
-    # One bs=4096 read, because a smaller one could take SIGPIPE when od exits early.
+    # dd reads the whole block in one bs=4096 read, because smaller reads could take
+    # SIGPIPE once od has its two bytes and exits.
     MAGIC_RE='^[0-9a-f]{4}$'
     for at in 0:1080 32768:56; do
       block="${at%:*}"
