@@ -97,7 +97,8 @@ def test_a_stored_value_that_is_not_an_int_is_refused(value: str):
 
 
 def test_a_bool_is_refused_although_python_counts_it_an_int():
-    with pytest.raises(WindowRefused):
+    """Refused as not a number, rather than as a window of one session under the floor."""
+    with pytest.raises(WindowRefused, match="not a whole number"):
         window_sessions(True, GuardConstants())
 
 

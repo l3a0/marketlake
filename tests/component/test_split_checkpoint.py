@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from lake.manifest import (
 )
 from lake.paths import CHAINS, TRIMMED_FILE, LakePaths
 from lake.report import SPLITS_PIECE
-from lake.security_master import SecurityMaster, master_path
+from lake.security_master import ID_TYPE_FIGI, SecurityMaster, master_path
 from lake.split_checkpoint import (
     CHECKPOINT_PARTITION,
     Checkpoint,
@@ -509,6 +510,108 @@ def test_a_ticker_sharing_its_instrument_with_another_is_refused(fixture_lake: F
     walked = _night_two(root)
 
     assert "instrument 1 is also named by QQQ on overlapping days" in _refused(walked)["SPY"]
+
+
+def test_a_quarantine_after_the_cutoff_does_not_refuse(fixture_lake: FixtureLake):
+    """A day after the cutoff is one the resume reads, and skips, like a walk from scratch."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _night_one(root, edge=DAY_ONE)
+    _trim(root, DAY_ONE)
+    append_quarantine(root, {"partition": _partition(DAY_TWO), "verdict": "bad"})
+
+    walked = _night_two(root)
+
+    assert walked.report.refused == ()
+
+
+def test_another_identifier_on_the_same_instrument_is_not_a_shared_ticker(
+    fixture_lake: FixtureLake,
+):
+    """A FIGI names the instrument on the same days by design, and is not a second ticker."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _night_one(root, edge=DAY_TWO)
+    _trim(root, DAY_ONE)
+    figi = replace(_mapping(1, "BBG000BDTBL9"), id_type=ID_TYPE_FIGI)
+    SecurityMaster([_mapping(1, "SPY"), figi]).write(master_path(root))
+
+    walked = _night_two(root)
+
+    assert walked.report.refused == ()
+
+
+def test_a_ledger_damaged_during_the_walk_refuses_the_ticker_it_was_asked_about(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """Whether the absent day was trimmed is unknown, so walking on past it is refused."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    real = splits.read_session
+    done: list[bool] = []
+
+    def damaging(lake_root, ticker, day, instrument_id):
+        if not done:
+            _trim(root, DAY_ONE)
+            ledger = root / TRIMMED_FILE
+            ledger.write_bytes(b"\xef\xbb\xbf" + ledger.read_bytes())
+            done.append(True)
+        return real(lake_root, ticker, day, instrument_id)
+
+    monkeypatch.setattr(splits, "read_session", damaging)
+
+    walked = _night_two(root)
+
+    assert "the trimmed ledger or the manifest cannot be read" in _refused(walked)["SPY"]
+    assert _splits(root) == []
+
+
+def test_a_state_passed_for_a_refused_ticker_is_not_reported(fixture_lake: FixtureLake):
+    """``detect_splits`` drops a refused ticker's state, so the caller keeps its saved one."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    state = WalkState("SPY", DAY_ONE, None, frozenset(), (), 0, DAY_ONE)
+
+    report = splits.detect_splits(
+        lake_root=root,
+        clock=ManualClock(SECOND_NIGHT),
+        calendar=CALENDAR,
+        resume=[state],
+        refused={"SPY": "refused by the caller"},
+    )
+
+    assert report.states == ()
+    assert [(r.ticker, r.reason) for r in report.refused] == [("SPY", "refused by the caller")]
+
+
+def _rewrite_checkpoint(root: Path, column: str, values: list) -> None:
+    path = checkpoint_path(root)
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(column)
+    table = table.set_column(index, table.schema.field(index), pa.array(values, table[column].type))
+    pq.write_table(table, path)
+
+
+def _two_ticker_checkpoint(root: Path) -> None:
+    entries = tuple(
+        CheckpointEntry(state=WalkState(t, DAY_ONE, None, frozenset(), (), 0, DAY_ONE), mappings=())
+        for t in ("QQQ", "SPY")
+    )
+    write_checkpoint(root, Checkpoint(DAY_TWO, entries), recorded_at=FIRST_NIGHT)
+
+
+def test_a_checkpoint_naming_a_ticker_twice_is_unreadable(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, SPLIT_LAKE)
+    _two_ticker_checkpoint(root)
+    _rewrite_checkpoint(root, "ticker", ["SPY", "SPY"])
+
+    with pytest.raises(CheckpointUnreadable, match="names SPY twice"):
+        read_checkpoint(root)
+
+
+def test_a_checkpoint_naming_two_session_days_is_unreadable(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, SPLIT_LAKE)
+    _two_ticker_checkpoint(root)
+    _rewrite_checkpoint(root, "session_day", [DAY_ONE, DAY_TWO])
+
+    with pytest.raises(CheckpointUnreadable, match="one session day"):
+        read_checkpoint(root)
 
 
 def test_two_tickers_on_one_instrument_on_days_apart_are_not_refused(fixture_lake: FixtureLake):
