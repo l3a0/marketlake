@@ -334,6 +334,37 @@ def test_a_segment_the_writer_appends_to_is_read_again_and_its_new_minute_shows(
     assert writer.path.resolve() not in segments
 
 
+def test_a_grown_segment_after_the_first_in_its_batch_is_counted_once(
+    fixture_lake: FixtureLake, segment_reads: Counter, partition_reads: Counter
+):
+    # The first refresh reads all four of SPY's chains segments in one statement, and each
+    # segment's groups must be remembered under that segment alone. The one that grows
+    # sorts last, so it is not the first of the batch. Were its groups filed under another
+    # segment's entry, that entry would still answer for them after the growth, and the
+    # re-read would count the segment's earlier minute a second time.
+    root, _, _ = build_lake(fixture_lake)
+    writer = journal.SegmentWriter.open(
+        root, "chains", "SPY", MONDAY, _start_ts(et(MONDAY, 9, 33)), 1
+    )
+    try:
+        writer.write_cycle(_segment_table("chains", [_row("chains", "SPY", et(MONDAY, 9, 33))]))
+        service = service_over(root, partition_reads)
+        refresh(service)
+        writer.write_cycle(_segment_table("chains", [_row("chains", "SPY", et(MONDAY, 9, 34))]))
+        segment_reads.clear()
+        second = refresh(service)
+        reads = Counter(segment_reads)
+        fresh = refresh(service_over(root, Counter()))
+    finally:
+        writer.close()
+    assert reads == Counter({writer.path.resolve(): 1})
+    for name in READS_FILES:
+        assert second[name] == fresh[name], name
+    strip = _strip(second["today"], "SPY", "chains")
+    assert _slot(strip, et(MONDAY, 9, 33))["rows"] == 1
+    assert _slot(strip, et(MONDAY, 9, 34))["rows"] == 1
+
+
 def test_a_partition_replaced_between_refreshes_changes_the_answer(
     fixture_lake: FixtureLake, segment_reads: Counter, partition_reads: Counter
 ):
