@@ -694,3 +694,20 @@ def test_an_empty_ledger_recorded_at_no_rows_re_records_a_later_append(tmp_path)
     assert _repair(root) is True
 
     assert latest_entries(root)[TRIMMED_FILE]["rows"] == 1
+
+
+def test_an_undecodable_line_after_the_entry_refuses_in_the_readers_words(tmp_path):
+    """Mutation this catches: decoding before the reader runs, which names a bare
+    ``UnicodeDecodeError`` rather than the ledger refusal the Sunday scrub also prints.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"partition": "\xff"}\n')
+        handle.write((json.dumps(_trim(SPY_NEXT, "b" * 64), sort_keys=True) + "\n").encode())
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    assert "LedgerNotUtf8" in str(exc.value)
+    assert "UnicodeDecodeError" not in str(exc.value)
