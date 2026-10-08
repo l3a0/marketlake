@@ -24,8 +24,10 @@ the code under test.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
@@ -36,9 +38,15 @@ from lake.bucket import RangeRestoreRefused, restore_range
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.lock import lake_lock
-from lake.manifest import append_manifest, latest_entries, scrub, sha256_file
-from lake.trimmed import append_trimmed, latest_trimmed, trim_line, trimmed_path
-from tests.support.bucket import FakeS3
+from lake.manifest import ManifestError, append_manifest, latest_entries, scrub, sha256_file
+from lake.trimmed import (
+    TrimmedLineLost,
+    append_trimmed,
+    latest_trimmed,
+    trim_line,
+    trimmed_path,
+)
+from tests.support.bucket import FakeS3, client_error
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -383,29 +391,85 @@ def test_a_quotes_partition_is_restored_and_its_chains_twin_is_not_selected(tmp_
 # -- 5. temp files ----------------------------------------------------------------
 
 
-def test_a_leftover_temp_is_removed_and_no_part_file_is_ever_left(tmp_path, monkeypatch):
+def _watch_downloads(
+    monkeypatch, root: Path, seen: list[str], stop: BaseException | None = None
+) -> None:
+    """Wrap the bucket reader so each download records its target directory mid-flight.
+
+    The listing is taken after the first chunk is handed over, while the in-flight file is
+    open. With ``stop`` set, the read then raises it, the way an interrupt or a client bug
+    would partway through a body.
+    """
+    real = bucket.bucket_reader
+
+    def reader(client, target):
+        read = real(client, target)
+
+        def watched(rel):
+            chunks = read(rel)
+            first = next(chunks)
+            yield first
+            seen.extend(sorted(os.listdir((root / rel).parent)))
+            if stop is not None:
+                raise stop
+            yield from chunks
+
+        return watched
+
+    monkeypatch.setattr(bucket, "bucket_reader", reader)
+
+
+def test_a_download_in_flight_carries_the_name_the_backup_excludes(tmp_path, monkeypatch):
     """Mutation this catches: reverting ``_download_to`` to ``.part`` for this caller.
 
-    A ``.part`` file sits in neither exclusion list, so the nightly upload would send it and
-    the Sunday scrub would call it an orphan, and the rerun's temp sweep never finds it.
+    A ``.part`` file sits in neither exclusion list, so the nightly upload would send one in
+    flight, the Sunday scrub would call a leftover an orphan, and the next run's sweep of
+    ``<name>.tmp-<pid>`` would never find it.
+    """
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    seen: list[str] = []
+    _watch_downloads(monkeypatch, root, seen)
+
+    _run(root, client, last=D1)
+
+    in_flight = [name for name in seen if name.startswith("date=2026-08-24.parquet")]
+    assert len(in_flight) == 1
+    assert in_flight[0].startswith("date=2026-08-24.parquet.tmp-")
+    assert bucket.rsync_excluded(f"chains/ticker=SPY/{in_flight[0]}", is_dir=False)
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
+    assert _strays(root) == []
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt(), RuntimeError("a client bug")])
+def test_an_interrupt_or_a_bug_mid_download_leaves_no_temp_in_the_lake(tmp_path, monkeypatch, stop):
+    """Mutation this catches: removing the temp only on the refusals the command names.
+
+    A leftover is an orphan to the Sunday scrub, which withholds its ping, and only a re-run
+    over the same target would remove it.
     """
     root, client, _originals = _lake(tmp_path)
-    _trim_away(root, client, SPY_1)
+    (root / SPY_1).unlink()
+    seen: list[str] = []
+    _watch_downloads(monkeypatch, root, seen, stop=stop)
 
-    def crash(source, destination):
-        raise Crash("killed before the rename")
-
-    monkeypatch.setattr(bucket.os, "replace", crash)
-    with pytest.raises(Crash):
+    with pytest.raises(type(stop)):
         _run(root, client, last=D1)
-    monkeypatch.undo()
-    left = _strays(root)
-    assert len(left) == 1 and ".tmp-" in left[0]
-    assert left[0].startswith("chains/ticker=SPY/date=2026-08-24.parquet")
+
+    assert any(".tmp-" in name for name in seen)
+    assert _strays(root) == []
+    assert not (root / SPY_1).exists()
+
+
+def test_a_leftover_temp_from_a_dead_process_is_removed_by_the_next_run(tmp_path):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+    leftover = root / "chains/ticker=SPY/date=2026-08-24.parquet.tmp-424242"
+    leftover.write_bytes(b"what a killed run left")
 
     summary = _run(root, client, last=D1)
 
-    assert summary.temps_removed == left
+    assert summary.temps_removed == ["chains/ticker=SPY/date=2026-08-24.parquet.tmp-424242"]
     assert _strays(root) == []
     assert scrub(root).ok
 
@@ -531,21 +595,36 @@ def test_a_lake_walk_that_cannot_read_every_path_refuses(tmp_path):
     assert not (root / SPY_1).exists()
 
 
-def test_free_space_short_of_the_journal_reserve_refuses_and_room_for_it_passes(tmp_path):
-    root, client, originals = _lake(tmp_path)
-    (root / SPY_1).unlink()
-    planned = len(originals[SPY_1])
+def test_the_reserve_is_measured_on_the_lake_as_it_stands_after_the_restore(tmp_path):
+    """A restored day inside the growth window can become the busiest one.
+
+    Both of the day's chains partitions are lost, so on disk the day holds only its quotes
+    partition and reads smaller than the days around it. Restored, it is the busiest day, and
+    the Lake panel reads the reserve off it from then on. Mutation this catches: measuring the
+    busiest day before the restore, which passes at the old boundary.
+    """
     from lake import runway
 
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    (root / QQQ_1).unlink()
+    planned = len(originals[SPY_1]) + len(originals[QQQ_1])
     usage = runway.walk(root)
-    busiest = runway.busiest_sealed_day(usage, today=MONDAY_19.date())
-    needed = planned + runway.JOURNAL_RESERVE_SESSIONS * busiest
+    before = runway.busiest_sealed_day(usage, today=MONDAY_19.date())
+    after = usage.sealed_bytes(D1) + planned
+    assert after > before
+    # 13 is the reserve's session count, written as a literal rather than read from the code.
+    old_boundary = planned + 13 * before
+    new_boundary = planned + 13 * after
 
-    line = _refuses(root, client, free=needed - 1)
-
-    assert "short of the journal reserve" in line
-    assert not (root / SPY_1).exists()
-    assert _run(root, client, free=needed).restored == 1
+    assert "short of the journal reserve" in _refuses(
+        root, client, ticker=None, last=D1, free=old_boundary
+    )
+    assert "short of the journal reserve" in _refuses(
+        root, client, ticker=None, last=D1, free=new_boundary - 1
+    )
+    assert not (root / SPY_1).exists() and not (root / QQQ_1).exists()
+    assert _run(root, client, ticker=None, last=D1, free=new_boundary).restored == 2
 
 
 def test_a_shadow_host_refuses_with_one_line(tmp_path, monkeypatch, capsys):
@@ -561,11 +640,13 @@ def test_a_shadow_host_refuses_with_one_line(tmp_path, monkeypatch, capsys):
     assert code == 2
     err = capsys.readouterr().err.splitlines()
     assert len(err) == 1 and err[0].startswith("restore-range: ")
+    assert "Run it on the primary" in err[0]
+    assert "uploads nothing" not in err[0]
     assert client.calls == []
     assert not (root / SPY_1).exists()
 
 
-def _argv(config: Path) -> list[str]:
+def _argv(config: Path, first: str = "2026-08-24", last: str = "2026-08-26") -> list[str]:
     return [
         "restore-range",
         "--surface",
@@ -573,9 +654,9 @@ def _argv(config: Path) -> list[str]:
         "--ticker",
         "SPY",
         "--from",
-        "2026-08-24",
+        first,
         "--to",
-        "2026-08-26",
+        last,
         "--config",
         str(config),
         "--target",
@@ -669,3 +750,266 @@ def test_the_temp_name_is_the_one_the_backup_excludes(tmp_path):
 
     assert bucket.rsync_excluded(temp.relative_to(root).as_posix(), is_dir=False)
     assert not bucket.rsync_excluded(SPY_1 + ".part", is_dir=False)
+
+
+# -- the lock is never held across a hash ------------------------------------------
+
+
+def test_no_present_partition_is_hashed_under_the_lock(tmp_path, monkeypatch):
+    """Capture's close+5 fill waits on the lock with no timeout, and a rollback's present files
+    run to gigabytes. Mutation this catches: hashing a present file inside the lock hold.
+    """
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+    (root / SPY_2).unlink()
+    held: list[bool] = []
+    hashed: list[tuple[str, bool]] = []
+    real_lock = bucket.lake_lock
+    real_sha = bucket.sha256_file
+
+    @contextmanager
+    def watched_lock(lake_root):
+        with real_lock(lake_root) as path:
+            held.append(True)
+            try:
+                yield path
+            finally:
+                held.pop()
+
+    def watched_sha(path):
+        hashed.append((Path(path).relative_to(root).as_posix(), bool(held)))
+        return real_sha(path)
+
+    monkeypatch.setattr(bucket, "lake_lock", watched_lock)
+    monkeypatch.setattr(bucket, "sha256_file", watched_sha)
+
+    summary = _run(root, client)
+
+    assert sorted(rel for rel, _locked in hashed) == [SPY_1, SPY_3]
+    assert [rel for rel, locked in hashed if locked] == []
+    assert (summary.restored, summary.restore_lines) == (1, 1)
+    assert _kind(root, SPY_1) == "restore"
+
+
+# -- every refusal handler reaches the operator as one line ----------------------
+
+
+def _main_refusal(tmp_path, root, client, monkeypatch, capsys, **argv) -> str:
+    config = write_config(tmp_path, root)
+    config.write_text(config.read_text() + KEYS)
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+
+    with pytest.raises(SystemExit) as exc:
+        bucket.main(_argv(config, **argv), clock=ManualClock(MONDAY_19), calendar=CALENDAR)
+
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    assert len(lines) == 1, captured.err
+    assert lines[0].startswith("restore-range: ")
+    assert "Traceback" not in captured.err
+    return lines[0]
+
+
+def test_a_reversed_range_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+
+    line = _main_refusal(
+        tmp_path, root, client, monkeypatch, capsys, first="2026-08-26", last="2026-08-24"
+    )
+
+    assert "before it starts" in line
+
+
+def test_a_damaged_manifest_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    manifest = root / "manifest.jsonl"
+    manifest.write_bytes(manifest.read_bytes() + b'{"partition": "\xff"}\n')
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "manifest.jsonl" in line and "nothing was restored" in line
+    assert "records no" not in line
+
+
+def test_a_ledger_the_repair_refuses_stops_the_run(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+    ledger = trimmed_path(root)
+    ledger.write_bytes(ledger.read_bytes().replace(b'"version_id": "v', b'"version_id": "w'))
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "edited in place" in line and "Nothing was restored" in line
+    assert not (root / SPY_1).exists()
+
+
+def test_a_restore_line_the_ledger_refuses_in_the_repair_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+
+    def lost(*args, **kwargs):
+        raise TrimmedLineLost("trimmed.jsonl: the line was lost")
+
+    monkeypatch.setattr(trimmed, "append_trimmed", lost)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "the line was lost" in line
+
+
+def test_a_ticker_directory_that_will_not_list_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    locked = root / "chains/ticker=SPY"
+    locked.chmod(0)
+    try:
+        line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+    finally:
+        locked.chmod(0o755)
+
+    assert "PermissionError" in line and "reading or repairing" in line
+
+
+def test_free_space_that_cannot_be_read_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+
+    def broken(path):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(bucket.shutil, "disk_usage", broken)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "reading free space" in line
+
+
+def test_a_temp_that_cannot_be_written_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    directory = root / "chains/ticker=SPY"
+    directory.chmod(0o555)
+    try:
+        line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+    finally:
+        directory.chmod(0o755)
+
+    assert "writing chains/ticker=SPY/date=2026-08-24.parquet.tmp-" in line
+    assert _strays(root) == []
+
+
+def test_a_flush_that_fails_at_the_commit_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+
+    def failing(path):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(bucket, "_fsync_path", failing)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "committing" in line and SPY_1 in line
+    assert _strays(root) == []
+
+
+def test_a_partition_gone_from_the_bucket_mid_run_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    version = _trim_away(root, client, SPY_1)
+
+    def absent(**kwargs):
+        raise client_error("NoSuchKey", "GetObject", 404)
+
+    monkeypatch.setattr(client, "get_object", absent)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "holds no current version" in line and f"version {version}" in line
+    assert _strays(root) == []
+
+
+def test_a_ledger_that_cannot_be_read_at_the_commit_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    real = trimmed.latest_trimmed
+    calls: list[int] = []
+
+    def flaky(lake_root):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ManifestError("trimmed.jsonl: unreadable at the commit")
+        return real(lake_root)
+
+    monkeypatch.setattr(trimmed, "latest_trimmed", flaky)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "unreadable at the commit" in line and "stopped at" in line
+    assert not (root / SPY_1).exists()
+    assert _strays(root) == []
+
+
+def test_a_present_partition_that_cannot_be_read_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    unreadable = root / SPY_3
+    unreadable.chmod(0)
+    try:
+        line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+    finally:
+        unreadable.chmod(0o644)
+
+    assert "hashing the chains partitions" in line and "PermissionError" in line
+
+
+def test_a_restore_line_the_disk_refuses_in_the_repair_refuses(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(trimmed, "append_trimmed", full)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "writing a restore line" in line and "OSError" in line
+
+
+def test_the_bound_is_checked_again_once_the_lock_is_taken(tmp_path, monkeypatch):
+    """The lock can be waited on past the bound, behind compaction or a capture cycle.
+
+    The clock reaches the bound while the run waits for its first lock. Mutation this catches:
+    checking the bound only before the lock, which runs the repairs inside the pre-open margin.
+    """
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "restore", "partition": "x", "restored_at": "t", "sha256": "s"}\n')
+    entry = latest_entries(root)["trimmed.jsonl"]
+    clock = ManualClock(datetime(2026, 8, 31, 8, 30, tzinfo=MARKET_TZ))
+    real_lock = bucket.lake_lock
+
+    @contextmanager
+    def slow_lock(lake_root):
+        with real_lock(lake_root) as path:
+            clock.set(MONDAY_BOUND)
+            yield path
+
+    monkeypatch.setattr(bucket, "lake_lock", slow_lock)
+
+    with pytest.raises(RangeRestoreRefused, match="next session"):
+        restore_range(
+            root,
+            TARGET,
+            client=client,
+            clock=clock,
+            calendar=CALENDAR,
+            surface="chains",
+            ticker="SPY",
+            first=D1,
+            last=D1,
+            free_space=lambda path: PLENTY,
+        )
+
+    assert latest_entries(root)["trimmed.jsonl"] == entry
+    assert not (root / SPY_1).exists()

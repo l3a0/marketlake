@@ -12,7 +12,7 @@ the disk lasts is worse than either being wrong alone.
 
 That is also why it is a module of its own rather than a part of :mod:`lake.dashboard`.
 The sweep has no reason to import the dashboard's DuckDB query layer to read a number off
-the disk, and a computation living in one consumer invites the other to grow a copy.
+the disk, and a computation living in one consumer invites the others to grow a copy.
 
 Five decisions are worth reading before the code.
 

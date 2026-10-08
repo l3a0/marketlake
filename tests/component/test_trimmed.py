@@ -589,3 +589,51 @@ def test_a_ledger_path_that_cannot_be_read_refuses_rather_than_raise(tmp_path):
 
     with pytest.raises(TrimmedRepairRefused, match="IsADirectoryError"):
         _repair(root)
+
+
+def test_a_ledger_edited_in_place_is_refused_and_the_scrub_still_reports_it(tmp_path):
+    """One character changed, the line count the same. Re-recording it would bless the edit.
+
+    Mutation this catches: re-recording on any sha disagreement whose tail parses, which quiets
+    the Sunday scrub's sha check on the ledger, and compaction would do it every night.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _append(root, _trim(SPY_NEXT, "b" * 64))
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes().replace(b'"version_id": "v1"', b'"version_id": "v2"', 1))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused, match="edited in place or the bytes rotted"):
+        _repair(root)
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+    assert TRIMMED_FILE in scrub(root).sha_mismatches
+
+
+def test_an_edit_in_place_behind_an_appended_line_is_still_refused(tmp_path):
+    """A line landed after the entry does not excuse an edit to the lines the entry covers."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes().replace(b'"version_id": "v1"', b'"version_id": "v2"', 1))
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    with pytest.raises(TrimmedRepairRefused, match="edited in place"):
+        _repair(root)
+
+
+def test_a_damaged_manifest_is_named_as_the_manifest_and_not_the_ledger(tmp_path):
+    """The repair for a damaged manifest is not the ledger's, so the text names manifest.jsonl."""
+    root = _lake(tmp_path / "lake")
+    _write_line(root, _trim(SPY, "a" * 64))
+    manifest = root / "manifest.jsonl"
+    manifest.write_bytes(manifest.read_bytes() + b'{"partition": "\xff"}\n')
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    text = str(exc.value)
+    assert text.startswith(f"{manifest}: the manifest could not be read (LedgerNotUtf8")
+    assert "Repair manifest.jsonl by hand" in text
+    assert "last line whole" not in text

@@ -91,7 +91,7 @@ import os
 import shutil
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1992,6 +1992,13 @@ def restore_lake(
 # The writer the trimmed ledger's manifest entry names when the range restore records it.
 RANGE_RESTORE_SOURCE = "range-restore"
 
+# The range restore's refusal on a shadow host. A shadow's lake is compared with the primary's
+# and then discarded, so a partition restored into it would be thrown away with it.
+RANGE_RESTORE_SHADOW = (
+    "this host's role is shadow, whose lake is compared with the primary's and then "
+    "discarded, so the range restore writes nothing into it. Run it on the primary"
+)
+
 
 class RangeRestoreRefused(BucketRefusal):
     """The range restore refused to start, or stopped, with one line for an operator."""
@@ -2086,19 +2093,22 @@ def restore_range(
        ends before it starts, the Sunday scrub window, a ``now`` inside a session or its
        pre-open margin by ``session_bound``, and a lake root holding no ``manifest.jsonl``,
        since ``lake_lock`` would create one under a wrong ``lake_root``.
-    2. Under ``lake_lock``, the repairs of what a crashed earlier run left.
-       ``trimmed.repair_trimmed_entry`` re-records a ledger whose sha disagrees with its
-       entry. A leftover temp file beside a selected target is removed. A selected present
-       file whose latest trimmed line is still a trim line gets its restore line, which a crash
-       after the move and before the line leaves. This last repair stays inside the selection,
-       because a trim that crashed between its line and its unlink leaves the same state, and
-       the next trim finishes that unlink. A present file whose sha differs from its entry
-       refuses before any of the third repair is written.
+    2. The repairs of what a crashed earlier run left. Under ``lake_lock``,
+       ``trimmed.repair_trimmed_entry`` re-records a ledger whose entry lags an append, and a
+       leftover temp file beside a selected target is removed. Then, unlocked, every selected
+       present file is hashed. One whose sha differs from its entry refuses before anything is
+       written, and one whose latest trimmed line is still a trim line owes a restore line,
+       which a crash after the move and before the line leaves. Those lines are written under
+       the lock after a re-check that hashes nothing, because capture's close+5 fill waits on
+       the lock with no timeout and a rollback's present files run to gigabytes. This repair
+       stays inside the selection, because a trim that crashed between its line and its
+       unlink leaves the same state, and the next trim finishes that unlink.
     3. Unlocked, every partition to download must be in the bucket's listing, and the free
        space left after the download must cover the journal reserve, by
-       ``runway.reserve_shortfall`` on ``runway.busiest_sealed_day`` read from this lake. A
-       lake walk that could not read every path refuses, since an unread day could be the
-       busiest.
+       ``runway.reserve_shortfall``. Its basis is ``runway.busiest_sealed_day`` over this
+       lake's walk with each planned partition's size added to its day, since a restored day
+       inside the growth window can become the busiest one. A lake walk that could not read
+       every path refuses, since an unread day could be the busiest.
     4. Each partition is downloaded into ``paths.temp_write_path``'s name beside its target,
        outside the lock, and must hash to its latest manifest sha. The lock is then taken for
        that partition alone: the target must still be absent and its entry unchanged, the file
@@ -2106,8 +2116,9 @@ def restore_range(
        ``trimmed.append_trimmed``, which reads it back and refreshes the ledger's entry. A crash
        between any two of those leaves a state step 2 repairs on the next run.
 
-    The Sunday window and the session bound are checked again before every download and every
-    commit, so a run begun in the evening stops before either.
+    The Sunday window and the session bound are checked again after every lock is taken and
+    before every download, so a run begun in the evening stops before either. Whatever stops a
+    partition, its temp file is removed.
 
     Every refusal raises ``RangeRestoreRefused`` with one line naming the repair. A refusal
     after some partitions were committed says how many, since each stands on its own and a
@@ -2169,14 +2180,15 @@ def restore_range(
     def unservable(rel: str, why: str, line: Mapping[str, Any] | None) -> RangeRestoreRefused:
         if is_trimmed(line):
             recovery = (
-                f"The trim line records version {line.get(VERSION_ID_FIELD)} as verified, so "
-                "recover that version in the S3 console, as the README's \"When the lake is "
-                'gone" steps describe, and put it back as the current version'
+                f"The trim line records version {line.get(VERSION_ID_FIELD)} as verified. Put "
+                "that version back as the current one, as the README's \"Putting a version back "
+                'for the range restore" steps describe, and run the range restore again'
             )
         else:
             recovery = (
-                "Recover an earlier version that matches the manifest in the S3 console, as the "
-                'README\'s "When the lake is gone" steps describe'
+                "Put back an earlier version that matches the manifest as the current one, as "
+                'the README\'s "Putting a version back for the range restore" steps describe, '
+                "and run the range restore again"
             )
         return refuse(f"{rel}: {why}, so it was not restored. {recovery}")
 
@@ -2198,22 +2210,25 @@ def restore_range(
             "nothing was restored"
         )
 
-    # Step 2, the repairs and the plan, in one lock hold.
+    # Step 2, the repairs and the plan. The lock is held for reads of the two ledgers, the
+    # ledger repair and directory listings, never for hashing a partition, because capture's
+    # close+5 fill waits on this lock with no timeout and a rollback's present files run to
+    # gigabytes.
     plan: dict[str, str] = {}
     trim_lines: dict[str, Mapping[str, Any] | None] = {}
+    present: dict[str, str] = {}
+    days: dict[str, date] = {}
     try:
         with lake_lock(root):
+            guard()
             try:
                 summary.ledger_repaired = repair_trimmed_entry(
                     root, source=RANGE_RESTORE_SOURCE, fetched_at=stamp()
                 )
             except TrimmedRepairRefused as exc:
                 raise refuse(f"{exc} Nothing was restored") from None
-            try:
-                latest = latest_entries(root)
-                trimmed = latest_trimmed(root)
-            except ManifestError as exc:
-                raise refuse(f"{exc}, so nothing was restored") from None
+            latest = latest_entries(root)
+            trimmed = latest_trimmed(root)
             selected: dict[str, str] = {}
             for rel, entry in sorted(latest.items()):
                 ref = parse_partition_rel(rel)
@@ -2224,46 +2239,79 @@ def restore_range(
                     and first <= ref.day <= last
                 ):
                     selected[rel] = str(entry["sha256"])
+                    days[rel] = ref.day
             if not selected:
                 raise refuse(
                     f"the manifest records no {scope}, so nothing was restored. Check the "
                     "surface, the ticker and the dates"
                 )
             summary.selected = len(selected)
-            owed: list[tuple[str, str]] = []
             for rel, sha in selected.items():
                 path = root / rel
                 for temp in _leftover_temps(path):
                     temp.unlink()
                     summary.temps_removed.append(temp.relative_to(root).as_posix())
-                if not path.exists():
+                if path.exists():
+                    present[rel] = sha
+                else:
                     plan[rel] = sha
                     trim_lines[rel] = trimmed.get(rel)
-                    continue
-                if sha256_file(path) != sha:
-                    raise refuse(
-                        f"{rel} is on disk and does not match its manifest entry, which the "
-                        "Sunday scrub also reports, so nothing was restored. Repair it by the "
-                        "README's repair runbook first"
-                    )
-                summary.present += 1
-                if is_trimmed(trimmed.get(rel)):
-                    owed.append((rel, sha))
-            for rel, sha in owed:
-                at = stamp()
-                append_trimmed(
-                    root,
-                    restore_line(rel, sha256=sha, restored_at=at),
-                    source=RANGE_RESTORE_SOURCE,
-                    fetched_at=at,
-                )
-                summary.restore_lines += 1
     except RangeRestoreRefused:
         raise
     except ManifestError as exc:
-        raise refuse(f"{exc}, so the range restore stopped") from None
+        raise refuse(f"{exc}, so nothing was restored") from None
     except OSError as exc:
         raise local(f"reading or repairing {scope} under {root}", exc) from None
+
+    # Unlocked, each present file is hashed. One that differs refuses before anything is
+    # written, and one under a trim line owes a restore line, which a crash after the move and
+    # before the line leaves.
+    owed: list[tuple[str, str]] = []
+    try:
+        for rel, sha in present.items():
+            if sha256_file(root / rel) != sha:
+                raise refuse(
+                    f"{rel} is on disk and does not match its manifest entry, which the Sunday "
+                    "scrub also reports, so nothing was restored. Move it out of the lake and "
+                    "run the range restore again, which brings back the bucket's copy if that "
+                    "copy matches the manifest"
+                )
+            if is_trimmed(trimmed.get(rel)):
+                owed.append((rel, sha))
+    except OSError as exc:
+        raise local(f"hashing the {scope} already in the lake", exc) from None
+    summary.present = len(present)
+    if owed:
+        try:
+            with lake_lock(root):
+                guard()
+                latest = latest_entries(root)
+                trimmed = latest_trimmed(root)
+                for rel, sha in owed:
+                    # Re-checked without a hash: the file is still there, its entry is the one
+                    # hashed, and its latest trimmed line is still a trim line.
+                    entry = latest.get(rel)
+                    if (
+                        not (root / rel).exists()
+                        or entry is None
+                        or entry.get("sha256") != sha
+                        or not is_trimmed(trimmed.get(rel))
+                    ):
+                        continue
+                    at = stamp()
+                    append_trimmed(
+                        root,
+                        restore_line(rel, sha256=sha, restored_at=at),
+                        source=RANGE_RESTORE_SOURCE,
+                        fetched_at=at,
+                    )
+                    summary.restore_lines += 1
+        except RangeRestoreRefused:
+            raise
+        except ManifestError as exc:
+            raise refuse(f"{exc}, so the range restore stopped") from None
+        except OSError as exc:
+            raise local(f"writing a restore line under {root}", exc) from None
 
     if not plan:
         return summary
@@ -2283,8 +2331,13 @@ def restore_range(
             f"{usage.refusals[0]}, so the journal reserve cannot be measured and nothing was "
             "restored. Make the lake readable and run the range restore again"
         )
+    # The reserve is measured on the lake as it will stand after the restore. A restored day
+    # inside the growth window can become the busiest one, and the panel reads it from then on.
+    after = dict(usage.day_bytes)
+    for rel in plan:
+        after[days[rel]] = after.get(days[rel], 0) + listing[rel]
     today = clock.now().astimezone(MARKET_TZ).date()
-    busiest = runway.busiest_sealed_day(usage, today=today)
+    busiest = runway.busiest_sealed_day(replace(usage, day_bytes=after), today=today)
     try:
         free = free_space(root)
     except OSError as exc:
@@ -2295,70 +2348,74 @@ def restore_range(
             f"the restore needs {planned / 1_000_000:.1f} MB and would leave "
             f"{(free - planned) / 1_000_000:.1f} MB free, {short / 1_000_000:.1f} MB short of "
             f"the journal reserve of {runway.JOURNAL_RESERVE_SESSIONS} times the busiest sealed "
-            f"day ({busiest / 1_000_000:.1f} MB), which the next session's journal needs. "
-            "Nothing was restored. Restore a narrower range or grow the volume"
+            f"day after the restore ({busiest / 1_000_000:.1f} MB), which the next session's "
+            "journal needs. Nothing was restored. Restore a narrower range or grow the volume"
         )
 
-    # Step 4, partition by partition.
+    # Step 4, partition by partition. Whatever stops a partition, a refusal, an error or an
+    # interrupt, the ``finally`` removes its temp, which the Sunday scrub would read as an
+    # orphan. Once the rename ran there is nothing at that name, and it removes nothing.
     read = bucket_reader(client, target)
     for rel, sha in plan.items():
         path = root / rel
         temp = temp_write_path(path, os.getpid())
-        guard()
         try:
-            actual, size = _download_to(read, rel, temp)
-        except BucketReadError as exc:
-            temp.unlink(missing_ok=True)
-            if exc.absent:
-                raise unservable(
-                    rel, f"the bucket holds no current version of it: {target}", trim_lines[rel]
-                ) from None
-            raise refuse(f"{_one_line(exc, target)}") from None
-        except OSError as exc:
-            temp.unlink(missing_ok=True)
-            raise local(f"writing {temp.relative_to(root).as_posix()}", exc) from None
-        if actual != sha:
-            temp.unlink(missing_ok=True)
-            raise unservable(
-                rel,
-                "the bucket's current version does not match its manifest entry",
-                trim_lines[rel],
-            )
-        try:
-            _fsync_path(temp)
             guard()
-            with lake_lock(root):
-                entry = latest_entries(root).get(rel)
-                if entry is None or entry.get("sha256") != sha or path.exists():
-                    raise refuse(
-                        f"{rel} changed in the lake while it downloaded, so it was not "
-                        "restored. Run the range restore again"
-                    )
-                line = latest_trimmed(root).get(rel)
-                os.replace(temp, path)
-                _fsync_path(path.parent)
-                summary.restored += 1
-                summary.restored_bytes += size
-                if is_trimmed(line):
-                    at = stamp()
-                    append_trimmed(
-                        root,
-                        restore_line(rel, sha256=sha, restored_at=at),
-                        source=RANGE_RESTORE_SOURCE,
-                        fetched_at=at,
-                    )
-                    summary.restore_lines += 1
-        except RangeRestoreRefused:
-            # A temp left behind is an orphan to the Sunday scrub, so every stop removes it.
-            # Once the rename ran there is nothing at that name, and this removes nothing.
-            temp.unlink(missing_ok=True)
-            raise
-        except ManifestError as exc:
-            temp.unlink(missing_ok=True)
-            raise refuse(f"{exc}, so the range restore stopped at {rel}") from None
-        except OSError as exc:
-            temp.unlink(missing_ok=True)
-            raise local(f"committing {rel}", exc) from None
+            try:
+                actual, size = _download_to(read, rel, temp)
+            except BucketReadError as exc:
+                if exc.absent:
+                    raise unservable(
+                        rel,
+                        f"the bucket holds no current version of it: {target}",
+                        trim_lines[rel],
+                    ) from None
+                raise refuse(f"{_one_line(exc, target)}") from None
+            except OSError as exc:
+                raise local(f"writing {temp.relative_to(root).as_posix()}", exc) from None
+            if actual != sha:
+                raise unservable(
+                    rel,
+                    "the bucket's current version does not match its manifest entry",
+                    trim_lines[rel],
+                )
+            try:
+                _fsync_path(temp)
+                with lake_lock(root):
+                    guard()
+                    entry = latest_entries(root).get(rel)
+                    if entry is None or entry.get("sha256") != sha or path.exists():
+                        raise refuse(
+                            f"{rel} changed in the lake while it downloaded, so it was not "
+                            "restored. Run the range restore again"
+                        )
+                    line = latest_trimmed(root).get(rel)
+                    os.replace(temp, path)
+                    _fsync_path(path.parent)
+                    summary.restored += 1
+                    summary.restored_bytes += size
+                    if is_trimmed(line):
+                        at = stamp()
+                        append_trimmed(
+                            root,
+                            restore_line(rel, sha256=sha, restored_at=at),
+                            source=RANGE_RESTORE_SOURCE,
+                            fetched_at=at,
+                        )
+                        summary.restore_lines += 1
+            except RangeRestoreRefused:
+                raise
+            except ManifestError as exc:
+                raise refuse(f"{exc}, so the range restore stopped at {rel}") from None
+            except OSError as exc:
+                raise local(f"committing {rel}", exc) from None
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                # A directory that refuses the unlink refused the write first, and that
+                # refusal is the one line the operator needs.
+                pass
     return summary
 
 
@@ -2543,8 +2600,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lake.bucket",
         description=(
-            "Seed the backup bucket by hand, restore a lake from it, or check the "
-            "provider's behavior live."
+            "Seed the backup bucket by hand, restore a lake from it, put chosen partitions "
+            "back into the live lake from it, or check the provider's behavior live."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2664,8 +2721,9 @@ def main(
     exit 2 before a client is built. A shadow seeded from the primary would upload under the
     primary's credentials, and ``first-upload`` replaces the bucket's ``manifest.jsonl``
     outright. ``restore-range`` writes into the lake at ``lake_root``, and a shadow's lake is
-    not the one the bucket backs up, so its manifest would refuse every partition the bucket
-    holds. ``restore`` runs under either role. It uploads nothing and writes only into an empty
+    compared with the primary's and then discarded, so nothing restored into it would be kept.
+    It prints its own line saying to run it on the primary. ``restore`` runs under either
+    role. It uploads nothing and writes only into an empty
     directory, which may be a fresh volume's mount point holding only ``lost+found``.
     That is how a new host is seeded.
 
@@ -2681,6 +2739,9 @@ def main(
         role, warning = outbox.role_of(config)
         if warning is not None:
             print(f"{label}: {warning}", file=sys.stderr)
+        if role != outbox.PRIMARY and args.command == "restore-range":
+            print(f"{label}: {RANGE_RESTORE_SHADOW}", file=sys.stderr)
+            return 2
         if role != outbox.PRIMARY and args.command != "restore":
             print(f"{label}: {BUCKET_SHADOW}", file=sys.stderr)
             return 2
@@ -2775,6 +2836,7 @@ __all__ = [
     "ManifestedFileMissing",
     "TrimmedNotInBucket",
     "ObjectTooLarge",
+    "RANGE_RESTORE_SHADOW",
     "RANGE_RESTORE_SOURCE",
     "RangeRestoreRefused",
     "RangeRestoreSummary",
