@@ -157,7 +157,7 @@ def test_the_edge_stops_counting_rather_than_looping_on_a_calendar_with_no_sessi
     """A calendar that answers no session refuses the edge instead of hanging the sweep."""
     calendar = _CountingCalendar(limit=400)
 
-    with pytest.raises(EdgeNotFound):
+    with pytest.raises(EdgeNotFound, match="answers no session"):
         window_edge(calendar, FRIDAY, 22)
 
     # A literal year rather than ``EDGE_SEARCH_DAYS``, so a shorter stop cannot move the
@@ -242,3 +242,21 @@ def test_the_floor_reads_each_calendar_span(monkeypatch, span: str):
     monkeypatch.setattr(f"lake.window.{span}", 60)
 
     assert window_floor(GuardConstants()) == 44
+
+
+def test_a_window_reaching_past_the_real_calendars_first_session_is_refused():
+    """``exchange_calendars`` refuses a day before 2006-10-09 with a ``ValueError``.
+
+    6,000 sessions reach back further than that. Escaping as ``DateOutOfBounds`` would cost the
+    sweep its report, digest and ping, so the count refuses as ``EdgeNotFound`` instead.
+    """
+    from lake.calendar import ExchangeCalendar
+
+    with pytest.raises(EdgeNotFound, match="reaches back past it"):
+        window_edge(ExchangeCalendar(), date(2026, 10, 8), 6000)
+
+
+def test_a_huge_window_on_a_calendar_with_no_session_stops_at_the_first_date():
+    """The search outruns ``date.min`` before its own bound, and stepping past it overflows."""
+    with pytest.raises(EdgeNotFound, match="first day a date can name"):
+        window_edge(_CountingCalendar(limit=10**7), FRIDAY, 300_000)

@@ -141,6 +141,10 @@ def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
     Counting back needs no forward lookup, so it never meets the calendar's one-year bound.
 
     ``tonight`` need not be a session. A day that is not one takes no slot.
+
+    Every way the count can fail is :class:`EdgeNotFound`: a calendar that answers no session,
+    a window longer than the search, and a window reaching back past the calendar's first
+    session or past ``date.min``.
     """
     if sessions < 1:
         raise ValueError(f"a window holds at least one session, not {sessions}")
@@ -148,10 +152,30 @@ def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
     day = tonight
     search = edge_search_days(sessions)
     for _ in range(search):
-        if calendar.is_session(day):
+        # A calendar refuses a day before its first session with a ``ValueError``:
+        # ``exchange_calendars`` raises ``DateOutOfBounds`` before 2006-10-09. A long enough
+        # search also steps past ``date.min``. Either way the window reaches back further than
+        # the calendar can count, which is this refusal rather than a raise that escapes the
+        # sweep.
+        refused = False
+        try:
+            answer = calendar.is_session(day)
+        except ValueError:
+            refused = True
+        if refused:
+            raise EdgeNotFound(
+                f"only {counted} of {sessions} sessions before {day.isoformat()}, where the "
+                "calendar's first session lies, so the window reaches back past it"
+            )
+        if answer:
             counted += 1
             if counted == sessions:
                 return day
+        if day == date.min:
+            raise EdgeNotFound(
+                f"only {counted} of {sessions} sessions back to the first day a date can "
+                "name, so the window reaches back past the calendar's first session"
+            )
         day -= timedelta(days=1)
     if counted == 0:
         raise EdgeNotFound(

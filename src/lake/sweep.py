@@ -883,6 +883,11 @@ def _window_edge(
     except EdgeNotFound as exc:
         report.add(f"lake window edge not found: {exc}", ACTION)
         return None
+    except Exception as exc:  # noqa: BLE001 - a calendar that cannot answer must not cost the record
+        # ``window_edge`` turns every refusal it knows into ``EdgeNotFound``. This is the
+        # backstop for one it does not, the way the Friday wake contains the same calendar.
+        report.add(f"lake window edge not found: {type(exc).__name__}", ACTION)
+        return None
 
 
 def _file_split_refusals(

@@ -974,8 +974,11 @@ def test_a_ticker_that_stops_before_its_first_day_saves_the_starting_state(
     write_checkpoint(root, Checkpoint(DAY_THREE, walked.entries), recorded_at=SECOND_NIGHT)
     assert read_checkpoint(root).cutoffs() == {"SPY": date.min}
     # ``last_day`` comes back ``None`` rather than ``date.min``. A resume from ``date.min``
-    # would count every calendar day since year one as uncaptured.
-    assert read_checkpoint(root).entries == walked.entries
+    # would count every calendar day since year one as uncaptured. It is compared with the
+    # literal, since both sides of an entry comparison move with a mutated starting state.
+    (read,) = read_checkpoint(root).entries
+    assert read.state.last_day is None
+    assert read == entry
     assert _night_two(root, edge=DAY_THREE).report.refused == ()
 
 
@@ -1399,3 +1402,44 @@ def test_a_night_refusing_every_ticker_still_restamps_the_saved_checkpoint(
     written = read_checkpoint(root)
     assert written.session_day == SESSION
     assert written.entry("SPY") == saved.entry("SPY")
+
+
+class _RefusingBefore:
+    """A calendar that answers like ``inner`` and refuses every day before ``first``.
+
+    ``refusal`` is what it raises: a ``ValueError`` the way ``exchange_calendars`` raises
+    ``DateOutOfBounds``, or some other class the edge's own refusals do not name.
+    """
+
+    def __init__(self, inner, first: date, refusal: type[Exception]) -> None:
+        self._inner = inner
+        self._first = first
+        self._refusal = refusal
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def is_session(self, day: date) -> bool:
+        if day < self._first:
+            raise self._refusal(f"{day.isoformat()} is before the calendar's first session")
+        return self._inner.is_session(day)
+
+
+@pytest.mark.parametrize("refusal", [ValueError, ArithmeticError], ids=["ValueError", "other"])
+def test_a_window_past_the_calendars_first_session_still_files_and_pings(
+    fixture_lake: FixtureLake, refusal: type[Exception]
+):
+    """The night keeps its report and its ping, and the line says what went wrong.
+
+    A ``ValueError`` is the shape ``exchange_calendars`` refuses with, which ``window_edge``
+    turns into its own refusal. Any other class reaches the sweep's backstop.
+    """
+    root = _swept_lake(fixture_lake)
+    calendar = _RefusingBefore(LONG_CALENDAR, date(2016, 8, 3), refusal)
+
+    outcome, pinger = _sweep(root, window=6000, calendar=calendar)
+
+    assert outcome.filed_at is not None
+    assert pinger.events
+    assert any(line.startswith("lake window edge not found: ") for line in outcome.nightly.report)
+    assert not checkpoint_path(root).exists()
