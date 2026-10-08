@@ -2438,8 +2438,10 @@ def _backup_scrub_raised(target: Path | BucketTarget, exc: Exception) -> BackupS
 
     The line opens with ``BackupScrubResult.problem``'s ``backup could not be read:`` prefix,
     and the text after it says the backup scrub raised rather than that the disk failed. A
-    raise that got past the scrub's own ``except OSError`` is a damaged lake manifest or a
-    bug, never the copy.
+    raise that got past the path scrub's own ``except OSError`` is a damaged lake manifest or
+    a bug, never the copy. On a bucket target it can also be a fault reading the bucket's
+    copy: a ``urllib3`` error while ``_bucket_scrub`` reads a diverged manifest copy is
+    sorted by ``_failure``, which does not know it, so it arrives here (marketlake #830).
     """
     print(traceback.format_exc(), file=sys.stderr, end="")
     return BackupScrubResult(

@@ -1596,11 +1596,12 @@ def test_a_torn_trimmed_ledger_is_two_problem_lines_and_never_a_raise(fixture_la
 
 # -- a lake path the scrub cannot read -----------------------------------------------
 
-# Marketlake #441. A path the scrub cannot read is a named finding rather than a raise, because
-# every other Sunday check runs after the scrub. Each finding withholds the ping, is named in
-# ``report`` by its path, and leaves the canary and the coverage assertion running. The cases
-# that come back clean or ``missing`` sit with the scrub's own tests in
-# ``tests/component/test_manifest.py``.
+# Marketlake #441. A path the scrub cannot read is a named finding rather than a raise. A raise
+# would reach the Sunday job's guard, whose line says only that the scrub could not run, while
+# the finding names the path and leaves every other path's answer standing. Each finding
+# withholds the ping, is named in ``report`` by its path, and leaves the canary and the coverage
+# assertion running. The cases that come back clean or ``missing`` sit with the scrub's own
+# tests in ``tests/component/test_manifest.py``.
 
 _no_root_chmod = pytest.mark.skipif(
     os.geteuid() == 0, reason="root reads and lists past every permission bit"

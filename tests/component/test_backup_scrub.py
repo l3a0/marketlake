@@ -529,9 +529,9 @@ def test_a_plain_file_where_the_target_should_be_is_not_a_mounted_disk(fixture_l
 def test_a_read_that_fails_is_a_named_finding_rather_than_a_raise(fixture_lake):
     """The scrub reads the one disk in this system built to fail.
 
-    Every other Sunday check runs after it, so a raise would cost the run its canary,
-    its coverage assertion and its re-auth reminder, and report a traceback in place of
-    the disk. A bad sector, or the cable pulled mid-walk, is a named finding instead.
+    A raise would reach the Sunday job's guard, whose line says the backup scrub raised and
+    sends the operator looking for a bug. A bad sector, or the cable pulled mid-walk, is a
+    named finding instead, so the line names the disk, which is where the repair is.
     """
     root, target = _backed_up(fixture_lake)
     (target / CHAINS).chmod(0o000)

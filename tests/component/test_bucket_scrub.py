@@ -1,7 +1,8 @@
 """The Sunday scrub of a bucket target, against the fake S3 client.
 
-``bucket.bucket_scrub`` gives the path scrub's findings and its ping rules. The cases
-follow the issue's list, marketlake #639.
+``bucket.bucket_scrub`` gives the path scrub's ping rules, and its findings except
+``not_regular`` and ``target_missing``, which a bucket cannot have. The cases follow the
+issue's list, marketlake #639.
 
 1. The prefix check, which also names where a copy diverged.
 2. The forward pass, by ``HeadObject`` in checksum mode, inside the watermark.
