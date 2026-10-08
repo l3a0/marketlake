@@ -113,6 +113,7 @@ from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TICKERS_PATH_ENV, TickersError, default_tickers_path
 from lake.vendor import VendorResponse
+from lake.watchdog import TOKEN_DEAD, whole_daemon_cause
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import WAIT_GRACE_SECONDS, ManualClock
@@ -1772,10 +1773,10 @@ class _DeadSampler:
 def test_the_sampler_page_says_how_many_tickers_it_stands_for(size, tmp_path):
     """A folded page has to say how much it folded.
 
-    The design folds every quotes ticker into one page rather than sending N, and the
-    same rule makes compaction's drift page name how many columns it left. Without the
-    count, one page for two tickers and one page for four hundred read identically, and
-    the quotes batch runs to hundreds of symbols per request.
+    The design folds the quotes tickers a failed batched request explains into one page
+    rather than sending N, and the same rule makes compaction's drift page name how many
+    columns it left. Without the count, one page for two tickers and one page for four
+    hundred read identically, and the quotes batch runs to hundreds of symbols per request.
 
     The count comes off the page's own surfaces rather than a constant, so a roster that
     changed mid-session reports what it is now.
@@ -1835,6 +1836,46 @@ def test_a_folded_page_whose_tickers_disagree_still_says_how_many(tmp_path):
     (page,) = rig.transport.sent
     assert page.title == "Capture down: quote sampler dead"
     assert page.body == "3 session minutes without a durable cycle, one page for 4 tickers"
+
+
+class _WriteFailingQuotes:
+    """A cycle runner whose every quotes segment write fails, every cycle.
+
+    The batched request answered and the disk refused the writes, so the cycle carries
+    one ``SegmentError`` per ticker and no segment at all.
+    """
+
+    def __init__(self, tickers: tuple[str, ...]):
+        self._tickers = tickers
+
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
+        errors = tuple(
+            SegmentError(journal.QUOTES_SURFACE, ticker, "o_s_error") for ticker in self._tickers
+        )
+        return CycleResult(snap_ts=slot, segments=(), errors=errors)
+
+
+def test_every_quotes_write_failing_pages_each_ticker_rather_than_the_sampler(tmp_path):
+    """A refused write names the ticker and the write class, never the batched request.
+
+    The sampler page sends the operator after a request that answered. Each ticker whose
+    write failed pages under its own title instead, the way a chains write failure already
+    does, and its body names the write class that points at the disk (marketlake #771).
+    """
+    tickers = ("T00", "T01", "T02", "T03")
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WriteFailingQuotes(tickers))
+
+    assert sorted((page.title, page.body) for page in rig.transport.sent) == [
+        (
+            f"Capture down: {ticker} quotes",
+            "3 session minutes without a durable cycle, failing with o_s_error",
+        )
+        for ticker in tickers
+    ]
 
 
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):
@@ -3481,6 +3522,82 @@ def test_a_write_failure_released_from_the_cause_moves_no_token_pull(tmp_path, c
     assert sent == [
         ("Capture down: token dead", "http_401"),
         ("Capture down: QQQ chains", "o_s_error"),
+        ("Capture down: token dead", "http_401"),
+    ]
+
+
+def _qqq_chains_failing_alone(minutes: Sequence[tuple[str | None, str | None]]):
+    """A cycle runner for the probe in marketlake #760, one pair of classes per minute.
+
+    The pair's first class is what SPY's chains and quotes and QQQ's quotes each fail
+    with, or ``None`` when they land. The second is what QQQ's chains fails with.
+    """
+    queue = list(minutes)
+
+    def segment(surface: str, error_class: str | None) -> SegmentOutcome:
+        if error_class is None:
+            return _segment(journal.ROW_KIND_DATA, Path("unused"), surface, "QQQ")
+        gapped = _segment(journal.ROW_KIND_GAP, Path("unused"), surface, "QQQ")
+        return replace(gapped, error_class=error_class)
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        others, qqq_chains = queue.pop(0)
+        spy = _failing(slot, others, others)
+        return CycleResult(
+            snap_ts=slot,
+            segments=(
+                *spy.segments,
+                segment(journal.CHAINS_SURFACE, qqq_chains),
+                segment(journal.QUOTES_SURFACE, others),
+            ),
+        )
+
+    return runner
+
+
+def test_a_5xx_released_from_the_token_cause_moves_no_token_pull(tmp_path, capsys):
+    """The pull reads ``whole_daemon_cause``, and the release changes only the watchdog.
+
+    The probe that found marketlake #760: 3 dead-token minutes, then 6 in which QQQ's
+    chains answers 500 while every other surface lands, then 4 dead again. QQQ's chains
+    leaves the token-dead cause on the first healed minute and pages for itself, and the
+    second death pages again. The pull fires on the first dead minute of each death, the
+    second one 9 slots after the first, the same cycles it fired on before the release.
+    The cycles the daemon ran read as a dead token on the dead minutes alone, which is
+    what the pull reads.
+    """
+    rig = _rig(
+        tmp_path,
+        roster="SPY: {options: true, chain_cadence: 1m}\nQQQ: {options: true, chain_cadence: 1m}\n",
+    )
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    minutes = (
+        [("http_401", "http_401")] * 3 + [(None, "http_500")] * 6 + [("http_401", "http_401")] * 4
+    )
+    inner = _qqq_chains_failing_alone(minutes)
+    causes: list[str | None] = []
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        result = inner(slot=slot, close_tag=close_tag, session_phase=session_phase)
+        causes.append(whole_daemon_cause(result))
+        return result
+
+    _run(rig, clock, ticks=len(minutes), cycle_runner=runner)
+
+    dead = [minute for minute, cause in enumerate(causes) if cause == TOKEN_DEAD]
+    assert len(causes) == len(minutes)
+    assert dead == [0, 1, 2, 9, 10, 11, 12]
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0), et(2026, 9, 2, 10, 9)]
+    # The class is the one word after "failing with", read that narrowly so the test
+    # holds whatever else the body says, its minutes included.
+    sent = [
+        (message.title, re.search(r"failing with (\w+)", message.body).group(1))
+        for message in rig.transport.sent
+        if message.event == "capture_down"
+    ]
+    assert sent == [
+        ("Capture down: token dead", "http_401"),
+        ("Capture down: QQQ chains", "http_500"),
         ("Capture down: token dead", "http_401"),
     ]
 

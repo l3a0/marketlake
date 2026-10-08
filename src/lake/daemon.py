@@ -621,12 +621,14 @@ _OUT_OF_SPAN_NAMED = 4
 def _out_of_span_body(page: Page) -> str:
     """What the out-of-span page says: how many, for how long, and which.
 
-    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. Unlike the folds
-    that fire only when a whole set failed, this set is part of the roster, so the names
-    say which part. Like the ``capture:`` line it names the possible causes and prescribes
-    no repair, because re-running ``retire`` or ``onboard`` is the wrong repair for some of
-    them. It carries no class, since nothing was attempted for these tickers, and no
-    dead-man follow-on, since the tickers still captured keep the dead-man fed.
+    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. The cause page and
+    the sampler page leave their names out, because the cause page fires only when every
+    surface failed, and every quotes ticker the sampler page leaves out pages some other
+    way. This set is part of the roster, so the names say which part. Like the
+    ``capture:`` line it names the possible causes and prescribes no repair, because
+    re-running ``retire`` or ``onboard`` is the wrong repair for some of them. It carries
+    no class, since nothing was attempted for these tickers, and no dead-man follow-on,
+    since the tickers still captured keep the dead-man fed.
     """
     names = ", ".join(page.tickers[:_OUT_OF_SPAN_NAMED])
     rest = len(page.tickers) - _OUT_OF_SPAN_NAMED
@@ -1833,17 +1835,22 @@ def run_loop_from_config(
                 body = f"{body}, failing with {page.cause}"
             # A folded page says how much it folded, the rule compaction's drift page
             # already follows. Three pages here fold: the sampler page stands for every
-            # quotes ticker, the cause page stands for every surface that failed the same
-            # way, and the stall page stands for every surface a stall charged. Without
-            # the count, one page for two and one page for four hundred read identically.
-            # A page standing for one surface carries none, and on every page but the
-            # stall page the title itself says which surface that is.
+            # quotes ticker a failed batched request explains, the cause page stands for
+            # every surface that failed the same way, and the stall page stands for every
+            # surface a stall charged. Without the count, one page for two and one page
+            # for four hundred read identically. A page standing for one surface carries
+            # none, and on every page but the stall page the title itself says which
+            # surface that is.
             #
-            # The names are left out because both folds only fire when the whole set
-            # failed, so listing them says no more than the count does and costs the
-            # body's byte budget as the roster grows. The sampler's set is every surface
-            # on one ticker apiece, so it counts tickers. The cause page spans both
-            # surfaces of every ticker, so it counts surfaces.
+            # The names are left out because listing them costs the body's byte budget
+            # as the roster grows and tells the operator nothing the other pages do not.
+            # The cause page fires only when every surface failed, so its names restate
+            # the roster. The sampler page fires only when every quotes ticker failed, and
+            # each ticker it leaves out is either covered by a cause page or failing its
+            # own write, which pages on its own once it reaches the threshold
+            # (marketlake #771). The sampler's set holds one quotes surface per ticker, so
+            # it counts tickers. The cause page spans both surfaces of every ticker, so it
+            # counts surfaces.
             if len(page.surfaces) > 1:
                 folded = "tickers" if page.sampler_collapse else "surfaces"
                 body = f"{body}, one page for {len(page.surfaces)} {folded}"
