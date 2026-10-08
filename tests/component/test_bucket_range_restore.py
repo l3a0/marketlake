@@ -25,6 +25,7 @@ the code under test.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import os
 from contextlib import contextmanager
@@ -1445,3 +1446,52 @@ def test_leftover_temps_are_removed_and_reported_in_name_order(tmp_path):
     summary = _run(root, client, last=D1)
 
     assert summary.temps_removed == sorted(names)
+
+
+def _lock_is_held(root: Path) -> bool:
+    """Whether some open description holds the lake-root lock, probed without blocking."""
+    fd = os.open(root / "manifest.jsonl", os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_the_repairs_and_the_commit_run_under_the_lake_lock(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+    _trim_away(root, client, SPY_3, unlink=False)
+    seen: dict[str, bool] = {}
+    repair = trimmed.repair_trimmed_entry
+    append = trimmed.append_trimmed
+    replace = os.replace
+
+    def spy_repair(*args, **kwargs):
+        seen["repair"] = _lock_is_held(root)
+        return repair(*args, **kwargs)
+
+    def spy_append(lake_root, line, **kwargs):
+        seen.setdefault(f"append {line['partition']}", _lock_is_held(root))
+        return append(lake_root, line, **kwargs)
+
+    def spy_replace(source, destination):
+        seen["replace"] = _lock_is_held(root)
+        return replace(source, destination)
+
+    monkeypatch.setattr(trimmed, "repair_trimmed_entry", spy_repair)
+    monkeypatch.setattr(trimmed, "append_trimmed", spy_append)
+    monkeypatch.setattr(bucket.os, "replace", spy_replace)
+
+    _run(root, client)
+
+    assert seen == {
+        "repair": True,
+        f"append {SPY_3}": True,
+        "replace": True,
+        f"append {SPY_1}": True,
+    }
