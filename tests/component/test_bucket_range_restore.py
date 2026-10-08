@@ -36,7 +36,7 @@ from lake.bucket import RangeRestoreRefused, restore_range
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.lock import lake_lock
-from lake.manifest import latest_entries, scrub, sha256_file
+from lake.manifest import append_manifest, latest_entries, scrub, sha256_file
 from lake.trimmed import append_trimmed, latest_trimmed, trim_line, trimmed_path
 from tests.support.bucket import FakeS3
 from tests.support.calendar import weekday_sessions
@@ -58,6 +58,9 @@ QUOTES_1 = "quotes/ticker=SPY/date=2026-08-24.parquet"
 MONDAY_19 = datetime(2026, 8, 31, 19, 0, tzinfo=MARKET_TZ)
 SUNDAY_20 = datetime(2026, 8, 30, 20, 0, tzinfo=MARKET_TZ)
 MONDAY_10 = datetime(2026, 8, 31, 10, 0, tzinfo=MARKET_TZ)
+# Monday's open at 09:30, less the 15-minute in-flight allowance and the 15-minute pre-open
+# margin, written out rather than computed from the constants under test.
+MONDAY_BOUND = datetime(2026, 8, 31, 9, 0, tzinfo=MARKET_TZ)
 CALENDAR = weekday_sessions(date(2026, 8, 24), date(2026, 8, 31))
 PLENTY = 10**12
 STAMP = "2026-08-28T19:00:00-04:00"
@@ -294,6 +297,49 @@ def test_a_present_file_under_a_trim_line_gets_its_restore_line_only_inside_the_
     assert _kind(root, SPY_2) == "trim"
 
 
+@pytest.mark.parametrize("race", ["reentered", "resealed"])
+def test_a_lake_that_moved_during_the_download_refuses_the_commit_and_keeps_no_temp(
+    tmp_path, monkeypatch, race
+):
+    """The download runs unlocked, so the commit re-checks under the lock.
+
+    Mutations this catches: dropping that re-check, which overwrites a file another writer
+    put there or installs bytes the manifest no longer records, and leaving the temp behind
+    when the commit refuses, which the Sunday scrub reads as an orphan.
+    """
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    download = bucket._download_to
+
+    def racing(read, rel, part):
+        result = download(read, rel, part)
+        if race == "reentered":
+            (root / SPY_1).write_bytes(b"another writer's bytes")
+        else:
+            with lake_lock(root):
+                append_manifest(
+                    root,
+                    partition=SPY_1,
+                    source="recompact",
+                    sha256="f" * 64,
+                    rows=10**6,
+                    fetched_at=STAMP,
+                )
+        return result
+
+    monkeypatch.setattr(bucket, "_download_to", racing)
+
+    with pytest.raises(RangeRestoreRefused, match="changed in the lake while it downloaded"):
+        _run(root, client, last=D1)
+
+    assert _strays(root) == []
+    if race == "reentered":
+        assert (root / SPY_1).read_bytes() == b"another writer's bytes"
+    else:
+        assert not (root / SPY_1).exists()
+    assert originals[SPY_1] != b"another writer's bytes"
+
+
 # -- 4. a lost partition ----------------------------------------------------------
 
 
@@ -402,16 +448,28 @@ def test_the_sunday_scrub_window_refuses_before_any_request(tmp_path):
     assert not (root / SPY_1).exists()
 
 
-def test_a_session_refuses_before_any_request(tmp_path):
+@pytest.mark.parametrize("now", [MONDAY_10, MONDAY_BOUND], ids=["in-session", "at-the-bound"])
+def test_a_session_refuses_before_any_request(tmp_path, now):
+    """The bound itself refuses. Mutation this catches: a strict comparison at the bound."""
     root, client, _originals = _lake(tmp_path)
     (root / SPY_1).unlink()
     client.calls.clear()
 
-    line = _refuses(root, client, now=MONDAY_10)
+    line = _refuses(root, client, now=now)
 
     assert "next session" in line
     assert client.calls == []
     assert not (root / SPY_1).exists()
+
+
+def test_a_minute_before_the_bound_still_restores(tmp_path):
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+
+    summary = _run(root, client, now=datetime(2026, 8, 31, 8, 59, tzinfo=MARKET_TZ))
+
+    assert summary.restored == 1
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
 
 
 def test_a_present_file_that_differs_refuses_and_restores_nothing(tmp_path):
