@@ -801,3 +801,88 @@ def test_panels_refreshing_together_answer_as_they_do_one_at_a_time(
     for name, payload in answers:
         if name in READS_FILES:
             assert payload == expected[name], name
+
+
+# -- a partly remembered day -----------------------------------------------------
+
+
+def _now_surface(payload: dict, ticker: str, surface: str) -> dict:
+    return next(s for s in payload["surfaces"] if (s["ticker"], s["surface"]) == (ticker, surface))
+
+
+def test_a_first_segment_read_again_after_later_ones_were_remembered_keeps_now_on_the_latest(
+    fixture_lake: FixtureLake, partition_reads: Counter
+):
+    # A repair republishes the day's first segment while the later two stay remembered.
+    # The request then finds the later segments' minutes in the memo before it reads the
+    # first one's, so the merged day must still come out in minute order: Now's last
+    # cycle is the last element, and it must be 09:32, never the re-read 09:30.
+    root, _, _ = build_lake(fixture_lake)
+    service = service_over(root, partition_reads)
+    refresh(service)
+    first = LakePaths(root).segment_path("chains", "SPY", MONDAY, _start_ts(et(MONDAY, 9, 30)), 1)
+    _publish_segment(first, _segment_table("chains", [_row("chains", "SPY", et(MONDAY, 9, 30))]))
+    surface = _now_surface(service.run_query("now", {}), "SPY", "chains")
+    assert surface["last_snap_ts"] == et(MONDAY, 9, 32).isoformat()
+    assert surface["last_data_snap_ts"] == et(MONDAY, 9, 32).isoformat()
+
+
+def test_a_remembered_partition_still_reports_its_drifted_and_unstamped_rows(
+    fixture_lake: FixtureLake, partition_reads: Counter
+):
+    # History's bulk read counts a partition's drifted and unstamped rows. The second
+    # refresh answers from the memo, and the cell must carry the same counts.
+    root, _, _ = build_lake(fixture_lake)
+    base = {"ticker": "QQQ", "suspect": False, "schema_version": journal.SCHEMA_VERSION}
+    rows = [
+        {**base, "snap_ts": et(THURSDAY, 9, 30).isoformat(), "row_kind": journal.ROW_KIND_DATA},
+        {**base, "snap_ts": "not a time", "row_kind": journal.ROW_KIND_DATA},
+        {**base, "snap_ts": et(THURSDAY, 9, 31).isoformat(), "row_kind": "weird"},
+    ]
+    partition = LakePaths(root).partition_path("chains", "QQQ", THURSDAY)
+    _publish_partition(partition, sample_chains_table(rows))
+    service = service_over(root, partition_reads)
+    for _ in range(2):  # once read, once remembered
+        cell = _cell(service.run_query("history", {}), "QQQ", "chains", THURSDAY)
+        assert (cell["unparseable_stamp_rows"], cell["drifted_rows"]) == (1, 1)
+    assert partition_reads[partition] == 1
+
+
+def test_a_day_of_more_segments_than_a_small_index_holds_reads_every_one(
+    fixture_lake: FixtureLake, partition_reads: Counter
+):
+    # A full session writes about 390 segments, and the first read of the day counts
+    # them in one statement keyed by each segment's index.
+    count = 300
+    for index in range(count):
+        fixture_lake.with_journal_segment(
+            "chains",
+            "SPY",
+            MONDAY,
+            _segment_table("chains", [_row("chains", "SPY", et(MONDAY, 9, 30))]),
+            start_ts=f"20260824T133000{index:06d}",
+            pid=1,
+        )
+    root = fixture_lake.build().resolve()
+    service = service_over(root, partition_reads)
+    for _ in range(2):
+        strip = _strip(service.run_query("today", {}), "SPY", "chains")
+        assert _slot(strip, et(MONDAY, 9, 30))["rows"] == count
+
+
+def test_a_segment_that_will_not_stat_is_still_read_and_counted(
+    fixture_lake: FixtureLake, partition_reads: Counter, monkeypatch
+):
+    # ``_file_identity`` returns None when ``stat`` fails, and the file is read anyway.
+    root, _, _ = build_lake(fixture_lake)
+    target = LakePaths(root).segment_path("chains", "SPY", MONDAY, _start_ts(et(MONDAY, 9, 31)), 1)
+    real_identity = dashboard._file_identity
+
+    def identity(path):
+        return None if Path(path) == target else real_identity(path)
+
+    monkeypatch.setattr(dashboard, "_file_identity", identity)
+    service = service_over(root, partition_reads)
+    for _ in range(2):
+        strip = _strip(service.run_query("today", {}), "SPY", "chains")
+        assert _slot(strip, et(MONDAY, 9, 31))["status"] == "captured"
