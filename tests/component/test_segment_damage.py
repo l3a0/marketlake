@@ -673,8 +673,9 @@ def test_a_write_after_a_removal_is_refused(lake_root, monkeypatch):
     writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
     with pytest.raises(OSError):
         writer.write_cycle(_batch())
+    assert writer.closed
 
-    with pytest.raises(ValueError, match="closed"):
+    with pytest.raises(ValueError, match="cannot write to a closed segment"):
         writer.write_cycle(_batch())
 
     assert not writer.path.exists()
