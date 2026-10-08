@@ -577,15 +577,22 @@ class Watchdog:
         ``observe`` also calls it on its own, for the token-dead cause only. In a minute
         another surface landed data, a surface failing a class that does not resolve to a
         dead token leaves that cause. The token is shared, so data landing anywhere proves
-        no surface is failing for the token. Kept in the cause, a surface answering a 5xx
-        or timing out after the token healed never paged, and a 429 there paged for itself
-        but still held the cause, so a second token death that session sent no cause page
-        (marketlake #760). A rate limit is per surface, so the rate-limited cause keeps
-        its surfaces. Releasing from every cause would page a surface still limited the
-        moment it timed out once, and then the rate limit a second time.
+        the token works, and a surface failing another class is failing for its own
+        reason. A surface still answering ``http_401``, ``http_403``, ``vendor_auth_error``
+        or ``token_file_unreadable`` stays, because releasing it would page the same dead
+        token again under the surface's own title. Kept in the cause, a surface answering
+        a 5xx or timing out after the token healed never paged, and a 429 there paged for
+        itself but still held the cause, so a second token death that session sent no
+        cause page (marketlake #760). A rate limit is per surface, so the rate-limited
+        cause keeps its surfaces. Releasing from every cause would page a surface still
+        limited the moment it timed out once, and then the rate limit a second time.
 
         The released surface pages at once under its own title and class, unless it is
-        already in ``_paged``. Its counter kept climbing under the cause, so its page
+        already in ``_paged``. A released quotes surface folds into the ``quote sampler
+        dead`` page instead when every other quotes surface fails that minute too. A
+        threshold raised during the outage delays the page until the surface's count
+        reaches the new threshold. The surface's counter kept climbing under the cause, so
+        its page
         carries the outage's minutes, even when it failed only on the minute the token
         healed. That is the price, the same one a write failure pays.
         """
