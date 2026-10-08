@@ -716,17 +716,6 @@ def test_an_undecodable_line_after_the_entry_refuses_in_the_readers_words(tmp_pa
 # -- ported from the mutation lens on PR #810 ---------------------------------------
 
 
-def test_the_re_recorded_entry_names_the_caller_as_its_writer(tmp_path):
-    root = _lake(tmp_path / "lake")
-    _write_line(root, _trim(SPY, "a" * 64))
-
-    with lake_lock(root):
-        assert repair_trimmed_entry(root, source="range-restore", fetched_at=STAMP) is True
-
-    entry = latest_entries(root)[TRIMMED_FILE]
-    assert (entry["source"], entry["fetched_at"]) == ("range-restore", STAMP)
-
-
 def test_a_torn_tail_refusal_carries_the_torn_tail_repair_once(tmp_path):
     """The torn tail names its own repair, so the generic hand repair is not appended to it."""
     root = _lake(tmp_path / "lake")

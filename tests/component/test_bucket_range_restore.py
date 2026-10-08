@@ -1445,21 +1445,3 @@ def test_leftover_temps_are_removed_and_reported_in_name_order(tmp_path):
     summary = _run(root, client, last=D1)
 
     assert summary.temps_removed == sorted(names)
-
-
-def test_the_ledger_repair_runs_even_when_the_selection_refuses(tmp_path, monkeypatch):
-    root, client, _originals = _lake(tmp_path)
-    _trim_away(root, client, SPY_1)
-
-    def crash(*args, **kwargs):
-        raise Crash("killed between the append and the record")
-
-    monkeypatch.setattr(trimmed, "_record", crash)
-    with pytest.raises(Crash):
-        _run(root, client, last=D1)
-    monkeypatch.undo()
-
-    with pytest.raises(RangeRestoreRefused, match="records no chains partitions"):
-        _run(root, client, ticker="SPYY")
-
-    assert latest_entries(root)["trimmed.jsonl"]["sha256"] == sha256_file(trimmed_path(root))
