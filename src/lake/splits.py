@@ -171,18 +171,23 @@ reach reads as a rule.
 
 **A run's second night appends nothing.** ``observed_on`` and ``ex_date`` are both the
 boundary session itself, never the night the walk ran. A split stays visible in sealed chains
-forever, so a detector stamping the night it ran would re-derive the same split and fail
-``actions.same_but_for_recorded_at`` every night, appending it again every night forever.
+until marketlake #755 trims its sessions, so a detector stamping the night it ran would
+re-derive the same split and fail ``actions.same_but_for_recorded_at`` every night, appending
+it again every night until then.
 The two dates being equal is worth saying plainly, because the key exists to hold two
 different things apart. A split detected from a root change has no vendor date at all, so the
 boundary session is the only honest answer for either.
 
 **A held split has no way to clear, and that is inherited rather than new.**
 ``report.write_withheld`` says a held finding files again every night and the repetition is
-the record, and nothing prunes ``reports/``. Sealed chains never change, so a split this
-gate refuses is re-derived identically every night. The only resolution is the ``manual``
-entry #286 has not shipped, which is the same gap #284 already carries for dividends.
-Nothing here claims a gate that can be cleared.
+the record, and nothing prunes ``reports/``. A sealed chains partition never changes while it
+is on disk, and a held finding stops the walk's cutoff before its day, so the trim of
+marketlake #787 never drops that day and a split this gate refuses is re-derived identically
+every night. The only resolution is the ``manual`` entry #286 has not shipped, which is the
+same gap #284 already carries for dividends. Nothing here claims a gate that can be cleared.
+On a host with a lake window, a held finding of any kind therefore also stops the trim until
+the hold is resolved. The owner accepted that on 2026-10-07, decision 7 on marketlake #755,
+and the disk-runway alarm covers the growth meanwhile.
 
 **Rescaling is not this module's and never will be.** Rescaling historical strikes in place
 is storage mutation, which is how option databases quietly corrupt themselves. Cross-event
@@ -1565,7 +1570,8 @@ def detect_splits(
        the ledger's own record rules refuse, rather than ending the run as a traceback.
     10. The entry lands only when it differs from what ``latest`` already resolves on its
         key, on every field but ``recorded_at``. A split stays visible in sealed chains
-        forever, so without this the ledger would grow by a line every night.
+        until its sessions are trimmed, so without this the ledger would grow by a line every
+        night.
 
     **Both ways the resolution can fail hold the action and file it.** ``UnresolvedSymbol``
     says the master and the lake disagree about a ticker. ``AmbiguousSymbol`` says the master

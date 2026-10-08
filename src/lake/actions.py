@@ -1414,8 +1414,8 @@ def same_but_for_recorded_at(existing: dict | None, candidate: dict) -> bool:
     Public because ``lake.splits`` needs the same comparison and a second copy of it could
     drift from this one without anything noticing. What the two writers do differ on is what
     they stamp into ``observed_on``, and that is theirs rather than this rule's: a split
-    stays visible in sealed chains forever, so a detector stamping the night it ran would
-    fail this comparison every night and append the same split every night.
+    stays visible in sealed chains until its sessions are trimmed, so a detector stamping the
+    night it ran would fail this comparison every night and append the same split every night.
     """
     if existing is None:
         return False

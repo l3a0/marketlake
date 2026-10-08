@@ -491,7 +491,7 @@ def _check_tag(value: object) -> str:
 
 
 def _check_config(merged: Mapping[str, Any]) -> None:
-    """Refuse a merged mapping the daemon could not load, or a bucket job would refuse."""
+    """Refuse a merged mapping the daemon could not load, or a job would refuse."""
     # The refusal is raised after the handler, so the load error is not its context.
     failure = None
     try:

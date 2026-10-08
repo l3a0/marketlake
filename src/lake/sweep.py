@@ -14,7 +14,10 @@ What one run does, in the design's own order.
 1. The corporate-actions poll, so today's split flags before bars land. Two walks over sealed
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
    The split walk takes the calendar as well, because whether two sealed sessions are adjacent
-   is the calendar's answer and not the manifest's. Marketlake #431.
+   is the calendar's answer and not the manifest's. Marketlake #431. It runs through
+   ``split_checkpoint.walk_splits``, which resumes a ticker whose chains days were trimmed
+   from the split checkpoint, and when the window key ``lake_window_sessions`` is set the run
+   writes tonight's checkpoint after the walk. Marketlake #786.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
    the one the clock is in, because a daily bar waits for the next session to seal before
@@ -84,11 +87,12 @@ every session still unlanded rather than only the one its clock sits on.
 **A holiday runs none of the data work.** The schedule is Monday through Friday on both hosts, so
 a non-session weekday is a holiday, and the design has "compaction and the sweep no-op on an
 empty journal". The one-line digest settles it: a run whose walks found something would have
-nowhere to say so. The walks read every sealed ticker-day rather than today's, so a holiday
-run would re-derive yesterday's held findings and file each one again under
-``reports/withheld/`` for no new information. The run still pings, and the Friday branch still
-sets the wake, which the design's pmset table states directly. One side effect is worth
-naming: a holiday never builds the vendor, so it never reads the token.
+nowhere to say so. The walks read every sealed ticker-day rather than today's, or every one
+after a trimmed ticker's saved cutoff, so a holiday run would re-derive yesterday's held
+findings and file each one again under ``reports/withheld/`` for no new information. The run
+still pings, and the Friday branch still sets the wake, which the design's pmset table states
+directly. One side effect is worth naming: a holiday never builds the vendor, so it never
+reads the token.
 
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
