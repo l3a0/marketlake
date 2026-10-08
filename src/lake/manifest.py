@@ -1198,10 +1198,8 @@ def scrub(lake_root: Path) -> ScrubResult:
         filename = getattr(exc, "filename", None)
         if isinstance(exc, FileNotFoundError) and filename is not None and Path(filename) != root:
             return
-        try:
-            rel = Path(filename).relative_to(root).as_posix() if filename is not None else "."
-        except ValueError:
-            rel = "."
+        # ``os.walk`` builds every name it lists from ``root``, so each one sits under it.
+        rel = Path(filename).relative_to(root).as_posix() if filename is not None else "."
         where = "the lake root" if rel in ("", ".") else rel
         unreadable.append(f"{where}: {type(exc).__name__}")
 
