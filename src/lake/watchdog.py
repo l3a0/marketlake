@@ -565,8 +565,7 @@ class Watchdog:
         while claiming three minutes, when eighteen hours passed. A ``_paged`` flag
         carried the same way would silence a genuine page all the next morning, and so
         would a stall flag, so both are dropped here too. So is the set a sampler page
-        absorbed, or the collapse not holding today would hand yesterday's silenced
-        tickers a second page for a failure that already paged today.
+        absorbed, which keeps yesterday's entries out of today's set as a guard.
         """
         day = slot.astimezone(MARKET_TZ).date()
         if day != self._day:
@@ -827,6 +826,11 @@ class Watchdog:
         another cause's class sends no fresh sampler page, which is how an ordinary surface
         that has already paged behaves.
 
+        A minute that touched no surface releases nothing, because it says nothing about any
+        surface, the same judgement ``_drop_departed`` makes. Releasing there kept the
+        released tickers' counts, so the first minute they came back still failing sent the
+        sampler page again.
+
         It applies only where a request was actually attempted, and ``observe`` is the
         only caller for that reason. A slot the loop slept through gaps every quotes
         ticker too, and calling that a dead sampler would name a batched request nobody
@@ -845,14 +849,16 @@ class Watchdog:
         # A ticker a sampler page silenced is heard again once the collapse no longer
         # explains it, before ``tripped`` is built, so one at the threshold pages now. One
         # a live cause covers right now stays silenced, or a class flapping in and out of
-        # the cover would re-page the sampler on every flip.
-        explained = (sampler if holds else set()) | {
-            key
-            for key in self._sampler_absorbed
-            if self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
-        }
-        self._paged -= self._sampler_absorbed - explained
-        self._sampler_absorbed &= explained
+        # the cover would re-page the sampler on every flip. A cycle that touched nothing
+        # says nothing about any surface, so it releases none.
+        if watched:
+            explained = (sampler if holds else set()) | {
+                key
+                for key in self._sampler_absorbed
+                if self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
+            }
+            self._paged -= self._sampler_absorbed - explained
+            self._sampler_absorbed &= explained
         tripped = [
             key
             for key in sorted(failed, key=str)

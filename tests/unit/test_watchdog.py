@@ -3073,6 +3073,22 @@ def test_one_silenced_ticker_leaving_keeps_the_rest_silenced_while_the_collapse_
     ]
 
 
+def test_a_cycle_that_touched_nothing_keeps_the_silenced_tickers_silenced():
+    """A cycle that touched no surface says nothing about any of them, so it releases none.
+
+    The sampler page names SPY and QQQ at minute 2. Minute 3 touches nothing, the way a
+    roster with every ticker retired or every ticker out of span does. SPY and QQQ come
+    back still failing, with their counts intact. Releasing them on the empty minute sent
+    the sampler page again the moment they returned.
+    """
+    cycles = [_batch_minute(minute, {"SPY": "down", "QQQ": "down"}) for minute in range(3)]
+    cycles.append(_cycle(at=_at(3)))
+    cycles += [_batch_minute(minute, {"SPY": "down", "QQQ": "down"}) for minute in (4, 5)]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("QQQ quotes", "SPY quotes"))
+    ]
+
+
 # -- a silenced ticker a live cause covers stays silenced -----------------------------
 
 
