@@ -7,6 +7,7 @@ tests are too. Each one names the rule it checks.
 from __future__ import annotations
 
 import collections
+import errno
 import os
 import re
 import threading
@@ -14,6 +15,7 @@ from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import gap, journal
@@ -1049,6 +1051,57 @@ def test_a_day_whose_record_cannot_be_read_is_refused_rather_than_over_marked(tm
     # Named as corrupt, the kind that fits the damage: these bytes are not an Arrow
     # stream at all, so the file says nothing about its own schema.
     assert report.problems == ("quotes/XYZ 2026-09-01: 1 unreadable (1 corrupt)",)
+
+
+class _FillsAfter:
+    """A file handle that takes ``room`` bytes and then refuses, as a full disk does."""
+
+    def __init__(self, inner, room: int) -> None:
+        self._inner = inner
+        self._room = room
+
+    def write(self, data) -> int:
+        data = bytes(data)
+        if len(data) > self._room:
+            self._inner.write(data[: self._room])
+            self._room = 0
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self._room -= len(data)
+        return self._inner.write(data)
+
+    @property
+    def closed(self) -> bool:
+        return self._inner.closed
+
+
+def test_a_write_torn_inside_its_header_no_longer_stops_marking_the_pair(tmp_path, monkeypatch):
+    """The disk filled 100 bytes into the header, so nothing durable was ever written.
+
+    The writer removes that file (marketlake #769). Left in place, it read as a torn header,
+    which every reader refuses, and startup marking then refused the whole surface and
+    ticker for the day rather than mark the minute the write lost.
+    """
+    _capture(tmp_path, "XYZ", date(2026, 8, 31))
+    slot = et(2026, 9, 1, 11, 0)
+    batch = journal.gap_rows("quotes", ticker="XYZ", slots=[slot], error_class="x")
+    real = pa.PythonFile
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            pa, "PythonFile", lambda handle, mode=None: real(_FillsAfter(handle, 100), mode=mode)
+        )
+        with pytest.raises(OSError, match="No space"):
+            with journal.SegmentWriter.open(
+                tmp_path, "quotes", "XYZ", slot.date(), slot.strftime(gap.SEGMENT_STAMP_FORMAT), 1
+            ) as writer:
+                writer.write_cycle(batch)
+
+    report = _marker(tmp_path, et(2026, 9, 2, 10, 0), roster=Roster((EQUITY_ONLY,))).on_start(
+        et(2026, 9, 2, 10, 0)
+    )
+
+    assert report.problems == ()
+    tuesday = [span for span in report.spans if span.day == date(2026, 9, 1)]
+    assert [span.slots for span in tuesday] == [FULL_SESSION_SLOTS]
 
 
 def test_the_walk_back_cap_counts_sessions_not_calendar_days(tmp_path, monkeypatch):

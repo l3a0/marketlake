@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import capture, close_guard, daemon, gap, journal
 from lake.capture import CycleResult
 from lake.capture_spans import CaptureSpans, spans_path
+from lake.cassette import load_cassette
 from lake.manifest import append_manifest, manifest_path, sha256_file
 from lake.paths import LakePaths
 from lake.security_master import SecurityMaster, master_path
@@ -20,10 +23,13 @@ from lake.session import (
     SessionClock,
     SessionDispatch,
 )
+from lake.tickers import Roster
+from tests.conftest import CASSETTES
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
+from tests.support.vendor import CassetteVendor
 
 _STAMP_FORMAT = "%Y%m%dT%H%M%S%f"
 
@@ -273,6 +279,61 @@ def test_an_equity_close_that_ran_and_failed_is_already_recorded(tmp_path):
     outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("XYZ", False)]).run(DAY)
     assert outcome.unobserved == ()
     assert len(_rows(tmp_path, "quotes", "XYZ", DAY)) == 1
+
+
+class _FullDisk:
+    """A file handle whose every write is refused, as on a disk with no room left."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def write(self, data) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    @property
+    def closed(self) -> bool:
+        return self._inner.closed
+
+
+def test_a_spot_close_cycle_whose_write_failed_leaves_its_own_tagged_row(tmp_path, monkeypatch):
+    """The cycle's gap row records the failed 16:00 write, so the guard adds nothing.
+
+    The row carries the close tag, so ``NoSpotClose`` reads a cycle that ran and failed,
+    as after a fetch failure, rather than one that never tried (marketlake #769).
+    """
+    refused: list[str] = []
+    real_open = journal.SegmentWriter.open
+    real_file = pa.PythonFile
+
+    def open_(root, surface, ticker, *args, **kwargs):
+        refused.append(f"{surface}/{ticker}")
+        return real_open(root, surface, ticker, *args, **kwargs)
+
+    def python_file(handle, mode=None):
+        # Only the first quotes segment for SPY, the data write. Its gap row lands.
+        first = refused[-1] == "quotes/SPY" and refused.count("quotes/SPY") == 1
+        return real_file(_FullDisk(handle) if first else handle, mode=mode)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(journal.SegmentWriter, "open", open_)
+        patched.setattr(pa, "PythonFile", python_file)
+        result = capture.run_cycle(
+            ManualClock(start=et(2026, 9, 2, 16, 0, 1)),
+            CassetteVendor(load_cassette(CASSETTES / "spy_minimal.json")),
+            Roster.from_mapping({"SPY": {"options": False}, "QQQ": {"options": False}}),
+            tmp_path,
+            pid=4242,
+            slot=et(2026, 9, 2, 16, 0),
+            close_tag=SPOT_CLOSE,
+        )
+    assert result.errors == (capture.SegmentError("quotes", "SPY", "o_s_error"),)
+
+    outcome = _guard(tmp_path, _clock(et(2026, 9, 2, 16, 18)), [("SPY", False)]).run(DAY)
+
+    assert outcome.unobserved == ()
+    [row] = _rows(tmp_path, "quotes", "SPY", DAY)
+    assert row["close_tag"] == SPOT_CLOSE
+    assert row["error_class"] == capture.SEGMENT_WRITE_FAILED
 
 
 def _untagged(root: Path, ticker: str, slot: datetime) -> None:

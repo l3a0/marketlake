@@ -38,6 +38,7 @@ from lake.manifest import LedgerNotUtf8, manifest_path, read_manifest
 from lake.tickers import Roster
 from lake.timing import timing_path
 from lake.vendor import VendorError, VendorResponse
+from tests.component.test_capture_cycle import _refuse_writes
 from tests.support.clock import ManualClock
 from tests.support.timing import request_lines
 
@@ -645,7 +646,8 @@ def test_a_unit_whose_write_raises_costs_its_own_segment_and_the_others_land(
 ):
     # QQQ's chain and SPY's quote segment cannot be opened. Each is recorded as its own
     # error, in plan order although QQQ's chain finishes first, and the other two land with
-    # manifest entries.
+    # manifest entries. Refusing the open per surface and ticker refuses the gap row too,
+    # since it opens the same path, so this is the case where the gap row fails as well.
     real = journal.SegmentWriter.open
 
     def refuse(root, surface, ticker, *args, **kwargs):
@@ -663,6 +665,37 @@ def test_a_unit_whose_write_raises_costs_its_own_segment_and_the_others_land(
     )
     assert [(s.surface, s.ticker) for s in result.segments] == [(CHAINS, "SPY"), (QUOTES, "QQQ")]
     assert [entry["partition"] for entry in read_manifest(lake_root)] == list(result.partitions)
+
+
+def test_failed_write_lines_print_in_plan_order_whatever_order_the_units_landed(
+    lake_root, monkeypatch, capsys
+):
+    # SPY's chain lands last, after QQQ's quote segment, and its line still prints first,
+    # because the lines print after the landing loop in plan order (marketlake #769).
+    _refuse_writes(monkeypatch, {(CHAINS, "SPY"): ["write"], (QUOTES, "QQQ"): ["write"]})
+    opened: list[tuple[str, str]] = []
+    refusing_open = journal.SegmentWriter.open
+
+    def record(root, surface, ticker, *args, **kwargs):
+        opened.append((surface, ticker))
+        return refusing_open(root, surface, ticker, *args, **kwargs)
+
+    monkeypatch.setattr(journal.SegmentWriter, "open", record)
+    vendor = _ThreadedVendor(delay={("SPY", _d(0)): 0.2})
+    result = _run(vendor, lake_root)
+
+    assert opened.index((QUOTES, "QQQ")) < opened.index((CHAINS, "SPY"))
+    assert result.errors == (
+        capture.SegmentError(CHAINS, "SPY", "o_s_error"),
+        capture.SegmentError(QUOTES, "QQQ", "o_s_error"),
+    )
+    lines = [
+        line for line in capsys.readouterr().err.splitlines() if "segment write failed" in line
+    ]
+    assert [line.split("segment write failed: ")[1].split(" (")[0] for line in lines] == [
+        "chains SPY",
+        "quotes QQQ",
+    ]
 
 
 def test_the_timing_lines_keep_plan_order_whatever_order_the_units_finished(lake_root):
@@ -734,7 +767,9 @@ def test_a_slow_write_cannot_stretch_the_stagger(lake_root, monkeypatch):
 @pytest.mark.parametrize("cap", [1, 20])
 def test_a_write_that_raises_any_exception_costs_only_its_own_segment(lake_root, monkeypatch, cap):
     # ``write_cycle`` can raise pyarrow's ``ArrowInvalid``, a ``ValueError`` rather than an
-    # ``OSError``. It is recorded like a refused disk, and the other units still land.
+    # ``OSError``. It is recorded like a refused disk, and the other units still land. The
+    # refusal is on the open for that surface and ticker, which refuses the gap row too,
+    # so this is the case where the gap row fails as well.
     real = journal.SegmentWriter.open
 
     def refuse(root, surface, ticker, *args, **kwargs):

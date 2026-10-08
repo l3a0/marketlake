@@ -310,6 +310,38 @@ def test_fetch_end_is_the_latest_units_whatever_order_the_units_land_in(lake_roo
     assert line["fetch_end_ts"] >= quotes["request_end_ts"]
 
 
+def test_segments_durable_comes_after_the_gap_rows_of_failed_writes(
+    lake_root, timed_phases, monkeypatch
+):
+    """A failed write's gap row is flushed before the cycle reads the instant (marketlake #769).
+
+    Each gap row takes 5s here, so an instant read before them would show their flushes
+    as the wait for the lock.
+    """
+    clock = timed_phases
+    timed_write = capture._CaptureCycle._write
+    real_mark = capture._CaptureCycle._mark_failed_write
+    marked: list[datetime] = []
+
+    def refuse_quotes(self, surface, ticker, plan):
+        if surface == QUOTES:
+            raise OSError("disk refused")
+        return timed_write(self, surface, ticker, plan)
+
+    def slow_mark(self, failure):
+        clock.advance(5.0)
+        real_mark(self, failure)
+        marked.append(clock.now())
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", refuse_quotes)
+    monkeypatch.setattr(capture._CaptureCycle, "_mark_failed_write", slow_mark)
+
+    _run(_vendor(clock, chain_s=3.0, quote_s=1.0), clock, lake_root)
+
+    assert marked
+    assert _only_cycle_line(lake_root)["segments_durable_ts"] == marked[-1].isoformat()
+
+
 # -- 3. a lock another holder holds ----------------------------------------------------------
 
 _HOLD_S = 0.6
