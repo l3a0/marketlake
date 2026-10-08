@@ -1469,6 +1469,23 @@ Three things call for a rerun.
    size that has not changed means rerun a minute later. AWS cannot shrink a volume, so
    the size only grows.
 
+   When the volume filled before it grew, the daemon may have lost minutes it fetched.
+   Each segment the disk refused printed one line to journald, which lives on the root
+   volume, and the line says whether a gap row recorded the minute in the lake
+   ([#769](https://github.com/l3a0/marketlake/issues/769)). Find them this way.
+
+   ```bash
+   TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'segment write failed'
+   ```
+
+   A minute whose gap row did not land is recorded only by a restart, which marks it
+   `daemon_dead`, and only before compaction next seals that day. The bootstrap's
+   install restarts nothing, so restart the daemon once the volume has grown.
+
+   ```bash
+   sudo ~/.local/state/marketlake/systemd/restart.sh daemon
+   ```
+
 **When the clone failed.** A clone that fails all 10 attempts leaves no bootstrap on
 disk, so nothing ran. `cloud-init status --long` reports the boot as an error, and the
 log's last line says the clone failed. The shim wrote `bootstrap.conf` before the clone,
