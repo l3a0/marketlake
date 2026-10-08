@@ -224,6 +224,34 @@ class SymbolHistory:
     def __len__(self) -> int:
         return len(self._seen)
 
+    def export(self) -> tuple[tuple[int, str, date], ...]:
+        """Every contract this history knows, as ``(ssid, symbol, first day)``, in ``ssid`` order.
+
+        This is what lets a walk stop at one day and resume after it without reading the days
+        before it, which marketlake #783 builds for a lake whose older partitions are trimmed.
+        The first day is carried with the symbol because it is the ``valid_from`` a later
+        re-symboling of the contract dates its old mapping from. A history rebuilt from the
+        sessions after a trim would date it from the first of those instead.
+
+        It is a tuple of plain values rather than a copy of the dict, so a caller holding it
+        cannot reach back into a history that goes on observing.
+        """
+        return tuple(sorted((ssid, symbol, day) for ssid, (symbol, day) in self._seen.items()))
+
+    @classmethod
+    def from_export(cls, entries: Iterable[tuple[int, str, date]]) -> SymbolHistory:
+        """A history holding exactly what :meth:`export` returned.
+
+        Two entries naming one ``ssid`` are refused rather than letting the second win, since
+        an export never carries one twice and keeping either would silently re-date a contract.
+        """
+        history = cls()
+        for ssid, symbol, day in entries:
+            if ssid in history._seen:
+                raise ValueError(f"the history names contract {ssid} twice")
+            history._seen[ssid] = (symbol, day)
+        return history
+
     def reset(self) -> None:
         """Forget everything. The walk calls this when the instrument changes."""
         self._seen.clear()

@@ -17,8 +17,9 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    costs the manifest and the corporate-actions ledgers, which still read short.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
-3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha.
-   And every data file in the lake must have an entry. The second direction catches a
+3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha,
+   unless the trimmed ledger records it as removed on purpose (``lake.trimmed``, marketlake
+   #782). And every data file in the lake must have an entry. The second direction catches a
    crash between writing a file and appending its entry.
 
 The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolves on
@@ -36,16 +37,18 @@ verdicts and admit the partitions they withhold. :func:`read_quarantine` refuses
 byte-order mark, which does decode and still cannot be read past. The manifest's reader keeps
 the truncating read **for a torn tail**, because :func:`scrub` resolves through it and a Sunday
 scrub that raised would fail on the very file it exists to report. Bytes that will not decode
-are not that shape, and both ledgers refuse them as :class:`LedgerNotUtf8`, because a read that
-cannot decode the file answers nothing for the scrub to report either way. Marketlake #499 is
-that half. What the manifest does about a byte-order mark is still open and is marketlake #519.
+are not that shape, and every ledger read here refuses them as :class:`LedgerNotUtf8`, because
+a read that cannot decode the file answers nothing for the scrub to report either way.
+Marketlake #499 is that half. What the manifest does about a byte-order mark is still open
+and is marketlake #519.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
 it keys on the action rather than on a path, the way the quarantine ledger keys on the
 partition and the check, so ``lake.actions`` resolves its own last entry and reuses
 ``append_line`` and ``parse_jsonl`` for the line rules alone. Those two are public for that
-reason: three ledgers now implement one rule, and a second copy of it would be a second
-answer to what a torn tail is.
+reason: four ledgers now implement one rule, and a second copy of it would be a second
+answer to what a torn tail is. The fourth is the trimmed ledger at ``trimmed.jsonl``, whose
+strict append in ``lake.trimmed`` writes through the same one-write primitive.
 
 The same ledger judges the backup copy. ``backup_scrub`` walks the rsync target and
 checks it against this manifest rather than against the copy of the manifest riding on
@@ -103,10 +106,11 @@ from lake.paths import (
 #    by name, so a subdirectory added under it needs nothing added here. None of the five
 #    is a measurement.
 #
-# Neither the quarantine ledger nor the corporate-actions ledger is on this list, and
-# both are off it deliberately. Each writer refreshes its own manifest entry in the same
-# locked invocation that appends the row, so both are scrubbed like any sealed file. That
-# is the check that catches a verdict, or an action, written without its entry.
+# None of the quarantine ledger, the corporate-actions ledger and the trimmed ledger is on
+# this list, and each is off it deliberately. Each writer refreshes its own manifest entry in
+# the same locked invocation that appends the row, so all three are scrubbed like any sealed
+# file. That is the check that catches a verdict, an action, or a trim written without its
+# entry.
 #
 # An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
 # at the lake root. The lock adds no file to skip, because it locks the manifest itself.
@@ -194,7 +198,9 @@ class LedgerNotUtf8(ManifestError):
     ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves the manifest,
     so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
     ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
-    the sentence above is true of one of the two ledgers this class now covers.
+    the sentence above is false of the manifest. It is true of the other two ledgers this class
+    covers, the quarantine ledger and the trimmed ledger, whose three readers in marketlake #782
+    each contain it.
     """
 
 
@@ -293,6 +299,20 @@ _MANIFEST_CONSEQUENCE = (
     "say which partitions the lake holds, how many rows each one has, or what its checksum was."
 )
 
+# What a ledger loses when whole lines sit behind the point a read stopped at, and what it loses
+# when a byte-order mark is read past. Both default to the quarantine ledger's words, because
+# that ledger was the only caller until the trimmed ledger (marketlake #782) gave the same two
+# refusals a second reader. A refusal's text becomes a problem line word for word, so a trimmed
+# ledger refused in quarantine's words would send the operator to the wrong file's guard.
+_QUARANTINE_HIDDEN_CONSEQUENCE = (
+    "Every verdict behind that line is invisible, so this ledger cannot say which partitions it "
+    "withholds."
+)
+_QUARANTINE_MARK_CONSEQUENCE = (
+    "Read past it, a verdict is either discarded or filed under a name no reader asks about, so "
+    "this ledger cannot say which partitions it withholds."
+)
+
 
 def _decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
     """A ledger's bytes as text, or :class:`LedgerNotUtf8` naming the byte that refused.
@@ -315,18 +335,19 @@ def _decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
     pinning removes is a dependence on an interpreter flag nobody tracks rather than a failure
     anything has met.
 
-    **This is the shared rule, and :func:`_decode` is the quarantine ledger's own reader.** Both
-    ledgers refuse bytes that will not decode, and the refusal is one implementation, which is
-    why it sits apart from the caller. What deliberately does not cross between them is anything
-    one ledger decides for itself. Marketlake #506 settled what the quarantine ledger does about
+    **This is the shared rule, and :func:`_decode` is the reader the quarantine and trimmed
+    ledgers share.** The manifest, the quarantine ledger and the trimmed ledger all refuse bytes
+    that will not decode, and the refusal is one implementation, which is why it sits apart from
+    the caller. What deliberately does not cross between them is anything one ledger decides for
+    itself. Marketlake #506 settled what the quarantine ledger does about
     a byte-order mark and marketlake #519 is that question for the manifest, still open and
     owned by nobody. A manifest read routed through :func:`_decode` would inherit #506's answer
     without anyone deciding it should, so it routes through here instead and #519 keeps its
     question.
 
     **The consequence sentence belongs to the caller.** The byte, the line and the repair are
-    the same for both ledgers. What the damage costs is not, so the caller supplies it rather
-    than this function naming one ledger's loss on the other's file.
+    the same for every ledger read here. What the damage costs is not, so the caller supplies it
+    rather than this function naming one ledger's loss on another's file.
 
     **The message sends the person repairing the file to the byte and to the line.** The
     exception carries the byte offset alone, which is the wrong unit for an editor, so the
@@ -460,7 +481,13 @@ def latest_entries(lake_root: Path) -> dict[str, dict]:
     return _latest_by_partition(read_manifest(lake_root), manifest_path(lake_root))
 
 
-def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> None:
+def _refuse_hidden_entries(
+    path: Path,
+    text: str,
+    entries: Sequence[dict],
+    *,
+    consequence: str = _QUARANTINE_HIDDEN_CONSEQUENCE,
+) -> None:
     """Raise :class:`TornLedger` when whole lines sit after the point the read stopped at.
 
     ``parse_jsonl`` ends the read at the first line it cannot parse, so the count it returns
@@ -502,6 +529,9 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
     the positions, and a positive ``hidden`` is exactly the statement that ``len(entries)`` is a
     position this list holds. A length check there was tried and the mutation review found it
     inert: every input it would have returned on, ``hidden <= 0`` returns on first.
+
+    ``consequence`` is the sentence naming what the hidden lines cost, and it belongs to the
+    caller for the reason :func:`_decode_utf8` gives about its own.
     """
     positions = [number for number, line in enumerate(text.splitlines(), start=1) if line.strip()]
     hidden = len(positions) - len(entries) - 1
@@ -510,19 +540,25 @@ def _refuse_hidden_entries(path: Path, text: str, entries: Sequence[dict]) -> No
     raise TornLedger(
         f"{path}: the read stopped at line {positions[len(entries)]} and {hidden} "
         f"line{'' if hidden == 1 else 's'} after it {'is' if hidden == 1 else 'are'} written "
-        "and unreachable. Every verdict behind that line is invisible, so this ledger cannot "
-        "say which partitions it withholds. Repairing a ledger is a human's job under the lock."
+        f"and unreachable. {consequence} Repairing a ledger is a human's job under the lock."
     )
 
 
-def _decode(path: Path, raw: bytes) -> str:
-    """The quarantine ledger's bytes as text, or a refusal naming what in them cannot be read.
+def _decode(
+    path: Path,
+    raw: bytes,
+    *,
+    consequence: str = _QUARANTINE_CONSEQUENCE,
+    mark_consequence: str = _QUARANTINE_MARK_CONSEQUENCE,
+) -> str:
+    """A guard ledger's bytes as text, or a refusal naming what in them cannot be read.
 
-    Two shapes refuse. Bytes that do not decode raise :class:`LedgerNotUtf8`, through
-    :func:`_decode_utf8`, which both ledgers share. Text that decodes and holds a byte-order
-    mark raises :class:`LedgerHasByteOrderMark`, and that one is this ledger's alone: marketlake
-    #519 is the same question for the manifest and it is open, so :func:`_read_jsonl` reads
-    through :func:`_decode_utf8` and meets only the first of the two.
+    The quarantine ledger and the trimmed ledger read through here. Two shapes refuse. Bytes
+    that do not decode raise :class:`LedgerNotUtf8`, through :func:`_decode_utf8`, which the
+    manifest shares. Text that decodes and holds a byte-order mark raises
+    :class:`LedgerHasByteOrderMark`, and the manifest does not refuse that one: marketlake #519
+    is the same question for the manifest and it is open, so :func:`_read_jsonl` reads through
+    :func:`_decode_utf8` and meets only the first of the two.
 
     **The byte-order mark is looked for in the decoded text rather than in the bytes.** A UTF-16
     mark is not valid UTF-8, so ``FF FE`` and ``FE FF`` both refuse above as
@@ -542,8 +578,12 @@ def _decode(path: Path, raw: bytes) -> str:
     operator is told. A tear sends them looking for a half-written line, and a marked ledger
     holds none: every line in it is intact. The mark wins because it is a statement about the
     whole file, where a tear is a statement about one line in it.
+
+    The two consequence sentences default to the quarantine ledger's. The trimmed ledger reads
+    through here too, with its own, because the byte-order mark argues the same way on any
+    ledger whose entries a guard resolves.
     """
-    text = _decode_utf8(path, raw, consequence=_QUARANTINE_CONSEQUENCE)
+    text = _decode_utf8(path, raw, consequence=consequence)
     index = text.find(BYTE_ORDER_MARK)
     # ``!= -1`` rather than a truthiness test. A leading mark is the one an editor writes, so it
     # is the case that has to be caught, and its index is zero, which a truthiness test drops.
@@ -569,10 +609,8 @@ def _decode(path: Path, raw: bytes) -> str:
             f"{path}: byte {offset} on line {line} begins a byte-order mark, the three bytes "
             f"ef bb bf. It is valid UTF-8 and zero width, so it decodes cleanly and an editor "
             f"shows nothing there. {where}. Nothing in this lake writes this character, so these "
-            "bytes were changed by something other than a writer. Read past it, a verdict is "
-            "either discarded or filed under a name no reader asks about, so this ledger cannot "
-            "say which partitions it withholds. Repairing a ledger is a human's job under the "
-            "lock."
+            f"bytes were changed by something other than a writer. {mark_consequence} Repairing "
+            "a ledger is a human's job under the lock."
         )
     return text
 
@@ -588,17 +626,18 @@ def read_quarantine(lake_root: Path) -> list[dict]:
     quarantine consumer funnels through, so all three refusals reach all of them from one place.
 
     **Why the torn-tail refusal is here and not in ``parse_jsonl``.** The rule is the same for
-    both ledgers and the consequences are not. :func:`scrub` resolves the manifest through
-    :func:`latest_entries`, so a manifest raising on a torn tail would take the Sunday scrub
-    down on exactly the file it exists to report, and the entries in front of the tear are real
-    and are what the scrub reads. Marketlake #447 carries the manifest ledger and the scrub's
-    own reporting of damage. This ledger's readers are a guard, and a guard that cannot read its
-    own ledger has to refuse rather than admit, which is :func:`is_quarantined`'s stated rule at
-    file scope.
+    the manifest and this ledger, and the consequences are not. :func:`scrub` resolves the
+    manifest through :func:`latest_entries`, so a manifest raising on a torn tail would take the
+    Sunday scrub down on exactly the file it exists to report, and the entries in front of the
+    tear are real and are what the scrub reads. Marketlake #447 carries the manifest ledger and
+    the scrub's own reporting of damage. This ledger's readers are a guard, and a guard that
+    cannot read its own ledger has to refuse rather than admit, which is :func:`is_quarantined`'s
+    stated rule at file scope.
 
     That argument is about a read that still answers, so it does not reach
-    :class:`LedgerNotUtf8`. Both ledgers refuse those bytes, because neither read answers
-    anything on a file it cannot decode. Marketlake #499 moved the manifest's half.
+    :class:`LedgerNotUtf8`. The manifest and this ledger both refuse those bytes, because
+    neither read answers anything on a file it cannot decode. Marketlake #499 moved the
+    manifest's half.
 
     ``_read_jsonl`` is not reused because this needs the text the count is taken from, and
     that function returns entries alone. A missing ledger still reads as no entries, which is
@@ -952,7 +991,7 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
     mapping, including a verdict spelling ``is_quarantined`` refuses to clear, where
     ``battery.build_entry`` is the one place an entry is assembled and checked.
 
-    It stays public because the two ledgers' line rules live here and a test writing a
+    It stays public because the ledgers' line rules live here and a test writing a
     deliberately malformed entry needs a way past the checked builder.
     """
     append_line(quarantine_path(lake_root), entry)
@@ -972,16 +1011,29 @@ class ScrubResult:
     - ``sha_mismatches``: a file present but not matching its last recorded sha. A
       forward-pass failure.
     - ``orphans``: a data file with no manifest entry. A reverse-pass failure.
+
+    ``trimmed_unreadable`` is the refusal text of a trimmed ledger the scrub could not read, or
+    ``None`` when it read or is absent. With it set, the scrub cannot tell a partition removed on
+    purpose from one lost, so every absent file is in ``missing`` and the scrub fails closed. It
+    is a field rather than a raise because ``control_plane.sunday_maintenance`` calls the scrub
+    with no guard, and a raise would cost the canary and the ping with the cause only in the job
+    log.
     """
 
     missing: tuple[str, ...]
     sha_mismatches: tuple[str, ...]
     orphans: tuple[str, ...]
+    trimmed_unreadable: str | None = None
 
     @property
     def ok(self) -> bool:
-        """Whether the scrub found nothing wrong in either direction."""
-        return not (self.missing or self.sha_mismatches or self.orphans)
+        """Whether the scrub found nothing wrong in either direction, and read every ledger."""
+        return not (
+            self.missing
+            or self.sha_mismatches
+            or self.orphans
+            or self.trimmed_unreadable is not None
+        )
 
 
 def _compacted_partition_for_segment(rel: str) -> str | None:
@@ -1019,13 +1071,28 @@ def scrub(lake_root: Path) -> ScrubResult:
     Forward pass: every manifest entry's file must exist and match its last recorded
     sha. A slice-1 segment entry is treated as superseded once an entry exists for its
     matching compacted partition, so compaction's verify-then-delete never strands it.
+    A file the trimmed ledger records as removed on purpose is a designed absence, which
+    ``lake.trimmed.is_designed_absence`` decides, and is not ``missing``. The ledger is read
+    only when it exists, so a lake that never trims scrubs exactly as before. A ledger that
+    cannot be read sets ``trimmed_unreadable`` and leaves every absent file in ``missing``.
 
     Reverse pass: every data file under the lake root must have a manifest entry. The
     enumerated exclusion set is skipped. The lock adds nothing to skip, because it
     locks the manifest, which is already excluded.
     """
+    # Local: ``lake.trimmed`` builds on this module, so a module-level import would be circular.
+    from lake.trimmed import is_designed_absence, latest_trimmed, trimmed_path
+
     root = Path(lake_root)
     latest = latest_entries(root)
+
+    trimmed: dict = {}
+    trimmed_unreadable: str | None = None
+    if trimmed_path(root).exists():
+        try:
+            trimmed = latest_trimmed(root)
+        except (ManifestError, OSError) as exc:
+            trimmed_unreadable = f"{type(exc).__name__}: {exc}"
 
     missing: list[str] = []
     sha_mismatches: list[str] = []
@@ -1037,7 +1104,9 @@ def scrub(lake_root: Path) -> ScrubResult:
             continue
         path = root / partition
         if not path.exists():
-            missing.append(partition)
+            # An unreadable ledger leaves ``trimmed`` empty, so every absence lands here.
+            if not is_designed_absence(partition, latest, trimmed):
+                missing.append(partition)
         elif sha256_file(path) != entry["sha256"]:
             sha_mismatches.append(partition)
 
@@ -1055,6 +1124,7 @@ def scrub(lake_root: Path) -> ScrubResult:
         tuple(sorted(missing)),
         tuple(sorted(sha_mismatches)),
         tuple(sorted(orphans)),
+        trimmed_unreadable=trimmed_unreadable,
     )
 
 
