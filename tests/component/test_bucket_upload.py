@@ -848,3 +848,33 @@ def test_the_first_upload_summary_counts_every_file_and_its_time(tmp_path):
     assert again.puts == 0 and again.put_bytes == 0
     assert again.skipped == len(files) - 1
     assert again.seconds == 0.0
+
+
+def test_the_nightly_upload_still_refuses_a_designed_absence_among_its_pending_entries(tmp_path):
+    """Marketlake #782. Mutation this catches: pointing the nightly upload at the first upload's
+    variant of ``manifested_files``.
+
+    A trim removes only a partition whose entry sits behind the bucket's watermark, and the
+    watermark never moves back, so a designed absence past it cannot happen. The nightly upload
+    keeps the raise that guards exactly that, rather than learning to skip it.
+    """
+    from lake.trimmed import append_trimmed, trim_line
+
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    rel = _seal_another_day(lake)
+    line = trim_line(
+        rel,
+        sha256=sha256_file(lake / rel),
+        version_id="v1",
+        verified_at="2026-08-25T16:40:00-04:00",
+        trimmed_at="2026-08-25T16:41:00-04:00",
+    )
+    with lake_lock(lake):
+        append_trimmed(lake, line, source="test-trim", fetched_at=None)
+    (lake / rel).unlink()
+
+    with pytest.raises(ManifestedFileMissing, match=rel):
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    assert _key("manifest.jsonl") not in [put["Key"] for put in client.puts()]

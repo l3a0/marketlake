@@ -1247,11 +1247,11 @@ def surface_ticker_days(lake_root: Path, surface: str) -> list[tuple[str, date]]
     nothing catches it, because this walk passes over a key it cannot read rather than
     raising on one.
 
-    A key naming any other surface is passed over, along with both ledgers and every
-    reference table. ``surface`` is a parameter rather than a constant because two walks
-    enumerate this way and they read different surfaces. The dividend extraction below reads
-    quotes and ``lake.splits`` reads chains, and a second copy of this would be a second
-    place the partition-key convention lives.
+    A key naming any other surface is passed over, along with every ledger that carries a
+    manifest entry and every reference table. ``surface`` is a parameter rather than a constant
+    because two walks enumerate this way and they read different surfaces. The dividend
+    extraction below reads quotes and ``lake.splits`` reads chains, and a second copy of this
+    would be a second place the partition-key convention lives.
     """
     found: list[tuple[str, date]] = []
     for partition in latest_entries(lake_root):

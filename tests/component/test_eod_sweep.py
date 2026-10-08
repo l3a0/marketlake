@@ -95,6 +95,11 @@ CENSUS_RENAMED = {"cleared": "clean", "appended": "wrote"}
 # ``paged``'s question as much as this field's. Answering it for one of the two would leave
 # the pair inconsistent, so it is not marketlake #427's to answer.
 CENSUS_NOT_COUNTS = {"report", "report_kinds", "findings", "paged", "drift_paged"}
+# The one count the census prints only above zero, for the reason ``battery.BatteryReport``
+# gives: a lake that never trims renders the census exactly as it did before marketlake #782.
+# The derived test over a real run skips it, because that run trims nothing. The distinct-value
+# test gives it a number, so it is still read off its own field there.
+CENSUS_ABOVE_ZERO = {"sessions_trimmed"}
 
 # The week the fixture calendar serves. 2026-09-14 is a Monday, so the sessions run Monday
 # through Friday and the second Monday gives the Friday branch a next week to wake before.
@@ -2324,14 +2329,16 @@ def test_the_sweeps_census_carries_every_count_the_battery_produces(fixture_lake
     named = {field.name for field in fields(BatteryReport)}
     assert CENSUS_RENAMED.keys() <= named, f"stale rename: {CENSUS_RENAMED.keys() - named}"
     assert CENSUS_NOT_COUNTS <= named, f"stale exclusion: {CENSUS_NOT_COUNTS - named}"
+    assert CENSUS_ABOVE_ZERO <= named, f"stale exclusion: {CENSUS_ABOVE_ZERO - named}"
 
     root = _lake(fixture_lake)
 
     outcome, _, _ = _run(root)
     (line,) = [ln for ln in outcome.render().splitlines() if "battery: judged" in ln]
 
+    assert "trimmed" not in line, "a lake that trims nothing prints no trimmed count"
     for field in fields(BatteryReport):
-        if field.name in CENSUS_NOT_COUNTS:
+        if field.name in CENSUS_NOT_COUNTS | CENSUS_ABOVE_ZERO:
             continue
         name = CENSUS_RENAMED.get(field.name, field.name)
         assert re.search(rf"(?:^|\s){re.escape(name)} -?\d+", line), (
@@ -2378,6 +2385,7 @@ def test_each_census_count_carries_its_own_number():
         scope_unknown=10,
         sessions_owed=11,
         sessions_missing=12,
+        sessions_trimmed=14,
         appended=("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"),
     )
     outcome = sweep.SweepOutcome(
@@ -2408,7 +2416,7 @@ def test_each_census_count_carries_its_own_number():
     # Every count distinct, which is what makes the loop above able to tell one field from the
     # one beside it. A fixture that repeated a value would pass a census reading the wrong field
     # for that pair, so this holds the fixture rather than the code.
-    assert len(seen) == 13, f"the fixture must give each count its own value: {sorted(seen)}"
+    assert len(seen) == 14, f"the fixture must give each count its own value: {sorted(seen)}"
 
 
 def test_a_holiday_runs_no_battery_at_all(fixture_lake: FixtureLake):

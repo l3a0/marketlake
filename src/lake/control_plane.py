@@ -2571,10 +2571,18 @@ def sunday_maintenance(
         problems.append(f"lake root missing: {root}")
     result = scrub(root)
     if not result.ok:
+        # The trimmed ledger's field is named only when it is set, so a lake that never trims
+        # renders this line exactly as it did before the ledger existed.
+        unreadable = " trimmed_ledger=unreadable" if result.trimmed_unreadable is not None else ""
         problems.append(
             "scrub failed: "
             f"missing={len(result.missing)} sha_mismatches={len(result.sha_mismatches)} "
-            f"orphans={len(result.orphans)}"
+            f"orphans={len(result.orphans)}{unreadable}"
+        )
+    if result.trimmed_unreadable is not None:
+        problems.append(
+            "trimmed ledger unreadable, so every absent file counts as missing: "
+            f"{result.trimmed_unreadable}"
         )
 
     # ``None`` is the shadow role's skip, and it skips every form of the backup step.
