@@ -4433,7 +4433,7 @@ def _trim_away(root: Path, rel: str = TRIMMED) -> None:
     (root / rel).unlink()
 
 
-def _tear_the_ledger(root: Path) -> None:
+def _tear_the_trimmed_ledger(root: Path) -> None:
     from lake.trimmed import trimmed_path
 
     path = trimmed_path(root)
@@ -4519,7 +4519,7 @@ def test_a_torn_ledger_degrades_coverage_and_the_nights_verdicts_still_land(lake
     _cover_all(lake)
     _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-900.0))
     _trim_away(lake)
-    _tear_the_ledger(lake)
+    _tear_the_trimmed_ledger(lake)
 
     report = judge(lake, calendar=CALENDAR, now=NOW, day=DAY, guards=GuardConstants())
 
