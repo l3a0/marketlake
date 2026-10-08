@@ -13,6 +13,7 @@ is what makes the absence designed rather than lost.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 from dataclasses import replace
@@ -23,8 +24,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lake import actions, splits, sweep
+from lake import actions, split_checkpoint, splits, sweep
 from lake.alert import Publisher
+from lake.config import GuardConstants
 from lake.lock import lake_lock
 from lake.manifest import (
     ManifestError,
@@ -44,6 +46,7 @@ from lake.split_checkpoint import (
     checkpoint_path,
     mappings_at,
     read_checkpoint,
+    starting_state,
     walk_splits,
     write_checkpoint,
 )
@@ -728,6 +731,7 @@ def _sweep(
     calendar=LONG_CALENDAR,
     pinger: FakePinger | None = None,
     transport: FakeTransport | None = None,
+    guards: GuardConstants | None = None,
 ):
     pinger = FakePinger() if pinger is None else pinger
     transport = FakeTransport() if transport is None else transport
@@ -743,6 +747,7 @@ def _sweep(
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
         window_sessions=window,
+        guards=guards,
     )
     return outcome, pinger
 
@@ -940,3 +945,152 @@ def test_a_checkpoint_entry_is_dated_by_the_night_it_ran(fixture_lake: FixtureLa
     _night_one(root, edge=DAY_TWO)
 
     assert latest_entries(root)[CHECKPOINT_PARTITION]["fetched_at"] == FIRST_NIGHT.isoformat()
+
+
+# -- review fixes ---------------------------------------------------------------------------
+
+
+def test_a_ticker_that_stops_before_its_first_day_saves_the_starting_state(
+    fixture_lake: FixtureLake,
+):
+    """A saved cutoff must not outlive the day that now stops the walk before it.
+
+    Day one is quarantined after the first night saved a cutoff of day two. Walked from
+    scratch, the ticker stops before day one and reports no state. Kept, the saved entry would
+    let #787 trim day two past a skip a sign-off can reverse. The entry becomes the state a walk
+    from scratch starts from, whose cutoff covers no day, and the row count stays.
+    """
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _night_one(root, edge=DAY_TWO)
+    append_quarantine(root, {"partition": _partition(DAY_ONE), "verdict": "bad"})
+
+    walked = _night_two(root, edge=DAY_THREE)
+
+    assert _state(walked) is None
+    (entry,) = walked.entries
+    assert entry.state == starting_state("SPY")
+    assert entry.state.cutoff < DAY_ONE
+    write_checkpoint(root, Checkpoint(DAY_THREE, walked.entries), recorded_at=SECOND_NIGHT)
+    assert read_checkpoint(root).cutoffs() == {"SPY": date.min}
+    assert _night_two(root, edge=DAY_THREE).report.refused == ()
+
+
+def test_a_resumed_ticker_with_no_new_day_keeps_its_saved_entry(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    saved = _night_one(root, edge=DAY_THREE)
+    _trim(root, DAY_ONE)
+
+    walked = _night_two(root)
+
+    assert walked.entries == saved.entries
+
+
+def test_a_checkpoint_naming_one_contract_twice_refuses_in_the_sweep(fixture_lake: FixtureLake):
+    """Valid Parquet whose history names one ssid twice is unreadable, not a ``ValueError``.
+
+    Escaping the sweep would cost the night's report file, digest and ping.
+    """
+    root = _swept_lake(fixture_lake)
+    master = SecurityMaster.read(master_path(root))
+    state = WalkState("SPY", EARLY, None, frozenset(), ((1, "A", EARLY), (1, "B", EARLY)), 0, EARLY)
+    entry = CheckpointEntry(state=state, mappings=mappings_at(master, "SPY", EARLY))
+    write_checkpoint(root, Checkpoint(EARLY, (entry,)), recorded_at=FIRST_NIGHT)
+    _trim(root, EARLY)
+
+    with pytest.raises(CheckpointUnreadable, match="names one contract twice in SPY's history"):
+        read_checkpoint(root)
+    outcome, pinger = _sweep(root)
+
+    assert outcome.filed_at is not None
+    assert any(
+        problem.startswith("splits did not run for SPY: ") for problem in outcome.nightly.problems
+    )
+    assert pinger.events == []
+
+
+def test_the_window_key_in_config_yaml_reaches_the_checkpoint(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path: Path
+):
+    """``sweep_from_config`` hands the loaded key to the sweep, which then writes."""
+    root = _swept_lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    with config.open("a") as handle:
+        handle.write("lake_window_sessions: 22\n")
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: LONG_CALENDAR)
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    capsys.readouterr()
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EARLY}
+
+
+def test_a_checkpoint_write_that_raises_is_filed_and_withholds_the_ping(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    root = _swept_lake(fixture_lake)
+
+    def failing(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sweep, "write_checkpoint", failing)
+
+    outcome, pinger = _sweep(root)
+
+    assert outcome.nightly.problems == ("split checkpoint not written: OSError: disk full",)
+    assert "split checkpoint not written: OSError" in outcome.nightly.report
+    assert pinger.events == []
+    assert outcome.filed_at is not None
+
+
+def test_the_checkpoint_entry_is_recorded_while_the_lake_lock_is_held(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """``record_partition`` takes no lock of its own, so the write has to hold it.
+
+    A second open of the manifest conflicts with a held ``flock`` even inside one process, so
+    trying for it without blocking says whether the lock is held.
+    """
+    root = _lake(fixture_lake, SPLIT_LAKE)
+    held: list[bool] = []
+    real = split_checkpoint.record_partition
+
+    def spy(*args, **kwargs):
+        fd = os.open(root / "manifest.jsonl", os.O_RDONLY | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            held.append(False)
+        except BlockingIOError:
+            held.append(True)
+        finally:
+            os.close(fd)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(split_checkpoint, "record_partition", spy)
+
+    _night_one(root, edge=DAY_TWO)
+
+    assert held == [True]
+
+
+def test_the_sweep_judges_the_window_against_the_guards_it_was_given(fixture_lake: FixtureLake):
+    """A raised trailing median raises the floor past 22, so the sweep writes nothing."""
+    root = _swept_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, guards=GuardConstants(trailing_median_sessions=25))
+
+    assert any(
+        line.startswith("lake window refused: ") and "26 sessions" in line
+        for line in outcome.nightly.report
+    )
+    assert not checkpoint_path(root).exists()

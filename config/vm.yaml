@@ -15,11 +15,11 @@
 #
 # `lake_window_sessions` is how many recent sessions the VM keeps on its lake volume, and the
 # opt-in to trimming older partitions once the bucket holds them, #755 and #786. With it set,
-# the 18:30 sweep writes the split checkpoint, and #787's trim reads it. The owner set it to
-# 22 on 2026-10-07 (decision 1 on #755), after #786 measured that chains are nearly all of
-# each session's growth. The render refuses a value under the floor that the readers of sealed
-# chains need, which lake.window derives. Removing the key stops both the checkpoint and the
-# trim.
+# the 18:30 sweep writes the split checkpoint, and #787's trim reads it. The owner chose 22 on
+# 2026-10-07 (decision 1 on #755), to be set once du was measured per surface. #786 measured
+# it on 2026-10-08, and chains were nearly all of each session's growth, so 22 stands. The
+# render refuses a value under the floor that the readers of sealed chains need, which
+# lake.window derives. Removing the key stops both the checkpoint and the trim.
 role: shadow
 lake_root: /srv/marketlake
 token_store: store

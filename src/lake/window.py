@@ -23,7 +23,7 @@ sets a minimum on the window, and marketlake #786's body carries the table. Thre
 1. ``battery.trailing_medians`` reads ``trailing_median_sessions`` sessions before the
    judged day, so it needs that many plus the day itself. The value can be overridden in
    ``config.yaml``, which is why the floor reads the loaded guards.
-2. The dashboard's History panel reads ``dashboard.HISTORY_WINDOW_DAYS`` calendar days.
+2. The dashboard's History panel reads :data:`HISTORY_WINDOW_DAYS` calendar days.
 3. ``runway.assess`` reads the busiest day over ``runway.GROWTH_WINDOW_DAYS`` calendar days.
 
 The other readers need less: ``battery._judge_drift`` reads the previous sealed day, and
@@ -40,18 +40,30 @@ from datetime import date, timedelta
 
 from lake.calendar import Calendar
 from lake.config import LAKE_WINDOW_SESSIONS_KEY, GuardConstants
+from lake.runway import GROWTH_WINDOW_DAYS
 
 # The key, spelled once in ``lake.config`` beside the other keys. ``lake.vm_config``, the sweep
 # and marketlake #787's trim read it.
 WINDOW_KEY = LAKE_WINDOW_SESSIONS_KEY
 
-# How far back the edge is looked for before it gives up. The real calendar answers every
-# day back to 2006, so it never gets near this. A calendar that answers no session at all,
-# which a test's fake does outside the weeks it was built with, would otherwise hang the job.
+# How far back the edge is looked for before it gives up, at the least. A calendar that answers
+# no session at all, which a test's fake does outside the weeks it was built with, would
+# otherwise hang the job. The search grows with the window, by :func:`edge_search_days`, so a
+# long window is never cut off by a year: the NYSE holds 249 to 253 sessions in 366 days.
 EDGE_SEARCH_DAYS = 366
+# How many times the calendar days a window spans at five sessions a week the search allows.
+# Three covers every holiday run the NYSE has had since 2006 several times over.
+EDGE_SEARCH_MULTIPLE = 3
 
 _WEEK_DAYS = 7
 _WEEKDAYS = 5
+
+# The History panel's width in calendar days, the same value as ``dashboard.HISTORY_WINDOW_DAYS``.
+# It is restated here because importing ``lake.dashboard`` pulls DuckDB and the dashboard's whole
+# import graph into the 18:30 sweep and the VM's config render, about 17.5 MiB, for one integer.
+# ``tests/unit/test_window.py`` fails if the two drift. The dashboard can import it from here
+# once its own file is free to change, which marketlake #786 leaves to the session that holds it.
+HISTORY_WINDOW_DAYS = 30
 
 
 class WindowRefused(Exception):
@@ -64,7 +76,7 @@ class WindowRefused(Exception):
 
 
 class EdgeNotFound(Exception):
-    """No window edge lies within :data:`EDGE_SEARCH_DAYS` of the night it was counted from."""
+    """No window edge lies within :func:`edge_search_days` of the night it was counted from."""
 
 
 def most_sessions_in(days: int) -> int:
@@ -83,9 +95,6 @@ def window_floor(guards: GuardConstants) -> int:
 
     The module docstring names the three readers this is the largest of.
     """
-    from lake.dashboard import HISTORY_WINDOW_DAYS
-    from lake.runway import GROWTH_WINDOW_DAYS
-
     return max(
         guards.trailing_median_sessions + 1,
         most_sessions_in(HISTORY_WINDOW_DAYS),
@@ -114,6 +123,16 @@ def window_sessions(value: object, guards: GuardConstants) -> int | None:
     return value
 
 
+def edge_search_days(sessions: int) -> int:
+    """How many days back :func:`window_edge` looks for ``sessions`` sessions before refusing.
+
+    At least :data:`EDGE_SEARCH_DAYS`, and otherwise :data:`EDGE_SEARCH_MULTIPLE` times the
+    calendar days ``sessions`` weekdays span.
+    """
+    span = -(-sessions * _WEEK_DAYS // _WEEKDAYS)
+    return max(EDGE_SEARCH_DAYS, EDGE_SEARCH_MULTIPLE * span)
+
+
 def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
     """The window edge: the ``sessions``-th session counted back from ``tonight``, tonight first.
 
@@ -127,23 +146,32 @@ def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
         raise ValueError(f"a window holds at least one session, not {sessions}")
     counted = 0
     day = tonight
-    for _ in range(EDGE_SEARCH_DAYS):
+    search = edge_search_days(sessions)
+    for _ in range(search):
         if calendar.is_session(day):
             counted += 1
             if counted == sessions:
                 return day
         day -= timedelta(days=1)
+    if counted == 0:
+        raise EdgeNotFound(
+            f"no session in the {search} days up to {tonight.isoformat()}, so the calendar "
+            "answers no session there"
+        )
     raise EdgeNotFound(
-        f"no {sessions} sessions in the {EDGE_SEARCH_DAYS} days up to {tonight.isoformat()}, "
-        "so the calendar answers no session there"
+        f"only {counted} of {sessions} sessions in the {search} days up to "
+        f"{tonight.isoformat()}, so the window is longer than the search reaches"
     )
 
 
 __all__ = [
     "EDGE_SEARCH_DAYS",
+    "EDGE_SEARCH_MULTIPLE",
+    "HISTORY_WINDOW_DAYS",
     "EdgeNotFound",
     "WINDOW_KEY",
     "WindowRefused",
+    "edge_search_days",
     "most_sessions_in",
     "window_edge",
     "window_floor",

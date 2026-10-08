@@ -46,11 +46,14 @@ text names its repair, because the sweep's problem line is that text word for wo
 A trimmed ledger that cannot be read refuses the whole walk rather than one ticker. Without it
 no ticker can be told to resume or to walk from scratch.
 
-**What the next checkpoint holds.** Tonight's states replace the saved ones, ticker by ticker,
-and a ticker with no state tonight keeps its saved entry. So a ticker refused for one night is
-not refused for ever, and the count of entries only grows, which is what lets the manifest's
-row-count guard stand. One night is different: a checkpoint that could not be read and that a
-refused ticker still needs is left in place for the repair, and nothing is written over it.
+**What the next checkpoint holds.** Tonight's states replace the saved ones, ticker by ticker.
+A ticker refused tonight, or resumed with no new day, keeps its saved entry, so a ticker refused
+for one night is not refused for ever. A ticker walked from scratch that stopped before its
+first day saves :func:`starting_state`, whose cutoff covers no day, because a saved cutoff
+would otherwise outlive the skip or the held finding that now stops the walk before it. The
+count of entries only grows, which is what lets the manifest's row-count guard stand. One night
+is different: a checkpoint that could not be read and that a refused ticker still needs is left
+in place for the repair, and nothing is written over it.
 """
 
 from __future__ import annotations
@@ -77,6 +80,7 @@ from lake.manifest import (
     latest_quarantine,
     record_partition,
 )
+from lake.occ_mapping import SymbolHistory
 from lake.paths import (
     CHAINS,
     REFERENCE_DIR,
@@ -403,14 +407,24 @@ def _from_table(path: Path, table: pa.Table) -> Checkpoint:
                 strikes=frozenset(row["previous_strikes"] or ()),
                 spot=row["previous_spot"],
             )
+        history = tuple(
+            (item["ssid"], item["symbol"], item["first"]) for item in row["history"] or ()
+        )
+        # The walk rebuilds the history with ``SymbolHistory.from_export``, which raises a
+        # ``ValueError`` on a contract named twice. Asked here, it is a checkpoint this code
+        # cannot read, rather than an exception that escapes the sweep and costs its record.
+        try:
+            SymbolHistory.from_export(history)
+        except ValueError:
+            history = None
+        if history is None:
+            raise CheckpointUnreadable(path, f"names one contract twice in {ticker}'s history")
         state = WalkState(
             ticker=ticker,
             cutoff=row["cutoff"],
             previous=previous,
             seen=frozenset(row["seen"] or ()),
-            history=tuple(
-                (item["ssid"], item["symbol"], item["first"]) for item in row["history"] or ()
-            ),
+            history=history,
             unread_since=row["unread_since"],
             last_day=row["last_day"],
         )
@@ -634,11 +648,39 @@ def walk_splits(
         absent_refusal=partial(_absent_refusal, root),
     )
     blocked = unreadable is not None and bool(refused)
+    # A ticker walked from scratch that stopped before its first day reports no state, and the
+    # saved entry would then outlive the reason it stopped. #787 would trim through a day the
+    # walk skipped as reversible, or through a held finding. So it gets the state a walk from
+    # scratch starts from, which holds no day and lets the trim drop nothing. Dropping its
+    # entry instead would shrink the checkpoint and trip the manifest's row-count guard.
+    stated = {state.ticker for state in report.states}
+    not_walked = {state.ticker for state in resume} | {r.ticker for r in report.refused}
+    starts = [
+        starting_state(ticker)
+        for ticker in sorted(set(_chains_days(manifest)) - not_walked - stated)
+    ]
     return SplitWalk(
         report=report,
-        entries=_merged(saved, report.states, master),
+        entries=_merged(saved, [*report.states, *starts], master),
         blocked=blocked,
         replaces_unreadable=unreadable is not None and not blocked,
+    )
+
+
+def starting_state(ticker: str) -> WalkState:
+    """The state a walk from scratch starts from, as a checkpoint entry can hold it.
+
+    Its cutoff is ``date.min``, before every day, so the trim drops nothing for it and a resume
+    from it walks every day, with ``resolved`` seeded False exactly as a walk from scratch is.
+    """
+    return WalkState(
+        ticker=ticker,
+        cutoff=date.min,
+        previous=None,
+        seen=frozenset(),
+        history=(),
+        unread_since=0,
+        last_day=None,
     )
 
 
@@ -669,6 +711,7 @@ __all__ = [
     "mappings_at",
     "read_checkpoint",
     "shared_instrument",
+    "starting_state",
     "walk_splits",
     "write_checkpoint",
 ]

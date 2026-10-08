@@ -17,6 +17,7 @@ from lake.window import (
     WINDOW_KEY,
     EdgeNotFound,
     WindowRefused,
+    edge_search_days,
     most_sessions_in,
     window_edge,
     window_floor,
@@ -171,3 +172,54 @@ def test_the_stop_reaches_back_a_year():
             return day in (FRIDAY, far)
 
     assert window_edge(_OneSession(), FRIDAY, 2) == far
+
+
+# -- review fixes ----------------------------------------------------------------------------
+
+
+def test_the_history_width_matches_the_dashboards():
+    """``lake.window`` restates the History panel's width so the sweep need not import DuckDB.
+
+    The two must not drift, or the floor would protect a panel of a different width.
+    """
+    from lake import dashboard, window
+
+    assert window.HISTORY_WINDOW_DAYS == dashboard.HISTORY_WINDOW_DAYS
+
+
+def test_the_window_module_does_not_import_the_dashboard():
+    """The render and the sweep load ``lake.window``, and DuckDB is about 17.5 MiB of import."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, lake.window, lake.config; "
+        "from lake.window import window_floor; "
+        "window_floor(lake.config.GuardConstants()); "
+        "print('lake.dashboard' in sys.modules, 'duckdb' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    ).stdout
+
+    assert out.split() == ["False", "False"]
+
+
+def test_a_year_long_window_finds_its_edge_on_the_real_calendar():
+    """260 sessions span more than 366 days, so a fixed one-year search would always refuse."""
+    from lake.calendar import ExchangeCalendar
+
+    tonight = date(2026, 10, 8)
+
+    edge = window_edge(ExchangeCalendar(), tonight, 260)
+
+    assert tonight - edge > timedelta(days=EDGE_SEARCH_DAYS)
+    assert edge_search_days(260) > EDGE_SEARCH_DAYS
+
+
+def test_a_window_longer_than_the_search_says_so():
+    """Too few sessions found is a window the search cannot reach, not an empty calendar."""
+    with pytest.raises(EdgeNotFound, match="only 15 of 22 sessions") as raised:
+        window_edge(THREE_WEEKS, FRIDAY, 22)
+
+    assert "answers no session" not in str(raised.value)

@@ -64,7 +64,7 @@ def test_the_settings_are_what_the_vm_needs():
 
 
 def test_the_vm_keeps_a_window_of_22_sessions():
-    """The owner set the window to 22 sessions on 2026-10-07, decision 1 on marketlake #755.
+    """The owner chose a window of 22 sessions on 2026-10-07, decision 1 on marketlake #755.
 
     #786 measured ``du`` per surface first, and chains were nearly all of each session's
     growth, so the value stands. The type is checked as well as the value, because a quoted
