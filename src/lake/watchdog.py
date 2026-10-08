@@ -278,9 +278,10 @@ class Watchdog:
         # Consecutive session minutes in which no surface landed data, which is what a
         # cause page waits on and dates itself from, per ``_whole_daemon``. A minute that
         # touched a surface and landed nothing adds one, and so does a slept-through slot
-        # that charged a surface. Landed data resets it, and so does a cycle that touched
-        # nothing, because counting a clamped stretch paged the cause on the first minute
-        # the span opened, dated inside the clamp (marketlake #768).
+        # that charged a surface. Landed data resets it, and so do a cycle that touched
+        # nothing and a slept-through slot that charged nothing, because counting a clamped
+        # stretch paged the cause on the first minute the span opened, dated inside the
+        # clamp (marketlake #768).
         self._minutes_without_data = 0
 
     def _threshold(self) -> int:
@@ -370,9 +371,10 @@ class Watchdog:
         Each slot that charges at least one surface also adds a minute to the run a cause
         page waits on, so a stall inside a token death dates that page from the death
         rather than from the resume. A slot that charges nobody, because every enabled
-        ticker was out of span or the roster was empty, adds nothing. Counted, it paged a
-        token death on the first minute the span opened, dated inside the stall
-        (marketlake #768).
+        ticker was out of span or the roster was empty, restarts that run at zero. Counted,
+        it paged a token death on the first minute the span opened, dated inside the stall.
+        Left unchanged, it dated a death that resumed after the stall from a minute before
+        the stall, which is neither the death nor the restart (marketlake #768).
 
         One stall gaps every watched surface at the same moment, so it is one fact and
         owes one page. Fanning out instead sent a page per surface, which on a roster of
@@ -419,6 +421,8 @@ class Watchdog:
             self._roll(slot)
             if watched:
                 self._minutes_without_data += 1
+            else:
+                self._minutes_without_data = 0
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
             for ticker in left_out:

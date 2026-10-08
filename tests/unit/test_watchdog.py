@@ -2398,6 +2398,26 @@ def test_a_stall_while_every_ticker_is_out_of_span_adds_nothing_to_the_run():
     assert _causes(_run(watchdog, cycles)) == {_at(5): [(TOKEN_DEAD, 3, _at(3), 4)]}
 
 
+def test_a_stall_that_charged_no_surface_restarts_the_run():
+    """A slept-through slot that charged nobody restarts the run, the way price 2 does.
+
+    The token is dead at 10:00 and 10:01, the loop sleeps through 10:02 with an empty
+    roster and so no surface to charge, and the token is dead again from 10:03. The run
+    restarts at 10:03, so the cause pages at 10:05, dated 10:03. The stall charged no
+    counter and dropped none, so SPY and QQQ reach the threshold at 10:03 and page on their
+    own first. Left unchanged by the stall, the run paged at 10:03, dated 10:01, a minute
+    that is neither the death nor the restart.
+    """
+    watchdog = Watchdog()
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    assert _run(watchdog, cycles) == {}
+    assert watchdog.missed([], [_at(2)]) == []
+    cycles = [_dead(_at(minute), "SPY", "QQQ") for minute in range(3, 7)]
+    raised = _run(watchdog, cycles)
+    assert _titles(raised) == {_at(3): SPY_AND_QQQ_ON_THEIR_OWN, _at(5): [TOKEN_DEAD]}
+    assert _causes(raised)[_at(5)] == [(TOKEN_DEAD, 3, _at(3), 4)]
+
+
 @pytest.mark.parametrize("fresh", [True, False], ids=["fresh-watchdog", "new-session-date"])
 def test_the_first_cycle_of_a_session_counts_toward_the_run(fresh):
     """Test 9: a token dead from 10:00 pages at 10:02, dated 10:00.
