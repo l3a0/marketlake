@@ -35,7 +35,7 @@ an option close means and not how loudly to complain. Past it the fill is refuse
 outright.
 
 The guard is the sole writer of the ``spot_close`` absent-marker, and the equity close
-still gets one row however the writers are ordered. There are three orders.
+still gets one row however the writers are ordered. There are four orders.
 
 1. On a post-close restart the guard runs before startup gap marking, so the minutes it
    owns are already recorded when the marker walks the day and are not marked a second
@@ -46,6 +46,11 @@ still gets one row however the writers are ordered. There are three orders.
 3. On a tick that wakes past close+5 from a stall across the equity close, the daemon's
    wiring runs the guard after that tick's overrun markers, so this is order 2 again
    rather than a race.
+4. When the 16:00 cycle's quotes write fails, the cycle itself writes a gap row at the
+   failed segment's path, tagged with the close, minutes before the guard runs
+   (marketlake #769). The guard reads it as a cycle that ran and failed, as after a fetch
+   failure, and adds no row of its own. Only when that gap row fails too does the guard's
+   marker record the minute.
 
 Which tickers it checks is a rule of its own, because every row it writes names one. A
 ticker is checked for a close when a capture span covers that close's minute. The guard

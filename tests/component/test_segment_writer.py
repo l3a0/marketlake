@@ -2,7 +2,8 @@
 
 These cross the filesystem, so they sit in the component tier. They cover exclusive
 creation, the data-row and gap-row round trips, one schema per file by surface,
-torn-tail tolerance, the shadow-append refusal, and per-cycle durability.
+torn-tail tolerance, the shadow-append refusal, per-cycle durability, and the handle that
+finishes a short write or raises.
 """
 
 from __future__ import annotations
@@ -287,3 +288,36 @@ def test_writing_after_close_is_refused(lake_root):
     assert writer.closed
     with pytest.raises(ValueError):
         writer.write_cycle(_chain_batch())
+
+
+# -- every byte or a raise ---------------------------------------------------
+
+
+class _ShortRaw:
+    """A raw file that takes at most ``most`` bytes a call, the way a filling disk can."""
+
+    closed = False
+
+    def __init__(self, most: int) -> None:
+        self.most = most
+        self.data = b""
+
+    def write(self, data) -> int:
+        taken = bytes(data)[: self.most]
+        self.data += taken
+        return len(taken)
+
+
+def test_a_short_write_is_written_to_the_end():
+    """pyarrow ignores the count a write returns, so the handle finishes the buffer itself."""
+    raw = _ShortRaw(3)
+
+    assert journal._WriteAll(raw).write(memoryview(b"0123456789")) == 10
+    assert raw.data == b"0123456789"
+
+
+def test_a_write_that_takes_nothing_raises_rather_than_spinning():
+    raw = _ShortRaw(0)
+
+    with pytest.raises(OSError, match="took 0 of the 10 bytes"):
+        journal._WriteAll(raw).write(b"0123456789")

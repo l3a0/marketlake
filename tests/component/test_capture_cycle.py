@@ -15,29 +15,43 @@ They cover the cycle's observable contract:
    survive the write and the daemon's schema-drift page is what reads it.
 3. A failing quote batch gaps every ticker's quotes, because the sampler is one shared
    failure unit.
-4. The manifest gains one entry per segment, keyed by the segment path. The cycle reads the
-   manifest once and hashes each segment as it closes (marketlake #573). A hash that fails
-   there is taken again under the lock, and a cycle with nothing to record reads nothing.
+4. The manifest gains one entry per segment the plan wrote, keyed by the segment path, and
+   none for a failed write's gap row. The cycle reads the manifest once and hashes each
+   segment as it closes (marketlake #573). A hash that fails there is taken again under
+   the lock, and a cycle with nothing to record reads nothing.
 5. The journal metadata gains the cycle's token mint time and roster, and a vendor that
    cannot name its mint time costs the stamp rather than the cycle.
+6. A segment write the disk refuses leaves a gap row at the failed segment's path and a
+   line in the daemon's log, and a diagnostic that cannot print costs nothing
+   (marketlake #769).
 """
 
 from __future__ import annotations
 
+import errno
+import gc
 import json
+import sys
+import weakref
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
-from lake import capture, journal, manifest
+from lake import capture, gap, journal, manifest
+from lake.calendar import MARKET_TZ
+from lake.capture_spans import CaptureSpans
 from lake.cassette import Cassette, Interaction, load_cassette
 from lake.chain_plan import ChainPlan
 from lake.config import GuardConstants
 from lake.manifest import latest_entries, manifest_path, sha256_file
 from lake.metadata import JournalMetadata, read_metadata
+from lake.security_master import SecurityMaster
+from lake.session import SessionClock
 from lake.tickers import Roster
 from lake.vendor import VendorError
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.vendor import CassetteVendor
 
@@ -273,15 +287,26 @@ def test_a_gap_segment_entry_counts_its_gap_row(lake_root):
     assert latest_entries(lake_root)[gap.partition]["rows"] == 1
 
 
-def _cycle(lake_root: Path, *, minute: int = 0) -> capture.CycleResult:
-    """One four-segment cycle, ``minute`` minutes after the clock's start."""
+def _cycle(
+    lake_root: Path,
+    *,
+    minute: int = 0,
+    cap: int | None = None,
+    cassette: str = "spy_minimal.json",
+) -> capture.CycleResult:
+    """One four-segment cycle, ``minute`` minutes after the clock's start.
+
+    ``cap`` is the concurrency cap, which picks the landing path. Left unset, the cycle
+    takes the default.
+    """
     return capture.run_cycle(
         ManualClock(start=_CLOCK_START + timedelta(minutes=minute)),
-        CassetteVendor(load_cassette(CASSETTES / "spy_minimal.json")),
+        CassetteVendor(load_cassette(CASSETTES / cassette)),
         _both_options(),
         lake_root,
         pid=4242,
         plan=_ONE_WINDOW,
+        guards=None if cap is None else GuardConstants(capture_max_concurrency=cap),
     )
 
 
@@ -343,8 +368,9 @@ def test_a_hash_that_fails_at_close_still_lands_the_entry_hashed_under_the_lock(
 
 
 def test_a_cycle_with_no_segment_to_record_returns_on_a_damaged_manifest(lake_root, monkeypatch):
-    # Every write fails, so the cycle has nothing to append. It reads nothing either, so a
-    # manifest holding a byte that will not decode does not end it.
+    # Every planned write fails, so the cycle has no entry to append, and the gap rows it
+    # writes in their place get none. It reads nothing either, so a manifest holding a byte
+    # that will not decode does not end it.
     _cycle(lake_root)
     ledger = manifest_path(lake_root)
     raw = ledger.read_bytes()
@@ -1068,3 +1094,596 @@ def test_a_vendor_that_cannot_name_its_mint_time_still_captures(lake_root):
     assert result.errors == ()
     assert len(_rows(result.segment(CHAINS, "SPY"))) == 2
     assert read_metadata(lake_root) == JournalMetadata()
+
+
+# -- 8. a segment write the disk refuses -------------------------------------
+
+
+class _RefusingSink:
+    """The handle a segment is written through, refusing as the disk under it would.
+
+    ``write`` refuses every write. ``marker`` refuses only what follows the batch's
+    durability flush, which is the end-of-stream marker. ``None`` passes everything.
+    """
+
+    def __init__(self, inner, mode: str | None) -> None:
+        self._inner = inner
+        self._mode = mode
+        self.flushed = False
+
+    def write(self, data) -> int:
+        if self._mode == "write" or (self._mode == "marker" and self.flushed):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return self._inner.write(data)
+
+    @property
+    def closed(self) -> bool:
+        return self._inner.closed
+
+
+def _refuse_writes(monkeypatch, refused: dict[tuple[str, str], list[str]]) -> None:
+    """A disk that refuses the named segments, with the real writer on top of it.
+
+    Each key is a surface and ticker, and its list names how each segment opened there
+    fails, in order: the data segment first, then the gap row. Opening is never refused,
+    because a refused open would refuse the gap row for a reason a full disk does not
+    give. Every segment is written on the cycle's own thread, opened and closed before the
+    next one opens, so the most recent sink is the one a flush belongs to.
+    """
+    queues = {key: list(modes) for key, modes in refused.items()}
+    current: dict[str, object] = {"mode": None, "sink": None}
+    real_open = journal.SegmentWriter.open
+    real_file = pa.PythonFile
+    real_flush = journal.SegmentWriter._flush_durable
+
+    def open_(root, surface, ticker, *args, **kwargs):
+        queue = queues.get((surface, ticker))
+        current["mode"] = queue.pop(0) if queue else None
+        return real_open(root, surface, ticker, *args, **kwargs)
+
+    def python_file(handle, mode=None):
+        sink = _RefusingSink(handle, current["mode"])
+        current["sink"] = sink
+        return real_file(sink, mode=mode)
+
+    def flush(writer):
+        real_flush(writer)
+        current["sink"].flushed = True
+
+    monkeypatch.setattr(journal.SegmentWriter, "open", open_)
+    monkeypatch.setattr(pa, "PythonFile", python_file)
+    monkeypatch.setattr(journal.SegmentWriter, "_flush_durable", flush)
+
+
+def _files(lake_root: Path, surface: str, ticker: str) -> list[Path]:
+    directory = journal.segment_dir(lake_root, surface, ticker, _EXPECTED_SNAP.date())
+    return sorted(directory.glob("*.arrows"))
+
+
+def _failure_lines(err: str) -> list[str]:
+    return [line for line in err.splitlines() if "segment write failed" in line]
+
+
+_CAPS = pytest.mark.parametrize("cap", [1, 20])
+_SEGMENT_FULL = capture.SegmentError(QUOTES, "SPY", "o_s_error")
+
+
+@_CAPS
+def test_a_refused_data_write_leaves_one_gap_row_at_its_own_path(lake_root, monkeypatch, cap):
+    """The minute was fetched and the disk refused it, so the lake says so (marketlake #769)."""
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+
+    result = _cycle(lake_root, cap=cap)
+
+    assert result.errors == (_SEGMENT_FULL,)
+    assert [(s.surface, s.ticker) for s in result.segments] == [
+        (CHAINS, "SPY"),
+        (CHAINS, "QQQ"),
+        (QUOTES, "QQQ"),
+    ]
+    # The failed segment's own name, the cycle's start stamp and pid, as its neighbour has.
+    [path] = _files(lake_root, QUOTES, "SPY")
+    assert path.name == result.segment(QUOTES, "QQQ").path.name
+    [row] = journal.read_segment(path).to_pylist()
+    landed = _rows(result.segment(QUOTES, "QQQ"))[0]
+    assert row["row_kind"] == journal.ROW_KIND_GAP
+    assert row["error_class"] == capture.SEGMENT_WRITE_FAILED == "segment_write_failed"
+    assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
+    # The quote batch was one fetch, so its stamps are the ones the landed row carries.
+    assert (row["fetch_ts"], row["fetch_end_ts"]) == (landed["fetch_ts"], landed["fetch_end_ts"])
+    present = journal.recorded_slots(lake_root, QUOTES, "SPY", _EXPECTED_SNAP.date())
+    assert present.slots == frozenset({_EXPECTED_SNAP})
+    # Like a startup marker, the row has no manifest entry, and the result leaves it out.
+    partition = path.relative_to(lake_root).as_posix()
+    assert partition not in latest_entries(lake_root)
+    assert set(latest_entries(lake_root)) == set(result.partitions)
+
+
+@_CAPS
+def test_a_refused_gap_row_is_written_again_with_its_own_class(lake_root, monkeypatch, cap):
+    """The fetch failed first, so its class says what lost the minute."""
+    _refuse_writes(monkeypatch, {(CHAINS, "QQQ"): ["write"]})
+
+    result = _cycle(lake_root, cap=cap, cassette="chain_fail.json")
+
+    assert result.errors == (capture.SegmentError(CHAINS, "QQQ", "o_s_error"),)
+    [path] = _files(lake_root, CHAINS, "QQQ")
+    [row] = journal.read_segment(path).to_pylist()
+    assert row["row_kind"] == journal.ROW_KIND_GAP
+    assert row["error_class"] == "http_500"
+    assert row["snap_ts"] == _EXPECTED_SNAP.isoformat()
+
+
+@_CAPS
+def test_a_gap_plan_that_raises_does_not_end_the_cycle(lake_root, monkeypatch, capsys, cap):
+    """A raise out of the cycle ends the daemon, so building the gap row is guarded too."""
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+
+    def broken(self, *args):
+        raise RuntimeError("a bug in the gap plan")
+
+    monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", broken)
+
+    result = _cycle(lake_root, cap=cap)
+
+    assert result.errors == (_SEGMENT_FULL,)
+    assert len(result.segments) == 3
+    assert _files(lake_root, QUOTES, "SPY") == []
+    [line] = _failure_lines(capsys.readouterr().err)
+    assert line.endswith("the gap row did not land: RuntimeError: a bug in the gap plan")
+
+
+@_CAPS
+def test_each_failed_write_prints_one_line_in_plan_order(lake_root, monkeypatch, capsys, cap):
+    """The quotes usually land before the chains above a cap of 1, and the lines do not."""
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"], (CHAINS, "QQQ"): ["write"]})
+
+    _cycle(lake_root, cap=cap)
+
+    prefix = f"capture: {_EXPECTED_SNAP.isoformat()}: segment write failed: "
+    reason = "(ENOSPC): OSError: [Errno 28] No space left on device; the gap row landed"
+    assert _failure_lines(capsys.readouterr().err) == [
+        f"{prefix}chains QQQ {reason}",
+        f"{prefix}quotes SPY {reason}",
+    ]
+
+
+@_CAPS
+def test_when_the_gap_row_fails_too_a_restart_marks_the_minute(lake_root, monkeypatch, capsys, cap):
+    """The late stage of a full disk, where the small gap row fails with the data.
+
+    The log line is then the only record, and the cycle still returns. This shows what
+    startup marking does after a restart, and nothing here makes a restart happen.
+    """
+    _refuse_writes(monkeypatch, {(CHAINS, "QQQ"): ["write", "write"]})
+
+    result = _cycle(lake_root, cap=cap)
+
+    assert result.errors == (capture.SegmentError(CHAINS, "QQQ", "o_s_error"),)
+    assert _files(lake_root, CHAINS, "QQQ") == []
+    [line] = _failure_lines(capsys.readouterr().err)
+    assert "chains QQQ (ENOSPC)" in line
+    assert line.endswith("the gap row did not land: OSError: [Errno 28] No space left on device")
+
+    monkeypatch.undo()
+    slot = _EXPECTED_SNAP.astimezone(MARKET_TZ)
+    master = SecurityMaster()
+    spans = CaptureSpans()
+    for ticker in ("SPY", "QQQ"):
+        iid = master.register(
+            kind="equity", capture_start=slot, valid_from=slot.date(), ticker=ticker
+        )
+        spans.open_span(iid, slot, True)
+    marker = gap.GapMarker(
+        lake_root=lake_root,
+        roster=_both_options,
+        session_clock=SessionClock(
+            clock=ManualClock(start=slot), calendar=weekday_sessions(slot.date())
+        ),
+        master=lambda: master,
+        spans=lambda: spans,
+        pid=4243,
+    )
+
+    report = marker.on_start(slot)
+
+    assert report.problems == ()
+    [path] = _files(lake_root, CHAINS, "QQQ")
+    [row] = [
+        row
+        for row in journal.read_segment(path).to_pylist()
+        if datetime.fromisoformat(row["snap_ts"]) == _EXPECTED_SNAP
+    ]
+    assert row["error_class"] == gap.DAEMON_DEAD
+
+
+@_CAPS
+def test_a_batch_whose_marker_failed_keeps_its_rows_and_gets_no_gap_row(
+    lake_root, monkeypatch, capsys, cap
+):
+    """The rows were durable, so the minute is captured, and the create refuses a second row.
+
+    The cycle still reports the write failure, because counting the segment as landed would
+    push a manifest entry onto a disk that just refused eight bytes.
+    """
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["marker"]})
+
+    result = _cycle(lake_root, cap=cap)
+
+    assert result.errors == (_SEGMENT_FULL,)
+    [path] = _files(lake_root, QUOTES, "SPY")
+    rows = journal.read_segment(path).to_pylist()
+    assert [row["row_kind"] for row in rows] == [journal.ROW_KIND_DATA]
+    assert path.relative_to(lake_root).as_posix() not in latest_entries(lake_root)
+    [line] = _failure_lines(capsys.readouterr().err)
+    assert "the gap row did not land: FileExistsError" in line
+
+
+class _RefusingStderr:
+    def write(self, text):
+        raise OSError(errno.EPIPE, "Broken pipe")
+
+    def flush(self):
+        raise OSError(errno.EPIPE, "Broken pipe")
+
+
+class _Unprintable(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("the message cannot be built")
+
+
+def _explode(failure: str):
+    def explode(*args, **kwargs):
+        raise _Unprintable() if failure == "message" else RuntimeError("a bug")
+
+    return explode
+
+
+@pytest.mark.parametrize("failure", ["stderr", "message"])
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [(journal, "routed_columns"), (journal, "data_rows"), (capture, "sha256_file")],
+    ids=["drift-scan", "row-count", "hash"],
+)
+def test_a_diagnostic_that_cannot_print_never_costs_the_segment(
+    lake_root, monkeypatch, failure, module, name
+):
+    """Each of these prints a line and lets the segment land, and printing it cannot raise.
+
+    A refusing stderr, or an exception whose message raises, used to turn a segment that
+    landed, or a write that never ran, into a ``SegmentError``.
+    """
+    monkeypatch.setattr(module, name, _explode(failure))
+    if failure == "stderr":
+        monkeypatch.setattr(sys, "stderr", _RefusingStderr())
+
+    result = _cycle(lake_root)
+
+    assert result.errors == ()
+    assert len(result.segments) == 4
+
+
+@pytest.mark.parametrize("failure", ["stderr", "message"])
+def test_a_snapshot_whose_drift_scan_cannot_print_still_lands(lake_root, monkeypatch, failure):
+    monkeypatch.setattr(journal, "routed_columns", _explode(failure))
+    if failure == "stderr":
+        monkeypatch.setattr(sys, "stderr", _RefusingStderr())
+    body = load_cassette(CASSETTES / "spy_minimal.json").find("chains", {"symbol": "SPY"}).body
+
+    outcome = capture.journal_snapshot(
+        lake_root,
+        CHAINS,
+        "SPY",
+        body=body,
+        cycle_start=_CLOCK_START,
+        fetch_ts=_CLOCK_START,
+        fetch_end_ts=_CLOCK_START,
+        pid=4242,
+    )
+
+    assert outcome.routed_columns == ()
+    assert outcome.partition in latest_entries(lake_root)
+
+
+@pytest.mark.parametrize("unprintable", ["write-failure", "gap-row-failure"])
+def test_a_failed_write_line_prints_when_a_message_cannot_be_built(
+    lake_root, monkeypatch, capsys, unprintable
+):
+    """The line is the only record left when the gap row fails, so a message never drops it.
+
+    An exception whose ``__str__`` raises prints its class name in place of its message.
+    """
+    prefix = f"capture: {_EXPECTED_SNAP.isoformat()}: segment write failed: quotes SPY"
+    if unprintable == "write-failure":
+        real_write = capture._CaptureCycle._write
+
+        def write(self, surface, ticker, plan):
+            if (surface, ticker) == (QUOTES, "SPY"):
+                raise _Unprintable()
+            return real_write(self, surface, ticker, plan)
+
+        monkeypatch.setattr(capture._CaptureCycle, "_write", write)
+        expected = f"{prefix}: _Unprintable; the gap row landed"
+    else:
+        _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+        monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", _explode("message"))
+        expected = (
+            f"{prefix} (ENOSPC): OSError: [Errno 28] No space left on device; "
+            "the gap row did not land: _Unprintable"
+        )
+
+    _cycle(lake_root)
+
+    assert _failure_lines(capsys.readouterr().err) == [expected]
+
+
+class _Tracked(Exception):
+    """An exception a test can hold a weak reference to, which ``Exception`` itself refuses."""
+
+
+def _snapshot(lake_root: Path) -> None:
+    body = load_cassette(CASSETTES / "spy_minimal.json").find("chains", {"symbol": "SPY"}).body
+    capture.journal_snapshot(
+        lake_root,
+        CHAINS,
+        "SPY",
+        body=body,
+        cycle_start=_CLOCK_START,
+        fetch_ts=_CLOCK_START,
+        fetch_end_ts=_CLOCK_START,
+        pid=4242,
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "name", "run"),
+    [
+        (journal, "routed_columns", _cycle),
+        (journal, "data_rows", _cycle),
+        (capture, "sha256_file", _cycle),
+        (journal, "routed_columns", _snapshot),
+    ],
+    ids=["drift-scan", "row-count", "hash", "snapshot-drift-scan"],
+)
+def test_a_printed_diagnostic_does_not_keep_its_exception_in_a_cycle(
+    lake_root, monkeypatch, module, name, run
+):
+    """A frame that kept the exception would hold the batch until the collector ran.
+
+    The exception's traceback holds the frame that caught it, and that frame holds the
+    batch. A local in that frame holding the exception closes a reference cycle, which only
+    the cyclic collector frees, so a chain's megabytes would outlive the write.
+    """
+    raised: list[weakref.ref] = []
+
+    def track(error: _Tracked) -> _Tracked:
+        raised.append(weakref.ref(error))
+        return error
+
+    def explode(*args):
+        raise track(_Tracked("a bug"))
+
+    monkeypatch.setattr(module, name, explode)
+
+    gc.disable()
+    try:
+        run(lake_root)
+        assert raised
+        assert [ref() for ref in raised] == [None] * len(raised)
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize("name", ["append_requests", "failures", "append_cycle"])
+def test_a_timing_failure_whose_message_raises_never_ends_the_cycle(lake_root, monkeypatch, name):
+    """The timing writers never raise, because a raise out of the cycle ends the daemon."""
+    monkeypatch.setattr(capture, name, _explode("message"))
+
+    result = _cycle(lake_root)
+
+    assert result.errors == ()
+    assert len(result.segments) == 4
+
+
+@pytest.mark.parametrize("cleanup", ["fails", "succeeds"])
+def test_a_failed_write_does_not_hold_its_chain_to_the_end_of_the_cycle(
+    lake_root, monkeypatch, cleanup
+):
+    """Above a cap of 1 a chain's batch is dropped once it lands, and a failure keeps it no longer.
+
+    A close that raises inside ``__exit__`` chains the write's own failure behind its own,
+    and the chained failure's traceback holds the frames that held the batch.
+    """
+    _refuse_writes(monkeypatch, {(CHAINS, "QQQ"): ["write"]})
+    batches: list[weakref.ref] = []
+    alive: list[bool] = []
+    real_write = capture._CaptureCycle._write
+    real_close = journal.SegmentWriter.close
+    real_mark = capture._CaptureCycle._mark_failed_write
+
+    def write(self, surface, ticker, plan):
+        if (surface, ticker) == (CHAINS, "QQQ"):
+            batches.append(weakref.ref(plan.batch))
+        return real_write(self, surface, ticker, plan)
+
+    def close(self):
+        real_close(self)
+        if cleanup == "fails" and self._write_failed:
+            raise RuntimeError("the cleanup failed too")
+
+    def mark(self, failure):
+        gc.collect()
+        alive.append(batches[0]() is not None)
+        return real_mark(self, failure)
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", write)
+    monkeypatch.setattr(journal.SegmentWriter, "close", close)
+    monkeypatch.setattr(capture._CaptureCycle, "_mark_failed_write", mark)
+
+    result = _cycle(lake_root, cap=20)
+
+    assert [(error.surface, error.ticker) for error in result.errors] == [(CHAINS, "QQQ")]
+    assert alive == [False]
+
+
+def _raised(error: BaseException) -> BaseException:
+    """The error, raised and caught, so it carries a traceback of its own."""
+    try:
+        raise error
+    except BaseException as caught:
+        return caught
+
+
+def test_clearing_a_failure_clears_every_exception_chained_to_it():
+    """The cause, the context and an exception group's members each lose their traceback.
+
+    Each one holds its own frames, so clearing only some of them keeps the rest alive.
+    """
+    cause = _raised(OSError(errno.ENOSPC, "no space"))
+    context = _raised(ValueError("the cleanup failed"))
+    member = _raised(PermissionError("refused"))
+    group = _raised(ExceptionGroup("several", [member]))
+    outer = _raised(RuntimeError("the write failed"))
+    outer.__cause__ = cause
+    outer.__context__ = context
+    context.__context__ = group
+
+    assert capture._without_tracebacks(outer) is outer
+
+    for link in (outer, cause, context, group, member):
+        assert link.__traceback__ is None, link
+
+
+def _raise_from_write(monkeypatch, surface: str, ticker: str, error: BaseException) -> None:
+    """The named segment's write raises ``error`` before it touches the disk.
+
+    Nothing else is refused, so the gap row lands.
+    """
+    real_write = capture._CaptureCycle._write
+
+    def write(self, s, t, plan):
+        if (s, t) == (surface, ticker):
+            raise error
+        return real_write(self, s, t, plan)
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", write)
+
+
+@pytest.mark.parametrize(
+    ("error", "tail"),
+    [
+        (
+            OSError(errno.ENOSPC, "No space\nleft on device"),
+            " (ENOSPC): OSError: [Errno 28] No space left on device; the gap row landed",
+        ),
+        (
+            PermissionError(errno.EACCES, "Permission denied"),
+            " (EACCES): PermissionError: [Errno 13] Permission denied; the gap row landed",
+        ),
+    ],
+    ids=["newline", "oserror-subclass"],
+)
+def test_a_failed_write_line_is_one_line_naming_any_errno(
+    lake_root, monkeypatch, capsys, error, tail
+):
+    """The runbook finds the line by its phrase, so a message never splits it.
+
+    The errno's name is there whenever the failure carries one, a subclass of ``OSError``
+    such as ``PermissionError`` included.
+    """
+    prefix = f"capture: {_EXPECTED_SNAP.isoformat()}: segment write failed: quotes SPY"
+    _raise_from_write(monkeypatch, QUOTES, "SPY", error)
+
+    _cycle(lake_root, cap=1)
+
+    # A message that split the line would print its second half on a line of its own.
+    lines = capsys.readouterr().err.splitlines()
+    assert [line for line in lines if "quotes SPY" in line or "left on" in line] == [prefix + tail]
+
+
+def test_a_gap_row_refusal_prints_on_the_same_line(lake_root, monkeypatch, capsys):
+    """The reason the gap row did not land is part of the one line, however it reads."""
+    _raise_from_write(monkeypatch, QUOTES, "SPY", OSError(errno.ENOSPC, "No space left on device"))
+
+    def broken(self, *args):
+        raise RuntimeError("two\nlines")
+
+    monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", broken)
+
+    _cycle(lake_root, cap=1)
+
+    err = capsys.readouterr().err
+    [line] = _failure_lines(err)
+    assert line.endswith("the gap row did not land: RuntimeError: two lines")
+    assert "lines" not in err.replace(line, "")
+
+
+class _SlowQuotes(CassetteVendor):
+    """The cassette's replies, with the quote batch taking two seconds on the cycle's clock."""
+
+    def __init__(self, cassette, clock) -> None:
+        super().__init__(cassette)
+        self._clock = clock
+
+    def get_quotes(self, *args, **kwargs):
+        reply = super().get_quotes(*args, **kwargs)
+        self._clock.advance(2.0)
+        return reply
+
+
+def test_a_gap_row_keeps_its_fetch_stamps_in_order_and_the_cycles_phase(lake_root, monkeypatch):
+    """The row carries the batch's own fetch stamps, start before end, as a landed row does.
+
+    The quote batch takes time here, so a row whose stamps were swapped would end before it
+    started. The row also carries the cycle's session phase, and its writer is closed.
+    """
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+    clock = ManualClock(start=_CLOCK_START)
+
+    result = capture.run_cycle(
+        clock,
+        _SlowQuotes(load_cassette(CASSETTES / "spy_minimal.json"), clock),
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+        guards=GuardConstants(capture_max_concurrency=1),
+        session_phase="post_equity_close",
+    )
+
+    [path] = _files(lake_root, QUOTES, "SPY")
+    [row] = journal.read_segment(path).to_pylist()
+    landed = _rows(result.segment(QUOTES, "QQQ"))[0]
+    assert row["fetch_ts"] < row["fetch_end_ts"]
+    assert (row["fetch_ts"], row["fetch_end_ts"]) == (landed["fetch_ts"], landed["fetch_end_ts"])
+    assert row["session_phase"] == landed["session_phase"] == "post_equity_close"
+    # The writer was closed, so the row's file ends in its end-of-stream marker.
+    assert path.read_bytes().endswith(b"\xff\xff\xff\xff\x00\x00\x00\x00")
+
+
+def test_a_gap_row_refusal_does_not_keep_its_exception_in_a_cycle(lake_root, monkeypatch):
+    """The refusal is kept only to print it, and never in a frame its traceback holds.
+
+    The traceback holds the frame that caught the refusal. A local there holding the
+    refusal closes a reference cycle, which only the cyclic collector frees, so the frames
+    that built the gap row would outlive the attempt.
+    """
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+    raised: list[weakref.ref] = []
+
+    def track(error: _Tracked) -> _Tracked:
+        raised.append(weakref.ref(error))
+        return error
+
+    def broken(self, *args):
+        raise track(_Tracked("a bug in the gap plan"))
+
+    monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", broken)
+
+    gc.disable()
+    try:
+        _cycle(lake_root)
+        assert len(raised) == 1
+        assert raised[0]() is None
+    finally:
+        gc.enable()
