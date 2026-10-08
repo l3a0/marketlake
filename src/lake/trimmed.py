@@ -384,12 +384,15 @@ def _prefix_ends(text: str, rows: int) -> list[int] | None:
     line that directly follows it, because an entry recorded over a ledger ending in blank
     lines covers those bytes too, and nothing in the entry says how many there were. With
     ``rows`` at 0 they start at 0. ``None`` means the text holds fewer than ``rows`` lines.
+
+    ``text`` may carry bytes that did not decode, as ``surrogateescape`` decoding leaves them,
+    and each line is encoded back the same way, so every offset is a true byte offset.
     """
     ends: list[int] = [0] if rows <= 0 else []
     count = 0
     offset = 0
     for piece in text.splitlines(keepends=True):
-        offset += len(piece.encode("utf-8"))
+        offset += len(piece.encode("utf-8", "surrogateescape"))
         blank = not piece.strip()
         if ends:
             if not blank:
@@ -473,10 +476,11 @@ def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None
             if recorded == sha256_bytes(raw):
                 return False
             rows = int(entry.get("rows") or 0)
-            # The reader's own refusals come first, so a ledger that will not decode or hides
-            # entries names its own class, and the text below is known to decode.
-            read_trimmed(root)
-            text = raw.decode("utf-8")
+            # The recorded lines are compared first, before the reader runs. Damage inside them
+            # is rot or an edit, whose repair is the bucket's copy, and the reader would name it
+            # by its own class with advice to re-record, which would bless it. Bytes that do not
+            # decode are carried through ``surrogateescape``, so the comparison still runs.
+            text = raw.decode("utf-8", "surrogateescape")
             ends = _prefix_ends(text, rows)
             if ends is None:
                 held = sum(1 for piece in text.splitlines() if piece.strip())
@@ -489,6 +493,8 @@ def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None
                     "bucket's copy, then re-record its manifest entry with "
                     "lake.trimmed.refresh_trimmed_entry."
                 )
+            # Only the appended lines are left, and the reader's refusals name their damage.
+            read_trimmed(root)
         refresh_trimmed_entry(root, source=source, fetched_at=fetched_at)
     except TrimmedRepairRefused:
         raise

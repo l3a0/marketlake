@@ -8,6 +8,7 @@ when it exists, so a lake that never trims scrubs exactly as before.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 from pathlib import Path
@@ -21,6 +22,7 @@ from lake.manifest import (
     LedgerNotUtf8,
     ScrubResult,
     TornLedger,
+    append_manifest,
     latest_entries,
     record_partition,
     scrub,
@@ -727,3 +729,105 @@ def test_a_torn_tail_refusal_carries_the_torn_tail_repair_once(tmp_path):
         _repair(root)
 
     assert str(exc.value).count("Repair by hand under the lock") == 1
+
+
+# -- rot inside the recorded lines, and the line rule (review batch 3 on PR #810) ----
+
+_L1 = json.dumps({"partition": "a", "kind": "trim"})
+_L2 = json.dumps({"partition": "b", "kind": "trim"})
+_L3 = json.dumps({"partition": "c", "kind": "restore"})
+
+
+def _recorded_ledger(root: Path, recorded: bytes, rows: int) -> None:
+    """A ledger whose manifest entry records exactly ``recorded`` at ``rows`` lines."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.jsonl").write_bytes(b"")
+    trimmed_path(root).write_bytes(recorded)
+    with lake_lock(root):
+        append_manifest(
+            root,
+            partition=TRIMMED_FILE,
+            source=SOURCE,
+            sha256=hashlib.sha256(recorded).hexdigest(),
+            rows=rows,
+            fetched_at=STAMP,
+            guard=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "appended"),
+    [
+        ("high-bit-flip", True),
+        ("quote-flip", True),
+        ("byte-order-mark", True),
+        ("high-bit-flip", False),
+    ],
+)
+def test_rot_inside_the_recorded_lines_gets_the_bucket_repair_not_a_re_record(
+    tmp_path, damage, appended
+):
+    """Damage inside the lines the entry covers is rot or an edit, and its repair is the bucket's
+    copy. The reader names such damage by its own class, with advice to re-record the entry,
+    which would bless it, and #787 would page that advice every night.
+
+    Mutation this catches: running the reader's checks ahead of the comparison of the recorded
+    lines.
+    """
+    root = tmp_path / "lake"
+    recorded = f"{_L1}\n{_L2}\n".encode()
+    _recorded_ledger(root, recorded, 2)
+    body = bytearray(recorded + (f"{_L3}\n".encode() if appended else b""))
+    if damage == "high-bit-flip":
+        body[5] ^= 0x80
+    elif damage == "quote-flip":
+        body[body.index(b'"', 1)] ^= 0x01
+    else:
+        body[0:0] = b"\xef\xbb\xbf"
+    trimmed_path(root).write_bytes(bytes(body))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    text = str(exc.value)
+    assert "edited in place or the bytes rotted" in text
+    assert "recover the ledger from the bucket's copy" in text
+    assert "last line whole" not in text
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    ("recorded", "appended", "rows"),
+    [
+        (f"{_L1}\n{_L2}\n", f"{_L3}\n", 2),
+        (f"{_L1}\r\n{_L2}\r\n", f"{_L3}\r\n", 2),
+        (f"{_L1}\r\n{_L2}\r\n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\n  \n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\r\n", f"{_L3}\n", 2),
+        (f"\n{_L1}\n\n{_L2}\n", f"{_L3}\n", 2),
+        ("", f"{_L1}\n", 0),
+        ("\n\n", f"{_L1}\n", 0),
+        (f"{_L1}\n{_L2}\n\u3000\n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\x85", f"{_L3}\n", 2),
+    ],
+    ids=[
+        "lf",
+        "crlf",
+        "crlf-then-lf",
+        "trailing-blank-lines",
+        "trailing-crlf-blank",
+        "blank-lines-between",
+        "empty",
+        "only-blank-lines",
+        "ideographic-space-line",
+        "next-line-separator",
+    ],
+)
+def test_the_recorded_offset_is_found_by_the_readers_line_rule(recorded, appended, rows):
+    """Mutation this catches: splitting on a newline alone, which misses the line breaks
+    ``str.splitlines`` honours, such as U+0085, the next-line separator.
+    """
+    ends = trimmed._prefix_ends(recorded + appended, rows)
+
+    assert ends is not None and len(recorded.encode()) in ends, ends

@@ -2293,7 +2293,9 @@ def restore_range(
 
                 def moved(rel: str) -> bool:
                     entry = latest.get(rel)
-                    return entry is None or entry.get("sha256") != present[rel]
+                    # Compared as text, the way ``present`` holds it, so an entry whose
+                    # sha is not a string does not read as moved on every run.
+                    return entry is None or str(entry.get("sha256")) != present[rel]
 
                 changed = sorted(rel for rel in present if moved(rel))
                 if differs is not None and differs not in changed:
@@ -2407,7 +2409,7 @@ def restore_range(
                 with lake_lock(root):
                     guard()
                     entry = latest_entries(root).get(rel)
-                    if entry is None or entry.get("sha256") != sha or path.exists():
+                    if entry is None or str(entry.get("sha256")) != sha or path.exists():
                         raise refuse(
                             f"{rel} changed in the lake while it downloaded, so it was not "
                             "restored. Run the range restore again"

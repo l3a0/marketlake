@@ -27,6 +27,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import json
 import os
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -1495,3 +1496,80 @@ def test_the_repairs_and_the_commit_run_under_the_lake_lock(tmp_path, monkeypatc
         "replace": True,
         f"append {SPY_1}": True,
     }
+
+
+# -- a vanished file under the second lock (review batch 3 on PR #810) --------------
+
+
+def _vanish_during_hash(monkeypatch, root: Path, rel: str) -> None:
+    real = bucket.sha256_file
+
+    def gone(path):
+        if Path(path) == root / rel:
+            Path(path).unlink()
+        return real(path)
+
+    monkeypatch.setattr(bucket, "sha256_file", gone)
+
+
+def test_a_vanished_file_the_bucket_lacks_refuses_naming_its_trim_version(tmp_path, monkeypatch):
+    """Mutation this catches: putting a vanished file back into the plan without its trim line,
+    which raises ``KeyError`` instead of naming the version to recover.
+    """
+    root, client, _originals = _lake(tmp_path)
+    version = _trim_away(root, client, SPY_1, unlink=False)
+    del client.objects[TARGET.key(SPY_1)]
+    _vanish_during_hash(monkeypatch, root, SPY_1)
+
+    line = _refuses_after_commit(root, client)
+
+    assert "holds no current version" in line and f"version {version}" in line
+    assert not [kwargs for name, kwargs in client.calls if name == "get_object"]
+
+
+def test_a_vanished_file_whose_entry_moved_says_run_again(tmp_path, monkeypatch):
+    """Mutation this catches: planning a download for a vanished file against an entry that
+    moved, which would verify the bucket's copy against a sha the manifest no longer records.
+    """
+    root, client, _originals = _lake(tmp_path)
+    real = bucket.sha256_file
+
+    def gone_and_resealed(path):
+        if Path(path) == root / SPY_1:
+            with lake_lock(root):
+                append_manifest(
+                    root,
+                    partition=SPY_1,
+                    source="recompact",
+                    sha256="0" * 64,
+                    rows=latest_entries(root)[SPY_1]["rows"],
+                    fetched_at=STAMP,
+                    guard=False,
+                )
+                Path(path).unlink()
+        return real(path)
+
+    monkeypatch.setattr(bucket, "sha256_file", gone_and_resealed)
+
+    line = _refuses_after_commit(root, client)
+
+    assert "changed in the lake while the range restore ran" in line
+    assert not [kwargs for name, kwargs in client.calls if name == "get_object"]
+
+
+def test_an_entry_whose_sha_is_not_text_refuses_as_a_mismatch_every_run(tmp_path):
+    """A hand-written ``"sha256": null`` must not read as an entry that moved during the run,
+    which would answer run again forever.
+
+    Mutation this catches: comparing the raw sha with the text the run planned against.
+    """
+    root, client, _originals = _lake(tmp_path)
+    entry = dict(latest_entries(root)[SPY_3], sha256=None, source="hand")
+    with (root / "manifest.jsonl").open("a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+    lines = [_refuses_after_commit(root, client) for _ in range(2)]
+
+    for line in lines:
+        assert "does not match its manifest entry" in line
+        assert "changed in the lake" not in line
