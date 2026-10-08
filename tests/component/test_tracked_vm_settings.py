@@ -19,8 +19,16 @@ from lake.config import is_region_name
 ROOT = Path(__file__).resolve().parents[2]
 TRACKED_SETTINGS = ROOT / "config" / "vm.yaml"
 
-# The five keys the file holds, written out rather than read from the code.
-KEYS = {"role", "lake_root", "token_store", "bucket_credentials", "bucket_region"}
+# The six keys the file holds, written out rather than read from the code.
+# ``lake_window_sessions`` joined them under marketlake #786.
+KEYS = {
+    "role",
+    "lake_root",
+    "token_store",
+    "bucket_credentials",
+    "bucket_region",
+    "lake_window_sessions",
+}
 
 
 def _settings() -> dict:
@@ -39,7 +47,7 @@ def test_the_vm_runs_as_a_shadow():
     assert role == "shadow"
 
 
-def test_the_settings_hold_exactly_the_five_keys():
+def test_the_settings_hold_exactly_the_six_keys():
     settings = _settings()
     assert set(settings) == KEYS
     assert not set(settings) & vm_config.FILLED_KEYS
@@ -53,3 +61,15 @@ def test_the_settings_are_what_the_vm_needs():
     assert settings["bucket_credentials"] == "instance_profile"
     assert settings["bucket_region"] == "us-east-1"
     assert is_region_name(settings["bucket_region"])
+
+
+def test_the_vm_keeps_a_window_of_22_sessions():
+    """The owner set the window to 22 sessions on 2026-10-07, decision 1 on marketlake #755.
+
+    #786 measured ``du`` per surface first, and chains were nearly all of each session's
+    growth, so the value stands. The type is checked as well as the value, because a quoted
+    ``"22"`` loads as text and the render refuses it.
+    """
+    window = _settings()["lake_window_sessions"]
+    assert type(window) is int
+    assert window == 22

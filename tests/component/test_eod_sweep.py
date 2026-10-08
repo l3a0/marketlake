@@ -2827,18 +2827,20 @@ def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLa
     ``detect_splits`` decides whether two sealed sessions are adjacent, and that is the
     calendar's answer under marketlake #431. A sweep that constructed its own would agree with
     the injected fake on every ordinary week and disagree on exactly the days a test declares,
-    so the identity is the assertion rather than any verdict downstream of it.
+    so the identity is the assertion rather than any verdict downstream of it. The sweep reaches
+    it through ``split_checkpoint.walk_splits`` since marketlake #786, so that is where the
+    calendar is caught.
     """
     root = _lake(fixture_lake)
     calendar = weekday_sessions(MONDAY, NEXT_MONDAY)
     seen: list[object] = []
-    real = sweep.detect_splits
+    real = sweep.walk_splits
 
     def recording(**kwargs):
         seen.append(kwargs["calendar"])
         return real(**kwargs)
 
-    monkeypatch.setattr(sweep, "detect_splits", recording)
+    monkeypatch.setattr(sweep, "walk_splits", recording)
 
     sweep.sweep(
         lake_root=root,

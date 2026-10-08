@@ -12,8 +12,17 @@
 #
 # `lake_root` is the lake volume's mount point. It changes only with a replacement of the
 # instance, because a kept instance's fstab line would still name the old path.
+#
+# `lake_window_sessions` is how many recent sessions the VM keeps on its lake volume, and the
+# opt-in to trimming older partitions once the bucket holds them, #755 and #786. With it set,
+# the 18:30 sweep writes the split checkpoint, and #787's trim reads it. The owner set it to
+# 22 on 2026-10-07 (decision 1 on #755), after #786 measured that chains are nearly all of
+# each session's growth. The render refuses a value under the floor that the readers of sealed
+# chains need, which lake.window derives. Removing the key stops both the checkpoint and the
+# trim.
 role: shadow
 lake_root: /srv/marketlake
 token_store: store
 bucket_credentials: instance_profile
 bucket_region: us-east-1
+lake_window_sessions: 22

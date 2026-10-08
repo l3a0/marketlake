@@ -1,0 +1,151 @@
+"""The lake window: how many recent sessions a host keeps, and the edge that count sets.
+
+Marketlake #755 keeps only a window of recent sessions on the hosted VM's lake volume and
+leaves older partitions in the backup bucket. One config key, ``lake_window_sessions``, is
+both the window and the opt-in. A host without it never trims and writes no split
+checkpoint, which is the laptop today. Marketlake #786 adds the key and its first reader,
+the 18:30 sweep's split checkpoint, and marketlake #787's trim is its second reader.
+
+The key is named for the lake rather than for chains. The owner decided on 2026-10-07
+(decision 9 on #755) that every dated surface is trimmed at one snapshot cutoff, so
+marketlake #794 reuses this key for ``quotes/``. Chains go first, so the floor below is the
+chains readers' until #794 adds the quotes readers'.
+
+**Loading never judges the value.** ``config.load_config`` runs every capture cycle, so a
+refusal there would stop capture on a typo. Loading stores an integer as read and any other
+value as its ``repr``, the way ``role`` is stored, and each job judges it here: the render
+in ``lake.vm_config`` refuses a bad value before it reaches the VM, and the sweep and the
+trim check it again as a backstop.
+
+**The floor is derived, never written down.** Every job that reads sealed chains on a host
+sets a minimum on the window, and marketlake #786's body carries the table. Three set it:
+
+1. ``battery.trailing_medians`` reads ``trailing_median_sessions`` sessions before the
+   judged day, so it needs that many plus the day itself. The value can be overridden in
+   ``config.yaml``, which is why the floor reads the loaded guards.
+2. The dashboard's History panel reads ``dashboard.HISTORY_WINDOW_DAYS`` calendar days.
+3. ``runway.assess`` reads the busiest day over ``runway.GROWTH_WINDOW_DAYS`` calendar days.
+
+The other readers need less: ``battery._judge_drift`` reads the previous sealed day, and
+compaction reads only the day it seals.
+
+A span of calendar days becomes sessions by :func:`most_sessions_in`, the most weekdays any
+span that long can hold. A holiday only removes a session, so no span of 30 days holds more
+than 22, and a window of 22 covers every one of them.
+"""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from lake.calendar import Calendar
+from lake.config import LAKE_WINDOW_SESSIONS_KEY, GuardConstants
+
+# The key, spelled once in ``lake.config`` beside the other keys. ``lake.vm_config``, the sweep
+# and marketlake #787's trim read it.
+WINDOW_KEY = LAKE_WINDOW_SESSIONS_KEY
+
+# How far back the edge is looked for before it gives up. The real calendar answers every
+# day back to 2006, so it never gets near this. A calendar that answers no session at all,
+# which a test's fake does outside the weeks it was built with, would otherwise hang the job.
+EDGE_SEARCH_DAYS = 366
+
+_WEEK_DAYS = 7
+_WEEKDAYS = 5
+
+
+class WindowRefused(Exception):
+    """The window key holds a value no job may act on.
+
+    The message names the key and the floor, never the value, for the reason ``lake.vm_config``
+    gives for every line it prints. It holds no ``": "``, so ``report.redacted`` keeps it whole
+    when the sweep files it.
+    """
+
+
+class EdgeNotFound(Exception):
+    """No window edge lies within :data:`EDGE_SEARCH_DAYS` of the night it was counted from."""
+
+
+def most_sessions_in(days: int) -> int:
+    """The most sessions any span of ``days`` consecutive calendar days can hold.
+
+    A session falls on a weekday, so the answer is the most weekdays such a span holds: five
+    for each whole week, and up to five more for the days left over. A holiday only takes one
+    away, so no real span holds more.
+    """
+    weeks, rest = divmod(days, _WEEK_DAYS)
+    return weeks * _WEEKDAYS + min(rest, _WEEKDAYS)
+
+
+def window_floor(guards: GuardConstants) -> int:
+    """The fewest sessions a window may keep, given the loaded guard constants.
+
+    The module docstring names the three readers this is the largest of.
+    """
+    from lake.dashboard import HISTORY_WINDOW_DAYS
+    from lake.runway import GROWTH_WINDOW_DAYS
+
+    return max(
+        guards.trailing_median_sessions + 1,
+        most_sessions_in(HISTORY_WINDOW_DAYS),
+        most_sessions_in(GROWTH_WINDOW_DAYS),
+    )
+
+
+def window_sessions(value: object, guards: GuardConstants) -> int | None:
+    """The window a stored key value sets, ``None`` when the key is absent, or a refusal.
+
+    ``value`` is ``Config.lake_window_sessions``: ``None`` for an absent key, an ``int`` as
+    read, or the ``repr`` of anything else. A ``bool`` is refused even though Python counts it
+    as an ``int``, because ``lake_window_sessions: true`` is a typo rather than a window.
+    """
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise WindowRefused(f"{WINDOW_KEY} is not a whole number of sessions")
+    floor = window_floor(guards)
+    if value < floor:
+        raise WindowRefused(
+            f"{WINDOW_KEY} is under the floor of {floor} sessions that the readers of sealed "
+            "chains need, which are the battery's trailing median, the History panel and the "
+            "disk runway. Raise it in config/vm.yaml"
+        )
+    return value
+
+
+def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
+    """The window edge: the ``sessions``-th session counted back from ``tonight``, tonight first.
+
+    After the next trim and seal the lake then holds exactly ``sessions`` chains sessions. A
+    session the lake did not capture still takes a slot, because the count is the calendar's.
+    Counting back needs no forward lookup, so it never meets the calendar's one-year bound.
+
+    ``tonight`` need not be a session. A day that is not one takes no slot.
+    """
+    if sessions < 1:
+        raise ValueError(f"a window holds at least one session, not {sessions}")
+    counted = 0
+    day = tonight
+    for _ in range(EDGE_SEARCH_DAYS):
+        if calendar.is_session(day):
+            counted += 1
+            if counted == sessions:
+                return day
+        day -= timedelta(days=1)
+    raise EdgeNotFound(
+        f"no {sessions} sessions in the {EDGE_SEARCH_DAYS} days up to {tonight.isoformat()}, "
+        "so the calendar answers no session there"
+    )
+
+
+__all__ = [
+    "EDGE_SEARCH_DAYS",
+    "EdgeNotFound",
+    "WINDOW_KEY",
+    "WindowRefused",
+    "most_sessions_in",
+    "window_edge",
+    "window_floor",
+    "window_sessions",
+]
