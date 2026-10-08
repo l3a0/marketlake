@@ -1137,7 +1137,9 @@ def scrub(lake_root: Path) -> ScrubResult:
     answered for it, and so is a directory at a manifested path that will not list. That is
     what keeps one fault from being named twice. A file whose ``is_file()`` raises is
     ``unreadable`` too. ``is_file()`` follows symlinks, so a symlinked file is checked like
-    any other and a FIFO is skipped without being opened.
+    any other and a FIFO is skipped without being opened. A symlinked directory is not
+    descended, as ``rglob`` did not descend one, because the link may point outside the lake
+    and the files there are no orphans of it.
 
     The walk copies ``lake.runway.walk``'s rules rather than calling it, because that walk
     returns byte and file counts and no list of files. The price is two walks carrying the

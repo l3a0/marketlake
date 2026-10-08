@@ -489,6 +489,24 @@ def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
     assert not result.ok
 
 
+def test_a_symlinked_trimmed_ledger_is_read_through_its_link(tmp_path):
+    """Mutation this catches: a regular-file gate that does not follow symlinks.
+
+    A ledger reached through a link is still a regular file to read, so the trimmed partition
+    stays a designed absence rather than every absence counting as missing.
+    """
+    root = _lake(tmp_path / "lake")
+    _trim_away(root, SPY)
+    outside = tmp_path / "outside.jsonl"
+    trimmed_path(root).rename(outside)
+    trimmed_path(root).symlink_to(outside)
+
+    result = scrub(root)
+
+    assert result.trimmed_unreadable is None
+    assert result.ok, result
+
+
 def test_a_trimmed_file_deleted_mid_check_is_still_a_designed_absence(tmp_path, monkeypatch):
     """Mutation this catches: recording a file that vanished mid-check as unreadable.
 

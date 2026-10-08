@@ -1859,6 +1859,95 @@ def test_every_lake_finding_is_named_in_order_beside_the_backup_notes(fixture_la
     _withheld_and_still_ran(outcome, pinger)
 
 
+def test_lake_lines_are_capped_at_three_per_kind(fixture_lake):
+    # A disk going bad names every file it carries. One report line per path would bury every
+    # other finding the run made, so each kind names three and counts the rest.
+    from lake.manifest import append_manifest
+
+    root = _clean_lake(fixture_lake)
+    (root / "w").mkdir()
+    (root / "o").mkdir()
+    for name in ("a", "b", "c", "d"):
+        # Manifested and never written, so missing.
+        append_manifest(
+            root,
+            partition=f"m/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        # Manifested with a sha the bytes do not have.
+        (root / f"w/{name}.parquet").write_bytes(b"x")
+        append_manifest(
+            root,
+            partition=f"w/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        # A directory at a manifested path, so unreadable.
+        append_manifest(
+            root,
+            partition=f"u/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        (root / f"u/{name}.parquet").mkdir(parents=True)
+        # Written with no entry, so an orphan.
+        (root / f"o/{name}.parquet").write_bytes(b"x")
+
+    outcome, pinger = _run(root)
+
+    assert [line for line in outcome.report if line.startswith("lake")] == [
+        "lake file missing: m/a.parquet",
+        "lake file missing: m/b.parquet",
+        "lake file missing: m/c.parquet",
+        "lake file missing: and 1 more",
+        "lake file does not match its sha: w/a.parquet",
+        "lake file does not match its sha: w/b.parquet",
+        "lake file does not match its sha: w/c.parquet",
+        "lake file does not match its sha: and 1 more",
+        "lake file has no manifest entry: o/a.parquet",
+        "lake file has no manifest entry: o/b.parquet",
+        "lake file has no manifest entry: o/c.parquet",
+        "lake file has no manifest entry: and 1 more",
+        "lake path could not be read: u/a.parquet: not a regular file",
+        "lake path could not be read: u/b.parquet: not a regular file",
+        "lake path could not be read: u/c.parquet: not a regular file",
+        "lake path could not be read: and 1 more",
+    ]
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_a_directory_at_a_manifested_path_in_an_unsearchable_parent_is_named_once_on_sunday(
+    fixture_lake,
+):
+    # The forward pass and the walk's error callback would each build the same entry for it.
+    # The walk leaves a manifested path to the forward pass, so the path is named once.
+    from lake.manifest import append_manifest
+
+    root = _clean_lake(fixture_lake)
+    parent = root / "bars"
+    (parent / "d.parquet").mkdir(parents=True)
+    append_manifest(
+        root, partition="bars/d.parquet", source="sweep", sha256="s", rows=1, fetched_at=None
+    )
+    with _mode(parent, 0o444):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == ("bars/d.parquet: PermissionError",)
+    assert "scrub failed: missing=0 sha_mismatches=0 orphans=0 unreadable=1" in outcome.problems
+    assert [line for line in outcome.report if line.startswith("lake")] == [
+        "lake path could not be read: bars/d.parquet: PermissionError"
+    ]
+    _withheld_and_still_ran(outcome, pinger)
+
+
 # -- a scrub that raises -------------------------------------------------------------
 
 # A fault that leaves the scrub nothing to say per path still raises from it. Each of the

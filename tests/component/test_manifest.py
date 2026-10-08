@@ -806,6 +806,21 @@ def test_the_reverse_pass_follows_a_symlink_and_never_counts_a_fifo(fixture_lake
     assert result.unreadable == ()
 
 
+def test_a_symlinked_directory_is_not_descended(fixture_lake, tmp_path):
+    # ``os.walk`` does not follow a link to a directory, as ``rglob`` did not, and the link may
+    # point outside the lake, whose files are no orphans of it.
+    root = _base_lake(fixture_lake).root
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "stray.parquet").write_bytes(b"x")
+    (root / "linked").symlink_to(outside)
+
+    result = scrub(root)
+
+    assert result.orphans == ()
+    assert result.ok, result
+
+
 def test_orphans_are_sorted_whatever_order_the_walk_meets_them(fixture_lake):
     # ``os.walk`` lists a directory's files before it descends, so the root's own orphan comes
     # first in walk order and last in sorted order.

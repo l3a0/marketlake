@@ -493,6 +493,42 @@ def test_a_read_that_fails_is_a_named_finding_rather_than_a_raise(fixture_lake):
     assert result.problem.startswith("backup could not be read: PermissionError")
 
 
+def test_a_symlinked_file_on_the_copy_is_hashed_through_its_link(fixture_lake, tmp_path):
+    # The regular-file check follows symlinks, as ``exists()`` does, so a partition the copy
+    # reaches through a link is checked by its bytes rather than called not a regular file.
+    root, target = _backed_up(fixture_lake)
+    real = tmp_path / "outside.parquet"
+    (target / CHAINS).rename(real)
+    (target / CHAINS).symlink_to(real)
+
+    result = backup_scrub(root, target)
+
+    assert result.not_regular == ()
+    assert result.ok, result.problem
+
+
+def test_backup_not_regular_paths_are_sorted_and_capped(fixture_lake):
+    # Manifested in an order that is not sorted, so only the sort puts the named lines right,
+    # and more of them than the cap names, so the last line counts the rest.
+    for ticker in ("SPY", "QQQ", "IWM", "DIA", "XLF"):
+        fixture_lake.with_chains(ticker, DAY)
+    root = fixture_lake.build()
+    target = mirror_lake(root, root.parent / "ssd")
+    for path in target.glob("chains/**/*.parquet"):
+        path.unlink()
+        path.mkdir()
+
+    result = backup_scrub(root, target)
+
+    label = "backup path is not a regular file, so remove it from the copy first"
+    assert [line for line in result.notes if line.startswith(label)] == [
+        f"{label}: chains/ticker=DIA/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=IWM/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=QQQ/date={DAY.isoformat()}.parquet",
+        f"{label}: and 2 more",
+    ]
+
+
 def test_many_wrong_files_name_a_few_and_then_say_how_many(fixture_lake):
     # A disk going bad names every file it carries. One report line per partition would
     # bury every other finding the run made, so the naming stops and counts the rest.
