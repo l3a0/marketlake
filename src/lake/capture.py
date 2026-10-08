@@ -2,11 +2,12 @@
 
 A capture cycle is the smallest unit of capture. It fetches every option chain and
 one batched equity quote, journals what the vendor sent, and records each journal
-segment it wrote in the manifest. A segment whose write failed is recorded instead by a
-gap row at that segment's path, which gets no manifest entry, and by a line in the
-daemon's log (marketlake #769). This module builds that one cycle. The daemon that calls it
-once a minute is ``lake.daemon``. The market-hours, calendar, and session logic live
-there and in ``lake.session``. Here the cycle runs once and returns.
+segment it wrote in the manifest. A segment whose write failed gets no manifest entry.
+The cycle prints a line for it to the daemon's log and tries to write a gap row at that
+segment's path, and ``SegmentError`` says when that row lands (marketlake #769). This
+module builds that one cycle. The daemon that calls it once a minute is ``lake.daemon``.
+The market-hours, calendar, and session logic live there and in ``lake.session``. Here
+the cycle runs once and returns.
 
 The cycle's two halves are also exported on their own, so a caller outside the loop can
 do either the loop's way. ``fetch_chain`` is the fetching half: it runs a chain's
@@ -454,16 +455,21 @@ def record_requests(
             append_requests(lake_root, snap_ts=snap_ts, day=day, records=(record,))
         except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
             refused = refused or exc
+    # Each line is built inside the guard, because an exception whose message raises
+    # would otherwise raise here, outside it.
     if refused is not None:
-        _say(
-            f"capture: request timing not written for {where}: {type(refused).__name__}: {refused}"
+        _say_built(
+            lambda: (
+                f"capture: request timing not written for {where}: "
+                f"{type(refused).__name__}: {refused}"
+            )
         )
     try:
         found = failures(records)
     except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
-        found = [f"{type(exc).__name__}: {exc}"]
+        found = [_one_line_or_class(exc)]
     if found:
-        _say(f"capture: request timing incomplete for {where}: {'; '.join(found)}")
+        _say_built(lambda: f"capture: request timing incomplete for {where}: {'; '.join(found)}")
 
 
 def record_cycle(lake_root: Path | str, *, day: date, record: CycleRecord, where: str) -> None:
@@ -478,9 +484,16 @@ def record_cycle(lake_root: Path | str, *, day: date, record: CycleRecord, where
     try:
         append_cycle(lake_root, day=day, record=record)
     except Exception as exc:  # noqa: BLE001 - timing must never cost a minute
-        _say(f"capture: cycle timing not written for {where}: {type(exc).__name__}: {exc}")
+        # Built inside the guard, as ``record_requests`` says.
+        _say_built(
+            lambda error=exc: (
+                f"capture: cycle timing not written for {where}: {type(error).__name__}: {error}"
+            )
+        )
     if record.failures:
-        _say(f"capture: cycle timing incomplete for {where}: {'; '.join(record.failures)}")
+        _say_built(
+            lambda: f"capture: cycle timing incomplete for {where}: {'; '.join(record.failures)}"
+        )
 
 
 def _say(line: str) -> None:
@@ -551,6 +564,18 @@ def _one_line(exc: BaseException) -> str:
     sentences, so a raw message would split one event across several log lines.
     """
     return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+def _one_line_or_class(exc: BaseException) -> str:
+    """``_one_line``, or the class name alone when the exception's message raises.
+
+    The failed-write line is the only record of a minute whose gap row also failed, so a
+    message that cannot be built costs the message and never the line (marketlake #769).
+    """
+    try:
+        return _one_line(exc)
+    except Exception:  # noqa: BLE001 - the line must print whatever the message does
+        return type(exc).__name__
 
 
 def _say_built(line: Callable[[], str]) -> None:
@@ -743,7 +768,11 @@ class SegmentError:
     2. When the batch was durable and only its end-of-stream marker failed, the file stays
        with its rows and no gap row is written beside it.
     3. When the gap row fails too, or the file could not be removed, the minute holds no
-       row from this cycle. The daemon's log line says which.
+       row from this cycle.
+
+    The daemon's log line says whether the gap row landed. A ``FileExistsError`` there
+    means a file stayed at the path, and the line cannot tell the rows of case 2 from a
+    file that could not be removed.
     """
 
     surface: str
@@ -817,7 +846,9 @@ class _FailedWrite:
     Only what its gap row and its log line need. A data plan's batch is dropped, since
     its gap row is built fresh, so a chain's megabytes are not held to the end of the
     cycle. A gap plan's batch is its one row, written again as it stands. ``error`` has no
-    traceback, because the traceback's frames would hold the plan.
+    traceback anywhere along its chain, because a traceback's frames would hold the plan,
+    and a failure chained behind it, such as a cleanup that raised in ``__exit__``, keeps
+    its own.
     """
 
     rank: int
@@ -828,6 +859,30 @@ class _FailedWrite:
     fetch_end_ts: datetime
     gap_batch: object | None
     error: Exception
+
+
+def _without_tracebacks(exc: Exception) -> Exception:
+    """The exception, with the traceback cleared on it and on every exception chained to it.
+
+    A traceback holds the frames it passed through, and those frames hold their locals,
+    so a kept exception keeps them alive. ``with_traceback(None)`` clears only the
+    outermost one, while ``__cause__``, ``__context__`` and an exception group's members
+    keep their own.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        seen.add(id(link))
+        link.__traceback__ = None
+        pending.extend(
+            chained for chained in (link.__cause__, link.__context__) if chained is not None
+        )
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(link.exceptions)
+    return exc
 
 
 @dataclass(frozen=True)
@@ -2274,11 +2329,13 @@ class _CaptureCycle:
         try:
             routed = journal.routed_columns(surface, plan.batch)
         except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
-            scan_error = exc
+            # The lambda takes the exception as a default, never from a local, because a
+            # local holds it in this frame and its traceback holds the frame, a cycle that
+            # keeps the batch alive until the collector runs. The same holds below.
             _say_built(
-                lambda: (
+                lambda error=exc: (
                     f"capture: schema-drift scan failed on {surface} {ticker}: "
-                    f"{type(scan_error).__name__}: {scan_error}"
+                    f"{type(error).__name__}: {error}"
                 )
             )
             routed = ()
@@ -2291,11 +2348,10 @@ class _CaptureCycle:
         try:
             sha256: str | None = sha256_file(writer.path)
         except Exception as exc:  # noqa: BLE001 - the segment is durable, so it must land
-            hash_error = exc
             _say_built(
-                lambda: (
+                lambda error=exc: (
                     f"capture: hash at close failed on {surface} {ticker}, "
-                    f"hashing under the lock instead: {type(hash_error).__name__}: {hash_error}"
+                    f"hashing under the lock instead: {type(error).__name__}: {error}"
                 )
             )
             sha256 = None
@@ -2355,14 +2411,15 @@ class _CaptureCycle:
             ) as writer:
                 writer.write_cycle(batch)
         except Exception as exc:  # noqa: BLE001 - a raise out of run ends the daemon
-            refused = exc.with_traceback(None)
+            refused = _without_tracebacks(exc)
         _say_built(lambda: self._failed_write_line(failure, refused))
 
     def _failed_write_line(self, failure: _FailedWrite, refused: Exception | None) -> str:
         """The daemon's log line for one failed segment write.
 
         ``segment write failed`` is a fixed phrase, so the runbook can find the line in the
-        log. The errno's name, such as ``ENOSPC``, is there when the failure carried one.
+        log. The errno's name, such as ``ENOSPC``, is there when the failure carried one. An
+        exception whose message raises prints as its class name, so the line always prints.
         """
         error = failure.error
         code = getattr(error, "errno", None)
@@ -2371,10 +2428,10 @@ class _CaptureCycle:
         if refused is None:
             outcome = "the gap row landed"
         else:
-            outcome = f"the gap row did not land: {_one_line(refused)}"
+            outcome = f"the gap row did not land: {_one_line_or_class(refused)}"
         return (
             f"capture: {self.snap_ts.isoformat()}: segment write failed: "
-            f"{failure.surface} {failure.ticker}{cause}: {_one_line(error)}; {outcome}"
+            f"{failure.surface} {failure.ticker}{cause}: {_one_line_or_class(error)}; {outcome}"
         )
 
     # -- the cycle -----------------------------------------------------------
@@ -2424,7 +2481,7 @@ class _CaptureCycle:
                         fetch_ts=plan.fetch_ts,
                         fetch_end_ts=plan.fetch_end_ts,
                         gap_batch=plan.batch if plan.row_kind == journal.ROW_KIND_GAP else None,
-                        error=exc.with_traceback(None),
+                        error=_without_tracebacks(exc),
                     )
                 )
 
@@ -2490,13 +2547,14 @@ class _CaptureCycle:
             if isinstance(item, SegmentOutcome)
         ]
 
-        # Now the segments are durable, append one manifest entry per segment, keyed by
-        # the segment path, under the lake-root lock. One call reads the manifest once and
-        # writes every line in one write (marketlake #573). The lock serializes
-        # lake-mutating jobs, so the manifest append never races a daily job. Capture
-        # stayed outside the lock for the perishable part, and each segment was hashed as
-        # it closed. The cycle line brackets the append, so a reader can tell the wait for
-        # the lock from the time spent holding it.
+        # Now the segments are durable, append one manifest entry per segment the plan
+        # wrote, keyed by the segment path, under the lake-root lock. A failed write's gap
+        # row gets none. One call reads the manifest once and writes every line in one
+        # write (marketlake #573). The lock serializes lake-mutating jobs, so the manifest
+        # append never races a daily job. Capture stayed outside the lock for the
+        # perishable part, and each segment was hashed as it closed. The cycle line
+        # brackets the append, so a reader can tell the wait for the lock from the time
+        # spent holding it.
         with lake_lock(self.lake_root):
             lock_acquired = self.clock.now()
             append_entries(self.lake_root, entries)
@@ -2638,8 +2696,8 @@ def run_cycle(
        segments are written once every fetch is done. Above it each chain, and the quote
        batch, is written as soon as its own requests are done, marketlake #563, so step 2
        and this step overlap and the quotes usually land first.
-    4. For each segment whose write failed, in plan order, write one gap row at that
-       segment's own path and print one line to the daemon's log, marketlake #769. The
+    4. For each segment whose write failed, in plan order, try to write one gap row at
+       that segment's own path and print one line to the daemon's log, marketlake #769. The
        result reports the failure as a ``SegmentError``, and the gap row is in neither the
        result nor the manifest.
     5. Append one manifest entry per segment written in step 3, keyed by the segment path,
@@ -3060,9 +3118,9 @@ def journal_snapshot(
     try:
         routed = journal.routed_columns(surface, batch)
     except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
-        error = exc
+        # A default rather than a local, for the reason ``_CaptureCycle._write`` gives.
         _say_built(
-            lambda: (
+            lambda error=exc: (
                 f"capture: schema-drift scan failed on {surface} {ticker}: "
                 f"{type(error).__name__}: {error}"
             )
@@ -3122,9 +3180,9 @@ def _count_data_rows(surface: str, ticker: str, batch: object) -> int | None:
     try:
         return journal.data_rows(batch)
     except Exception as exc:  # noqa: BLE001 - a diagnostic must never cost a minute
-        error = exc
+        # A default rather than a local, for the reason ``_CaptureCycle._write`` gives.
         _say_built(
-            lambda: (
+            lambda error=exc: (
                 f"capture: data-row count failed on {surface} {ticker}: "
                 f"{type(error).__name__}: {error}"
             )

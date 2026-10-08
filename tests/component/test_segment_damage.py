@@ -698,6 +698,57 @@ def test_a_later_batch_that_fails_keeps_the_durable_one_without_a_marker(lake_ro
     assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
 
 
+def test_a_later_good_write_does_not_restore_the_marker(lake_root, monkeypatch):
+    """The half-written batch is still in the file, so no later write makes it finished.
+
+    The first batch is durable, so the failed second one keeps the file (#552). The disk
+    then frees up and a third batch lands, and the marker must still stay off, because it
+    would sit behind the second batch's half-written bytes.
+    """
+    whole = _written(lake_root, "a", 1).stat().st_size
+    # Room for the first batch and part of the second, and then the disk recovers.
+    _full_disk_after(monkeypatch, whole - len(EOS) + 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    with writer:
+        writer.write_cycle(_batch())
+        with pytest.raises(OSError, match="No space"):
+            writer.write_cycle(_batch())
+        writer.write_cycle(_batch())
+
+    assert writer.durable_syncs == 2
+    assert not writer.path.read_bytes().endswith(EOS)
+
+
+def test_a_failed_write_after_an_interrupt_keeps_the_interrupted_batch(lake_root, monkeypatch):
+    """An interrupt leaves a whole batch the writer has not counted, so a later failure keeps it.
+
+    The interrupt lands just after the real flush, so the batch is on disk while
+    ``durable_syncs`` still reads 0. A caller that catches the interrupt and writes again,
+    into a disk that then fills, must not remove the file and the rows already in it.
+    """
+    whole = _written(lake_root, "a", 1).stat().st_size
+    # Room for the first batch and part of the second.
+    _full_disk_after(monkeypatch, whole - len(EOS) + 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    real_fcntl, real_fsync = journal.fcntl.fcntl, journal.os.fsync
+    monkeypatch.setattr(journal.fcntl, "fcntl", _then_interrupt(real_fcntl))
+    monkeypatch.setattr(journal.os, "fsync", _then_interrupt(real_fsync))
+
+    with writer:
+        with pytest.raises(KeyboardInterrupt):
+            writer.write_cycle(_batch())
+        # Only the platform's own flush was interrupted, so the other one is put back too.
+        monkeypatch.setattr(journal.fcntl, "fcntl", real_fcntl)
+        monkeypatch.setattr(journal.os, "fsync", real_fsync)
+        with pytest.raises(OSError, match="No space"):
+            writer.write_cycle(_batch())
+
+    assert writer.durable_syncs == 0
+    assert not writer.path.read_bytes().endswith(EOS)
+    assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
+
+
 def test_a_failed_write_still_closes_the_file(lake_root, monkeypatch):
     _full_disk_after(monkeypatch, 5000)
     writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)

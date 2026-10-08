@@ -646,7 +646,8 @@ def test_a_unit_whose_write_raises_costs_its_own_segment_and_the_others_land(
 ):
     # QQQ's chain and SPY's quote segment cannot be opened. Each is recorded as its own
     # error, in plan order although QQQ's chain finishes first, and the other two land with
-    # manifest entries.
+    # manifest entries. Refusing the open per surface and ticker refuses the gap row too,
+    # since it opens the same path, so this is the case where the gap row fails as well.
     real = journal.SegmentWriter.open
 
     def refuse(root, surface, ticker, *args, **kwargs):
@@ -766,7 +767,9 @@ def test_a_slow_write_cannot_stretch_the_stagger(lake_root, monkeypatch):
 @pytest.mark.parametrize("cap", [1, 20])
 def test_a_write_that_raises_any_exception_costs_only_its_own_segment(lake_root, monkeypatch, cap):
     # ``write_cycle`` can raise pyarrow's ``ArrowInvalid``, a ``ValueError`` rather than an
-    # ``OSError``. It is recorded like a refused disk, and the other units still land.
+    # ``OSError``. It is recorded like a refused disk, and the other units still land. The
+    # refusal is on the open for that surface and ticker, which refuses the gap row too,
+    # so this is the case where the gap row fails as well.
     real = journal.SegmentWriter.open
 
     def refuse(root, surface, ticker, *args, **kwargs):

@@ -2227,9 +2227,9 @@ def _fsync_directory(directory: Path) -> None:
 def _discard(path: Path, close: Callable[[], None]) -> None:
     """Close a segment that holds nothing durable, remove it, and make the removal durable.
 
-    It never raises, so the failure that called it is the one the caller sees. A close or
-    a removal that fails leaves the file where it is, the way it was before this cleanup
-    existed.
+    It never raises, so the failure that called it is the one the caller sees. A close that
+    fails is ignored, and the removal still runs. A removal that fails leaves the file
+    where it is, the way it was before this cleanup existed.
     """
     try:
         close()
@@ -2262,9 +2262,11 @@ class SegmentWriter:
     ``BaseException`` such as ``KeyboardInterrupt`` raised by a write keeps the file. Python
     raises a pending interrupt just after the durability flush returns and before the count
     of durable flushes moves, so the file it interrupts almost always holds a complete
-    batch. A failure of the exclusive create itself never removes anything, because the
-    path may be another writer's durable segment. After a removal the writer counts as
-    closed, and a later ``write_cycle`` raises ``ValueError``.
+    batch. For the same reason a write that raises after an earlier write raised keeps the
+    file, since the interrupted batch may be whole on disk while the count still reads 0. A
+    failure of the exclusive create itself never removes anything, because the path may be
+    another writer's durable segment. After a removal the writer counts as closed, and a
+    later ``write_cycle`` raises ``ValueError``.
 
     Where an earlier batch was durable, the file stays, and the marker never lands after
     a write that raised. A write can fail partway through a batch and leave the caller
@@ -2275,9 +2277,13 @@ class SegmentWriter:
     torn tail, and its complete batches are kept. This is keyed on the write rather than on
     the exception ``__exit__`` receives, because a caller that catches the failure inside
     the ``with`` block leaves ``__exit__`` nothing to see. Every production caller writes
-    one batch, so none of them reaches this case. The file a production caller keeps is
-    one whose batch was durable and whose end-of-stream marker then failed, which
-    ``close`` raises.
+    one batch, so none of them reaches this case. A production caller keeps a file after a
+    failure in three cases:
+
+    1. Its batch was durable and its end-of-stream marker then failed, which ``close``
+       raises.
+    2. The removal itself failed, as on a volume that turned read-only.
+    3. An interrupt stopped the write, which keeps the file whatever it holds.
     """
 
     def __init__(self, path: Path | str, schema: pa.Schema, *, surface: str | None = None) -> None:
@@ -2353,12 +2359,15 @@ class SegmentWriter:
         batch can never land in a chains segment. Durability is the design's success
         point. A cycle counts as captured only after this returns.
 
-        A write that raises an ``Exception`` before any batch was durable removes the file,
-        and the writer then counts as closed. The class docstring says why, and why an
-        interrupt keeps the file.
+        A write that raises an ``Exception`` before any batch was durable, and after no
+        earlier write raised, removes the file, and the writer then counts as closed. The
+        class docstring says why, and why an interrupt keeps the file.
         """
         if self._closed:
             raise ValueError("cannot write to a closed segment")
+        # An earlier write that raised may have left a whole batch the count never reached,
+        # as an interrupt just after the flush does, so only the first failure removes.
+        failed_before = self._write_failed
         try:
             if isinstance(batch, pa.Table):
                 self._writer.write_table(batch)
@@ -2369,7 +2378,7 @@ class SegmentWriter:
             # How many of the batch's bytes reached the file is unknown, so the marker
             # must not follow them. The class docstring says why.
             self._write_failed = True
-            if isinstance(exc, Exception) and self.durable_syncs == 0:
+            if isinstance(exc, Exception) and self.durable_syncs == 0 and not failed_before:
                 self._closed = True
                 _discard(self.path, self._file.close)
             raise
