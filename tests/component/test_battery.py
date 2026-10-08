@@ -4455,6 +4455,27 @@ def test_a_partition_trimmed_by_design_is_counted_apart_and_not_missing(lake: Pa
     )
 
 
+def test_a_trimmed_quotes_partition_counts_the_same_as_a_trimmed_chains_one(lake: Path):
+    """The ledger is keyed by partition whatever its surface, and coverage walks both surfaces.
+
+    Chains are trimmed first, and the owner means every dated surface to be trimmed at the same
+    cutoff in time, so a quotes partition trimmed on purpose is not missing either.
+    """
+    quotes = f"quotes/ticker=SPY/date={TRIMMED_SESSION.isoformat()}.parquet"
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+    _trim_away(lake, quotes)
+
+    found = _coverage(lake)
+
+    assert found.missing == ()
+    assert found.trimmed == 2
+    assert coverage_line(found) == (
+        "battery: calendar coverage, 14 owed sessions, 2 trimmed by design, the rest present"
+    )
+
+
 def test_a_trimmed_partition_and_a_real_miss_are_each_counted(lake: Path):
     _seed_spans(lake)
     _cover_all(lake, days=[day for day in COVERED_SESSIONS if day != date(2026, 9, 15)])

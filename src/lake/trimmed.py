@@ -1,7 +1,10 @@
 """The trimmed ledger: the record that tells a partition dropped on purpose from one lost.
 
-Marketlake #755 keeps only a window of recent chains sessions on the hosted VM's lake volume,
-and drops an older chains partition once its copy in the backup bucket is verified. Before
+Marketlake #755 keeps only a window of recent sessions on the hosted VM's lake volume, and
+drops an older partition once its copy in the backup bucket is verified. Chains partitions are
+trimmed first, and the owner means every dated surface to be trimmed at the same cutoff in time,
+so nothing here assumes a surface. A line is keyed by the lake-relative ``partition``, which is
+any path ``paths.parse_partition_rel`` reads, ``chains`` and ``quotes`` today. Before
 anything deletes a sealed partition, the lake has to be able to say that a missing file was
 removed on purpose. Without a record, every reader that walks the manifest reads a trimmed
 partition as loss: the Sunday scrub withholds its ping every week, the battery's coverage check

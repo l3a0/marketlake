@@ -1474,7 +1474,8 @@ def coverage(
     **A partition trimmed on purpose is counted apart from a missing one.** Marketlake #782 is
     why. This check reads no manifest on a lake with no ``trimmed.jsonl``, so a host that never
     trims stats exactly what it did before. Once the ledger exists, an absent partition is asked
-    whether it is a designed absence, under every spelling, the way presence is asked.
+    whether it is a designed absence, on either surface and under every spelling, the way
+    presence is asked.
     """
     from lake.session import COMPACTION_DELAY
     from lake.trimmed import is_designed_absence, latest_trimmed, trimmed_path

@@ -124,8 +124,9 @@ MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
 # The trimmed ledger, the fourth append-only ledger, written by ``lake.trimmed``. It records
-# each chains partition removed from the lake on purpose once its bucket copy was verified, so
-# a reader can tell a partition dropped by design from one lost. Marketlake #782 built it.
+# each dated partition removed from the lake on purpose once its bucket copy was verified,
+# chains first, so a reader can tell a partition dropped by design from one lost. Marketlake
+# #782 built it.
 TRIMMED_FILE = "trimmed.jsonl"
 
 # The one entry a fresh ext4 filesystem holds at its root. On the hosted VM ``lake_root``

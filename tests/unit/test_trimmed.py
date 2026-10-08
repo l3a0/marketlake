@@ -26,6 +26,7 @@ from lake.trimmed import (
 )
 
 PART = "chains/ticker=SPY/date=2026-09-01.parquet"
+QUOTES = "quotes/ticker=SPY/date=2026-09-01.parquet"
 OTHER = "chains/ticker=QQQ/date=2026-09-01.parquet"
 SHA = "a" * 64
 NEW_SHA = "b" * 64
@@ -89,6 +90,14 @@ def test_the_designed_absence_table(lines, manifest, designed):
     # restore lines (the later-restore case), and resolving the first line per partition rather
     # than the latest (the later-restore and trim-after-restore cases).
     assert is_designed_absence(PART, manifest, latest_by_partition(lines)) is designed
+
+
+def test_the_predicate_assumes_no_surface():
+    """Chains are trimmed first, and every dated surface may be trimmed at the same cutoff."""
+    manifest = {QUOTES: {"partition": QUOTES, "sha256": SHA, "rows": 10}}
+    latest = latest_by_partition([_trim(QUOTES)])
+    assert is_designed_absence(QUOTES, manifest, latest) is True
+    assert _trim(QUOTES)["partition"] == QUOTES
 
 
 def test_the_predicate_takes_no_root_or_path():
