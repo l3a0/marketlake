@@ -462,7 +462,8 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
     the role's credentials first. ``_AssumeRoleFailed`` is STS turning that down, so it
     is *refused* or *unreachable* as ``lake.aws_session`` sorted it where it was caught,
     with the detail ``AssumeRole <code>``. Without this branch every caller would re-raise
-    it, and the Sunday job would stop before its canary.
+    it, and the Sunday job's guard would name it only as a scrub that raised, rather than as
+    the refusal or the outage it is. The guard still withholds the ping either way.
     """
     from botocore.exceptions import BotoCoreError, ClientError
 

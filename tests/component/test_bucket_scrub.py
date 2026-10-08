@@ -548,6 +548,14 @@ def test_the_sunday_job_reports_suspended_versioning_and_still_pings(tmp_path):
 # damage.
 
 
+def _tracebacks_printed(err: str) -> int:
+    """How many stack traces ``err`` holds, counting a chained cause as part of its trace."""
+    chained = err.count("The above exception was the direct cause") + err.count(
+        "During handling of the above exception"
+    )
+    return err.count("Traceback (most recent call last)") - chained
+
+
 def _damaged_with_its_copy(root: Path, old: bytes, new: bytes) -> tuple[Path, FakeS3]:
     lake, client = _uploaded(root)
     path = manifest_path(lake)
@@ -577,7 +585,7 @@ def _damaged_with_its_copy(root: Path, old: bytes, new: bytes) -> tuple[Path, Fa
                 "no partition"
             ),
             lambda lake: [
-                "backup could not be read: ManifestError: "
+                "backup could not be read: the backup scrub raised ManifestError: "
                 f"{manifest_path(lake)}: entry 1 names no partition"
             ],
             id="no partition",
@@ -594,9 +602,10 @@ def _damaged_with_its_copy(root: Path, old: bytes, new: bytes) -> tuple[Path, Fa
     ],
 )
 def test_a_damaged_lake_manifest_is_a_problem_line_on_a_bucket_target(
-    tmp_path, old, new, lake_line, backup_lines
+    tmp_path, capsys, old, new, lake_line, backup_lines
 ):
     lake, client = _damaged_with_its_copy(tmp_path / "lake", old, new)
+    capsys.readouterr()
 
     outcome, pinger = _sunday(lake, client)
 
@@ -604,10 +613,14 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_bucket_target(
     first, *rest = outcome.problems
     assert first.startswith(lake_line(lake))
     assert rest == backup_lines(lake)
-    if outcome.backup.unreadable is not None:
+    raised = outcome.backup.unreadable is not None
+    if raised:
         # The guard's result: no restore test, and not the shadow host's skip line.
         assert outcome.restore is None
     assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
+    # The lake guard always fired here, and the bucket guard when the bucket scrub raised.
+    # Each kept the stack trace, so a bug in a scrub is not lost to the line.
+    assert _tracebacks_printed(capsys.readouterr().err) == 1 + raised
     assert pinger.urls == []
     assert outcome.canary_passed and outcome.covered is True
 

@@ -1918,6 +1918,14 @@ def _damaged_then_copied(fixture_lake: FixtureLake, old: bytes, new: bytes) -> P
     return root
 
 
+def _tracebacks_printed(err: str) -> int:
+    """How many stack traces ``err`` holds, counting a chained cause as part of its trace."""
+    chained = err.count("The above exception was the direct cause") + err.count(
+        "During handling of the above exception"
+    )
+    return err.count("Traceback (most recent call last)") - chained
+
+
 def _manifest_named(root: Path) -> str:
     return str(root / "manifest.jsonl")
 
@@ -1940,7 +1948,7 @@ def _manifest_named(root: Path) -> str:
                 "names no partition"
             ),
             lambda root: [
-                "backup could not be read: ManifestError: "
+                "backup could not be read: the backup scrub raised ManifestError: "
                 f"{_manifest_named(root)}: entry 1 names no partition"
             ],
             id="no partition",
@@ -1949,13 +1957,13 @@ def _manifest_named(root: Path) -> str:
             b'"sha256"',
             b'"sha25X"',
             lambda root: "lake scrub could not run: KeyError: 'sha256'",
-            lambda root: ["backup could not be read: KeyError: 'sha256'"],
+            lambda root: ["backup could not be read: the backup scrub raised KeyError: 'sha256'"],
             id="no sha256",
         ),
     ],
 )
 def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
-    fixture_lake, old, new, lake, backup
+    fixture_lake, capsys, old, new, lake, backup
 ):
     root = _damaged_then_copied(fixture_lake, old, new)
 
@@ -1972,6 +1980,8 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
     else:
         assert outcome.backup.ok and outcome.restore is not None
     assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
+    # Each guard that fired kept the stack trace, so a bug in a scrub is not lost to the line.
+    assert _tracebacks_printed(capsys.readouterr().err) == 1 + len(backup_lines)
     _withheld_and_still_ran(outcome, pinger)
 
 

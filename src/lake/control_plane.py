@@ -101,6 +101,7 @@ import math
 import re
 import shlex
 import sys
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
@@ -2430,6 +2431,18 @@ def restore_week(now: datetime) -> int:
     return (day - RESTORE_EPOCH).days // 7
 
 
+def _backup_scrub_raised(target: Path | BucketTarget, exc: Exception) -> BackupScrubResult:
+    """The finding for a backup scrub that raised, with its stack trace printed to stderr.
+
+    The words say the scrub raised rather than that the disk failed, because a raise that got
+    past the scrub's own ``except OSError`` is a damaged lake manifest or a bug, never the copy.
+    """
+    print(traceback.format_exc(), file=sys.stderr, end="")
+    return BackupScrubResult(
+        target=str(target), unreadable=f"the backup scrub raised {type(exc).__name__}: {exc}"
+    )
+
+
 def sunday_maintenance(
     *,
     lake_root: Path,
@@ -2583,9 +2596,10 @@ def sunday_maintenance(
     # nothing per path to say, such as a ``manifest.jsonl`` that cannot be read or a line
     # in it naming no partition. The catch is broad because those shapes include
     # ``KeyError`` and ``AttributeError``, and a withheld ping still fails loud, so nothing
-    # is hidden. A missing root skips the scrub, whose walk would name the root a second
-    # time. ``is_dir`` sits inside the guard because it raises when the root's parent
-    # cannot be searched.
+    # is hidden. A broad catch also takes in a plain bug in the scrub, so each guard prints
+    # the stack trace to stderr, where the job's error log keeps it for whoever fixes it. A
+    # missing root skips the scrub, whose walk would name the root a second time. ``is_dir``
+    # sits inside the guard because it raises when the root's parent cannot be searched.
     root = Path(lake_root)
     result: ScrubResult | None = None
     try:
@@ -2594,6 +2608,7 @@ def sunday_maintenance(
         else:
             result = scrub(root)
     except Exception as exc:
+        print(traceback.format_exc(), file=sys.stderr, end="")
         problems.append(f"lake scrub could not run: {type(exc).__name__}: {exc}")
     lake_lines: list[str] = []
     if result is not None and not result.ok:
@@ -2619,10 +2634,10 @@ def sunday_maintenance(
         )
 
     # ``None`` is the shadow role's skip, and it skips every form of the backup step. A
-    # backup scrub that raises becomes the ``unreadable`` finding its own ``except OSError``
-    # would have set, so the restore test is skipped. When the raise came from the lake's
-    # own manifest, the lake's ``lake scrub could not run:`` line comes first and names the
-    # lake, so the backup's line is not read as a fault on the copy.
+    # backup scrub that raises becomes an ``unreadable`` finding, so the restore test is
+    # skipped. Its text says the scrub raised, so a bug in the scrub is not read as a fault
+    # on the disk. When the raise came from the lake's own manifest, the lake's
+    # ``lake scrub could not run:`` line comes first and names the lake.
     backup: BackupScrubResult | None = None
     if backup_target is None:
         backup = None
@@ -2636,16 +2651,12 @@ def sunday_maintenance(
         try:
             backup = bucket_scrub(root, backup_target, bucket_client)
         except Exception as exc:
-            backup = BackupScrubResult(
-                target=str(backup_target), unreadable=f"{type(exc).__name__}: {exc}"
-            )
+            backup = _backup_scrub_raised(backup_target, exc)
     else:
         try:
             backup = backup_scrub(root, Path(backup_target))
         except Exception as exc:
-            backup = BackupScrubResult(
-                target=str(backup_target), unreadable=f"{type(exc).__name__}: {exc}"
-            )
+            backup = _backup_scrub_raised(backup_target, exc)
     if backup is not None and backup.problem is not None:
         problems.append(backup.problem)
 
