@@ -691,6 +691,22 @@ def test_the_service_drops_an_idle_file_on_its_injected_clock(
     assert partition_reads[thursday_file] == 2
 
 
+def test_a_wall_clock_jump_drops_nothing(fixture_lake: FixtureLake, partition_reads: Counter):
+    # The idle span is elapsed time, so it runs on the clock's ``monotonic`` and never on
+    # its wall time, which a time sync can step by any amount. Here the wall clock jumps
+    # an hour and the monotonic timer does not move, so Thursday's partition stays put.
+    root, _, _ = build_lake(fixture_lake)
+    clock = ManualClock(NOW.astimezone(UTC))
+    service = service_over(root, partition_reads, clock=clock)
+    thursday = {"date": THURSDAY.isoformat(), "ticker": "QQQ"}
+    thursday_file = LakePaths(root).partition_path("chains", "QQQ", THURSDAY)
+    service.run_query("today", thursday)
+    clock.set(clock.now() + timedelta(hours=1))
+    service.run_query("today", {"date": FRIDAY.isoformat(), "ticker": "QQQ"})  # a store
+    service.run_query("today", thursday)
+    assert partition_reads[thursday_file] == 1
+
+
 # -- concurrency -----------------------------------------------------------------
 
 
