@@ -2418,6 +2418,72 @@ def test_a_stall_that_charged_no_surface_restarts_the_run():
     assert _causes(raised)[_at(5)] == [(TOKEN_DEAD, 3, _at(3), 4)]
 
 
+def test_a_stall_over_several_slots_counts_every_slot_toward_the_run():
+    """Each slept-through slot that charged a surface is its own minute nothing landed.
+
+    The token is dead at 10:00, the loop sleeps through 10:01 and 10:02, and the token is
+    dead again at 10:03. The stall itself pages the loop stall. The run is four minutes
+    long by 10:03, so the cause pages then, dated 10:00. Counting the stall once paged a
+    minute later, and counting every slot of it on every slot paged dated before the death.
+    """
+    watchdog = Watchdog()
+    assert watchdog.observe(_dead(_at(0), "SPY", "QQQ")) == []
+    stall = watchdog.missed(_roster_of("SPY", "QQQ"), [_at(1), _at(2)])
+    assert [page.title for page in stall] == ["Capture down: loop stalled"]
+    cycles = [_dead(_at(minute), "SPY", "QQQ") for minute in range(3, 5)]
+    assert _causes(_run(watchdog, cycles)) == {_at(3): [(TOKEN_DEAD, 4, _at(0), 4)]}
+
+
+def test_an_answer_with_no_contract_does_not_restart_the_run():
+    """A chain that answered with no contract landed no data, so the run goes on through it.
+
+    The token is dead at 10:00 and 10:01. At 10:02 the SPY chain answers with no contract
+    while every other surface fails ``http_401``, and the token is dead again at 10:03. The
+    dead-man was fed nothing at 10:02, so the cause pages at 10:03, dated 10:00.
+    """
+    mixed = _cycle(
+        _seg("chains", "SPY", "data", data_rows=0),
+        _fail("quotes", "SPY", "http_401"),
+        _fail("chains", "QQQ", "http_401"),
+        _fail("quotes", "QQQ", "http_401"),
+        at=_at(2),
+    )
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ"), mixed]
+    cycles += [_dead(_at(3), "SPY", "QQQ")]
+    raised = _run(Watchdog(), cycles)
+    assert [c for c in _causes(raised).get(_at(3), []) if c[0] == TOKEN_DEAD] == [
+        (TOKEN_DEAD, 4, _at(0), 4)
+    ]
+
+
+def test_a_minute_that_failed_one_surface_extends_the_run():
+    """A minute that captured a single surface and landed nothing still starved the dead-man.
+
+    The token is dead at 10:00 and 10:01. At 10:02 the spans leave SPY and QQQ out and the
+    one captured surface, XYZ's quotes, fails ``http_401``. The token is dead again at
+    10:03, so the cause pages then, dated 10:00.
+    """
+    one = _clamped(_fail("quotes", "XYZ", "http_401"), out=("SPY", "QQQ"), at=_at(2))
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ"), one]
+    cycles += [_dead(_at(3), "SPY", "QQQ")]
+    raised = _run(Watchdog(), cycles)
+    assert _causes(raised)[_at(3)][0] == (TOKEN_DEAD, 4, _at(0), 4)
+
+
+def test_a_stall_that_charged_one_surface_extends_the_run():
+    """A slept-through slot that charged a single surface is a minute nothing landed.
+
+    The token is dead at 10:00, the loop sleeps through 10:01 with only SPY's quotes to
+    charge, and the token is dead again at 10:02. The run is three minutes long, so the
+    cause pages at 10:02, dated 10:00.
+    """
+    watchdog = Watchdog()
+    assert watchdog.observe(_dead(_at(0), "SPY", "QQQ")) == []
+    assert watchdog.missed([Surface("quotes", "SPY")], [_at(1)]) == []
+    cycles = [_dead(_at(2), "SPY", "QQQ")]
+    assert _causes(_run(watchdog, cycles)) == {_at(2): [(TOKEN_DEAD, 3, _at(0), 4)]}
+
+
 @pytest.mark.parametrize("fresh", [True, False], ids=["fresh-watchdog", "new-session-date"])
 def test_the_first_cycle_of_a_session_counts_toward_the_run(fresh):
     """Test 9: a token dead from 10:00 pages at 10:02, dated 10:00.
