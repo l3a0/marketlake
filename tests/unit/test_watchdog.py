@@ -3882,3 +3882,236 @@ def test_a_cause_emptied_by_roster_drops_alone_re_arms_without_raising():
         _at(2): [(TOKEN_DEAD, 3, _at(0), 4)],
         _at(3): [(TOKEN_DEAD, 4, _at(0), 2)],
     }
+
+
+def test_a_joiner_failing_the_cause_only_on_minutes_that_land_data_pages_on_its_own():
+    """Test 16: the per-surface rate limit, for a joiner rather than a surface let go.
+
+    QQQ quotes lands every minute from 10:03, and IWM joins failing 429. No minute after the
+    page is free of landed data, so the cause takes IWM in on none of them, and IWM pages
+    its own surfaces with ``http_429`` at the threshold.
+    """
+    qqq_quotes = (("quotes", "QQQ"),)
+    cycles = [_outage(minute, "http_429", "SPY", "QQQ") for minute in range(3)]
+    cycles += [
+        _outage(minute, "http_429", "SPY", "QQQ", "IWM", landed=qqq_quotes)
+        for minute in range(3, 8)
+    ]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(RATE_LIMITED_TITLE, "http_429")],
+        5: [("Capture down: IWM chains", "http_429"), ("Capture down: IWM quotes", "http_429")],
+    }
+
+
+def _apart(minute: int, error_class: str, own: dict[tuple[str, str], str], *tickers: str):
+    """One minute in which every surface of ``tickers`` fails ``error_class``, except those
+    named in ``own``, which fail the class ``own`` gives them."""
+    return _cycle(
+        *(
+            _fail(surface, ticker, own.get((surface, ticker), error_class))
+            for ticker in tickers
+            for surface in SURFACES
+        ),
+        at=_at(minute),
+    )
+
+
+def test_a_ticker_joining_a_dead_token_beside_a_surface_failing_another_way_folds():
+    """Test 17: test 8 under a dead token, where only ``observe``'s fold can take IWM in.
+
+    QQQ chains answers 500 from 10:03 and IWM joins failing 401. Nothing lands and no minute
+    is unanimous, so the token-dead cause takes IWM in on the minutes nothing landed.
+    """
+    own = {("chains", "QQQ"): "http_500"}
+    cycles = [_outage(minute, "http_401", "SPY", "QQQ") for minute in range(3)]
+    cycles += [_apart(minute, "http_401", own, "SPY", "QQQ", "IWM") for minute in range(3, 10)]
+    watchdog = Watchdog()
+    assert _titles(_run(watchdog, cycles)) == {_at(2): [TOKEN_DEAD]}
+    assert set(_roster_of("IWM")) <= watchdog._paged_causes[TOKEN_DEAD]
+
+
+@pytest.mark.parametrize(
+    ("error_class", "title"), [("http_429", RATE_LIMITED_TITLE), ("http_401", TOKEN_DEAD)]
+)
+def test_a_joiner_failing_a_class_no_cause_names_is_not_taken_in(error_class, title):
+    """Test 18: the fold takes in only a class that resolves to the live cause.
+
+    IWM joins failing 500 while SPY and QQQ keep failing the cause's way and nothing lands.
+    A 500 resolves to no cause, so IWM stays out and pages its own surfaces at the threshold.
+    """
+    own = {(surface, "IWM"): "http_500" for surface in SURFACES}
+    cycles = [_outage(minute, error_class, "SPY", "QQQ") for minute in range(3)]
+    cycles += [_apart(minute, error_class, own, "SPY", "QQQ", "IWM") for minute in range(3, 6)]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(title, error_class)],
+        5: [("Capture down: IWM chains", "http_500"), ("Capture down: IWM quotes", "http_500")],
+    }
+
+
+def _let_go_by(exit_minute: CycleResult, error_class: str, own: str, again: str):
+    """SPY chains leaves the cause at 10:03 by ``exit_minute``, and fails ``own`` from 10:06.
+
+    Every surface of SPY and QQQ fails ``error_class`` at 10:00-10:02 and 10:04-10:05. From
+    10:06 to 10:39 everything lands except SPY chains, and from 10:40 every surface fails
+    ``again``, a second outage.
+    """
+    spy_chains = ("chains", "SPY")
+    others = tuple(
+        (surface, ticker)
+        for ticker in ("SPY", "QQQ")
+        for surface in SURFACES
+        if (surface, ticker) != spy_chains
+    )
+    cycles = [_outage(minute, error_class, "SPY", "QQQ") for minute in range(3)]
+    cycles += [exit_minute]
+    cycles += [_outage(minute, error_class, "SPY", "QQQ") for minute in range(4, 6)]
+    cycles += [_outage(minute, own, "SPY", "QQQ", landed=others) for minute in range(6, 40)]
+    cycles += [_outage(minute, again, "SPY", "QQQ") for minute in range(40, 50)]
+    return cycles
+
+
+def _spy_chains_at_3(error_class: str, spy_chains: SegmentOutcome | None, errors=()):
+    """Minute 10:03: QQQ quotes lands, SPY chains is ``spy_chains`` or a write failure."""
+    rest = [
+        _seg(surface, ticker, "data")
+        if (surface, ticker) == ("quotes", "QQQ")
+        else _fail(surface, ticker, error_class)
+        for ticker in ("SPY", "QQQ")
+        for surface in SURFACES
+        if (surface, ticker) != ("chains", "SPY")
+    ]
+    return _cycle(*rest, *([spy_chains] if spy_chains else []), errors=errors, at=_at(3))
+
+
+def test_a_surface_the_token_exit_let_go_is_not_taken_back_in():
+    """Test 19: test 11 with SPY chains leaving by marketlake #760's exit.
+
+    SPY chains fails 500 at 10:03 while QQQ quotes lands, which lets it go from the
+    token-dead cause. It pages its 500 then. Taken back in at 10:04, its 403 from 10:06
+    held the cause live, and the second death at 10:40 sent no cause page.
+    """
+    exit_minute = _spy_chains_at_3("http_401", _fail("chains", "SPY", "http_500"))
+    pages = _per_minute(
+        Watchdog(), _let_go_by(exit_minute, "http_401", "http_403", "vendor_auth_error")
+    )
+    assert pages[3] == [("Capture down: SPY chains", "http_500")]
+    assert pages[42] == [(TOKEN_DEAD, "vendor_auth_error")]
+
+
+def test_a_surface_an_empty_answer_let_go_is_not_taken_back_in():
+    """Test 20: test 10 with SPY chains leaving by answering with no contract at 10:03."""
+    exit_minute = _spy_chains_at_3("http_429", _seg("chains", "SPY", "data", data_rows=0))
+    pages = _per_minute(Watchdog(), _let_go_by(exit_minute, "http_429", "http_500", "http_429"))
+    assert pages[3] == [("Capture down: SPY chains", CONTRACTS_ABSENT)]
+    assert pages[42] == [(RATE_LIMITED_TITLE, "http_429")]
+
+
+def test_a_surface_a_write_failure_let_go_is_not_taken_back_in():
+    """Test 21: test 10 with SPY chains leaving by a write failure while QQQ quotes lands."""
+    exit_minute = _spy_chains_at_3(
+        "http_429", None, errors=(SegmentError("chains", "SPY", "o_s_error"),)
+    )
+    pages = _per_minute(Watchdog(), _let_go_by(exit_minute, "http_429", "http_500", "http_429"))
+    assert pages[42] == [(RATE_LIMITED_TITLE, "http_429")]
+
+
+SPY_BOTH = (("chains", "SPY"), ("quotes", "SPY"))
+
+
+def test_a_cause_the_roster_empties_re_arms_before_the_fold_reads_it():
+    """Test 22: the releases run before the fold, so an emptied cause takes nobody in.
+
+    SPY lands at 10:03 and leaves the rate limit. At 10:04 QQQ leaves the roster and IWM
+    joins, and SPY and IWM fail 429 from then on. QQQ leaving empties the cause before IWM
+    could be taken in, so the outage pages again as a new cause at 10:06.
+    """
+    cycles = [_outage(minute, "http_429", "SPY", "QQQ") for minute in range(3)]
+    cycles += [_outage(3, "http_429", "SPY", "QQQ", landed=SPY_BOTH)]
+    cycles += [_outage(minute, "http_429", "SPY", "IWM") for minute in range(4, 8)]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(RATE_LIMITED_TITLE, "http_429")],
+        6: [(RATE_LIMITED_TITLE, "http_429")],
+    }
+
+
+def test_a_cause_an_empty_answer_empties_re_arms_before_the_fold_reads_it():
+    """Test 23: the same for an answer with no contract.
+
+    After 10:03 the cause holds only QQQ chains. At 10:04 QQQ chains answers with no
+    contract and IWM joins failing 429. The empty answer drops the cause before IWM could be
+    taken in, so the outage pages as a new cause at 10:06.
+    """
+    cycles = [_outage(minute, "http_429", "SPY", "QQQ") for minute in range(3)]
+    cycles += [_outage(3, "http_429", "SPY", "QQQ", landed=SPY_BOTH + (("quotes", "QQQ"),))]
+    fourth = [
+        seg
+        for seg in _outage(4, "http_429", "SPY", "QQQ", "IWM").segments
+        if (seg.surface, seg.ticker) != ("chains", "QQQ")
+    ]
+    cycles += [_cycle(*fourth, _seg("chains", "QQQ", "data", data_rows=0), at=_at(4))]
+    cycles += [_outage(minute, "http_429", "SPY", "QQQ", "IWM") for minute in range(5, 8)]
+    pages = _per_minute(Watchdog(), cycles)
+    assert pages[2] == [(RATE_LIMITED_TITLE, "http_429")]
+    assert pages[6] == [(RATE_LIMITED_TITLE, "http_429")]
+
+
+def test_the_last_surface_a_dropped_cause_let_go_is_taken_in_by_the_next():
+    """Test 24: the record of what a cause let go goes with it, whichever surface left last.
+
+    QQQ chains is the last surface to leave the first rate limit, at 10:05, which drops it.
+    The second rate limit pages at 10:08 on SPY and IWM, and QQQ joins it at 10:09. SPY
+    chains landing from 10:15 sends nothing, because the dropped cause's record does not
+    keep QQQ chains out of the second.
+    """
+    every = tuple((surface, ticker) for ticker in ("SPY", "QQQ") for surface in SURFACES)
+    cycles = [_outage(minute, "http_429", "SPY", "QQQ") for minute in range(3)]
+    cycles += [_outage(3, "http_429", "SPY", "QQQ", landed=SPY_BOTH)]
+    cycles += [_outage(4, "http_429", "SPY", "QQQ", landed=SPY_BOTH + (("quotes", "QQQ"),))]
+    cycles += [_outage(5, "http_429", "SPY", "QQQ", landed=every)]
+    cycles += [_outage(minute, "http_429", "SPY", "IWM") for minute in range(6, 9)]
+    cycles += [_outage(minute, "http_429", "SPY", "IWM", "QQQ") for minute in range(9, 15)]
+    cycles += [
+        _outage(minute, "http_429", "SPY", "IWM", "QQQ", landed=(("chains", "SPY"),))
+        for minute in range(15, 19)
+    ]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(RATE_LIMITED_TITLE, "http_429")],
+        8: [(RATE_LIMITED_TITLE, "http_429")],
+    }
+
+
+def test_letting_a_surface_go_from_one_cause_does_not_keep_it_out_of_another():
+    """Test 25: what a cause let go is kept per cause.
+
+    A dead token pages at 10:02 and a rate limit at 10:05, both over SPY and QQQ. IWM joins
+    at 10:06 failing 401, so only the token-dead cause takes it in. At 10:07 SPY chains
+    lands and IWM fails 429, which lets IWM go from the token-dead cause only. From 10:08
+    nothing lands and IWM fails 429, so the rate limit takes it in, and QQQ quotes landing
+    from 10:13 sends no IWM page.
+    """
+    iwm_401 = {(surface, "IWM"): "http_401" for surface in SURFACES}
+    spy_quotes_401 = {("quotes", "SPY"): "http_401"}
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [_outage(minute, "http_401", "SPY", "QQQ") for minute in range(3)]
+    cycles += [_outage(minute, "http_429", "SPY", "QQQ") for minute in range(3, 6)]
+    cycles += [_apart(6, "http_429", iwm_401, *tickers)]
+
+    def rest(minute: int, landed: tuple[str, str]) -> CycleResult:
+        failing = _apart(minute, "http_429", spy_quotes_401, *tickers).segments
+        return _cycle(
+            *(
+                _seg(seg.surface, seg.ticker, "data")
+                if (seg.surface, seg.ticker) == landed
+                else seg
+                for seg in failing
+            ),
+            at=_at(minute),
+        )
+
+    cycles += [rest(7, ("chains", "SPY"))]
+    cycles += [_apart(minute, "http_429", spy_quotes_401, *tickers) for minute in range(8, 13)]
+    cycles += [rest(minute, ("quotes", "QQQ")) for minute in range(13, 17)]
+    pages = _per_minute(Watchdog(), cycles)
+    assert pages[2] == [(TOKEN_DEAD, "http_401")]
+    assert pages[3] == [(RATE_LIMITED_TITLE, "http_429")]
+    assert not [title for raised in pages.values() for title, _ in raised if "IWM" in title]
