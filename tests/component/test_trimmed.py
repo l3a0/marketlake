@@ -125,6 +125,102 @@ def test_a_write_that_loses_bytes_fails_the_read_back(tmp_path, monkeypatch):
     assert SPY in str(refused.value)
 
 
+@pytest.mark.parametrize(
+    "garbled",
+    [
+        pytest.param(b'{"kind": "trim", "partition": "chains/ti\n', id="lost bytes, kept newline"),
+        pytest.param(b"[1, 2]\n", id="json that is not an object"),
+        pytest.param(b"\xff\xfe\n", id="bytes that do not decode"),
+    ],
+)
+def test_a_garbled_last_line_with_a_newline_refuses_the_append(tmp_path, garbled):
+    """Mutation this catches: checking only for the trailing newline.
+
+    A write that lost bytes mid-line and kept its newline ends in ``\\n``, so the newline check
+    passes it, and ``parse_jsonl`` drops the line without a word. The append refuses before it
+    writes, and the file is unchanged.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(garbled + b"\n")
+    before = trimmed_path(root).read_bytes()
+
+    with pytest.raises(TrimmedTornTail) as refused:
+        _append(root, _trim(SPY_NEXT, "b" * 64))
+
+    assert trimmed_path(root).read_bytes() == before
+    assert "does not parse as one JSON object" in str(refused.value)
+
+
+def test_a_write_that_lands_nothing_fails_even_when_an_identical_line_is_last(
+    tmp_path, monkeypatch
+):
+    """Mutation this catches: comparing only the last line, without the line count.
+
+    The line being appended is already the ledger's last line, so a write that lands nothing
+    leaves a last line equal to the new one. Only the count tells the two apart.
+    """
+    root = _lake(tmp_path / "lake")
+    line = _trim(SPY, "a" * 64)
+    _append(root, line)
+    monkeypatch.setattr(trimmed, "_append_once", lambda path, data: None)
+    entry_before = latest_entries(root)[TRIMMED_FILE]
+
+    with pytest.raises(TrimmedLineLost):
+        _append(root, line)
+
+    assert latest_entries(root)[TRIMMED_FILE] == entry_before, "no entry certifies it"
+
+
+def test_a_torn_partial_behind_an_identical_last_line_fails_the_read_back(tmp_path, monkeypatch):
+    """A fragment with no newline is discarded by the reader, so the earlier line reads as last."""
+    root = _lake(tmp_path / "lake")
+    line = _trim(SPY, "a" * 64)
+    _append(root, line)
+    real = trimmed._append_once
+    monkeypatch.setattr(trimmed, "_append_once", lambda path, data: real(path, data[:20]))
+    entry_before = latest_entries(root)[TRIMMED_FILE]
+
+    with pytest.raises(TrimmedLineLost):
+        _append(root, line)
+
+    assert latest_entries(root)[TRIMMED_FILE] == entry_before, "no entry certifies the tear"
+
+
+def test_bytes_landed_behind_the_line_are_never_certified(tmp_path, monkeypatch):
+    """Mutation this catches: dropping the tail check that runs after the read-back.
+
+    The write lands the whole line and then a fragment. The read-back stops at the fragment, so
+    it sees one new last line equal to this one and passes. ``_record`` checks no tail of its
+    own, so without the second check the entry would certify the fragment.
+    """
+    root = _lake(tmp_path / "lake")
+    real = trimmed._append_once
+    monkeypatch.setattr(
+        trimmed, "_append_once", lambda path, data: real(path, data + b'{"kind": "tr')
+    )
+
+    with pytest.raises(TrimmedTornTail):
+        _append(root, _trim(SPY, "a" * 64))
+
+    assert TRIMMED_FILE not in latest_entries(root), "no entry certifies the fragment"
+
+
+def test_an_append_to_an_existing_empty_ledger_succeeds(tmp_path):
+    """Mutation this catches: refusing a zero-byte ledger as torn.
+
+    An empty file holds no line for the next one to fuse onto, so it is no torn tail.
+    """
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).write_bytes(b"")
+    line = _trim(SPY, "a" * 64)
+
+    assert _append(root, line) == line
+    assert read_trimmed(root) == [line]
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 1
+
+
 # -- the ledger's own manifest entry ------------------------------------------
 
 
@@ -148,6 +244,24 @@ def test_a_refresh_refuses_a_torn_tail_rather_than_certify_it(tmp_path):
     _append(root, _trim(SPY, "a" * 64))
     with trimmed_path(root).open("ab") as handle:
         handle.write(b'{"kind": "tr')
+    entry_before = latest_entries(root)[TRIMMED_FILE]
+
+    with lake_lock(root), pytest.raises(TrimmedTornTail):
+        refresh_trimmed_entry(root, source=SOURCE, fetched_at=STAMP)
+
+    assert latest_entries(root)[TRIMMED_FILE] == entry_before
+
+
+def test_a_refresh_refuses_a_garbled_last_line_that_ends_in_a_newline(tmp_path):
+    """Mutation this catches: the refresh checking only for the trailing newline.
+
+    Certifying the line would let the Sunday scrub pass over a garbage line, since the reader
+    drops it without a word and the entry's sha would match the bytes.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "trim", "partition": "chains/ti\n')
     entry_before = latest_entries(root)[TRIMMED_FILE]
 
     with lake_lock(root), pytest.raises(TrimmedTornTail):
@@ -298,4 +412,23 @@ def test_an_unreadable_ledger_alone_fails_the_scrub(tmp_path):
 
     assert (result.missing, result.sha_mismatches, result.orphans) == ((), (), ())
     assert result.trimmed_unreadable is not None
+    assert not result.ok
+
+
+def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
+    """Mutation this catches: catching ``ManifestError`` alone, so an ``OSError`` raises.
+
+    A directory at the ledger's path is a read that fails with ``IsADirectoryError``, the
+    unreadable half of "torn or unreadable". It needs no ``chmod``, which a root runner ignores.
+    The directory carries no manifest entry, so the forward pass never hashes it.
+    """
+    root = _lake(tmp_path / "lake")
+    (root / SPY).unlink()
+    trimmed_path(root).mkdir()
+
+    result = scrub(root)
+
+    assert result.missing == (SPY,)
+    assert result.trimmed_unreadable is not None
+    assert result.trimmed_unreadable.startswith("IsADirectoryError: ")
     assert not result.ok

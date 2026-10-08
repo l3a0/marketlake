@@ -369,3 +369,57 @@ def test_an_unreadable_ledger_refuses_an_absence_as_missing_and_names_why(
 
     line = _refused(capsys, exited)
     assert TRIMMED in line and "trimmed ledger" in line and "TornLedger" in line
+
+
+def test_an_unreadable_ledger_that_raises_oserror_refuses_as_missing_too(
+    tmp_path, monkeypatch, capsys
+):
+    """Mutation this catches: catching ``ManifestError`` alone, so an ``OSError`` escapes.
+
+    A directory at the ledger's path fails its read with ``IsADirectoryError``, the unreadable
+    half of "torn or unreadable", with no ``chmod``, which a root runner ignores.
+    """
+    from lake.trimmed import trimmed_path
+
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    _main(config, client, monkeypatch)
+    _trim_away(lake)
+    trimmed_path(lake).unlink()
+    trimmed_path(lake).mkdir()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert TRIMMED in line and "trimmed ledger" in line and "IsADirectoryError" in line
+
+
+def test_a_missing_file_whose_entry_has_no_sha_refuses_as_missing_as_before(
+    tmp_path, monkeypatch, capsys
+):
+    """The variant keeps ``manifested_files``' order: the present-file check reads the sha.
+
+    An entry with no ``sha256`` whose file is gone exits 2 with the ``ManifestedFileMissing``
+    line, which is what ``manifested_files`` gave before marketlake #782. Reading the sha first
+    raised a bare ``KeyError`` with a traceback instead.
+    """
+    import json
+
+    lake, config = _setup(tmp_path)
+    absent = f"chains/ticker=QQQ/date={DAY.isoformat()}.parquet"
+    entry = {"partition": absent, "source": "test", "rows": 1, "fetched_at": None}
+    with manifest_path(lake).open("a") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    client = FakeS3()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert line == (
+        f"first-upload: {absent} is in the lake's manifest and missing from disk, so the upload "
+        "stops rather than let the bucket's watermark claim it"
+    )
+    assert "lake/manifest.jsonl" not in client.put_keys()

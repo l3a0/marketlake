@@ -42,6 +42,7 @@ Times are injected. Every stamp is passed in by the caller as text. Nothing here
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -244,21 +245,49 @@ def is_designed_absence(
 
 
 def _refuse_torn_tail(path: Path, action: str) -> None:
-    """Raise :class:`TrimmedTornTail` when the ledger is non-empty and does not end in a newline.
+    """Raise :class:`TrimmedTornTail` when the ledger's last line is not one whole entry.
 
-    ``action`` names what was refused, so the message says whether a line or an entry refresh
-    stopped.
+    Two shapes refuse, and both are a line the next append would fuse onto or a refresh would
+    certify.
+
+    1. A non-empty file that does not end in a newline. That is the shape a crash mid-write
+       leaves.
+    2. A last non-blank line that ends in a newline and does not parse as a JSON object. That is
+       the shape a write that lost bytes mid-line and kept its newline leaves. ``parse_jsonl``
+       drops an unparseable last line without a word, so nothing else would notice it: a refresh
+       would certify it and the Sunday scrub would then pass over a garbage line.
+
+    An empty file refuses nothing, because it holds no line to fuse onto. ``action`` names what
+    was refused, so the message says whether a line or an entry refresh stopped.
     """
     if not path.exists():
         return
     raw = path.read_bytes()
-    if raw and not raw.endswith(b"\n"):
+    if not raw:
+        return
+    if not raw.endswith(b"\n"):
         torn = len(raw) - raw.rfind(b"\n") - 1
         raise TrimmedTornTail(
             f"{path}: the last line has no terminating newline, so it is a torn write, and "
             f"{action} would fuse onto it or certify it. The {torn} bytes after the last "
             "newline are the torn line. Repair by hand under the lock: delete those bytes, then "
             "re-record the ledger's manifest entry."
+        )
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return
+    try:
+        last = json.loads(lines[-1])
+    except ValueError:
+        # ``json.loads`` raises ``JSONDecodeError`` on text that does not parse and
+        # ``UnicodeDecodeError`` on bytes that do not decode. Both are a ``ValueError``.
+        last = None
+    if not isinstance(last, dict):
+        raise TrimmedTornTail(
+            f"{path}: the last line ends in a newline and does not parse as one JSON object, so "
+            f"it is a write that lost bytes, and {action} would certify it. The reader discards "
+            "that line without a word. Repair by hand under the lock: make the last line whole "
+            "or remove it, then re-record the ledger's manifest entry."
         )
 
 
@@ -270,13 +299,16 @@ def append_trimmed(lake_root: Path, line: Mapping, *, source: str, fetched_at: s
     could interleave between the read and the write. Every writer of this ledger holds
     ``lake_lock``, so no one can. Two checks follow from that.
 
-    1. A non-empty ledger that does not end in a newline refuses before anything is written.
-       ``read_trimmed`` discards a torn trailing line, so a line appended behind one fuses onto
-       it and is lost while the append reports success. On this ledger the lost line would be a
-       trim line whose unlink then runs, an absence nothing explains.
-    2. The line has to read back as the ledger's last line before this returns, the way
-       ``lake.signoff`` reads its sign-off back. A write that landed short or changed is refused
-       here, before the caller unlinks anything.
+    1. A ledger whose last line is not one whole entry refuses before anything is written,
+       which :func:`_refuse_torn_tail` decides. ``read_trimmed`` discards a torn trailing line,
+       so a line appended behind one fuses onto it and is lost while the append reports success.
+       On this ledger the lost line would be a trim line whose unlink then runs, an absence
+       nothing explains.
+    2. The line has to read back as one new last line before this returns, the way
+       ``lake.signoff`` reads its sign-off back: the ledger holds exactly one line more than it
+       did, and the last one is this line. A write that landed short, changed, or not at all is
+       refused here, before the caller unlinks anything. The count matters when an identical
+       line is already last, because that line alone would read back as this one.
 
     Then the ledger's manifest entry is refreshed by :func:`refresh_trimmed_entry`, so the
     Sunday scrub and the nightly upload see a sha that matches the bytes. ``source`` names the
@@ -286,15 +318,22 @@ def append_trimmed(lake_root: Path, line: Mapping, *, source: str, fetched_at: s
     path = trimmed_path(root)
     entry = dict(line)
     _refuse_torn_tail(path, "a new line")
+    before = len(read_trimmed(root))
     _append_once(path, _line(entry))
     lines = read_trimmed(root)
-    if not lines or lines[-1] != entry:
+    # The count is what tells this line from an identical one already last. A write that landed
+    # nothing, or landed a fragment the reader discards, leaves the earlier line last.
+    if len(lines) != before + 1 or lines[-1] != entry:
         raise TrimmedLineLost(
             f"{path}: a line for {entry.get(PARTITION_FIELD)!r} was appended and does not read "
-            "back as the last line, so the write landed short or changed. Nothing may act on "
-            "it. Repair by hand under the lock: make the last line whole or remove it, then "
+            "back as one new last line, so the write landed short or changed. Nothing may act "
+            "on it. Repair by hand under the lock: make the last line whole or remove it, then "
             "re-record the ledger's manifest entry."
         )
+    # The read-back stops at the first line it cannot parse, so bytes landed behind the line
+    # would pass it. ``_record`` checks no tail of its own, so the tail is checked once more
+    # here rather than certified.
+    _refuse_torn_tail(path, "recording the ledger's manifest entry")
     _record(root, rows=len(lines), source=source, fetched_at=fetched_at)
     return entry
 
@@ -305,9 +344,11 @@ def refresh_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | Non
     The entry's ``rows`` is the number of lines, which only grows, so ``record_partition``'s
     row-count guard refuses a ledger that lost lines.
 
-    **A torn tail refuses here too.** Re-recording the entry over a torn last line would
-    certify the fragment, and the next append would fuse onto it with a matching sha. So a repair
-    that refreshes the entry has to remove the torn bytes first.
+    **A torn or garbled tail refuses here too**, by :func:`_refuse_torn_tail`'s two shapes.
+    Re-recording the entry over a torn last line would certify the fragment, and the next append
+    would fuse onto it with a matching sha. Re-recording it over a whole line that does not parse
+    would certify a line the reader drops without a word. So a repair that refreshes the entry has
+    to make the last line whole first.
     """
     root = Path(lake_root)
     _refuse_torn_tail(trimmed_path(root), "re-recording its manifest entry")

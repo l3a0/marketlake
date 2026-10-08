@@ -2080,15 +2080,19 @@ def test_the_report_prints_every_count_including_the_zeroes():
     # gives where it draws the same line. ``drift_paged`` is there on ``paged``'s own
     # reasoning, which that file states and which holds of the schema-drift page unchanged.
     not_counts = {"report", "report_kinds", "findings", "paged", "drift_paged"}
+    # The one count printed only above zero, for the reason ``BatteryReport`` gives. Its own
+    # tests below hold both sides of that rule.
+    above_zero = {"sessions_trimmed"}
 
     named = {field.name for field in fields(BatteryReport)}
     assert labelled.keys() <= named, f"stale label: {labelled.keys() - named}"
     assert not_counts <= named, f"stale exclusion: {not_counts - named}"
+    assert above_zero <= named, f"stale exclusion: {above_zero - named}"
 
     printed = render(BatteryReport(judged=4, cleared=4))
 
     for field in fields(BatteryReport):
-        if field.name in not_counts:
+        if field.name in not_counts | above_zero:
             continue
         label = labelled.get(field.name, field.name)
         assert re.search(rf"(?:^|\s){re.escape(label)}: +-?\d+", printed), (
@@ -4572,3 +4576,79 @@ def test_an_unreadable_manifest_beside_a_ledger_is_a_report_line_too(lake: Path)
         "battery: calendar coverage could not read the manifest, so every absent partition "
         "counts as missing: LedgerNotUtf8: "
     )
+
+
+def test_an_unreadable_ledger_is_a_report_line_rather_than_a_raise(lake: Path):
+    """Mutation this catches: catching ``ManifestError`` alone, so an ``OSError`` raises.
+
+    A directory at the ledger's path fails its read with ``IsADirectoryError``, the unreadable
+    half of "torn or unreadable", with no ``chmod``, which a root runner ignores. The absence
+    fails closed as missing, and the failure is one report line.
+    """
+    from lake.trimmed import trimmed_path
+
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+    trimmed_path(lake).unlink()
+    trimmed_path(lake).mkdir()
+
+    found = _coverage(lake)
+
+    assert [finding.partition for finding in found.missing] == [TRIMMED]
+    assert found.trimmed == 0
+    (line,) = found.unreadable
+    assert line.startswith(
+        "battery: calendar coverage could not read the trimmed ledger, so every absent "
+        "partition counts as missing: IsADirectoryError: "
+    )
+
+
+def test_a_partition_trimmed_under_a_tickers_old_name_is_counted_as_trimmed(lake: Path):
+    """Mutation this catches: asking the predicate under the first spelling alone.
+
+    The ticker is renamed to a spelling that sorts first, so the first name sorted is not the one
+    the partition was written and trimmed under. Presence is asked under every spelling, and so
+    is a designed absence.
+    """
+    from lake.security_master import ID_TYPE_TICKER, SecurityMaster, master_path
+
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+    master = SecurityMaster.read(master_path(lake))
+    master.remap(1, ID_TYPE_TICKER, "AAA", date(2026, 9, 16))
+    pa_pq.write_table(master.to_table(), lake / "reference" / "security_master.parquet")
+
+    found = _coverage(lake)
+
+    assert found.missing == (), "the trimmed partition is under ticker=SPY, which sorts second"
+    assert found.trimmed == 1
+
+
+def test_the_trimmed_session_count_prints_only_above_zero():
+    """Owed minus missing reads as all present, so a trimmed session needs its own count.
+
+    It prints only above zero, so a lake that never trims prints the census it printed before
+    marketlake #782, which the exact-text checks elsewhere in this file hold.
+    """
+    from lake.battery import render
+
+    without = render(BatteryReport(sessions_owed=14, sessions_missing=2))
+    trimmed = render(BatteryReport(sessions_owed=14, sessions_missing=2, sessions_trimmed=3))
+
+    assert "trimmed" not in without
+    assert "  sessions trimmed:     3" in trimmed.splitlines()
+    assert trimmed.replace("  sessions trimmed:     3\n", "") == without
+
+
+def test_judge_carries_the_trimmed_count_into_the_report(lake: Path):
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, day=DAY, guards=GuardConstants())
+
+    assert report.sessions_owed == 14
+    assert report.sessions_missing == 0
+    assert report.sessions_trimmed == 1

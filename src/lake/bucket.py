@@ -957,9 +957,11 @@ def first_upload_files(
         compacted = _compacted_partition_for_segment(rel)
         if compacted is not None and compacted in ledger.latest:
             continue
-        hexdigest = str(ledger.latest[rel]["sha256"])
+        # The present file is handled before the absence reads anything, the order
+        # :func:`manifested_files` keeps, so an entry with no ``sha256`` whose file is missing
+        # refuses as missing here exactly as it does there.
         if (root / rel).is_file():
-            yield rel, hexdigest, False
+            yield rel, str(ledger.latest[rel]["sha256"]), False
             continue
         if trimmed is None:
             try:
@@ -976,7 +978,8 @@ def first_upload_files(
                 f"{rel} is in the lake's manifest and missing from disk, so the upload "
                 "stops rather than let the bucket's watermark claim it"
             )
-        yield rel, hexdigest, True
+        # A designed absence has a ``sha256`` on its entry, because the predicate compared it.
+        yield rel, str(ledger.latest[rel]["sha256"]), True
 
 
 def _unmanifested(root: Path, ledger: Ledger) -> Iterator[tuple[str, Path]]:

@@ -442,6 +442,12 @@ class BatteryReport:
     one pair here not scoped by ``day``. :func:`coverage` says why. The denominator is carried
     because the check's correct answer against today's lake is that it found nothing, and a
     count of misses alone cannot tell that from a check that did not run.
+
+    ``sessions_trimmed`` counts the owed sessions the trimmed ledger records as removed on
+    purpose, :class:`Coverage`'s ``trimmed``. Owed minus missing reads as all present, so without
+    it a trimmed session would be counted present. It prints only when it is above zero, which
+    is the one exception to :func:`render`'s rule that every count prints, so a lake that never
+    trims prints exactly the census it printed before marketlake #782.
     """
 
     judged: int = 0
@@ -456,6 +462,7 @@ class BatteryReport:
     scope_unknown: int = 0
     sessions_owed: int = 0
     sessions_missing: int = 0
+    sessions_trimmed: int = 0
     appended: tuple[str, ...] = ()
     paged: tuple[str, ...] = ()
     drift_paged: tuple[str, ...] = ()
@@ -2373,6 +2380,7 @@ def judge(
         scope_unknown=len(found.unnamed),
         sessions_owed=found.owed,
         sessions_missing=len(found.missing),
+        sessions_trimmed=found.trimmed,
         appended=tuple(appended),
         paged=paged,
         drift_paged=drift_paged,
@@ -2668,6 +2676,8 @@ def render(report: BatteryReport) -> str:
     that judged everything cleanly are different answers and a report that printed only
     non-zero counts would render them the same. That rule is what the coverage pair leans on:
     zero missing sessions out of a stated number owed says the check ran and found nothing.
+    ``sessions trimmed`` is the one exception, printed only above zero, for the reason
+    :class:`BatteryReport` gives.
     """
     lines = [
         f"  judged:               {report.judged}",
@@ -2682,8 +2692,11 @@ def render(report: BatteryReport) -> str:
         f"  scope unknown:        {report.scope_unknown}",
         f"  sessions owed:        {report.sessions_owed}",
         f"  sessions missing:     {report.sessions_missing}",
-        f"  ledger lines written: {len(report.appended)}",
     ]
+    # The one count printed only above zero, for the reason ``BatteryReport`` gives.
+    if report.sessions_trimmed:
+        lines.append(f"  sessions trimmed:     {report.sessions_trimmed}")
+    lines.append(f"  ledger lines written: {len(report.appended)}")
     lines.extend(f"  {line}" for line in report.report)
     for finding in report.findings:
         if finding.verdict == QUARANTINED_VERDICT:
