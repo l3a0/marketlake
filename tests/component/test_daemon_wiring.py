@@ -113,6 +113,7 @@ from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TICKERS_PATH_ENV, TickersError, default_tickers_path
 from lake.vendor import VendorResponse
+from lake.watchdog import TOKEN_DEAD, whole_daemon_cause
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import WAIT_GRACE_SECONDS, ManualClock
@@ -3521,6 +3522,82 @@ def test_a_write_failure_released_from_the_cause_moves_no_token_pull(tmp_path, c
     assert sent == [
         ("Capture down: token dead", "http_401"),
         ("Capture down: QQQ chains", "o_s_error"),
+        ("Capture down: token dead", "http_401"),
+    ]
+
+
+def _qqq_chains_failing_alone(minutes: Sequence[tuple[str | None, str | None]]):
+    """A cycle runner for the probe in marketlake #760, one pair of classes per minute.
+
+    The pair's first class is what SPY's chains and quotes and QQQ's quotes each fail
+    with, or ``None`` when they land. The second is what QQQ's chains fails with.
+    """
+    queue = list(minutes)
+
+    def segment(surface: str, error_class: str | None) -> SegmentOutcome:
+        if error_class is None:
+            return _segment(journal.ROW_KIND_DATA, Path("unused"), surface, "QQQ")
+        gapped = _segment(journal.ROW_KIND_GAP, Path("unused"), surface, "QQQ")
+        return replace(gapped, error_class=error_class)
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        others, qqq_chains = queue.pop(0)
+        spy = _failing(slot, others, others)
+        return CycleResult(
+            snap_ts=slot,
+            segments=(
+                *spy.segments,
+                segment(journal.CHAINS_SURFACE, qqq_chains),
+                segment(journal.QUOTES_SURFACE, others),
+            ),
+        )
+
+    return runner
+
+
+def test_a_5xx_released_from_the_token_cause_moves_no_token_pull(tmp_path, capsys):
+    """The pull reads ``whole_daemon_cause``, and the release changes only the watchdog.
+
+    The probe that found marketlake #760: 3 dead-token minutes, then 6 in which QQQ's
+    chains answers 500 while every other surface lands, then 4 dead again. QQQ's chains
+    leaves the token-dead cause on the first healed minute and pages for itself, and the
+    second death pages again. The pull fires on the first dead minute of each death, the
+    second one 9 slots after the first, the same cycles it fired on before the release.
+    The cycles the daemon ran read as a dead token on the dead minutes alone, which is
+    what the pull reads.
+    """
+    rig = _rig(
+        tmp_path,
+        roster="SPY: {options: true, chain_cadence: 1m}\nQQQ: {options: true, chain_cadence: 1m}\n",
+    )
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    minutes = (
+        [("http_401", "http_401")] * 3 + [(None, "http_500")] * 6 + [("http_401", "http_401")] * 4
+    )
+    inner = _qqq_chains_failing_alone(minutes)
+    causes: list[str | None] = []
+
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        result = inner(slot=slot, close_tag=close_tag, session_phase=session_phase)
+        causes.append(whole_daemon_cause(result))
+        return result
+
+    _run(rig, clock, ticks=len(minutes), cycle_runner=runner)
+
+    dead = [minute for minute, cause in enumerate(causes) if cause == TOKEN_DEAD]
+    assert len(causes) == len(minutes)
+    assert dead == [0, 1, 2, 9, 10, 11, 12]
+    assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0), et(2026, 9, 2, 10, 9)]
+    # The class is the one word after "failing with", read that narrowly so the test
+    # holds whatever else the body says, its minutes included.
+    sent = [
+        (message.title, re.search(r"failing with (\w+)", message.body).group(1))
+        for message in rig.transport.sent
+        if message.event == "capture_down"
+    ]
+    assert sent == [
+        ("Capture down: token dead", "http_401"),
+        ("Capture down: QQQ chains", "http_500"),
         ("Capture down: token dead", "http_401"),
     ]
 
