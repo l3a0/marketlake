@@ -537,13 +537,15 @@ def test_the_sunday_job_reports_suspended_versioning_and_still_pings(tmp_path):
     assert any("versioning is Suspended" in line for line in outcome.report)
 
 
-# A damaged lake manifest reaches the bucket scrub too, marketlake #441. ``read_ledger`` decodes
-# with a replacement and reads a missing ``sha256`` with ``entry.get``, so only a line naming no
-# partition raises from it, and the Sunday job's guard turns that into the backup's own
-# unreadable finding. The bucket's copy carries the same damaged bytes, so the prefix check
-# passes and each cell reaches the read it is about. ``first_upload`` refuses a lake whose
-# manifest names no partition or no ``sha256``, so the copy is stored directly rather than
-# uploaded after the damage.
+# A damaged lake manifest reaches the bucket scrub too, marketlake #441. ``bucket_scrub`` reads
+# the lake's manifest through ``read_ledger`` before it touches the bucket, so a line naming no
+# partition raises there whatever the bucket holds, and the Sunday job's guard turns that into
+# the backup's own unreadable finding. ``read_ledger`` decodes with a replacement, and
+# ``_bucket_scrub`` reads a missing ``sha256`` with ``entry.get``, so neither of those raises.
+# The bucket's copy carries the same damaged bytes, so the prefix check passes and each cell
+# reaches the read it is about. ``first_upload`` refuses a lake whose manifest names no
+# partition or no ``sha256``, so the copy is stored directly rather than uploaded after the
+# damage.
 
 
 def _damaged_with_its_copy(root: Path, old: bytes, new: bytes) -> tuple[Path, FakeS3]:

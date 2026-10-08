@@ -2354,20 +2354,22 @@ class SundayOutcome:
     ping's failure is different in kind. It is recorded after the others have all
     passed, and it names why the ping did not land rather than why it was not attempted.
 
-    ``report`` carries the report-tier findings. Three kinds ride it. The first is pmset
+    ``report`` carries the report-tier findings, in this order. The first is pmset
     alarm drift, which the design pins to the nightly report because the pre-open
     self-check already catches a missed wake an hour before the bell. The second is the
     path of every file the lake scrub found missing, wrong, unrecorded or unreadable,
     capped per kind, because its problem line carries counts alone. The third is
-    everything the backup scrub names rather than pages for. That covers the path of
+    everything the backup scrub names rather than pages for, or ``BACKUP_SCRUB_SKIPPED``
+    on a shadow host. That covers the path of
     every file it found wrong, because a count decides whether to ping and only a path
     says where to look. It also covers an extra file on the copy and a copy behind its
     lake, neither of which can be lake data going missing. How far behind reads by eye
     from the partition count, and one run carries no history of the last one. The
     restore test's own findings ride it the same way, each file it read back wrong and
-    the repair for it. The lines run in that order, alarms, then the lake, then its copy,
-    then the restore test, which is not the order the steps run. It is the order a reader
-    wants: the cheap alarm lines first, then the lake, then its copy.
+    the repair for it. After those come the Time Machine exclusion lines and, last, the
+    title of a daemon page this attempt found owed. The first four are not the order the
+    steps run. They are the order a reader wants: the cheap alarm lines first, then the
+    lake, then its copy.
 
     ``scrub`` is the lake scrub's result. It is ``None`` when the scrub did not run,
     because the lake root is missing or because the scrub raised, and a problem line says
@@ -2618,7 +2620,9 @@ def sunday_maintenance(
 
     # ``None`` is the shadow role's skip, and it skips every form of the backup step. A
     # backup scrub that raises becomes the ``unreadable`` finding its own ``except OSError``
-    # would have set, so the restore test is skipped and the line reads as the backup's.
+    # would have set, so the restore test is skipped. When the raise came from the lake's
+    # own manifest, the lake's ``lake scrub could not run:`` line comes first and names the
+    # lake, so the backup's line is not read as a fault on the copy.
     backup: BackupScrubResult | None = None
     if backup_target is None:
         backup = None

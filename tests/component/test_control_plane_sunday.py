@@ -1897,9 +1897,12 @@ def test_every_lake_finding_is_named_in_order_beside_the_backup_notes(fixture_la
 
 # A fault that leaves the scrub nothing to say per path still raises from it. Each of the
 # three scrub calls is guarded, so the raise becomes a problem line and the rest of the run
-# goes on. The damage is made before the copy, because damage made after it stops the path
-# scrub at the diverged manifest before it parses a line, and a test of the backup guard
-# would then pass with the guard deleted.
+# goes on. The damage is made before the copy, so the copy carries the same bytes and the
+# path scrub reaches the line. Damage that rewrites bytes the copy already holds stops the
+# path scrub at the diverged manifest before it parses a line, and a test of the backup
+# guard would then pass with the guard deleted. A damaged line appended after a clean copy
+# is different: the copy stays a strict prefix, the scrub resolves the whole lake manifest,
+# and the guard fires.
 
 
 def _damaged_then_copied(fixture_lake: FixtureLake, old: bytes, new: bytes) -> Path:

@@ -134,7 +134,8 @@ TRIMMED_FILE = "trimmed.jsonl"
 # root at mode 0700. A restore may find it in an empty destination and still count the
 # destination as empty, and the disk-runway walk skips it rather than reporting it refused
 # every night. It is spelled here because ``lake.runway`` imports only this module and
-# the calendar, and ``lake.bucket`` reads the same name.
+# the calendar, ``lake.bucket`` reads the same name, and so does ``manifest.SCRUB_EXCLUSIONS``,
+# which keeps the Sunday scrub out of it.
 LOST_AND_FOUND = "lost+found"
 
 # The daemon's journal metadata stamp, written by ``lake.metadata``. It sits at the

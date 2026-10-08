@@ -460,16 +460,12 @@ def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]
     can interpret. This file is the lake's integrity root, so a reader that quietly stepped
     over damage in it would make every check downstream weaker than it reads.
 
-    Raising is safe precisely because the callers that must survive it already catch it:
-    the close+5 guard's prologue, the marking pass, and the Sunday job's three scrubs. The
-    first two catch bare ``Exception``, so the second shape needs nothing from them that the
-    first did not already have. ``control_plane.sunday_maintenance`` guards each scrub call
-    the same way and turns the raise into a problem line that withholds the ping, so the
-    canary and the coverage assertion still run. What it gains them all is a message naming
-    this ledger and the entry, where a bare ``TypeError`` named neither. The price at the
-    Sunday scrubs is that the raise stops the whole scrub, so no other file's finding is
-    named that week. Every other caller is a place where stopping is correct, and the
-    compaction child's own silence pages.
+    So a damaged line stops the read, and each caller decides whether stopping the read
+    stops it too. A caller that must keep going catches ``ManifestError``, or a broader class,
+    at its own boundary and names the damage there, and a caller that leaves the raise alone
+    has decided that stopping is correct. Both shapes raising one class with a message naming
+    this ledger and the entry is what lets a caller decide, where a bare ``TypeError`` named
+    neither.
     """
     latest: dict[str, dict] = {}
     for position, entry in enumerate(entries, start=1):
@@ -1027,14 +1023,16 @@ NOT_A_REGULAR_FILE = "not a regular file"
 class ScrubResult:
     """The verdict of a two-way scrub.
 
-    Four tuples of lake-relative paths name what is wrong, and in which direction.
+    Four tuples name what is wrong, and in which direction. The first three hold
+    lake-relative paths. ``unreadable`` holds a path and a reason.
 
     - ``missing``: a manifest entry whose file is gone. A forward-pass failure.
     - ``sha_mismatches``: a file present but not matching its last recorded sha. A
       forward-pass failure.
     - ``orphans``: a data file with no manifest entry. A reverse-pass failure.
-    - ``unreadable``: a path either pass could not read, each entry the path, a colon, and
-      the reason. The reason is the error's class, as in ``rel: PermissionError``, or the
+    - ``unreadable``: a path either pass could not read, each entry the lake-relative path, or
+      the words ``the lake root`` when the root itself would not list, then a colon and the
+      reason. The reason is the error's class, as in ``rel: PermissionError``, or the
       words ``not a regular file``. The forward pass sets it for a manifested file it could
       not reach, open, or hash, and for one that is a directory, a FIFO or a socket. The
       reverse pass sets it for a directory it could not list and for a file it could not
@@ -1269,8 +1267,8 @@ def _first_difference(source: bytes, backup: bytes) -> int:
 class BackupScrubResult:
     """The verdict of a scrub over the backup copy.
 
-    ``target`` is the backup root the scrub walked, and every finding repeats it, so a
-    line read on its own names the disk it came from.
+    ``target`` is the backup root the scrub walked. Every problem line repeats it, or carries
+    the path of the file whose read failed, so a line read on its own names where to look.
 
     Four tuples name what is wrong with the copied files. Each withholds the Sunday
     ping, because each is the copy no longer holding what the lake says it holds.
@@ -1298,7 +1296,10 @@ class BackupScrubResult:
     not run is a week nothing looked at the copy.
 
     - ``target_missing``: the backup target is not a mounted directory.
-    - ``unreadable``: a read of the target failed partway through.
+    - ``unreadable``: a read the backup scrub needed failed, of the target or of the lake's
+      own manifest. The scrub's own ``except OSError`` sets it for a read that fails partway,
+      and ``control_plane.sunday_maintenance`` sets it when the scrub raises, such as on a
+      lake manifest line naming no partition.
     - ``manifest_missing``: the target is mounted and carries no usable manifest copy,
       either because the file is absent or because it holds no entries while the lake
       holds some. So no sync has ever landed, or the copy's integrity root is gone.
