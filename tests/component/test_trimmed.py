@@ -29,10 +29,12 @@ from lake.manifest import (
 from lake.paths import TRIMMED_FILE
 from lake.trimmed import (
     TrimmedLineLost,
+    TrimmedRepairRefused,
     TrimmedTornTail,
     append_trimmed,
     read_trimmed,
     refresh_trimmed_entry,
+    repair_trimmed_entry,
     restore_line,
     trim_line,
     trimmed_path,
@@ -461,3 +463,129 @@ def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
     assert result.trimmed_unreadable is not None
     assert result.trimmed_unreadable.startswith("IsADirectoryError: ")
     assert not result.ok
+
+
+# -- the repair of the ledger's manifest entry (marketlake #784) ---------------
+
+
+def _repair(root: Path) -> bool:
+    with lake_lock(root):
+        return repair_trimmed_entry(root, source=SOURCE, fetched_at=STAMP)
+
+
+def _write_line(root: Path, line: dict) -> None:
+    """Append a whole line by hand, with no entry refresh, as a crash before the record leaves."""
+    with trimmed_path(root).open("ab") as handle:
+        handle.write((json.dumps(line, sort_keys=True) + "\n").encode())
+
+
+def test_a_ledger_whose_sha_disagrees_with_its_entry_is_re_recorded(tmp_path):
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["sha256"] == sha256_file(trimmed_path(root))
+    assert entry["rows"] == 2
+
+
+def test_a_ledger_with_no_entry_at_all_is_re_recorded(tmp_path):
+    root = _lake(tmp_path / "lake")
+    _write_line(root, _trim(SPY, "a" * 64))
+    assert TRIMMED_FILE not in latest_entries(root)
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["sha256"] == sha256_file(trimmed_path(root))
+    assert entry["rows"] == 1
+
+
+def test_a_ledger_in_step_with_its_entry_is_left_alone(tmp_path):
+    """Mutation this catches: dropping the sha comparison, so every call re-records."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    assert _repair(root) is False
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_a_torn_tail_is_refused_and_never_re_recorded(tmp_path):
+    """Mutation this catches: re-recording a torn tail, which certifies the fragment."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "res')
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused, match="Repair by hand under the lock"):
+        _repair(root)
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_with_no_ledger_the_repair_reads_nothing_and_writes_nothing(tmp_path):
+    """A host that never trims stays byte-identical and fails exactly as it did.
+
+    The manifest here is damaged, so a repair that read it would raise. Mutation this catches:
+    reading the manifest before checking the ledger exists.
+    """
+    root = _lake(tmp_path / "lake")
+    with (root / "manifest.jsonl").open("ab") as handle:
+        handle.write(b"\xff damaged\n")
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    assert _repair(root) is False
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+    assert not trimmed_path(root).exists()
+
+
+_LINE = json.dumps({"kind": "trim", "partition": SPY}).encode()
+
+
+@pytest.mark.parametrize(
+    ("raw", "cause"),
+    [
+        (b'{"partition": "\xff"}\n' + _LINE + b"\n", "LedgerNotUtf8"),
+        (b"\xef\xbb\xbf" + _LINE + b"\n", "LedgerHasByteOrderMark"),
+        (b"{\n" + _LINE + b"\n", "TornLedger"),
+    ],
+)
+def test_an_unreadable_ledger_refuses_naming_its_cause_and_the_hand_repair(tmp_path, raw, cause):
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).write_bytes(raw)
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    assert cause in str(exc.value)
+    assert "Repair by hand under the lock" in str(exc.value)
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_a_ledger_that_lost_lines_refuses_through_the_row_count_guard(tmp_path):
+    """``record_partition``'s guard raises ``RowCountRegression``, which is no ``ManifestError``."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _append(root, _trim(SPY_NEXT, "b" * 64))
+    first_line = trimmed_path(root).read_bytes().splitlines(keepends=True)[0]
+    trimmed_path(root).write_bytes(first_line)
+
+    with pytest.raises(TrimmedRepairRefused, match="lines were lost"):
+        _repair(root)
+
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 2
+
+
+def test_a_ledger_path_that_cannot_be_read_refuses_rather_than_raise(tmp_path):
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).mkdir()
+
+    with pytest.raises(TrimmedRepairRefused, match="IsADirectoryError"):
+        _repair(root)

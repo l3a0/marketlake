@@ -48,12 +48,15 @@ from pathlib import Path
 
 from lake.manifest import (
     ManifestError,
+    RowCountRegression,
     _append_once,
     _decode,
     _line,
     _refuse_hidden_entries,
+    latest_entries,
     parse_jsonl,
     record_partition,
+    sha256_file,
 )
 from lake.paths import TRIMMED_FILE
 
@@ -103,6 +106,14 @@ class TrimmedTornTail(TrimmedAppendRefused):
 
 class TrimmedLineLost(TrimmedAppendRefused):
     """The line was written and does not read back as the ledger's last line."""
+
+
+class TrimmedRepairRefused(ManifestError):
+    """Raised when :func:`repair_trimmed_entry` cannot bring the ledger's entry back into step.
+
+    It is a ``ManifestError`` so that a caller's existing containment of a damaged ledger
+    catches it with no new tuple. Its text names the hand repair.
+    """
 
 
 def trimmed_path(lake_root: Path) -> Path:
@@ -356,6 +367,72 @@ def refresh_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | Non
     return _record(root, rows=len(lines), source=source, fetched_at=fetched_at)
 
 
+# What the operator does about a ledger whose entry could not be repaired, for every cause that
+# does not carry its own repair. ``TrimmedTornTail`` and ``TrimmedLineLost`` already name one.
+_REPAIR_BY_HAND = (
+    "Repair by hand under the lock: make the ledger's last line whole or remove it, then "
+    "re-record its manifest entry with lake.trimmed.refresh_trimmed_entry."
+)
+
+
+def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None) -> bool:
+    """Re-record the ledger's manifest entry when its sha disagrees with the bytes on disk.
+
+    **The caller holds the lake-root lock.** This is the one repair for a ledger whose line
+    landed without its entry, which a crash inside :func:`append_trimmed` leaves, between the
+    append and the record. Left alone, the Sunday scrub reports the ledger's sha as mismatched,
+    and the nightly upload either sends the old bytes' entry without an error, when that entry
+    is behind the bucket's watermark, or raises ``ChecksumRefused`` when it is past it. The
+    range restore in :mod:`lake.bucket` calls it at the start of every run, and marketlake #787's
+    compaction calls it before the backup.
+
+    It returns ``True`` when it re-recorded the entry and ``False`` when nothing needed it.
+
+    1. **A host with no ledger reads nothing and writes nothing.** The function returns before
+       the manifest is read, so such a host stays byte-identical and fails exactly as it did.
+    2. **An entry whose sha matches the bytes is left alone.**
+    3. **A ledger with no entry at all counts as disagreeing.** A crash between the ledger's
+       first append and its first record leaves that.
+
+    The re-record is :func:`refresh_trimmed_entry`, which refuses a torn or garbled last line
+    rather than certify it, so this never re-records a torn tail. Re-recording one would bless
+    the fragment and guarantee the next append fuses onto it with a matching sha.
+
+    Every failure raises :class:`TrimmedRepairRefused` naming the hand repair: a torn tail,
+    ``TornLedger``, ``LedgerNotUtf8``, ``LedgerHasByteOrderMark``, any other ``ManifestError``
+    from the manifest's own read, an ``OSError``, and ``record_partition``'s row-count guard.
+    That guard raises ``RowCountRegression``, which is not a ``ManifestError``, so it is named
+    here. It fires when the ledger holds fewer lines than its entry records, which only a
+    ledger that lost lines can do.
+    """
+    root = Path(lake_root)
+    path = trimmed_path(root)
+    try:
+        if not path.exists():
+            return False
+        entry = latest_entries(root).get(TRIMMED_FILE)
+        if entry is not None and entry.get("sha256") == sha256_file(path):
+            return False
+        refresh_trimmed_entry(root, source=source, fetched_at=fetched_at)
+    except RowCountRegression as exc:
+        raise TrimmedRepairRefused(
+            f"{path}: the ledger holds {exc.proposed} line(s) and its manifest entry records "
+            f"{exc.recorded}, so lines were lost and the entry was not re-recorded. Repair by "
+            "hand under the lock: recover the ledger from the bucket's copy, then re-record its "
+            "manifest entry with lake.trimmed.refresh_trimmed_entry."
+        ) from exc
+    except TrimmedAppendRefused as exc:
+        raise TrimmedRepairRefused(
+            f"the trimmed ledger's manifest entry was not re-recorded: {exc}"
+        ) from exc
+    except (ManifestError, OSError) as exc:
+        raise TrimmedRepairRefused(
+            f"{path}: the trimmed ledger's manifest entry was not re-recorded "
+            f"({type(exc).__name__}: {exc}). {_REPAIR_BY_HAND}"
+        ) from exc
+    return True
+
+
 def _record(root: Path, *, rows: int, source: str, fetched_at: str | None) -> dict:
     return record_partition(root, TRIMMED_FILE, source=source, rows=rows, fetched_at=fetched_at)
 
@@ -372,6 +449,7 @@ __all__ = [
     "VERSION_ID_FIELD",
     "TrimmedAppendRefused",
     "TrimmedLineLost",
+    "TrimmedRepairRefused",
     "TrimmedTornTail",
     "append_trimmed",
     "is_designed_absence",
@@ -379,6 +457,7 @@ __all__ = [
     "latest_trimmed",
     "read_trimmed",
     "refresh_trimmed_entry",
+    "repair_trimmed_entry",
     "restore_line",
     "trim_line",
     "trimmed_path",

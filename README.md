@@ -228,9 +228,9 @@ credentials, such as a VM with no instance profile or a laptop that carries the 
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: assume_role` in `config.yaml`.
 
-Four commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
-any host whose config sets `role` to something other than `primary`. The restore runs on
-either.
+Five commands go with the bucket. The first two and the range restore refuse with exit 2 on a
+shadow host, which is any host whose config sets `role` to something other than `primary`.
+The whole-lake restore runs on either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -274,9 +274,24 @@ either.
    differ only by case are named as failures, because on macOS one would overwrite the
    other. A year-end lake
    is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
-   empty `lake_root` is seeded. A restore uploads nothing and takes no lock, which is why
+   empty `lake_root` is seeded. This restore uploads nothing and takes no lock, which is why
    a shadow host may run it.
-4. The nightly upload needs no command. Once `backup_target` names the bucket, the
+4. `uv run python -m lake.bucket restore-range --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30`
+   puts chosen chains or quotes partitions back into the live lake at `lake_root`, for a
+   partition lost by accident or a rollback of trimming. Leave out `--ticker` to take every
+   ticker. It restores only partitions the lake's manifest records, verifies each download
+   against the manifest's sha before it moves the file into place, and leaves a partition
+   already on disk with that sha as it is. A partition trimmed on purpose gets a restore line
+   in `trimmed.jsonl`, which a lost one does not. Each partition holds the lake-root lock only
+   for its own rename and ledger line, so the command blocks nothing for long. It removes a
+   temp file a crashed run left beside a target, and finishes what a crashed run left
+   unrecorded, so running it again is always safe. It refuses with exit 2 on Sunday from
+   19:55 to 23:30, inside a session or within 30 minutes of its open, when a partition on disk
+   differs from its manifest entry, when the bucket's current version does not match, and
+   when the volume would be left with less free space than the journal reserve, 13 times the
+   busiest sealed day. A refusal for a trimmed partition names the version its trim line
+   recorded, which the console steps below recover.
+5. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
