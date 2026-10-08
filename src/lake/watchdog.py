@@ -25,8 +25,9 @@ until one of three things re-arms it.
 A flapping surface can therefore page many times an hour, which is the honest signal
 rather than a comfortable one.
 
-One failure can take every surface down at once, such as a dead token or a rate
-limit. The watchdog calls that a cause, pages it once under its own title, and then
+One failure can take every surface down at once, such as a dead token, a rate limit, or
+a full lake volume refusing every segment write. The watchdog calls that a cause, pages
+it once under its own title, and then
 suppresses the pages of every surface it named. Each later minute in which nothing
 landed data takes in every surface failing the cause's way that the cause has not let go,
 so a ticker that joins mid-outage stays with the cause rather than restating it under its
@@ -34,14 +35,16 @@ own title. A minute with landed data takes nobody in, because a rate limit is pe
 and a surface the cause let go is not taken back, because leaving showed it is not failing
 for the cause's reason (marketlake #790). That suppression ends one surface at a
 time, and the cause re-arms only when the last of them has gone. A surface goes when any
-of five things happens.
+of six things happens.
 
 1. It produces data again.
 2. It answers with no contract.
 3. Its segment could not be written in a minute another surface landed data.
 4. It fails a way that does not resolve to a dead token in a minute another surface
    landed data. This one takes it out of the token-dead cause only.
-5. It leaves the roster.
+5. Its segment was written, whatever class it recorded. This one takes it out of the
+   writes cause only, because the disk took that write (marketlake #789).
+6. It leaves the roster.
 
 So a rate limit that runs all session stays one condition, and one surface returning and
 dying again never re-pages the cause.
@@ -52,8 +55,9 @@ live cause covers, means the sampler died rather than N tickers dying at once. T
 one page naming the sampler rather than one page per ticker. The page names only the
 tickers the failed request explains, which are the ones that recorded a class and that no
 live cause covers under that class. A ticker whose segment write failed recorded nothing
-about the vendor, so it pages under its own title with its write class. A covered ticker
-stays with the cause that covers it. Every ticker the sampler page names counts as paged,
+about the vendor, so it pages under its own title with its write class, or folds with the
+other write failures tripping in that minute, as below. A covered ticker stays with the
+cause that covers it. Every ticker the sampler page names counts as paged,
 so one sampler death pages once. A ticker it named without its own page is heard again
 once the collapse no longer explains it and no live cause covers it. The collapse stops
 explaining it when any quotes ticker lands data, when fewer than two tickers still fail
@@ -61,6 +65,12 @@ the vendor's way uncovered, or when the ticker itself stops failing that way, su
 its own write fails. It then pages under its own title once its count reaches the
 threshold, unless the collapse holds again by the time it trips. Then it trips inside the
 sampler's set and is heard through a sampler page instead (marketlake #771).
+
+Write failures fold as well. Two or more write failures tripping in the same minute send
+one page, ``Capture down: lake writes failing``, with no ``since``, because other surfaces
+may still be landing data. It folds what trips together rather than what fails together,
+so write failures that start a minute apart send one page each minute. A single write
+failure still pages under its own title (marketlake #789).
 
 A stall folds too. A slot the loop slept through gaps every watched surface at the
 same moment, so one stall that trips the threshold is one fact and sends one page,
@@ -126,6 +136,12 @@ _WHOLE_DAEMON_CAUSES = {
 # reason across two spellings.
 _OVERRUN_TITLE = "Capture down: loop stalled"
 
+# What a minute in which every touched surface failed its write pages under, and what two
+# or more write failures tripping in one minute fold into. A full lake volume refuses every
+# segment write at once, so one page per surface would spend the daily cap of 40 in one
+# minute on a roster of about 115 tickers (marketlake #789).
+_WRITES_TITLE = "Capture down: lake writes failing"
+
 # What enabled tickers the capture spans leave out page under, one page for all of them.
 _OUT_OF_SPAN_TITLE = "Capture down: tickers outside every capture span"
 
@@ -168,13 +184,19 @@ class Page:
 
     ``surfaces`` is what went quiet. It holds one entry for an ordinary page, the quotes
     tickers a failed batched request explains for a collapsed sampler page, every surface
-    a cause named, and every surface a stall charged, so a caller can say what it saw
-    without the watchdog formatting prose it may not want.
+    a cause named, every surface a stall charged, and the write failures that tripped
+    together for a folded writes page, so a caller can say what it saw without the
+    watchdog formatting prose it may not want.
 
     ``cause`` is the class the failure arrived as, and it is what lets a body say why
     rather than only what. It is ``None`` where there is nothing to name: a slot the loop
     slept through attempted no request, a failure can be recorded without a class, and a
-    collapsed sampler page whose tickers disagreed has no single class to pick.
+    collapsed sampler page or a writes page whose surfaces disagreed has no single class
+    to pick.
+
+    ``write_fold`` marks the folded writes page, which stands for the write failures in
+    one class that tripped together. They can be any part of the roster, so a body names
+    some of them, where the cause page and the sampler page name none (marketlake #789).
 
     ``tickers`` is set only on the out-of-span page, and names every enabled ticker the
     spans leave out, in roster order. The cycle knows those tickers and not which surfaces
@@ -185,13 +207,16 @@ class Page:
     counts, in the slot's own ET zone. A cause page fires only on a cycle in which every
     surface failed, so it is the one page that always rides a minute feeding the
     ``capture`` dead-man nothing. The body dates it and promises that check's DOWN on the
-    strength of this field, so no other page sets it (marketlake #747).
+    strength of this field, so no other page sets it (marketlake #747). The folded writes
+    page shares the writes cause's title and sets none, because it fires on a minute in
+    which other surfaces may still be landing data (marketlake #789).
     """
 
     title: str
     minutes: int
     surfaces: tuple[Surface, ...]
     sampler_collapse: bool = False
+    write_fold: bool = False
     cause: str | None = None
     tickers: tuple[str, ...] = ()
     since: datetime | None = None
@@ -205,12 +230,14 @@ class _Tally:
     ``failed`` is the touched surfaces that landed no data row. ``recorded`` is the class
     each failed segment is failing with, per :func:`_failure_class`. A surface whose
     segment could not be written is failed and touched but has no entry there, because a
-    write failure says nothing about what the vendor did.
+    write failure says nothing about what the vendor did. ``write_failed`` holds every
+    surface the cycle could not journal instead, each with the class its write raised.
     """
 
     touched: frozenset[Surface]
     failed: frozenset[Surface]
     recorded: dict[Surface, str | None]
+    write_failed: dict[Surface, str]
 
 
 def _tally(result: CycleResult) -> _Tally:
@@ -230,13 +257,31 @@ def _tally(result: CycleResult) -> _Tally:
         for segment in result.segments
         if Surface(segment.surface, segment.ticker) in failed
     }
-    return _Tally(frozenset(touched), frozenset(failed), recorded)
+    write_failed = {
+        Surface(error.surface, error.ticker): error.error_class for error in result.errors
+    }
+    return _Tally(frozenset(touched), frozenset(failed), recorded, write_failed)
+
+
+def _shared_class(classes: Iterable[str | None]) -> str | None:
+    """The one class every failure reports, or ``None`` when they disagree.
+
+    Naming one of several would pick a winner arbitrarily, so a disagreement names none.
+    """
+    distinct = set(classes)
+    return distinct.pop() if len(distinct) == 1 else None
 
 
 def _whole_daemon_title(tally: _Tally) -> str | None:
-    """The cause's title when the tally is one whole-daemon failure, and ``None`` otherwise."""
+    """The cause's title when the tally is one whole-daemon failure, and ``None`` otherwise.
+
+    A minute in which every touched surface failed its write recorded no class at all, so
+    it is the lake's writes failing rather than anything the vendor said (marketlake #789).
+    """
     if not tally.failed or tally.failed != tally.touched or len(tally.touched) < 2:
         return None
+    if not tally.recorded:
+        return _WRITES_TITLE
     classes = {error_class for error_class in tally.recorded.values() if error_class is not None}
     if len(classes) != 1:
         return None
@@ -246,7 +291,7 @@ def _whole_daemon_title(tally: _Tally) -> str | None:
 def whole_daemon_cause(result: CycleResult) -> str | None:
     """The title of the one cause that took this whole cycle down, or ``None``.
 
-    Three things have to hold.
+    Three things have to hold, with one exception below for refused writes.
 
     1. The cycle touched at least two surfaces, because one surface cannot be the whole
        daemon by itself.
@@ -257,6 +302,12 @@ def whole_daemon_cause(result: CycleResult) -> str | None:
 
     A chain that answered with no contract counts as ``contracts_absent`` and breaks the
     unanimity. A surface whose segment could not be written records no class and does not.
+
+    A cycle in which every touched surface failed its write records no class at all, so
+    condition 3 cannot hold for it. That cycle is a cause of its own, ``Capture down: lake
+    writes failing``, because a full lake volume refuses every write in the same minute and
+    one page per surface would spend the daily page cap at once (marketlake #789). Write
+    failures beside a recorded class still fold under that class's title, as above.
 
     This reads one cycle and no threshold, so it says what the cycle was rather than
     whether a page is owed. The watchdog's page decision reads it, and so does the daemon,
@@ -290,7 +341,8 @@ class Watchdog:
         # be written in a minute another surface landed data, or when the roster drops
         # it, per ``_release``. It leaves the token-dead set alone when it fails a way
         # that does not resolve to a dead token in a minute another surface landed data,
-        # per ``_release_from``. A cause whose set empties is dropped, which re-arms it.
+        # and the writes set alone when its segment was written, per ``_release_from``. A
+        # cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         # The surfaces each live cause has let go, kept until the cause is dropped. A cause
         # takes a surface in once. One that left it by any exit but leaving the roster has
@@ -320,6 +372,32 @@ class Watchdog:
         # stretch paged the cause on the first minute the span opened, dated inside the
         # clamp (marketlake #768).
         self._minutes_without_data = 0
+        # Consecutive session minutes in which every touched surface failed its write, which
+        # is what the writes cause waits on and dates itself from instead. A minute in which
+        # any segment was written restarts it, because the disk took that write. Waiting on
+        # the minutes without data instead re-paged the cause each time a nearly full volume
+        # took one minute's gap rows during a token death, since those minutes land no data
+        # (marketlake #789). A slept-through slot that charged a surface continues a run
+        # already counting, so a stall inside a refused run dates the page from the first
+        # refusal rather than from a slot nobody wrote in. It starts no run, since it
+        # attempted no write, and one that charged nobody restarts it, as it restarts the
+        # minutes without data.
+        self._minutes_writes_refused = 0
+        # Whether the writes cause has paged in this outage, and the write class it named.
+        # A disk that refuses every write again with that class before the outage ends is
+        # the same fault, so the cause forms again without a page. Re-armed by every minute
+        # that released it, the cause paged once for each refill of a disk that took one
+        # minute's gap rows and refused the next three, up to 15 pages an hour during a
+        # token death (marketlake #789). The outage ends when data lands anywhere, the rule
+        # the token-dead cause follows (marketlake #754), or when the disk has taken writes
+        # for the threshold's minutes in a row, which is a disk that was freed. Ended only
+        # by landed data, a freed disk that broke again, or one refusing writes a new way,
+        # never paged while the vendor or the disk kept data from landing.
+        self._writes_paged_this_outage = False
+        self._writes_paged_cause: str | None = None
+        # Consecutive minutes in which the disk took at least one segment, which is what
+        # ends the outage above.
+        self._minutes_writes_taken = 0
 
     def _threshold(self) -> int:
         """The page threshold as it stands now.
@@ -345,7 +423,9 @@ class Watchdog:
         A surface whose segment could not be written leaves every cause that named it too,
         but only in a minute another surface landed data, per :meth:`_release`. In that
         same minute a surface failing a way that does not resolve to a dead token leaves
-        the token-dead cause, and only that one, per :meth:`_release_from`.
+        the token-dead cause, and only that one, per :meth:`_release_from`. A surface whose
+        segment was written, whatever class it recorded, leaves the writes cause in any
+        minute, per :meth:`_release_from`.
         A surface it did not touch at all has left the cycle and loses its counter, per
         :meth:`_drop_departed`.
 
@@ -363,6 +443,16 @@ class Watchdog:
             self._minutes_without_data += 1
         else:
             self._minutes_without_data = 0
+        if touched and not result.segments:
+            self._minutes_writes_refused += 1
+        else:
+            self._minutes_writes_refused = 0
+        if result.segments:
+            self._minutes_writes_taken += 1
+        else:
+            self._minutes_writes_taken = 0
+        if touched - failed:
+            self._writes_paged_this_outage = False
         self._drop_departed(touched, result.out_of_span)
         for key in touched - failed:
             self._reset(key)
@@ -374,6 +464,12 @@ class Watchdog:
         for key, error_class in recorded.items():
             if error_class == CONTRACTS_ABSENT:
                 self._release(key)
+        # A surface whose segment was written, whatever class it recorded, proves the disk
+        # took its write, so the disk is not what fails it now. It leaves the writes cause
+        # in any minute. Kept in, a chain answering a 5xx after the disk was freed stayed
+        # covered and silent while no other surface landed data (marketlake #789).
+        for key in recorded:
+            self._release_from(key, _WRITES_TITLE)
         classes = dict(recorded)
         # A segment that could not be written carries its own class, and that surface is
         # just as down, so its page names that class the same way.
@@ -383,7 +479,8 @@ class Watchdog:
         # A write failure records no class, so nothing about it says whether the cause is
         # over. Data landing on another surface says the vendor answered this minute, so
         # the write failure is the surface's own, and it leaves the cause and pages for
-        # itself. Only landed data counts. It resets the count of minutes in which no
+        # itself, or with the other write failures tripping that minute (marketlake #789).
+        # Only landed data counts. It resets the count of minutes in which no
         # surface landed data, so the cause cannot page again until the threshold's minutes
         # pass with no surface landing data. An answer with no contract resets nothing, and
         # counting it let a chain alternating a 401 with an empty answer re-page the cause
@@ -409,7 +506,16 @@ class Watchdog:
                 held = self._paged_causes.get(title)
                 if held is not None and key not in self._cause_released.get(title, ()):
                     held.add(key)
+            # A write failure records no class, so the loop above never reaches it. On a
+            # minute nothing landed, a live writes cause is what it is failing for. Left
+            # out, a ticker joining a full disk beside a chain answering with no contract
+            # tripped and paged the full disk again (marketlake #789).
+            held = self._paged_causes.get(_WRITES_TITLE)
+            if held is not None:
+                held |= (failed - recorded.keys()) - self._cause_released.get(_WRITES_TITLE, set())
         threshold = self._threshold()
+        if self._minutes_writes_taken >= threshold:
+            self._writes_paged_this_outage = False
         out_of_span = self._out_of_span_pages(result, threshold)
         cause = self._whole_daemon(tally, threshold, result.snap_ts)
         if cause is not None:
@@ -485,6 +591,10 @@ class Watchdog:
                 self._minutes_without_data += 1
             else:
                 self._minutes_without_data = 0
+            if not watched:
+                self._minutes_writes_refused = 0
+            elif self._minutes_writes_refused:
+                self._minutes_writes_refused += 1
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
             for ticker in left_out:
@@ -523,9 +633,10 @@ class Watchdog:
         the token is dead. The operator then reads a page storm and has to infer the one
         thing that actually broke.
 
-        So a cycle where every surface failed with the same class is reported as that
-        class, once. It suppresses the fan-out for that minute rather than adding to it,
-        and the counters keep climbing underneath, so the surface pages resume by
+        So a cycle where every surface failed with the same class is reported as that class, once. A
+        cycle where every surface failed its write is reported as the writes cause, whatever write
+        classes it raised (marketlake #789). It suppresses the fan-out for that minute rather than
+        adding to it, and the counters keep climbing underneath, so the surface pages resume by
         themselves if the cause turns out to be something else.
 
         Once means once per cause, and the cause is the title, not the error class that
@@ -576,13 +687,19 @@ class Watchdog:
         outage under that title sent no cause page either. The price is a surface that left
         and then failed the cause's way again. It restates the cause once under its own
         title, on the first minute another surface lands data after it trips.
+
+        A minute in which every touched surface failed its write is the writes cause, and
+        follows every rule above. It records no vendor class, so the page names the class
+        the writes raised when every one shares it, and none otherwise (marketlake #789).
+        A write failure records no class, so the class fold in ``observe`` never reaches
+        one. ``observe`` takes write failures into a live writes cause on any minute in
+        which nothing landed data instead, and this method takes them in on a minute that
+        passes the rule here.
         """
         title = _whole_daemon_title(tally)
         if title is None:
             return None
         failed = tally.failed
-        # The rule passed, so the failed segments recorded exactly one class.
-        error_class = next(c for c in tally.recorded.values() if c is not None)
         held = self._paged_causes.get(title)
         if held is not None:
             # The cause already paged, and this minute is it again, so it speaks for every
@@ -590,10 +707,31 @@ class Watchdog:
             # this adds the write failures.
             held |= failed - self._cause_released.get(title, set())
             return []
-        minutes = self._minutes_without_data
+        if (
+            title == _WRITES_TITLE
+            and self._writes_paged_this_outage
+            and _shared_class(tally.write_failed.values()) == self._writes_paged_cause
+        ):
+            # The writes cause already paged this class in this outage, so the disk
+            # refusing every write again the same way is the same fault. It covers its
+            # surfaces again and sends nothing.
+            self._paged_causes[title] = set(failed)
+            return []
+        if title == _WRITES_TITLE:
+            minutes = self._minutes_writes_refused
+        else:
+            minutes = self._minutes_without_data
         if minutes < threshold:
             return None
+        if title == _WRITES_TITLE:
+            error_class = _shared_class(tally.write_failed.values())
+        else:
+            # The rule passed, so the failed segments recorded exactly one class.
+            error_class = next(c for c in tally.recorded.values() if c is not None)
         self._paged_causes[title] = set(failed)
+        if title == _WRITES_TITLE:
+            self._writes_paged_this_outage = True
+            self._writes_paged_cause = error_class
         return [
             Page(
                 title=title,
@@ -628,6 +766,9 @@ class Watchdog:
             self._out_of_span.clear()
             self._paged_out_of_span.clear()
             self._minutes_without_data = 0
+            self._minutes_writes_refused = 0
+            self._writes_paged_this_outage = False
+            self._minutes_writes_taken = 0
 
     def _reset(self, key: Surface) -> None:
         self._counts[key] = 0
@@ -643,13 +784,18 @@ class Watchdog:
         """Take one surface out of the causes covering it, dropping one that empties.
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
-        Four things bring a surface here, and a fifth takes it out of the token-dead cause
-        alone, through :meth:`_release_from`.
+        Four things bring a surface here, and two more take it out of one cause alone,
+        through :meth:`_release_from`.
 
         1. It produced data.
         2. The roster dropped it.
         3. It answered with no contract.
         4. Its segment could not be written in a minute another surface landed data.
+        5. It fails a way that does not resolve to a dead token in a minute another
+           surface landed data, which takes it out of the token-dead cause only.
+        6. Its segment was written, whatever class it recorded, which takes it out of the
+           writes cause only, in any minute. The disk took that write, so the disk is not
+           what fails the surface now (marketlake #789).
 
         An answer with no contract proves at least one of the surface's requests
         authenticated and got through, so the token works and the vendor is serving it, and
@@ -666,8 +812,9 @@ class Watchdog:
         resolves to no cause, and the cause it held stayed live until the session date
         changed, so a second token death that session paged nothing (marketlake #754).
         Data landing on another surface proves the vendor answered, so ``observe`` brings
-        the surface here in that minute. Its own page then goes out at once, unless it
-        already paged before the cause did and is still in ``_paged``. Its counter kept
+        the surface here in that minute. Its own page then goes out at once, folded with any
+        other write failure tripping that minute (marketlake #789), unless it already paged
+        before the cause did and is still in ``_paged``. Its counter kept
         climbing under the cause, so it skips the threshold and the page carries the
         outage's minutes, even when its write failed only on the minute the outage healed.
         A surface that answers with no contract on that minute already pages the same way.
@@ -684,7 +831,8 @@ class Watchdog:
         ``_release`` loops over this, so one place drops an emptied cause. A title with no
         live cause releases nothing.
 
-        ``observe`` also calls it on its own, for the token-dead cause only. In a minute
+        ``observe`` also calls it on its own, for the writes cause on every surface whose
+        segment was written, and for the token-dead cause as follows. In a minute
         another surface landed data, a surface failing a class that does not resolve to a
         dead token leaves that cause. The token is shared, so data landing anywhere proves
         the token works, and a surface failing another class is failing for its own
@@ -894,6 +1042,15 @@ class Watchdog:
         released tickers' counts, so the first minute they came back still failing sent the
         sampler page again.
 
+        Two or more write failures in one class tripping in the same minute send one page,
+        titled ``Capture down: lake writes failing``, which names that class. Each class
+        folds apart, and a class with one surface pages under that surface's own title. A covered
+        write failure does not trip, so this page never restates a cause. It folds what
+        trips together rather than what fails together, so it needs no state like
+        ``_sampler_absorbed``. The price is a stagger: write failures that start a minute
+        apart send one page each minute. A full disk and an unwritable surface directory
+        both refuse every write in the same minute, so they trip together (marketlake #789).
+
         It applies only where a request was actually attempted, and ``observe`` is the
         only caller for that reason. A slot the loop slept through gaps every quotes
         ticker too, and calling that a dead sampler would name a batched request nobody
@@ -939,20 +1096,44 @@ class Watchdog:
         pages: list[Page] = []
         if collapsed:
             # One batched request died, so in practice every collapsed ticker reports the
-            # same class. Naming one of several would pick a winner arbitrarily, so a
-            # disagreement names none.
-            shared = {classes.get(key) for key in sampler}
+            # same class, and a disagreement names none.
             pages.append(
                 Page(
                     title="Capture down: quote sampler dead",
                     minutes=max(self._counts[key] for key in sampler),
                     surfaces=tuple(sorted(sampler, key=str)),
                     sampler_collapse=True,
-                    cause=shared.pop() if len(shared) == 1 else None,
+                    cause=_shared_class(classes.get(key) for key in sampler),
+                )
+            )
+        # Two or more write failures tripping in this minute with the same class are one
+        # fact about the lake, so they send one page naming that class. Write failures in
+        # different classes are different faults, such as a full disk beside one ticker's
+        # unwritable directory, so each class folds apart, and a class with one surface
+        # pages under that surface's own title. Folded across classes, two unrelated faults
+        # read as one page naming no class and no surface (marketlake #789). The sampler's
+        # set holds only surfaces that recorded a class, so no write failure is ever in it,
+        # and the two folds never share a surface.
+        by_class: dict[str | None, list[Surface]] = {}
+        for key in tripped:
+            if key not in recorded:
+                by_class.setdefault(classes.get(key), []).append(key)
+        folded: set[Surface] = set()
+        for write_class, writes in by_class.items():
+            if len(writes) < 2:
+                continue
+            folded.update(writes)
+            pages.append(
+                Page(
+                    title=_WRITES_TITLE,
+                    minutes=max(self._counts[key] for key in writes),
+                    surfaces=tuple(writes),
+                    cause=write_class,
+                    write_fold=True,
                 )
             )
         for key in tripped:
-            if collapsed and key in sampler:
+            if (collapsed and key in sampler) or key in folded:
                 continue
             pages.append(
                 Page(

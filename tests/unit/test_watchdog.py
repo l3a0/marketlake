@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1912,6 +1913,10 @@ def test_a_minute_whose_every_write_failed_inside_a_token_death_sends_nothing_ne
     A disk that refuses every write in one minute of a token death proves nothing about
     the vendor. Releasing the write failures there emptied the cause, paged each of them,
     and paged the dead token a second time on the next minute.
+
+    One such minute is also below the writes cause's own threshold, which counts the
+    minutes in which every write was refused rather than the minutes without data, so it
+    sends nothing (marketlake #789). The token-dead cause still keeps every surface.
     """
     watchdog = Watchdog()
     every_write = (
@@ -2303,6 +2308,27 @@ WHOLE_DAEMON_CASES = [
         "Capture down: token dead",
         id="a-write-failure-counts-as-touched",
     ),
+    pytest.param(
+        (),
+        (SegmentError("chains", "SPY", "os_error"), SegmentError("quotes", "SPY", "os_error")),
+        "Capture down: lake writes failing",
+        id="every-write-failed",
+    ),
+    pytest.param(
+        (), (SegmentError("chains", "SPY", "os_error"),), None, id="one-surface-write-failed"
+    ),
+    pytest.param(
+        (_seg("chains", "SPY", "data"),),
+        (SegmentError("quotes", "SPY", "os_error"), SegmentError("quotes", "QQQ", "os_error")),
+        None,
+        id="writes-failing-beside-landed-data",
+    ),
+    pytest.param(
+        (_fail("chains", "SPY", "http_500"),),
+        (SegmentError("quotes", "SPY", "os_error"),),
+        None,
+        id="a-write-failure-beside-an-unmapped-class",
+    ),
 ]
 
 
@@ -2317,12 +2343,15 @@ def test_the_watchdog_pages_the_cause_the_public_rule_names(segments, errors, ti
     # watchdog sends a page under the title the public function gave the cycle, and sends
     # no cause page when it gave none. A copy of the rule kept inside the watchdog would
     # pass the case above and drift here.
+    #
+    # A cause page is told apart by ``since``, which only a cause page sets. The title
+    # cannot tell it apart, because two or more write failures tripping beside landed data
+    # fold into a page sharing the writes cause's title with no ``since`` (marketlake #789).
     watchdog = Watchdog()
     raised = []
     for minute in range(3):
         raised += watchdog.observe(_cycle(*segments, errors=errors, at=_at(minute)))
-    causes = {"Capture down: token dead", "Capture down: rate limited"}
-    assert [page.title for page in raised if page.title in causes] == (
+    assert [page.title for page in raised if page.since is not None] == (
         [title] if title is not None else []
     )
 
@@ -2363,17 +2392,21 @@ def test_a_dead_token_and_an_unreadable_token_file_are_one_outage():
     assert [page.title for page in raised] == ["Capture down: token dead"]
 
 
-def test_a_cycle_whose_every_write_failed_names_no_cause_and_does_not_raise():
+def test_a_cycle_whose_every_write_failed_names_the_writes_cause_and_does_not_raise():
     # A full disk fails every segment write, so the cycle touches every surface through
-    # ``errors`` alone and records no class at all. The rule reads that as no cause rather
-    # than taking a class out of an empty set, and the watchdog keeps counting.
+    # ``errors`` alone and records no class at all. The rule reads that as the writes
+    # cause rather than taking a class out of an empty set, and the watchdog keeps
+    # counting. Before marketlake #789 this asserted no cause, which sent one page per
+    # surface, about 230 on a roster of about 115 tickers.
     errors = (SegmentError("chains", "SPY", "os_error"), SegmentError("quotes", "SPY", "os_error"))
-    assert whole_daemon_cause(_cycle(errors=errors)) is None
+    assert whole_daemon_cause(_cycle(errors=errors)) == "Capture down: lake writes failing"
     watchdog = Watchdog()
     raised = []
     for minute in range(3):
         raised += watchdog.observe(_cycle(errors=errors, at=_at(minute)))
-    assert "Capture down: token dead" not in [page.title for page in raised]
+    assert [(page.title, page.cause, len(page.surfaces)) for page in raised] == [
+        ("Capture down: lake writes failing", "os_error", 2)
+    ]
     assert watchdog.count("chains", "SPY") == 3
 
 
@@ -2524,27 +2557,46 @@ def _raised(watchdog: Watchdog, cycles: list[CycleResult]) -> list[tuple]:
 
 
 @pytest.mark.parametrize(
-    "write_classes",
+    ("write_classes", "expected"),
     [
-        {"SPY": "o_s_error", "QQQ": "o_s_error"},
-        {"SPY": "o_s_error", "QQQ": "permission_error"},
+        (
+            {"SPY": "o_s_error", "QQQ": "o_s_error"},
+            [
+                (
+                    2,
+                    "Capture down: lake writes failing",
+                    "o_s_error",
+                    3,
+                    ("QQQ quotes", "SPY quotes"),
+                )
+            ],
+        ),
+        (
+            {"SPY": "o_s_error", "QQQ": "permission_error"},
+            [
+                (2, "Capture down: QQQ quotes", "permission_error", 3, ("QQQ quotes",)),
+                (2, "Capture down: SPY quotes", "o_s_error", 3, ("SPY quotes",)),
+            ],
+        ),
     ],
 )
-def test_every_quotes_write_failing_pages_each_ticker_under_its_own_title(write_classes):
+def test_every_quotes_write_failing_folds_by_class_and_never_into_the_sampler(
+    write_classes, expected
+):
     """Test 1: a refused write is not a dead sampler, whether the write classes agree or not.
 
     The batched request answered and the disk refused the writes. A write failure records
-    no class from the vendor, so no ticker joins the sampler's set, and each one pages under
-    its own title with its own write class, the way a chains write failure already does.
+    no class from the vendor, so no ticker joins the sampler's set. Two write failures in
+    one class trip together and fold into one ``lake writes failing`` page naming that
+    class. Two in different classes are different faults, so each pages under its own
+    title. Folded together, they read as one page naming no class and no surface
+    (marketlake #789).
     """
     errors = tuple(_quotes_write_failed(ticker, cls) for ticker, cls in write_classes.items())
     cycles = [
         _cycle(_seg("chains", "SPY", "data"), errors=errors, at=_at(minute)) for minute in range(4)
     ]
-    assert _raised(Watchdog(), cycles) == [
-        (2, "Capture down: QQQ quotes", write_classes["QQQ"], 3, ("QQQ quotes",)),
-        (2, "Capture down: SPY quotes", write_classes["SPY"], 3, ("SPY quotes",)),
-    ]
+    assert _raised(Watchdog(), cycles) == expected
 
 
 def test_one_write_failure_among_vendor_failures_leaves_the_sampler_page_to_the_vendor_failures():
@@ -2671,12 +2723,14 @@ def test_two_quotes_tickers_turning_to_a_dead_token_under_a_rate_limit_page_the_
     ]
 
 
-def test_a_token_death_healing_into_every_quotes_write_failing_pages_each_ticker():
-    """Test 4: the healed minute sends one page per ticker and no sampler page.
+def test_a_token_death_healing_into_every_quotes_write_failing_sends_one_writes_page():
+    """Test 4: the healed minute sends one writes page and no sampler page.
 
     The chains landing data proves the vendor answered, so each failing write leaves the
-    token-dead cause and pages at once, carrying the outage's minutes. The batched request
-    answered too, so nothing names the sampler.
+    token-dead cause and trips at once, carrying the outage's minutes. The three trip
+    together, so they fold into one ``lake writes failing`` page, where before marketlake
+    #789 each ticker paged under its own title. The batched request answered too, so
+    nothing names the sampler.
     """
     tickers = ("SPY", "QQQ", "IWM")
     cycles = [
@@ -2693,8 +2747,13 @@ def test_a_token_death_healing_into_every_quotes_write_failing_pages_each_ticker
     raised = _raised(Watchdog(), cycles)
     assert [page[:2] for page in raised[:1]] == [(2, "Capture down: token dead")]
     assert raised[1:] == [
-        (3, f"Capture down: {ticker} quotes", "o_s_error", 4, (f"{ticker} quotes",))
-        for ticker in ("IWM", "QQQ", "SPY")
+        (
+            3,
+            "Capture down: lake writes failing",
+            "o_s_error",
+            4,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        )
     ]
 
 
@@ -2904,14 +2963,15 @@ def test_a_ticker_that_left_and_rejoined_is_not_released_by_the_sampler_page_bef
 # -- a ticker the sampler page silenced is heard once the collapse stops holding ------
 
 
-def test_every_quotes_write_failing_after_a_sampler_page_pages_each_ticker_at_once():
+def test_every_quotes_write_failing_after_a_sampler_page_sends_one_writes_page_at_once():
     """The batched request answered, so the sampler page no longer speaks for any ticker.
 
     Every quotes write fails from minute 3 while the chain keeps landing data, so no quotes
     surface lands data all session and the dead-man stays fed. A write failure records no
     vendor class, so the sampler's set is empty and the collapse no longer holds. Each
-    ticker is already past the threshold and no cause covers it, so each pages under its
-    own title in that minute. Waiting for quotes data left all three silent.
+    ticker is already past the threshold and no cause covers it, so all three trip in that
+    minute and fold into one ``lake writes failing`` page. Waiting for quotes data left all
+    three silent. Before marketlake #789 each paged under its own title.
     """
     cycles = [
         _sampler_minute(minute, {"SPY": True, "QQQ": True, "IWM": True}) for minute in range(3)
@@ -2932,9 +2992,13 @@ def test_every_quotes_write_failing_after_a_sampler_page_pages_each_ticker_at_on
             3,
             ("IWM quotes", "QQQ quotes", "SPY quotes"),
         ),
-        (3, "Capture down: IWM quotes", "o_s_error", 4, ("IWM quotes",)),
-        (3, "Capture down: QQQ quotes", "o_s_error", 4, ("QQQ quotes",)),
-        (3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",)),
+        (
+            3,
+            "Capture down: lake writes failing",
+            "o_s_error",
+            4,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
     ]
 
 
@@ -4115,3 +4179,705 @@ def test_letting_a_surface_go_from_one_cause_does_not_keep_it_out_of_another():
     assert pages[2] == [(TOKEN_DEAD, "http_401")]
     assert pages[3] == [(RATE_LIMITED_TITLE, "http_429")]
     assert not [title for raised in pages.values() for title, _ in raised if "IWM" in title]
+
+
+# -- a refused write folds into one page (#789) ------------------------------------------
+
+WRITES = "Capture down: lake writes failing"
+
+
+def _full_disk(
+    minute: int, *tickers: str, classes: dict[str, str] | None = None, segments: tuple = ()
+) -> CycleResult:
+    """One minute in which every surface of ``tickers`` fails its write.
+
+    Each write raises ``o_s_error`` unless ``classes`` names another class for its ticker.
+    ``segments`` are written beside the failed writes, for a minute the disk took some of.
+    """
+    classes = classes or {}
+    return _cycle(
+        *segments,
+        errors=tuple(
+            SegmentError(surface, ticker, classes.get(ticker, "o_s_error"))
+            for ticker in tickers
+            for surface in SURFACES
+        ),
+        at=_at(minute),
+    )
+
+
+def _pages_of(raised: dict[datetime, list]) -> dict[datetime, list[tuple]]:
+    """Each page as its title, class, minutes, since and surfaces, written as strings."""
+    return {
+        slot: [
+            (
+                page.title,
+                page.cause,
+                page.minutes,
+                page.since,
+                tuple(str(key) for key in page.surfaces),
+            )
+            for page in pages
+        ]
+        for slot, pages in raised.items()
+    }
+
+
+EVERY_SURFACE_OF_THREE = (
+    "IWM chains",
+    "IWM quotes",
+    "QQQ chains",
+    "QQQ quotes",
+    "SPY chains",
+    "SPY quotes",
+)
+
+
+def test_every_write_failing_pages_once_as_the_writes_cause():
+    """A full lake volume refuses every write in one minute, and that is one fact.
+
+    Three tickers on two surfaces send one page, dated from the first minute, naming the
+    write class and the six surfaces it stands for. Before this, each surface paged under
+    its own title, which on a roster of about 115 tickers spends the daily cap of 40 in the
+    first minute.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ", "IWM") for minute in range(8)]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(WRITES, "o_s_error", 3, _at(0), EVERY_SURFACE_OF_THREE)]
+    }
+
+
+def test_writes_failing_with_different_classes_page_once_naming_no_class():
+    """Naming one of several write classes would pick a winner, so the page names none."""
+    cycles = [
+        _full_disk(minute, "SPY", "QQQ", "IWM", classes={"SPY": "permission_error"})
+        for minute in range(4)
+    ]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(WRITES, None, 3, _at(0), EVERY_SURFACE_OF_THREE)]
+    }
+
+
+@pytest.mark.parametrize(
+    ("error_class", "title"), [("http_401", TOKEN_DEAD), ("http_429", RATE_LIMITED_TITLE)]
+)
+def test_a_disk_filling_under_a_live_cause_pages_the_writes_cause_dated_from_the_fill(
+    error_class, title
+):
+    """The live cause covers every surface, and before this nothing released them.
+
+    Thirty-five minutes in which every write failed sent no page after the token death or
+    the rate limit had paged, because nothing landed data to release the write failures
+    and the live cause covered each one. The operator who repaired the token then found
+    capture still down with no page naming the disk. The writes cause has a title of its
+    own and waits on its own run, the minutes in which every write was refused, so it pages
+    on the third such minute, dated from the first.
+    """
+    cycles = [_outage(minute, error_class, "SPY", "QQQ", "IWM") for minute in range(3)]
+    cycles += [_full_disk(minute, "SPY", "QQQ", "IWM") for minute in range(3, 38)]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(title, error_class, 3, _at(0), EVERY_SURFACE_OF_THREE)],
+        _at(5): [(WRITES, "o_s_error", 3, _at(3), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def test_a_volume_that_takes_some_minutes_writes_does_not_re_page_the_writes_cause():
+    """A nearly full volume during a token death refuses some minutes and takes others.
+
+    A gap row is about 9 KB, so a disk at the edge can take one minute's gap rows and refuse
+    the next minute's. A minute it took releases every surface from the writes cause, which
+    drops it. Waiting on the minutes without data, which never restart while the token is
+    dead, the cause then paged again on every refused minute. Gated on its own run instead,
+    it still paged again once per refill of three refused minutes, up to 15 pages an hour.
+    No data landed, so it is one outage, and the cause forms again without a page until
+    data lands anywhere.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [_outage(minute, "http_401", *tickers) for minute in range(3)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(3, 6)]
+    cycles += [
+        _outage(minute, "http_401", *tickers) if minute % 2 == 0 else _full_disk(minute, *tickers)
+        for minute in range(6, 16)
+    ]
+    cycles += [_outage(16, "http_401", *tickers)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(17, 21)]
+    watchdog = Watchdog()
+    assert _pages_of(_run(watchdog, cycles)) == {
+        _at(2): [(TOKEN_DEAD, "http_401", 3, _at(0), EVERY_SURFACE_OF_THREE)],
+        _at(5): [(WRITES, "o_s_error", 3, _at(3), EVERY_SURFACE_OF_THREE)],
+    }
+    assert watchdog._paged_causes[WRITES] == set(_roster_of(*tickers))
+
+
+def test_a_refill_after_data_landed_pages_the_writes_cause_again():
+    """Landed data ends the outage, so the next full disk is a new one and pages.
+
+    The disk is full from 10:00 and pages at 10:02. At 10:05 every surface lands, and the
+    disk is full again from 10:06, which pages at 10:08, dated from 10:06.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    every = tuple((surface, ticker) for ticker in tickers for surface in SURFACES)
+    cycles = [_full_disk(minute, *tickers) for minute in range(5)]
+    cycles += [_outage(5, "http_401", *tickers, landed=every)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(6, 10)]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(WRITES, "o_s_error", 3, _at(0), EVERY_SURFACE_OF_THREE)],
+        _at(8): [(WRITES, "o_s_error", 3, _at(6), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def test_a_stall_inside_a_refused_run_dates_the_writes_cause_from_the_first_refusal():
+    """A stall continues a run of refused writes, as it continues the minutes without data.
+
+    Data lands at 10:00, every write is refused at 10:01, the loop sleeps through 10:02 to
+    10:06, and every write is refused again from 10:07. Leaving the run where the stall
+    found it dated the page 10:06, a slot nobody wrote in, and sent a folded page first. The
+    stall carries the run, so the cause pages at 10:07 dated 10:01.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    every = tuple((surface, ticker) for ticker in tickers for surface in SURFACES)
+    watchdog = Watchdog()
+    assert watchdog.observe(_outage(0, "http_401", *tickers, landed=every)) == []
+    assert watchdog.observe(_full_disk(1, *tickers)) == []
+    watchdog.missed(_roster_of(*tickers), [_at(minute) for minute in range(2, 7)])
+    pages = _pages_of(_run(watchdog, [_full_disk(minute, *tickers) for minute in range(7, 10)]))
+    assert pages == {_at(7): [(WRITES, "o_s_error", 7, _at(1), EVERY_SURFACE_OF_THREE)]}
+
+
+def test_a_ticker_joining_a_full_disk_folds_into_the_writes_cause():
+    """IWM joins at 10:03, after the writes cause paged, on minutes every write fails.
+
+    From 10:05 SPY chains answers with no contract, which the disk wrote, so no surface
+    lands data and the minute is not unanimous. The writes cause still covers SPY quotes
+    and QQQ, whose writes keep failing. Left out of the cause, IWM's two write failures
+    tripped at 10:05 and paged the full disk again. A unanimous minute takes IWM in, per
+    marketlake #790, so the only page then is SPY chains' own answer.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    cycles += [_full_disk(minute, "SPY", "QQQ", "IWM") for minute in range(3, 5)]
+    empty = _seg("chains", "SPY", "data", data_rows=0)
+    cycles += [
+        _cycle(
+            empty,
+            errors=tuple(
+                SegmentError(surface, ticker, "o_s_error")
+                for ticker in ("SPY", "QQQ", "IWM")
+                for surface in SURFACES
+                if (surface, ticker) != ("chains", "SPY")
+            ),
+            at=_at(minute),
+        )
+        for minute in range(5, 9)
+    ]
+    watchdog = Watchdog()
+    assert _titles(_run(watchdog, cycles)) == {
+        _at(2): [WRITES],
+        _at(5): ["Capture down: SPY chains"],
+    }
+    assert watchdog._paged_causes == {
+        WRITES: set(_roster_of("QQQ", "IWM")) | {_spy_quotes()},
+    }
+
+
+def test_the_writes_cause_re_arms_once_data_lands_everywhere():
+    """Every surface landing data at 10:03 empties the cause, so the next full disk pages.
+
+    The second page waits for its own threshold of minutes without data and is dated from
+    its own first minute.
+    """
+    landed = tuple(_seg(surface, "SPY", "data") for surface in SURFACES)
+    cycles = [_full_disk(minute, "SPY") for minute in range(3)]
+    cycles += [_cycle(*landed, at=_at(minute)) for minute in range(3, 5)]
+    cycles += [_full_disk(minute, "SPY") for minute in range(5, 9)]
+    assert _causes(_run(Watchdog(), cycles)) == {
+        _at(2): [(WRITES, 3, _at(0), 2)],
+        _at(7): [(WRITES, 3, _at(5), 2)],
+    }
+
+
+def test_a_surface_whose_gap_was_written_leaves_the_writes_cause_and_pages_its_own_class():
+    """The disk took the gap's write, so the disk is not what fails that surface now.
+
+    The disk is freed at 10:03 and the vendor answers 500 on every surface. No surface lands
+    data, so no exit that waits on landed data applies. Kept in the writes cause, every
+    surface stayed covered and silent for as long as the 500 lasted. Released, the chains
+    page under their own titles and the two quotes tickers collapse into the sampler page,
+    and the emptied writes cause re-arms.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    cycles += [_outage(minute, "http_500", "SPY", "QQQ") for minute in range(3, 6)]
+    watchdog = Watchdog()
+    assert _titles(_run(watchdog, cycles)) == {
+        _at(2): [WRITES],
+        _at(3): SPY_AND_QQQ_ON_THEIR_OWN,
+    }
+    assert watchdog._paged_causes == {}
+
+
+def test_a_written_gap_beside_a_full_disk_leaves_only_its_own_surface():
+    """SPY chains' 500 gap is written while every other write still fails.
+
+    SPY chains leaves the writes cause and pages its 500. The other surfaces stay in the
+    cause, which is still true of them, so they send nothing.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    gap = _fail("chains", "SPY", "http_500")
+    cycles += [
+        _cycle(
+            gap,
+            errors=(
+                SegmentError("quotes", "SPY", "o_s_error"),
+                SegmentError("chains", "QQQ", "o_s_error"),
+                SegmentError("quotes", "QQQ", "o_s_error"),
+            ),
+            at=_at(minute),
+        )
+        for minute in range(3, 8)
+    ]
+    watchdog = Watchdog()
+    assert _per_minute(watchdog, cycles) == {
+        2: [(WRITES, "o_s_error")],
+        3: [("Capture down: SPY chains", "http_500")],
+    }
+    assert watchdog._paged_causes == {
+        WRITES: {_spy_quotes(), Surface("chains", "QQQ"), Surface("quotes", "QQQ")}
+    }
+
+
+def test_a_stall_during_the_writes_cause_adds_no_page():
+    """The writes cause speaks for every surface, so a stall inside it is the same outage."""
+    watchdog = Watchdog()
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(4)]
+    assert _titles(_run(watchdog, cycles)) == {_at(2): [WRITES]}
+    slots = [_at(minute) for minute in range(4, 10)]
+    assert watchdog.missed(_roster_of("SPY", "QQQ"), slots) == []
+
+
+@pytest.mark.parametrize(
+    ("classes", "expected"),
+    [
+        ({}, [(WRITES, "o_s_error", 3, None, ("IWM quotes", "QQQ quotes", "SPY quotes"))]),
+        (
+            {"QQQ": "permission_error"},
+            [
+                (WRITES, "o_s_error", 3, None, ("IWM quotes", "SPY quotes")),
+                ("Capture down: QQQ quotes", "permission_error", 3, None, ("QQQ quotes",)),
+            ],
+        ),
+    ],
+)
+def test_every_quotes_write_failing_while_chains_land_folds_into_one_page(classes, expected):
+    """An unwritable quotes directory for the day refuses every quotes write.
+
+    The chains keep landing data, so the minute is not the writes cause and the dead-man
+    stays fed. The write failures in one class trip together and send one page with no
+    ``since``, naming that class. A ticker failing another class is another fault and pages
+    under its own title. Before this, each ticker paged under its own title, which on a
+    roster of about 115 tickers is about 115 pages.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [
+        _cycle(
+            *(_seg("chains", ticker, "data") for ticker in tickers),
+            errors=tuple(
+                SegmentError("quotes", ticker, classes.get(ticker, "o_s_error"))
+                for ticker in tickers
+            ),
+            at=_at(minute),
+        )
+        for minute in range(6)
+    ]
+    assert _pages_of(_run(Watchdog(), cycles)) == {_at(2): expected}
+
+
+def test_one_write_failure_still_pages_under_its_own_title():
+    """A single refused write names its own surface, because one surface is not the lake."""
+    cycles = [
+        _cycle(
+            _seg("chains", "SPY", "data"),
+            errors=(SegmentError("quotes", "SPY", "o_s_error"),),
+            at=_at(minute),
+        )
+        for minute in range(4)
+    ]
+    assert _per_minute(Watchdog(), cycles) == {2: [("Capture down: SPY quotes", "o_s_error")]}
+
+
+def test_write_failures_that_start_a_minute_apart_page_once_each_minute():
+    """The fold covers what trips together, which is the price of keeping no new state.
+
+    SPY's and QQQ's quotes writes fail from 10:00 and IWM's from 10:01, while the chains
+    land data. SPY and QQQ trip at 10:02 and fold. IWM trips alone at 10:03 and pages under
+    its own title.
+    """
+    cycles = [
+        _cycle(
+            *(_seg("chains", ticker, "data") for ticker in ("SPY", "QQQ", "IWM")),
+            errors=tuple(
+                SegmentError("quotes", ticker, "o_s_error")
+                for ticker in ("SPY", "QQQ", "IWM")
+                if ticker != "IWM" or minute >= 1
+            ),
+            at=_at(minute),
+        )
+        for minute in range(6)
+    ]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(WRITES, "o_s_error")],
+        3: [("Capture down: IWM quotes", "o_s_error")],
+    }
+
+
+def test_a_sampler_page_and_a_writes_page_go_out_in_the_same_minute():
+    """The two folds never share a surface, so both can fire in one minute.
+
+    SPY's and QQQ's batched quotes fail with 500 and IWM's quotes write fails, so every
+    quotes ticker failed and the two that recorded a class form the sampler's set. IWM's
+    chain write fails as well, so two write failures trip beside the sampler page and fold.
+    SPY chains lands data, so no cause applies.
+    """
+    cycles = [
+        _cycle(
+            _fail("quotes", "SPY", "http_500"),
+            _fail("quotes", "QQQ", "http_500"),
+            _seg("chains", "SPY", "data"),
+            errors=(
+                SegmentError("quotes", "IWM", "o_s_error"),
+                SegmentError("chains", "IWM", "o_s_error"),
+            ),
+            at=_at(minute),
+        )
+        for minute in range(4)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("QQQ quotes", "SPY quotes")),
+        (2, WRITES, "o_s_error", 3, ("IWM chains", "IWM quotes")),
+    ]
+
+
+def test_the_public_rule_names_the_writes_cause_and_the_token_pull_ignores_it():
+    """The daemon spawns a token pull only on ``TOKEN_DEAD``, so a full disk pulls nothing.
+
+    The rule names the writes cause for a cycle whose every write failed, and a recorded
+    401 beside write failures still names the dead token.
+    """
+    full_disk = _full_disk(0, "SPY", "QQQ")
+    assert whole_daemon_cause(full_disk) == WRITES != TOKEN_DEAD
+    beside = _cycle(_fail("chains", "SPY", "http_401"), errors=full_disk.errors[1:])
+    assert whole_daemon_cause(beside) == TOKEN_DEAD
+
+
+@pytest.mark.parametrize("joiner", ["IWM", "XLF"])
+def test_a_disk_freed_partway_folds_the_writes_still_failing_with_the_longest_run(joiner):
+    """SPY and QQQ fill the disk from 10:00, a ticker joins at 10:03, and SPY chains lands at
+    10:06.
+
+    Landed data proves the vendor answered, so every write still failing leaves the writes
+    cause and trips at once, per marketlake #754. They fold into one page under the same
+    title with no ``since``, which is the second page a disk freed partway sends. The joiner
+    has the lower count, and the page carries the longest run it folds wherever that
+    surface sorts, which is why the joiner runs once sorting first and once sorting last.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    cycles += [_full_disk(minute, "SPY", "QQQ", joiner) for minute in range(3, 6)]
+    landed = _seg("chains", "SPY", "data")
+    cycles += [
+        _cycle(
+            landed,
+            errors=tuple(
+                SegmentError(surface, ticker, "o_s_error")
+                for ticker in ("SPY", "QQQ", joiner)
+                for surface in SURFACES
+                if (surface, ticker) != ("chains", "SPY")
+            ),
+            at=_at(6),
+        )
+    ]
+    folded = sorted(
+        ["QQQ chains", "QQQ quotes", "SPY quotes", f"{joiner} chains", f"{joiner} quotes"]
+    )
+    watchdog = Watchdog()
+    assert _pages_of(_run(watchdog, cycles)) == {
+        _at(2): [
+            (
+                WRITES,
+                "o_s_error",
+                3,
+                _at(0),
+                ("QQQ chains", "QQQ quotes", "SPY chains", "SPY quotes"),
+            )
+        ],
+        _at(6): [(WRITES, "o_s_error", 7, None, tuple(folded))],
+    }
+    assert watchdog._paged_causes == {}
+
+
+def test_a_ticker_joining_a_full_disk_on_minutes_that_are_not_unanimous_folds_into_it():
+    """IWM joins at 10:03 while SPY chains answers with no contract, which the disk wrote.
+
+    No minute after the page is unanimous and nothing lands data, so only the fold on a
+    minute nothing landed can take IWM in. Left out, its two write failures tripped at
+    10:05 and paged the full disk a second time.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    empty = _seg("chains", "SPY", "data", data_rows=0)
+    cycles += [
+        _cycle(
+            empty,
+            errors=tuple(
+                SegmentError(surface, ticker, "o_s_error")
+                for ticker in ("SPY", "QQQ", "IWM")
+                for surface in SURFACES
+                if (surface, ticker) != ("chains", "SPY")
+            ),
+            at=_at(minute),
+        )
+        for minute in range(3, 9)
+    ]
+    watchdog = Watchdog()
+    assert _titles(_run(watchdog, cycles)) == {
+        _at(2): [WRITES],
+        _at(3): ["Capture down: SPY chains"],
+    }
+    assert watchdog._paged_causes == {
+        WRITES: set(_roster_of("QQQ", "IWM")) | {_spy_quotes()},
+    }
+
+
+def test_the_writes_cause_takes_in_only_write_failures_it_has_not_let_go():
+    """From 10:03 IWM's chain writes a 500 gap, so no minute is unanimous and nothing lands.
+
+    SPY chains wrote a 500 gap at 10:03 too, which let it go from the writes cause, and its
+    write fails again from 10:04. The cause takes a surface in once, so it stays out. IWM
+    chains' gap was written, so the disk is not what fails it, and it stays out and pages
+    its 500 at its own threshold. Only IWM quotes, a write failure the cause never let go,
+    is taken in.
+    """
+
+    def minute_of(minute: int) -> CycleResult:
+        errors = [
+            SegmentError("quotes", "SPY", "o_s_error"),
+            SegmentError("chains", "QQQ", "o_s_error"),
+            SegmentError("quotes", "QQQ", "o_s_error"),
+            SegmentError("quotes", "IWM", "o_s_error"),
+        ]
+        segments = [_fail("chains", "IWM", "http_500")]
+        if minute == 3:
+            segments.append(_fail("chains", "SPY", "http_500"))
+        else:
+            errors.append(SegmentError("chains", "SPY", "o_s_error"))
+        return _cycle(*segments, errors=tuple(errors), at=_at(minute))
+
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    cycles += [minute_of(minute) for minute in range(3, 9)]
+    watchdog = Watchdog()
+    assert _per_minute(watchdog, cycles) == {
+        2: [(WRITES, "o_s_error")],
+        3: [("Capture down: SPY chains", "http_500")],
+        5: [("Capture down: IWM chains", "http_500")],
+    }
+    assert watchdog._paged_causes == {
+        WRITES: {_spy_quotes(), Surface("chains", "QQQ"), Surface("quotes", "QQQ")}
+        | {Surface("quotes", "IWM")},
+    }
+
+
+def test_a_stall_before_any_refusal_starts_no_run_of_refused_writes():
+    """A slept slot attempted no write, so it cannot begin a run of refused writes.
+
+    Data lands at 10:00, the loop sleeps through 10:01 to 10:05, and every write is refused
+    from 10:06. The run begins at 10:06, so the cause pages at 10:08, dated 10:06, rather
+    than from inside the stall, when no write was attempted. The stall charged every
+    surface, so at 10:06 they trip together and fold into one page first, the way a
+    surface still dead after a stall is heard on the first cycle after it. That pair is the
+    price a disk pays for filling while its surfaces already count.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    every = tuple((surface, ticker) for ticker in tickers for surface in SURFACES)
+    watchdog = Watchdog()
+    assert watchdog.observe(_outage(0, "http_401", *tickers, landed=every)) == []
+    watchdog.missed(_roster_of(*tickers), [_at(minute) for minute in range(1, 6)])
+    pages = _pages_of(_run(watchdog, [_full_disk(minute, *tickers) for minute in range(6, 10)]))
+    assert pages == {
+        _at(6): [(WRITES, "o_s_error", 6, None, EVERY_SURFACE_OF_THREE)],
+        _at(8): [(WRITES, "o_s_error", 3, _at(6), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def test_a_stall_that_charged_no_surface_restarts_the_run_of_refused_writes():
+    """A slot that charged nobody says nothing about the disk, as it says nothing about data.
+
+    Every write is refused at 10:00 and 10:01. The loop sleeps through 10:02 with every
+    ticker out of span, so the stall charges nobody, and every write is refused again from
+    10:03. The run restarts at 10:03, so the cause pages at 10:05, dated 10:03. Each
+    surface's own count reached the threshold at 10:03, so they fold into one page then,
+    the price a disk pays for filling while its surfaces already count.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    watchdog = Watchdog()
+    for minute in (0, 1):
+        assert watchdog.observe(_full_disk(minute, *tickers)) == []
+    watchdog.missed([], [_at(2)])
+    pages = _pages_of(_run(watchdog, [_full_disk(minute, *tickers) for minute in range(3, 7)]))
+    assert pages == {
+        _at(3): [(WRITES, "o_s_error", 3, None, EVERY_SURFACE_OF_THREE)],
+        _at(5): [(WRITES, "o_s_error", 3, _at(3), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def test_a_disk_still_full_at_the_next_session_pages_the_writes_cause_again():
+    """The session date ends the outage, as it ends every cause.
+
+    The disk is full from 10:00 on 2 September and pages at 10:02, and no data lands for the
+    rest of the session. It is still full at 10:00 on 3 September, which pages again at
+    10:02, dated 10:00 that day.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [_full_disk(minute, *tickers) for minute in range(5)]
+    cycles += [
+        CycleResult(cycle.snap_ts.replace(day=3), cycle.segments, cycle.errors)
+        for cycle in (_full_disk(minute, *tickers) for minute in range(5))
+    ]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(WRITES, "o_s_error", 3, _at(0), EVERY_SURFACE_OF_THREE)],
+        _at(2, day=3): [(WRITES, "o_s_error", 3, _at(0, day=3), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def _classless_gap(surface: str, ticker: str) -> SegmentOutcome:
+    """A gap segment that recorded no class, which ``_seg`` never builds."""
+    return replace(_seg(surface, ticker, "gap"), error_class=None)
+
+
+def test_a_classless_gap_written_beside_a_full_disk_leaves_the_writes_cause():
+    """A written gap leaves the writes cause whatever it recorded, a missing class included.
+
+    SPY and QQQ fill the disk and it pages at 10:02. From 10:03 SPY chains writes a gap that
+    recorded no class while every other write is refused. The disk took that write, so SPY
+    chains leaves the cause and pages at once, naming no class.
+    """
+    cycles = [_full_disk(minute, "SPY", "QQQ") for minute in range(3)]
+    rest = tuple(
+        SegmentError(surface, ticker, "o_s_error")
+        for ticker in ("SPY", "QQQ")
+        for surface in SURFACES
+        if (surface, ticker) != ("chains", "SPY")
+    )
+    cycles += [_cycle(_classless_gap("chains", "SPY"), errors=rest, at=_at(3))]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(WRITES, "o_s_error")],
+        3: [("Capture down: SPY chains", None)],
+    }
+
+
+def test_a_surface_that_recorded_a_class_is_not_taken_into_the_writes_cause():
+    """The writes cause takes in write failures only, so a vendor failure still pages on time.
+
+    SPY and QQQ fill the disk and it pages at 10:02. The loop sleeps through 10:03 and 10:04,
+    which charges IWM too. At 10:05 IWM chains answers 500 beside the full disk. Its gap was
+    written, so the disk is not its cause, and it pages then with ``http_500``.
+    """
+    watchdog = Watchdog()
+    pages = _run(watchdog, [_full_disk(minute, "SPY", "QQQ") for minute in range(3)])
+    assert _per_minute_of(pages) == {_at(2): [(WRITES, "o_s_error")]}
+    assert watchdog.missed(_roster_of("SPY", "QQQ", "IWM"), [_at(3), _at(4)]) == []
+    fifth = _full_disk(5, "SPY", "QQQ")
+    cycle = _cycle(_fail("chains", "IWM", "http_500"), errors=fifth.errors, at=_at(5))
+    assert [(page.title, page.cause) for page in watchdog.observe(cycle)] == [
+        ("Capture down: IWM chains", "http_500")
+    ]
+
+
+def _per_minute_of(raised: dict[datetime, list]) -> dict[datetime, list[tuple]]:
+    return {slot: [(page.title, page.cause) for page in pages] for slot, pages in raised.items()}
+
+
+@pytest.mark.parametrize(
+    ("segments", "errors"),
+    [
+        ((_classless_gap("chains", "SPY"),), (SegmentError("quotes", "SPY", "o_s_error"),)),
+        ((_classless_gap("chains", "SPY"), _classless_gap("quotes", "SPY")), ()),
+    ],
+    ids=["beside-a-write-failure", "alone"],
+)
+def test_gaps_that_recorded_no_class_are_not_the_writes_cause(segments, errors):
+    """A gap that recorded no class was written, so the disk took it and the minute is no
+    full disk, and nothing else names a cause for it."""
+    assert whole_daemon_cause(_cycle(*segments, errors=errors)) is None
+
+
+def test_a_sampler_page_whose_tickers_recorded_a_class_and_none_names_no_class():
+    """One ticker recorded ``http_500`` and the other no class, so they do not share one."""
+    cycles = [
+        _cycle(
+            _seg("chains", "SPY", "data"),
+            _seg("chains", "QQQ", "data"),
+            _fail("quotes", "SPY", "http_500"),
+            _classless_gap("quotes", "QQQ"),
+            at=_at(minute),
+        )
+        for minute in range(4)
+    ]
+    assert _per_minute(Watchdog(), cycles) == {2: [("Capture down: quote sampler dead", None)]}
+
+
+def test_a_new_write_fault_after_the_disk_was_freed_pages_inside_one_token_death():
+    """The silent re-form covers the same fault coming back, not a different one.
+
+    A dead token pages at 10:02. The disk refuses every write from 10:04 and pages at 10:06.
+    It takes 401 gap rows at 10:08 and 10:09, and from 10:10 every write is refused with
+    ``permission_error``. No data lands in any of it. Re-formed silently because no data had
+    landed, that fault never paged, and after the token healed the refused writes kept data
+    from landing, so it stayed silent all session. A different class is a different fault,
+    so it pages at the threshold, dated from 10:10.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    permission = {ticker: "permission_error" for ticker in tickers}
+    cycles = [_outage(minute, "http_401", *tickers) for minute in range(4)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(4, 8)]
+    cycles += [_outage(minute, "http_401", *tickers) for minute in (8, 9)]
+    cycles += [_full_disk(minute, *tickers, classes=permission) for minute in range(10, 14)]
+    assert _pages_of(_run(Watchdog(), cycles)) == {
+        _at(2): [(TOKEN_DEAD, "http_401", 3, _at(0), EVERY_SURFACE_OF_THREE)],
+        _at(6): [(WRITES, "o_s_error", 3, _at(4), EVERY_SURFACE_OF_THREE)],
+        _at(12): [(WRITES, "permission_error", 3, _at(10), EVERY_SURFACE_OF_THREE)],
+    }
+
+
+def test_a_disk_that_took_writes_for_the_threshold_and_filled_again_pages_again():
+    """A disk that takes writes for the threshold's minutes in a row was freed.
+
+    The disk refuses every write from 10:00 and pages at 10:02. From 10:04 to 10:09 every
+    surface answers 500, so nothing lands, but the disk takes every gap row. It refuses every
+    write again from 10:10. That is a freed disk filling again, so it pages at 10:12, where
+    the silent re-form kept the dead-man's DOWN the only sign of it. At 10:10 the quotes,
+    which the sampler page silenced at 10:04, are heard again and fold into one page first.
+    The chains paged their own 500s at 10:04 and stay paged, since none landed.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [_full_disk(minute, *tickers) for minute in range(4)]
+    cycles += [_outage(minute, "http_500", *tickers) for minute in range(4, 10)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(10, 14)]
+    pages = _pages_of(_run(Watchdog(), cycles))
+    assert pages[_at(2)] == [(WRITES, "o_s_error", 3, _at(0), EVERY_SURFACE_OF_THREE)]
+    quotes = ("IWM quotes", "QQQ quotes", "SPY quotes")
+    assert pages[_at(10)] == [(WRITES, "o_s_error", 11, None, quotes)]
+    assert pages[_at(12)] == [(WRITES, "o_s_error", 3, _at(10), EVERY_SURFACE_OF_THREE)]
+
+
+@pytest.mark.parametrize(("taken", "pages_again"), [(2, False), (3, True)])
+def test_the_disk_must_take_writes_for_the_threshold_to_end_the_outage(taken, pages_again):
+    """Two minutes of writes taken is still the same outage, and three is a freed disk.
+
+    The disk refuses every write from 10:00 and pages at 10:02. It takes 500 gap rows for
+    ``taken`` minutes from 10:04, and then refuses every write again. At the threshold the
+    refill is a new fault and pages once its own run reaches it.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    refill = 4 + taken
+    cycles = [_full_disk(minute, *tickers) for minute in range(4)]
+    cycles += [_outage(minute, "http_500", *tickers) for minute in range(4, refill)]
+    cycles += [_full_disk(minute, *tickers) for minute in range(refill, refill + 4)]
+    pages = _pages_of(_run(Watchdog(), cycles))
+    cause = (WRITES, "o_s_error", 3, _at(refill), EVERY_SURFACE_OF_THREE)
+    assert (cause in pages.get(_at(refill + 2), [])) is pages_again
