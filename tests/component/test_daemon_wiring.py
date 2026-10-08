@@ -113,6 +113,7 @@ from lake.security_master import SecurityMaster, master_path
 from lake.session import SPOT_CLOSE, TICK
 from lake.tickers import TICKERS_PATH_ENV, TickersError, default_tickers_path
 from lake.vendor import VendorResponse
+from lake.watchdog import TOKEN_DEAD, whole_daemon_cause
 from tests.support.backup import FakeBackup
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import WAIT_GRACE_SECONDS, ManualClock
@@ -3522,6 +3523,8 @@ def test_a_5xx_released_from_the_token_cause_moves_no_token_pull(tmp_path, capsy
     leaves the token-dead cause on the first healed minute and pages for itself, and the
     second death pages again. The pull fires on the first dead minute of each death, the
     second one 9 slots after the first, the same cycles it fired on before the release.
+    The cycles the daemon ran read as a dead token on the dead minutes alone, which is
+    what the pull reads.
     """
     rig = _rig(
         tmp_path,
@@ -3531,8 +3534,19 @@ def test_a_5xx_released_from_the_token_cause_moves_no_token_pull(tmp_path, capsy
     minutes = (
         [("http_401", "http_401")] * 3 + [(None, "http_500")] * 6 + [("http_401", "http_401")] * 4
     )
-    _run(rig, clock, ticks=len(minutes), cycle_runner=_qqq_chains_failing_alone(minutes))
+    inner = _qqq_chains_failing_alone(minutes)
+    causes: list[str | None] = []
 
+    def runner(*, slot: datetime, close_tag: str | None, session_phase: str | None) -> CycleResult:
+        result = inner(slot=slot, close_tag=close_tag, session_phase=session_phase)
+        causes.append(whole_daemon_cause(result))
+        return result
+
+    _run(rig, clock, ticks=len(minutes), cycle_runner=runner)
+
+    dead = [minute for minute, cause in enumerate(causes) if cause == TOKEN_DEAD]
+    assert len(causes) == len(minutes)
+    assert dead == [0, 1, 2, 9, 10, 11, 12]
     assert _pulled_at(capsys.readouterr().err) == [et(2026, 9, 2, 10, 0), et(2026, 9, 2, 10, 9)]
     # The class is the one word after "failing with", read that narrowly so the test
     # holds whatever else the body says, its minutes included.

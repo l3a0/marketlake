@@ -2105,7 +2105,7 @@ def _qqq_chains_apart(minute: int, others: str | None, qqq_chains: str) -> Cycle
     )
 
 
-def _token_death_around(qqq_chains: str) -> list[CycleResult]:
+def _token_death_around(qqq_chains: str | None) -> list[CycleResult]:
     """The issue's probe: a dead token at minutes 0-2, healed 3-8, dead again 9-12.
 
     QQQ chains fails with ``qqq_chains`` while the token is healed.
@@ -2373,3 +2373,129 @@ def test_a_cycle_whose_every_write_failed_names_no_cause_and_does_not_raise():
         raised += watchdog.observe(_cycle(errors=errors, at=_at(minute)))
     assert "Capture down: token dead" not in [page.title for page in raised]
     assert watchdog.count("chains", "SPY") == 3
+
+
+def test_two_surfaces_failing_apart_both_leave_the_token_cause():
+    """Every surface failing another way in a healed minute leaves, not only the first.
+
+    QQQ chains answers 500 and QQQ quotes times out once the token heals. Both leave the
+    token-dead cause on the first healed minute and page for themselves, so the cause
+    empties and the second token death pages it again.
+    """
+
+    def minute(n, others, qqq_chains, qqq_quotes):
+        def one(name, ticker, state):
+            return _seg(name, ticker, "data") if state is None else _fail(name, ticker, state)
+
+        return _cycle(
+            one("chains", "SPY", others),
+            one("chains", "QQQ", qqq_chains),
+            one("quotes", "SPY", others),
+            one("quotes", "QQQ", qqq_quotes),
+            at=_at(n),
+        )
+
+    cycles = (
+        [minute(n, "http_401", "http_401", "http_401") for n in range(3)]
+        + [minute(n, None, "http_500", "timeout") for n in range(3, 9)]
+        + [minute(n, "http_401", "http_401", "http_401") for n in range(9, 13)]
+    )
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [(QQQ_CHAINS, "http_500"), ("Capture down: QQQ quotes", "timeout")],
+        11: [(TOKEN_DEAD_TITLE, "http_401")],
+    }
+
+
+def test_a_classless_failure_leaves_the_token_cause():
+    """A failure that records no class says nothing about the token, so it leaves."""
+    assert _per_minute(Watchdog(), _token_death_around(None)) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [(QQQ_CHAINS, None)],
+        11: [(TOKEN_DEAD_TITLE, "http_401")],
+    }
+
+
+@pytest.mark.parametrize("token_class", ["http_403", "token_file_unreadable"])
+def test_every_token_class_stays_in_the_token_cause(token_class):
+    """Each class the token-dead cause names keeps its surface quiet after data lands."""
+    watchdog = Watchdog()
+    raised = []
+    for minute in range(3):
+        raised += watchdog.observe(
+            _cycle(
+                _fail("chains", "SPY", "http_401"),
+                _fail("chains", "QQQ", "http_401"),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    for minute in range(3, 8):
+        raised += watchdog.observe(
+            _cycle(
+                _seg("chains", "SPY", "data"),
+                _fail("chains", "QQQ", token_class),
+                _fail("quotes", "SPY", "http_401"),
+                at=_at(minute),
+            )
+        )
+    assert [page.title for page in raised] == [TOKEN_DEAD_TITLE]
+    assert watchdog._paged_causes == {
+        TOKEN_DEAD_TITLE: {Surface("chains", "QQQ"), Surface("quotes", "SPY")}
+    }
+
+
+def test_a_rate_limit_re_arms_when_capture_returns():
+    """A rate-limited cause that every surface left is dropped, so the next one pages."""
+
+    def minute(n, state):
+        if state is None:
+            return _cycle(_seg("chains", "SPY", "data"), _seg("quotes", "SPY", "data"), at=_at(n))
+        return _cycle(_fail("chains", "SPY", state), _fail("quotes", "SPY", state), at=_at(n))
+
+    cycles = (
+        [minute(n, "http_429") for n in range(3)]
+        + [minute(3, None)]
+        + [minute(n, "http_429") for n in range(4, 7)]
+    )
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(RATE_LIMITED_TITLE, "http_429")],
+        6: [(RATE_LIMITED_TITLE, "http_429")],
+    }
+
+
+def test_landing_data_leaves_both_causes_that_hold_a_surface():
+    """A surface held by the token-dead and rate-limited causes leaves both when it lands."""
+    a, b = Surface("chains", "SPY"), Surface("quotes", "SPY")
+
+    def minute(n, state):
+        if state is None:
+            return _cycle(_seg("chains", "SPY", "data"), _seg("quotes", "SPY", "data"), at=_at(n))
+        return _cycle(_fail("chains", "SPY", state), _fail("quotes", "SPY", state), at=_at(n))
+
+    watchdog = Watchdog()
+    for n in range(3):
+        watchdog.observe(minute(n, "http_401"))
+    for n in range(3, 6):
+        watchdog.observe(minute(n, "http_429"))
+    assert watchdog._paged_causes == {TOKEN_DEAD_TITLE: {a, b}, RATE_LIMITED_TITLE: {a, b}}
+    watchdog.observe(minute(6, None))
+    assert watchdog._paged_causes == {}
+
+
+def test_a_rate_limit_inside_a_token_death_pages_on_its_own():
+    """The token-dead cause does not speak for a surface that starts failing 429."""
+
+    def minute(n, qqq_chains):
+        return _cycle(
+            _fail("chains", "SPY", "http_401"),
+            _fail("chains", "QQQ", qqq_chains),
+            _fail("quotes", "SPY", "http_401"),
+            at=_at(n),
+        )
+
+    cycles = [minute(n, "http_401") for n in range(3)] + [minute(3, "http_429")]
+    assert _per_minute(Watchdog(), cycles) == {
+        2: [(TOKEN_DEAD_TITLE, "http_401")],
+        3: [(QQQ_CHAINS, "http_429")],
+    }
