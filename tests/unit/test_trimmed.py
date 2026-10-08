@@ -98,26 +98,41 @@ def test_the_predicate_takes_no_root_or_path():
 
 
 def test_the_predicate_never_touches_the_disk(tmp_path, monkeypatch):
-    """Called with no lake on disk, and with every way of statting a file made to fail.
+    """Called with no lake on disk, and with every way of statting a file recorded.
 
     Mutation this catches: a stat added inside the predicate, such as a ``Path.exists`` check on
     the partition. Callers ask only about a file they already found absent, so a stat here would
     be a second answer to a question the caller settled, and one the bucket rebuild cannot ask.
+
+    Each patched call is recorded and passed through rather than raised, and the record is read
+    only after the patches are undone. A raise inside the patch would reach pytest's own failure
+    reporting, which stats files too, and end the run in an internal error rather than a failure.
     """
     monkeypatch.chdir(tmp_path)
-
-    def refuse(*_args, **_kwargs):
-        raise AssertionError("is_designed_absence touched the disk")
-
-    for name in ("exists", "is_file", "stat", "lstat", "open", "read_bytes"):
-        monkeypatch.setattr(Path, name, refuse)
-    monkeypatch.setattr(os, "stat", refuse)
-    monkeypatch.setattr(os.path, "exists", refuse)
-    monkeypatch.setattr(os.path, "isfile", refuse)
-
     latest = latest_by_partition([_trim()])
-    assert is_designed_absence(PART, _manifest(), latest) is True
-    assert is_designed_absence(OTHER, _manifest(), latest) is False
+    touched: list[str] = []
+
+    def recording(owner, name):
+        original = getattr(owner, name)
+
+        def record(*args, **kwargs):
+            touched.append(name)
+            return original(*args, **kwargs)
+
+        return record
+
+    with monkeypatch.context() as patch:
+        for name in ("exists", "is_file", "stat", "lstat", "open", "read_bytes"):
+            patch.setattr(Path, name, recording(Path, name))
+        patch.setattr(os, "stat", recording(os, "stat"))
+        patch.setattr(os.path, "exists", recording(os.path, "exists"))
+        patch.setattr(os.path, "isfile", recording(os.path, "isfile"))
+        designed = is_designed_absence(PART, _manifest(), latest)
+        lost = is_designed_absence(OTHER, _manifest(), latest)
+
+    assert touched == []
+    assert designed is True
+    assert lost is False
 
 
 def test_the_schema_has_a_trim_kind_and_a_restore_kind_and_no_hold():
