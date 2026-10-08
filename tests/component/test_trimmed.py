@@ -221,6 +221,35 @@ def test_an_append_to_an_existing_empty_ledger_succeeds(tmp_path):
     assert latest_entries(root)[TRIMMED_FILE]["rows"] == 1
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param("whole line then blank", id="a blank line after a whole one"),
+        pytest.param("blank only", id="only a blank line"),
+    ],
+)
+def test_a_blank_last_line_is_no_torn_tail(tmp_path, tail):
+    """Mutations this catches: judging the last line with blanks counted, and dropping the guard
+    for a ledger of blank lines alone.
+
+    ``parse_jsonl`` skips a blank line, so the ledger reads whole and the append has nothing to
+    fuse onto. Counting the blank as the last line would refuse it as garbled, and a ledger with
+    no non-blank line would index past the end.
+    """
+    root = _lake(tmp_path / "lake")
+    first = _trim(SPY, "a" * 64)
+    if tail == "whole line then blank":
+        trimmed_path(root).write_text(json.dumps(first, sort_keys=True) + "\n\n")
+        expected = [first]
+    else:
+        trimmed_path(root).write_text("\n")
+        expected = []
+    line = _trim(SPY_NEXT, "b" * 64)
+
+    assert _append(root, line) == line
+    assert read_trimmed(root) == [*expected, line]
+
+
 # -- the ledger's own manifest entry ------------------------------------------
 
 
