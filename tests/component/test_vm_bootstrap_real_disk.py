@@ -21,19 +21,21 @@ from pathlib import Path
 
 import pytest
 
-from tests.component.test_vm_bootstrap import VM, build_tools
+from tests.component.test_vm_bootstrap import BOOTSTRAP, EMPTY, VM, build_tools
+from tests.support.fake_bin import checked_links, dispatcher
 from tests.support.real_tools import require_tool
 
 SIZE = 256 * 2**20
 BLOCK = 4096
 FORMATS = "the lake volume holds no ext4 superblock, so it gets an ext4 filesystem"
 MOUNTS = "the lake volume holds an ext4 filesystem, so it mounts without formatting"
+REAL_TOOLS = ("blkid", "mkfs.ext4", "dd", "od")
 
 
 @pytest.fixture(scope="module")
 def real_disk(tmp_path_factory) -> tuple[Path, str]:
     """The harness tools with the real disk tools over the fakes, and the real blkid."""
-    found = {name: require_tool(name) for name in ("blkid", "mkfs.ext4", "dd", "od")}
+    found = {name: require_tool(name) for name in REAL_TOOLS}
     shared = build_tools(tmp_path_factory.mktemp("vm-real-disk"))
     # Each real tool replaces the fake's link. The fake's body stays under bin/.fake,
     # where nothing reads it once the name points at the real tool.
@@ -50,6 +52,19 @@ def vm(tmp_path, real_disk) -> VM:
     with vm.device.open("r+b") as image:
         image.truncate(SIZE)
     return vm
+
+
+def test_every_executable_is_a_link_to_the_dispatcher_or_a_real_tool(tmp_path, real_disk, vm):
+    # The fixtures these tests run with. Only the four real tools may link anywhere but
+    # the dispatcher and the two scripts under test.
+    real = {name: Path(require_tool(name)) for name in REAL_TOOLS}
+    shared = checked_links(real_disk[0], BOOTSTRAP, EMPTY, *real.values())
+    for name, path in real.items():
+        assert shared[f"bin/{name}"] == path.resolve(), name
+    assert shared["bin/findmnt"] == dispatcher().resolve()
+    own = checked_links(tmp_path, BOOTSTRAP, EMPTY)
+    assert own["checkout/deploy/vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert own["home/.local/bin/uv"] == dispatcher().resolve()
 
 
 def _probe(blkid: str, vm: VM) -> subprocess.CompletedProcess[str]:

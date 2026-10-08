@@ -4,70 +4,32 @@
 sources the fake's body. A Mac then scans one new file per process rather than one per
 fake. Two things can undo that quietly. A fake written later as its own file pays the scan
 again with nothing failing, and a dispatcher that changes the shell it hands a body would
-change what every fake does. The first half of this file checks every tool layout the
-shared installers and the VM fixtures build. The second runs the dispatcher itself.
+change what every fake does. The first part of this file checks the layouts the shared
+installers and the entry point's checkout build. The VM tests check their own layouts,
+from the fixtures they run with. The rest runs the dispatcher itself.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from tests.component import test_control_plane_systemd as systemd
-from tests.component import test_vm_bootstrap as bootstrap
-from tests.component import test_vm_shim as shim
-from tests.support.fake_bin import dispatcher, install
+from tests.support.fake_bin import checked_links, dispatcher, install
 from tests.support.fake_disk import install_disk_fakes
 from tests.support.fake_systemd import FAKES, install_fakes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _tracked_scripts() -> set[Path]:
-    """The repository's executable files under ``deploy``, as git records them."""
-    staged = subprocess.run(
-        ["git", "ls-files", "-s", "deploy"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    scripts = set()
-    for line in staged.splitlines():
-        meta, name = line.split("\t")
-        if meta.split()[0] == "100755":
-            scripts.add((REPO_ROOT / name).resolve())
-    return scripts
-
-
-def _programs(root: Path) -> dict[str, Path]:
-    """Every link and executable file under ``root``, by path relative to it, resolved.
-
-    A link must end at the dispatcher or at a tracked script, and no other file may be
-    executable, so a fake written as its own file fails here.
-    """
-    allowed = {dispatcher().resolve(), *_tracked_scripts()}
-    found = {}
-    for directory, dirnames, filenames in os.walk(root):
-        for name in dirnames + filenames:
-            path = Path(directory) / name
-            relative = str(path.relative_to(root))
-            if path.is_symlink():
-                target = path.resolve()
-                assert target in allowed, f"{relative} links to {target}"
-                found[relative] = target
-            elif path.is_file():
-                assert not os.access(path, os.X_OK), f"{relative} is an executable file"
-    return found
-
-
 def test_the_shared_installers_write_only_links_to_the_dispatcher(tmp_path):
     install_fakes(tmp_path / "systemd")
     install_disk_fakes(tmp_path / "disk")
-    found = _programs(tmp_path)
+    found = checked_links(tmp_path)
     assert set(found.values()) == {dispatcher().resolve()}
     systemd_names = {key.split("/", 1)[1] for key in found if key.startswith("systemd/")}
     disk_names = {key.split("/", 1)[1] for key in found if key.startswith("disk/")}
@@ -75,36 +37,10 @@ def test_the_shared_installers_write_only_links_to_the_dispatcher(tmp_path):
     assert disk_names > set(FAKES) | {"blkid", "mkfs.ext4", "dd", "findmnt", "python3"}
 
 
-def test_the_bootstrap_tools_and_checkout_are_links(tmp_path):
-    tools = bootstrap.build_tools(tmp_path / "tools")
-    (tmp_path / "vm").mkdir()
-    vm = bootstrap.VM(tmp_path / "vm", tools)
-    vm.set_uv("0.10.0")
-    found = _programs(tmp_path)
-    assert found["tools/vm-bootstrap.sh"] == bootstrap.BOOTSTRAP.resolve()
-    assert found["tools/vm-empty-shadow-lake.sh"] == bootstrap.EMPTY.resolve()
-    assert found["vm/checkout/deploy/vm-bootstrap.sh"] == bootstrap.BOOTSTRAP.resolve()
-    assert found["vm/checkout/deploy/linux-install.sh"] == dispatcher().resolve()
-    assert found["vm/checkout/.venv/bin/python"] == dispatcher().resolve()
-    assert found["vm/home/.local/bin/uv"] == dispatcher().resolve()
-    assert "tools/uv-0.10.0" in found
-
-
-def test_the_shim_tools_and_checkout_are_links(tmp_path):
-    tools = shim.build_tools(tmp_path / "tools")
-    (tmp_path / "host").mkdir()
-    host = shim.Host(tmp_path / "host", tools)
-    host.valid_checkout()
-    found = _programs(tmp_path)
-    for name in ("bin/git", "bin/sleep", "bin/sudo", "vm-bootstrap.sh"):
-        assert found[f"tools/{name}"] == dispatcher().resolve(), name
-    assert found["host/home/marketlake/deploy/vm-bootstrap.sh"] == dispatcher().resolve()
-
-
 def test_the_entry_point_checkout_and_harness_are_links(tmp_path):
     systemd._checkout(tmp_path)
     systemd.Harness(tmp_path)
-    found = _programs(tmp_path)
+    found = checked_links(tmp_path, systemd.ENTRY_POINT)
     assert found["checkout/deploy/linux-install.sh"] == systemd.ENTRY_POINT.resolve()
     assert found["checkout/.venv/bin/python"] == dispatcher().resolve()
     assert found["home/.local/bin/uv"] == dispatcher().resolve()
@@ -153,10 +89,45 @@ def test_a_chained_link_finds_its_body_a_hop_away(tmp_path):
     relative = tmp_path / "other" / "python"
     relative.parent.mkdir()
     relative.symlink_to(Path("..") / "venv" / "bin" / "python")
-    for link in (absolute, relative):
+    # A link named apart from its target, as the owner's uv links to tools/uv-0.10.0. Its
+    # body is found by the name of the hop that reached it, not by the name it was run as.
+    versioned = tmp_path / "tools" / "uv-0.10.0"
+    install(versioned, "#!/bin/bash\nprintf '%s\\n' \"$0\"\n")
+    renamed = tmp_path / "home" / "uv"
+    renamed.parent.mkdir()
+    renamed.symlink_to(versioned)
+    for link in (absolute, relative, renamed):
         proc = _run([link])
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == f"{link}\n"
+
+
+def test_a_slash_free_path_finds_its_body_in_the_working_directory(tmp_path):
+    # bash given a bare name reads that file from the working directory, so $0 holds no
+    # directory at all.
+    fake = tmp_path / "bin" / "echoer"
+    install(fake, "#!/bin/bash\nprintf '%s\\n' \"$0\"\n")
+    proc = _run(["/bin/bash", "echoer"], cwd=fake.parent)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "echoer\n"
+
+
+def test_a_chain_is_followed_for_eight_hops_and_no_further(tmp_path):
+    shared = tmp_path / "tools" / "python"
+    install(shared, "#!/bin/bash\necho ran\n")
+    links, previous = [], shared
+    for n in range(9):
+        link = tmp_path / f"hop{n}" / "python"
+        link.parent.mkdir()
+        link.symlink_to(previous)
+        links.append(link)
+        previous = link
+    # links[k] is k + 1 hops from the body.
+    near = _run([links[7]])
+    assert (near.returncode, near.stdout) == (0, "ran\n"), near.stderr
+    far = _run([links[8]])
+    assert far.returncode == 127
+    assert far.stderr == f"fake: no body for {links[8]}\n"
 
 
 def test_a_missing_body_exits_127_naming_the_path(tmp_path):
@@ -181,6 +152,22 @@ def test_the_body_inherits_the_environment_unchanged(tmp_path):
     baseline = _run(["/bin/bash", plain]).stdout.splitlines()
     assert "KEEP=kept" in through
     assert sorted(through) == sorted(baseline)
+
+
+def test_the_body_sees_the_shell_state_bash_gives_a_script(tmp_path):
+    # Beyond the environment: umask, options, shopts, traps and the working directory
+    # match a plain bash run, and the one variable left behind is the body's path.
+    body = (
+        '#!/bin/bash\numask\necho "$-"\nshopt -p\nset -o\ntrap -p\npwd\n'
+        "compgen -v | grep '^__fake_' || true\n"
+    )
+    fake = tmp_path / "bin" / "state"
+    install(fake, body)
+    plain = tmp_path / "plain"
+    plain.write_text(body)
+    through = _run([fake]).stdout.splitlines()
+    baseline = _run(["/bin/bash", plain]).stdout.splitlines()
+    assert through == [*baseline, "__fake_body"]
 
 
 def test_descriptor_9_reaches_the_body_as_it_was(tmp_path):
@@ -210,3 +197,30 @@ def test_a_write_through_a_link_raises(tmp_path):
     with pytest.raises(PermissionError):
         fake.write_text("#!/bin/bash\nexit 1\n")
     assert dispatcher().read_text() == before
+
+
+def test_the_dispatcher_outlives_a_forked_child_and_goes_at_exit(tmp_path):
+    # A forked child runs the exit hook it inherited, which must leave the dispatcher in
+    # place for its parent. The parent's own exit removes it.
+    script = (
+        "import os, sys\n"
+        "from tests.support.fake_bin import dispatcher\n"
+        "path = dispatcher()\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    sys.exit(0)\n"
+        "os.waitpid(child, 0)\n"
+        "print(path, path.exists())\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    path, alive = proc.stdout.split()
+    assert alive == "True"
+    assert not Path(path).exists()

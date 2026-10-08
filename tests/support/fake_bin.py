@@ -13,14 +13,30 @@ fake was run by. When the link's own directory holds no body, as for a checkout'
 ``.venv/bin/python`` linked to a shared ``tools/python``, it follows the link one hop at a
 time and looks again.
 
-A sourced body shares the dispatcher's shell, so the dispatcher changes nothing a body
-can see. It sets neither ``-e`` nor ``-u``, exports nothing, leaves descriptor 9 alone,
-defines no functions, and sources the body as its last act, with the arguments untouched.
-The one variable it leaves set is the body's own path, which the ``.`` needs and which is
-not exported.
+A sourced body shares the dispatcher's shell, so the dispatcher keeps that shell as bash
+gives it to a script. It sets neither ``-e`` nor ``-u``, exports nothing, leaves
+descriptor 9 alone, defines no functions, and sources the body as its last act, with the
+arguments untouched. The one variable it leaves set is the body's own path, which the
+``.`` needs and which is not exported.
 
-The dispatcher is read-only, so writing a fake's path without unlinking it first raises
-rather than overwriting the program every fake shares. ``install`` unlinks first.
+Two things still differ from running the body as its own script, because the body is
+sourced.
+
+1. ``${BASH_SOURCE[0]}`` is the body's path, ``<dir>/.fake/<name>``, rather than the
+   fake's. So a real script that finds its own files from ``BASH_SOURCE`` must not be
+   installed through ``install``.
+2. A top-level ``return`` ends the fake with its status. A script run on its own prints
+   an error there and carries on.
+
+The dispatcher finds a body beside a link before it follows the link. So a link
+re-pointed with ``symlink_to``, in a directory that still holds an older
+``.fake/<name>``, runs that stale body. ``install`` avoids this by writing the body beside
+every link it makes.
+
+The dispatcher's mode is read-only. So for any user but root, opening a fake's path for
+writing raises rather than overwriting the program every fake shares, and ``install``
+unlinks first. The mode does not stop a chmod through a link. ``Path.chmod`` follows the
+link, and an owner may change the mode of a file whatever the mode is.
 """
 
 from __future__ import annotations
@@ -87,6 +103,28 @@ def dispatcher() -> Path:
 def body_path(path: Path) -> Path:
     """Where the body of the fake at ``path`` lives."""
     return path.parent / BODY_DIR / path.name
+
+
+def checked_links(root: Path, *allowed: Path) -> dict[str, Path]:
+    """Every link under ``root``, by its path relative to ``root``, resolved.
+
+    Each link must end at the dispatcher or at one of ``allowed``, and no other file under
+    ``root`` may be executable. So a fake written as its own file fails here, as does a
+    link to anything else.
+    """
+    targets = {dispatcher().resolve(), *(path.resolve() for path in allowed)}
+    found = {}
+    for directory, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(directory) / name
+            relative = str(path.relative_to(root))
+            if path.is_symlink():
+                target = path.resolve()
+                assert target in targets, f"{relative} links to {target}"
+                found[relative] = target
+            elif path.is_file():
+                assert not os.access(path, os.X_OK), f"{relative} is an executable file"
+    return found
 
 
 def install(path: Path, body: str) -> None:

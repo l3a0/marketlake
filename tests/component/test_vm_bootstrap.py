@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from lake import control_plane as cp
-from tests.support.fake_bin import install
+from tests.support.fake_bin import checked_links, dispatcher, install
 from tests.support.fake_disk import (
     FAKE_LINUX_INSTALL,
     FAKE_UUID,
@@ -70,7 +70,10 @@ class VM:
     scans each new file on its first run as a program, at 0.3 to 2.3 seconds a file under
     load. The scan is paid once per file, so a symlink to a file that already ran costs
     nothing, while a copy pays again. The scripts find their checkout from the path they
-    were run by, which is the symlink's, so each test still gets its own checkout.
+    were run by, which is the symlink's, so each test still gets its own checkout. The
+    checkout's two scripts reach the repository's own files through ``tools``, so a write
+    through either rewrites the tracked file. A test that needs a changed script must
+    unlink it and write its own.
     """
 
     def __init__(self, tmp_path: Path, tools: Path) -> None:
@@ -245,6 +248,24 @@ def tools(tmp_path_factory) -> Path:
 @pytest.fixture
 def vm(tmp_path, tools) -> VM:
     return VM(tmp_path, tools)
+
+
+# -- the tools -------------------------------------------------------------------------
+
+
+def test_every_executable_is_a_link_to_the_dispatcher_or_a_script(tmp_path, tools, vm):
+    # The fixtures the tests run with, so a fake added as its own file anywhere in them
+    # fails here.
+    vm.set_uv("0.10.0")
+    shared = checked_links(tools, BOOTSTRAP, EMPTY)
+    assert shared["vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert shared["vm-empty-shadow-lake.sh"] == EMPTY.resolve()
+    assert shared["uv-0.10.0"] == dispatcher().resolve()
+    own = checked_links(tmp_path, BOOTSTRAP, EMPTY)
+    assert own["checkout/deploy/vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert own["checkout/deploy/linux-install.sh"] == dispatcher().resolve()
+    assert own["checkout/.venv/bin/python"] == dispatcher().resolve()
+    assert own["home/.local/bin/uv"] == dispatcher().resolve()
 
 
 # -- tracking --------------------------------------------------------------------------

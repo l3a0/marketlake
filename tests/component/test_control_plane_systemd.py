@@ -765,7 +765,9 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     """A checkout holding the entry point and a venv interpreter, and the owner's home.
 
     The entry point is a link to the repository's own file, which finds its checkout from
-    the path it was run by, so it runs against this one. The interpreter is a wrapper
+    the path it was run by, so it runs against this one. A write through that link
+    rewrites the tracked file, so a test that needs a changed script must unlink it and
+    write its own. The interpreter is a wrapper
     around this test's own, so the real render runs. The owner's ``uv`` is a fake that
     records the call and where it ran. Both are links to ``tests.support.fake_bin``'s one
     program, so none of the three is a new file a Mac scans on its first run.
