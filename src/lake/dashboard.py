@@ -8,8 +8,11 @@ queries at view time. Nothing is pre-rendered and no summary state is kept. The 
 thing the service keeps between requests is ``FileMemo``, a read cache of each journal
 segment's and sealed partition's per-minute counts, so a refresh reads only the files that
 changed since the last one. It is not summary state, because it holds nothing a file does
-not hold at that moment: any change to a file changes its key and forces a fresh read, and
-a restart empties it. Freshness reads off the data's own timestamps, so a dead capture
+not hold at that moment. An entry is keyed by what one ``stat`` says of its file, and
+every way the lake changes a file moves one of those fields, so the next request reads
+the file again. The one change the key would miss is a rewrite in place to the same size
+within one tick of the filesystem's modification time, and no lake writer does that. A
+restart empties it. Freshness reads off the data's own timestamps, so a dead capture
 shows as an old last cycle and a dead service shows as a page that cannot load. Neither
 can be mistaken for the other.
 
@@ -87,8 +90,8 @@ Nothing here reads the wall clock or names a session time. The service takes a `
 and a ``Calendar``. Each request stamps ``now`` from the clock and hands it into the
 query, so minutes-since is computed against the injected instant, never ``now()`` in SQL.
 The slots come from the calendar through ``SessionClock.bounds``. ``FileMemo`` times how
-long an entry has gone unused on the monotonic clock, which decides only when a file is
-read again and never what a panel answers.
+long an entry has gone unused on the injected clock's ``monotonic``, which decides only
+when a file is read again and never what a panel answers.
 """
 
 from __future__ import annotations
@@ -100,7 +103,6 @@ import os
 import re
 import sys
 import threading
-import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -466,7 +468,9 @@ _CAST_ERRORS = (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError)
 # enumerated rather than a bare ``duckdb.Error`` so a real SQL defect still surfaces.
 _PARTITION_READ_ERRORS = (duckdb.IOException, duckdb.InvalidInputException)
 
-# The name the day's journal rows are registered under for the duration of one query.
+# The name a statement's journal rows are registered under for its duration. They are
+# the segments the memo missed, each row tagged with its ``segment``, or an empty table
+# registered beside a partition read for its pinned schema alone.
 _JOURNAL_VIEW = "journal_rows"
 
 # The per-slot aggregate. ``snap_ts`` is an ISO string with an offset on every row the
@@ -501,8 +505,9 @@ _JOURNAL_VIEW = "journal_rows"
 # slot carried. A slot whose rows all carry a null class aggregates to a null list, and
 # the dataclass reads that as no reason at all.
 #
-# The aggregate columns are one fragment shared by the three statements below, so the
-# per-file reads and the window read cannot count a minute two different ways.
+# The aggregate columns are one fragment shared by the three statements that count a
+# file, so the per-file reads and the window read cannot count a minute two different
+# ways.
 _SLOT_COLUMNS = """
        count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
        count(*) FILTER (WHERE row_kind = $gap_kind) AS gap_rows,
@@ -515,27 +520,24 @@ _SLOT_COLUMNS = """
            array_agg(DISTINCT error_class) FILTER (WHERE error_class IS NOT NULL)
        ) AS error_classes"""
 
-_SLOT_SELECT = f"""
+# The per-slot aggregate of one sealed partition, unioned by name with the journal view.
+# The view registered beside it is empty and is there for its pinned schema alone:
+# ``union_by_name`` then binds every provenance column even when the partition lacks an
+# optional one, which is what keeps a drifted partition readable.
+_PARTITION_SLOT_SELECT = f"""
 SELECT slot_ms,{_SLOT_COLUMNS}
 FROM (
     SELECT epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
            row_kind, error_class, suspect
-    FROM ({{source}})
+    FROM (
+        SELECT * FROM {_JOURNAL_VIEW}
+        UNION ALL BY NAME
+        SELECT * FROM read_parquet($partitions, union_by_name = true)
+    )
 )
 GROUP BY slot_ms
 ORDER BY slot_ms NULLS LAST
 """
-
-# One sealed partition, unioned by name with the journal view. The view registered beside
-# it is empty and is there for its pinned schema alone: ``union_by_name`` then binds every
-# provenance column even when the partition lacks an optional one, which is what keeps a
-# drifted partition readable.
-_SOURCE_JOURNAL_AND_PARTITION = (
-    f"SELECT * FROM {_JOURNAL_VIEW} "
-    "UNION ALL BY NAME "
-    "SELECT * FROM read_parquet($partitions, union_by_name = true)"
-)
-_SLOT_SQL_JOURNAL_AND_PARTITION = _SLOT_SELECT.format(source=_SOURCE_JOURNAL_AND_PARTITION)
 
 # The per-slot aggregate of several journal segments in one statement, keyed by which
 # segment each row came from. ``segment`` is the row's index into the list of segments
@@ -692,13 +694,13 @@ SlotGroup = tuple[int | None, int, int, int, bool, tuple[str, ...]]
 
 # What says a file is unchanged: its inode, size, modification time and change time, all
 # from one ``stat``. Every way the lake changes a file moves one of them. A segment only
-# grows, which moves the size. A partition is published, repaired, restored or trimmed
-# through ``os.replace``, which gives it a new inode. A permission change moves only the
-# change time, and it is in the key so that a partition turning unreadable is reported on
-# the next request rather than answered from memory.
+# grows, which moves the size. Compaction and ``lake.bars`` publish a partition through
+# ``os.replace``, which gives it a new inode. A permission change moves only the change
+# time, and it is in the key so that a partition turning unreadable is reported on the
+# next request rather than answered from memory.
 FileIdentity = tuple[int, int, int, int]
 
-# How long an entry may go unused before the next write to the memo drops it. The page
+# How long an entry may go unused before the next store into the memo drops it. The page
 # refreshes every minute (``REFRESH_MS`` in ``status.html``), and every refresh touches
 # every file a panel still reads, so a live entry is used about once a minute. An entry
 # ten refreshes stale belongs to a file no panel reads any more: a segment compaction
@@ -742,11 +744,13 @@ class FileMemo:
 
     **Why it is not summary state.** The module promises that no summary state is kept,
     and this keeps that promise. An entry holds nothing its file does not hold at that
-    moment. It is keyed by the file's path and ``FileIdentity``, so any change to the
-    file changes the key and the next request reads the file again. A restart empties it.
-    It holds per-slot counts rather than bytes, so it is not the DuckDB external file
-    cache that marketlake #735 turned off, and a full day costs it a few small tuples per
-    file.
+    moment. It is keyed by the file's path and ``FileIdentity``, and every way the lake
+    changes a file moves one of the identity's fields, so the next request reads the file
+    again. The one change the key would miss is a rewrite in place to the same size within
+    one tick of the filesystem's modification time, and no lake writer does that. A
+    restart empties it. It holds per-slot counts rather than bytes, so it is not the
+    DuckDB external file cache that marketlake #735 turned off, and a full day costs it a
+    few small tuples per file.
 
     Four rules keep the entries true.
 
@@ -759,17 +763,30 @@ class FileMemo:
        a shadow-append or drifted, and a partition that would not read, are read and
        counted again on every request. A failure can be transient, and a kept one would
        hide a file that has since come right.
-    3. An entry unused for ``MEMO_IDLE_SECONDS`` is dropped on the next write, so the
-       memo follows what the panels read rather than growing for the life of the process.
+    3. An entry unused for ``MEMO_IDLE_SECONDS`` is dropped the next time the memo
+       stores something, so the memo follows what the panels read rather than growing
+       for the life of the process. Nothing else drops an entry. A lake where nothing
+       changes stores nothing and keeps its entries however long no tab is open, and the
+       first store after an idle span drops every entry that refresh has not yet used.
     4. One lock guards every access to the entries, because the server answers each
        request on its own thread. Files are read outside the lock, so a slow read never
        holds up another panel. Two requests that miss the same file at once both read
        it, which costs that one read twice and is never wrong.
 
-    ``monotonic`` is the time source for the idle span, injected so a test can move it.
+    **The price it accepts.** A file that read once and then starts failing while its
+    ``stat`` stays the same, as a disk returning ``EIO`` would, keeps answering from the
+    memo, where a read on every request counted it unreadable every time. Every lake
+    write that changes a file's bytes moves its key, so this needs the bytes to go bad
+    underneath the filesystem. Compaction still hashes each segment that has a manifest
+    entry against the sha256 recorded when it closed, before it seals anything, so a
+    segment that rots under the memo is still caught there. No periodic re-read is kept,
+    because it would put back the cost this exists to remove.
+
+    ``monotonic`` is the time source for the idle span. ``DashboardService`` passes its
+    injected clock's, so a test moves it by moving that clock.
     """
 
-    def __init__(self, *, monotonic: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, monotonic: Callable[[], float]) -> None:
         self._monotonic = monotonic
         self._lock = threading.Lock()
         # path -> [identity, groups, last used]. A list so a hit can stamp its use.
@@ -1074,7 +1091,7 @@ def _partition_groups(
     params = {**_kind_params(), "partitions": [str(partition)]}
     con.register(_JOURNAL_VIEW, _PROVENANCE_SCHEMA.empty_table())
     try:
-        result = con.execute(_SLOT_SQL_JOURNAL_AND_PARTITION, params).fetchall()
+        result = con.execute(_PARTITION_SLOT_SELECT, params).fetchall()
     except _PARTITION_READ_ERRORS:
         return [], SegmentHealth(unreadable_partitions=1)
     finally:
@@ -1896,10 +1913,11 @@ HISTORY_REPORTS = 10
 # surface-ticker, so a real one is kilobytes and this refuses nothing the sweep writes.
 HISTORY_REPORT_MAX_BYTES = 4 * 1024 * 1024
 
-# The window aggregate: the same per-slot grouping ``_SLOT_SELECT`` makes, keyed by the
-# file each row came from so one query covers every ticker-day on a surface. The
-# filename is mapped back to its ticker and day in Python, against the very paths this
-# query was handed, so no pattern here has to agree with the lake's directory layout.
+# The window aggregate: the same per-slot grouping ``_PARTITION_SLOT_SELECT`` makes, keyed
+# by the file each row came from so one query covers every window partition the memo
+# missed. The filename is mapped back to its ticker and day in Python, against the very
+# paths this query was handed, so no pattern here has to agree with the lake's directory
+# layout.
 #
 # Only the sealed partitions come through here. A ticker-day with journal segments goes
 # to ``_slot_aggregates`` instead, which is the one reader that knows the durability
@@ -1959,10 +1977,10 @@ def _window_aggregates(
     which is what keeps the window's cost growing with bytes rather than with days. On a
     steady page the bulk read holds only what compaction sealed since the last refresh,
     if anything, because ``_WINDOW_SELECT`` keys its groups by file and each file's
-    groups are remembered on their own. A ticker-day
-    holding journal segments never joins the bulk read. It goes through
-    ``_slot_aggregates``, because that is the reader that unions the journal with the
-    partition and re-checks the partition after the segments are read, "so a seal that
+    groups are remembered on their own. A ticker-day holding journal segments never
+    joins the bulk read. It goes through ``_slot_aggregates``, because that is the reader
+    that counts the segments and the partition in statements of their own, merges the
+    counts, and re-checks the partition after the segments are read, "so a seal that
     landed in between does not render a fully captured day as entirely missing."
 
     The bulk read is all-or-nothing, which is the price of one query, so any failure of
@@ -1979,7 +1997,12 @@ def _window_aggregates(
     disagreeing on a column's type raise a ``BinderException``, and so does a column that
     no partition in the union happens to carry. Neither is reachable per-day, because
     ``_slot_aggregates`` always registers the journal view and its pinned schema beside
-    the one file.
+    the one file. Once the memo holds the rest of the window, the union holds only the
+    partitions it missed, often one newly sealed file. So a new partition lacking an
+    optional column such as ``error_class`` or ``suspect`` now raises on its own, logs
+    the traceback and takes the per-day fallback, once for each version of that file,
+    where a union with older partitions carrying the column would have bound it. The
+    answers are the same either way.
 
     So the fallback is not a swallow. It is a retreat to the reader that does not union,
     which is the reader that was there before this panel, and a real defect surfaces from
@@ -2918,8 +2941,8 @@ class DashboardService:
     shipped in the package, and a test that wants neither passes its own.
 
     The service holds one ``FileMemo`` for its life and hands it to every request, so a
-    file one panel has read is not read again until it changes. A test that wants to move
-    the memo's clock passes its own.
+    file one panel has read is not read again until it changes. The memo times its idle
+    span on the injected clock's ``monotonic``, so a test moves it by moving the clock.
     """
 
     def __init__(
@@ -2932,7 +2955,6 @@ class DashboardService:
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
         icon: bytes | None = None,
-        memo: FileMemo | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root).resolve())
         self._clock = clock
@@ -2941,7 +2963,7 @@ class DashboardService:
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
         self._icon = icon if icon is not None else load_favicon()
-        self._memo = memo if memo is not None else FileMemo()
+        self._memo = FileMemo(monotonic=self._clock.monotonic)
 
     @property
     def page(self) -> bytes:
@@ -2950,10 +2972,6 @@ class DashboardService:
     @property
     def icon(self) -> bytes:
         return self._icon
-
-    @property
-    def memo(self) -> FileMemo:
-        return self._memo
 
     def roster(self) -> dict[str, tuple[str, ...]]:
         """The lake's current roster, re-read per call so a new ticker appears at once."""

@@ -449,7 +449,8 @@ Slice 2 wraps the primitive in the market-hours loop and hardens it for a laptop
      cannot reach that state, because launchd holds the definition throughout. Picking up
      a changed plist is the install's job.
   2. **Defaulting to both residents.** Restarting the dashboard costs its open
-     connections. Restarting the daemon costs the in-flight cycle and its `caffeinate`
+     connections and empties its read cache, so the next refresh pays the full read once.
+     Restarting the daemon costs the in-flight cycle and its `caffeinate`
      assertion until it is back. A bare `./restart.sh` must not be the command that takes
      capture down, so it restarts the dashboard alone and the daemon has to be named.
 

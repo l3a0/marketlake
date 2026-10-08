@@ -1080,7 +1080,7 @@ def test_today_strip_carries_status_rows_and_gap_reason(service: DashboardServic
     assert chains["slots"][-1]["status"] == "pending"
 
 
-def test_today_unions_journal_and_sealed_partition_by_name(service: DashboardService):
+def test_today_merges_a_segment_and_a_partition_into_one_strip(service: DashboardService):
     today = service.run_query("today", {"date": "2026-08-24", "ticker": "SPY"})
     quotes = today["strips"][1]
     # 09:30 came from a pinned-schema segment stamped in UTC. 09:31 came from a

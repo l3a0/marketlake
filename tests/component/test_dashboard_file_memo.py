@@ -212,17 +212,16 @@ def partition_reads() -> Counter:
 def service_over(
     root: Path,
     partition_reads: Counter,
-    memo: FileMemo | None = None,
+    clock: ManualClock | None = None,
     after: AfterRead | None = None,
 ):
     return DashboardService(
         root,
-        clock=ManualClock(NOW.astimezone(UTC)),
+        clock=clock if clock is not None else ManualClock(NOW.astimezone(UTC)),
         calendar=CALENDAR,
         connection=_CountingConnection(root, partition_reads, after),  # type: ignore[arg-type]
         page=b"<!doctype html>",
         icon=b"",
-        memo=memo,
     )
 
 
@@ -637,61 +636,57 @@ def test_a_minute_split_across_files_merges_as_one_statement_over_them_would(
 # -- eviction --------------------------------------------------------------------
 
 
-class _Monotonic:
-    """A monotonic time a test moves by hand."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, span: timedelta) -> None:
-        self.now += span.total_seconds()
+def _advance(clock: ManualClock, span: timedelta) -> None:
+    clock.advance(span.total_seconds())
 
 
-def test_an_entry_unused_past_the_span_is_dropped_on_the_next_write():
-    clock = _Monotonic()
-    memo = FileMemo(monotonic=clock)
+def test_an_entry_unused_past_the_span_is_dropped_on_the_next_store():
+    clock = ManualClock(NOW.astimezone(UTC))
+    memo = FileMemo(monotonic=clock.monotonic)
     identity = (1, 2, 3, 4)
     groups = ((0, 1, 0, 0, False, ()),)
     memo.put([("a", identity, groups)])
-    clock.advance(timedelta(minutes=9))
+    _advance(clock, timedelta(minutes=9))
     memo.put([("b", identity, groups)])
-    # Nine minutes unused is inside the span, so the write keeps it.
+    # Nine minutes unused is inside the span, so the store keeps it.
     assert memo.get("a", identity) == groups
-    clock.advance(timedelta(minutes=9))
+    _advance(clock, timedelta(minutes=9))
     memo.put([("c", identity, groups)])
-    # ``a`` was used nine minutes ago, by the get above, and ``b`` written then.
+    # ``a`` was used nine minutes ago, by the get above, and ``b`` stored then.
     assert len(memo) == 3
-    clock.advance(timedelta(minutes=2))
-    # Nothing is dropped until something is written.
+    _advance(clock, timedelta(minutes=2))
+    # Nothing is dropped until something is stored, so a lake where nothing changes
+    # keeps its entries however long it goes unread.
     assert len(memo) == 3
     memo.put([("d", identity, groups)])
-    # Eleven minutes unused is past the span, so the write drops ``a`` and ``b``.
+    # Eleven minutes unused is past the span, so the store drops ``a`` and ``b``.
     assert memo.get("a", identity) is None
     assert memo.get("b", identity) is None
     assert memo.get("c", identity) == groups
     assert len(memo) == 2
 
 
-def test_a_dropped_file_is_read_again_and_a_used_one_is_not(
+def test_the_service_drops_an_idle_file_on_its_injected_clock(
     fixture_lake: FixtureLake, partition_reads: Counter
 ):
+    # The memo times its idle span on the service's own clock, never the process's
+    # timer. Only the injected clock moves here, and it is what decides that Thursday's
+    # partition, idle eleven minutes, is read again while one idle nine is not. A memo
+    # timed on the real timer would see a few seconds pass and keep both.
     root, _, _ = build_lake(fixture_lake)
-    clock = _Monotonic()
-    service = service_over(root, partition_reads, memo=FileMemo(monotonic=clock))
+    clock = ManualClock(NOW.astimezone(UTC))
+    service = service_over(root, partition_reads, clock=clock)
     thursday = {"date": THURSDAY.isoformat(), "ticker": "QQQ"}
     friday = {"date": FRIDAY.isoformat(), "ticker": "QQQ"}
     paths = LakePaths(root)
     thursday_file = paths.partition_path("chains", "QQQ", THURSDAY)
     service.run_query("today", thursday)
-    clock.advance(timedelta(minutes=11))
-    service.run_query("today", friday)  # a write, eleven minutes after Thursday's last use
+    _advance(clock, timedelta(minutes=11))
+    service.run_query("today", friday)  # a store, eleven minutes after Thursday's last use
     service.run_query("today", thursday)
     assert partition_reads[thursday_file] == 2
-    clock.advance(timedelta(minutes=9))
-    service.run_query("today", {"date": MONDAY.isoformat(), "ticker": "QQQ"})  # a write
+    _advance(clock, timedelta(minutes=9))
+    service.run_query("today", {"date": MONDAY.isoformat(), "ticker": "QQQ"})  # a store
     service.run_query("today", thursday)
     assert partition_reads[thursday_file] == 2
 
