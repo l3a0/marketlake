@@ -621,10 +621,11 @@ _OUT_OF_SPAN_NAMED = 4
 def _out_of_span_body(page: Page) -> str:
     """What the out-of-span page says: how many, for how long, and which.
 
-    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. The cause page and
-    the sampler page leave their names out, because the cause page fires only when every
-    surface failed, and every quotes ticker the sampler page leaves out pages some other
-    way. This set is part of the roster, so the names say which part. Like the
+    It names up to ``_OUT_OF_SPAN_NAMED`` tickers and counts the rest. The cause page, the
+    sampler page and the folded lake writes page leave their names out. The cause page
+    fires only when every surface failed, every quotes ticker the sampler page leaves out
+    pages some other way, and a refused write is a fact about the disk rather than about
+    the tickers it refused. This set is part of the roster, so the names say which part. Like the
     ``capture:`` line it names the possible causes and prescribes no repair, because
     re-running ``retire`` or ``onboard`` is the wrong repair for some of them. It carries
     no class, since nothing was attempted for these tickers, and no dead-man follow-on,
@@ -1816,14 +1817,15 @@ def run_loop_from_config(
             # The title says what went quiet. The class says why, and without it a rate
             # limit that starves one ticker reads as that ticker being dead. A page with
             # no class says nothing rather than guessing: a slept-through slot attempted
-            # no request, and a collapsed sampler page whose tickers disagreed has no one
-            # class to name. One class is not recorded anywhere: ``contracts_absent``, a
-            # chain that answered with no contract, which the watchdog derives and the
-            # lake never carries (marketlake #326).
+            # no request, and a collapsed sampler page or a lake writes page whose
+            # surfaces disagreed has no one class to name. One class is not recorded
+            # anywhere: ``contracts_absent``, a chain that answered with no contract,
+            # which the watchdog derives and the lake never carries (marketlake #326).
             #
             # A cause page also says since when, in ET, and ends with a line telling the
             # operator that the ``capture`` dead-man's DOWN is coming for the same outage,
-            # as the design's message table pins for token dead and rate limited. Both key
+            # as the design's message table pins for every cause page: token dead, rate
+            # limited, and the cause form of lake writes failing (marketlake #789). Both key
             # on ``since``, which only a cause page sets, and never on the class, because a
             # per-surface page can carry ``http_401`` while the dead-man stays fed. The zone
             # is a literal ET, since ``%Z`` prints EDT half the year. The body is plain
@@ -1834,26 +1836,43 @@ def run_loop_from_config(
             if page.cause is not None:
                 body = f"{body}, failing with {page.cause}"
             # A folded page says how much it folded, the rule compaction's drift page
-            # already follows. Three pages here fold: the sampler page stands for every
-            # quotes ticker a failed batched request explains, the cause page stands for
-            # every surface that failed the same way, and the stall page stands for every
-            # surface a stall charged. Without the count, one page for two and one page
-            # for four hundred read identically. A page standing for one surface carries
-            # none, and on every page but the stall page the title itself says which
-            # surface that is.
+            # already follows. Four pages here fold.
             #
-            # The names are left out because listing them costs the body's byte budget
-            # as the roster grows and tells the operator nothing the other pages do not.
+            # 1. The sampler page stands for every quotes ticker a failed batched request
+            #    explains.
+            # 2. The cause page stands for every surface that failed the same way.
+            # 3. The stall page stands for every surface a stall charged.
+            # 4. The writes page without ``since`` stands for every write failure that
+            #    tripped in the same minute (marketlake #789).
+            #
+            # Without the count, one page for two and one page for four hundred read
+            # identically. A page standing for one surface carries none, and on every page
+            # but the stall page the title itself says which surface that is.
+            #
+            # The names are left out, except on the folded writes page below, because
+            # listing them costs the body's byte budget as the roster grows and tells the
+            # operator nothing the other pages do not.
             # The cause page fires only when every surface failed, so its names restate
             # the roster. The sampler page fires only when every quotes ticker failed, and
             # each ticker it leaves out is either covered by a cause page or failing its
-            # own write, which pages on its own once it reaches the threshold
+            # own write, which pages on its own, or folds into the writes page with the
+            # other write failures tripping that minute, once it reaches the threshold
             # (marketlake #771). The sampler's set holds one quotes surface per ticker, so
-            # it counts tickers. The cause page spans both surfaces of every ticker, so it
-            # counts surfaces.
+            # it counts tickers. The cause page and the writes page can span both surfaces
+            # of a ticker, so they count surfaces.
             if len(page.surfaces) > 1:
                 folded = "tickers" if page.sampler_collapse else "surfaces"
                 body = f"{body}, one page for {len(page.surfaces)} {folded}"
+            # The folded writes page can stand for any two or more surfaces, not the whole
+            # roster, so its count alone cannot say where to look. It names up to
+            # ``_OUT_OF_SPAN_NAMED`` of them the way the out-of-span page names tickers
+            # (marketlake #789).
+            if page.write_fold:
+                names = ", ".join(str(key) for key in page.surfaces[:_OUT_OF_SPAN_NAMED])
+                rest = len(page.surfaces) - _OUT_OF_SPAN_NAMED
+                if rest > 0:
+                    names = f"{names} and {rest} more"
+                body = f"{body}: {names}"
             if page.since is not None:
                 body = f"{body}. Expect Capture dead-man is DOWN in about 5 min: same outage."
             publisher.publish(

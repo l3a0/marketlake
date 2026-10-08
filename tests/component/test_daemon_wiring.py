@@ -1650,16 +1650,29 @@ def test_a_surface_page_names_the_class_it_is_failing_with(error_class, tmp_path
 
 
 class _WholeDaemonFailure:
-    """A cycle runner whose every cycle fails both surfaces with one whole-daemon class."""
+    """A cycle runner whose every cycle fails both surfaces with one whole-daemon class.
 
-    def __init__(self, rig: _Rig, clock: ManualClock, error_class: str = "http_401"):
+    With ``writes`` set, both segment writes fail with the class instead, so the cycle
+    carries one ``SegmentError`` per surface and no segment, the shape of a full lake volume.
+    """
+
+    def __init__(
+        self, rig: _Rig, clock: ManualClock, error_class: str = "http_401", *, writes: bool = False
+    ):
         self._rig = rig
         self._clock = clock
         self._error_class = error_class
+        self._writes = writes
 
     def __call__(
         self, *, slot: datetime, close_tag: str | None, session_phase: str | None
     ) -> CycleResult:
+        if self._writes:
+            errors = tuple(
+                SegmentError(surface, "XYZ", self._error_class)
+                for surface in (journal.QUOTES_SURFACE, "chains")
+            )
+            return CycleResult(snap_ts=slot, segments=(), errors=errors)
         segments = tuple(
             SegmentOutcome(
                 surface=surface,
@@ -1704,28 +1717,33 @@ def test_the_cause_page_names_its_class_on_the_wire_too(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("error_class", "title", "start", "since"),
+    ("error_class", "title", "start", "since", "writes"),
     [
         # An afternoon outage reads on the 24-hour clock, so 14:00 never reads as 02:00.
-        ("http_429", "Capture down: rate limited", (13, 59), "14:00"),
-        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead", (9, 59), "10:00"),
+        ("http_429", "Capture down: rate limited", (13, 59), "14:00", False),
+        (capture.TOKEN_FILE_UNREADABLE, "Capture down: token dead", (9, 59), "10:00", False),
         # A morning outage off the hour shows its minute and the hour's leading zero.
-        ("http_401", "Capture down: token dead", (9, 44), "09:45"),
+        ("http_401", "Capture down: token dead", (9, 44), "09:45", False),
+        # A full lake volume, whose class is the one the refused writes raised.
+        ("o_s_error", "Capture down: lake writes failing", (11, 29), "11:30", True),
     ],
 )
 def test_every_cause_page_dates_itself_and_names_the_dead_man_page_to_come(
-    error_class, title, start, since, tmp_path
+    error_class, title, start, since, writes, tmp_path
 ):
-    """The design's message table pins the time and the follow-on line on both causes.
+    """The design's message table pins the time and the follow-on line on every cause.
 
     The rate limit is the second row that carries them, and an unreadable token file
-    reaches the token-dead page by its own class (marketlake #702). The body is composed
-    from the page, not from the title or the class, so each cause is driven to the wire.
+    reaches the token-dead page by its own class (marketlake #702). A cycle whose every
+    write failed lands no data either, so the writes cause carries both (marketlake #789).
+    The body is composed from the page, not from the title or the class, so each cause is
+    driven to the wire.
     """
     rig = _rig(tmp_path)
     hour, minute = start
     clock = ManualClock(start=et(2026, 9, 2, hour, minute, 30))
-    _run(rig, clock, ticks=4, cycle_runner=_WholeDaemonFailure(rig, clock, error_class))
+    runner = _WholeDaemonFailure(rig, clock, error_class, writes=writes)
+    _run(rig, clock, ticks=4, cycle_runner=runner)
 
     (page,) = rig.transport.sent
     assert page.event == "capture_down"
@@ -1839,13 +1857,15 @@ def test_a_folded_page_whose_tickers_disagree_still_says_how_many(tmp_path):
 
 
 class _WriteFailingQuotes:
-    """A cycle runner whose every quotes segment write fails, every cycle.
+    """A cycle runner whose every quotes segment write fails while a chain lands data.
 
-    The batched request answered and the disk refused the writes, so the cycle carries
-    one ``SegmentError`` per ticker and no segment at all.
+    The batched request answered and the disk refused the quotes writes, so the cycle
+    carries one ``SegmentError`` per ticker. The chain landing data keeps the minute off
+    the writes cause and keeps the dead-man fed.
     """
 
-    def __init__(self, tickers: tuple[str, ...]):
+    def __init__(self, rig: _Rig, tickers: tuple[str, ...]):
+        self._rig = rig
         self._tickers = tickers
 
     def __call__(
@@ -1854,27 +1874,32 @@ class _WriteFailingQuotes:
         errors = tuple(
             SegmentError(journal.QUOTES_SURFACE, ticker, "o_s_error") for ticker in self._tickers
         )
-        return CycleResult(snap_ts=slot, segments=(), errors=errors)
+        landed = _segment(journal.ROW_KIND_DATA, self._rig.lake_root, journal.CHAINS_SURFACE)
+        return CycleResult(snap_ts=slot, segments=(landed,), errors=errors)
 
 
-def test_every_quotes_write_failing_pages_each_ticker_rather_than_the_sampler(tmp_path):
-    """A refused write names the ticker and the write class, never the batched request.
+def test_every_quotes_write_failing_beside_landed_data_sends_one_writes_page(tmp_path):
+    """A refused write names the write class, never the batched request.
 
-    The sampler page sends the operator after a request that answered. Each ticker whose
-    write failed pages under its own title instead, the way a chains write failure already
-    does, and its body names the write class that points at the disk (marketlake #771).
+    The sampler page sends the operator after a request that answered (marketlake #771).
+    The five write failures trip together and fold into one page, whose body names the
+    write class that points at the disk, how many surfaces it stands for, and the first
+    four of them, since a fold can stand for any part of the roster. Each ticker paged
+    under its own title before marketlake #789. A chain landed data in every minute, so the
+    dead-man stays fed, and the page carries no time and no dead-man line.
     """
-    tickers = ("T00", "T01", "T02", "T03")
+    tickers = ("T00", "T01", "T02", "T03", "T04")
     rig = _rig(tmp_path)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
-    _run(rig, clock, ticks=4, cycle_runner=_WriteFailingQuotes(tickers))
+    _run(rig, clock, ticks=4, cycle_runner=_WriteFailingQuotes(rig, tickers))
 
-    assert sorted((page.title, page.body) for page in rig.transport.sent) == [
+    assert [(page.title, page.body) for page in rig.transport.sent] == [
         (
-            f"Capture down: {ticker} quotes",
-            "3 session minutes without a durable cycle, failing with o_s_error",
+            "Capture down: lake writes failing",
+            "3 session minutes without a durable cycle, failing with o_s_error,"
+            " one page for 5 surfaces: T00 quotes, T01 quotes, T02 quotes, T03 quotes"
+            " and 1 more",
         )
-        for ticker in tickers
     ]
 
 
