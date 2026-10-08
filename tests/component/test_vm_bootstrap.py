@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from lake import control_plane as cp
+from tests.support.fake_bin import checked_links, dispatcher, install
 from tests.support.fake_disk import (
     FAKE_LINUX_INSTALL,
     FAKE_UUID,
@@ -66,10 +67,13 @@ class VM:
     ``uv``, and every Python step succeeds. A test changes what it needs before it runs a script.
 
     Every executable is a symlink into ``tools``, which the module builds once. A Mac
-    checks each new executable file on its first run, at about 0.2 seconds a file, so
-    fresh fakes for each test cost several seconds a run. The scripts find their checkout
-    from the path they were run by, which is the symlink's, so each test still gets its
-    own checkout.
+    scans each new file on its first run as a program, at 0.3 to 2.3 seconds a file under
+    load. The scan is paid once per file, so a symlink to a file that already ran costs
+    nothing, while a copy pays again. The scripts find their checkout from the path they
+    were run by, which is the symlink's, so each test still gets its own checkout. The
+    checkout's two scripts reach the repository's own files through ``tools``, so a write
+    through either rewrites the tracked file. A test that needs a changed script must
+    unlink it and write its own.
     """
 
     def __init__(self, tmp_path: Path, tools: Path) -> None:
@@ -158,7 +162,7 @@ class VM:
             return
         shared = self.tools / f"uv-{version}"
         if not shared.exists():
-            _executable(shared, f'#!/bin/bash\necho "uv {version} (abc123 2026-01-01)"\n')
+            install(shared, f'#!/bin/bash\necho "uv {version} (abc123 2026-01-01)"\n')
         uv.parent.mkdir(parents=True, exist_ok=True)
         uv.symlink_to(shared)
 
@@ -187,12 +191,6 @@ class VM:
 
     def index(self, line: str) -> int:
         return self.calls().index(line)
-
-
-def _executable(path: Path, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body)
-    path.chmod(0o755)
 
 
 def _one_line(proc: subprocess.CompletedProcess[str], prefix: str) -> str:
@@ -226,21 +224,48 @@ def _assert_nothing_installed(vm: VM, *, chowned: bool = False) -> None:
     assert bool(vm.ran(f"chown {OWNER}:")) == chowned, calls
 
 
+def build_tools(shared: Path) -> Path:
+    """Every executable the tests run, in ``shared``.
+
+    The fakes are links to ``tests.support.fake_bin``'s one program, and the two scripts
+    under test are links to the repository's own files, so none of them is a new file a
+    Mac scans.
+    """
+    install_disk_fakes(shared / "bin")
+    for script in (BOOTSTRAP, EMPTY):
+        (shared / script.name).symlink_to(script)
+    install(shared / "linux-install.sh", FAKE_LINUX_INSTALL)
+    install(shared / "python", FAKE_VENV_PYTHON)
+    return shared
+
+
 @pytest.fixture(scope="module")
 def tools(tmp_path_factory) -> Path:
     """Every executable the tests run, written once for the module."""
-    shared = tmp_path_factory.mktemp("vm-tools")
-    install_disk_fakes(shared / "bin")
-    for script in (BOOTSTRAP, EMPTY):
-        shutil.copy2(script, shared / script.name)
-    _executable(shared / "linux-install.sh", FAKE_LINUX_INSTALL)
-    _executable(shared / "python", FAKE_VENV_PYTHON)
-    return shared
+    return build_tools(tmp_path_factory.mktemp("vm-tools"))
 
 
 @pytest.fixture
 def vm(tmp_path, tools) -> VM:
     return VM(tmp_path, tools)
+
+
+# -- the tools -------------------------------------------------------------------------
+
+
+def test_every_executable_is_a_link_to_the_dispatcher_or_a_script(tmp_path, tools, vm):
+    # The fixtures the tests run with, so a fake added as its own file anywhere in them
+    # fails here.
+    vm.set_uv("0.10.0")
+    shared = checked_links(tools, BOOTSTRAP, EMPTY)
+    assert shared["vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert shared["vm-empty-shadow-lake.sh"] == EMPTY.resolve()
+    assert shared["uv-0.10.0"] == dispatcher().resolve()
+    own = checked_links(tmp_path, BOOTSTRAP, EMPTY)
+    assert own["checkout/deploy/vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert own["checkout/deploy/linux-install.sh"] == dispatcher().resolve()
+    assert own["checkout/.venv/bin/python"] == dispatcher().resolve()
+    assert own["home/.local/bin/uv"] == dispatcher().resolve()
 
 
 # -- tracking --------------------------------------------------------------------------

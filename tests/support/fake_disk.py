@@ -58,6 +58,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from tests.support.fake_bin import install
 from tests.support.fake_systemd import install_fakes
 
 FAKE_UUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
@@ -332,7 +333,7 @@ exit 9
 
 
 def install_disk_fakes(bin_dir: Path) -> None:
-    """Write the systemd fakes and every disk fake into ``bin_dir``, executable."""
+    """Install the systemd fakes and every disk fake into ``bin_dir``."""
     install_fakes(bin_dir)
     fakes = {
         "blkid": FAKE_BLKID,
@@ -358,6 +359,4 @@ def install_disk_fakes(bin_dir: Path) -> None:
         ),
     }
     for name, body in fakes.items():
-        path = bin_dir / name
-        path.write_text(body)
-        path.chmod(0o755)
+        install(bin_dir / name, body)
