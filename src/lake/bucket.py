@@ -311,6 +311,15 @@ class ManifestedFileMissing(BucketRefusal):
     """A file the manifest records is gone from disk, so the watermark cannot claim it."""
 
 
+class TrimmedNotInBucket(BucketRefusal):
+    """A partition trimmed on purpose is absent from the bucket, so no copy of it is left.
+
+    The trimmed ledger says the lake removed this file because the bucket held it. The first
+    upload is the one job that re-baselines the bucket, so it checks that claim rather than
+    trusting it, and a bucket without the partition means the only copy is gone.
+    """
+
+
 class ObjectTooLarge(BucketRefusal):
     """A file is past S3's single-PUT limit and would need a multipart upload."""
 
@@ -868,6 +877,23 @@ class _Uploader:
         data = self._read(rel, self.root / rel)
         self.put(rel, data, hex_to_b64(hexdigest))
 
+    def trimmed(self, rel: str, hexdigest: str, *, listed: bool) -> None:
+        """Confirm the bucket holds a partition trimmed on purpose, or refuse.
+
+        The trimmed ledger's claim is that the bucket holds these bytes, so the check is the
+        same compare-before-PUT :meth:`manifested` makes. Nothing is read from disk, because
+        the file is not there. The HEAD is skipped when the listing did not name the key, since
+        nothing can match then.
+        """
+        if listed and self.holds(rel, hexdigest):
+            self.summary.skipped += 1
+            return
+        raise TrimmedNotInBucket(
+            f"{rel} was trimmed from the lake on purpose and the bucket does not hold it with "
+            "the manifest's SHA-256, so no copy of it is left. Nothing is uploaded over it and "
+            f"no manifest.jsonl goes up: {self.target}"
+        )
+
     def unmanifested(self, rel: str, path: Path, listed_size: int | None) -> None:
         """Upload a file the manifest does not record, when its size differs from the bucket's."""
         size = path.stat().st_size
@@ -899,6 +925,61 @@ def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterato
                 "stops rather than let the bucket's watermark claim it"
             )
         yield rel, str(ledger.latest[rel]["sha256"])
+
+
+def first_upload_files(
+    root: Path, ledger: Ledger, rels: Sequence[str]
+) -> Iterator[tuple[str, str, bool]]:
+    """:func:`manifested_files` for the first upload, which also meets trimmed partitions.
+
+    It yields ``(rel, hex sha256, trimmed)``. A present file yields ``trimmed`` false and is
+    uploaded as before. An absent file that ``lake.trimmed.is_designed_absence`` calls a designed
+    absence yields ``trimmed`` true, and the caller checks the bucket holds it rather than
+    reading a file that is not there. Any other absent file refuses with
+    :class:`ManifestedFileMissing`, exactly as :func:`manifested_files` does.
+
+    The trimmed ledger is read only at the first absent file, so a lake with every file present
+    reads exactly what it read before marketlake #782, and a damaged ledger costs nothing until
+    an absence needs it. A ledger that cannot be read then refuses as
+    :class:`ManifestedFileMissing`, naming why, because an absence nothing explains is loss.
+
+    ``nightly_upload`` keeps :func:`manifested_files`. A trim removes only a partition whose
+    entry sits behind the bucket's watermark, and the watermark never moves back, so a designed
+    absence among the nightly upload's pending entries cannot happen and the raise guards
+    exactly that.
+    """
+    from lake.trimmed import is_designed_absence, latest_trimmed
+
+    trimmed: Mapping[str, dict] | None = None
+    for rel in sorted(rels):
+        if rsync_excluded(rel, is_dir=False):
+            continue
+        compacted = _compacted_partition_for_segment(rel)
+        if compacted is not None and compacted in ledger.latest:
+            continue
+        # The present file is handled before the absence reads anything, the order
+        # :func:`manifested_files` keeps, so an entry with no ``sha256`` whose file is missing
+        # refuses as missing here exactly as it does there.
+        if (root / rel).is_file():
+            yield rel, str(ledger.latest[rel]["sha256"]), False
+            continue
+        if trimmed is None:
+            try:
+                trimmed = latest_trimmed(root)
+            except (ManifestError, OSError) as exc:
+                raise ManifestedFileMissing(
+                    f"{rel} is in the lake's manifest and missing from disk, and the trimmed "
+                    f"ledger that could say it was removed on purpose cannot be read "
+                    f"({type(exc).__name__}), so the upload stops rather than let the bucket's "
+                    "watermark claim it"
+                ) from exc
+        if not is_designed_absence(rel, ledger.latest, trimmed):
+            raise ManifestedFileMissing(
+                f"{rel} is in the lake's manifest and missing from disk, so the upload "
+                "stops rather than let the bucket's watermark claim it"
+            )
+        # A designed absence has a ``sha256`` on its entry, because the predicate compared it.
+        yield rel, str(ledger.latest[rel]["sha256"]), True
 
 
 def _unmanifested(root: Path, ledger: Ledger) -> Iterator[tuple[str, Path]]:
@@ -1099,8 +1180,11 @@ def first_upload(
     uploader.check()
     listing = list_bucket(client, target)
     done: dict[str, str] = {}
-    for rel, hexdigest in manifested_files(root, early, list(early.latest)):
-        uploader.manifested(rel, hexdigest, listed=rel in listing)
+    for rel, hexdigest, trimmed in first_upload_files(root, early, list(early.latest)):
+        if trimmed:
+            uploader.trimmed(rel, hexdigest, listed=rel in listing)
+        else:
+            uploader.manifested(rel, hexdigest, listed=rel in listing)
         done[rel] = hexdigest
 
     with lake_lock(root):
@@ -1116,8 +1200,11 @@ def first_upload(
         uploader.check()
         ledger = read_ledger(root)
         late = [rel for rel, entry in ledger.latest.items() if done.get(rel) != entry["sha256"]]
-        for rel, hexdigest in manifested_files(root, ledger, late):
-            uploader.manifested(rel, hexdigest, listed=rel in listing)
+        for rel, hexdigest, trimmed in first_upload_files(root, ledger, late):
+            if trimmed:
+                uploader.trimmed(rel, hexdigest, listed=rel in listing)
+            else:
+                uploader.manifested(rel, hexdigest, listed=rel in listing)
         for rel, path in _unmanifested(root, ledger):
             uploader.unmanifested(rel, path, listing.get(rel))
         uploader.check()
@@ -2231,6 +2318,7 @@ __all__ = [
     "FirstUploadRefused",
     "Ledger",
     "ManifestedFileMissing",
+    "TrimmedNotInBucket",
     "ObjectTooLarge",
     "RestoreRefused",
     "RestoreSummary",
@@ -2244,6 +2332,7 @@ __all__ = [
     "client_from_config",
     "connect",
     "first_upload",
+    "first_upload_files",
     "hex_to_b64",
     "in_sunday_scrub_window",
     "list_bucket",

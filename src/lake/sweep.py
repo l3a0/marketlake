@@ -668,7 +668,14 @@ class SweepOutcome:
                 f" unreadable {self.battery.unreadable}"
                 f" sessions_owed {self.battery.sessions_owed}"
                 f" sessions_missing {self.battery.sessions_missing}"
-                f" wrote {len(self.battery.appended)}"
+                # Printed only above zero, so a lake that never trims renders this line exactly
+                # as it did before marketlake #782. ``battery.BatteryReport`` gives the reason.
+                + (
+                    f" sessions_trimmed {self.battery.sessions_trimmed}"
+                    if self.battery.sessions_trimmed
+                    else ""
+                )
+                + f" wrote {len(self.battery.appended)}"
             )
         lines.append(
             f"  gaps={'unsealed' if nightly.gaps is None else nightly.gaps}"
