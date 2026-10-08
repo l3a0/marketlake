@@ -310,9 +310,11 @@ def _transient(response: VendorResponse | None, error: Exception | None) -> bool
 
 
 # A 429's sub-code, such as ``429-005`` for a burst or ``429-001`` for a sustained rate. The
-# design calls the sub-codes community-documented rather than published, and no 429 has
-# ever reached the lake, so where Schwab puts one is unmeasured. The pattern is therefore
-# looked for anywhere in the reply rather than at one assumed field.
+# design calls the sub-codes community-documented rather than published. None of the 24
+# requests Schwab answered 429 from 2026-10-01 to 2026-10-07 carried one. Every body was
+# whitespace, and no header held a sub-code, a rate-limit field or a ``Retry-After``. The
+# pattern is still looked for anywhere in the reply rather than at one assumed field, so a
+# sub-code Schwab starts sending is recorded wherever it lands.
 _SUBCODE = re.compile(r"429-\d{3}")
 
 # How much of a rejected reply's body ``request_error_detail`` keeps, in UTF-8 bytes.
