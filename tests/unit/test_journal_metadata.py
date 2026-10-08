@@ -296,6 +296,51 @@ def test_a_directory_at_the_stamp_reads_as_empty(lake_root):
     assert read_metadata(lake_root) == JournalMetadata()
 
 
+def test_a_tty_at_the_stamp_reads_as_empty_without_being_read(lake_root):
+    """A terminal is neither a file, a FIFO nor a directory, and a read of one blocks.
+
+    The stamp is a symlink to a pseudo-terminal, whose read waits for a line that never
+    comes. With the regular-file check narrowed to ``S_ISFIFO`` the reader opens the
+    terminal and blocks, and this fails.
+    """
+    master, slave = os.openpty()
+    try:
+        path = metadata_path(lake_root)
+        path.parent.mkdir(parents=True)
+        path.symlink_to(os.ttyname(slave))
+        answer: dict[str, JournalMetadata] = {}
+        reader = threading.Thread(
+            target=lambda: answer.update(stamp=read_metadata(lake_root)), daemon=True
+        )
+        reader.start()
+        reader.join(timeout=2)
+        blocked = reader.is_alive()
+    finally:
+        # Closing both ends fails a blocked read, so the thread ends either way.
+        os.close(master)
+        os.close(slave)
+    reader.join(timeout=2)
+    assert not blocked, "the reader opened the terminal and blocked"
+    assert answer["stamp"] == JournalMetadata()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file with no permission bits")
+def test_a_stamp_that_cannot_be_read_reads_as_empty(lake_root):
+    """A stamp the job has no permission to read answers empty rather than raising.
+
+    With ``_read_raw``'s catch narrowed from ``OSError`` to ``FileNotFoundError``, the
+    ``PermissionError`` escapes, and this fails.
+    """
+    path = metadata_path(lake_root)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({ASSERTION_PID: 4242}))
+    path.chmod(0)
+    try:
+        assert read_metadata(lake_root) == JournalMetadata()
+    finally:
+        path.chmod(0o644)
+
+
 def test_a_stamp_reached_through_a_symlink_still_reads(lake_root, tmp_path):
     real = tmp_path / "elsewhere.json"
     real.write_text(json.dumps({ASSERTION_PID: 4242}))

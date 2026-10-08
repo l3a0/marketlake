@@ -2040,18 +2040,23 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
     _withheld_and_still_ran(outcome, pinger)
 
 
+class _ScrubBug(Exception):
+    """A bug of a class no named exception tuple covers, so only ``except Exception`` catches it."""
+
+
 def test_a_bug_in_either_scrub_is_a_problem_line_with_its_trace(fixture_lake, monkeypatch, capsys):
     """The lake and path backup guards catch ``Exception``, not only a damaged manifest's raise.
 
-    ``AttributeError`` is a plain bug, and none of the damaged-manifest shapes above raise
-    it. With the lake guard narrowed to ``(KeyError, OSError, ManifestError)``, or the path
-    backup guard narrowed to ``(KeyError, ManifestError)``, it leaves the Sunday job, and
-    this fails. ``_backup_scrub_raised`` writing an empty ``target`` fails it too.
+    ``_ScrubBug`` is a plain bug of a class no tuple names. With either guard narrowed to any
+    tuple of named classes, even one that adds ``AttributeError`` to the ``KeyError`` and
+    ``ManifestError`` the guard comment names, it leaves the Sunday job, and this fails.
+    ``_backup_scrub_raised`` writing an empty ``target`` fails it too, and so does a guard
+    that prints a bare traceback header without the trace below it.
     """
     root = _clean_lake(fixture_lake)
 
     def bug(*args, **kwargs):
-        raise AttributeError("a bug in the scrub")
+        raise _ScrubBug("a bug in the scrub")
 
     monkeypatch.setattr(cp, "scrub", bug)
     monkeypatch.setattr(cp, "backup_scrub", bug)
@@ -2060,12 +2065,18 @@ def test_a_bug_in_either_scrub_is_a_problem_line_with_its_trace(fixture_lake, mo
 
     assert outcome.scrub is None
     assert outcome.problems == (
-        "lake scrub could not run: AttributeError: a bug in the scrub",
-        "backup could not be read: the backup scrub raised AttributeError: a bug in the scrub",
+        "lake scrub could not run: _ScrubBug: a bug in the scrub",
+        "backup could not be read: the backup scrub raised _ScrubBug: a bug in the scrub",
     )
     assert outcome.backup.target == str(_backup_of(root))
     assert outcome.restore is None
-    assert _tracebacks_printed(capsys.readouterr().err) == 2
+    err = capsys.readouterr().err
+    assert _tracebacks_printed(err) == 2
+    # Each guard printed its own whole trace: one names the lake scrub's call, the other the
+    # backup scrub's, and both reach the line that raised.
+    assert err.count("result = scrub(root)") == 1
+    assert err.count("backup = backup_scrub(root, Path(backup_target))") == 1
+    assert err.count('raise _ScrubBug("a bug in the scrub")') == 2
     _withheld_and_still_ran(outcome, pinger)
 
 
