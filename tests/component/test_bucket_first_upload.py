@@ -259,3 +259,113 @@ def test_a_bug_is_not_swallowed(tmp_path, monkeypatch):
     client.fail_with = ZeroDivisionError("a real bug")
     with pytest.raises(ZeroDivisionError):
         _main(config, client, monkeypatch)
+
+
+# -- a lake with partitions trimmed on purpose -------------------------------------
+
+# Marketlake #782. A trimmed lake has manifested files that are not on disk by design. The first
+# upload is the one job that re-baselines the bucket, so it checks the bucket holds each one
+# rather than reading a file that is not there, and refuses when the only copy is gone.
+
+TRIMMED = f"chains/ticker=SPY/date={DAY.isoformat()}.parquet"
+
+
+def _trim_away(lake: Path) -> None:
+    """Remove the chains partition the way #787's trim will: the line, its entry, the unlink."""
+    from lake.lock import lake_lock
+    from lake.manifest import latest_entries
+    from lake.trimmed import append_trimmed, trim_line
+
+    line = trim_line(
+        TRIMMED,
+        sha256=latest_entries(lake)[TRIMMED]["sha256"],
+        version_id="v1",
+        verified_at="2026-08-31T16:40:00-04:00",
+        trimmed_at="2026-08-31T16:41:00-04:00",
+    )
+    with lake_lock(lake):
+        append_trimmed(lake, line, source="test-trim", fetched_at=None)
+    (lake / TRIMMED).unlink()
+
+
+def test_a_trimmed_partition_the_bucket_holds_passes_and_is_not_sent(tmp_path, monkeypatch, capsys):
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    _main(config, client, monkeypatch)
+    _trim_away(lake)
+    client.calls.clear()
+    capsys.readouterr()
+
+    assert _main(config, client, monkeypatch) == 0
+
+    assert f"lake/{TRIMMED}" not in client.put_keys()
+    assert (
+        "head_object",
+        {"Bucket": "lake-backup", "Key": f"lake/{TRIMMED}", "ChecksumMode": "ENABLED"},
+    ) in client.calls
+    assert client.put_keys()[-1] == "lake/manifest.jsonl"
+    assert client.body("lake/manifest.jsonl") == manifest_path(lake).read_bytes()
+    assert "lake/trimmed.jsonl" in client.put_keys()
+
+
+@pytest.mark.parametrize("bucket_state", ["absent", "other bytes"])
+def test_a_trimmed_partition_the_bucket_lacks_refuses_with_one_line_and_exit_2(
+    tmp_path, monkeypatch, capsys, bucket_state
+):
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    _main(config, client, monkeypatch)
+    _trim_away(lake)
+    if bucket_state == "absent":
+        del client.objects[f"lake/{TRIMMED}"]
+    else:
+        client.store(f"lake/{TRIMMED}", b"other bytes")
+    manifest_copy = client.body("lake/manifest.jsonl")
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert TRIMMED in line and "no copy of it is left" in line
+    assert client.body("lake/manifest.jsonl") == manifest_copy, "no manifest.jsonl went up"
+    assert "lake/manifest.jsonl" not in client.put_keys()
+
+
+def test_an_absence_the_ledger_does_not_explain_still_refuses_as_missing(
+    tmp_path, monkeypatch, capsys
+):
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    _main(config, client, monkeypatch)
+    _trim_away(lake)
+    quotes = f"quotes/ticker=SPY/date={DAY.isoformat()}.parquet"
+    (lake / quotes).unlink()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert quotes in line and "missing from disk" in line
+
+
+def test_an_unreadable_ledger_refuses_an_absence_as_missing_and_names_why(
+    tmp_path, monkeypatch, capsys
+):
+    from lake.trimmed import trimmed_path
+
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    _main(config, client, monkeypatch)
+    _trim_away(lake)
+    path = trimmed_path(lake)
+    path.write_bytes(path.read_bytes() + b'{"kind": "tr\n' + path.read_bytes())
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert TRIMMED in line and "trimmed ledger" in line and "TornLedger" in line

@@ -4401,3 +4401,153 @@ def test_a_dry_run_judges_the_drift_and_pages_nothing(lake: Path, monkeypatch):
     assert report.drift_paged == ()
     assert transport.messages == []
     assert any("volume missing" in line for line in report.report)
+
+
+# -- coverage and the trimmed ledger ------------------------------------------
+
+# Marketlake #782. Coverage reads no manifest on a lake with no ``trimmed.jsonl``, which the
+# exact-text checks above and in ``test_eod_sweep.py`` already hold byte for byte. Once the ledger
+# exists, a partition trimmed on purpose is counted beside the owed sessions rather than reported
+# missing, and a ledger or manifest it cannot read degrades coverage alone.
+
+TRIMMED_SESSION = date(2026, 9, 2)
+TRIMMED = f"chains/ticker=SPY/date={TRIMMED_SESSION.isoformat()}.parquet"
+
+
+def _trim_away(root: Path, rel: str = TRIMMED) -> None:
+    """Record a sealed partition, then remove it the way #787's trim will."""
+    from lake.lock import lake_lock
+    from lake.manifest import record_partition
+    from lake.trimmed import append_trimmed, trim_line
+
+    entry = record_partition(root, rel, source="test", rows=5, fetched_at=None)
+    line = trim_line(
+        rel,
+        sha256=entry["sha256"],
+        version_id="v1",
+        verified_at="2026-09-16T16:40:00-04:00",
+        trimmed_at="2026-09-16T16:41:00-04:00",
+    )
+    with lake_lock(root):
+        append_trimmed(root, line, source="test-trim", fetched_at=None)
+    (root / rel).unlink()
+
+
+def _tear_the_ledger(root: Path) -> None:
+    from lake.trimmed import trimmed_path
+
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes() + b'{"kind": "tr\n' + path.read_bytes())
+
+
+def test_a_partition_trimmed_by_design_is_counted_apart_and_not_missing(lake: Path):
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+
+    found = _coverage(lake)
+
+    assert found.missing == ()
+    assert found.trimmed == 1
+    assert found.owed == 14
+    assert coverage_line(found) == (
+        "battery: calendar coverage, 14 owed sessions, 1 trimmed by design, the rest present"
+    )
+
+
+def test_a_trimmed_partition_and_a_real_miss_are_each_counted(lake: Path):
+    _seed_spans(lake)
+    _cover_all(lake, days=[day for day in COVERED_SESSIONS if day != date(2026, 9, 15)])
+    _trim_away(lake)
+
+    found = _coverage(lake)
+
+    assert {finding.partition for finding in found.missing} == {
+        "chains/ticker=SPY/date=2026-09-15.parquet",
+        "quotes/ticker=SPY/date=2026-09-15.parquet",
+    }
+    assert found.trimmed == 1
+    assert coverage_line(found) == (
+        "battery: calendar coverage, 2 of 14 owed sessions have no partition, over 1 session, "
+        "2026-09-15, 1 trimmed by design"
+    )
+
+
+def test_a_trimmed_line_that_was_restored_leaves_the_absence_missing(lake: Path):
+    from lake.lock import lake_lock
+    from lake.trimmed import append_trimmed, restore_line
+
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+    sha = latest_entries(lake)[TRIMMED]["sha256"]
+    with lake_lock(lake):
+        append_trimmed(
+            lake, restore_line(TRIMMED, sha256=sha, restored_at="x"), source="t", fetched_at=None
+        )
+
+    found = _coverage(lake)
+
+    assert [finding.partition for finding in found.missing] == [TRIMMED]
+    assert found.trimmed == 0
+    assert "trimmed" not in coverage_line(found)
+
+
+def test_with_no_ledger_coverage_reads_no_manifest(lake: Path):
+    """A host that never trims stats files and nothing else, so a damaged manifest costs it
+    nothing it did not cost before."""
+    _seed_spans(lake)
+    _cover_all(lake)
+    (lake / "manifest.jsonl").write_bytes(b"\xff\n")
+
+    found = _coverage(lake)
+
+    assert found.unreadable == ()
+    assert coverage_line(found) == "battery: calendar coverage, 14 owed sessions, all present"
+
+
+def test_a_torn_ledger_degrades_coverage_and_the_nights_verdicts_still_land(lake: Path):
+    """Mutation this catches: letting the ledger's refusal raise out of ``coverage``.
+
+    ``judge`` catches only ``ScopeUnknown`` around coverage, so a raise would cost the delayed-feed
+    quarantine this run exists to write. The refusal is one report line instead, and the absent
+    partition fails closed as missing.
+    """
+    from lake.report import redacted
+
+    _seed_spans(lake)
+    _cover_all(lake)
+    _write(lake, "chains", "SPY", DAY, _clean_rows("chains", staleness=-900.0))
+    _trim_away(lake)
+    _tear_the_ledger(lake)
+
+    report = judge(lake, calendar=CALENDAR, now=NOW, day=DAY, guards=GuardConstants())
+
+    assert _answer(report, partition=JUDGED).verdict == QUARANTINED_VERDICT
+    assert JUDGED in report.appended
+    assert {f.partition for f in report.findings if f.verdict == MISSING_SESSION} == {TRIMMED}
+    marker = "battery: calendar coverage could not read the trimmed ledger"
+    assert kind_of(report, marker) == ACTION
+    (line,) = [line for line in report.report if line.startswith(marker)]
+    assert redacted(line) == (
+        "battery: calendar coverage could not read the trimmed ledger, so every absent "
+        "partition counts as missing"
+    )
+
+
+def test_an_unreadable_manifest_beside_a_ledger_is_a_report_line_too(lake: Path):
+    _seed_spans(lake)
+    _cover_all(lake)
+    _trim_away(lake)
+    path = lake / "manifest.jsonl"
+    path.write_bytes(path.read_bytes() + b"\xff\n")
+
+    found = _coverage(lake)
+
+    assert [finding.partition for finding in found.missing] == [TRIMMED]
+    assert found.trimmed == 0
+    (line,) = found.unreadable
+    assert line.startswith(
+        "battery: calendar coverage could not read the manifest, so every absent partition "
+        "counts as missing: LedgerNotUtf8: "
+    )

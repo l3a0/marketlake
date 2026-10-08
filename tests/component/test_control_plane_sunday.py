@@ -1502,3 +1502,84 @@ def test_a_reminder_for_a_failing_canary_names_a_failed_pull_too(fixture_lake):
     )
     assert len(sent) == 3
     assert all(r.body.endswith(" Token pull: unreadable (ParameterNotFound).") for r in sent)
+
+
+# -- the trimmed ledger --------------------------------------------------------------
+
+# Marketlake #782. The scrub reads ``trimmed.jsonl`` only when it exists, and a ledger it could
+# not read reaches the operator as problem lines rather than a raise, because this job calls the
+# scrub with no guard and a raise would cost the canary and the ping.
+
+TRIMMED_DAY = date(2026, 8, 28)
+
+
+def _trim_away(root: Path, fixture_lake: FixtureLake) -> str:
+    """Trim the lake's chains partition the way #787 will: the line, its entry, the unlink."""
+    from lake.lock import lake_lock
+    from lake.manifest import latest_entries
+    from lake.trimmed import append_trimmed, trim_line
+
+    path = fixture_lake.partition_path("chains", "SPY", TRIMMED_DAY)
+    rel = path.relative_to(root).as_posix()
+    line = trim_line(
+        rel,
+        sha256=latest_entries(root)[rel]["sha256"],
+        version_id="v1",
+        verified_at="2026-08-29T16:40:00-04:00",
+        trimmed_at="2026-08-29T16:41:00-04:00",
+    )
+    with lake_lock(root):
+        append_trimmed(root, line, source="test-trim", fetched_at="2026-08-29T16:41:00-04:00")
+    path.unlink()
+    return rel
+
+
+def test_with_no_trimmed_ledger_a_missing_file_renders_the_scrub_line_unchanged(fixture_lake):
+    """Mutation this catches: naming the ledger's field on a lake that has no ledger."""
+    root = _clean_lake(fixture_lake)
+    fixture_lake.partition_path("chains", "SPY", TRIMMED_DAY).unlink()
+
+    outcome, pinger = _run(root)
+
+    assert [p for p in outcome.problems if p.startswith("scrub failed")] == [
+        "scrub failed: missing=1 sha_mismatches=0 orphans=0"
+    ]
+    assert not any("trimmed" in p for p in outcome.problems)
+    assert outcome.pinged is False and pinger.urls == []
+
+
+def test_a_designed_absence_scrubs_clean_and_the_sunday_job_pings(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    _trim_away(root, fixture_lake)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.ok, outcome.scrub
+    assert outcome.problems == ()
+    assert outcome.pinged is True and pinger.urls == [URL]
+
+
+def test_a_torn_trimmed_ledger_is_two_problem_lines_and_never_a_raise(fixture_lake):
+    from lake.manifest import record_partition
+    from lake.trimmed import trimmed_path
+
+    root = _clean_lake(fixture_lake)
+    rel = _trim_away(root, fixture_lake)
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes() + b'{"kind": "tr\n' + path.read_bytes())
+    # Recorded, so the ledger's own bytes are no sha mismatch and the line counts only the tear.
+    record_partition(root, "trimmed.jsonl", source="test-trim", rows=3, fetched_at=None)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.missing == (rel,), "every absence counts as missing"
+    assert "scrub failed: missing=1 sha_mismatches=0 orphans=0 trimmed_ledger=unreadable" in (
+        outcome.problems
+    )
+    named = [p for p in outcome.problems if p.startswith("trimmed ledger unreadable")]
+    assert len(named) == 1
+    assert named[0].startswith(
+        "trimmed ledger unreadable, so every absent file counts as missing: TornLedger: "
+    )
+    assert "trimmed on purpose" in named[0]
+    assert outcome.pinged is False and pinger.urls == []

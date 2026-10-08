@@ -217,6 +217,7 @@ from lake.manifest import (
     ManifestError,
     append_line,
     is_quarantined,
+    latest_entries,
     latest_quarantine_by_check,
     quarantine_path,
     record_partition,
@@ -1413,11 +1414,22 @@ class Coverage:
     partition and changes no read. ``capture_spans.build_from_master`` reaches this state on
     purpose, opening a span for every instrument in the master when the roster cannot be read,
     and ``SecurityMaster.register`` takes no ticker at all.
+
+    ``trimmed`` counts the owed partitions the trimmed ledger records as removed on purpose,
+    which ``lake.trimmed.is_designed_absence`` decides. They are owed and absent, so they are
+    neither present nor in ``missing``, and :func:`coverage_line` names them apart.
+
+    ``unreadable`` holds one report line for a trimmed ledger or a manifest the check could not
+    read. Every absent partition then stays in ``missing``, so the check fails closed, and the
+    line degrades coverage alone. Raising would cost more: :func:`judge` catches only
+    :class:`ScopeUnknown` around this check, so a raise would cost the night's verdicts.
     """
 
     owed: int = 0
     missing: tuple[Finding, ...] = ()
     unnamed: tuple[str, ...] = ()
+    trimmed: int = 0
+    unreadable: tuple[str, ...] = ()
 
 
 def coverage(
@@ -1458,8 +1470,14 @@ def coverage(
     resolving as of the run date loses it after a rename. Either way a partition that exists
     would be reported missing. The name the finding is written under is the spelling valid on
     that day, falling back to the first the instrument ever had.
+
+    **A partition trimmed on purpose is counted apart from a missing one.** Marketlake #782 is
+    why. This check reads no manifest on a lake with no ``trimmed.jsonl``, so a host that never
+    trims stats exactly what it did before. Once the ledger exists, an absent partition is asked
+    whether it is a designed absence, under every spelling, the way presence is asked.
     """
     from lake.session import COMPACTION_DELAY
+    from lake.trimmed import is_designed_absence, latest_trimmed, trimmed_path
 
     root = Path(lake_root)
     master, spans = reference.master, reference.spans
@@ -1500,10 +1518,35 @@ def coverage(
                         owed.add((surface, span.instrument_id, day))
             day += timedelta(days=1)
 
+    # Read only when the ledger exists. Either read failing leaves both maps empty, so every
+    # absent partition stays missing and the failure is one report line.
+    manifest_latest: dict = {}
+    trimmed: dict = {}
+    unreadable: list[str] = []
+    if trimmed_path(root).exists():
+        what = "manifest"
+        try:
+            manifest_latest = latest_entries(root)
+            what = "trimmed ledger"
+            trimmed = latest_trimmed(root)
+        except (ManifestError, OSError) as exc:
+            manifest_latest, trimmed = {}, {}
+            unreadable.append(
+                f"battery: calendar coverage could not read the {what}, so every absent "
+                f"partition counts as missing: {type(exc).__name__}: {exc}"
+            )
+
     missing: list[Finding] = []
+    designed = 0
     for surface, instrument_id, day in sorted(owed, key=lambda key: (key[0], key[1], key[2])):
         names = spellings[instrument_id]
         if any(_partition_file(root, surface, name, day).is_file() for name in names):
+            continue
+        if any(
+            is_designed_absence(partition_key(surface, name, day), manifest_latest, trimmed)
+            for name in names
+        ):
+            designed += 1
             continue
         named = master.symbol_at(instrument_id, day) or names[0]
         missing.append(
@@ -1520,7 +1563,13 @@ def coverage(
                 ),
             )
         )
-    return Coverage(owed=len(owed), missing=tuple(missing), unnamed=tuple(unnamed))
+    return Coverage(
+        owed=len(owed),
+        missing=tuple(missing),
+        unnamed=tuple(unnamed),
+        trimmed=designed,
+        unreadable=tuple(unreadable),
+    )
 
 
 def _partition_file(root: Path, surface: str, ticker: str, day: date) -> Path:
@@ -1561,9 +1610,15 @@ def coverage_line(found: Coverage) -> str:
 
     It prints on a night it finds nothing, because the battery's census is on stdout and not in
     the report file, so a check reporting only misses cannot be told from one that did not run.
+
+    Partitions trimmed on purpose are counted beside the owed sessions rather than inside "all
+    present", and that wording appears only when the count is above zero. So a lake that never
+    trims prints exactly the line it printed before marketlake #782.
     """
+    trimmed = f", {found.trimmed} trimmed by design" if found.trimmed else ""
     if not found.missing:
-        return f"battery: calendar coverage, {found.owed} owed sessions, all present"
+        present = "the rest present" if found.trimmed else "all present"
+        return f"battery: calendar coverage, {found.owed} owed sessions{trimmed}, {present}"
     days = sorted({finding.day for finding in found.missing})
     span = (
         days[0].isoformat()
@@ -1573,6 +1628,7 @@ def coverage_line(found: Coverage) -> str:
     return (
         f"battery: calendar coverage, {len(found.missing)} of {found.owed} owed sessions have "
         f"no partition, over {len(days)} session{'s' if len(days) != 1 else ''}, {span}"
+        f"{trimmed}"
     )
 
 
@@ -2125,6 +2181,8 @@ def judge(
     appended: list[str] = []
     report = ReportLines()
     for line in found.unnamed:
+        report.add(line, ACTION)
+    for line in found.unreadable:
         report.add(line, ACTION)
     medians: dict[str, float] = {}
     deferred = 0
