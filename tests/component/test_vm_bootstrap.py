@@ -41,6 +41,11 @@ NEW_UUID = "11111111-2222-3333-4444-555555555555"
 OTHER_UUID = "99999999-8888-7777-6666-555555555555"
 UV_VERSION = "0.11.2"
 ROOT_LINE = "LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n"
+# The two installs the bootstrap runs, as the fake logs them: step 9 syncs the venv the
+# config steps run from, and the last one installs and starts the units once they ran.
+SYNC = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT} --sync-only"
+INSTALL = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}"
+FINISHED = "vm-bootstrap: finished with a failed step, listed above"
 VM_YAML = (
     "role: shadow\n"
     f"lake_root: {LAKE_ROOT}\n"
@@ -295,13 +300,20 @@ def test_a_first_boot_formats_a_fresh_volume_and_installs(vm):
         f"findmnt --fstab --tab-file {vm.fstab} -n -o SOURCE --mountpoint {LAKE_ROOT}",
         f"chown {OWNER}: {lake}",
         f"resize2fs {dev}",
-        f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}",
+        SYNC,
         "flock -w 600 9",
         "venv-python -m lake.vm_config render",
         f"venv-python -m lake.token_store pull --token {vm.home}/.config/marketlake/token.json",
         "venv-python -m lake.roster apply",
+        INSTALL,
     ]
     assert _in_order(calls, steps), calls
+    # The units are installed, and so started, only once the config steps have run.
+    assert vm.ran("linux-install") == [SYNC, INSTALL]
+    says = proc.stdout.splitlines()
+    sync_say = f"vm-bootstrap: syncing the environment as {OWNER}"
+    install_say = "vm-bootstrap: installing and starting the units"
+    assert _in_order(says, [sync_say, install_say]), says
     assert vm.immutable() == [lake]
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(NEW_UUID)
     assert vm.fstab.stat().st_mode & 0o777 == 0o644
@@ -706,9 +718,7 @@ def test_uv_is_installed_when_the_version_differs(vm, installed):
     assert vm.index(f"chmod 0644 {installer}") < vm.index(run)
     assert "uv-installer mode -rw-r--r--" in vm.calls()
     assert "uv-installer UV_NO_MODIFY_PATH=1" in vm.calls()
-    assert vm.index("uv-installer UV_NO_MODIFY_PATH=1") < vm.index(
-        f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}"
-    )
+    assert vm.index("uv-installer UV_NO_MODIFY_PATH=1") < vm.index(SYNC)
     assert not Path(installer).exists()
     assert list(vm.temp.iterdir()) == []
 
@@ -755,14 +765,16 @@ def test_a_tool_versions_without_a_plain_uv_pin_is_refused(vm, pin):
 # -- the install, the lock and the retries ---------------------------------------------
 
 
-def test_the_lock_is_taken_only_after_the_install_returns(vm):
+def test_the_lock_is_taken_only_between_the_two_installs(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    install = vm.index(f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}")
     lock = vm.index("flock -w 600 9")
     render = vm.index("venv-python -m lake.vm_config render")
-    assert install < lock < render
-    # One lock for each of the render, the pull and the roster.
+    roster = vm.index("venv-python -m lake.roster apply")
+    assert vm.index(SYNC) < lock < render
+    assert roster < vm.index(INSTALL)
+    # One lock for each of the render, the pull and the roster. An install run inside
+    # locked() would add a fourth, and on a VM it would wait 600 seconds and refuse.
     assert vm.ran("flock") == ["flock -w 600 9"] * 3
     assert vm.lock.exists()
 
@@ -789,7 +801,7 @@ def test_each_attempt_takes_the_lock_and_the_wait_runs_without_it(vm):
 def test_a_transient_install_failure_is_retried(vm):
     proc = vm.bootstrap(INSTALL_RCS="1 1 0")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert len(vm.ran("linux-install")) == 3
+    assert vm.ran("linux-install") == [SYNC] * 3 + [INSTALL]
     assert vm.ran("sleep") == ["sleep 30"] * 2
 
 
@@ -801,13 +813,75 @@ def test_a_transient_install_failure_is_retried(vm):
     ],
     ids=["refusal", "every attempt"],
 )
-def test_an_install_that_keeps_failing_stops_the_bootstrap(vm, rcs, runs, line):
+def test_a_sync_that_keeps_failing_stops_the_bootstrap(vm, rcs, runs, line):
     proc = vm.bootstrap(INSTALL_RCS=rcs)
     assert proc.returncode == 1
     assert line in proc.stderr
     assert len(vm.ran("linux-install")) == runs
     assert not vm.ran("flock")
     assert not vm.ran("venv-python")
+
+
+def test_each_install_gets_its_own_retry_budget(vm):
+    # Step 9 spends two retries. The last install still gets all five attempts.
+    proc = vm.bootstrap(INSTALL_RCS="1 1 0 1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert vm.ran("linux-install") == [SYNC] * 3 + [INSTALL] * 5
+    assert vm.ran("sleep") == ["sleep 30"] * 6
+    retries = [line for line in proc.stdout.splitlines() if "retrying in 30 seconds" in line]
+    assert retries == [
+        f"vm-bootstrap: deploy/linux-install.sh exited 1, retrying in 30 seconds (attempt {n} of 5)"
+        for n in (1, 2, 1, 2, 3, 4)
+    ]
+
+
+def test_a_transient_failure_of_the_last_install_is_retried(vm):
+    proc = vm.bootstrap(INSTALL_RCS="0 1 0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.ran("linux-install") == [SYNC, INSTALL, INSTALL]
+    assert vm.ran("sleep") == ["sleep 30"]
+    assert proc.stdout.splitlines()[-1] == "vm-bootstrap: done"
+
+
+# Step 9's two lines, which the last install's own lines must not contain, or a test that
+# looks for one of them by containment could pass on the wrong line.
+STEP_9_LINES = ("exited 2, a refusal", "exited 1 on all 5 attempts")
+
+
+@pytest.mark.parametrize(
+    ("rcs", "runs", "line"),
+    [
+        (
+            "0 1",
+            5,
+            "the install that starts the units did not finish, because"
+            " deploy/linux-install.sh exited 1 on each of 5 tries. A rerun of the bootstrap"
+            " installs and starts the units",
+        ),
+        (
+            "0 2",
+            1,
+            "the install that starts the units did not finish, because"
+            " deploy/linux-install.sh exited 2, which no retry fixes. The lines above it"
+            " say why, and when one names the install lock, a rerun of the bootstrap"
+            " installs and starts the units",
+        ),
+    ],
+    ids=["every attempt", "refusal"],
+)
+def test_a_failed_last_install_fails_the_run_after_the_config_steps(vm, rcs, runs, line):
+    proc = vm.bootstrap(INSTALL_RCS=rcs)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert vm.ran("linux-install") == [SYNC] + [INSTALL] * runs
+    assert vm.ran("sleep") == ["sleep 30"] * (runs - 1)
+    # The config steps all ran, since the sync before them succeeded.
+    assert len(vm.ran("venv-python -m lake.roster")) == 1
+    errors = proc.stderr.splitlines()
+    assert f"vm-bootstrap: {line}" in errors
+    for step_9 in STEP_9_LINES:
+        assert step_9 not in proc.stderr
+    # A fail rather than a stop, so the end check still runs and prints its line last.
+    assert errors[-1] == FINISHED
 
 
 @pytest.mark.parametrize("rcs", ["3 1 0", "1 3 3 0"])
@@ -831,6 +905,10 @@ def test_a_render_refusal_is_final_and_skips_what_reads_config(vm):
     assert "the config render exited 2, which is not retried" in proc.stderr
     skipped = "the token pull and the roster are skipped, because both read config.yaml"
     assert f"vm-bootstrap: {skipped}" in proc.stderr.splitlines()
+    # The units are still installed, into the restart loop a missing config.yaml causes.
+    assert vm.ran("linux-install") == [SYNC, INSTALL]
+    assert vm.index("venv-python -m lake.vm_config render") < vm.index(INSTALL)
+    assert proc.stderr.splitlines()[-1] == FINISHED
 
 
 def test_the_render_retries_are_bounded(vm):
@@ -860,7 +938,9 @@ def test_a_roster_refusal_prints_and_finishes_the_run(vm):
     assert proc.returncode == 1
     assert len(vm.ran("venv-python -m lake.roster")) == 1
     assert "vm-bootstrap: the roster apply exited 2" in proc.stderr.splitlines()
-    assert proc.stderr.splitlines()[-1] == "vm-bootstrap: finished with a failed step, listed above"
+    assert vm.ran("linux-install") == [SYNC, INSTALL]
+    assert vm.index("venv-python -m lake.roster apply") < vm.index(INSTALL)
+    assert proc.stderr.splitlines()[-1] == FINISHED
 
 
 def test_a_lock_that_never_frees_skips_the_python_steps(vm):

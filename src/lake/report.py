@@ -3,11 +3,18 @@
 The design gives report-tier findings no message of their own. They ride the nightly
 report, one dated file per vendor-sweep run under ``reports/`` in the lake root, which
 sits inside the backup sync root and outside the manifest. ``lake.sweep`` writes that
-file and D20 renders it, so the reader arrives later than the producers do. Compaction's
-two findings are the exception. The schema policy makes drift one, since a missing or
-retyped known field pages. A damaged segment is the other, because the minutes it holds
-are lost unless a human repairs the day. So compaction pages once per run for each on top
-of filing here.
+file and D20 renders it, so the reader arrives later than the producers do. Three
+findings are the exception and page on top of filing here.
+
+1. Compaction's schema drift, since the schema policy pages on a missing or retyped
+   known field.
+2. Compaction's damaged segment, because the minutes it holds are lost unless a human
+   repairs the day.
+3. The vendor sweep's disk runway under ``runway.PAGE_FLOOR_WEEKS``, because a full lake
+   volume stops compaction from sealing and can lose the minutes the journal is capturing.
+
+Compaction pages once per run for each of its two, and the sweep pages once per run for
+the runway, every night it stays under the floor.
 
 The close+5 guard is one of those producers and it has been finding things with nowhere
 to put them. Three of the design's rules for it end in "flags the nightly report", and

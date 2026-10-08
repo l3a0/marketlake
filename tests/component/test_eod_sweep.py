@@ -24,19 +24,19 @@ import os
 import re
 import subprocess
 from contextlib import contextmanager
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
-from lake import journal, report, sweep
+from lake import journal, report, runway, sweep
 from lake.actions import ActionsError, actions_path
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
 from lake.battery import BatteryReport
-from lake.calendar import NotASession
+from lake.calendar import Calendar, NotASession
 from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
 from lake.config import GuardConstants
@@ -411,8 +411,13 @@ def _run(
     roster: Roster | None = None,
     holidays: tuple[date, ...] = (),
     guards: GuardConstants | None = None,
+    calendar: Calendar | None = None,
 ):
     """One sweep run with every seam injected, returning the outcome and the fakes.
+
+    ``calendar`` replaces the two-week default, which leaves nine sessions after ``EVENING``
+    and answers False past them. A disk-runway test that needs a runway longer than that
+    passes a longer one.
 
     ``guards`` stays ``None`` by default, which is what the production wiring passes when a
     config names no ``guards:`` section. The bar walk resolves it to the design's pinned defaults
@@ -428,7 +433,11 @@ def _run(
     outcome = sweep.sweep(
         lake_root=root,
         clock=ManualClock(now),
-        calendar=weekday_sessions(MONDAY, NEXT_MONDAY, holidays=holidays),
+        calendar=(
+            calendar
+            if calendar is not None
+            else weekday_sessions(MONDAY, NEXT_MONDAY, holidays=holidays)
+        ),
         roster=roster if roster is not None else _roster(),
         vendor_source=vendor_source if vendor_source is not None else _CountingVendorSource(),
         pinger=pinger,
@@ -3350,3 +3359,443 @@ def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: F
     (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
     assert line == "bars abandoned: 6 ticker-day(s), 1 PartitionAbsent, 5 SnapAbsent"
     assert kind_of(outcome.nightly, "bars abandoned") == ACTION
+
+
+# -- the disk runway (marketlake #438) ---------------------------------------------------
+#
+# Free space is stubbed through ``lake.runway.shutil.disk_usage``, so the runner's own disk
+# never decides a verdict. The peak is read off the same lake first with no free space at
+# all, and every run is at or after the compaction moment, so a test asserting no line is
+# not passing because the gate skipped the check. ``_runway_calls`` records each call to
+# ``sweep.assess`` for the tests that ask whether the check ran at all.
+
+# Three weeks from ``MONDAY``, so a runway of twelve sessions has dates to land on.
+THIRD_MONDAY = date(2026, 9, 28)
+
+
+class _Space:
+    """What ``assess`` reads off ``shutil.disk_usage``."""
+
+    def __init__(self, free: int) -> None:
+        self.free = free
+        self.total = 1 << 50
+
+
+def _stub_free(monkeypatch: pytest.MonkeyPatch, free: int) -> None:
+    monkeypatch.setattr(runway.shutil, "disk_usage", lambda _path: _Space(free))
+
+
+def _sealed_peak(monkeypatch: pytest.MonkeyPatch, root: Path) -> int:
+    """The rate's peak this lake shows the check, read before the run writes anything.
+
+    The lake holds sealed partitions and no journal, so the rate's peak and the busiest
+    sealed day are one figure, and the reserve is thirteen of it. That is what lets the
+    tests write free space as the peak times the sessions plus thirteen.
+    """
+    _stub_free(monkeypatch, 0)
+    calendar = weekday_sessions(MONDAY, NEXT_MONDAY)
+    peak = runway.assess(root, today=SESSION, calendar=calendar).peak
+    assert peak > 0
+    return peak
+
+
+def _runway_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    calls: list[dict] = []
+    real = sweep.assess
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sweep, "assess", spy)
+    return calls
+
+
+def _runway_lines(outcome) -> list[str]:
+    return [line for line in outcome.nightly.report if line.startswith("disk runway")]
+
+
+def _pages(transport: FakeTransport) -> list:
+    return [m for m in transport.messages if m.event == "sweep_disk_runway"]
+
+
+def _digest(transport: FakeTransport):
+    (digest,) = [m for m in transport.messages if m.event == NIGHTLY_EVENT]
+    return digest
+
+
+def test_the_disk_runway_page_matches_the_designs_message_table_literally():
+    # Compared against literals, because a constant compared to itself passes whatever it
+    # says. The title is the house form for a path that can lose captured minutes.
+    assert sweep.DISK_RUNWAY_EVENT == "sweep_disk_runway"
+    assert sweep.DISK_RUNWAY_TITLE == "Capture at risk: lake disk runway short"
+    assert sweep.DISK_RUNWAY_REPAIR == (
+        "infra/README.md, Rerun the bootstrap, A larger lake volume"
+    )
+
+
+def test_a_healthy_runway_files_no_line_and_pages_nothing(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """The quiet side. A night with room files nothing, so the report's other tests hold.
+
+    The spy shows the check ran, so the empty result is the check's answer rather than the
+    gate's silence.
+    """
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    calls = _runway_calls(monkeypatch)
+    outcome, _, transport = _run(root)
+    assert len(calls) == 1
+    assert _runway_lines(outcome) == []
+    assert _pages(transport) == []
+
+
+def test_a_device_that_will_not_read_files_an_action_line(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # ``assess`` names the class in ``space_error`` and ``short`` reads False, so without
+    # this line a disk that cannot be read would pass as a disk with room.
+    root = _lake(fixture_lake)
+
+    def refuse(_path):
+        raise PermissionError(errno.EACCES, "Permission denied", str(root))
+
+    monkeypatch.setattr(runway.shutil, "disk_usage", refuse)
+    outcome, pinger, transport = _run(root)
+    assert _runway_lines(outcome) == ["disk runway unreadable: PermissionError"]
+    assert kind_of(outcome.nightly, "disk runway") == ACTION
+    assert _pages(transport) == []
+    # Report-tier, so the ping still lands.
+    assert pinger.urls == [PING_URL]
+
+
+def test_a_walk_refusal_files_a_line_carrying_its_count_and_names(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """A path the walk could not read leaves bytes out, which lengthens the runway.
+
+    Each refusal arrives as ``scratch: PermissionError``, and ``report.redacted`` keeps
+    only two fields of a line split on ``": "``. So the line writes it as
+    ``scratch (PermissionError)``, and the count and the name survive into the digest.
+    """
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    locked = root / "scratch"
+    locked.mkdir()
+    (locked / "a").write_bytes(b"x")
+    locked.chmod(0o000)
+    try:
+        outcome, _, transport = _run(root)
+    finally:
+        locked.chmod(0o755)
+    line = "disk runway walk refused: 1 path, scratch (PermissionError)"
+    assert _runway_lines(outcome) == [line]
+    assert kind_of(outcome.nightly, "disk runway") == ACTION
+    assert report.redacted(line) == line
+    assert f"report: {line}" in _digest(transport).body.split("\n")
+
+
+def test_a_raise_from_the_runway_check_files_a_line_and_keeps_the_record(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # Anything ``assess`` lets through is a line in the pmset read-back's shape, and the
+    # report file, the ping and the digest all survive it.
+    root = _lake(fixture_lake)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the walk fell over")
+
+    monkeypatch.setattr(sweep, "assess", boom)
+    outcome, pinger, transport = _run(root)
+    assert _runway_lines(outcome) == ["disk runway unreadable: RuntimeError: the walk fell over"]
+    assert kind_of(outcome.nightly, "disk runway") == ACTION
+    assert pinger.urls == [PING_URL]
+    assert outcome.filed_at is not None
+    assert "disk runway unreadable: RuntimeError" in _filed(root)[0]["report"]
+    assert _digest(transport)
+
+
+def test_a_critical_runway_pages_once_and_files_the_line(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """Under the two-week floor the line is filed and one page goes out.
+
+    Free space below the 13-session reserve reads zero capture days and fills today. The
+    page is found by its event, because the digest goes out after it, and the digest still
+    carries the line whole.
+    """
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    outcome, pinger, transport = _run(root)
+
+    (page,) = _pages(transport)
+    assert page.title == "Capture at risk: lake disk runway short"
+    assert page.priority == 5
+    assert page.body.startswith("0 capture days left, fills 2026-09-14: 0.0 GiB free less a ")
+    assert page.body.endswith(
+        ". Grow the lake volume: infra/README.md, Rerun the bootstrap, A larger lake volume."
+    )
+    assert len(page.body.encode("utf-8")) < 1000
+    assert str(root) not in page.body
+
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 0 capture days left, fills 2026-09-14, ")
+    assert kind_of(outcome.nightly, "disk runway") == ACTION
+    assert f"report: {line}" in _digest(transport).body.split("\n")
+    # A page is not a problem, so the ping still lands.
+    assert pinger.urls == [PING_URL]
+
+
+def test_the_line_and_the_page_print_gib_with_every_number_before_a_second_field(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """The exact words, at the scale the VM's volume runs at.
+
+    Nine capture days from Monday 2026-09-14 fill on Friday 2026-09-25, under the two-week
+    floor. ``report.redacted`` drops everything after a second ``": "``, so the line has
+    only one and survives whole.
+    """
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    real = sweep.assess
+    gib = 1 << 30
+
+    def nine_days(*args, **kwargs):
+        return replace(
+            real(*args, **kwargs),
+            free=int(6.1 * gib),
+            reserve=int(7.8 * gib),
+            peak=int(0.6 * gib),
+            capture_days_left=9,
+            exhausts_on=date(2026, 9, 25),
+            beyond_horizon=False,
+        )
+
+    monkeypatch.setattr(sweep, "assess", nine_days)
+    outcome, _, transport = _run(root)
+    line = (
+        "disk runway short: 9 capture days left, fills 2026-09-25,"
+        " 6.1 GiB free less a 7.8 GiB journal reserve, at 0.60 GiB a session"
+    )
+    assert _runway_lines(outcome) == [line]
+    assert report.redacted(line) == line
+    (page,) = _pages(transport)
+    assert page.body == (
+        "9 capture days left, fills 2026-09-25: 6.1 GiB free less a 7.8 GiB journal reserve,"
+        " at 0.60 GiB a session. Grow the lake volume: infra/README.md, Rerun the bootstrap,"
+        " A larger lake volume."
+    )
+
+
+def test_a_short_runway_over_the_floor_files_a_line_and_pages_nothing(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    """Twelve sessions is under three weeks and over two: the report tier alone.
+
+    From Monday 2026-09-14 the twelfth session is Wednesday 2026-09-30, after the floor's
+    2026-09-28 and before the headroom's 2026-10-05. The default calendar ends after nine
+    sessions, so this run passes one three weeks long.
+    """
+    root = _lake(fixture_lake)
+    peak = _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, peak * (12 + 13))
+    outcome, _, transport = _run(root, calendar=weekday_sessions(MONDAY, NEXT_MONDAY, THIRD_MONDAY))
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 12 capture days left, fills 2026-09-30, ")
+    assert kind_of(outcome.nightly, "disk runway") == ACTION
+    assert _pages(transport) == []
+
+
+def test_a_run_with_no_publisher_files_the_line_and_sends_no_page(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # ``_run`` always builds a publisher, so this calls the sweep directly. A page sent to
+    # no publisher would raise into the check's own catch and file an unreadable line
+    # instead of the short one.
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    outcome = sweep.sweep(
+        lake_root=root,
+        clock=ManualClock(EVENING),
+        calendar=weekday_sessions(MONDAY, NEXT_MONDAY),
+        roster=_roster(),
+        vendor_source=_CountingVendorSource(),
+        pinger=FakePinger(),
+        ping_url=PING_URL,
+        publisher=None,
+        schedule_reader=lambda: _schedule_text(),
+        schedule_setter=_RecordingSetter(),
+    )
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 0 capture days left")
+    assert outcome.delivered is False
+
+
+@pytest.mark.parametrize(
+    ("now", "runs"),
+    [
+        (datetime.fromisoformat("2026-09-14T16:20:00-04:00"), False),
+        (datetime.fromisoformat("2026-09-14T16:30:00-04:00"), True),
+    ],
+)
+def test_on_a_session_day_the_check_waits_for_the_compaction_moment(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch, now: datetime, runs: bool
+):
+    """16:30 is the option close plus fifteen minutes, when compaction seals the journal.
+
+    Before it, today's journal is on the disk and the full reserve comes off as well, so a
+    catch-up run would read the runway 9 to 13 sessions short. 16:20 is after the equity
+    close at 16:00, so a gate on the equity close would run here, and only the compaction
+    moment skips it.
+    """
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 0)
+    calls = _runway_calls(monkeypatch)
+    outcome, _, transport = _run(root, now=now)
+    assert (len(calls) == 1) is runs
+    assert bool(_runway_lines(outcome)) is runs
+    assert bool(_pages(transport)) is runs
+
+
+def test_on_a_day_with_no_session_the_check_runs_and_files_nothing_false(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # No journal to wait for, so the check runs at once. The gate's ``not session`` arm
+    # comes first because ``option_close`` refuses a non-session, and a refusal reaching the
+    # check would file a false line every holiday.
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    calls = _runway_calls(monkeypatch)
+    outcome, _, _ = _run(root, holidays=(SESSION,))
+    assert outcome.nightly.session is False
+    assert len(calls) == 1
+    assert _runway_lines(outcome) == []
+
+
+def test_one_capture_day_left_reads_in_the_singular(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # One session past the reserve from Monday 2026-09-14 fills on Tuesday 2026-09-15, which
+    # is under the two-week floor, so the line and the page both carry the count.
+    root = _lake(fixture_lake)
+    peak = _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, peak * (1 + 13))
+    outcome, _, transport = _run(root)
+    (line,) = _runway_lines(outcome)
+    assert line.startswith("disk runway short: 1 capture day left, fills 2026-09-15, ")
+    (page,) = _pages(transport)
+    assert page.body.startswith("1 capture day left, fills 2026-09-15: ")
+
+
+def _runway_stderr(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    """The lines the runway page printed to stderr, and no other part of the sweep's."""
+    return [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "disk-runway" in line or "disk runway" in line
+    ]
+
+
+def test_a_sent_page_is_echoed_to_stderr_whole_and_nothing_else_is_said(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    capsys.readouterr()
+    _, _, transport = _run(root)
+    (page,) = _pages(transport)
+    assert _runway_stderr(capsys) == [
+        f"sweep: Capture at risk: lake disk runway short: {page.body}"
+    ]
+
+
+def test_a_refused_page_says_so_and_never_echoes_its_body(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A publisher holding words from the page's body as a secret refuses the page.
+
+    Echoing the body to stderr then would undo the redaction. The secret is the page's
+    repair sentence, which the nightly report line does not carry, so the digest still goes
+    out and only the page is refused.
+    """
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    transport = FakeTransport()
+    publisher = Publisher(lake_root=root, transport=transport, secrets=("Grow the lake volume",))
+    capsys.readouterr()
+    _run(root, publisher=publisher, transport=transport)
+    assert _runway_stderr(capsys) == ["sweep: disk-runway page refused: it carried a secret"]
+    assert _pages(transport) == []
+    assert _digest(transport)
+
+
+@pytest.mark.parametrize(("lake_exists", "kept"), [(True, "written down"), (False, "lost")])
+def test_an_unsent_page_says_whether_it_was_written_down(
+    fixture_lake: FixtureLake,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    lake_exists: bool,
+    kept: str,
+):
+    # No transport fails the post. The publisher's record lands under a lake root that
+    # exists and is lost under one that does not, and the sweep says which after the echo.
+    root = _lake(fixture_lake)
+    _sealed_peak(monkeypatch, root)
+    _stub_free(monkeypatch, 0)
+    record_root = root if lake_exists else tmp_path / "absent"
+    publisher = Publisher(lake_root=record_root, transport=None, secrets=("secret-key",))
+    capsys.readouterr()
+    _run(root, publisher=publisher)
+    echo, not_sent = _runway_stderr(capsys)
+    assert echo.startswith(
+        "sweep: Capture at risk: lake disk runway short: 0 capture days left, fills 2026-09-14: "
+    )
+    assert not_sent == f"sweep: disk-runway page not sent: post_failed, {kept}"
+
+
+def test_a_walk_refusing_past_the_named_cap_counts_every_path_and_names_three(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # Five locked directories, three named and two counted. The walk's order decides which
+    # three, so the names are matched by shape.
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    locked = [root / f"scratch{index}" for index in range(5)]
+    for directory in locked:
+        directory.mkdir()
+        (directory / "a").write_bytes(b"x")
+        directory.chmod(0o000)
+    try:
+        outcome, _, _ = _run(root)
+    finally:
+        for directory in locked:
+            directory.chmod(0o755)
+    (line,) = _runway_lines(outcome)
+    named = r"scratch[0-4] \(PermissionError\)"
+    assert re.fullmatch(
+        rf"disk runway walk refused: 5 paths, {named}, {named}, {named}, 2 more", line
+    ), line
+
+
+def test_a_refusal_named_by_its_class_alone_is_filed_as_it_is(
+    fixture_lake: FixtureLake, monkeypatch: pytest.MonkeyPatch
+):
+    # ``walk`` names a path that will not sit under the root by its class alone, which has
+    # no ``": "`` to rewrite.
+    root = _lake(fixture_lake)
+    _stub_free(monkeypatch, 1 << 45)
+    real = sweep.assess
+
+    def outside(*args, **kwargs):
+        result = real(*args, **kwargs)
+        return replace(result, usage=replace(result.usage, refusals=("OSError",), refused=1))
+
+    monkeypatch.setattr(sweep, "assess", outside)
+    outcome, _, _ = _run(root)
+    assert _runway_lines(outcome) == ["disk runway walk refused: 1 path, OSError"]
