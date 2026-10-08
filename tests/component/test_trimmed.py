@@ -479,7 +479,7 @@ def _write_line(root: Path, line: dict) -> None:
         handle.write((json.dumps(line, sort_keys=True) + "\n").encode())
 
 
-def test_a_ledger_whose_sha_disagrees_with_its_entry_is_re_recorded(tmp_path):
+def test_a_ledger_whose_entry_lags_an_appended_line_is_re_recorded(tmp_path):
     root = _lake(tmp_path / "lake")
     _append(root, _trim(SPY, "a" * 64))
     _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
@@ -637,3 +637,60 @@ def test_a_damaged_manifest_is_named_as_the_manifest_and_not_the_ledger(tmp_path
     assert text.startswith(f"{manifest}: the manifest could not be read (LedgerNotUtf8")
     assert "Repair manifest.jsonl by hand" in text
     assert "last line whole" not in text
+
+
+@pytest.mark.parametrize(
+    "between",
+    [b"\n", " \n".encode(), b"\n\n"],
+    ids=["blank-line", "no-break-space-line", "two-blank-lines"],
+)
+def test_an_entry_recorded_over_trailing_blank_lines_still_re_records_an_append(tmp_path, between):
+    """The reader skips a line holding only whitespace, Unicode whitespace included.
+
+    No writer leaves one, and a hand edit can. Compaction runs this repair every night, so
+    counting such a line differently from the reader would refuse, and page, every night.
+    Mutation this catches: counting lines by any rule but ``parse_jsonl``'s, or accepting only
+    the offset right after the last counted line.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(between)
+    # Recorded by hand, as a person repairing the ledger would. The strict append's tail check
+    # reads a last line of only U+00A0 as garbled, so it would refuse to record over one.
+    record_partition(root, TRIMMED_FILE, source=SOURCE, rows=1, fetched_at=STAMP)
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["rows"] == 2 and entry["sha256"] == sha256_file(trimmed_path(root))
+
+
+def test_a_blank_line_inside_the_recorded_lines_still_re_records_an_append(tmp_path):
+    root = _lake(tmp_path / "lake")
+    line = (json.dumps(_trim(SPY, "a" * 64), sort_keys=True) + "\n").encode()
+    trimmed_path(root).write_bytes(line + " \n".encode() + line)
+    with lake_lock(root):
+        refresh_trimmed_entry(root, source=SOURCE, fetched_at=STAMP)
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 2
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+
+def test_an_empty_ledger_recorded_at_no_rows_re_records_a_later_append(tmp_path):
+    """A first append whose write landed nothing leaves an empty ledger, which the repair records
+    at zero rows. A later append that crashes before its record is still a lagging append.
+
+    Mutation this catches: dropping the zero-row case, which reads it as lost lines.
+    """
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).write_bytes(b"")
+    assert _repair(root) is True
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 0
+    _write_line(root, _trim(SPY, "a" * 64))
+
+    assert _repair(root) is True
+
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 1

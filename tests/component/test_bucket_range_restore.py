@@ -944,7 +944,7 @@ def test_a_ledger_that_cannot_be_read_at_the_commit_refuses(tmp_path, monkeypatc
 
     monkeypatch.setattr(trimmed, "latest_trimmed", flaky)
 
-    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys, last="2026-08-24")
 
     assert "unreadable at the commit" in line and "stopped at" in line
     assert not (root / SPY_1).exists()
@@ -1050,14 +1050,30 @@ def test_the_bound_is_checked_again_before_a_commit(tmp_path, monkeypatch):
     assert _strays(root) == []
 
 
-def test_an_owed_restore_line_is_not_written_once_the_file_is_gone(tmp_path, monkeypatch):
-    """The owed lines are re-checked under the lock, since the hash ran without it.
+def _recompact(root: Path, rel: str) -> None:
+    """Reseal a partition with new bytes and a new entry, as a recompaction by hand does."""
+    with lake_lock(root):
+        data = (root / rel).read_bytes() + b"recompacted"
+        (root / rel).write_bytes(data)
+        append_manifest(
+            root,
+            partition=rel,
+            source="recompact",
+            sha256=hashlib.sha256(data).hexdigest(),
+            rows=latest_entries(root)[rel]["rows"],
+            fetched_at=STAMP,
+            guard=False,
+        )
 
-    Here the trim that crashed before its unlink finishes it between the hash and the lock.
-    Mutation this catches: writing the owed line without the re-check, which supersedes the
-    trim line of a file that is gone, an absence nothing explains.
+
+def test_a_file_gone_after_the_hash_is_restored_rather_than_counted_present(tmp_path, monkeypatch):
+    """The trim that crashed before its unlink finishes it between the hash and the lock.
+
+    Mutations this catches: writing the owed line without the re-check, which supersedes the
+    trim line of a file that is gone, and counting the file present, which reports success
+    over a selected partition that is absent.
     """
-    root, client, _originals = _lake(tmp_path)
+    root, client, originals = _lake(tmp_path)
     _trim_away(root, client, SPY_1, unlink=False)
     real_sha = bucket.sha256_file
 
@@ -1071,9 +1087,92 @@ def test_an_owed_restore_line_is_not_written_once_the_file_is_gone(tmp_path, mon
 
     summary = _run(root, client, last=D1)
 
-    assert summary.restore_lines == 0
+    assert (summary.present, summary.restored, summary.restore_lines) == (0, 1, 1)
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
+    assert _kind(root, SPY_1) == "restore"
+    assert scrub(root).ok
+
+
+def test_a_file_gone_before_the_hash_is_restored_rather_than_refused(tmp_path, monkeypatch):
+    """Mutation this catches: reading the vanished file as a local failure to fix by hand."""
+    root, client, originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+    real_sha = bucket.sha256_file
+
+    def trim_then_hash(path):
+        if Path(path) == root / SPY_1:
+            Path(path).unlink()
+        return real_sha(path)
+
+    monkeypatch.setattr(bucket, "sha256_file", trim_then_hash)
+
+    summary = _run(root, client, last=D1)
+
+    assert (summary.present, summary.restored, summary.restore_lines) == (0, 1, 1)
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
+    assert scrub(root).ok
+
+
+def test_a_recompaction_between_the_plan_and_the_hash_says_run_again(tmp_path, monkeypatch):
+    """A recompaction by hand takes the lock and has no session bound, so it can land between
+    the planning lock and the unlocked hash. The lake it leaves is consistent.
+
+    Mutation this catches: telling the operator to move a good file out of the lake.
+    """
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    real_sha = bucket.sha256_file
+    done: list[int] = []
+
+    def recompact_then_hash(path):
+        if Path(path) == root / SPY_3 and not done:
+            done.append(1)
+            _recompact(root, SPY_3)
+        return real_sha(path)
+
+    monkeypatch.setattr(bucket, "sha256_file", recompact_then_hash)
+
+    line = _refuses_after_commit(root, client)
+
+    assert f"{SPY_3} changed in the lake while the range restore ran" in line
+    assert "Move it out of the lake" not in line
+    assert SPY_3 not in scrub(root).sha_mismatches
+    assert not (root / SPY_1).exists()
+
+
+def test_a_recompaction_after_the_hash_writes_no_stale_restore_line(tmp_path, monkeypatch):
+    """Mutation this catches: dropping the entry's sha from the owed line's re-check, which
+    writes a restore line carrying a sha the manifest no longer records.
+    """
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+    real_sha = bucket.sha256_file
+    done: list[int] = []
+
+    def hash_then_recompact(path):
+        digest = real_sha(path)
+        if Path(path) == root / SPY_1 and not done:
+            done.append(1)
+            _recompact(root, SPY_1)
+        return digest
+
+    monkeypatch.setattr(bucket, "sha256_file", hash_then_recompact)
+
+    line = _refuses_after_commit(root, client)
+
+    assert "changed in the lake while the range restore ran" in line
     assert _kind(root, SPY_1) == "trim"
-    assert _unexplained(root) == ()
+
+
+def test_a_file_that_still_differs_under_the_lock_is_refused_as_rot(tmp_path, monkeypatch):
+    """The re-check reads the entry again. An entry that did not move means the bytes did."""
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_3).write_bytes(b"rotted bytes")
+
+    line = _refuses(root, client)
+
+    assert "does not match its manifest entry" in line
+    assert "changed in the lake" not in line
 
 
 def test_an_owed_restore_line_is_not_written_twice(tmp_path, monkeypatch):
@@ -1107,3 +1206,51 @@ def test_an_owed_restore_line_is_not_written_twice(tmp_path, monkeypatch):
     assert summary.restore_lines == 0
     kinds = [line["kind"] for line in read_trimmed(root) if line["partition"] == SPY_1]
     assert kinds == ["trim", "restore"]
+
+
+def test_a_temp_the_directory_will_not_unlink_keeps_the_one_line(tmp_path, monkeypatch, capsys):
+    """A read-only remount after the temp landed: the cleanup's own unlink is refused too.
+
+    Mutation this catches: the cleanup catching only a missing file, so its ``PermissionError``
+    replaces the one-line refusal with a traceback.
+    """
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    parent = (root / SPY_1).parent
+
+    def landed_then_refused(read, rel, temp):
+        Path(temp).write_bytes(b"partial")
+        parent.chmod(0o555)
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(bucket, "_download_to", landed_then_refused)
+    try:
+        line = _main_refusal(tmp_path, root, client, monkeypatch, capsys, last="2026-08-24")
+    finally:
+        parent.chmod(0o755)
+
+    assert "Read-only file system" in line and "writing" in line
+
+
+def test_a_bucket_refusal_mid_run_says_how_far_it_got(tmp_path, monkeypatch, capsys):
+    """Mutation this catches: the download's bucket failure escaping as itself, so ``main``
+    prints its generic line and the count of partitions already restored is lost.
+    """
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    (root / SPY_2).unlink()
+    real_get = client.get_object
+
+    def second_denied(**kwargs):
+        if kwargs.get("Key") == TARGET.key(SPY_2):
+            raise client_error("AccessDenied", "GetObject", 403)
+        return real_get(**kwargs)
+
+    monkeypatch.setattr(client, "get_object", second_denied)
+
+    line = _main_refusal(tmp_path, root, client, monkeypatch, capsys)
+
+    assert "AccessDenied" in line
+    assert "1 partition(s) were restored before this stop" in line
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
+    assert _strays(root) == []

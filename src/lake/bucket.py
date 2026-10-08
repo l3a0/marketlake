@@ -2265,38 +2265,60 @@ def restore_range(
 
     # Unlocked, each present file is hashed. One that differs refuses before anything is
     # written, and one under a trim line owes a restore line, which a crash after the move and
-    # before the line leaves.
-    owed: list[tuple[str, str]] = []
+    # before the line leaves. The hash runs without the lock, so what it saw is re-checked
+    # under the lock below, by reading the ledgers and stat, never by hashing again.
+    owed: list[str] = []
+    differs: str | None = None
     try:
         for rel, sha in present.items():
-            if sha256_file(root / rel) != sha:
-                raise refuse(
-                    f"{rel} is on disk and does not match its manifest entry, which the Sunday "
-                    "scrub also reports, so nothing was restored. Move it out of the lake and "
-                    "run the range restore again, which brings back the bucket's copy if that "
-                    "copy matches the manifest"
-                )
+            try:
+                digest = sha256_file(root / rel)
+            except FileNotFoundError:
+                # Gone since the plan, which a trim finishing a crashed unlink does. The
+                # re-check below puts it into the plan.
+                continue
+            if digest != sha:
+                differs = rel
+                break
             if is_trimmed(trimmed.get(rel)):
-                owed.append((rel, sha))
+                owed.append(rel)
     except OSError as exc:
         raise local(f"hashing the {scope} already in the lake", exc) from None
-    summary.present = len(present)
-    if owed:
+    if present:
         try:
             with lake_lock(root):
                 guard()
                 latest = latest_entries(root)
                 trimmed = latest_trimmed(root)
-                for rel, sha in owed:
-                    # Re-checked without a hash: the file is still there, its entry is the one
-                    # hashed, and its latest trimmed line is still a trim line.
+
+                def moved(rel: str) -> bool:
                     entry = latest.get(rel)
-                    if (
-                        not (root / rel).exists()
-                        or entry is None
-                        or entry.get("sha256") != sha
-                        or not is_trimmed(trimmed.get(rel))
-                    ):
+                    return entry is None or entry.get("sha256") != present[rel]
+
+                changed = sorted(rel for rel in present if moved(rel))
+                if differs is not None and differs not in changed:
+                    raise refuse(
+                        f"{differs} is on disk and does not match its manifest entry, which the "
+                        "Sunday scrub also reports, so nothing was restored. Move it out of the "
+                        "lake and run the range restore again, which brings back the bucket's "
+                        "copy if that copy matches the manifest"
+                    )
+                # A partition whose entry moved since the plan was resealed meanwhile, by a
+                # recompaction run by hand. Its bytes are consistent, and the run's view of it
+                # is not, so the run stops before it writes a line or plans a download for it.
+                stale = [rel for rel in changed if rel == differs or rel in owed]
+                stale += [rel for rel in changed if not (root / rel).exists()]
+                if stale:
+                    raise refuse(
+                        f"{stale[0]} changed in the lake while the range restore ran, so nothing "
+                        "more was written. Run the range restore again"
+                    )
+                for rel, sha in present.items():
+                    if not (root / rel).exists():
+                        plan[rel] = sha
+                        trim_lines[rel] = trimmed.get(rel)
+                        continue
+                    if rel not in owed or not is_trimmed(trimmed.get(rel)):
                         continue
                     at = stamp()
                     append_trimmed(
@@ -2312,6 +2334,7 @@ def restore_range(
             raise refuse(f"{exc}, so the range restore stopped") from None
         except OSError as exc:
             raise local(f"writing a restore line under {root}", exc) from None
+    summary.present = sum(1 for rel in present if rel not in plan)
 
     if not plan:
         return summary

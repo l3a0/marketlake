@@ -375,24 +375,32 @@ _REPAIR_BY_HAND = (
 )
 
 
-def _prefix_end(raw: bytes, rows: int) -> int | None:
-    """The byte offset just past the ``rows``-th non-blank line of ``raw``, or ``None``.
+def _prefix_ends(text: str, rows: int) -> list[int] | None:
+    """Every byte offset at which the ledger could have stood when ``rows`` lines were recorded.
 
-    Lines are counted the way the reader counts entries, a blank line counting for nothing, so
-    the offset is where the ledger stood when an entry recording ``rows`` lines was written.
-    ``None`` means ``raw`` holds fewer than ``rows`` non-blank lines.
+    Lines are counted by the reader's own rule, ``parse_jsonl``'s: ``splitlines`` then
+    ``strip``, so a line holding only whitespace, Unicode whitespace included, counts for
+    nothing. The offsets run from the end of the ``rows``-th counted line through each blank
+    line that directly follows it, because an entry recorded over a ledger ending in blank
+    lines covers those bytes too, and nothing in the entry says how many there were. With
+    ``rows`` at 0 they start at 0. ``None`` means the text holds fewer than ``rows`` lines.
     """
-    if rows <= 0:
-        return 0
+    ends: list[int] = [0] if rows <= 0 else []
     count = 0
     offset = 0
-    for piece in raw.split(b"\n"):
-        offset += len(piece) + 1
-        if piece.strip():
+    for piece in text.splitlines(keepends=True):
+        offset += len(piece.encode("utf-8"))
+        blank = not piece.strip()
+        if ends:
+            if not blank:
+                break
+            ends.append(offset)
+            continue
+        if not blank:
             count += 1
             if count == rows:
-                return min(offset, len(raw))
-    return None
+                ends.append(offset)
+    return ends or None
 
 
 def _lost_lines(path: Path, held: int, recorded: int) -> TrimmedRepairRefused:
@@ -465,11 +473,15 @@ def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None
             if recorded == sha256_bytes(raw):
                 return False
             rows = int(entry.get("rows") or 0)
-            end = _prefix_end(raw, rows)
-            if end is None:
-                held = sum(1 for piece in raw.split(b"\n") if piece.strip())
+            # The reader's own refusals come first, so a ledger that will not decode or hides
+            # entries names its own class, and the text below is known to decode.
+            read_trimmed(root)
+            text = raw.decode("utf-8")
+            ends = _prefix_ends(text, rows)
+            if ends is None:
+                held = sum(1 for piece in text.splitlines() if piece.strip())
                 raise _lost_lines(path, held, rows)
-            if sha256_bytes(raw[:end]) != recorded:
+            if not any(sha256_bytes(raw[:end]) == recorded for end in ends):
                 raise TrimmedRepairRefused(
                     f"{path}: the ledger's first {rows} line(s) no longer hash to its manifest "
                     "entry, so a line was edited in place or the bytes rotted, and the entry was "
