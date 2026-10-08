@@ -1673,13 +1673,14 @@ def test_a_chain_that_answered_empty_leaves_the_cause_so_the_next_death_pages():
 
 
 def test_a_cause_page_is_dated_from_the_death_not_from_one_surface_failing_before_it():
-    """The cause page counts the run in which none of its surfaces landed data.
+    """The cause page counts the run in which no surface landed data.
 
     One chain failing its own class for half an hour before the token dies has a count
     that reaches back to 10:00. Dating the cause from it would tell the operator the token
     died at 10:00 and that capture had been down since then, when every other surface
-    landed data until 10:30. The dead-man is fed until 10:30 too, so the smallest count is
-    the one that matches the outage the follow-on line names (marketlake #747).
+    landed data until 10:30. The dead-man is fed until 10:30 too, so the run in which no
+    surface landed data is the one that matches the outage the follow-on line names
+    (marketlake #747, #768).
     """
     watchdog = Watchdog()
     raised = []
@@ -1730,12 +1731,12 @@ def test_a_cause_that_turns_unanimous_late_is_dated_from_the_first_dead_minute()
 
 
 def test_a_surface_whose_write_failed_still_dates_the_cause():
-    """The smallest count is taken over every failed surface, written or not.
+    """A write failure lands no data, so it extends the run the cause page counts.
 
     The chains fail with ``http_401`` for eight minutes. The quotes land data for the first
     five, then their segment write fails for three, so they record no class. The outage
-    that starves the dead-man began at 10:05, when the quotes stopped landing. Taking the
-    smallest count over only the surfaces that recorded a class would date it from 10:00.
+    that starves the dead-man began at 10:05, when the quotes stopped landing. Dating it
+    from the only surface that recorded a class, the chains, would say 10:00.
     """
     watchdog = Watchdog()
     raised = []
@@ -2213,3 +2214,204 @@ def test_a_cycle_whose_every_write_failed_names_no_cause_and_does_not_raise():
         raised += watchdog.observe(_cycle(errors=errors, at=_at(minute)))
     assert "Capture down: token dead" not in [page.title for page in raised]
     assert watchdog.count("chains", "SPY") == 3
+
+
+# -- a ticker joining a dead token (marketlake #768) -----------------------------------
+
+
+def _late(minute: int, day: int = 2) -> datetime:
+    return datetime(2026, 9, day, 15, minute, tzinfo=ET)
+
+
+SURFACES = ("chains", "quotes")
+
+
+def _dead(at: datetime, *tickers: str) -> CycleResult:
+    """One dead-token minute: every surface of every named ticker fails ``http_401``."""
+    return _cycle(
+        *(_fail(surface, ticker, "http_401") for ticker in tickers for surface in SURFACES),
+        at=at,
+    )
+
+
+def _roster_of(*tickers: str) -> list[Surface]:
+    return [Surface(surface, ticker) for ticker in tickers for surface in SURFACES]
+
+
+def _run(watchdog: Watchdog, cycles: list[CycleResult]) -> dict[datetime, list]:
+    """Every page each cycle raised, keyed by the cycle's slot, leaving out a quiet one."""
+    raised = {cycle.snap_ts: watchdog.observe(cycle) for cycle in cycles}
+    return {slot: pages for slot, pages in raised.items() if pages}
+
+
+def _causes(raised: dict[datetime, list]) -> dict[datetime, list[tuple]]:
+    """Each page as its title, minutes, since and how many surfaces it folded."""
+    return {
+        slot: [(page.title, page.minutes, page.since, len(page.surfaces)) for page in pages]
+        for slot, pages in raised.items()
+    }
+
+
+def _titles(raised: dict[datetime, list]) -> dict[datetime, list[str]]:
+    return {slot: [page.title for page in pages] for slot, pages in raised.items()}
+
+
+TOKEN_DEAD = "Capture down: token dead"
+SPY_AND_QQQ_ON_THEIR_OWN = [
+    "Capture down: quote sampler dead",
+    "Capture down: QQQ chains",
+    "Capture down: SPY chains",
+]
+
+
+def test_a_ticker_joining_a_dead_token_folds_into_one_cause_page():
+    """Test 1: SPY and QQQ die at 10:00 and IWM joins at 10:02.
+
+    IWM's own counter is 1 on the third dead minute. Waiting for every failed surface's
+    count to reach the threshold held the cause back, so the older surfaces paged on their
+    own and the cause paged at 10:04, dated from the join. The minutes in which no surface
+    landed data reach the threshold at 10:02, so the cause pages then, dated 10:00, when the
+    dead-man stopped being fed.
+    """
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    cycles += [_dead(_at(minute), "SPY", "QQQ", "IWM") for minute in range(2, 6)]
+    assert _causes(_run(Watchdog(), cycles)) == {_at(2): [(TOKEN_DEAD, 3, _at(0), 6)]}
+
+
+def test_two_tickers_joining_a_dead_token_in_successive_minutes_send_one_page():
+    """Test 2: IWM joins at 10:02 and DIA at 10:03, and the operator gets one page."""
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    cycles += [_dead(_at(2), "SPY", "QQQ", "IWM")]
+    cycles += [_dead(_at(minute), "SPY", "QQQ", "IWM", "DIA") for minute in range(3, 7)]
+    assert _causes(_run(Watchdog(), cycles)) == {_at(2): [(TOKEN_DEAD, 3, _at(0), 6)]}
+
+
+def test_a_stall_before_the_join_still_dates_the_cause_from_the_death():
+    """Test 3: a slept-through slot that charged a surface is a minute nothing landed.
+
+    SPY and QQQ die at 10:00, the loop sleeps through 10:01, and IWM joins at 10:02. The
+    stall counts once toward the run, so the page goes at 10:02, dated 10:00.
+    """
+    watchdog = Watchdog()
+    assert watchdog.observe(_dead(_at(0), "SPY", "QQQ")) == []
+    assert watchdog.missed(_roster_of("SPY", "QQQ"), [_at(1)]) == []
+    cycles = [_dead(_at(minute), "SPY", "QQQ", "IWM") for minute in range(2, 5)]
+    assert _causes(_run(watchdog, cycles)) == {_at(2): [(TOKEN_DEAD, 3, _at(0), 6)]}
+
+
+def test_a_stall_on_the_first_slot_of_a_session_counts_toward_that_session():
+    """A stall slot is counted after the session date rolls, so the roll cannot wipe it.
+
+    The loop sleeps through 10:00 on a fresh session and the token is dead at 10:01 and
+    10:02. The run is three minutes long, so the cause pages at 10:02, dated 10:00.
+    """
+    watchdog = Watchdog()
+    assert watchdog.missed(_roster_of("SPY", "QQQ"), [_at(0)]) == []
+    cycles = [_dead(_at(minute), "SPY", "QQQ") for minute in range(1, 4)]
+    assert _causes(_run(watchdog, cycles)) == {_at(2): [(TOKEN_DEAD, 3, _at(0), 4)]}
+
+
+def test_the_minutes_without_data_do_not_carry_across_a_session_date():
+    """Test 4: a token dead at the close starts the next session's run at zero.
+
+    The token is dead at 15:58 and 15:59 and again from 10:00 the next morning, so the page
+    goes at 10:02, dated 10:00. Carried overnight, the run paged at 10:00, dated 09:58.
+    """
+    cycles = [_dead(_late(58), "SPY", "QQQ"), _dead(_late(59), "SPY", "QQQ")]
+    cycles += [_dead(_at(minute, day=3), "SPY", "QQQ") for minute in range(4)]
+    assert _causes(_run(Watchdog(), cycles)) == {_at(2, day=3): [(TOKEN_DEAD, 3, _at(0, day=3), 4)]}
+
+
+def test_a_cycle_that_touched_nothing_restarts_the_run():
+    """Test 5: a minute the spans left every ticker out resets the run.
+
+    The token is dead at 10:00 and 10:01, the spans leave SPY and QQQ out at 10:02, and the
+    token is dead again from 10:03. The run restarts at 10:03, so the cause pages at 10:05,
+    dated 10:03. Left unchanged by the clamped minute, the run paged at 10:03, dated 10:01.
+    Counting the clamped minute paged at 10:03, dated 10:00.
+    """
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    cycles += [_clamped(out=("SPY", "QQQ"), at=_at(2))]
+    cycles += [_dead(_at(minute), "SPY", "QQQ") for minute in range(3, 7)]
+    assert _causes(_run(Watchdog(), cycles)) == {_at(5): [(TOKEN_DEAD, 3, _at(3), 4)]}
+
+
+def test_an_empty_roster_minute_inside_a_token_death_restarts_the_run():
+    """Price 2: a ``nothing_to_capture`` minute resets the run and keeps every counter.
+
+    The token is dead at 10:00 and 10:01, the roster is empty at 10:02, and the token is
+    dead again from 10:03. That empty minute feeds the dead-man, so the run restarts at
+    10:03. The per-surface counters were kept through it and reach the threshold at 10:03,
+    so SPY and QQQ page on their own first, and the cause pages at 10:05, dated 10:03.
+    """
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    cycles += [CycleResult(_at(2), (), (), nothing_to_capture=True)]
+    cycles += [_dead(_at(minute), "SPY", "QQQ") for minute in range(3, 7)]
+    raised = _run(Watchdog(), cycles)
+    assert _titles(raised) == {_at(3): SPY_AND_QQQ_ON_THEIR_OWN, _at(5): [TOKEN_DEAD]}
+    assert _causes(raised)[_at(5)] == [(TOKEN_DEAD, 3, _at(3), 4)]
+
+
+def test_a_ticker_that_lands_data_and_retires_restarts_the_run():
+    """Test 6, price 1: the minute IWM landed data fed the dead-man.
+
+    SPY and QQQ fail ``http_401`` from 10:00. IWM fails at 10:00, lands data at 10:01 and
+    retires at 10:02. SPY and QQQ reach the threshold at 10:02 and page on their own, and
+    the cause pages at 10:04, dated 10:02, the first minute after the landing.
+    """
+    landed = _cycle(
+        *_dead(_at(1), "SPY", "QQQ").segments,
+        _seg("chains", "IWM", "data"),
+        _seg("quotes", "IWM", "data"),
+        at=_at(1),
+    )
+    cycles = [_dead(_at(0), "SPY", "QQQ", "IWM"), landed]
+    cycles += [_dead(_at(minute), "SPY", "QQQ") for minute in range(2, 6)]
+    raised = _run(Watchdog(), cycles)
+    assert _titles(raised) == {_at(2): SPY_AND_QQQ_ON_THEIR_OWN, _at(4): [TOKEN_DEAD]}
+    assert _causes(raised)[_at(4)] == [(TOKEN_DEAD, 3, _at(2), 4)]
+
+
+def test_the_token_pull_reads_a_dead_token_on_every_minute_of_a_join():
+    """Test 7: the daemon's pull reads one cycle, so a join cannot hold it back.
+
+    ``whole_daemon_cause`` is untouched by the gate, so every minute of the join probe in
+    test 1 reads as a dead token and the pull fires on each.
+    """
+    cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
+    cycles += [_dead(_at(minute), "SPY", "QQQ", "IWM") for minute in range(2, 6)]
+    assert [whole_daemon_cause(cycle) for cycle in cycles] == [TOKEN_DEAD] * 6
+
+
+def test_a_stall_while_every_ticker_is_out_of_span_adds_nothing_to_the_run():
+    """Test 8: a stall that charged no surface is not a minute capture was starved.
+
+    The spans leave SPY and QQQ out at 10:00, the loop sleeps through 10:01 and 10:02 while
+    they are still out, and the token is dead from 10:03. The stall charged nobody, so the
+    run starts at 10:03 and the cause pages at 10:05, dated 10:03. Counting the stall paged
+    at 10:03, the first minute the span opened, dated 10:01.
+    """
+    watchdog = Watchdog()
+    assert watchdog.observe(_clamped(out=("SPY", "QQQ"), at=_at(0))) == []
+    assert watchdog.missed(_roster_of("SPY", "QQQ"), [_at(1), _at(2)]) == []
+    cycles = [_dead(_at(minute), "SPY", "QQQ") for minute in range(3, 7)]
+    assert _causes(_run(watchdog, cycles)) == {_at(5): [(TOKEN_DEAD, 3, _at(3), 4)]}
+
+
+@pytest.mark.parametrize("fresh", [True, False], ids=["fresh-watchdog", "new-session-date"])
+def test_the_first_cycle_of_a_session_counts_toward_the_run(fresh):
+    """Test 9: a token dead from 10:00 pages at 10:02, dated 10:00.
+
+    The run is updated after the session date rolls. Updated before it, the roll wiped the
+    first dead minute, and the page went a minute late.
+    """
+    watchdog = Watchdog()
+    day = 2
+    if not fresh:
+        healthy = _cycle(_seg("chains", "SPY", "data"), _seg("quotes", "SPY", "data"), at=_late(59))
+        assert watchdog.observe(healthy) == []
+        day = 3
+    cycles = [_dead(_at(minute, day=day), "SPY", "QQQ") for minute in range(4)]
+    assert _causes(_run(watchdog, cycles)) == {
+        _at(2, day=day): [(TOKEN_DEAD, 3, _at(0, day=day), 4)]
+    }
