@@ -279,6 +279,14 @@ class Watchdog:
         # says nothing about any surface's health.
         self._out_of_span: dict[str, int] = {}
         self._paged_out_of_span: set[str] = set()
+        # Consecutive session minutes in which no surface landed data, which is what a
+        # cause page waits on and dates itself from, per ``_whole_daemon``. A minute that
+        # touched a surface and landed nothing adds one, and so does a slept-through slot
+        # that charged a surface. Landed data resets it, and so do a cycle that touched
+        # nothing and a slept-through slot that charged nothing, because counting a clamped
+        # stretch paged the cause on the first minute the span opened, dated inside the
+        # clamp (marketlake #768).
+        self._minutes_without_data = 0
 
     def _threshold(self) -> int:
         """The page threshold as it stands now.
@@ -317,6 +325,11 @@ class Watchdog:
         failed = set(tally.failed)
         recorded = tally.recorded
         self._roll(result.snap_ts)
+        # After ``_roll``, so the first cycle of a session counts toward that session.
+        if touched and touched == failed:
+            self._minutes_without_data += 1
+        else:
+            self._minutes_without_data = 0
         self._drop_departed(touched, result.out_of_span)
         for key in touched - failed:
             self._reset(key)
@@ -337,10 +350,11 @@ class Watchdog:
         # A write failure records no class, so nothing about it says whether the cause is
         # over. Data landing on another surface says the vendor answered this minute, so
         # the write failure is the surface's own, and it leaves the cause and pages for
-        # itself. Only landed data counts. It resets the surface that landed it, so the
-        # cause cannot page again until that surface has failed for the threshold. An
-        # answer with no contract resets nothing, and counting it let a chain alternating
-        # a 401 with an empty answer re-page the cause every other minute (marketlake #754).
+        # itself. Only landed data counts. It resets the count of minutes in which no
+        # surface landed data, so the cause cannot page again until the threshold's minutes
+        # pass with no surface landing data. An answer with no contract resets nothing, and
+        # counting it let a chain alternating a 401 with an empty answer re-page the cause
+        # every other minute (marketlake #754).
         # The same landed data proves the shared token works, so a surface failing a class
         # that does not resolve to a dead token is failing for its own reason. It leaves
         # the token-dead cause alone. A rate limit is per surface, so the rate-limited
@@ -366,6 +380,14 @@ class Watchdog:
         slot is its own session minute without a durable data cycle, so a ten-minute
         overrun advances a counter by ten rather than by one. The counting is per slot
         and per surface. Only the page is folded.
+
+        Each slot that charges at least one surface also adds a minute to the run a cause
+        page waits on, so a stall inside a token death dates that page from the death
+        rather than from the resume. A slot that charges nobody, because every enabled
+        ticker was out of span or the roster was empty, restarts that run at zero. Counted,
+        it paged a token death on the first minute the span opened, dated inside the stall.
+        Left unchanged, it dated a death that resumed after the stall from a minute before
+        the stall, which is neither the death nor the restart (marketlake #768).
 
         One stall gaps every watched surface at the same moment, so it is one fact and
         owes one page. Fanning out instead sent a page per surface, which on a roster of
@@ -410,6 +432,10 @@ class Watchdog:
         threshold = self._threshold()
         for slot in sorted(slots):
             self._roll(slot)
+            if watched:
+                self._minutes_without_data += 1
+            else:
+                self._minutes_without_data = 0
             for key in sorted(watched, key=str):
                 self._counts[key] = self._counts.get(key, 0) + 1
             for ticker in left_out:
@@ -466,15 +492,20 @@ class Watchdog:
         ``contracts_absent``. That answer proves at least one of its requests authenticated
         and got through, so the cycle is not one cause.
 
-        The page's ``minutes`` is the smallest count over the failed surfaces, and
-        ``since`` is the first minute of that run, ``slot`` less ``minutes - 1``. The
-        smallest count is the run in which none of the surfaces the page folds landed
-        data, which is the run that starves the dead-man. The largest is one surface's own
-        failure, which can start long before the cause: a chain failing ``http_500`` from
-        10:00 under a token that dies at 10:30 would date the page 10:00. The threshold
-        check reads the same set, so ``minutes`` is never below the threshold. The slot is
-        already in ET, and :meth:`_roll` clears every count at the ET date change, so
-        ``since`` always falls inside the session (marketlake #747).
+        The page waits for the consecutive minutes in which no surface landed data to
+        reach the threshold. ``minutes`` is that count, and ``since`` is the first minute
+        of that run, ``slot`` less ``minutes - 1``. It is the run that starves the
+        dead-man, so the page is dated from when capture stopped rather than from one
+        surface's own failure, which can start long before the cause: a chain failing
+        ``http_500`` from 10:00 under a token that dies at 10:30 would date the page 10:00
+        (marketlake #747). The wait and ``minutes`` read one number, so ``minutes`` is
+        never below the threshold. The slot is already in ET, and :meth:`_roll` clears the
+        count at the ET date change, so ``since`` always falls inside the session.
+
+        Waiting instead for every failed surface's own count to reach the threshold let a
+        ticker joining mid-outage split the cause. Its young counter held the cause back,
+        the older surfaces paged on their own, and the cause paged late, dated from the
+        join (marketlake #768).
         """
         title = _whole_daemon_title(tally)
         if title is None:
@@ -484,10 +515,10 @@ class Watchdog:
         error_class = next(c for c in tally.recorded.values() if c is not None)
         if title in self._paged_causes:
             return []
-        if any(self._counts.get(key, 0) < threshold for key in failed):
+        minutes = self._minutes_without_data
+        if minutes < threshold:
             return None
         self._paged_causes[title] = set(failed)
-        minutes = min(self._counts[key] for key in failed)
         return [
             Page(
                 title=title,
@@ -518,6 +549,7 @@ class Watchdog:
             self._paged_overrun = False
             self._out_of_span.clear()
             self._paged_out_of_span.clear()
+            self._minutes_without_data = 0
 
     def _reset(self, key: Surface) -> None:
         self._counts[key] = 0

@@ -4,7 +4,7 @@ This is the single production home for path construction. It covers two location
 
 The lake is the first. Give it a ``lake_root`` and it builds every path the lake
 uses: the surface partitions, the journal segments, the daemon's journal metadata
-stamp, the three append-only ledgers, and the reference tables. The root is an argument,
+stamp, the four append-only ledgers, and the reference tables. The root is an argument,
 so a test points it at a throwaway directory and production points it at the configured
 ``lake_root``.
 
@@ -90,7 +90,7 @@ SURFACES = (CHAINS, QUOTES, BARS, ACTIONS)
 DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 
 # The journal top-level directory, the reference directory, the reports directory,
-# and the two lake-root ledgers. ``reports/`` holds one dated file per vendor-sweep run,
+# and the three lake-root ledgers. ``reports/`` holds one dated file per vendor-sweep run,
 # written by ``lake.sweep`` and named by the day it is about, then by the stamp and the
 # writing process's id. Two runs on one night are two verdicts rather than a correction,
 # because nothing here resolves one file against another. Five more trees sit under it,
@@ -122,6 +122,12 @@ REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
+
+# The trimmed ledger, the fourth append-only ledger, written by ``lake.trimmed``. It records
+# each dated partition removed from the lake on purpose once its bucket copy was verified,
+# chains first, so a reader can tell a partition dropped by design from one lost. Marketlake
+# #782 built it.
+TRIMMED_FILE = "trimmed.jsonl"
 
 # The one entry a fresh ext4 filesystem holds at its root. On the hosted VM ``lake_root``
 # is the lake volume's mount point, so the directory sits beside the surfaces, owned by
@@ -320,6 +326,11 @@ class LakePaths:
     def quarantine_path(self) -> Path:
         """The quarantine ledger. It sits inside the backup root, beside the data."""
         return self.root / QUARANTINE_FILE
+
+    @property
+    def trimmed_path(self) -> Path:
+        """The trimmed ledger: the partitions removed on purpose, beside the manifest."""
+        return self.root / TRIMMED_FILE
 
     # -- reference -----------------------------------------------------------
 
@@ -581,6 +592,7 @@ __all__ = [
     "TICKER_PREFIX",
     "TIMING_DIR",
     "TOKEN_FILE",
+    "TRIMMED_FILE",
     "LakePaths",
     "PartitionRef",
     "SegmentRef",

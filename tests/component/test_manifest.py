@@ -1185,6 +1185,26 @@ def test_a_byte_order_mark_on_a_one_entry_ledger_refuses_instead_of_lifting_it(l
     assert str(quarantine_path(lake_root)) in str(refusal.value)
 
 
+def test_the_quarantine_mark_refusal_still_says_what_that_ledger_loses(lake_root):
+    """Marketlake #782 moved this sentence into ``_decode``'s default, for the trimmed ledger.
+
+    The trimmed ledger passes its own sentence, so only the quarantine ledger reads the default.
+    Emptying the default passed the full suite until this test, and the quarantine refusal then
+    named no loss at all.
+    """
+    append_quarantine(lake_root, _verdict("chains/ticker=SPY/date=2026-09-16.parquet"))
+    _mark_before(lake_root, b"{")
+
+    with pytest.raises(LedgerHasByteOrderMark) as refusal:
+        read_quarantine(lake_root)
+
+    assert (
+        "Read past it, a verdict is either discarded or filed under a name no reader asks "
+        "about, so this ledger cannot say which partitions it withholds. Repairing a ledger is "
+        "a human's job under the lock." in str(refusal.value)
+    )
+
+
 def test_a_byte_order_mark_before_the_last_line_refuses_at_any_ledger_length(lake_root):
     """One entry is when the damage is reachable, not what makes it possible.
 

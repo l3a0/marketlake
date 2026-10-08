@@ -135,6 +135,33 @@ def test_a_contract_absent_from_the_session_before_the_boundary_still_pairs():
     assert pairing.pairs == (Pair(ssid=1, old_symbol=OLD, valid_from=DAY_ONE, new_symbol=NEW),)
 
 
+def test_an_exported_history_imports_back_with_every_contract_symbol_and_first_day():
+    """A walk resumed after a trim pairs and dates exactly as the walk that saved it would.
+
+    The three contracts were first read on three different days, and one of them moved symbol
+    on the third, so a round trip that kept the symbol and lost the day, or kept the first day
+    of the old symbol, would show here.
+    """
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(1, OLD)])
+    history.observe(DAY_TWO, [_row(1, OLD), _row(2, OTHER)])
+    history.observe(DAY_THREE, [_row(1, NEW), _row(2, OTHER), _row(3, NEWER)])
+
+    exported = history.export()
+    restored = SymbolHistory.from_export(exported)
+
+    assert exported == ((1, NEW, DAY_THREE), (2, OTHER, DAY_TWO), (3, NEWER, DAY_THREE))
+    assert restored.export() == exported
+    rows = [_row(1, NEWER), _row(2, OLD), _row(4, OTHER)]
+    assert restored.inspect(rows) == history.inspect(rows)
+
+
+def test_an_import_naming_one_contract_twice_is_refused():
+    """Letting the second entry win would re-date the contract in silence."""
+    with pytest.raises(ValueError, match="names contract 1 twice"):
+        SymbolHistory.from_export([(1, OLD, DAY_ONE), (1, NEW, DAY_TWO)])
+
+
 def test_a_contract_the_history_has_never_seen_is_a_new_listing_and_not_a_pair():
     """New contracts list under an adjusted root as readily as under a standard one."""
     history = SymbolHistory()
@@ -625,3 +652,16 @@ def test_an_ambiguous_master_is_what_the_old_symbol_guard_exists_to_avoid():
 
     with pytest.raises(AmbiguousSymbol):
         master.resolve(OLD, DAY_TWO, id_type=ID_TYPE_OCC)
+
+
+def test_an_export_is_in_ssid_order_whatever_order_contracts_were_first_read():
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(3, NEWER)])
+    history.observe(DAY_TWO, [_row(1, OLD), _row(2, OTHER)])
+
+    assert [ssid for ssid, _, _ in history.export()] == [1, 2, 3]
+
+
+def test_an_import_naming_one_contract_twice_is_refused_even_when_both_agree():
+    with pytest.raises(ValueError, match="names contract 1 twice"):
+        SymbolHistory.from_export([(1, OLD, DAY_ONE), (1, OLD, DAY_ONE)])
