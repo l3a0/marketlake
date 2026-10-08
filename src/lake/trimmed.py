@@ -493,8 +493,8 @@ def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None
                     "bucket's copy, then re-record its manifest entry with "
                     "lake.trimmed.refresh_trimmed_entry."
                 )
-            # Only the appended lines are left, and the reader's refusals name their damage.
-            read_trimmed(root)
+        # Only lines appended after the entry are left unchecked. The refresh reads the ledger
+        # before it records, so the reader's refusals name any damage in them.
         refresh_trimmed_entry(root, source=source, fetched_at=fetched_at)
     except TrimmedRepairRefused:
         raise
