@@ -522,6 +522,10 @@ def test_an_unsealed_session_among_the_uncaptured_stops_the_cutoff_before_them(
 
 
 def test_a_session_the_lake_never_captured_does_not_stop_the_cutoff(fixture_lake: FixtureLake):
+    """A file compaction would never seal is not a segment, so day three counts as uncaptured."""
+    directory = LakePaths(fixture_lake.root).segment_dir(CHAINS, "SPY", DAY_THREE)
+    directory.mkdir(parents=True)
+    (directory / "stray.arrows").write_bytes(b"")
     base = _lake(fixture_lake, _days(DAY_ONE, DAY_FOUR))
 
     report_out = _run(_copy(base, "one-pass"))
