@@ -2612,3 +2612,175 @@ def test_a_ticker_that_left_and_rejoined_is_not_released_by_the_sampler_page_bef
         (2, "Capture down: quote sampler dead", "http_500"),
         (7, "Capture down: IWM quotes", "o_s_error"),
     ]
+
+
+# -- a ticker the sampler page silenced is heard once the collapse stops holding ------
+
+
+def test_every_quotes_write_failing_after_a_sampler_page_pages_each_ticker_at_once():
+    """The batched request answered, so the sampler page no longer speaks for any ticker.
+
+    Every quotes write fails from minute 3 while the chain keeps landing data, so no quotes
+    surface lands data all session and the dead-man stays fed. A write failure records no
+    vendor class, so the sampler's set is empty and the collapse no longer holds. Each
+    ticker is already past the threshold and no cause covers it, so each pages under its
+    own title in that minute. Waiting for quotes data left all three silent.
+    """
+    cycles = [
+        _sampler_minute(minute, {"SPY": True, "QQQ": True, "IWM": True}) for minute in range(3)
+    ]
+    cycles += [
+        _cycle(
+            _seg("chains", "SPY", "data"),
+            errors=tuple(_quotes_write_failed(ticker) for ticker in ("SPY", "QQQ", "IWM")),
+            at=_at(minute),
+        )
+        for minute in range(3, 7)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (
+            2,
+            "Capture down: quote sampler dead",
+            "http_500",
+            3,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
+        (3, "Capture down: IWM quotes", "o_s_error", 4, ("IWM quotes",)),
+        (3, "Capture down: QQQ quotes", "o_s_error", 4, ("QQQ quotes",)),
+        (3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",)),
+    ]
+
+
+def test_a_ticker_whose_write_fails_after_a_sampler_page_pages_while_the_batch_stays_dead():
+    """A ticker that leaves the sampler's set is heard even while the collapse holds.
+
+    The sampler page names SPY, QQQ and IWM. SPY's write fails from minute 3, so the failed
+    request no longer explains it, and it pages ``o_s_error`` at once. QQQ and IWM still
+    fail the vendor's way, so they stay with the sampler page. IWM then leaves for two
+    minutes, which leaves a sampler's set of one, so QQQ is released and pages too. IWM
+    returns with a fresh count, and when it trips with QQQ the collapse sends a second
+    sampler page, the price #570 already names for a ticker that returns.
+    """
+    cycles = []
+    for minute in range(10):
+        segments = [_fail("quotes", "QQQ", "http_500"), _seg("chains", "SPY", "data")]
+        errors: tuple = ()
+        if minute < 3:
+            segments.append(_fail("quotes", "SPY", "http_500"))
+        else:
+            errors = (_quotes_write_failed("SPY"),)
+        if minute not in (4, 5):
+            segments.append(_fail("quotes", "IWM", "http_500"))
+        cycles.append(_cycle(*segments, errors=errors, at=_at(minute)))
+    assert _raised(Watchdog(), cycles) == [
+        (
+            2,
+            "Capture down: quote sampler dead",
+            "http_500",
+            3,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
+        (3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",)),
+        (4, "Capture down: QQQ quotes", "http_500", 5, ("QQQ quotes",)),
+        (8, "Capture down: quote sampler dead", "http_500", 9, ("IWM quotes", "QQQ quotes")),
+    ]
+
+
+def test_a_ticker_named_early_pages_at_its_threshold_once_its_only_batch_mate_leaves():
+    """A sampler's set of one is not a dead sampler, so the ticker left in it is heard.
+
+    T0 fails from minute 0 and T1 from minute 2, so the sampler page names T1 below the
+    threshold. T0 then falls outside every capture span. No quotes surface lands data, so
+    waiting for one left T1 silent all session. With T0 gone the collapse no longer holds,
+    and T1 pages under its own title when it reaches the threshold at minute 4.
+    """
+    cycles = []
+    for minute in range(5):
+        segments = [
+            _fail("quotes", "T1", "http_500") if minute >= 2 else _seg("quotes", "T1", "data"),
+            _seg("chains", "T1", "data"),
+        ]
+        if minute < 3:
+            segments.append(_fail("quotes", "T0", "http_500"))
+        out = ("T0",) if minute >= 3 else ()
+        cycles.append(_clamped(*segments, out=out, at=_at(minute)))
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("T0 quotes", "T1 quotes")),
+        (4, "Capture down: T1 quotes", "http_500", 3, ("T1 quotes",)),
+    ]
+
+
+def _batch_minute(minute: int, quotes: dict[str, str], errors: tuple = ()) -> CycleResult:
+    """One minute of quotes tickers each ``"down"`` (``http_500``) or ``"up"`` (data).
+
+    A ticker missing from ``quotes`` is not touched, so it has left the cycle. ``chains
+    SPY`` lands data every minute, as in ``_sampler_minute``.
+    """
+    segments = [
+        _fail("quotes", ticker, "http_500") if state == "down" else _seg("quotes", ticker, "data")
+        for ticker, state in quotes.items()
+    ]
+    return _cycle(*segments, _seg("chains", "SPY", "data"), errors=errors, at=_at(minute))
+
+
+def test_a_second_sampler_page_keeps_the_tickers_the_first_one_silenced():
+    """Two sampler pages in one outage add to what is silenced rather than replace it.
+
+    The first page names SPY and QQQ. IWM joins failing and trips the second page. When SPY
+    lands data, QQQ is still failing, so it pages along with IWM. Keeping only the second
+    page's new tickers would have left QQQ silent.
+    """
+    cycles = []
+    for minute in range(9):
+        quotes = {"SPY": "down" if minute < 7 else "up", "QQQ": "down"}
+        if minute >= 3:
+            quotes["IWM"] = "down"
+        cycles.append(_batch_minute(minute, quotes))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (5, "Capture down: quote sampler dead"),
+        (7, "Capture down: IWM quotes"),
+        (7, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_a_write_failure_recovering_releases_the_tickers_the_sampler_page_silenced():
+    """Any quotes ticker landing data ends the collapse, not only one the page silenced.
+
+    SPY's write fails from the start, so it pages on its own and the sampler page names
+    only QQQ and IWM. When SPY lands data at minute 5, the batch has answered, so QQQ and
+    IWM, still failing, each page under their own title.
+    """
+    cycles = []
+    for minute in range(8):
+        if minute < 5:
+            quotes = {"QQQ": "down", "IWM": "down"}
+            cycles.append(_batch_minute(minute, quotes, (_quotes_write_failed("SPY"),)))
+        else:
+            cycles.append(_batch_minute(minute, {"SPY": "up", "QQQ": "down", "IWM": "down"}))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (2, "Capture down: SPY quotes"),
+        (5, "Capture down: IWM quotes"),
+        (5, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_one_silenced_ticker_leaving_keeps_the_rest_silenced_while_the_collapse_holds():
+    """A departure forgets only the ticker that left, so the rest are still heard later.
+
+    The sampler page names all three. IWM leaves at minute 3, and SPY and QQQ still form a
+    sampler's set of two, so the collapse holds and nothing pages. When SPY lands data at
+    minute 5, QQQ is still failing and pages. Forgetting every silenced ticker on IWM's
+    departure would have left QQQ silent.
+    """
+    cycles = []
+    for minute in range(8):
+        quotes = {"SPY": "down" if minute < 5 else "up", "QQQ": "down"}
+        if minute < 3:
+            quotes["IWM"] = "down"
+        cycles.append(_batch_minute(minute, quotes))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (5, "Capture down: QQQ quotes"),
+    ]

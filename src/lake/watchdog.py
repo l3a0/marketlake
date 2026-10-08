@@ -539,9 +539,6 @@ class Watchdog:
         # This surface is back, so no cause covers it now. A cause that named others is
         # still true of them and stays live until the last one is released.
         self._release(key)
-        if key.surface == QUOTES_SURFACE and self._sampler_absorbed:
-            self._paged -= self._sampler_absorbed
-            self._sampler_absorbed.clear()
 
     def _release(self, key: Surface) -> None:
         """Take one surface out of the causes covering it, dropping one that empties.
@@ -735,15 +732,6 @@ class Watchdog:
         ticker too, and calling that a dead sampler would name a batched request nobody
         made. ``missed`` folds its own page instead and never arrives here.
         """
-        tripped = [
-            key
-            for key in sorted(failed, key=str)
-            if self._counts.get(key, 0) >= threshold
-            and key not in self._paged
-            and not self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
-        ]
-        if not tripped:
-            return []
         quotes_failed = {key for key in failed if key.surface == QUOTES_SURFACE}
         quotes_watched = {key for key in watched if key.surface == QUOTES_SURFACE}
         recorded = set(recorded)
@@ -753,12 +741,22 @@ class Watchdog:
             if key in recorded
             and not self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
         }
-        collapsed = (
-            len(quotes_watched) > 1
-            and quotes_failed == quotes_watched
-            and len(sampler) >= 2
-            and any(key in sampler for key in tripped)
-        )
+        holds = len(quotes_watched) > 1 and quotes_failed == quotes_watched and len(sampler) >= 2
+        # A ticker a sampler page silenced is heard again once the collapse no longer
+        # explains it, before ``tripped`` is built, so one at the threshold pages now.
+        explained = sampler if holds else set()
+        self._paged -= self._sampler_absorbed - explained
+        self._sampler_absorbed &= explained
+        tripped = [
+            key
+            for key in sorted(failed, key=str)
+            if self._counts.get(key, 0) >= threshold
+            and key not in self._paged
+            and not self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
+        ]
+        if not tripped:
+            return []
+        collapsed = holds and any(key in sampler for key in tripped)
         if collapsed:
             self._sampler_absorbed |= sampler - self._paged
             self._paged |= sampler
