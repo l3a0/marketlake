@@ -780,8 +780,8 @@ def test_the_ticker_days_come_from_the_manifest_and_name_the_quotes_surface(
 def test_the_append_refreshes_the_manifest_entry(fixture_lake: FixtureLake):
     """The ledger is manifested like any lake file.
 
-    The reverse scrub names ``manifest.jsonl``, ``journal/`` and ``reports/`` alone, so a write
-    that skipped its manifest entry would be reported as an orphan.
+    The reverse scrub names ``manifest.jsonl``, ``journal/``, ``reports/`` and ``lost+found/``
+    alone, so a write that skipped its manifest entry would be reported as an orphan.
     """
     from lake.manifest import latest_entries
 

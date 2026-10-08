@@ -52,14 +52,15 @@ per-check answer and the ledger carries the partition's readability, and only a 
 ``verdict`` is one of :data:`VERDICTS` ever reaches the ledger.
 
 **The writer takes the lock and refreshes the ledger's manifest entry, in one invocation.**
-``manifest.SCRUB_EXCLUSIONS`` holds the manifest, ``journal/`` and ``reports/`` and nothing
-else, and the comment above it says each ledger writer refreshes its own manifest entry in the
-same locked invocation that appends the row, because that is the check which catches a verdict
-written without its entry. ``quarantine.jsonl`` is not excluded, so an unmanifested ledger is an
-orphan to the Sunday scrub. #139 requires the same of the sign-off tool, and ``lake.signoff``
-meets it at :func:`append_verdict` rather than at the bare append. ``actions.append`` is
-the worked precedent and :func:`append_verdict` follows it, down to counting the file's lines
-rather than the entries a read returns, so a damaged ledger cannot stop the writer.
+``manifest.SCRUB_EXCLUSIONS`` holds the manifest, ``journal/``, ``reports/`` and
+``lost+found/`` and nothing else, and the comment above it says each ledger writer refreshes
+its own manifest entry in the same locked invocation that appends the row, because that is the
+check which catches a verdict written without its entry. ``quarantine.jsonl`` is not excluded,
+so an unmanifested ledger is an orphan to the Sunday scrub. #139 requires the same of the
+sign-off tool, and ``lake.signoff`` meets it at :func:`append_verdict` rather than at the bare
+append. ``actions.append`` is the worked precedent and :func:`append_verdict` follows it, down
+to counting the file's lines rather than the entries a read returns, so a damaged ledger cannot
+stop the writer.
 
 The pair sits at two levels rather than one. :func:`append_verdict` takes the lock and is what
 ``lake.signoff`` and any other caller holding none wants. :func:`write_verdict` is the same two

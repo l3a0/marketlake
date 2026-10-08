@@ -20,8 +20,8 @@ writing beside a nightly job.
 2. *Last entry wins*, keyed by ``(instrument_id, ex_date, type)``. A correction is a
    superseding entry, never a rewrite of the one it corrects.
 3. *It is manifested and scrubbed like any lake file.* The reverse scrub's exclusion set
-   names ``manifest.jsonl``, ``journal/`` and ``reports/`` alone, so a write that skipped
-   its manifest entry would be reported as an orphan.
+   names ``manifest.jsonl``, ``journal/``, ``reports/`` and ``lost+found/`` alone, so a
+   write that skipped its manifest entry would be reported as an orphan.
 
 **Append-only, because of look-ahead bias.** Rewriting the file would mean a dividend
 corrected in August silently rewrites June's factor, and nothing could then say what the

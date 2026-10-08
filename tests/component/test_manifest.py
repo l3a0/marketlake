@@ -602,6 +602,160 @@ def test_slice1_segment_entry_is_superseded_by_its_compacted_partition(fixture_l
     assert scrub(lake.root).ok
 
 
+# -- paths the scrub cannot read, and paths it must leave alone (marketlake #441) --------
+
+# The Sunday-level half of these, where each finding withholds the ping and names its path,
+# lives in ``tests/component/test_control_plane_sunday.py``. These are the cases that come
+# back clean or ``missing``, with nothing ``unreadable``, plus the walk's own rules.
+
+_no_root_chmod = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root reads and lists past every permission bit"
+)
+
+
+@_no_root_chmod
+def test_lost_and_found_at_the_root_scrubs_clean_at_mode_000(fixture_lake):
+    # On the hosted VM the lake root is the volume's mount point, and ``mkfs.ext4`` leaves
+    # ``lost+found`` there owned by root. A walk that listed it would fail every Sunday.
+    root = _base_lake(fixture_lake).root
+    found = root / "lost+found"
+    found.mkdir()
+    (found / "#12345").write_bytes(b"recovered")
+    found.chmod(0)
+    try:
+        result = scrub(root)
+    finally:
+        found.chmod(0o755)
+    assert result.ok, result
+    assert result.unreadable == ()
+
+
+@_no_root_chmod
+@pytest.mark.parametrize("mode", [0o000, 0o444], ids=["000", "0444"])
+def test_an_unreadable_directory_under_journal_is_never_entered(fixture_lake, mode):
+    # Mode 000 is the case a walk that descended into the excluded tree would report. At
+    # 0444 the old reverse pass raised from ``is_file()`` before it checked the exclusion.
+    root = _base_lake(fixture_lake).root
+    locked = root / "journal" / "date=2026-08-24"
+    locked.mkdir(parents=True)
+    (locked / "seg-1.arrows").write_bytes(b"segment")
+    locked.chmod(mode)
+    try:
+        result = scrub(root)
+    finally:
+        locked.chmod(0o755)
+    assert result.ok, result
+    assert result.unreadable == ()
+
+
+def test_unreachable_manifested_paths_stay_missing_rather_than_unreadable(fixture_lake):
+    # ``exists()`` answers False for all three, and a file behind any of them cannot be intact.
+    root = _base_lake(fixture_lake).root
+    loop = "chains/ticker=SPY/loop.parquet"
+    os.symlink("loop.parquet", root / loop)
+    under_a_file = f"{CHAINS_REL}/inner.parquet"
+    dangling = "chains/ticker=SPY/dangling.parquet"
+    os.symlink("nowhere.parquet", root / dangling)
+    for partition in (loop, under_a_file, dangling):
+        append_manifest(
+            root, partition=partition, source="capture", sha256="s", rows=1, fetched_at=None
+        )
+
+    result = scrub(root)
+
+    assert result.missing == tuple(sorted((loop, under_a_file, dangling)))
+    assert result.unreadable == ()
+    assert result.sha_mismatches == () and result.orphans == ()
+
+
+def test_a_file_deleted_between_exists_and_the_hash_is_missing(fixture_lake, monkeypatch):
+    # Compaction or a trim can unlink a file under the scrub. The absent branch is what the
+    # scrub would have reported a moment later, so a ``FileNotFoundError`` takes it.
+    root = _base_lake(fixture_lake).root
+    real = manifest.sha256_file
+
+    def unlink_then_read(path: Path) -> str:
+        if Path(path) == root / QUOTES_REL:
+            Path(path).unlink()
+        return real(path)
+
+    monkeypatch.setattr(manifest, "sha256_file", unlink_then_read)
+
+    result = scrub(root)
+
+    assert result.missing == (QUOTES_REL,)
+    assert result.unreadable == ()
+
+
+def _scandir_failing(monkeypatch, target: Path, exc: OSError) -> None:
+    """Make ``os.scandir`` raise ``exc`` for one directory, the way ``os.walk`` meets it."""
+    real = os.scandir
+
+    def scandir(path="."):
+        if Path(os.fsdecode(path)) == target:
+            raise exc
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+
+def test_a_directory_that_vanishes_mid_walk_is_skipped_without_a_finding(fixture_lake, monkeypatch):
+    # Compaction prunes an emptied directory under the lake lock, so a directory the walk
+    # just saw can be gone when it is listed. That is a lake behaving as designed.
+    root = _base_lake(fixture_lake).root
+    gone = root / "chains" / "ticker=SPY"
+    _scandir_failing(
+        monkeypatch, gone, FileNotFoundError(errno.ENOENT, "No such file", os.fspath(gone))
+    )
+
+    result = scrub(root)
+
+    assert result.ok, result
+    assert result.unreadable == ()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(PermissionError(errno.EACCES, "Permission denied"), id="unlistable"),
+        pytest.param(FileNotFoundError(errno.ENOENT, "No such file"), id="vanished"),
+    ],
+)
+def test_a_lake_root_that_will_not_list_is_named_as_the_lake_root(fixture_lake, monkeypatch, exc):
+    # The root vanishing is not the pruned-directory case, because it cannot be told apart
+    # from a lake that is not there.
+    root = _base_lake(fixture_lake).root
+    exc.filename = os.fspath(root)
+    _scandir_failing(monkeypatch, root, exc)
+
+    result = scrub(root)
+
+    assert result.unreadable == (f"the lake root: {type(exc).__name__}",)
+    assert not result.ok
+
+
+def test_an_unstattable_orphan_is_unreadable_whatever_its_error(fixture_lake, monkeypatch):
+    # ``is_file()`` raises every ``OSError`` but four errnos, so a catch narrowed to
+    # ``PermissionError`` would let an ``EIO`` escape and hide every other finding.
+    root = _base_lake(fixture_lake).root
+    orphan = root / "bars" / "orphan.parquet"
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"x")
+    real = Path.is_file
+
+    def is_file(self, *args, **kwargs):
+        if self == orphan:
+            raise OSError(errno.EIO, "Input/output error", os.fspath(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+
+    result = scrub(root)
+
+    assert result.unreadable == ("bars/orphan.parquet: OSError",)
+    assert result.orphans == ()
+
+
 # -- the quarantine ledger ---------------------------------------------------
 
 

@@ -125,6 +125,7 @@ from lake.manifest import (
     BackupScrubResult,
     RestoreResult,
     ScrubResult,
+    _named,
     backup_scrub,
     path_reader,
     restore_check,
@@ -2347,21 +2348,30 @@ class SundayOutcome:
 
     ``problems`` are the findings that withhold the ping, plus the ping's own failure
     when it is reached and fails. The withholding ones are a missing lake root, a
-    failed scrub, a failed backup scrub, a failed restore test, a failed canary, a token
-    that does not cover the coming week, and a mint time that could not be read. The
+    failed scrub, a scrub that raised and so could not run, a failed backup scrub, a
+    backup scrub that raised, a failed restore test, a failed canary, a token that does
+    not cover the coming week, and a mint time that could not be read. The
     ping's failure is different in kind. It is recorded after the others have all
     passed, and it names why the ping did not land rather than why it was not attempted.
 
-    ``report`` carries the report-tier findings. Two kinds ride it. The first is pmset
+    ``report`` carries the report-tier findings. Three kinds ride it. The first is pmset
     alarm drift, which the design pins to the nightly report because the pre-open
-    self-check already catches a missed wake an hour before the bell. The second is
+    self-check already catches a missed wake an hour before the bell. The second is the
+    path of every file the lake scrub found missing, wrong, unrecorded or unreadable,
+    capped per kind, because its problem line carries counts alone. The third is
     everything the backup scrub names rather than pages for. That covers the path of
     every file it found wrong, because a count decides whether to ping and only a path
     says where to look. It also covers an extra file on the copy and a copy behind its
     lake, neither of which can be lake data going missing. How far behind reads by eye
     from the partition count, and one run carries no history of the last one. The
     restore test's own findings ride it the same way, each file it read back wrong and
-    the repair for it.
+    the repair for it. The lines run in that order, alarms, then the lake, then its copy,
+    then the restore test, which is not the order the steps run. It is the order a reader
+    wants: the cheap alarm lines first, then the lake, then its copy.
+
+    ``scrub`` is the lake scrub's result. It is ``None`` when the scrub did not run,
+    because the lake root is missing or because the scrub raised, and a problem line says
+    which.
 
     ``restore`` is the restore test's result. It is ``None`` when the test did not run,
     because the backup scrub stopped before the end of its walk, or because a shadow host
@@ -2390,7 +2400,7 @@ class SundayOutcome:
     one attempt and cannot see the ones before it.
     """
 
-    scrub: ScrubResult
+    scrub: ScrubResult | None
     backup: BackupScrubResult | None
     alarms: AlarmCheck | None
     canary_passed: bool
@@ -2566,26 +2576,49 @@ def sunday_maintenance(
     """
     problems: list[str] = []
 
+    # Each scrub call is guarded, because every other Sunday check runs after it. A scrub
+    # contains what it can name per path, so what reaches a guard is a fault that leaves
+    # nothing per path to say, such as a ``manifest.jsonl`` that cannot be read or a line
+    # in it naming no partition. The catch is broad because those shapes include
+    # ``KeyError`` and ``AttributeError``, and a withheld ping still fails loud, so nothing
+    # is hidden. A missing root skips the scrub, whose walk would name the root a second
+    # time. ``is_dir`` sits inside the guard because it raises when the root's parent
+    # cannot be searched.
     root = Path(lake_root)
-    if not root.is_dir():
-        problems.append(f"lake root missing: {root}")
-    result = scrub(root)
-    if not result.ok:
-        # The trimmed ledger's field is named only when it is set, so a lake that never trims
-        # renders this line exactly as it did before the ledger existed.
-        unreadable = " trimmed_ledger=unreadable" if result.trimmed_unreadable is not None else ""
+    result: ScrubResult | None = None
+    try:
+        if not root.is_dir():
+            problems.append(f"lake root missing: {root}")
+        else:
+            result = scrub(root)
+    except Exception as exc:
+        problems.append(f"lake scrub could not run: {type(exc).__name__}: {exc}")
+    lake_lines: list[str] = []
+    if result is not None and not result.ok:
+        # Each field is named only when it is set, so a lake that never trims and reads
+        # every path renders this line exactly as it did before either field existed.
+        ledger = " trimmed_ledger=unreadable" if result.trimmed_unreadable is not None else ""
+        unreadable = f" unreadable={len(result.unreadable)}" if result.unreadable else ""
         problems.append(
             "scrub failed: "
             f"missing={len(result.missing)} sha_mismatches={len(result.sha_mismatches)} "
-            f"orphans={len(result.orphans)}{unreadable}"
+            f"orphans={len(result.orphans)}{unreadable}{ledger}"
         )
-    if result.trimmed_unreadable is not None:
+        # The count decides the ping, and only a path says where to look. They wait for
+        # ``report``, which is assembled after the backup step.
+        lake_lines += _named("lake file missing", result.missing)
+        lake_lines += _named("lake file does not match its sha", result.sha_mismatches)
+        lake_lines += _named("lake file has no manifest entry", result.orphans)
+        lake_lines += _named("lake path could not be read", result.unreadable)
+    if result is not None and result.trimmed_unreadable is not None:
         problems.append(
             "trimmed ledger unreadable, so every absent file counts as missing: "
             f"{result.trimmed_unreadable}"
         )
 
-    # ``None`` is the shadow role's skip, and it skips every form of the backup step.
+    # ``None`` is the shadow role's skip, and it skips every form of the backup step. A
+    # backup scrub that raises becomes the ``unreadable`` finding its own ``except OSError``
+    # would have set, so the restore test is skipped and the line reads as the backup's.
     backup: BackupScrubResult | None = None
     if backup_target is None:
         backup = None
@@ -2596,9 +2629,19 @@ def sunday_maintenance(
             raise ValueError("a bucket backup_target needs a bucket_client to scrub it")
         from lake.bucket import bucket_scrub  # lazy: lake.bucket imports this module
 
-        backup = bucket_scrub(root, backup_target, bucket_client)
+        try:
+            backup = bucket_scrub(root, backup_target, bucket_client)
+        except Exception as exc:
+            backup = BackupScrubResult(
+                target=str(backup_target), unreadable=f"{type(exc).__name__}: {exc}"
+            )
     else:
-        backup = backup_scrub(root, Path(backup_target))
+        try:
+            backup = backup_scrub(root, Path(backup_target))
+        except Exception as exc:
+            backup = BackupScrubResult(
+                target=str(backup_target), unreadable=f"{type(exc).__name__}: {exc}"
+            )
     if backup is not None and backup.problem is not None:
         problems.append(backup.problem)
 
@@ -2654,6 +2697,7 @@ def sunday_maintenance(
         else:
             alarms = check_alarms(schedule, one_shot_date=expected_one_shot(now, calendar))
     report = list(alarms.problems) if alarms is not None else []
+    report.extend(lake_lines)
 
     if backup is None:
         report.append(BACKUP_SCRUB_SKIPPED)
