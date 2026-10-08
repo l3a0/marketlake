@@ -286,6 +286,16 @@ def test_a_fifo_at_the_stamp_reads_as_empty_without_being_opened(lake_root):
     assert read_metadata(lake_root).dead_man_last_ping == PING
 
 
+def test_a_directory_at_the_stamp_reads_as_empty(lake_root):
+    # The regular-file check refuses it before any open. Were the check narrowed to FIFOs,
+    # the open's ``IsADirectoryError`` would read as empty all the same, so this covers the
+    # shape rather than the check.
+    path = metadata_path(lake_root)
+    path.mkdir(parents=True)
+
+    assert read_metadata(lake_root) == JournalMetadata()
+
+
 def test_a_stamp_reached_through_a_symlink_still_reads(lake_root, tmp_path):
     real = tmp_path / "elsewhere.json"
     real.write_text(json.dumps({ASSERTION_PID: 4242}))

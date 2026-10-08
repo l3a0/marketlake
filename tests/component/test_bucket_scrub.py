@@ -314,6 +314,22 @@ def test_reports_and_the_journal_are_skipped_by_the_reverse_pass(tmp_path):
     assert bucket_scrub(lake, TARGET, client).orphans == ()
 
 
+def test_lost_and_found_in_the_bucket_is_not_an_orphan(tmp_path):
+    """The reverse pass skips ``SCRUB_EXCLUSIONS``, which includes ``lost+found/``.
+
+    The test above covers only the older entries. Reverting ``SCRUB_EXCLUSIONS`` to its
+    three entries before marketlake #441 names the object under ``lost+found/`` as an
+    orphan, and this fails.
+    """
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key("lost+found/#12345"), b"recovered")
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.orphans == ()
+    assert result.ok and result.notes == ()
+
+
 def test_objects_outside_the_prefix_are_not_the_lakes(tmp_path):
     lake, client = _uploaded(tmp_path / "lake")
     client.store("live-check-20261005T000000Z/probe", b"probe")
@@ -621,6 +637,32 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_bucket_target(
     # The lake guard always fired here, and the bucket guard when the bucket scrub raised.
     # Each kept the stack trace, so a bug in a scrub is not lost to the line.
     assert _tracebacks_printed(capsys.readouterr().err) == 1 + raised
+    assert pinger.urls == []
+    assert outcome.canary_passed and outcome.covered is True
+
+
+def test_a_bug_in_the_bucket_scrub_is_a_problem_line_with_its_trace(tmp_path, monkeypatch, capsys):
+    """The bucket guard catches ``Exception``, not only what a damaged manifest raises.
+
+    ``AttributeError`` is a plain bug, and no damaged-manifest shape raises it here. With
+    the guard narrowed to ``ManifestError`` it leaves the Sunday job, and this fails.
+    """
+    lake, client = _uploaded(tmp_path / "lake")
+
+    def bug(*args, **kwargs):
+        raise AttributeError("a bug in the scrub")
+
+    monkeypatch.setattr(bucket, "bucket_scrub", bug)
+    capsys.readouterr()
+
+    outcome, pinger = _sunday(lake, client)
+
+    assert outcome.problems == (
+        "backup could not be read: the backup scrub raised AttributeError: a bug in the scrub",
+    )
+    assert outcome.backup.target == str(TARGET)
+    assert outcome.restore is None
+    assert _tracebacks_printed(capsys.readouterr().err) == 1
     assert pinger.urls == []
     assert outcome.canary_passed and outcome.covered is True
 

@@ -2040,6 +2040,35 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
     _withheld_and_still_ran(outcome, pinger)
 
 
+def test_a_bug_in_either_scrub_is_a_problem_line_with_its_trace(fixture_lake, monkeypatch, capsys):
+    """The lake and path backup guards catch ``Exception``, not only a damaged manifest's raise.
+
+    ``AttributeError`` is a plain bug, and none of the damaged-manifest shapes above raise
+    it. With the lake guard narrowed to ``(KeyError, OSError, ManifestError)``, or the path
+    backup guard narrowed to ``(KeyError, ManifestError)``, it leaves the Sunday job, and
+    this fails. ``_backup_scrub_raised`` writing an empty ``target`` fails it too.
+    """
+    root = _clean_lake(fixture_lake)
+
+    def bug(*args, **kwargs):
+        raise AttributeError("a bug in the scrub")
+
+    monkeypatch.setattr(cp, "scrub", bug)
+    monkeypatch.setattr(cp, "backup_scrub", bug)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub is None
+    assert outcome.problems == (
+        "lake scrub could not run: AttributeError: a bug in the scrub",
+        "backup could not be read: the backup scrub raised AttributeError: a bug in the scrub",
+    )
+    assert outcome.backup.target == str(_backup_of(root))
+    assert outcome.restore is None
+    assert _tracebacks_printed(capsys.readouterr().err) == 2
+    _withheld_and_still_ran(outcome, pinger)
+
+
 @_no_root_chmod
 def test_an_unreadable_lake_manifest_is_named_by_each_scrub(fixture_lake):
     # Made after the copy, since the copy refuses an unreadable file. The backup scrub names

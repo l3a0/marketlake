@@ -170,6 +170,23 @@ def test_the_reverse_pass_skips_what_the_lake_s_own_scrub_skips(fixture_lake):
     assert backup_scrub(root, target).ok
 
 
+def test_lost_and_found_on_the_copy_is_not_an_orphan(fixture_lake):
+    """``lost+found/`` is in the exclusion set, so the copy's reverse pass skips it too.
+
+    A path target can be a volume's mount point, where ``fsck`` leaves recovered files in
+    ``lost+found``. Reverting ``SCRUB_EXCLUSIONS`` to its three entries before
+    marketlake #441 names the recovered file as an orphan, and this fails.
+    """
+    root, target = _backed_up(fixture_lake)
+    (target / "lost+found").mkdir()
+    (target / "lost+found" / "#12345").write_bytes(b"recovered")
+
+    result = backup_scrub(root, target)
+
+    assert result.orphans == ()
+    assert result.notes == ()
+
+
 def test_the_scrub_writes_nothing_to_either_tree(fixture_lake):
     # Read-only, the same promise ``scrub`` carries. Repair is a separate, deliberate,
     # human-invoked step, and a scrub that quietly healed the copy would destroy the
@@ -462,6 +479,41 @@ def test_a_fifo_where_the_manifest_copy_should_be_stops_the_walk_unopened(fixtur
     assert result.problem == f"backup could not be read: {copy}: not a regular file"
 
 
+def test_a_directory_where_the_manifest_copy_should_be_is_not_a_regular_file(fixture_lake):
+    """The copy's gate is ``S_ISREG``, which refuses every shape that is not a file.
+
+    The FIFO test above passes with the gate narrowed to ``S_ISFIFO``. A directory then
+    reaches the read and is named ``IsADirectoryError`` rather than not a regular file, and
+    this fails.
+    """
+    root, target = _backed_up(fixture_lake)
+    copy = target / MANIFEST_FILE
+    copy.unlink()
+    copy.mkdir()
+
+    result = backup_scrub(root, target)
+
+    assert result.unreadable == f"{copy}: not a regular file"
+    assert result.walked is False
+
+
+def test_a_symlinked_manifest_copy_is_read_through_its_link(fixture_lake, tmp_path):
+    """The copy's gate follows symlinks, as the forward pass's own check does.
+
+    With ``stat`` changed to ``lstat`` the gate sees the link rather than the file it
+    points at, refuses a copy whose bytes are sound, and this fails.
+    """
+    root, target = _backed_up(fixture_lake)
+    real = tmp_path / "elsewhere.jsonl"
+    (target / MANIFEST_FILE).rename(real)
+    (target / MANIFEST_FILE).symlink_to(real)
+
+    result = backup_scrub(root, target)
+
+    assert result.unreadable is None
+    assert result.ok, result.problem
+
+
 def test_a_plain_file_where_the_target_should_be_is_not_a_mounted_disk(fixture_lake):
     # The repair for an unmounted disk and the repair for a disk carrying no backup are
     # different, so the finding has to tell them apart.
@@ -526,6 +578,30 @@ def test_backup_not_regular_paths_are_sorted_and_capped(fixture_lake):
         f"{label}: chains/ticker=IWM/date={DAY.isoformat()}.parquet",
         f"{label}: chains/ticker=QQQ/date={DAY.isoformat()}.parquet",
         f"{label}: and 2 more",
+    ]
+
+
+def test_exactly_the_cap_names_every_path_and_counts_none(fixture_lake):
+    """Three paths fill the cap, so each is named and no count line follows.
+
+    With ``_named``'s ``>`` changed to ``>=``, a spurious ``and 0 more`` line follows the
+    three, and this fails.
+    """
+    for ticker in ("SPY", "QQQ", "IWM"):
+        fixture_lake.with_chains(ticker, DAY)
+    root = fixture_lake.build()
+    target = mirror_lake(root, root.parent / "ssd")
+    for path in target.glob("chains/**/*.parquet"):
+        path.unlink()
+        path.mkdir()
+
+    result = backup_scrub(root, target)
+
+    label = "backup path is not a regular file, so remove it from the copy first"
+    assert [line for line in result.notes if line.startswith(label)] == [
+        f"{label}: chains/ticker=IWM/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=QQQ/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=SPY/date={DAY.isoformat()}.parquet",
     ]
 
 
