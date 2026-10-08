@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_bin import install
 from tests.support.fake_disk import FAKE_CHMOD, FAKE_RM, FAKE_SLEEP, NEXT_RC
 from tests.support.fake_systemd import install_fakes
 
@@ -184,25 +185,18 @@ class Host:
         )
 
 
-def _executable(path: Path, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body)
-    path.chmod(0o755)
-
-
 def _shim_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
     """The shim's own lines on stderr. The fake git prints its own errors too."""
     return [line for line in proc.stderr.splitlines() if line.startswith("user-data:")]
 
 
-@pytest.fixture(scope="module")
-def tools(tmp_path_factory) -> Path:
-    """Every executable the tests run, written once for the module.
+def build_tools(shared: Path) -> Path:
+    """Every executable the tests run, in ``shared``.
 
-    A Mac checks each new executable file on its first run, so the clone links each
+    A Mac scans each new file on its first run as a program, once per file. So every fake
+    here is a link to ``tests.support.fake_bin``'s one program, and the clone links each
     checkout's ``vm-bootstrap.sh`` to the one here rather than writing a fresh one.
     """
-    shared = tmp_path_factory.mktemp("shim-tools")
     install_fakes(shared / "bin")
     for name, body in {
         "git": FAKE_GIT,
@@ -210,9 +204,15 @@ def tools(tmp_path_factory) -> Path:
         "rm": FAKE_RM,
         "sleep": FAKE_SLEEP,
     }.items():
-        _executable(shared / "bin" / name, body)
-    _executable(shared / "vm-bootstrap.sh", FAKE_BOOTSTRAP)
+        install(shared / "bin" / name, body)
+    install(shared / "vm-bootstrap.sh", FAKE_BOOTSTRAP)
     return shared
+
+
+@pytest.fixture(scope="module")
+def tools(tmp_path_factory) -> Path:
+    """Every executable the tests run, written once for the module."""
+    return build_tools(tmp_path_factory.mktemp("shim-tools"))
 
 
 @pytest.fixture
