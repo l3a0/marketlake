@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -235,8 +236,15 @@ def _read_raw(path: Path) -> dict:
     or not UTF-8, raise ``ValueError``. A payload nested deeper than the interpreter
     will recurse raises ``RecursionError``, which is a ``RuntimeError`` and passed both
     of the others until it was found reaching a dashboard page.
+
+    A path that is not a regular file reads as empty without being opened. A FIFO there
+    raises nothing, and a read of it blocks until a writer appears, which would hang the
+    Sunday run on every attempt (marketlake #441). The check follows symlinks, so a stamp
+    reached through a link still reads.
     """
     try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return {}
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return {}
