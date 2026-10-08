@@ -24,12 +24,14 @@ One failure can take every surface down at once, such as a dead token or a rate
 limit. The watchdog calls that a cause, pages it once under its own title, and then
 suppresses the pages of every surface it named. That suppression ends one surface at a
 time, and the cause re-arms only when the last of them has gone. A surface goes when any
-of four things happens.
+of five things happens.
 
 1. It produces data again.
 2. It answers with no contract.
 3. Its segment could not be written in a minute another surface landed data.
-4. It leaves the roster.
+4. It fails a way that does not resolve to a dead token in a minute another surface
+   landed data. This one takes it out of the token-dead cause only.
+5. It leaves the roster.
 
 So a rate limit that runs all session stays one condition, and one surface returning and
 dying again never re-pages the cause.
@@ -262,7 +264,9 @@ class Watchdog:
         # A cause maps to the surfaces its page covers. A surface leaves that set when
         # it produces data, when it answers with no contract, when its segment could not
         # be written in a minute another surface landed data, or when the roster drops
-        # it, per ``_release``. A cause whose set empties is dropped, which re-arms it.
+        # it, per ``_release``. It leaves the token-dead set alone when it fails a way
+        # that does not resolve to a dead token in a minute another surface landed data,
+        # per ``_release_from``. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
         # Whether an overrun has already paged. It is the stall's own once-on-transition
@@ -298,7 +302,9 @@ class Watchdog:
         A data segment holding no data row fails too, as ``contracts_absent``, per
         :func:`_failure_class`, and leaves every cause that named it, per :meth:`_release`.
         A surface whose segment could not be written leaves every cause that named it too,
-        but only in a minute another surface landed data, per :meth:`_release`.
+        but only in a minute another surface landed data, per :meth:`_release`. In that
+        same minute a surface failing a way that does not resolve to a dead token leaves
+        the token-dead cause, and only that one, per :meth:`_release_from`.
         A surface it did not touch at all has left the cycle and loses its counter, per
         :meth:`_drop_departed`.
 
@@ -335,9 +341,16 @@ class Watchdog:
         # cause cannot page again until that surface has failed for the threshold. An
         # answer with no contract resets nothing, and counting it let a chain alternating
         # a 401 with an empty answer re-page the cause every other minute (marketlake #754).
+        # The same landed data proves the shared token works, so a surface failing a class
+        # that does not resolve to a dead token is failing for its own reason. It leaves
+        # the token-dead cause alone. A rate limit is per surface, so the rate-limited
+        # cause keeps it (marketlake #760).
         if touched - failed:
             for key in failed - recorded.keys():
                 self._release(key)
+            for key, error_class in recorded.items():
+                if _WHOLE_DAEMON_CAUSES.get(error_class) != TOKEN_DEAD:
+                    self._release_from(key, TOKEN_DEAD)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
         cause = self._whole_daemon(tally, threshold, result.snap_ts)
@@ -520,7 +533,8 @@ class Watchdog:
         """Take one surface out of the causes covering it, dropping one that empties.
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
-        Four things bring a surface here.
+        Four things bring a surface here, and a fifth takes it out of the token-dead cause
+        alone, through :meth:`_release_from`.
 
         1. It produced data.
         2. The roster dropped it.
@@ -534,7 +548,8 @@ class Watchdog:
         token death that session paged nothing (marketlake #326). Its counter keeps
         climbing, because it still produced nothing. A surface that merely started failing
         another way, a timeout or a 5xx or another cause's class, is still down, so the
-        cause that named it has not lifted and keeps it.
+        cause that named it keeps it here. The one exception is the token-dead cause in a
+        minute another surface landed data, which :meth:`_release_from` handles.
 
         A write failure records no class, so it says nothing about what the vendor did.
         Kept in the cause, it never paged for itself, because a cause covers a failure that
@@ -551,12 +566,35 @@ class Watchdog:
         write failure, and then the cause a second time.
         """
         for title in list(self._paged_causes):
-            held = self._paged_causes[title]
-            if key not in held:
-                continue
-            held.discard(key)
-            if not held:
-                del self._paged_causes[title]
+            self._release_from(key, title)
+
+    def _release_from(self, key: Surface, title: str) -> None:
+        """Take one surface out of one cause, dropping the cause if that empties it.
+
+        ``_release`` loops over this, so one place drops an emptied cause. A title with no
+        live cause releases nothing.
+
+        ``observe`` also calls it on its own, for the token-dead cause only. In a minute
+        another surface landed data, a surface failing a class that does not resolve to a
+        dead token leaves that cause. The token is shared, so data landing anywhere proves
+        no surface is failing for the token. Kept in the cause, a surface answering a 5xx
+        or timing out after the token healed never paged, and a 429 there paged for itself
+        but still held the cause, so a second token death that session sent no cause page
+        (marketlake #760). A rate limit is per surface, so the rate-limited cause keeps
+        its surfaces. Releasing from every cause would page a surface still limited the
+        moment it timed out once, and then the rate limit a second time.
+
+        The released surface pages at once under its own title and class, unless it is
+        already in ``_paged``. Its counter kept climbing under the cause, so its page
+        carries the outage's minutes, even when it failed only on the minute the token
+        healed. That is the price, the same one a write failure pays.
+        """
+        held = self._paged_causes.get(title)
+        if held is None or key not in held:
+            return
+        held.discard(key)
+        if not held:
+            del self._paged_causes[title]
 
     def _drop_departed(self, touched: set[Surface], out_of_span: tuple[str, ...]) -> None:
         """Forget the counter and the paged flag of every surface that left the cycle.
@@ -658,11 +696,13 @@ class Watchdog:
 
         ``title`` is the cause this minute's failure resolves to, or ``None`` when it
         resolves to no cause and when nothing was attempted. A cause covers the surface
-        it named while that surface keeps failing its way, and an ordinary transient
-        failure counts as still covered. The one thing that lifts the cover is the
-        surface failing a way some other cause names, because that is a different outage
-        with a different remedy, and the operator has to hear it. A surface also leaves a
-        cause outright through :meth:`_release`, which names the four ways it does.
+        it named while that surface keeps failing its way. An ordinary transient failure
+        counts as still covered, which for the token-dead cause holds only in a minute in
+        which nothing landed data. The one thing that lifts the cover is the surface
+        failing a way some other cause names, because that is a different outage with a
+        different remedy, and the operator has to hear it. A surface also leaves a cause
+        outright through :meth:`_release`, which names the ways it does, and leaves the
+        token-dead cause alone through :meth:`_release_from`.
         """
         return any(
             key in held and title in (None, cause) for cause, held in self._paged_causes.items()
