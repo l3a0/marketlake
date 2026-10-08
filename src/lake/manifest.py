@@ -1136,9 +1136,10 @@ def scrub(lake_root: Path) -> ScrubResult:
     the root that vanished before it was listed is skipped, because compaction prunes an
     emptied one under the lake lock, which is the rule ``lake.runway.walk`` gives. A
     manifested path is skipped before anything stats it, since the forward pass already
-    answered for it. A file whose ``is_file()`` raises is ``unreadable`` too. ``is_file()``
-    follows symlinks, so a symlinked file is checked like any other and a FIFO is skipped
-    without being opened.
+    answered for it, and so is a directory at a manifested path that will not list. That is
+    what keeps one fault from being named twice. A file whose ``is_file()`` raises is
+    ``unreadable`` too. ``is_file()`` follows symlinks, so a symlinked file is checked like
+    any other and a FIFO is skipped without being opened.
 
     The walk copies ``lake.runway.walk``'s rules rather than calling it, because that walk
     returns byte and file counts and no list of files. The price is two walks carrying the
@@ -1200,6 +1201,10 @@ def scrub(lake_root: Path) -> ScrubResult:
             return
         # ``os.walk`` builds every name it lists from ``root``, so each one sits under it.
         rel = Path(filename).relative_to(root).as_posix() if filename is not None else "."
+        if rel in latest:
+            # A directory at a manifested path. The forward pass already named it, and in a
+            # parent that lists but cannot be searched it named it with this same entry.
+            return
         where = "the lake root" if rel in ("", ".") else rel
         unreadable.append(f"{where}: {type(exc).__name__}")
 

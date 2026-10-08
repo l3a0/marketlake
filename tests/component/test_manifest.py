@@ -734,6 +734,25 @@ def test_a_lake_root_that_will_not_list_is_named_as_the_lake_root(fixture_lake, 
     assert not result.ok
 
 
+@_no_root_chmod
+def test_a_directory_at_a_manifested_path_in_an_unsearchable_parent_is_named_once(fixture_lake):
+    # The forward pass names the path when ``exists()`` raises, and the walk meets the same
+    # directory when it fails to list it. Both would build ``rel: PermissionError``, so the walk
+    # leaves a manifested path to the forward pass, as it does for a file.
+    root = _base_lake(fixture_lake).root
+    parent = root / "bars"
+    (parent / "d.parquet").mkdir(parents=True)
+    append_manifest(
+        root, partition="bars/d.parquet", source="sweep", sha256="s", rows=1, fetched_at=None
+    )
+    parent.chmod(0o444)
+    try:
+        result = scrub(root)
+    finally:
+        parent.chmod(0o755)
+    assert result.unreadable == ("bars/d.parquet: PermissionError",)
+
+
 def test_an_unstattable_orphan_is_unreadable_whatever_its_error(fixture_lake, monkeypatch):
     # ``is_file()`` raises every ``OSError`` but four errnos, so a catch narrowed to
     # ``PermissionError`` would let an ``EIO`` escape and hide every other finding.
@@ -754,6 +773,48 @@ def test_an_unstattable_orphan_is_unreadable_whatever_its_error(fixture_lake, mo
 
     assert result.unreadable == ("bars/orphan.parquet: OSError",)
     assert result.orphans == ()
+
+
+def test_a_manifested_symlink_to_a_regular_file_is_hashed_like_the_file(fixture_lake, tmp_path):
+    # The regular-file check follows symlinks, as ``exists()`` does, so a symlinked partition
+    # is checked by its bytes as it was before the check existed.
+    root = _base_lake(fixture_lake).root
+    real = tmp_path / "outside.parquet"
+    (root / CHAINS_REL).rename(real)
+    os.symlink(real, root / CHAINS_REL)
+
+    result = scrub(root)
+
+    assert result.ok, result
+
+
+def test_the_reverse_pass_follows_a_symlink_and_never_counts_a_fifo(fixture_lake, tmp_path):
+    # ``is_file()`` follows symlinks, so a symlinked orphan is an orphan. A dangling symlink
+    # and a FIFO are not regular files, so neither is an orphan, and the FIFO is never opened.
+    root = _base_lake(fixture_lake).root
+    real = tmp_path / "outside.bin"
+    real.write_bytes(b"x")
+    stray = root / "bars"
+    stray.mkdir()
+    os.symlink(real, stray / "linked.parquet")
+    os.symlink(tmp_path / "nowhere.bin", stray / "dangling.parquet")
+    os.mkfifo(stray / "pipe.parquet")
+
+    result = scrub(root)
+
+    assert result.orphans == ("bars/linked.parquet",)
+    assert result.unreadable == ()
+
+
+def test_orphans_are_sorted_whatever_order_the_walk_meets_them(fixture_lake):
+    # ``os.walk`` lists a directory's files before it descends, so the root's own orphan comes
+    # first in walk order and last in sorted order.
+    root = _base_lake(fixture_lake).root
+    (root / "zz.parquet").write_bytes(b"x")
+    (root / "bars").mkdir()
+    (root / "bars" / "a.parquet").write_bytes(b"x")
+
+    assert scrub(root).orphans == ("bars/a.parquet", "zz.parquet")
 
 
 # -- the quarantine ledger ---------------------------------------------------
