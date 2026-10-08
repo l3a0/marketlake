@@ -41,7 +41,8 @@ rest of the cycle went. It carries the cycle's ``snap_ts`` and six instants.
 2. ``fetch_end_ts`` is the latest ``fetch_end_ts`` among the units the cycle planned, a
    chain or the quote batch. A unit's spans its retry. On the concurrent path a unit the
    bound cut ends at the bound. Null when the cycle planned nothing.
-3. ``segments_durable_ts`` is when the last unit had landed. Earlier units land inside
+3. ``segments_durable_ts`` is when the last unit had landed and the cycle had tried a gap
+   row for each segment whose write failed (marketlake #769). Earlier units land inside
    the fetch, so the tail after the fetch is this less ``fetch_end_ts``.
 4. ``lock_acquired_ts`` is when the cycle got the lake-root lock for its manifest append.
    From durable to acquired is the wait, on another process or another cycle.

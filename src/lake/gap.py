@@ -373,7 +373,13 @@ class GapMarker:
                                     # likely to hit the next day too. The unwritten days stay
                                     # owed, so the next restart re-derives what is missing and
                                     # marks them then. Stopping now defers the work, never
-                                    # drops it.
+                                    # drops it. That holds because the writer removes a
+                                    # segment whose write failed before any batch was
+                                    # durable (marketlake #769), so no torn file is left
+                                    # behind to make the next walk refuse the pair. A
+                                    # removal that fails, as on a volume that turned
+                                    # read-only, or an interrupt mid-write still leaves
+                                    # one.
                                     problems.append(
                                         f"{surface}/{entry.ticker} {day.isoformat()}: "
                                         f"{type(exc).__name__}"

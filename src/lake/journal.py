@@ -44,6 +44,7 @@ import os
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from datetime import UTC, date, datetime
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
@@ -2177,6 +2178,73 @@ def segment_dir(lake_root: Path | str, surface: str, ticker: str, day: date | st
 # -- the writer --------------------------------------------------------------
 
 
+class _WriteAll:
+    """The file handle pyarrow writes a segment through, which writes every byte or raises.
+
+    pyarrow ignores the count a handle's ``write`` returns, so a short write, which the
+    kernel makes when a file reaches its size limit or a disk fills, left a batch torn
+    while ``write_cycle`` returned and counted it durable (marketlake #769). This loops
+    until the whole buffer is written and raises when a write takes nothing. pyarrow only
+    calls ``write`` and reads ``closed`` on the handle, and the end-of-stream marker goes
+    through it too.
+
+    Opening the file buffered is not the same repair. ``PythonFile.flush`` does not flush
+    the handle under it, so the durability flush would run with bytes still in memory.
+    """
+
+    def __init__(self, raw) -> None:
+        self._raw = raw
+
+    def write(self, data) -> int:
+        view = memoryview(data).cast("B")
+        total = len(view)
+        done = 0
+        while done < total:
+            written = self._raw.write(view[done:])
+            if not written:
+                raise OSError(f"a segment write took 0 of the {total - done} bytes left")
+            done += written
+        return total
+
+    @property
+    def closed(self) -> bool:
+        return self._raw.closed
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a directory's entries durable, with plain ``os.fsync`` on every platform.
+
+    macOS's ``F_FULLFSYNC`` does not apply to a directory. This matches how SQLite and
+    Postgres persist directory entries.
+    """
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _discard(path: Path, close: Callable[[], None]) -> None:
+    """Close a segment that holds nothing durable, remove it, and make the removal durable.
+
+    It never raises, so the failure that called it is the one the caller sees. A close that
+    fails is ignored, and the removal still runs. A removal that fails leaves the file
+    where it is, the way it was before this cleanup existed.
+    """
+    try:
+        close()
+    except Exception:  # noqa: BLE001 - the original failure is the one to report
+        pass
+    try:
+        path.unlink()
+    except Exception:  # noqa: BLE001 - a file that will not go stays, as it always did
+        return
+    try:
+        _fsync_directory(path.parent)
+    except Exception:  # noqa: BLE001 - the file is gone either way, so nothing to undo
+        pass
+
+
 class SegmentWriter:
     """A one-session writer for a single Arrow IPC segment.
 
@@ -2185,15 +2253,37 @@ class SegmentWriter:
     marker. The segment is never re-opened for append. Use it as a context manager so
     the marker lands after every write that finished.
 
-    The marker never lands after a write that raised. A write can fail partway through a
-    batch and leave the caller running, as a full disk that frees up does. A marker
-    written behind those half-written bytes would make the file look finished, and the
-    reader calls a stop inside a finished file damage rather than a torn tail
-    (marketlake #552). So ``write_cycle`` records that it raised, and ``close`` then
-    closes the file without the marker. The file reads as a torn tail, and its complete
-    batches are kept. This is keyed on the write rather than on the exception
-    ``__exit__`` receives, because a caller that catches the failure inside the ``with``
-    block leaves ``__exit__`` nothing to see.
+    A write that raises an ``Exception`` before any batch was durable removes the file
+    (marketlake #769). What it left could be empty, a torn header that makes every reader
+    refuse the surface and ticker for the day, or a torn batch that reads as no rows, and
+    none of those holds a row. Removing it leaves the path free for the capture cycle's
+    gap row, and for startup gap marking after a restart. A failure while the writer is
+    being built does the same, whatever was raised, because that file is empty. A
+    ``BaseException`` such as ``KeyboardInterrupt`` raised by a write keeps the file. Python
+    raises a pending interrupt just after the durability flush returns and before the count
+    of durable flushes moves, so the file it interrupts almost always holds a complete
+    batch. For the same reason a write that raises after an earlier write raised keeps the
+    file, since the interrupted batch may be whole on disk while the count still reads 0. A
+    failure of the exclusive create itself never removes anything, because the path may be
+    another writer's durable segment. After a removal the writer counts as closed, and a
+    later ``write_cycle`` raises ``ValueError``.
+
+    Where an earlier batch was durable, the file stays, and the marker never lands after
+    a write that raised. A write can fail partway through a batch and leave the caller
+    running, as a full disk that frees up does. A marker written behind those half-written
+    bytes would make the file look finished, and the reader calls a stop inside a finished
+    file damage rather than a torn tail (marketlake #552). So ``write_cycle`` records that
+    it raised, and ``close`` then closes the file without the marker. The file reads as a
+    torn tail, and its complete batches are kept. This is keyed on the write rather than on
+    the exception ``__exit__`` receives, because a caller that catches the failure inside
+    the ``with`` block leaves ``__exit__`` nothing to see. Every production caller writes
+    one batch, so none of them reaches this case. A production caller keeps a file after a
+    failure in three cases:
+
+    1. Its batch was durable and its end-of-stream marker then failed, which ``close``
+       raises.
+    2. The removal itself failed, as on a volume that turned read-only.
+    3. An interrupt stopped the write, which keeps the file whatever it holds.
     """
 
     def __init__(self, path: Path | str, schema: pa.Schema, *, surface: str | None = None) -> None:
@@ -2209,22 +2299,26 @@ class SegmentWriter:
         self._write_failed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # ``O_CREAT | O_EXCL`` makes the create fail loudly if the path already exists.
-        # A collision must never truncate durable rows or shadow-append past an EOS.
+        # A collision must never truncate durable rows or shadow-append past an EOS. A
+        # failure here removes nothing, because the path may be another writer's file.
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         self._fd = fd
-        # Make the new segment's directory entry durable, so the file itself survives
-        # a crash right after creation. This is the standard directory fsync. It uses
-        # plain ``os.fsync`` even on macOS, where ``F_FULLFSYNC`` does not apply to a
-        # directory, matching how SQLite and Postgres persist directory entries.
-        dir_fd = os.open(self.path.parent, os.O_RDONLY)
+        file = None
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        # Unbuffered, so every write reaches the OS before the durability flush.
-        self._file = open(fd, "wb", buffering=0, closefd=True)
-        self._sink = pa.PythonFile(self._file, mode="w")
-        self._writer = pa.ipc.new_stream(self._sink, schema)
+            # Make the new segment's directory entry durable, so the file itself survives
+            # a crash right after creation.
+            _fsync_directory(self.path.parent)
+            # Unbuffered, so every write reaches the OS before the durability flush.
+            file = open(fd, "wb", buffering=0, closefd=True)
+            self._file = file
+            self._sink = pa.PythonFile(_WriteAll(file), mode="w")
+            self._writer = pa.ipc.new_stream(self._sink, schema)
+        except BaseException:
+            # The file is empty, so nothing is lost by removing it. Closing the file
+            # object closes the descriptor once it owns it, and before that the
+            # descriptor is closed on its own, so neither leaks.
+            _discard(self.path, file.close if file is not None else partial(os.close, fd))
+            raise
 
     @classmethod
     def open(
@@ -2264,19 +2358,29 @@ class SegmentWriter:
         The batch's schema must match the segment's, which Arrow enforces. So a quotes
         batch can never land in a chains segment. Durability is the design's success
         point. A cycle counts as captured only after this returns.
+
+        A write that raises an ``Exception`` before any batch was durable, and after no
+        earlier write raised, removes the file, and the writer then counts as closed. The
+        class docstring says why, and why an interrupt keeps the file.
         """
         if self._closed:
             raise ValueError("cannot write to a closed segment")
+        # An earlier write that raised may have left a whole batch the count never reached,
+        # as an interrupt just after the flush does, so only the first failure removes.
+        failed_before = self._write_failed
         try:
             if isinstance(batch, pa.Table):
                 self._writer.write_table(batch)
             else:
                 self._writer.write_batch(batch)
             self._flush_durable()
-        except BaseException:
+        except BaseException as exc:
             # How many of the batch's bytes reached the file is unknown, so the marker
             # must not follow them. The class docstring says why.
             self._write_failed = True
+            if isinstance(exc, Exception) and self.durable_syncs == 0 and not failed_before:
+                self._closed = True
+                _discard(self.path, self._file.close)
             raise
 
     def _flush_durable(self) -> None:
@@ -2290,17 +2394,26 @@ class SegmentWriter:
     def close(self) -> None:
         """Write the end-of-stream marker, make it durable, and close the file.
 
-        After a write that raised, the file is closed without the marker, as the class
-        docstring explains. The Arrow writer is left unclosed, because closing it is what
-        writes the marker, and it writes nothing once the file under it is closed.
+        After a write that raised over an earlier durable batch, the file is closed
+        without the marker, as the class docstring explains. The Arrow writer is left
+        unclosed, because closing it is what writes the marker, and it writes nothing once
+        the file under it is closed. After a write that removed the file there is nothing
+        left to close.
+
+        The marker is tried once. When writing it or making it durable raises, the file is
+        still closed and the writer counts as closed, so a second ``close`` does nothing.
+        A second try would write the marker again behind the first one's bytes, and the
+        reader refuses that as a shadow-append. The file keeps its durable batches.
         """
         if self._closed:
             return
-        if not self._write_failed:
-            self._writer.close()  # writes the EOS marker
-            self._flush_durable()
-        self._file.close()
         self._closed = True
+        try:
+            if not self._write_failed:
+                self._writer.close()  # writes the EOS marker
+                self._flush_durable()
+        finally:
+            self._file.close()
 
     @property
     def closed(self) -> bool:

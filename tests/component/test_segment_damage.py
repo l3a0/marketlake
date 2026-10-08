@@ -9,8 +9,9 @@ as zero rows, which startup gap-marking then marked as a missing minute.
 The reader now validates every batch in full and reads a stop inside a file that still
 ends in its end-of-stream marker as damage. Both raise ``journal.SegmentDamaged``, an
 ``ArrowInvalid``, so every reader that tells a bad file from an absent one catches it as
-it already did. The writer leaves the marker off a write that raised, which is what keeps
-a failed write reading as the torn tail it always was.
+it already did. The writer removes a file whose write raised before any batch was durable,
+and leaves the marker off one whose earlier batch was, which keeps that file reading as the
+torn tail it is.
 
 These cover that contract:
 
@@ -21,7 +22,11 @@ These cover that contract:
    into ``ArrowInvalid`` on a torn one, and a missing file is still missing.
 4. A flip that crashed the unvalidated read is caught, read in a forked child.
 5. ``latest_expirations`` walks past a damaged segment to an older batch.
-6. A write that raised partway leaves no marker, whether or not the caller caught it.
+6. A write that raised before any batch was durable removes the file, whether or not the
+   caller caught it, and one that raised after a durable batch leaves no marker. An
+   interrupt keeps the file, and a failure while the writer is built leaves nothing.
+7. A real short write, made in a forked child under a file-size limit, raises rather than
+   reading as a durable batch (marketlake #769).
 
 Every flipped fixture is built from a literal offset into the ``spy_minimal`` segment,
 never from a constant the code reads. Each offset was found by flipping every bit 0 of
@@ -32,7 +37,10 @@ child.
 from __future__ import annotations
 
 import errno
+import gc
 import os
+import resource
+import signal
 import time as time_module
 from datetime import date, datetime, time
 from pathlib import Path
@@ -532,7 +540,18 @@ def _batch():
     )
 
 
-def test_a_write_that_raised_leaves_no_marker(lake_root, monkeypatch):
+def _segment_files(path: Path) -> list[Path]:
+    """What the segment's directory holds, so a removal is checked as an absent entry."""
+    return sorted(path.parent.iterdir())
+
+
+def test_a_write_that_raised_removes_the_file(lake_root, monkeypatch):
+    """Nothing was durable, so the file held no row a reader could use (marketlake #769).
+
+    Left in place, the half-written bytes read as a torn header or a torn batch. The first
+    makes startup marking refuse the whole surface and ticker for the day, and the second
+    reads as no rows, so a restart marks a minute the daemon was alive for.
+    """
     _full_disk_after(monkeypatch, 5000)
     writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
 
@@ -541,14 +560,12 @@ def test_a_write_that_raised_leaves_no_marker(lake_root, monkeypatch):
             writer.write_cycle(_batch())
 
     assert writer.closed
-    data = writer.path.read_bytes()
-    assert not data.endswith(EOS)
-    # The half-written batch reads as the torn tail it is, so startup marking still marks
-    # that minute rather than refusing the pair.
-    assert journal.read_segment(writer.path).num_rows == 0
+    assert writer.durable_syncs == 0
+    assert not writer.path.exists()
+    assert _segment_files(writer.path) == []
 
 
-def test_a_write_that_raised_and_was_caught_leaves_no_marker(lake_root, monkeypatch):
+def test_a_write_that_raised_and_was_caught_removes_the_file(lake_root, monkeypatch):
     """The caller that catches inside the block, which ``__exit__`` cannot see."""
     _full_disk_after(monkeypatch, 5000)
 
@@ -558,9 +575,7 @@ def test_a_write_that_raised_and_was_caught_leaves_no_marker(lake_root, monkeypa
         with pytest.raises(OSError, match="No space"):
             writer.write_cycle(_batch())
 
-    data = writer.path.read_bytes()
-    assert not data.endswith(EOS)
-    assert journal.read_segment(writer.path).num_rows == 0
+    assert not writer.path.exists()
 
 
 def test_a_write_that_finished_still_gets_its_marker(lake_root, monkeypatch):
@@ -589,11 +604,46 @@ def test_an_interrupted_write_leaves_no_marker(lake_root, monkeypatch):
     assert not writer.path.read_bytes().endswith(EOS)
 
 
-def test_a_failed_durability_flush_leaves_no_marker(lake_root, monkeypatch):
+def _then_interrupt(real):
+    """A flush that does its real work and is then interrupted, once."""
+    interrupted: list[bool] = []
+
+    def call(*args):
+        result = real(*args)
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return result
+
+    return call
+
+
+def test_an_interrupt_just_after_the_flush_keeps_the_batch(lake_root, monkeypatch):
+    """Where a Ctrl-C almost always lands, so its file is kept rather than removed.
+
+    Python raises a pending interrupt right after the flush returns and before the writer
+    counts the flush durable, so the batch is whole and on disk while ``durable_syncs`` still
+    reads 0. Removing the file on an interrupt would delete those rows.
+    """
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    monkeypatch.setattr(journal.fcntl, "fcntl", _then_interrupt(journal.fcntl.fcntl))
+    monkeypatch.setattr(journal.os, "fsync", _then_interrupt(journal.os.fsync))
+
+    with pytest.raises(KeyboardInterrupt):
+        with writer:
+            writer.write_cycle(_batch())
+
+    assert writer.durable_syncs == 0
+    assert not writer.path.read_bytes().endswith(EOS)
+    assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
+
+
+def test_a_failed_durability_flush_removes_the_file(lake_root, monkeypatch):
     """Every byte reached the file, but none was made durable, so the write did not finish.
 
     The flush is ``F_FULLFSYNC`` on macOS and ``os.fsync`` elsewhere, so both fail here,
-    once each, and only after the writer has opened and made its directory durable.
+    once each, and only after the writer has opened and made its directory durable. The
+    rows might read back, and nothing proves they reached the disk.
     """
     writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
     real_fcntl, real_fsync = journal.fcntl.fcntl, journal.os.fsync
@@ -615,21 +665,89 @@ def test_a_failed_durability_flush_leaves_no_marker(lake_root, monkeypatch):
         with writer:
             writer.write_cycle(_batch())
 
+    assert not writer.path.exists()
+
+
+def test_a_write_after_a_removal_is_refused(lake_root, monkeypatch):
+    """The writer counts as closed once its file is gone, so nothing writes into the void."""
+    _full_disk_after(monkeypatch, 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    with pytest.raises(OSError):
+        writer.write_cycle(_batch())
+    assert writer.closed
+
+    with pytest.raises(ValueError, match="cannot write to a closed segment"):
+        writer.write_cycle(_batch())
+
+    assert not writer.path.exists()
+
+
+def test_a_later_batch_that_fails_keeps_the_durable_one_without_a_marker(lake_root, monkeypatch):
+    """Where an earlier batch was durable, the file stays and the marker stays off (#552)."""
+    whole = _written(lake_root, "a", 1).stat().st_size
+    # Room for the first batch and part of the second.
+    _full_disk_after(monkeypatch, whole - len(EOS) + 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    with pytest.raises(OSError, match="No space"):
+        with writer:
+            writer.write_cycle(_batch())
+            writer.write_cycle(_batch())
+
+    assert writer.durable_syncs == 1
     assert not writer.path.read_bytes().endswith(EOS)
+    assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
 
 
 def test_a_later_good_write_does_not_restore_the_marker(lake_root, monkeypatch):
-    """The half-written batch is still in the file, so no later write makes it finished."""
-    _full_disk_after(monkeypatch, 5000)
+    """The half-written batch is still in the file, so no later write makes it finished.
 
-    with journal.SegmentWriter.open(
-        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID
-    ) as writer:
-        with pytest.raises(OSError):
+    The first batch is durable, so the failed second one keeps the file (#552). The disk
+    then frees up and a third batch lands, and the marker must still stay off, because it
+    would sit behind the second batch's half-written bytes.
+    """
+    whole = _written(lake_root, "a", 1).stat().st_size
+    # Room for the first batch and part of the second, and then the disk recovers.
+    _full_disk_after(monkeypatch, whole - len(EOS) + 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    with writer:
+        writer.write_cycle(_batch())
+        with pytest.raises(OSError, match="No space"):
             writer.write_cycle(_batch())
         writer.write_cycle(_batch())
 
+    assert writer.durable_syncs == 2
     assert not writer.path.read_bytes().endswith(EOS)
+
+
+def test_a_failed_write_after_an_interrupt_keeps_the_interrupted_batch(lake_root, monkeypatch):
+    """An interrupt leaves a whole batch the writer has not counted, so a later failure keeps it.
+
+    The interrupt lands just after the real flush, so the batch is on disk while
+    ``durable_syncs`` still reads 0. A caller that catches the interrupt and writes again,
+    into a disk that then fills, must not remove the file and the rows already in it.
+    """
+    whole = _written(lake_root, "a", 1).stat().st_size
+    # Room for the first batch and part of the second.
+    _full_disk_after(monkeypatch, whole - len(EOS) + 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    real_fcntl, real_fsync = journal.fcntl.fcntl, journal.os.fsync
+    monkeypatch.setattr(journal.fcntl, "fcntl", _then_interrupt(real_fcntl))
+    monkeypatch.setattr(journal.os, "fsync", _then_interrupt(real_fsync))
+
+    with writer:
+        with pytest.raises(KeyboardInterrupt):
+            writer.write_cycle(_batch())
+        # Only the platform's own flush was interrupted, so the other one is put back too.
+        monkeypatch.setattr(journal.fcntl, "fcntl", real_fcntl)
+        monkeypatch.setattr(journal.os, "fsync", real_fsync)
+        with pytest.raises(OSError, match="No space"):
+            writer.write_cycle(_batch())
+
+    assert writer.durable_syncs == 0
+    assert not writer.path.read_bytes().endswith(EOS)
+    assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
 
 
 def test_a_failed_write_still_closes_the_file(lake_root, monkeypatch):
@@ -642,3 +760,269 @@ def test_a_failed_write_still_closes_the_file(lake_root, monkeypatch):
 
     with pytest.raises(OSError):
         os.fstat(writer._fd)
+
+
+def test_a_marker_that_failed_is_not_written_by_a_second_close(lake_root, monkeypatch):
+    """The marker is tried once, so a second ``close`` cannot put a second one behind it.
+
+    The disk here refuses the marker and then frees up, so a retry would land. The reader
+    refuses a file with bytes after its marker as a shadow-append.
+    """
+    whole = _written(lake_root, "a", 1).stat().st_size
+    _full_disk_after(monkeypatch, whole - len(EOS))
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    writer.write_cycle(_batch())
+
+    with pytest.raises(OSError, match="No space"):
+        writer.close()
+    after_the_first = writer.path.read_bytes()
+    writer.close()
+
+    assert writer.closed
+    assert writer.path.read_bytes() == after_the_first
+    assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
+
+
+def test_a_marker_that_failed_still_closes_the_file(lake_root, monkeypatch):
+    """The descriptor goes even when writing the end-of-stream marker raises."""
+    whole = _written(lake_root, "a", 1).stat().st_size
+    _full_disk_after(monkeypatch, whole - len(EOS))
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    writer.write_cycle(_batch())
+
+    with pytest.raises(OSError, match="No space"):
+        writer.close()
+
+    with pytest.raises(OSError):
+        os.fstat(writer._fd)
+
+
+def _open_descriptors() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+class _Refused(Exception):
+    """A failure while the writer is being built, after its file exists."""
+
+
+@pytest.mark.parametrize(
+    ("target", "raised"),
+    [
+        ("fsync", OSError(errno.EIO, "I/O error")),
+        ("new_stream", _Refused("the stream would not start")),
+        ("new_stream", KeyboardInterrupt()),
+    ],
+    ids=["directory-fsync", "new-stream", "interrupt"],
+)
+def test_a_failure_after_the_create_leaves_no_file_and_no_descriptor(
+    lake_root, monkeypatch, target, raised
+):
+    """The file is empty at this point, so it goes whatever was raised, and so does its fd."""
+    path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    path.parent.mkdir(parents=True)
+
+    def refuse(*args, **kwargs):
+        raise raised
+
+    if target == "fsync":
+        monkeypatch.setattr(journal.os, "fsync", refuse)
+    else:
+        monkeypatch.setattr(pa.ipc, "new_stream", refuse)
+    before = _open_descriptors()
+
+    with pytest.raises(type(raised)):
+        journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    assert not path.exists()
+    assert _open_descriptors() == before
+
+
+def test_a_failure_after_the_file_object_exists_closes_the_descriptor_once(lake_root, monkeypatch):
+    """Once the file object owns the descriptor, closing the object is what closes it.
+
+    Closing the bare descriptor instead leaves the object to close the same number again
+    when it is collected. By then another open can hold that number, and the second close
+    shuts that file instead.
+    """
+    path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    path.parent.mkdir(parents=True)
+
+    def refuse(*args, **kwargs):
+        raise _Refused("the stream would not start")
+
+    monkeypatch.setattr(pa.ipc, "new_stream", refuse)
+
+    with pytest.raises(_Refused) as info:
+        journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    # The lowest free number, which is the one the writer's descriptor just gave up.
+    other = os.open(os.devnull, os.O_RDONLY)
+    try:
+        # The traceback holds the writer's frame, which holds the file object.
+        del info
+        gc.collect()
+        os.fstat(other)
+    finally:
+        try:
+            os.close(other)
+        except OSError:
+            pass
+
+
+def test_a_collision_leaves_the_other_writers_file_alone(lake_root):
+    """A failed create never removes anything, because the path is someone else's file."""
+    path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"another writer's durable rows")
+
+    with pytest.raises(FileExistsError):
+        journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    assert path.read_bytes() == b"another writer's durable rows"
+
+
+def test_a_removal_that_fails_still_raises_the_write_failure(lake_root, monkeypatch):
+    """The cleanup never replaces the failure, and a file it cannot remove stays."""
+    _full_disk_after(monkeypatch, 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+
+    def refuse(self, missing_ok=False):
+        raise PermissionError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    with pytest.raises(OSError) as info:
+        with writer:
+            writer.write_cycle(_batch())
+
+    assert info.value.errno == errno.ENOSPC
+    assert writer.closed
+    assert writer.path.exists()
+
+
+def test_a_removal_is_made_durable_in_its_directory(lake_root, monkeypatch):
+    """The directory is synced once the file is gone, so a crash cannot bring the file back."""
+    _full_disk_after(monkeypatch, 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    synced: list[tuple[Path, bool]] = []
+    real_fsync_directory = journal._fsync_directory
+
+    def record(directory):
+        synced.append((directory, writer.path.exists()))
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(journal, "_fsync_directory", record)
+
+    with pytest.raises(OSError, match="No space"):
+        writer.write_cycle(_batch())
+
+    assert synced == [(writer.path.parent, False)]
+
+
+# -- 7. a real short write ---------------------------------------------------
+
+
+def _snapshot_batch():
+    """The batch ``_captured`` writes, built the way ``journal_snapshot`` builds it."""
+    at = _et(10, 0)
+    return capture._build_snapshot_batch(
+        journal.CHAINS_SURFACE, "SPY", _CHAIN, snap_ts=at, fetch_ts=at, fetch_end_ts=at
+    )
+
+
+def _write_under_a_size_limit(lake_root: Path, limit: int) -> tuple[int, Path]:
+    """Write ``_snapshot_batch`` in a forked child whose files may not pass ``limit`` bytes.
+
+    ``RLIMIT_FSIZE`` makes the kernel write short and then refuse with ``EFBIG``, which is a
+    real short write on macOS and Linux alike. ``SIGXFSZ`` is ignored, or the signal would
+    kill the child instead. The limit applies to every file the child writes, so it prints
+    nothing and reports by exit code:
+
+    1. 10: ``write_cycle`` raised with nothing durable.
+    2. 20: ``write_cycle`` returned and ``close`` raised.
+    3. 30: both returned.
+    4. 40: ``write_cycle`` returned over nothing durable, or raised over a durable batch.
+    5. 50: anything else.
+    """
+    path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "f", PID)
+    batch = _snapshot_batch()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - runs in the child, which coverage does not follow
+        code = 50
+        try:
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (limit, hard))
+            writer = journal.SegmentWriter.open(
+                lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "f", PID
+            )
+            try:
+                writer.write_cycle(batch)
+            except OSError:
+                code = 10 if writer.durable_syncs == 0 else 40
+            else:
+                if writer.durable_syncs != 1:
+                    code = 40
+                else:
+                    try:
+                        writer.close()
+                        code = 30
+                    except OSError:
+                        code = 20
+        except BaseException:
+            code = 50
+        finally:
+            os._exit(code)
+    # Bounded, so a child that hangs fails the test rather than holding the job to its
+    # ceiling. The write takes milliseconds.
+    for _ in range(600):
+        done, status = os.waitpid(child, os.WNOHANG)
+        if done:
+            break
+        time_module.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        os.waitpid(child, 0)
+        pytest.fail("the forked write did not finish within 60 seconds")
+    assert not os.WIFSIGNALED(status), f"the write died on signal {os.WTERMSIG(status)}"
+    return os.WEXITSTATUS(status), path
+
+
+def test_the_snapshot_batch_is_the_measured_segment(lake_root):
+    """The budgets below are offsets from ``SEGMENT_BYTES``, so the batch must fill it."""
+    with journal.SegmentWriter.open(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "f", PID
+    ) as writer:
+        writer.write_cycle(_snapshot_batch())
+
+    assert writer.path.stat().st_size == SEGMENT_BYTES
+
+
+# pyarrow keeps a thread pool, and Python warns that forking a threaded process can
+# deadlock the child. The child here only writes a local file and exits.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_short_write_inside_the_batch_raises_rather_than_counting_it_durable(lake_root):
+    """pyarrow ignores the count ``write`` returns, so the writer has to (marketlake #769).
+
+    Eleven bytes short of the segment, the batch's last write is short and nothing after
+    it in the batch is written. Before the write loop, ``write_cycle`` returned there with
+    ``durable_syncs`` at 1 over a batch that reads as no rows.
+    """
+    code, path = _write_under_a_size_limit(lake_root, SEGMENT_BYTES - 11)
+
+    assert code == 10, {20: "write_cycle returned", 30: "both returned"}.get(code, code)
+    assert not path.exists()
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_short_end_of_stream_write_raises_from_close_and_keeps_the_rows(lake_root):
+    """One byte short, the batch is durable and only the marker is short.
+
+    The file stays with its rows, which is a captured minute the cycle still reports as a
+    write failure. Before the write loop, ``close`` returned with seven of the marker's
+    eight bytes on disk and the segment reported as landed.
+    """
+    code, path = _write_under_a_size_limit(lake_root, SEGMENT_BYTES - 1)
+
+    assert code == 20, {10: "write_cycle raised", 30: "close returned"}.get(code, code)
+    assert not path.read_bytes().endswith(EOS)
+    assert journal.read_segment(path).num_rows == ROWS_PER_SEGMENT
