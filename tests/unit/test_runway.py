@@ -1269,3 +1269,105 @@ def test_a_vanished_listing_that_names_no_path_is_still_refused(
     # Named as the root. The failure carries no path of its own, and naming it by its class
     # alone would hide that it reads the same as the whole lake going.
     assert usage.refusals == ("the lake root: FileNotFoundError",)
+
+
+# -- the shared journal-reserve check (marketlake #784) ----------------------
+
+
+# A busiest sealed day of 1,000 bytes makes the reserve 13,000, written as a literal so a
+# change to the constant fails here rather than moving the expectation with it.
+_BUSIEST = 1_000
+_RESERVE = 13_000
+
+
+def test_free_space_after_the_write_exactly_covering_the_reserve_passes():
+    """Assert both sides. Mutation this catches: an off-by-one at the boundary."""
+    planned = 5_000
+
+    assert (
+        runway.reserve_shortfall(
+            free=planned + _RESERVE, planned=planned, busiest_sealed_day=_BUSIEST
+        )
+        == 0
+    )
+    assert (
+        runway.reserve_shortfall(
+            free=planned + _RESERVE - 1, planned=planned, busiest_sealed_day=_BUSIEST
+        )
+        == 1
+    )
+
+
+def test_the_check_counts_the_reserve_and_not_the_planned_bytes_alone():
+    """Mutation this catches: a check that asks only whether the planned bytes fit.
+
+    Room for the write with nothing left over passes that check and leaves the next session's
+    journal no room at all.
+    """
+    planned = 5_000
+
+    assert (
+        runway.reserve_shortfall(free=planned, planned=planned, busiest_sealed_day=_BUSIEST)
+        == _RESERVE
+    )
+
+
+def test_room_to_spare_reads_no_shortfall_and_an_empty_volume_needs_only_the_plan():
+    assert runway.reserve_shortfall(free=10**9, planned=5_000, busiest_sealed_day=_BUSIEST) == 0
+    assert runway.reserve_shortfall(free=5_000, planned=5_000, busiest_sealed_day=0) == 0
+    assert runway.reserve_shortfall(free=4_999, planned=5_000, busiest_sealed_day=0) == 1
+
+
+def test_the_busiest_sealed_day_leaves_out_journal_and_days_outside_the_window(tmp_path: Path):
+    """The basis ``assess`` and the range restore share. Each day counts its sealed bytes only."""
+    today = date(2026, 9, 30)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-29.parquet", 4096)
+    # A stuck journal on a past day: on the disk, and never the reserve's basis.
+    _write(
+        tmp_path,
+        "journal/date=2026-09-28/surface=chains/ticker=SPY/seg-20260928T133000Z-1.arrows",
+        8 * 4096,
+    )
+    # The thirty-day window ending 2026-09-30 starts on 2026-09-01. The day before is out, and
+    # it is the largest day here, so counting it would change the answer.
+    _write(tmp_path, "chains/ticker=SPY/date=2026-08-31.parquet", 5 * 4096)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-01.parquet", 3 * 4096)
+    usage = walk(tmp_path)
+    sizes = {day: usage.sealed_bytes(day) for day in usage.day_bytes}
+
+    assert runway.busiest_sealed_day(usage, today=today) == sizes[date(2026, 9, 1)]
+    assert sizes[date(2026, 9, 1)] > sizes[date(2026, 9, 29)]
+    assert runway.busiest_sealed_day(usage, today=today, window_days=2) == sizes[date(2026, 9, 29)]
+    assert runway.busiest_sealed_day(walk(tmp_path / "empty"), today=today) == 0
+
+
+def test_assess_takes_its_reserve_from_the_shared_busiest_sealed_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One computation for the panel and the refusal, so the two cannot drift apart."""
+    today = date(2026, 9, 30)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-29.parquet", 4096)
+    monkeypatch.setattr(runway, "busiest_sealed_day", lambda usage, **kwargs: 7)
+    monkeypatch.setattr(runway.shutil, "disk_usage", lambda path: _Space(10**9, 10**10))
+
+    reading = assess(tmp_path, today=today, calendar=_weekday_calendar(today, 60))
+
+    assert reading.reserve == 13 * 7
+
+
+# -- ported from the mutation lens on PR #810 ---------------------------------------
+
+
+def test_assess_reads_the_busiest_sealed_day_over_its_own_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A narrower window leaves out a larger day the default thirty-day window would count."""
+    today = date(2026, 9, 30)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-29.parquet", 4096)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-10.parquet", 5 * 4096)
+    monkeypatch.setattr(runway.shutil, "disk_usage", lambda path: _Space(10**9, 10**10))
+    sealed = walk(tmp_path).sealed_bytes(date(2026, 9, 29))
+
+    reading = assess(tmp_path, today=today, calendar=_weekday_calendar(today, 60), window_days=7)
+
+    assert reading.reserve == 13 * sealed

@@ -228,9 +228,9 @@ credentials, such as a VM with no instance profile or a laptop that carries the 
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: assume_role` in `config.yaml`.
 
-Four commands go with the bucket. The first two refuse with exit 2 on a shadow host, which is
-any host whose config sets `role` to something other than `primary`. The restore runs on
-either.
+Five commands go with the bucket. The first two and the range restore refuse with exit 2 on a
+shadow host, which is any host whose config sets `role` to something other than `primary`.
+The whole-lake restore runs on either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -274,9 +274,29 @@ either.
    differ only by case are named as failures, because on macOS one would overwrite the
    other. A year-end lake
    is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
-   empty `lake_root` is seeded. A restore uploads nothing and takes no lock, which is why
+   empty `lake_root` is seeded. This restore uploads nothing and takes no lock, which is why
    a shadow host may run it.
-4. The nightly upload needs no command. Once `backup_target` names the bucket, the
+4. `uv run python -m lake.bucket restore-range --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30`
+   puts chosen chains or quotes partitions back into the live lake at `lake_root`, for a
+   partition lost by accident or a rollback of trimming. Leave out `--ticker` to take every
+   ticker. It restores only partitions the lake's manifest records, verifies each download
+   against the manifest's sha before it moves the file into place, and leaves a partition
+   already on disk with that sha as it is. A partition trimmed on purpose gets a restore line
+   in `trimmed.jsonl`, which a lost one does not. It hashes and downloads with the lake-root
+   lock released, and takes the lock only for short steps: listing the targets' directories,
+   reading the ledgers, each partition's rename, and each ledger line. So it blocks capture
+   for no more than a moment. It removes a
+   temp file a crashed run left beside a target, and finishes what a crashed run left
+   unrecorded, so running it again is always safe. It refuses with exit 2 on Sunday from
+   19:55 to 23:30, inside a session or within 30 minutes of its open, when a partition on disk
+   differs from its manifest entry, when the bucket's current version does not match, and
+   when the volume would be left with less free space than the journal reserve, 13 times the
+   busiest sealed day, counted with the restored partitions in place. A partition on disk
+   that differs is moved out of the lake by hand, and the next run restores the bucket's
+   copy. A version that does not match is repaired by "Putting a version back for the range
+   restore" below, and a refusal for a trimmed partition names the version its trim line
+   recorded.
+5. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
@@ -310,6 +330,20 @@ no `s3:GetObjectVersion`, so this is a console step.
    restore again. It finds the manifest's hash there and does not download the damaged
    current version. A file the manifest does not record is checked against the current
    version's stored checksum instead, so an earlier version of one never verifies.
+
+**Putting a version back for the range restore.** The range restore reads current versions
+only, so a partition it refuses because the bucket's current version does not match the
+manifest needs a matching version made current again. The lake is alive, so the manifest to
+check against is the lake's own.
+
+1. Open the bucket, turn on **Show versions**, and go to the partition's key under the lake's
+   prefix. For a trimmed partition, the refusal names the version its trim line verified.
+   Otherwise pick the latest version uploaded before the damage.
+2. Download that version, and check `shasum -a 256` of the download against the partition's
+   latest entry in `<lake_root>/manifest.jsonl`.
+3. Put it back as the current version with the put-object command above, with `--body`
+   naming the download.
+4. Run `restore-range` again.
 
 Versioning keeps every version of a partition and 30 days of the files rewritten nightly,
 per the lifecycle rules above.

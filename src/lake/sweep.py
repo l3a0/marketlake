@@ -387,7 +387,8 @@ _BARS_REFUSALS = (
 # ``bars`` calls "what separates a quarantine somebody can sign off from a gap nothing can
 # rebuild". The other three want a human. ``PartitionAbsent`` is a manifested partition gone
 # from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and ``PartialRead`` a
-# schema change (marketlake #530).
+# schema change (marketlake #530). A chains or quotes partition comes back from the bucket
+# through ``python -m lake.bucket restore-range`` (marketlake #784).
 #
 # ``SnapAbsent`` took ``NoSpotClose``'s place when marketlake #618 moved the gate's reference
 # onto the session's own 16:15 row, read by minute. A gap row at that minute is the same
