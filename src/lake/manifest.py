@@ -37,9 +37,10 @@ verdicts and admit the partitions they withhold. :func:`read_quarantine` refuses
 byte-order mark, which does decode and still cannot be read past. The manifest's reader keeps
 the truncating read **for a torn tail**, because :func:`scrub` resolves through it and a Sunday
 scrub that raised would fail on the very file it exists to report. Bytes that will not decode
-are not that shape, and both ledgers refuse them as :class:`LedgerNotUtf8`, because a read that
-cannot decode the file answers nothing for the scrub to report either way. Marketlake #499 is
-that half. What the manifest does about a byte-order mark is still open and is marketlake #519.
+are not that shape, and every ledger read here refuses them as :class:`LedgerNotUtf8`, because
+a read that cannot decode the file answers nothing for the scrub to report either way.
+Marketlake #499 is that half. What the manifest does about a byte-order mark is still open
+and is marketlake #519.
 
 The corporate-actions ledger at ``actions/corporate_actions.jsonl`` follows them too, and
 it keys on the action rather than on a path, the way the quarantine ledger keys on the
@@ -197,7 +198,9 @@ class LedgerNotUtf8(ManifestError):
     ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves the manifest,
     so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
     ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
-    the sentence above is true of one of the two ledgers this class now covers.
+    the sentence above is false of the manifest. It is true of the other two ledgers this class
+    covers, the quarantine ledger and the trimmed ledger, whose three readers in marketlake #782
+    each contain it.
     """
 
 
@@ -332,18 +335,19 @@ def _decode_utf8(path: Path, raw: bytes, *, consequence: str) -> str:
     pinning removes is a dependence on an interpreter flag nobody tracks rather than a failure
     anything has met.
 
-    **This is the shared rule, and :func:`_decode` is the quarantine ledger's own reader.** Both
-    ledgers refuse bytes that will not decode, and the refusal is one implementation, which is
-    why it sits apart from the caller. What deliberately does not cross between them is anything
-    one ledger decides for itself. Marketlake #506 settled what the quarantine ledger does about
+    **This is the shared rule, and :func:`_decode` is the reader the quarantine and trimmed
+    ledgers share.** The manifest, the quarantine ledger and the trimmed ledger all refuse bytes
+    that will not decode, and the refusal is one implementation, which is why it sits apart from
+    the caller. What deliberately does not cross between them is anything one ledger decides for
+    itself. Marketlake #506 settled what the quarantine ledger does about
     a byte-order mark and marketlake #519 is that question for the manifest, still open and
     owned by nobody. A manifest read routed through :func:`_decode` would inherit #506's answer
     without anyone deciding it should, so it routes through here instead and #519 keeps its
     question.
 
     **The consequence sentence belongs to the caller.** The byte, the line and the repair are
-    the same for both ledgers. What the damage costs is not, so the caller supplies it rather
-    than this function naming one ledger's loss on the other's file.
+    the same for every ledger read here. What the damage costs is not, so the caller supplies it
+    rather than this function naming one ledger's loss on another's file.
 
     **The message sends the person repairing the file to the byte and to the line.** The
     exception carries the byte offset alone, which is the wrong unit for an editor, so the
@@ -547,13 +551,14 @@ def _decode(
     consequence: str = _QUARANTINE_CONSEQUENCE,
     mark_consequence: str = _QUARANTINE_MARK_CONSEQUENCE,
 ) -> str:
-    """The quarantine ledger's bytes as text, or a refusal naming what in them cannot be read.
+    """A guard ledger's bytes as text, or a refusal naming what in them cannot be read.
 
-    Two shapes refuse. Bytes that do not decode raise :class:`LedgerNotUtf8`, through
-    :func:`_decode_utf8`, which both ledgers share. Text that decodes and holds a byte-order
-    mark raises :class:`LedgerHasByteOrderMark`, and that one is this ledger's alone: marketlake
-    #519 is the same question for the manifest and it is open, so :func:`_read_jsonl` reads
-    through :func:`_decode_utf8` and meets only the first of the two.
+    The quarantine ledger and the trimmed ledger read through here. Two shapes refuse. Bytes
+    that do not decode raise :class:`LedgerNotUtf8`, through :func:`_decode_utf8`, which the
+    manifest shares. Text that decodes and holds a byte-order mark raises
+    :class:`LedgerHasByteOrderMark`, and the manifest does not refuse that one: marketlake #519
+    is the same question for the manifest and it is open, so :func:`_read_jsonl` reads through
+    :func:`_decode_utf8` and meets only the first of the two.
 
     **The byte-order mark is looked for in the decoded text rather than in the bytes.** A UTF-16
     mark is not valid UTF-8, so ``FF FE`` and ``FE FF`` both refuse above as
@@ -621,17 +626,18 @@ def read_quarantine(lake_root: Path) -> list[dict]:
     quarantine consumer funnels through, so all three refusals reach all of them from one place.
 
     **Why the torn-tail refusal is here and not in ``parse_jsonl``.** The rule is the same for
-    both ledgers and the consequences are not. :func:`scrub` resolves the manifest through
-    :func:`latest_entries`, so a manifest raising on a torn tail would take the Sunday scrub
-    down on exactly the file it exists to report, and the entries in front of the tear are real
-    and are what the scrub reads. Marketlake #447 carries the manifest ledger and the scrub's
-    own reporting of damage. This ledger's readers are a guard, and a guard that cannot read its
-    own ledger has to refuse rather than admit, which is :func:`is_quarantined`'s stated rule at
-    file scope.
+    the manifest and this ledger, and the consequences are not. :func:`scrub` resolves the
+    manifest through :func:`latest_entries`, so a manifest raising on a torn tail would take the
+    Sunday scrub down on exactly the file it exists to report, and the entries in front of the
+    tear are real and are what the scrub reads. Marketlake #447 carries the manifest ledger and
+    the scrub's own reporting of damage. This ledger's readers are a guard, and a guard that
+    cannot read its own ledger has to refuse rather than admit, which is :func:`is_quarantined`'s
+    stated rule at file scope.
 
     That argument is about a read that still answers, so it does not reach
-    :class:`LedgerNotUtf8`. Both ledgers refuse those bytes, because neither read answers
-    anything on a file it cannot decode. Marketlake #499 moved the manifest's half.
+    :class:`LedgerNotUtf8`. The manifest and this ledger both refuse those bytes, because
+    neither read answers anything on a file it cannot decode. Marketlake #499 moved the
+    manifest's half.
 
     ``_read_jsonl`` is not reused because this needs the text the count is taken from, and
     that function returns entries alone. A missing ledger still reads as no entries, which is
@@ -985,7 +991,7 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
     mapping, including a verdict spelling ``is_quarantined`` refuses to clear, where
     ``battery.build_entry`` is the one place an entry is assembled and checked.
 
-    It stays public because the two ledgers' line rules live here and a test writing a
+    It stays public because the ledgers' line rules live here and a test writing a
     deliberately malformed entry needs a way past the checked builder.
     """
     append_line(quarantine_path(lake_root), entry)
