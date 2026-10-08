@@ -584,6 +584,48 @@ def test_an_unsealed_session_before_the_first_manifested_day_leaves_no_cutoff(
     _one_pass_equals_a_stopped_run(base, "SPY", None)
 
 
+def test_another_tickers_unsealed_session_before_this_tickers_first_day_does_not_stop_it(
+    fixture_lake: FixtureLake,
+):
+    """The journal is read per ticker before the first day too, so QQQ's day one is QQQ's."""
+    _segment(fixture_lake, "QQQ", DAY_ONE, QQQ_OCC)
+    base = _lake(fixture_lake, _days(DAY_TWO, DAY_THREE))
+
+    _one_pass_equals_a_stopped_run(base, "SPY", DAY_THREE)
+
+
+def test_segments_beside_a_sealed_first_day_do_not_stop_it(fixture_lake: FixtureLake):
+    """A manifested day is judged by its partition, the first one as much as any later one."""
+    _segment(fixture_lake, "SPY", DAY_ONE, CARRIED_OCC)
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO))
+
+    _one_pass_equals_a_stopped_run(base, "SPY", DAY_TWO)
+
+
+def test_journal_entries_that_name_no_date_do_not_stop_the_cutoff(fixture_lake: FixtureLake):
+    """The journal also holds the timing directory, and a date it cannot parse names no day."""
+    journal = LakePaths(fixture_lake.root).journal_dir
+    (journal / "timing").mkdir(parents=True)
+    (journal / "date=unreadable").mkdir()
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO))
+
+    _one_pass_equals_a_stopped_run(base, "SPY", DAY_TWO)
+
+
+def test_a_journal_that_cannot_be_listed_leaves_no_cutoff(fixture_lake: FixtureLake):
+    """Nothing says no unsealed session sits before the first day, so no day is passed."""
+    journal = LakePaths(fixture_lake.root).journal_dir
+    journal.mkdir(parents=True)
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO))
+    journal.chmod(0)
+    try:
+        states = _states(_run(base))
+    finally:
+        journal.chmod(0o755)
+
+    assert "SPY" not in states
+
+
 def test_an_unsealed_session_before_the_first_read_session_stops_the_cutoff(
     fixture_lake: FixtureLake,
 ):
@@ -722,9 +764,15 @@ def test_an_out_of_scope_day_after_a_day_that_resolved_unread_stops_it(
 def test_a_resume_after_a_day_that_resolved_unread_stops_at_an_out_of_scope_day(
     fixture_lake: FixtureLake,
 ):
-    """The saved state read no session, so only the master says day one resolved."""
+    """The saved state read no session, so only the master says day one resolved.
+
+    SPY's mapping opens on day one itself, the cutoff, which still counts as resolved there.
+    """
     master = SecurityMaster(
-        [_mapping(1, "SPY", valid_to=DAY_TWO), _mapping(1, "SPY", valid_from=DAY_THREE)]
+        [
+            _mapping(1, "SPY", valid_from=DAY_ONE, valid_to=DAY_TWO),
+            _mapping(1, "SPY", valid_from=DAY_THREE),
+        ]
     )
     base = _lake(
         fixture_lake,
@@ -737,6 +785,25 @@ def test_a_resume_after_a_day_that_resolved_unread_stops_at_an_out_of_scope_day(
     (state,) = _run(_copy(base, "second"), night=SECOND_NIGHT, resume=[saved]).states
 
     assert state == saved
+
+
+def test_a_resume_before_the_ticker_ever_resolved_passes_an_out_of_scope_day(
+    fixture_lake: FixtureLake,
+):
+    """SPY resolves only from day three, so days one and two precede its first in-scope day.
+
+    Another ticker resolving before the cutoff says nothing about SPY.
+    """
+    master = SecurityMaster([_mapping(1, "SPY", valid_from=DAY_THREE), _mapping(2, "QQQ")])
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO, DAY_THREE), master=master)
+    (saved,) = _stopped_through(base, "first", DAY_ONE).states
+    assert saved.cutoff == DAY_ONE
+
+    resumed = _states(_run(_copy(base, "second"), night=SECOND_NIGHT, resume=[saved]))["SPY"]
+    whole = _states(_run(_copy(base, "whole"), night=SECOND_NIGHT))["SPY"]
+
+    assert resumed == whole
+    assert resumed.cutoff == DAY_THREE
 
 
 def test_an_uncaptured_day_out_of_scope_does_not_stop_it(fixture_lake: FixtureLake):
