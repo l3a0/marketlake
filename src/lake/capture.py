@@ -300,9 +300,9 @@ def _transient(response: VendorResponse | None, error: Exception | None) -> bool
     The design names a timeout, a 5xx and a reset. A raised failure qualifies by
     ``is_transient_failure``, and a reply by a status from 500 to 599 that is not the
     ``TooBigBody`` 502, which is a size signal and splits instead. Nothing else is sent
-    again. A 429 is the burst the stagger exists to avoid (marketlake #533), a 401 or 403
-    is auth death, and a body that is the wrong shape or too big comes back the same way
-    the second time.
+    again. A 429 is a rate-limit rejection, and a retry inside the same volley only adds
+    to it (marketlake #533). A 401 or 403 is auth death, and a body that is the wrong
+    shape or too big comes back the same way the second time.
     """
     if error is not None:
         return is_transient_failure(error)
@@ -310,9 +310,11 @@ def _transient(response: VendorResponse | None, error: Exception | None) -> bool
 
 
 # A 429's sub-code, such as ``429-005`` for a burst or ``429-001`` for a sustained rate. The
-# design calls the sub-codes community-documented rather than published, and no 429 has
-# ever reached the lake, so where Schwab puts one is unmeasured. The pattern is therefore
-# looked for anywhere in the reply rather than at one assumed field.
+# design calls the sub-codes community-documented rather than published. None of the 24
+# requests Schwab answered 429 from 2026-10-01 to 2026-10-07 carried one. Every body was
+# whitespace, and no header held a sub-code, a rate-limit field or a ``Retry-After``. The
+# pattern is still looked for anywhere in the reply rather than at one assumed field, so a
+# sub-code Schwab starts sending is recorded wherever it lands.
 _SUBCODE = re.compile(r"429-\d{3}")
 
 # How much of a rejected reply's body ``request_error_detail`` keeps, in UTF-8 bytes.
@@ -333,8 +335,8 @@ def _rejection(response: VendorResponse) -> tuple[str | None, str | None, str | 
     1. ``subcode`` is the first ``429-`` and three digits found in the body or a header
        value, looked for on a 429 alone, so a 400 echoing a parameter cannot yield one.
     2. ``detail`` is JSON holding the reply's headers, less ``Set-Cookie``, and its body
-       cut to ``ERROR_DETAIL_MAX_BYTES``. It keeps the first real rejection's shape, so the
-       pattern above can be narrowed against a real sample.
+       cut to ``ERROR_DETAIL_MAX_BYTES``. It keeps each rejection's real shape, so a
+       rejection can be diagnosed from what Schwab sent.
     3. ``failure`` names what went wrong building the other two, which are then ``None``.
 
     The body searched and copied is the vendor's own text when the reply carries one.
@@ -1338,16 +1340,16 @@ def _fetch_concurrently(
     3. **Within one fetch, only this thread moves the clock.** Submissions are
        ``guards.capture_stagger_ms`` apart, slept on the injected clock here, so a volley
        leaves over about a second rather than in one instant, clear of Schwab's burst
-       rejection (429-005). This thread stamps
-       each unit's ``fetch_ts`` just before its first submission. Pool threads make vendor
-       calls and parse the responses, and read the clock once more to stamp when their own
-       task finished. A unit's ``fetch_end_ts`` is the latest of its tasks' finish stamps, so
-       it is when the unit's last response landed, whatever else was still being submitted.
-       Reading the clock from a pool thread is safe, since ``now`` changes nothing, and no
-       pool thread ever sleeps on it or advances it. Other threads do: each minute's cycle
-       runs on a thread of its own, and the daemon's loop thread waits on those cycles
-       through the same clock (marketlake #565). The real clock's sleep and wait change no
-       shared value, and the test clock takes a lock around every move.
+       rejection. This thread stamps each unit's ``fetch_ts`` just before its first
+       submission. Pool threads make vendor calls and parse the responses, and read the
+       clock once more to stamp when their own task finished. A unit's ``fetch_end_ts`` is
+       the latest of its tasks' finish stamps, so it is when the unit's last response
+       landed, whatever else was still being submitted. Reading the clock from a pool thread
+       is safe, since ``now`` changes nothing, and no pool thread ever sleeps on it or
+       advances it. Other threads do: each minute's cycle runs on a thread of its own, and
+       the daemon's loop thread waits on those cycles through the same clock (marketlake
+       #565). The real clock's sleep and wait change no shared value, and the test clock
+       takes a lock around every move.
     4. **A unit is handed over as soon as its own tasks are done** (marketlake #563). A unit
        is one ticker's chain, every window of it, or the one quote request. Once the whole
        volley is submitted, this thread waits for the first task to finish among those still

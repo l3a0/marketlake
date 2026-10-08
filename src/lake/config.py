@@ -576,8 +576,8 @@ class GuardConstants:
     # At 20 today's 19 tasks go out in one round, so without a bound a cycle would overrun only
     # once its slowest window passed about 60s, against a mean of about 30s at a cap of 10. The
     # bound below ends the cycle before that, so a slow window now costs its own window rather
-    # than the next minute (marketlake #597). What the cap risks is the burst rejection
-    # (429-005), whose threshold is unpublished and unmeasured. A cap of 1 fetches exactly as
+    # than the next minute (marketlake #597). What the cap risks is the burst rejection,
+    # whose threshold is unpublished and unmeasured. A cap of 1 fetches exactly as
     # the cycle fetched before #532, with no pool and no stagger, so lowering it here rolls the
     # fetch back on the next cycle. The token-refresh lock and the per-cycle client close from
     # the same change stay in place at a cap of 1.
