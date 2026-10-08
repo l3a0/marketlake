@@ -652,3 +652,16 @@ def test_an_ambiguous_master_is_what_the_old_symbol_guard_exists_to_avoid():
 
     with pytest.raises(AmbiguousSymbol):
         master.resolve(OLD, DAY_TWO, id_type=ID_TYPE_OCC)
+
+
+def test_an_export_is_in_ssid_order_whatever_order_contracts_were_first_read():
+    history = SymbolHistory()
+    history.observe(DAY_ONE, [_row(3, NEWER)])
+    history.observe(DAY_TWO, [_row(1, OLD), _row(2, OTHER)])
+
+    assert [ssid for ssid, _, _ in history.export()] == [1, 2, 3]
+
+
+def test_an_import_naming_one_contract_twice_is_refused_even_when_both_agree():
+    with pytest.raises(ValueError, match="names contract 1 twice"):
+        SymbolHistory.from_export([(1, OLD, DAY_ONE), (1, OLD, DAY_ONE)])

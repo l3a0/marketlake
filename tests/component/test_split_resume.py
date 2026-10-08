@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from lake.paths import CHAINS, LakePaths, parse_partition_rel
-from lake.security_master import SecurityMaster
+from lake.security_master import Mapping, SecurityMaster, master_path
 from lake.splits import (
     CHECK_SPLIT_BOUNDARY,
     CHECK_SPLIT_CONSISTENCY,
@@ -33,6 +33,7 @@ from lake.splits import (
     REASON_PARTIAL_READ,
     REASON_PARTITION_ABSENT,
     REASON_QUARANTINED,
+    REASON_THIN,
     SplitReport,
     WalkState,
     detect_splits,
@@ -155,15 +156,18 @@ def _ledger(root: Path) -> list[str]:
     )
 
 
-def _answers(reports: list[tuple[SplitReport, dict[str, date]]]) -> dict[str, list]:
+def _answers(reports: list[tuple[SplitReport, dict[str, date] | None]]) -> dict[str, list]:
     """The held findings, marks and skips several runs reported, each run up to its own bound.
 
-    Each run is paired with a bound per ticker: a run counts for that ticker's days up to the
-    bound, and a ticker it has no bound for counts in full.
+    Each run is paired with a bound per ticker, or with ``None`` to count it in full. A run
+    with bounds counts for each ticker's days up to its bound, and not at all for a ticker it
+    has no bound for. A first night that reported no state for a ticker leaves the second
+    night to walk that ticker from the start, so the first night's answers for it count for
+    nothing.
     """
 
-    def counts(ticker: str, day: date, bounds: dict[str, date]) -> bool:
-        return ticker not in bounds or day <= bounds[ticker]
+    def counts(ticker: str, day: date, bounds: dict[str, date] | None) -> bool:
+        return bounds is None or (ticker in bounds and day <= bounds[ticker])
 
     held, marks, skipped = [], [], []
     for report_out, bounds in reports:
@@ -193,8 +197,10 @@ class Scenario:
     """A lake as it stands on the second night, and what the first night saw of it.
 
     ``night_one`` is the last chains day the lake held on the first night. ``quarantine`` is
-    withheld on the first night and ``cleared`` is signed off before the second. ``exposes``
-    names the state variable whose loss this lake shows, where it shows one.
+    withheld on the first night and ``cleared`` is signed off before the second. Each of SPY's
+    ``unsealed`` days sat in the journal on the first night and is sealed before the second.
+    ``master`` is the master both nights start from, and ``edited`` replaces it before the
+    second. ``exposes`` names the state variable whose loss this lake shows, where it shows one.
     """
 
     sessions: dict
@@ -202,6 +208,9 @@ class Scenario:
     exposes: str | None = None
     quarantine: tuple[str, ...] = ()
     cleared: tuple[str, ...] = ()
+    unsealed: tuple[date, ...] = ()
+    master: tuple[Mapping, ...] | None = None
+    edited: tuple[Mapping, ...] | None = None
 
 
 def _partition(day: date, ticker: str = "SPY") -> str:
@@ -293,6 +302,32 @@ SCENARIOS = {
         },
         night_one=DAY_FOUR,
     ),
+    # The root of "a root returning after the cutoff", with day one still in the journal on
+    # the first night, as a seal ``compact`` refused would leave it while day two sealed. Read
+    # from day two alone, day three's returning root is a gain.
+    "an unsealed first day before the first night": Scenario(
+        sessions={
+            ("SPY", DAY_ONE): [_row(DAY_ONE), _row(DAY_ONE, **RETURNING)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE), _row(DAY_THREE, **RETURNING)],
+        },
+        night_one=DAY_TWO,
+        unsealed=(DAY_ONE,),
+    ),
+    # Day one resolves and is thin, and day two is out of scope until a master edit closes the
+    # hole. A walk from the start then reads day two, so the old mapping of day four's
+    # re-symboling opens there, and the resumed walk has to read it too.
+    "a master hole after a thin first day, closed after the first night": Scenario(
+        sessions={
+            ("SPY", DAY_ONE): [_row(DAY_ONE, suspect=True)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE)],
+            ("SPY", DAY_FOUR): [_row(DAY_FOUR, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_FOUR)],
+        },
+        night_one=DAY_THREE,
+        master=(_mapping(1, "SPY", valid_to=DAY_TWO), _mapping(1, "SPY", valid_from=DAY_THREE)),
+        edited=(_mapping(1, "SPY"),),
+    ),
 }
 
 # Each variable set back to what a walk from scratch starts with. The ladder is the
@@ -316,29 +351,43 @@ def _base(fixture_lake: FixtureLake, scenario: Scenario) -> Path:
         fixture_lake,
         scenario.sessions,
         quarantine=[{"partition": p, "verdict": "bad"} for p in scenario.quarantine],
+        master=None if scenario.master is None else SecurityMaster(scenario.master),
     )
+
+
+def _edit(root: Path, scenario: Scenario) -> None:
+    """The changes made between the two nights: a sign-off and a master edit."""
+    _clear(root, scenario.cleared)
+    if scenario.edited is not None:
+        SecurityMaster(scenario.edited).write(master_path(root))
 
 
 def _from_the_start(base: Path, scenario: Scenario) -> dict[str, list]:
     """The second night's walk over the whole lake."""
     root = _copy(base, "whole")
-    _clear(root, scenario.cleared)
+    _edit(root, scenario)
     report_out = _run(root, night=SECOND_NIGHT)
     return {
         "ledger": _ledger(root),
         "mappings": sorted(_mappings(root)),
-        **_answers([(report_out, {})]),
+        **_answers([(report_out, None)]),
     }
 
 
 def _resumed(base: Path, scenario: Scenario, *, trim: bool = True, drop=None) -> dict[str, list]:
     """The first night stopped at ``night_one``, then a trim, then a resumed second night."""
     root = _copy(base, "resumed")
-    later = _chains_lines(root, lambda ref: ref.day > scenario.night_one)
+    later = _chains_lines(
+        root, lambda ref: ref.day > scenario.night_one or ref.day in scenario.unsealed
+    )
+    for day in scenario.unsealed:
+        _segment(FixtureLake(root), "SPY", day, CARRIED_OCC)
     first = _run(root)
     states = first.states
-    _clear(root, scenario.cleared)
+    _edit(root, scenario)
     _restore(root, later)
+    for day in scenario.unsealed:
+        shutil.rmtree(LakePaths(root).segment_dir(CHAINS, "SPY", day))
     if trim:
         _trim(root, states)
     passed = tuple(drop(state) for state in states) if drop else states
@@ -347,7 +396,7 @@ def _resumed(base: Path, scenario: Scenario, *, trim: bool = True, drop=None) ->
     return {
         "ledger": _ledger(root),
         "mappings": sorted(_mappings(root)),
-        **_answers([(first, cutoffs), (second, {})]),
+        **_answers([(first, cutoffs), (second, None)]),
     }
 
 
@@ -403,6 +452,10 @@ def test_each_scenario_shows_what_it_says(fixture_lake: FixtureLake):
     assert len(found["a quarantine cleared after the first night"]["ledger"]) == 1
     refused = found["a refused split before the first night ends"]["held"]
     assert len(refused) == 1 and CHECK_SPLIT_CONSISTENCY in refused[0]
+    assert found["an unsealed first day before the first night"]["ledger"] == []
+    hole = found["a master hole after a thin first day, closed after the first night"]
+    ((_, valid_from, valid_to), _) = hole["mappings"]
+    assert valid_from == DAY_TWO and valid_to == DAY_FOUR
 
 
 # -- the cutoff one pass finds ---------------------------------------------------------------
@@ -521,6 +574,36 @@ def test_an_unsealed_session_among_the_uncaptured_stops_the_cutoff_before_them(
     assert state.unread_since == 0
 
 
+def test_an_unsealed_session_before_the_first_manifested_day_leaves_no_cutoff(
+    fixture_lake: FixtureLake,
+):
+    """Once day one seals it is SPY's first day, and a resume past day two would never read it."""
+    _segment(fixture_lake, "SPY", DAY_ONE, CARRIED_OCC)
+    base = _lake(fixture_lake, _days(DAY_TWO, DAY_THREE))
+
+    _one_pass_equals_a_stopped_run(base, "SPY", None)
+
+
+def test_an_unsealed_session_before_the_first_read_session_stops_the_cutoff(
+    fixture_lake: FixtureLake,
+):
+    """Day one is thin, so no session has been read when day two's unsealed rows are met.
+
+    Day two is not reported as uncaptured, since no session has been read before it. It still
+    stops the cutoff, because once it seals a resume past day three would never read it.
+    """
+    _segment(fixture_lake, "SPY", DAY_TWO, CARRIED_OCC)
+    base = _lake(
+        fixture_lake,
+        _days(DAY_ONE, DAY_THREE, **{DAY_ONE.isoformat(): [_row(DAY_ONE, suspect=True)]}),
+    )
+
+    report_out = _run(_copy(base, "skips"))
+
+    assert [(skip.day, skip.reason) for skip in report_out.skipped] == [(DAY_ONE, REASON_THIN)]
+    _one_pass_equals_a_stopped_run(base, "SPY", DAY_ONE)
+
+
 def test_a_session_the_lake_never_captured_does_not_stop_the_cutoff(fixture_lake: FixtureLake):
     """A file compaction would never seal is not a segment, so day three counts as uncaptured."""
     directory = LakePaths(fixture_lake.root).segment_dir(CHAINS, "SPY", DAY_THREE)
@@ -620,6 +703,42 @@ def test_an_out_of_scope_day_before_the_first_read_session_does_not_stop_it(
     _one_pass_equals_a_stopped_run(base, "SPY", DAY_THREE)
 
 
+def test_an_out_of_scope_day_after_a_day_that_resolved_unread_stops_it(
+    fixture_lake: FixtureLake,
+):
+    """Day one resolves and is thin, so day two is out of scope after a day in scope."""
+    master = SecurityMaster(
+        [_mapping(1, "SPY", valid_to=DAY_TWO), _mapping(1, "SPY", valid_from=DAY_THREE)]
+    )
+    base = _lake(
+        fixture_lake,
+        _days(DAY_ONE, DAY_TWO, DAY_THREE, **{DAY_ONE.isoformat(): [_row(DAY_ONE, suspect=True)]}),
+        master=master,
+    )
+
+    _one_pass_equals_a_stopped_run(base, "SPY", DAY_ONE)
+
+
+def test_a_resume_after_a_day_that_resolved_unread_stops_at_an_out_of_scope_day(
+    fixture_lake: FixtureLake,
+):
+    """The saved state read no session, so only the master says day one resolved."""
+    master = SecurityMaster(
+        [_mapping(1, "SPY", valid_to=DAY_TWO), _mapping(1, "SPY", valid_from=DAY_THREE)]
+    )
+    base = _lake(
+        fixture_lake,
+        _days(DAY_ONE, DAY_TWO, DAY_THREE, **{DAY_ONE.isoformat(): [_row(DAY_ONE, suspect=True)]}),
+        master=master,
+    )
+    (saved,) = _stopped_through(base, "first", DAY_ONE).states
+    assert saved.previous is None
+
+    (state,) = _run(_copy(base, "second"), night=SECOND_NIGHT, resume=[saved]).states
+
+    assert state == saved
+
+
 def test_an_uncaptured_day_out_of_scope_does_not_stop_it(fixture_lake: FixtureLake):
     """No partition exists there for a master edit to make readable."""
     early, late = date(2026, 9, 15), date(2026, 9, 21)
@@ -674,6 +793,68 @@ def test_a_retired_ticker_gets_a_cutoff_at_its_last_day(fixture_lake: FixtureLak
     assert state.previous.day == DAY_TWO
 
 
+def test_a_split_past_the_window_edge_is_still_judged(fixture_lake: FixtureLake):
+    """The edge sets the cutoff and nothing else, so a split past it is still filed."""
+    rows = [_row(DAY_THREE, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_THREE, note="200 SPY")]
+    base = _lake(
+        fixture_lake,
+        _days(DAY_ONE, DAY_TWO, DAY_THREE, DAY_FOUR, **{DAY_THREE.isoformat(): rows}),
+    )
+
+    edged = _run(_copy(base, "edged"), edge=DAY_ONE)
+    whole = _run(_copy(base, "whole"))
+
+    assert _states(edged)["SPY"].cutoff == DAY_ONE
+    assert _answers([(edged, None)]) == _answers([(whole, None)])
+    assert len(edged.held) == 1
+
+
+def test_a_cutoff_after_an_unread_day_keeps_the_count_of_unread_sessions(
+    fixture_lake: FixtureLake,
+):
+    """Day two is a gap day and day three is quarantined, so the state carries one unread."""
+    base = _lake(
+        fixture_lake,
+        _days(
+            DAY_ONE, DAY_TWO, DAY_THREE, DAY_FOUR, **{DAY_TWO.isoformat(): [_gap_day_row(DAY_TWO)]}
+        ),
+        quarantine=[{"partition": _partition(DAY_THREE), "verdict": "bad"}],
+    )
+
+    state = _one_pass_equals_a_stopped_run(base, "SPY", DAY_TWO)
+
+    assert state.unread_since == 1
+
+
+def test_a_held_split_after_an_uncaptured_session_stops_the_cutoff_before_counting_it(
+    fixture_lake: FixtureLake,
+):
+    """Day three was never captured, so a state counting it would count it again on a resume."""
+    rows = [_row(DAY_FOUR, occ_symbol=CARRIED_OCC), _adjusted_row(DAY_FOUR, note="200 SPY")]
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO, DAY_FOUR, **{DAY_FOUR.isoformat(): rows}))
+
+    state = _one_pass_equals_a_stopped_run(base, "SPY", DAY_TWO)
+
+    assert state.unread_since == 0
+
+
+def test_an_ambiguous_day_after_an_uncaptured_session_stops_the_cutoff_before_counting_it(
+    fixture_lake: FixtureLake,
+):
+    master = _master()
+    master.register(
+        kind="equity",
+        capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+        valid_from=DAY_FOUR,
+        ticker="SPY",
+    )
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO, DAY_FOUR), master=master)
+
+    state = _one_pass_equals_a_stopped_run(base, "SPY", DAY_TWO)
+
+    assert state.unread_since == 0
+
+
 # -- what a resume carries over --------------------------------------------------------------
 
 
@@ -719,3 +900,53 @@ def test_two_saved_states_for_one_ticker_are_refused(fixture_lake: FixtureLake):
 
     with pytest.raises(ValueError, match="two saved states name SPY"):
         _run(_copy(base, "second"), resume=[saved, saved])
+
+
+def test_a_resume_meeting_an_unknown_symbol_keeps_its_saved_state(fixture_lake: FixtureLake):
+    """The master no longer carries SPY, after a session the lake never captured."""
+    known = _lake(FixtureLake(fixture_lake.root.parent / "known" / "lake"), _days(DAY_ONE, DAY_TWO))
+    (saved,) = _run(_copy(known, "first")).states
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO, DAY_FOUR), master=_master(tickers=("QQQ",)))
+
+    (state,) = _run(_copy(base, "second"), night=SECOND_NIGHT, resume=[saved]).states
+
+    assert state == saved
+
+
+def test_a_resumed_state_whose_first_day_stops_before_any_day_is_processed_comes_back_unchanged(
+    fixture_lake: FixtureLake,
+):
+    """The edge stops the resume at its first day, so the run hands back what it was passed."""
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO, DAY_THREE))
+    (saved,) = _stopped_through(base, "first", DAY_ONE).states
+    blank = replace(saved, last_day=None)
+
+    (state,) = _run(_copy(base, "second"), resume=[blank], edge=DAY_ONE).states
+
+    assert state == blank
+
+
+def test_states_come_back_in_ticker_order(fixture_lake: FixtureLake):
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_TWO))
+    (spy,) = _stopped_through(base, "first", DAY_ONE).states
+    gone = WalkState(
+        ticker="IWM",
+        cutoff=DAY_ONE,
+        previous=None,
+        seen=frozenset(),
+        history=(),
+        unread_since=0,
+        last_day=DAY_ONE,
+    )
+
+    report_out = _run(_copy(base, "second"), resume=[spy, gone])
+
+    assert [state.ticker for state in report_out.states] == ["IWM", "SPY"]
+
+
+def test_two_different_saved_states_for_one_ticker_are_refused(fixture_lake: FixtureLake):
+    base = _lake(fixture_lake, _days(DAY_ONE))
+    (saved,) = _run(_copy(base, "first")).states
+
+    with pytest.raises(ValueError, match="two saved states name SPY"):
+        _run(_copy(base, "second"), resume=[saved, replace(saved, unread_since=1)])

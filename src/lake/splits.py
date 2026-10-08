@@ -247,7 +247,7 @@ from lake.occ_mapping import (
     SymbolHistory,
     write_mappings,
 )
-from lake.paths import CHAINS, SEGMENT_GLOB, LakePaths
+from lake.paths import CHAINS, DATE_PREFIX, SEGMENT_GLOB, LakePaths
 from lake.report import Withheld, write_withheld
 from lake.security_master import (
     AmbiguousSymbol,
@@ -439,8 +439,8 @@ REASON_NOT_SEALED = "no sealed chain for the session"
 # partial read whole. Two more reversible skips are decided where they arise in
 # :func:`detect_splits`, because each needs more than the reason: an unsealed session counts
 # only while the ticker's own journal still holds segments, and an out-of-scope day counts
-# only once the ticker has had a session read. A gap day, a thin chain and a session with no
-# option close stay as they are, so they do not stop it.
+# only once the master has resolved the ticker on an earlier day. A gap day, a thin chain and
+# a session with no option close stay as they are, so they do not stop it.
 _REVERSIBLE = frozenset({REASON_QUARANTINED, REASON_PARTITION_ABSENT, REASON_PARTIAL_READ})
 
 # Why the scale guard could not compare a pair of sessions. None of these is a finding. A pair
@@ -827,9 +827,11 @@ class _Cutoff:
 
     The walk cannot know the cutoff before it starts, because the events that set it are found
     during the run. So the walk calls :meth:`stop` with the state as it stood after the last day
-    it fully processed, and only the first call counts. Every caller passes the values it held
-    at the top of the iteration, never ones changed partway through it, since a state taken
-    inside the count of uncaptured sessions would count those sessions again on a resume.
+    it fully processed, and only the first call counts. A call inside the loop passes the values
+    the walk held at the top of the iteration, never ones changed partway through it, since a
+    state taken inside the count of uncaptured sessions would count those sessions again on a
+    resume. The call after the loop passes the values as the last iteration left them, because
+    by then every day has been fully processed.
     """
 
     def __init__(self, ticker: str, start: WalkState | None) -> None:
@@ -1364,7 +1366,9 @@ def _require_unmoved(before: object, after: object, what: str) -> None:
 def _uncaptured_sessions(calendar: Calendar, after: date, before: date) -> list[date]:
     """Every exchange session strictly between two of a ticker's consecutive sealed days.
 
-    The two ends come from the manifest and nothing the manifest holds sits between them, so
+    The upper end comes from the manifest. The lower end is the manifested day the walk looked
+    at last, or on a resume the saved state's ``last_day``, a day the trim may since have
+    removed from the manifest. Either way nothing the manifest holds sits between them, so
     every session here is one the lake captured nothing for. That is the count
     :func:`surface_ticker_days` cannot produce: a day with no partition has no manifest entry
     to be enumerated from, and the walk reads the two sessions either side of it as
@@ -1446,6 +1450,37 @@ def _segments_remain(lake_root: Path, ticker: str, day: date) -> bool:
     except OSError:
         return True
     return any(fnmatchcase(name, SEGMENT_GLOB) for name in names)
+
+
+def _segments_before(lake_root: Path, ticker: str, day: date) -> bool:
+    """Whether this ticker's chains journal holds segments for any session before ``day``.
+
+    The walk asks this once per ticker, at its first manifested day, where no earlier day
+    anchors a count of uncaptured sessions. A session there still unsealed becomes the ticker's
+    first manifested day once it seals, and a resume would never read it, since it falls at or
+    before the cutoff. A seal ``compact`` refuses keeps its segments while later days seal, so
+    such a day can sit below every manifested one. The answer is per ticker for the reason
+    :func:`_segments_remain` gives, and a journal that exists and cannot be listed answers yes
+    for the same reason.
+    """
+    journal = LakePaths(lake_root).journal_dir
+    try:
+        with os.scandir(journal) as entries:
+            names = [entry.name for entry in entries]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for name in names:
+        if not name.startswith(DATE_PREFIX):
+            continue
+        try:
+            earlier = date.fromisoformat(name[len(DATE_PREFIX) :])
+        except ValueError:
+            continue
+        if earlier < day and _segments_remain(lake_root, ticker, earlier):
+            return True
+    return False
 
 
 def detect_splits(
@@ -1540,11 +1575,14 @@ def detect_splits(
     the events are only found during the run.
 
     1. A day past ``edge``, the window edge the caller passes in.
-    2. A skip a later change can undo, which ``_REVERSIBLE`` names, on the day itself or among
-       the uncaptured sessions before it. An uncaptured session counts only while the ticker's
-       own journal holds its segments. An out-of-scope day counts only on a manifested day
-       after the ticker's first read session. Before that the walk has nothing for it to
-       change, and the live lake's SPY 2026-09-02 would stop SPY's cutoff forever.
+    2. A skip a later change can undo, on the day itself or among the uncaptured sessions
+       before it. ``_REVERSIBLE`` names three of them by their reason: quarantined,
+       ``PartitionAbsent`` and ``PartialRead``. The other two need more than the reason. An
+       unsealed session counts while the ticker's own journal holds its segments, whether it
+       falls between two manifested days or before the ticker's first one. An out-of-scope
+       day counts only on a manifested day after a day the master resolved for the ticker,
+       read or not. Before that the walk has nothing for it to change, and the live lake's
+       SPY 2026-09-02 would stop SPY's cutoff forever.
     3. A symbol the master cannot place, which ends the ticker's walk.
     4. A finding filed while judging the day, by ``_examine`` or by the scale guard. A held
        split never clears, so a resume has to file it again every night, as a walk from the
@@ -1621,6 +1659,11 @@ def detect_splits(
         # once and in date order: anchored on ``previous`` it would be re-enumerated on every
         # iteration until a read advanced it.
         last_day: date | None = None
+        # Whether the master has resolved this ticker on any day the walk has reached, read or
+        # not. An out-of-scope day before that has nothing for a master edit to change, and an
+        # out-of-scope day after it does. A resume seeds it from the master, since the days at
+        # or before the cutoff are not walked again.
+        resolved = False
         if start is not None:
             previous = start.previous
             history = SymbolHistory.from_export(start.history)
@@ -1628,6 +1671,10 @@ def detect_splits(
             unread_since = start.unread_since
             last_day = start.last_day
             days = [day for day in days if day > start.cutoff]
+            resolved = any(
+                mapping.id_value == ticker and mapping.valid_from <= start.cutoff
+                for mapping in master.mappings
+            )
         for day in days:
             # The state after the last day fully processed. Every stopping event below takes
             # this one, never the counters as this iteration changes them. ``history`` changes
@@ -1646,15 +1693,24 @@ def detect_splits(
             # one as consecutive. That is marketlake #431, and both consumers below inherit it
             # from this one counter.
             #
-            # **Only once a session has been read.** Below a ticker's first readable day the
-            # lake captured nothing because it was not yet asked to, and the master already
-            # calls such a day out of scope rather than a gap. Reporting it as uncaptured would
-            # file two skips per run for the live lake's 2026-09-03 and 2026-09-04 forever, on
-            # a window no pair spans.
-            if previous is not None and last_day is not None:
+            # **Reported only once a session has been read.** Below a ticker's first readable
+            # day the lake captured nothing because it was not yet asked to, and the master
+            # already calls such a day out of scope rather than a gap. Reporting it as
+            # uncaptured would file two skips per run for the live lake's 2026-09-03 and
+            # 2026-09-04 forever, on a window no pair spans.
+            #
+            # **Checked for unsealed segments either way.** An unsealed session stops the
+            # cutoff wherever it falls, since once it seals a resume would never read it. Before
+            # the ticker's first manifested day there is no earlier day to count from, so the
+            # check asks whether the journal holds this ticker's segments for any earlier date.
+            if last_day is None:
+                if _segments_before(lake_root, ticker, day):
+                    cutoff.stop(history=history, **top)
+            else:
                 for missing in _uncaptured_sessions(calendar, last_day, day):
-                    skipped.append(Skip(ticker, missing, _why_unread(master, ticker, missing)))
-                    unread_since += 1
+                    if previous is not None:
+                        skipped.append(Skip(ticker, missing, _why_unread(master, ticker, missing)))
+                        unread_since += 1
                     if _segments_remain(lake_root, ticker, missing):
                         cutoff.stop(history=history, **top)
             last_day = day
@@ -1665,7 +1721,7 @@ def detect_splits(
                     # Known symbol, no mapping valid that day. Out of scope, never a gap.
                     skipped.append(Skip(ticker, day, REASON_OUT_OF_SCOPE))
                     unread_since += 1
-                    if previous is not None:
+                    if resolved:
                         cutoff.stop(history=history, **top)
                     continue
                 hold(_resolution_finding(ticker, day, exc))
@@ -1679,6 +1735,7 @@ def detect_splits(
                 skipped.append(Skip(ticker, day, REASON_UNRESOLVED))
                 cutoff.stop(history=history, **top)
                 break
+            resolved = True
 
             session = read_session(lake_root, ticker, day, instrument_id)
             if isinstance(session, str):
