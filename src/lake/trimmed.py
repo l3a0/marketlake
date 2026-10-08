@@ -481,6 +481,8 @@ def repair_trimmed_entry(lake_root: Path, *, source: str, fetched_at: str | None
     except TrimmedRepairRefused:
         raise
     except RowCountRegression as exc:
+        # A backstop. The prefix check above refuses a ledger that lost lines first, so the
+        # row-count guard can fire here only if the two ways of counting lines ever disagree.
         raise _lost_lines(path, exc.proposed, exc.recorded) from exc
     except TrimmedAppendRefused as exc:
         raise TrimmedRepairRefused(
