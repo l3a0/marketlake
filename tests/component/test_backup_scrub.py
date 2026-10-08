@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date
 from pathlib import Path
 
 from lake.manifest import backup_scrub, scrub
 from lake.paths import MANIFEST_FILE
 from tests.support.backup import mirror_lake
+from tests.support.fifo import without_blocking
 from tests.support.lake import FixtureLake, sample_chains_table
 
 DAY = date(2026, 8, 28)
@@ -443,6 +445,21 @@ def test_a_manifest_copy_truncated_to_nothing_is_not_a_clean_watermark(fixture_l
     result = backup_scrub(root, target)
     assert result.manifest_missing is True
     assert result.ok is False
+
+
+def test_a_fifo_where_the_manifest_copy_should_be_stops_the_walk_unopened(fixture_lake):
+    # ``rsync -a`` copies a FIFO as a FIFO, and reading one blocks until a writer appears. Every
+    # later answer reads this ledger, so the walk stops here and names it.
+    root, target = _backed_up(fixture_lake)
+    copy = target / MANIFEST_FILE
+    copy.unlink()
+    os.mkfifo(copy)
+
+    result = without_blocking(copy, lambda: backup_scrub(root, target))
+
+    assert result.unreadable == f"{copy}: not a regular file"
+    assert result.walked is False and result.matched == ()
+    assert result.problem == f"backup could not be read: {copy}: not a regular file"
 
 
 def test_a_plain_file_where_the_target_should_be_is_not_a_mounted_disk(fixture_lake):

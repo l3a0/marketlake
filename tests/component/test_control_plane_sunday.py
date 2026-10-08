@@ -20,7 +20,6 @@ import os
 import shutil
 import stat
 import subprocess
-import threading
 import urllib.error
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -35,6 +34,7 @@ from lake.metadata import JournalMetadata, stamp_assertion_pid
 from tests.support.backup import FAIL, WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.fifo import without_blocking
 from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
@@ -1606,10 +1606,6 @@ _no_root_chmod = pytest.mark.skipif(
     os.geteuid() == 0, reason="root reads and lists past every permission bit"
 )
 
-# How long a scrub gets before a test calls it blocked. A run takes a few seconds even on a
-# loaded machine, and a scrub that opened a FIFO never returns at all.
-_FIFO_WAIT = 30
-
 
 @contextmanager
 def _mode(path: Path, mode: int):
@@ -1626,36 +1622,6 @@ def _withheld_and_still_ran(outcome, pinger) -> None:
     """The ping is withheld, and the canary and the coverage assertion ran all the same."""
     assert outcome.pinged is False and pinger.urls == []
     assert outcome.canary_passed is True and outcome.covered is True
-
-
-def _without_blocking(fifo: Path, call):
-    """Run ``call`` in a thread, and fail rather than hang if it opened ``fifo``.
-
-    A read of a FIFO blocks until a writer appears. The ``finally`` opens it for writing only
-    while the thread is still alive, which unblocks the read. A fixed scrub never opens the
-    FIFO, and opening one for writing with nobody reading raises ``ENXIO``.
-    """
-    box: dict = {}
-
-    def target() -> None:
-        try:
-            box["value"] = call()
-        except BaseException as exc:  # handed back to the test's own thread
-            box["error"] = exc
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout=_FIFO_WAIT)
-    blocked = thread.is_alive()
-    try:
-        assert not blocked, f"the run opened {fifo} and blocked"
-    finally:
-        if thread.is_alive():
-            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-            thread.join(timeout=_FIFO_WAIT)
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
 
 
 @_no_root_chmod
@@ -1792,7 +1758,7 @@ def test_a_fifo_at_a_manifested_path_is_named_without_being_opened(fixture_lake)
     fifo.unlink()
     os.mkfifo(fifo)
 
-    outcome, pinger = _without_blocking(fifo, lambda: _run(root))
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
 
     assert outcome.scrub.unreadable == (f"{QUOTES}: not a regular file",)
     assert f"lake path could not be read: {QUOTES}: not a regular file" in outcome.report
@@ -1808,7 +1774,7 @@ def test_a_fifo_at_the_trimmed_ledger_is_named_without_being_opened(fixture_lake
     fifo.unlink()
     os.mkfifo(fifo)
 
-    outcome, pinger = _without_blocking(fifo, lambda: _run(root))
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
 
     assert outcome.scrub.trimmed_unreadable == "not a regular file"
     assert outcome.scrub.unreadable == ("trimmed.jsonl: not a regular file",)
@@ -2040,7 +2006,7 @@ def test_a_fifo_on_the_copy_is_named_without_being_opened_and_the_walk_finishes(
     fifo.unlink()
     os.mkfifo(fifo)
 
-    outcome, pinger = _without_blocking(fifo, lambda: _run(root))
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
 
     assert outcome.backup.not_regular == (QUOTES,)
     assert outcome.backup.walked is True

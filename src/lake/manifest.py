@@ -1541,6 +1541,10 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
     copy = manifest_path(target)
     if not copy.exists():
         return BackupScrubResult(target=str(target), manifest_missing=True)
+    if not stat.S_ISREG(copy.stat().st_mode):
+        # A FIFO here would block the read below forever, as one at a partition would. Every
+        # later answer reads this ledger, so it stops the walk rather than being one finding.
+        return BackupScrubResult(target=str(target), unreadable=f"{copy}: {NOT_A_REGULAR_FILE}")
 
     source_bytes = manifest_path(root).read_bytes() if manifest_path(root).exists() else b""
     backup_bytes = copy.read_bytes()
