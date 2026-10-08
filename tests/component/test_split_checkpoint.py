@@ -36,10 +36,11 @@ from lake.manifest import (
     sha256_file,
 )
 from lake.paths import CHAINS, TRIMMED_FILE, LakePaths
-from lake.report import SPLITS_PIECE
+from lake.report import ACTION, SPLITS_PIECE
 from lake.security_master import ID_TYPE_FIGI, SecurityMaster, master_path
 from lake.split_checkpoint import (
     CHECKPOINT_PARTITION,
+    REPAIR,
     Checkpoint,
     CheckpointEntry,
     CheckpointUnreadable,
@@ -1094,3 +1095,304 @@ def test_the_sweep_judges_the_window_against_the_guards_it_was_given(fixture_lak
         for line in outcome.nightly.report
     )
     assert not checkpoint_path(root).exists()
+
+
+# -- the mutation lens's gaps ----------------------------------------------------------------
+
+
+def test_the_sweep_cuts_at_exactly_the_window_edge(fixture_lake: FixtureLake):
+    """Sealed days on the edge and the session after it pin the edge to one session."""
+    root = _swept_lake(
+        fixture_lake,
+        chains={
+            ("SPY", EDGE): sample_chains_table(),
+            ("SPY", date(2026, 8, 10)): sample_chains_table(),
+        },
+    )
+
+    _sweep(root)
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+
+
+def test_an_ordinary_write_keeps_the_row_count_guard(fixture_lake: FixtureLake):
+    """Only the replacement of an unreadable file turns the guard off."""
+    root = _swept_lake(fixture_lake)
+    _sweep(root)
+    record_partition(root, CHECKPOINT_PARTITION, source="reference", rows=99, fetched_at=None)
+
+    outcome, _ = _sweep(root)
+
+    assert any(
+        problem.startswith("split checkpoint not written: RowCountRegression")
+        for problem in outcome.nightly.problems
+    )
+
+
+def test_a_lake_with_no_chains_day_files_no_checkpoint_problem(fixture_lake: FixtureLake):
+    root = _sweep_lake(fixture_lake, judged=())
+
+    outcome, _ = _sweep(root)
+
+    assert not checkpoint_path(root).exists()
+    assert not any("split checkpoint" in problem for problem in outcome.nightly.problems)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "prefix"),
+    [
+        ({"window": 21}, "lake window refused: "),
+        ({"calendar": weekday_sessions(MONDAY, NEXT_MONDAY)}, "lake window edge not found: "),
+    ],
+    ids=["refused", "edge not found"],
+)
+def test_the_window_lines_are_action_lines(fixture_lake: FixtureLake, kwargs, prefix: str):
+    root = _swept_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, **kwargs)
+
+    nightly = outcome.nightly
+    (index,) = [i for i, line in enumerate(nightly.report) if line.startswith(prefix)]
+    assert nightly.report_kinds[index] == ACTION
+
+
+def test_a_blocked_write_puts_its_reason_in_the_report(fixture_lake: FixtureLake):
+    root = _swept_lake(
+        fixture_lake,
+        tickers=("SPY", "QQQ"),
+        instrument_ids=(1, 2),
+        chains={("QQQ", SESSION): sample_chains_table()},
+    )
+    _trim(root, SESSION, ticker="QQQ")
+    path = checkpoint_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"torn checkpoint")
+
+    outcome, _ = _sweep(root)
+
+    assert "split checkpoint not written: CheckpointUnreadable" in outcome.nightly.report
+
+
+def test_the_sweep_stamps_the_checkpoint_entry_with_its_own_clock(fixture_lake: FixtureLake):
+    root = _swept_lake(fixture_lake)
+
+    _sweep(root)
+
+    stamped = latest_entries(root)[CHECKPOINT_PARTITION]["fetched_at"]
+    assert stamped == ManualClock(EVENING).now().isoformat()
+
+
+def test_the_manifest_entry_counts_every_ticker(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _two_ticker_checkpoint(root)
+
+    assert latest_entries(root)[CHECKPOINT_PARTITION]["rows"] == 2
+
+
+def test_a_state_with_an_unread_session_reads_back_exactly(fixture_lake: FixtureLake):
+    """``unread_since`` above zero and ``previous`` before the cutoff come back at their types.
+
+    The walks the other tests save only ever produce ``unread_since`` 0 and ``previous`` on the
+    cutoff, so a reader that dropped either, or a column stored at a narrower type, would pass
+    them. A spot of 655.37 has no exact ``float32``.
+    """
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    written = _night_one(root, edge=DAY_TWO)
+    (entry,) = written.entries
+    state = replace(
+        entry.state,
+        cutoff=DAY_THREE,
+        last_day=DAY_THREE,
+        unread_since=2,
+        previous=replace(entry.state.previous, day=DAY_ONE, spot=655.37),
+    )
+    write_checkpoint(
+        root, Checkpoint(DAY_THREE, (replace(entry, state=state),)), recorded_at=SECOND_NIGHT
+    )
+
+    (read,) = read_checkpoint(root).entries
+
+    assert read.state == state
+    assert read.state.previous.spot == 655.37
+    assert type(read.state.previous.instrument_id) is int
+    assert read.state.history
+    assert {type(ssid) for ssid, _, _ in read.state.history} == {int}
+    assert read.mappings
+    assert {type(mapping[0]) for mapping in read.mappings} == {int}
+
+
+@pytest.mark.parametrize("column", ["session_day", "cutoff"])
+def test_a_checkpoint_row_missing_a_required_value_is_unreadable(
+    fixture_lake: FixtureLake, column: str
+):
+    """A null cutoff would otherwise raise ``TypeError`` in the walk, outside the sweep's net."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _night_one(root, edge=DAY_TWO)
+    _rewrite_checkpoint(root, column, [None])
+
+    with pytest.raises(CheckpointUnreadable):
+        read_checkpoint(root)
+
+
+def test_a_failed_write_leaves_no_temp_file(fixture_lake: FixtureLake, monkeypatch):
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    walked = walk_splits(lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR)
+
+    def failing(table, where):
+        Path(where).write_bytes(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(split_checkpoint.pq, "write_table", failing)
+
+    with pytest.raises(OSError):
+        write_checkpoint(root, Checkpoint(DAY_TWO, walked.entries), recorded_at=FIRST_NIGHT)
+
+    assert not list(checkpoint_path(root).parent.glob("*.tmp-*"))
+
+
+def test_the_saved_mappings_are_sorted_whatever_the_master_order():
+    master = SecurityMaster(
+        [_mapping(2, "SPY", valid_from=DAY_THREE), _mapping(1, "SPY", valid_to=DAY_THREE)]
+    )
+
+    assert mappings_at(master, "SPY", DAY_THREE) == (
+        (1, "ticker", date(2026, 9, 8), DAY_THREE),
+        (2, "ticker", DAY_THREE, None),
+    )
+
+
+def test_the_saved_mappings_come_from_the_master_the_walk_started_with(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """A master edited mid-walk then reads as changed at the next resume, which refuses."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    before = SecurityMaster.read(master_path(root))
+    real = splits.read_session
+
+    def editing(lake_root, ticker, day, instrument_id):
+        SecurityMaster([_mapping(1, "SPY", valid_from=date(2026, 9, 1))]).write(master_path(root))
+        return real(lake_root, ticker, day, instrument_id)
+
+    monkeypatch.setattr(splits, "read_session", editing)
+
+    walked = walk_splits(
+        lake_root=root, clock=ManualClock(FIRST_NIGHT), calendar=CALENDAR, edge=DAY_TWO
+    )
+
+    (entry,) = walked.entries
+    assert entry.mappings == mappings_at(before, "SPY", entry.state.cutoff)
+
+
+def _trim_quotes(root: Path, day: date) -> None:
+    partition = f"quotes/ticker=SPY/date={day.isoformat()}.parquet"
+    manifest = latest_entries(root)
+    with lake_lock(root):
+        line = trim_line(
+            partition,
+            sha256=manifest[partition]["sha256"],
+            version_id="v1",
+            verified_at=STAMP,
+            trimmed_at=STAMP,
+        )
+        append_trimmed(root, line, source="trim", fetched_at=None)
+        (root / partition).unlink()
+
+
+def test_a_trimmed_quotes_day_is_not_a_chains_absence(fixture_lake: FixtureLake):
+    """Quotes trims arrive with marketlake #794, and must not class a ticker as trimmed."""
+    root = _lake(fixture_lake, RETURNING_LAKE, quotes=("SPY", DAY_ONE))
+    _trim_quotes(root, DAY_ONE)
+
+    walked = _night_two(root)
+
+    assert walked.report.refused == ()
+
+
+def test_a_quarantined_quotes_day_does_not_refuse_a_resume(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, RETURNING_LAKE, quotes=("SPY", DAY_ONE))
+    _night_one(root, edge=DAY_TWO)
+    _trim(root, DAY_ONE)
+    quotes_day = f"quotes/ticker=SPY/date={DAY_ONE.isoformat()}.parquet"
+    append_quarantine(root, {"partition": quotes_day, "verdict": "bad"})
+
+    walked = _night_two(root)
+
+    assert walked.report.refused == ()
+
+
+def test_a_refusal_with_no_saved_entry_names_its_repair(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _trim(root, DAY_ONE)
+
+    walked = _night_two(root)
+
+    assert REPAIR in _refused(walked)["SPY"]
+
+
+def test_a_resumed_ticker_refused_mid_walk_reports_no_state(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    saved = _night_one(root, edge=DAY_ONE)
+    (root / _partition(DAY_TWO)).unlink()
+
+    report = splits.detect_splits(
+        lake_root=root,
+        clock=ManualClock(SECOND_NIGHT),
+        calendar=CALENDAR,
+        resume=[saved.entries[0].state],
+        absent_refusal=lambda ticker, day: "refused mid-walk",
+    )
+
+    assert [(r.ticker, r.reason) for r in report.refused] == [("SPY", "refused mid-walk")]
+    assert report.states == ()
+
+
+def test_an_unreadable_checkpoint_is_named_on_stderr(fixture_lake: FixtureLake, capsys):
+    """The report file keeps the class alone. The whole message reaches the job's log."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _night_one(root, edge=DAY_ONE)
+    checkpoint_path(root).write_bytes(b"PAR1 torn")
+
+    _night_two(root)
+
+    assert "splits: the split checkpoint at" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory whatever its mode")
+def test_an_absence_that_cannot_be_checked_raises(fixture_lake: FixtureLake):
+    """A ticker directory that cannot be read is not a designed absence."""
+    root = _lake(fixture_lake, RETURNING_LAKE)
+    _trim(root, DAY_ONE)
+    directory = (root / _partition(DAY_ONE)).parent
+    directory.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            _night_two(root)
+    finally:
+        directory.chmod(0o755)
+
+
+def test_a_night_refusing_every_ticker_still_restamps_the_saved_checkpoint(
+    fixture_lake: FixtureLake,
+):
+    """No state tonight is not a reason to drop the saved entries."""
+    root = _swept_lake(fixture_lake)
+    master = SecurityMaster.read(master_path(root))
+    saved_day = date(2026, 9, 11)
+    saved = Checkpoint(
+        session_day=saved_day,
+        entries=(
+            CheckpointEntry(
+                state=WalkState("SPY", saved_day, None, frozenset(), (), 0, saved_day),
+                mappings=mappings_at(master, "SPY", saved_day),
+            ),
+        ),
+    )
+    write_checkpoint(root, saved, recorded_at=FIRST_NIGHT)
+    _trim(root, SESSION)
+
+    outcome, _ = _sweep(root)
+
+    assert any(p.startswith("splits did not run for SPY") for p in outcome.nightly.problems)
+    written = read_checkpoint(root)
+    assert written.session_day == SESSION
+    assert written.entry("SPY") == saved.entry("SPY")

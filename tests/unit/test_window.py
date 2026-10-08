@@ -155,17 +155,23 @@ class _CountingCalendar:
 
 def test_the_edge_stops_counting_rather_than_looping_on_a_calendar_with_no_session():
     """A calendar that answers no session refuses the edge instead of hanging the sweep."""
-    calendar = _CountingCalendar(limit=EDGE_SEARCH_DAYS + 30)
+    calendar = _CountingCalendar(limit=400)
 
     with pytest.raises(EdgeNotFound):
         window_edge(calendar, FRIDAY, 22)
 
-    assert calendar.asked == EDGE_SEARCH_DAYS
+    # A literal year rather than ``EDGE_SEARCH_DAYS``, so a shorter stop cannot move the
+    # expectation with it.
+    assert calendar.asked == 366
 
 
 def test_the_stop_reaches_back_a_year():
-    """A session just inside the bound is still found, so the stop is not too short."""
-    far = FRIDAY - timedelta(days=EDGE_SEARCH_DAYS - 1)
+    """A session a year back is still found, so the stop is not too short.
+
+    Written with a literal 365 days, so a stop shortened in the code cannot move the fixture
+    with it.
+    """
+    far = FRIDAY - timedelta(days=365)
 
     class _OneSession:
         def is_session(self, day: date) -> bool:
@@ -223,3 +229,16 @@ def test_a_window_longer_than_the_search_says_so():
         window_edge(THREE_WEEKS, FRIDAY, 22)
 
     assert "answers no session" not in str(raised.value)
+
+
+def test_a_window_of_no_session_is_refused():
+    with pytest.raises(ValueError):
+        window_edge(THREE_WEEKS, FRIDAY, 0)
+
+
+@pytest.mark.parametrize("span", ["HISTORY_WINDOW_DAYS", "GROWTH_WINDOW_DAYS"])
+def test_the_floor_reads_each_calendar_span(monkeypatch, span: str):
+    """Widen either span to 60 days and the floor follows, to the 44 weekdays it holds."""
+    monkeypatch.setattr(f"lake.window.{span}", 60)
+
+    assert window_floor(GuardConstants()) == 44
