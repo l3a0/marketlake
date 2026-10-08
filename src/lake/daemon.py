@@ -1837,10 +1837,10 @@ def run_loop_from_config(
             # already follows. Three pages here fold: the sampler page stands for every
             # quotes ticker a failed batched request explains, the cause page stands for
             # every surface that failed the same way, and the stall page stands for every
-            # surface a stall charged. Without
-            # the count, one page for two and one page for four hundred read identically.
-            # A page standing for one surface carries none, and on every page but the
-            # stall page the title itself says which surface that is.
+            # surface a stall charged. Without the count, one page for two and one page
+            # for four hundred read identically. A page standing for one surface carries
+            # none, and on every page but the stall page the title itself says which
+            # surface that is.
             #
             # The names are left out because listing them costs the body's byte budget
             # as the roster grows and tells the operator nothing the other pages do not.

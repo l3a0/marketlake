@@ -2659,7 +2659,7 @@ def test_a_ticker_whose_write_fails_after_a_sampler_page_pages_while_the_batch_s
     fail the vendor's way, so they stay with the sampler page. IWM then leaves for two
     minutes, which leaves a sampler's set of one, so QQQ is released and pages too. IWM
     returns with a fresh count, and when it trips with QQQ the collapse sends a second
-    sampler page, the price #570 already names for a ticker that returns.
+    sampler page. That is the price a ticker that returns already pays (marketlake #570).
     """
     cycles = []
     for minute in range(10):
