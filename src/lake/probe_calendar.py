@@ -381,7 +381,7 @@ def _page_body(result: ProbeResult) -> str:
     them. This body is the same size at any roster, so it needs no cap of its own.
 
     The names buy nothing anyway. A market that is open quotes all of them, so the list
-    restates the roster, and the Quote sampler's row leaves its names out for that reason.
+    restates the roster.
 
     The denominator is what the vendor answered rather than what was asked. ``_batch_of``
     narrows a reply to the symbols the vendor named and ``answered`` counts those. A reply
