@@ -973,6 +973,9 @@ def test_a_ticker_that_stops_before_its_first_day_saves_the_starting_state(
     assert entry.state.cutoff < DAY_ONE
     write_checkpoint(root, Checkpoint(DAY_THREE, walked.entries), recorded_at=SECOND_NIGHT)
     assert read_checkpoint(root).cutoffs() == {"SPY": date.min}
+    # ``last_day`` comes back ``None`` rather than ``date.min``. A resume from ``date.min``
+    # would count every calendar day since year one as uncaptured.
+    assert read_checkpoint(root).entries == walked.entries
     assert _night_two(root, edge=DAY_THREE).report.refused == ()
 
 
