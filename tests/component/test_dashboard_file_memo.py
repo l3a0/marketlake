@@ -147,18 +147,30 @@ def build_lake(fixture_lake: FixtureLake) -> tuple[Path, list[Path], list[Path]]
 # -- counting reads -----------------------------------------------------------
 
 
+# Called with the partitions a statement read, once the statement has run.
+AfterRead = Callable[[list[Path]], None]
+
+
 class _CountingCursor:
     """A cursor that counts every partition a statement binds, then runs it as it was."""
 
-    def __init__(self, cursor: duckdb.DuckDBPyConnection, reads: Counter) -> None:
+    def __init__(
+        self, cursor: duckdb.DuckDBPyConnection, reads: Counter, after: AfterRead | None
+    ) -> None:
         self._cursor = cursor
         self._reads = reads
+        self._after = after
 
     def execute(self, sql: str, params: Any = None) -> duckdb.DuckDBPyConnection:
+        named: list[Path] = []
         if isinstance(params, dict):
-            for name in params.get("partitions", ()):
-                self._reads[Path(name).resolve()] += 1
-        return self._cursor.execute(sql, params)
+            named = [Path(name).resolve() for name in params.get("partitions", ())]
+            for path in named:
+                self._reads[path] += 1
+        result = self._cursor.execute(sql, params)
+        if self._after is not None and named:
+            self._after(named)
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._cursor, name)
@@ -167,12 +179,13 @@ class _CountingCursor:
 class _CountingConnection:
     """The service's sandboxed connection, handing out counting cursors."""
 
-    def __init__(self, root: Path, reads: Counter) -> None:
+    def __init__(self, root: Path, reads: Counter, after: AfterRead | None = None) -> None:
         self._con = open_lake_connection(root)
         self._reads = reads
+        self._after = after
 
     def cursor(self) -> _CountingCursor:
-        return _CountingCursor(self._con.cursor(), self._reads)
+        return _CountingCursor(self._con.cursor(), self._reads, self._after)
 
 
 @pytest.fixture
@@ -196,12 +209,17 @@ def partition_reads() -> Counter:
     return Counter()
 
 
-def service_over(root: Path, partition_reads: Counter, memo: FileMemo | None = None):
+def service_over(
+    root: Path,
+    partition_reads: Counter,
+    memo: FileMemo | None = None,
+    after: AfterRead | None = None,
+):
     return DashboardService(
         root,
         clock=ManualClock(NOW.astimezone(UTC)),
         calendar=CALENDAR,
-        connection=_CountingConnection(root, partition_reads),  # type: ignore[arg-type]
+        connection=_CountingConnection(root, partition_reads, after),  # type: ignore[arg-type]
         page=b"<!doctype html>",
         icon=b"",
         memo=memo,
@@ -446,6 +464,41 @@ def test_the_identity_is_taken_before_the_segment_is_read(
     assert _slot(second, et(MONDAY, 9, 34))["status"] == "captured"
 
 
+@pytest.mark.parametrize("query", ["history", "today"])
+def test_the_identity_is_taken_before_the_partition_is_read(
+    fixture_lake: FixtureLake, partition_reads: Counter, query: str
+):
+    # A repair can publish a new partition the moment after a read of the old one. The
+    # identity taken before the read names the old file, so the next request sees a new
+    # inode and reads the repair. An identity taken after would name the repair, and the
+    # memo would answer for it with the old file's counts. History reaches the file
+    # through the window's bulk read, and Today, asked for the sealed day, through the
+    # per-day read.
+    root, _, _ = build_lake(fixture_lake)
+    partition = LakePaths(root).partition_path("chains", "QQQ", THURSDAY)
+    replaced: list[bool] = []
+
+    def replace_after_read(read: list[Path]) -> None:
+        if partition in read and not replaced:
+            replaced.append(True)
+            _publish_partition(
+                partition, _sealed("chains", "QQQ", et(THURSDAY, 9, 30), et(THURSDAY, 9, 31))
+            )
+
+    service = service_over(root, partition_reads, after=replace_after_read)
+    raw = {} if query == "history" else {"date": THURSDAY.isoformat(), "ticker": "QQQ"}
+
+    def captured() -> int:
+        payload = service.run_query(query, raw)
+        if query == "history":
+            return _cell(payload, "QQQ", "chains", THURSDAY)["counts"]["captured"]
+        return _strip(payload, "QQQ", "chains")["counts"]["captured"]
+
+    assert captured() == 1
+    assert replaced == [True]
+    assert captured() == 2
+
+
 # -- failures are never remembered ------------------------------------------------
 
 
@@ -543,18 +596,23 @@ def test_a_minute_split_across_files_merges_as_one_statement_over_them_would(
     # are merged, so every column has to merge as one statement over all three would.
     # The first segment's rows are not suspect and the second's are, so ``suspect`` must be
     # the OR. Each file carries a row whose stamp will not cast and a row of a kind the
-    # panels do not know, and both counts must add across files rather than keep one.
+    # panels do not know, and both counts must add across files rather than keep one. The
+    # next minute holds a gap row in the first segment and only an unknown kind in the
+    # second, so it is a gap only if the gap count survives the merge.
     minute = et(MONDAY, 9, 30)
+    gap_minute = et(MONDAY, 9, 31)
     first = [
         _row("chains", "SPY", minute, error_class="b_class"),
         _row("chains", "SPY", "not a time"),
         _row("chains", "SPY", minute, row_kind="weird"),
+        _row("chains", "SPY", gap_minute, row_kind=journal.ROW_KIND_GAP, error_class="c_class"),
     ]
     second = [
         _row("chains", "SPY", minute, suspect=True, error_class="a_class"),
         _row("chains", "SPY", minute, error_class="b_class"),
         _row("chains", "SPY", "also not a time"),
         _row("chains", "SPY", minute, row_kind="weird"),
+        _row("chains", "SPY", gap_minute, row_kind="weird"),
     ]
     for start, rows in (("20260824T133000000000", first), ("20260824T133000500000", second)):
         fixture_lake.with_journal_segment(
@@ -570,7 +628,10 @@ def test_a_minute_split_across_files_merges_as_one_statement_over_them_would(
         assert slot["rows"] == 4
         assert slot["error_class"] == ["a_class", "b_class"]
         assert strip["unparseable_stamp_rows"] == 2
-        assert strip["drifted_rows"] == 2
+        assert strip["drifted_rows"] == 3
+        gap = _slot(strip, gap_minute)
+        assert gap["status"] == "gap"
+        assert gap["error_class"] == ["c_class"]
 
 
 # -- eviction --------------------------------------------------------------------
@@ -638,20 +699,26 @@ def test_a_dropped_file_is_read_again_and_a_used_one_is_not(
 # -- concurrency -----------------------------------------------------------------
 
 
-def test_one_write_to_the_memo_finishes_before_another_starts():
+@pytest.mark.parametrize("second", ["put", "get"])
+def test_no_access_to_the_memo_runs_inside_a_write(second: str):
     # The server answers each request on its own thread. The time source is read inside
-    # every access, so a time source that starts a second write and waits for it shows
-    # whether the first write still excludes it. With the lock the second write waits for
-    # the first to finish. Without it the second runs to the end inside the first.
+    # every write, so a time source that starts a second access and waits for it shows
+    # whether the write still excludes it. With the lock the second access waits for the
+    # write to finish. Without it the second runs to the end inside the first.
     memo = FileMemo(monotonic=lambda: inner())
     identity = (1, 2, 3, 4)
     groups: tuple = ()
     other: list[threading.Thread] = []
     finished_inside: list[bool] = []
+    access: Callable[[], object] = (
+        (lambda: memo.put([("b", identity, groups)]))
+        if second == "put"
+        else (lambda: memo.get("a", identity))
+    )
 
     def inner() -> float:
         if not other:
-            thread = threading.Thread(target=memo.put, args=([("b", identity, groups)],))
+            thread = threading.Thread(target=access)
             other.append(thread)
             thread.start()
             thread.join(timeout=0.5)
@@ -662,7 +729,7 @@ def test_one_write_to_the_memo_finishes_before_another_starts():
     other[0].join(timeout=5)
     assert finished_inside == [False]
     assert not other[0].is_alive()
-    assert len(memo) == 2
+    assert len(memo) == (2 if second == "put" else 1)
 
 
 def test_panels_refreshing_together_answer_as_they_do_one_at_a_time(
