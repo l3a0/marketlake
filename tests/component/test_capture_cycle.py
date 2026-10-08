@@ -1526,6 +1526,34 @@ def test_a_failed_write_does_not_hold_its_chain_to_the_end_of_the_cycle(
     assert alive == [False]
 
 
+def _raised(error: BaseException) -> BaseException:
+    """The error, raised and caught, so it carries a traceback of its own."""
+    try:
+        raise error
+    except BaseException as caught:
+        return caught
+
+
+def test_clearing_a_failure_clears_every_exception_chained_to_it():
+    """The cause, the context and an exception group's members each lose their traceback.
+
+    Each one holds its own frames, so clearing only some of them keeps the rest alive.
+    """
+    cause = _raised(OSError(errno.ENOSPC, "no space"))
+    context = _raised(ValueError("the cleanup failed"))
+    member = _raised(PermissionError("refused"))
+    group = _raised(ExceptionGroup("several", [member]))
+    outer = _raised(RuntimeError("the write failed"))
+    outer.__cause__ = cause
+    outer.__context__ = context
+    context.__context__ = group
+
+    assert capture._without_tracebacks(outer) is outer
+
+    for link in (outer, cause, context, group, member):
+        assert link.__traceback__ is None, link
+
+
 def _raise_from_write(monkeypatch, surface: str, ticker: str, error: BaseException) -> None:
     """The named segment's write raises ``error`` before it touches the disk.
 
