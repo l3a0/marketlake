@@ -530,6 +530,20 @@ def test_a_session_the_lake_never_captured_does_not_stop_the_cutoff(fixture_lake
     assert _states(report_out)["SPY"].cutoff == DAY_FOUR
 
 
+def test_a_journal_directory_that_cannot_be_listed_stops_the_cutoff(fixture_lake: FixtureLake):
+    """Nothing says the rows are gone, so the cutoff stays before the day rather than past it."""
+    directory = LakePaths(fixture_lake.root).segment_dir(CHAINS, "SPY", DAY_THREE)
+    directory.mkdir(parents=True)
+    base = _lake(fixture_lake, _days(DAY_ONE, DAY_FOUR))
+    directory.chmod(0)
+    try:
+        state = _states(_run(base))["SPY"]
+    finally:
+        directory.chmod(0o755)
+
+    assert state.cutoff == DAY_ONE
+
+
 def test_another_tickers_unsealed_session_does_not_stop_this_tickers_cutoff(
     fixture_lake: FixtureLake,
 ):
@@ -619,6 +633,27 @@ def test_an_uncaptured_day_out_of_scope_does_not_stop_it(fixture_lake: FixtureLa
 
     assert {skip.reason for skip in report_out.skipped} == {REASON_OUT_OF_SCOPE}
     assert _states(report_out)["SPY"].cutoff == late
+
+
+def test_an_unsealed_day_out_of_scope_still_stops_it(fixture_lake: FixtureLake):
+    """Sealed, its rows become a manifested out-of-scope day, which a master edit can open."""
+    early, late = date(2026, 9, 15), date(2026, 9, 21)
+    away = date(2026, 9, 17)
+    master = SecurityMaster(
+        [_mapping(1, "SPY", valid_to=date(2026, 9, 16)), _mapping(2, "SPY", valid_from=late)]
+    )
+    _segment(fixture_lake, "SPY", away, CARRIED_OCC)
+    base = _lake(
+        fixture_lake,
+        {("SPY", early): [_row(early)], ("SPY", late): [_row(late)]},
+        master=master,
+    )
+    calendar = weekday_sessions(date(2026, 9, 14), date(2026, 9, 21))
+
+    report_out = _run(_copy(base, "one-pass"), calendar=calendar)
+
+    assert (away, REASON_OUT_OF_SCOPE) in [(skip.day, skip.reason) for skip in report_out.skipped]
+    assert _states(report_out)["SPY"].cutoff == early
 
 
 def test_a_retired_ticker_gets_a_cutoff_at_its_last_day(fixture_lake: FixtureLake):

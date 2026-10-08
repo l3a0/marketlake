@@ -1428,8 +1428,10 @@ def _segments_remain(lake_root: Path, ticker: str, day: date) -> bool:
     :func:`_why_unread` says ``REASON_NOT_SEALED`` for every in-scope session with no manifest
     entry, and it cannot tell a session the lake never captured from one whose rows are on disk
     and not yet sealed. Only the second becomes readable later, so only the second stops the
-    cutoff. The check reads this ticker's directory and no other. Reading the whole day would let
-    another ticker's unsealed day stop this ticker's cutoff.
+    cutoff. It stops it whatever the master says about the day, since sealed rows out of scope
+    become a manifested out-of-scope day, which a master edit can make readable. The check reads
+    this ticker's directory and no other. Reading the whole day would let another ticker's
+    unsealed day stop this ticker's cutoff.
 
     A directory that exists and cannot be listed answers yes. Nothing then says the rows are
     gone, and a cutoff stopped one day early costs a day of disk, where one moved past unsealed
@@ -1651,10 +1653,9 @@ def detect_splits(
             # a window no pair spans.
             if previous is not None and last_day is not None:
                 for missing in _uncaptured_sessions(calendar, last_day, day):
-                    reason = _why_unread(master, ticker, missing)
-                    skipped.append(Skip(ticker, missing, reason))
+                    skipped.append(Skip(ticker, missing, _why_unread(master, ticker, missing)))
                     unread_since += 1
-                    if reason == REASON_NOT_SEALED and _segments_remain(lake_root, ticker, missing):
+                    if _segments_remain(lake_root, ticker, missing):
                         cutoff.stop(history=history, **top)
             last_day = day
             try:
