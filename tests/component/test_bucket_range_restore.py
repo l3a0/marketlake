@@ -975,28 +975,25 @@ def test_a_restore_line_the_disk_refuses_in_the_repair_refuses(tmp_path, monkeyp
     assert "writing a restore line" in line and "OSError" in line
 
 
-def test_the_bound_is_checked_again_once_the_lock_is_taken(tmp_path, monkeypatch):
-    """The lock can be waited on past the bound, behind compaction or a capture cycle.
+def _run_reaching_the_bound_at_lock(root, client, monkeypatch, number: int) -> None:
+    """Run from 08:30, with the clock reaching the 09:00 bound as lock ``number`` is taken.
 
-    The clock reaches the bound while the run waits for its first lock. Mutation this catches:
-    checking the bound only before the lock, which runs the repairs inside the pre-open margin.
+    A lock can be waited on past the bound, behind compaction or a capture cycle, so each
+    hold checks the bound again once it has the lock.
     """
-    root, client, _originals = _lake(tmp_path)
-    _trim_away(root, client, SPY_1)
-    with trimmed_path(root).open("ab") as handle:
-        handle.write(b'{"kind": "restore", "partition": "x", "restored_at": "t", "sha256": "s"}\n')
-    entry = latest_entries(root)["trimmed.jsonl"]
     clock = ManualClock(datetime(2026, 8, 31, 8, 30, tzinfo=MARKET_TZ))
     real_lock = bucket.lake_lock
+    taken: list[int] = []
 
     @contextmanager
     def slow_lock(lake_root):
         with real_lock(lake_root) as path:
-            clock.set(MONDAY_BOUND)
+            taken.append(1)
+            if len(taken) == number:
+                clock.set(MONDAY_BOUND)
             yield path
 
     monkeypatch.setattr(bucket, "lake_lock", slow_lock)
-
     with pytest.raises(RangeRestoreRefused, match="next session"):
         restore_range(
             root,
@@ -1010,6 +1007,68 @@ def test_the_bound_is_checked_again_once_the_lock_is_taken(tmp_path, monkeypatch
             last=D1,
             free_space=lambda path: PLENTY,
         )
+    assert len(taken) == number
+
+
+def test_the_bound_is_checked_again_once_the_first_lock_is_taken(tmp_path, monkeypatch):
+    """Mutation this catches: no check after the first lock, which runs the ledger repair."""
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "restore", "partition": "x", "restored_at": "t", "sha256": "s"}\n')
+    entry = latest_entries(root)["trimmed.jsonl"]
+
+    _run_reaching_the_bound_at_lock(root, client, monkeypatch, 1)
 
     assert latest_entries(root)["trimmed.jsonl"] == entry
     assert not (root / SPY_1).exists()
+
+
+def test_the_bound_is_checked_again_before_the_owed_restore_lines(tmp_path, monkeypatch):
+    """Mutation this catches: no check after the lock the owed restore lines are written in."""
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+
+    _run_reaching_the_bound_at_lock(root, client, monkeypatch, 2)
+
+    assert _kind(root, SPY_1) == "trim"
+
+
+def test_the_bound_is_checked_again_before_a_commit(tmp_path, monkeypatch):
+    """Mutation this catches: no check after a partition's commit lock, so a download that ran
+    into the pre-open margin still commits there.
+    """
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+
+    _run_reaching_the_bound_at_lock(root, client, monkeypatch, 2)
+
+    assert not (root / SPY_1).exists()
+    assert _kind(root, SPY_1) == "trim"
+    assert _strays(root) == []
+
+
+def test_an_owed_restore_line_is_not_written_once_the_file_is_gone(tmp_path, monkeypatch):
+    """The owed lines are re-checked under the lock, since the hash ran without it.
+
+    Here the trim that crashed before its unlink finishes it between the hash and the lock.
+    Mutation this catches: writing the owed line without the re-check, which supersedes the
+    trim line of a file that is gone, an absence nothing explains.
+    """
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+    real_sha = bucket.sha256_file
+
+    def hash_then_trim(path):
+        digest = real_sha(path)
+        if Path(path) == root / SPY_1:
+            Path(path).unlink()
+        return digest
+
+    monkeypatch.setattr(bucket, "sha256_file", hash_then_trim)
+
+    summary = _run(root, client, last=D1)
+
+    assert summary.restore_lines == 0
+    assert _kind(root, SPY_1) == "trim"
+    assert _unexplained(root) == ()
