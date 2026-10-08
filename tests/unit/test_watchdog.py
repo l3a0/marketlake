@@ -2787,6 +2787,145 @@ def test_one_silenced_ticker_leaving_keeps_the_rest_silenced_while_the_collapse_
     ]
 
 
+# -- a silenced ticker a live cause covers stays silenced -----------------------------
+
+
+def _token_death_then_flapping_batch(minute: int, covered: str, *, landed: tuple = ()) -> list:
+    """One minute of a token death on ``covered`` that turns into a flapping batch.
+
+    Minutes 0 to 2 fail ``covered``'s quotes and chain with ``http_401``, beside any other
+    quotes ticker the caller names in ``landed``, so the token-dead page goes out at minute
+    2 covering them all. At minute 3 the chain lands data, each ticker in ``landed`` lands
+    data, and every other quotes ticker of SPY, QQQ and IWM records ``quote_absent``. From
+    minute 4 the batch fails all three each minute, ``http_500`` on even minutes and
+    ``http_429`` on odd ones, while the chain keeps landing.
+
+    ``quote_absent`` and ``http_500`` resolve to no cause, so the token-dead cause still
+    covers ``covered`` in those minutes. ``http_429`` is the rate limit's class, so it
+    lifts the cover every other minute.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    if minute < 3:
+        dead = (covered, *landed)
+        return [_fail("quotes", ticker, "http_401") for ticker in dead] + [
+            _fail("chains", covered, "http_401")
+        ]
+    if minute == 3:
+        return [
+            _seg("quotes", ticker, "data")
+            if ticker in landed
+            else _fail("quotes", ticker, "quote_absent")
+            for ticker in tickers
+        ] + [_seg("chains", covered, "data")]
+    error_class = "http_500" if minute % 2 == 0 else "http_429"
+    return [_fail("quotes", ticker, error_class) for ticker in tickers] + [
+        _seg("chains", covered, "data")
+    ]
+
+
+def test_a_covered_ticker_whose_class_flaps_does_not_re_page_the_sampler():
+    """A ticker a live cause covers stays with the sampler page while the cover stands.
+
+    The token-dead page covers SPY quotes. QQQ and IWM join at minute 3, and from minute 4
+    the batch alternates ``http_500`` and ``http_429``. On a 429 minute SPY leaves the
+    cover and joins the sampler's set, so the sampler page at minute 5 names all three. On
+    a 500 minute the cause covers SPY again, which takes it out of the sampler's set.
+    Releasing it there let it trip on the next 429 minute and send the sampler page again,
+    every other minute without end.
+    """
+    cycles = [
+        _cycle(*_token_death_then_flapping_batch(minute, "SPY"), at=_at(minute))
+        for minute in range(21)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: token dead")]
+    assert raised[1:] == [
+        (
+            5,
+            "Capture down: quote sampler dead",
+            "http_429",
+            6,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        )
+    ]
+
+
+def test_batch_mates_freed_from_the_cause_by_landing_still_send_one_sampler_page():
+    """The same flapping batch sends one sampler page when every ticker started in the cause.
+
+    QQQ and IWM fail with SPY under the dead token, so the cause names all three. They
+    land data at minute 3, which takes them out of it, while SPY records ``quote_absent``
+    and stays covered. The flapping batch that follows must page the sampler once.
+    """
+    cycles = [
+        _cycle(
+            *_token_death_then_flapping_batch(minute, "SPY", landed=("QQQ", "IWM")),
+            at=_at(minute),
+        )
+        for minute in range(21)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: token dead")]
+    assert [page[:2] for page in raised[1:]] == [(5, "Capture down: quote sampler dead")]
+
+
+def test_a_covered_silenced_ticker_whose_write_fails_beside_landed_data_pages_its_write():
+    """A write failure in a minute data landed lifts the cover, so the ticker is heard.
+
+    The token-dead cause covers QQQ quotes and the sampler page at minute 5 silenced it.
+    At minute 6 the cause covers it again. At minute 7 its write fails while the chain lands
+    data, which takes it out of the cause, so it pages under its own title with its write
+    class, while SPY and IWM stay with the sampler page.
+    """
+    cycles = [
+        _cycle(*_token_death_then_flapping_batch(minute, "QQQ"), at=_at(minute))
+        for minute in range(7)
+    ]
+    cycles.append(
+        _cycle(
+            _fail("quotes", "SPY", "http_429"),
+            _fail("quotes", "IWM", "http_429"),
+            _seg("chains", "QQQ", "data"),
+            errors=(_quotes_write_failed("QQQ"),),
+            at=_at(7),
+        )
+    )
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:2]] == [
+        (2, "Capture down: token dead"),
+        (5, "Capture down: quote sampler dead"),
+    ]
+    assert raised[2:] == [(7, "Capture down: QQQ quotes", "o_s_error", 8, ("QQQ quotes",))]
+
+
+def test_a_covered_silenced_ticker_failing_another_cause_s_way_alone_pages_that_class():
+    """A class another cause names lifts the cover once the collapse no longer holds.
+
+    The token-dead cause covers QQQ quotes and the sampler page at minute 5 silenced it.
+    At minute 7 SPY and IWM land data, so the collapse no longer holds, and QQQ alone
+    answers 429, which the token-dead cause does not explain. It pages under its own title.
+    """
+    cycles = [
+        _cycle(*_token_death_then_flapping_batch(minute, "QQQ"), at=_at(minute))
+        for minute in range(7)
+    ]
+    cycles.append(
+        _cycle(
+            _seg("quotes", "SPY", "data"),
+            _fail("quotes", "QQQ", "http_429"),
+            _seg("quotes", "IWM", "data"),
+            _seg("chains", "QQQ", "data"),
+            at=_at(7),
+        )
+    )
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:2]] == [
+        (2, "Capture down: token dead"),
+        (5, "Capture down: quote sampler dead"),
+    ]
+    assert raised[2:] == [(7, "Capture down: QQQ quotes", "http_429", 8, ("QQQ quotes",))]
+
+
 # -- a ticker joining a dead token (marketlake #768) -----------------------------------
 
 

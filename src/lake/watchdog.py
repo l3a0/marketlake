@@ -48,11 +48,12 @@ live cause covers under that class. A ticker whose segment write failed recorded
 about the vendor, so it pages under its own title with its write class. A covered ticker
 stays with the cause that covers it. Every ticker the sampler page names counts as paged,
 so one sampler death pages once. A ticker it named without its own page is heard again
-once the collapse no longer explains it. That happens when any quotes ticker lands data,
-when fewer than two tickers still fail the vendor's way uncovered, or when the ticker
-itself stops failing that way, such as when its own write fails. It then pages under its
-own title once its count reaches the threshold and no live cause covers it
-(marketlake #771).
+once the collapse no longer explains it and no live cause covers it. The collapse stops
+explaining it when any quotes ticker lands data, when fewer than two tickers still fail
+the vendor's way uncovered, or when the ticker itself stops failing that way, such as when
+its own write fails. It then pages under its own title once its count reaches the
+threshold, unless the collapse holds again by the time it trips. Then it trips inside the
+sampler's set and is heard through a sampler page instead (marketlake #771).
 
 A stall folds too. A slot the loop slept through gaps every watched surface at the
 same moment, so one stall that trips the threshold is one fact and sends one page,
@@ -760,14 +761,24 @@ class Watchdog:
 
         The page's surfaces, minutes and class all come from the sampler's set, and every
         surface in it is marked paged, so one sampler death pages once. The ones that had
-        not paged on their own are kept in ``_sampler_absorbed``. Each minute, before
-        ``tripped`` is built, a surface leaves that set and ``_paged`` when conditions 1
-        to 3 no longer hold, or when they hold and it is outside the sampler's set. Any
-        quotes surface landing data breaks condition 2, a write failure takes its ticker
-        out of the set, and the last batch-mate leaving breaks condition 3. A released
-        surface already at the threshold that no live cause covers pages under its own
-        title in that minute, and one below the threshold pages when it reaches it
-        (marketlake #771).
+        not paged on their own are kept in ``_sampler_absorbed``. On each minute that
+        reaches the per-surface pages, before ``tripped`` is built, a surface leaves that
+        set and ``_paged`` when conditions 1 to 3 no longer hold, or when they hold and it
+        is outside the sampler's set. Any quotes surface landing data breaks condition 2, a
+        write failure takes its ticker out of the set, and the last batch-mate leaving
+        breaks condition 3. A minute the whole-daemon path answers returns before this
+        method, and so does ``missed``. No page is lost there, because every surface failed
+        in that minute, so no quotes data landed. A released surface already at the
+        threshold that no live cause covers pages under its own title in that minute, and
+        one below the threshold pages when it reaches it (marketlake #771).
+
+        A surface a live cause covers right now is never released, whatever the collapse
+        does, because its own page would restate the cause page. Released instead, it
+        rejoined the sampler's set outside ``_paged`` the next minute it failed a way
+        another cause names, tripped, and sent the sampler page again, once every time the
+        class flipped. The price is that a batch moving whole from a covered failure to
+        another cause's class sends no fresh sampler page, which is how an ordinary surface
+        that has already paged behaves.
 
         It applies only where a request was actually attempted, and ``observe`` is the
         only caller for that reason. A slot the loop slept through gaps every quotes
@@ -785,8 +796,14 @@ class Watchdog:
         }
         holds = len(quotes_watched) > 1 and quotes_failed == quotes_watched and len(sampler) >= 2
         # A ticker a sampler page silenced is heard again once the collapse no longer
-        # explains it, before ``tripped`` is built, so one at the threshold pages now.
-        explained = sampler if holds else set()
+        # explains it, before ``tripped`` is built, so one at the threshold pages now. One
+        # a live cause covers right now stays silenced, or a class flapping in and out of
+        # the cover would re-page the sampler on every flip.
+        explained = (sampler if holds else set()) | {
+            key
+            for key in self._sampler_absorbed
+            if self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
+        }
         self._paged -= self._sampler_absorbed - explained
         self._sampler_absorbed &= explained
         tripped = [
