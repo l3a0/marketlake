@@ -9,14 +9,15 @@ rows and no columns, so a directory at the spans path answered "no ticker is in 
 the daemon captured nothing, silently. A readable parquet in some other schema raised a bare
 ``KeyError`` from the build, which no caller guards, so the daemon died at its first cycle
 and relaunched into the same failure. A bit flip in a real file raised ``KeyError``,
-``ArrowNotImplementedError`` or ``OverflowError`` the same way.
+``ArrowNotImplementedError`` or ``OverflowError`` the same way. The split walk's checkpoint
+beside them, marketlake #786, reads through the same function.
 
 The rule is one sentence. A reference reader turns every damaged file into its own
 unreadable error, and lets only an access failure through as ``OSError``. It lives in one
-function with three callers rather than in three copies, because a copy can keep one check
+function with four callers rather than in four copies, because a copy can keep one check
 and drop another silently, the argument ``actions.read_master`` already makes for itself.
 
-It imports only pyarrow and the standard library, so none of the three modules gains an
+It imports only pyarrow and the standard library, so none of the four modules gains an
 import cycle. ``lake.paths`` is not its home, because that module answers where a file lives
 and nothing else. ``lake.reference_read`` is not either, because that is the daemon's
 print-once line and runs above these readers.

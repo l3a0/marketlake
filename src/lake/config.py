@@ -83,6 +83,11 @@ A third is ``token_store``, which says what this host does with the Schwab token
 key, ``token_store_role_arn`` and ``token_store_region``, are optional too, and only the
 re-auth checks them, for the same reason.
 
+A fourth is ``lake_window_sessions``, the number of recent sessions a host keeps on its lake
+volume, marketlake #786. An integer is stored as read and any other value as its ``repr``,
+and an absent key is ``None``, which means never trim. ``lake.window`` judges it in each job
+that reads it, for the same reason.
+
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
 values the design pins. Slice 1 measures the real distributions and recalibrates them.
@@ -199,6 +204,10 @@ TOKEN_PUT_KEYS = (*COMMAND_KEYS, TOKEN_STORE_ROLE_ARN_KEY, TOKEN_STORE_REGION_KE
 # The host-role key, spelled once. ``lake.outbox`` names it in the line it prints for a
 # value it does not recognise.
 ROLE_KEY = "role"
+
+# The lake window key, marketlake #786: how many recent sessions this host keeps on its lake
+# volume, and the opt-in to trimming. ``lake.window`` judges it and says why loading does not.
+LAKE_WINDOW_SESSIONS_KEY = "lake_window_sessions"
 
 
 class _Absent(Enum):
@@ -737,6 +746,9 @@ class Config:
     # because it names a mode rather than where a credential comes from.
     token_store: str = TOKEN_STORE_FILE
     token_store_region: str | None = None
+    # The ``lake_window_sessions`` integer as the file held it, the ``repr`` of any other
+    # value, or ``None`` when the key is absent. ``lake.window.window_sessions`` judges it.
+    lake_window_sessions: int | str | None = None
     # The command key, which signs only STS's ``AssumeRole``, marketlake #737.
     command_access_key_id: Secret | None = None
     command_secret_access_key: Secret | None = None
@@ -823,6 +835,7 @@ class Config:
                 else TOKEN_STORE_FILE
             ),
             token_store_region=_optional_text(mapping.get(TOKEN_STORE_REGION_KEY)),
+            lake_window_sessions=_window_value(mapping),
             command_access_key_id=None if command_key_id is None else Secret(command_key_id),
             command_secret_access_key=(
                 None if command_secret_key is None else Secret(command_secret_key)
@@ -830,6 +843,21 @@ class Config:
             bucket_role_arn=_optional_text(mapping.get(BUCKET_ROLE_ARN_KEY)),
             token_store_role_arn=_optional_text(mapping.get(TOKEN_STORE_ROLE_ARN_KEY)),
         )
+
+
+def _window_value(mapping: Mapping[str, object]) -> int | str | None:
+    """The ``lake_window_sessions`` value as stored: ``None`` when absent, an ``int`` as read.
+
+    Anything else is stored as its ``repr``, so a frozen config stays hashable and the job that
+    judges it can refuse it. A ``bool`` is an ``int`` to Python and is stored as its ``repr``,
+    because ``true`` is a typo rather than a window.
+    """
+    if LAKE_WINDOW_SESSIONS_KEY not in mapping:
+        return None
+    value = mapping[LAKE_WINDOW_SESSIONS_KEY]
+    if type(value) is int:
+        return value
+    return repr(value)
 
 
 def _role_text(value: object) -> str:

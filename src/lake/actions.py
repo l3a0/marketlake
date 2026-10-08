@@ -1414,8 +1414,8 @@ def same_but_for_recorded_at(existing: dict | None, candidate: dict) -> bool:
     Public because ``lake.splits`` needs the same comparison and a second copy of it could
     drift from this one without anything noticing. What the two writers do differ on is what
     they stamp into ``observed_on``, and that is theirs rather than this rule's: a split
-    stays visible in sealed chains forever, so a detector stamping the night it ran would
-    fail this comparison every night and append the same split every night.
+    stays visible in sealed chains until its sessions are trimmed, so a detector stamping the
+    night it ran would fail this comparison every night and append the same split every night.
     """
     if existing is None:
         return False
@@ -1522,8 +1522,9 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     dividends, and this is where it stops being silent. A run that held something and filed
     it is a live condition a human can go and read. A run that held something and filed
     nothing reads exactly like a run that found nothing, which is the silence the producer
-    exists to break, so it exits 1. Exit 2 stays what it is everywhere else here, an operator
-    mistake with a fix behind it.
+    exists to break, so it exits 1. So does a split run that refused a ticker on a trimmed lake,
+    marketlake #786, since that ticker's splits went undetected. Exit 2 stays what it is
+    everywhere else here, an operator mistake with a fix behind it.
     """
     args = _build_parser().parse_args(argv)
 
@@ -1584,7 +1585,10 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
         )
         return 2
     print(report.render())
-    return 1 if report.unfiled else 0
+    # A ticker the split walk refused, marketlake #786, had its splits go undetected, which is
+    # the same silence an unfiled finding is. Only the split report carries refusals.
+    refused = args.command == SPLITS_COMMAND and bool(report.refused)
+    return 1 if report.unfiled or refused else 0
 
 
 __all__ = [

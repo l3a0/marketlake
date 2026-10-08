@@ -300,7 +300,12 @@ def test_the_tracked_settings_render(monkeypatch, capsys, metadata, config_dir, 
     tracked = Path(__file__).resolve().parents[2] / "config" / "vm.yaml"
 
     assert _render(monkeypatch, tracked.read_bytes()) == 0
-    assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == EXPECTED
+    # The tracked file also sets the lake window, marketlake #786, the one value it carries
+    # that is not text.
+    assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == {
+        **EXPECTED,
+        "lake_window_sessions": 22,
+    }
 
 
 def test_the_render_asks_for_the_four_names_once_with_decryption(
@@ -1201,6 +1206,20 @@ CONFIG_REFUSALS = {
         {"lake_root": "~no-such-user-sentinel/lake"},
         "the merged config does not load (RuntimeError)",
     ),
+    # marketlake #786. Loading stores the window unjudged, so the render is where a bad one stops
+    # before it reaches the VM, rather than on the first night the sweep or the trim reads it.
+    "a lake window under the floor": (
+        {"lake_window_sessions": 21},
+        "lake_window_sessions is under the floor of 22 sessions",
+    ),
+    "a lake window written as text": (
+        {"lake_window_sessions": "22"},
+        "lake_window_sessions is not a whole number of sessions",
+    ),
+    "a lake window under a floor a guard raised": (
+        {"lake_window_sessions": 22, "guards": {"trailing_median_sessions": 30}},
+        "lake_window_sessions is under the floor of 31 sessions",
+    ),
 }
 
 
@@ -1215,6 +1234,46 @@ def test_a_merged_config_a_job_would_refuse_is_refused(
 
     assert expected in _assert_refused(capsys, config_dir, before)
     assert len(hook.requests) == 1
+
+
+def test_a_lake_window_at_the_floor_renders(monkeypatch, capsys, metadata, config_dir, not_root):
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes(lake_window_sessions=22)) == 0
+
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written["lake_window_sessions"] == 22
+
+
+@pytest.mark.parametrize(
+    ("line", "stored"),
+    [
+        ("lake_window_sessions: 21\n", 21),
+        ("lake_window_sessions: '22'\n", "'22'"),
+        ("lake_window_sessions: true\n", "True"),
+        ("lake_window_sessions:\n", "None"),
+        ("", None),
+    ],
+    ids=["under the floor", "text", "a bool", "empty", "absent"],
+)
+def test_loading_stores_a_lake_window_the_render_refuses(tmp_path: Path, line: str, stored):
+    """``load_config`` runs every capture cycle, so it stores the window and refuses nothing.
+
+    A refusal there would stop capture on a typo. An integer is stored as read and anything else
+    as its ``repr``, and an absent key is ``None``, which means never trim.
+    """
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"lake_root: {tmp_path / 'lake'}\n"
+        f"backup_target: {tmp_path / 'ssd'}\n"
+        "healthchecks_ping_key: k\nntfy_topic: t\nschwab_api_key: a\nschwab_app_secret: s\n"
+        f"{line}"
+    )
+
+    loaded = load_config(config).lake_window_sessions
+
+    assert loaded == stored
+    assert type(loaded) is type(stored)
 
 
 def test_a_refusal_with_no_old_file_writes_none(
