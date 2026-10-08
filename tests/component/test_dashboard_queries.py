@@ -2992,9 +2992,9 @@ def test_a_healthy_window_reads_its_sealed_days_in_one_query(root: Path, monkeyp
     per_day: list[tuple[str, str, date]] = []
     real = dashboard._slot_aggregates
 
-    def counted(con, paths, surface, ticker, day):
+    def counted(con, paths, surface, ticker, day, **kwargs):
         per_day.append((surface, ticker, day))
-        return real(con, paths, surface, ticker, day)
+        return real(con, paths, surface, ticker, day, **kwargs)
 
     monkeypatch.setattr(dashboard, "_slot_aggregates", counted)
     payload = service_over(root).run_query("history", {})

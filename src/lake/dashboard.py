@@ -4,9 +4,14 @@ Failures push alerts. Progress needs a pull surface. This module is that surface
 a small read-only query service on localhost that answers a fixed set of named queries
 over the lake. Two constant files ride along: ``status.html``, which renders the
 panels, and ``favicon.ico``, which the browser puts on the tab. The page runs the
-queries at view time. Nothing is pre-rendered and no summary state is kept. Freshness
-reads off the data's own timestamps, so a dead capture shows as an old last cycle and a
-dead service shows as a page that cannot load. Neither can be mistaken for the other.
+queries at view time. Nothing is pre-rendered and no summary state is kept. The one
+thing the service keeps between requests is ``FileMemo``, a read cache of each journal
+segment's and sealed partition's per-minute counts, so a refresh reads only the files that
+changed since the last one. It is not summary state, because it holds nothing a file does
+not hold at that moment: any change to a file changes its key and forces a fresh read, and
+a restart empties it. Freshness reads off the data's own timestamps, so a dead capture
+shows as an old last cycle and a dead service shows as a page that cannot load. Neither
+can be mistaken for the other.
 
 **The fixed-query contract is a security invariant, not a convenience.** DuckDB SQL is
 arbitrary local file read as the owning user, and the owning user can read the Schwab
@@ -44,8 +49,8 @@ queries, which are ``SELECT`` statements only, and on the connection never being
 to anything else. A test asserts the lake tree is byte-identical after every panel runs. The History
 panel reads three things that are not surface rows, and none of them goes through SQL:
 the quarantine ledger and the nightly report files are read off the filesystem, which is
-``alert.undelivered``'s rule, and the window aggregate is the same ``SELECT`` the Today
-strip runs, keyed by file.
+``alert.undelivered``'s rule, and the window aggregate counts each minute with the same
+columns the Today strip's reads use, keyed by file.
 
 The Lake panel adds a fourth such read and is the one panel that reports something from
 outside ``lake_root`` at all: the device's free space. That reading cannot go through
@@ -68,19 +73,22 @@ Three terms recur, glossed at first use.
    full day, never as a half-missing one.
 3. A *sealed partition* is the one Parquet file compaction writes for a ticker-day.
    Before compaction the day lives in journal segments, Arrow IPC files with one record
-   batch per cycle. A query reads both, unioned by column name, so the panel is the same
-   before and after the seal.
+   batch per cycle. A query reads both and merges their counts minute by minute, so the
+   panel is the same before and after the seal.
 
 The journal segments are read through ``lake.journal.read_segment``, the one reader that
 knows the durability rules: a torn tail reads to the last complete batch, and bytes after
 the end-of-stream marker are refused as a shadow-append. DuckDB has no native Arrow IPC
 reader, so the segment rows are registered with the connection as an Arrow view and
-unioned with the Parquet read inside SQL.
+counted inside SQL. A sealed partition is counted by DuckDB's own Parquet read in a
+statement of its own.
 
 Nothing here reads the wall clock or names a session time. The service takes a ``Clock``
 and a ``Calendar``. Each request stamps ``now`` from the clock and hands it into the
 query, so minutes-since is computed against the injected instant, never ``now()`` in SQL.
-The slots come from the calendar through ``SessionClock.bounds``.
+The slots come from the calendar through ``SessionClock.bounds``. ``FileMemo`` times how
+long an entry has gone unused on the monotonic clock, which decides only when a file is
+read again and never what a panel answers.
 """
 
 from __future__ import annotations
@@ -91,6 +99,8 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -431,6 +441,11 @@ _PROVENANCE_TYPES: dict[str, pa.DataType] = {
 }
 _PROVENANCE_SCHEMA = pa.schema(list(_PROVENANCE_TYPES.items()))
 
+# The journal view's rows carry one more column, the index of the segment each row came
+# from, so ``_SEGMENT_SLOT_SELECT`` can keep every segment's counts apart.
+_SEGMENT_FIELD = "segment"
+_SEGMENT_ROWS_SCHEMA = _PROVENANCE_SCHEMA.append(pa.field(_SEGMENT_FIELD, pa.int32()))
+
 # The provenance columns a segment must carry to be read at all. ``snap_ts`` names the
 # slot and ``row_kind`` says what the row records, so a segment missing either cannot be
 # placed on the strip. Nulling them would bind the union and then read as a gap, turning
@@ -485,8 +500,10 @@ _JOURNAL_VIEW = "journal_rows"
 # The ``FILTER`` keeps nulls out, which is what makes the list the distinct reasons the
 # slot carried. A slot whose rows all carry a null class aggregates to a null list, and
 # the dataclass reads that as no reason at all.
-_SLOT_SELECT = """
-SELECT slot_ms,
+#
+# The aggregate columns are one fragment shared by the three statements below, so the
+# per-file reads and the window read cannot count a minute two different ways.
+_SLOT_COLUMNS = """
        count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
        count(*) FILTER (WHERE row_kind = $gap_kind) AS gap_rows,
        count(*) FILTER (
@@ -496,26 +513,47 @@ SELECT slot_ms,
        bool_or(coalesce(suspect, false)) AS suspect,
        list_sort(
            array_agg(DISTINCT error_class) FILTER (WHERE error_class IS NOT NULL)
-       ) AS error_classes
+       ) AS error_classes"""
+
+_SLOT_SELECT = f"""
+SELECT slot_ms,{_SLOT_COLUMNS}
 FROM (
     SELECT epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
            row_kind, error_class, suspect
-    FROM ({source})
+    FROM ({{source}})
 )
 GROUP BY slot_ms
 ORDER BY slot_ms NULLS LAST
 """
 
-# The two sources: the day's journal rows alone, or those rows unioned by name with the
-# day's sealed partition. ``union_by_name`` is what keeps a drifted schema readable.
-_SOURCE_JOURNAL = f"SELECT * FROM {_JOURNAL_VIEW}"
+# One sealed partition, unioned by name with the journal view. The view registered beside
+# it is empty and is there for its pinned schema alone: ``union_by_name`` then binds every
+# provenance column even when the partition lacks an optional one, which is what keeps a
+# drifted partition readable.
 _SOURCE_JOURNAL_AND_PARTITION = (
     f"SELECT * FROM {_JOURNAL_VIEW} "
     "UNION ALL BY NAME "
     "SELECT * FROM read_parquet($partitions, union_by_name = true)"
 )
-_SLOT_SQL_JOURNAL = _SLOT_SELECT.format(source=_SOURCE_JOURNAL)
 _SLOT_SQL_JOURNAL_AND_PARTITION = _SLOT_SELECT.format(source=_SOURCE_JOURNAL_AND_PARTITION)
+
+# The per-slot aggregate of several journal segments in one statement, keyed by which
+# segment each row came from. ``segment`` is the row's index into the list of segments
+# read, set in Python as the view is built, so each segment's groups can be kept apart
+# and remembered on their own. One statement per segment would cost a statement for each
+# of a full day's few hundred segments on the first read.
+_SEGMENT_SLOT_SELECT = f"""
+SELECT {_SEGMENT_FIELD},
+       slot_ms,{_SLOT_COLUMNS}
+FROM (
+    SELECT {_SEGMENT_FIELD},
+           epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
+           row_kind, error_class, suspect
+    FROM {_JOURNAL_VIEW}
+)
+GROUP BY {_SEGMENT_FIELD}, slot_ms
+ORDER BY {_SEGMENT_FIELD}, slot_ms NULLS LAST
+"""
 
 
 @dataclass(frozen=True)
@@ -645,6 +683,183 @@ class SlotAggregate:
         raise ValueError("status is defined only for a slot with data or gap rows")
 
 
+# -- remembering one file's counts -------------------------------------------
+
+# One group of one file's rows, as the aggregate SQL returns it: ``slot_ms``, the three
+# kind counts, ``suspect`` and the sorted reasons. ``slot_ms`` is null for the group of
+# rows whose stamp will not cast.
+SlotGroup = tuple[int | None, int, int, int, bool, tuple[str, ...]]
+
+# What says a file is unchanged: its inode, size, modification time and change time, all
+# from one ``stat``. Every way the lake changes a file moves one of them. A segment only
+# grows, which moves the size. A partition is published, repaired, restored or trimmed
+# through ``os.replace``, which gives it a new inode. A permission change moves only the
+# change time, and it is in the key so that a partition turning unreadable is reported on
+# the next request rather than answered from memory.
+FileIdentity = tuple[int, int, int, int]
+
+# How long an entry may go unused before the next write to the memo drops it. The page
+# refreshes every minute (``REFRESH_MS`` in ``status.html``), and every refresh touches
+# every file a panel still reads, so a live entry is used about once a minute. An entry
+# ten refreshes stale belongs to a file no panel reads any more: a segment compaction
+# deleted, a version of a file since replaced, or a past day nobody is looking at. Ten
+# minutes rather than two leaves room for a tab the browser throttles in the background.
+# The price of the span is memory held for deleted files, which is a few small tuples
+# each.
+MEMO_IDLE_SECONDS = 10 * 60
+
+
+def _file_identity(path: Path) -> FileIdentity | None:
+    """The file's identity from one ``stat``, or ``None`` when the ``stat`` fails.
+
+    ``None`` means the file cannot be remembered. The caller reads it anyway, and the
+    read decides how a file that will not ``stat`` is counted, exactly as it did before
+    there was a memo.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _slot_group(row: Sequence[Any]) -> SlotGroup:
+    """One SQL result row as a frozen group. DuckDB returns a null list for no reason."""
+    slot_ms, data_rows, gap_rows, other_rows, suspect, classes = row
+    return (slot_ms, data_rows, gap_rows, other_rows, bool(suspect), tuple(classes or ()))
+
+
+class FileMemo:
+    """The per-slot counts of one file at a time, remembered across requests.
+
+    **Why it exists.** Every refresh of an open tab fires Now, Today and History, and
+    each of them read the whole day's journal again, so one refresh read every segment
+    three times (marketlake #700). History also re-counted every sealed partition in its
+    30-day window every minute, although none of them had changed (marketlake #701).
+    Measured on the laptop with two tickers, that was about 20 CPU-seconds a refresh.
+    A file's counts change only when the file does, so this keeps them and reads a file
+    again only when it has changed.
+
+    **Why it is not summary state.** The module promises that no summary state is kept,
+    and this keeps that promise. An entry holds nothing its file does not hold at that
+    moment. It is keyed by the file's path and ``FileIdentity``, so any change to the
+    file changes the key and the next request reads the file again. A restart empties it.
+    It holds per-slot counts rather than bytes, so it is not the DuckDB external file
+    cache that marketlake #735 turned off, and a full day costs it a few small tuples per
+    file.
+
+    Four rules keep the entries true.
+
+    1. The identity is taken before the read. The daemon appends to the segment it has
+       open, so a read can see more bytes than the ``stat`` said. Taken first, an entry
+       can only be ahead of its key, and the next ``stat`` sees a new size and reads
+       again. Taken after, an append between the read and the ``stat`` would leave the
+       entry behind its key for as long as the segment stopped growing.
+    2. Only a successful read is kept. A segment that vanished, would not read, carried
+       a shadow-append or drifted, and a partition that would not read, are read and
+       counted again on every request. A failure can be transient, and a kept one would
+       hide a file that has since come right.
+    3. An entry unused for ``MEMO_IDLE_SECONDS`` is dropped on the next write, so the
+       memo follows what the panels read rather than growing for the life of the process.
+    4. One lock guards every access to the entries, because the server answers each
+       request on its own thread. Files are read outside the lock, so a slow read never
+       holds up another panel. Two requests that miss the same file at once both read
+       it, which costs that one read twice and is never wrong.
+
+    ``monotonic`` is the time source for the idle span, injected so a test can move it.
+    """
+
+    def __init__(self, *, monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        # path -> [identity, groups, last used]. A list so a hit can stamp its use.
+        self._entries: dict[str, list[Any]] = {}
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def get(self, path: str, identity: FileIdentity) -> tuple[SlotGroup, ...] | None:
+        """The file's remembered groups, or ``None`` unless the identity matches."""
+        with self._lock:
+            entry = self._entries.get(path)
+            if entry is None or entry[0] != identity:
+                return None
+            entry[2] = self._monotonic()
+            return entry[1]
+
+    def put(self, entries: Iterable[tuple[str, FileIdentity, tuple[SlotGroup, ...]]]) -> None:
+        """Remember each file's groups under its identity, then drop the idle entries."""
+        with self._lock:
+            now = self._monotonic()
+            for path, identity, groups in entries:
+                self._entries[path] = [identity, groups, now]
+            idle = [
+                path for path, entry in self._entries.items() if now - entry[2] > MEMO_IDLE_SECONDS
+            ]
+            for path in idle:
+                del self._entries[path]
+
+
+def _remembered(
+    memo: FileMemo | None, path: Path, identity: FileIdentity | None
+) -> tuple[SlotGroup, ...] | None:
+    """The memo's groups for one file, or ``None`` when there is nothing to use."""
+    if memo is None or identity is None:
+        return None
+    return memo.get(str(path), identity)
+
+
+def _merge_groups(groups: Iterable[SlotGroup]) -> list[SlotGroup]:
+    """Several files' groups as one ticker-day's, ordered by slot with the null slot last.
+
+    Every column merges across files. The three counts add, ``suspect`` is true when any
+    file's rows were suspect, the reasons are the union of every file's, sorted as the
+    SQL sorts them, and the group of rows with an uncastable stamp adds like any other.
+    So the merge answers what one statement over every file's rows together would.
+    """
+    merged: dict[int | None, list[Any]] = {}
+    for slot_ms, data_rows, gap_rows, other_rows, suspect, classes in groups:
+        into = merged.get(slot_ms)
+        if into is None:
+            merged[slot_ms] = [data_rows, gap_rows, other_rows, suspect, set(classes)]
+            continue
+        into[0] += data_rows
+        into[1] += gap_rows
+        into[2] += other_rows
+        into[3] = into[3] or suspect
+        into[4].update(classes)
+    order = sorted(slot for slot in merged if slot is not None)
+    if None in merged:
+        order.append(None)
+    return [
+        (slot, *merged[slot][:4], tuple(sorted(merged[slot][4])))  # type: ignore[misc]
+        for slot in order
+    ]
+
+
+def _day_aggregates(
+    groups: Iterable[SlotGroup], health: SegmentHealth
+) -> tuple[list[SlotAggregate], SegmentHealth]:
+    """One ticker-day's slots with recognized rows, from its files' groups, plus health.
+
+    A slot whose rows are all of an unrecognized kind is dropped, so drift renders
+    missing instead of an invented gap. The rows whose ``snap_ts`` will not cast are
+    dropped too, because they name no minute. Both are counted in the returned health.
+    """
+    placed, unparseable_rows = _placed_aggregates(_merge_groups(groups))
+    health = health.with_row_counts(
+        drifted_rows=sum(agg.other_rows for agg in placed),
+        unparseable_stamp_rows=unparseable_rows,
+    )
+    return [agg for agg in placed if agg.has_bound_rows], health
+
+
+def _kind_params() -> dict[str, object]:
+    """The bound ``row_kind`` values every aggregate statement takes."""
+    return {"data_kind": journal.ROW_KIND_DATA, "gap_kind": journal.ROW_KIND_GAP}
+
+
 def _provenance_columns(table: pa.Table) -> pa.Table | None:
     """One segment's provenance columns in the pinned schema, or ``None`` on drift.
 
@@ -671,8 +886,15 @@ def _provenance_columns(table: pa.Table) -> pa.Table | None:
     return pa.Table.from_arrays(columns, schema=_PROVENANCE_SCHEMA)
 
 
-def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, SegmentHealth]:
-    """The provenance rows of every readable segment, plus how the segments read.
+def _load_journal_rows(
+    segments: Sequence[Path],
+) -> tuple[pa.Table, SegmentHealth, list[int]]:
+    """The provenance rows of every readable segment, how the segments read, and which read.
+
+    Each row carries ``segment``, the index of its segment in ``segments``, so one
+    statement can count every segment's rows and still keep each segment's apart. The
+    third value lists the index of every segment that read, including one that read with
+    no rows, because only a segment that read may be remembered.
 
     A segment that cannot be read is counted and skipped, so one bad file never blanks
     the panel. Four failures are counted apart, because they mean different things and
@@ -686,9 +908,9 @@ def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, SegmentHealt
 
     The counts are reported so every skip is visible, never silent.
     """
-    tables: list[pa.Table] = []
+    tables: list[tuple[int, pa.Table]] = []
     health = SegmentHealth()
-    for path in segments:
+    for index, path in enumerate(segments):
         try:
             table = journal.read_segment(path)
         except FileNotFoundError:
@@ -704,21 +926,28 @@ def _load_journal_rows(segments: Sequence[Path]) -> tuple[pa.Table, SegmentHealt
         if view is None:
             health += SegmentHealth(drifted=1)
             continue
-        tables.append(view)
+        tagged = view.append_column(
+            _SEGMENT_FIELD, pa.repeat(pa.scalar(index, pa.int32()), view.num_rows)
+        )
+        tables.append((index, tagged))
+    read = [index for index, _ in tables]
     if not tables:
-        return _PROVENANCE_SCHEMA.empty_table(), health
+        return _SEGMENT_ROWS_SCHEMA.empty_table(), health, read
     try:
-        return pa.concat_tables(tables), health
+        return pa.concat_tables([table for _, table in tables]), health, read
     except _CAST_ERRORS:
         # Unreachable while every table above carries the pinned schema. The fallback
         # keeps a future surprise to one skipped segment instead of a dead panel.
-        merged = _PROVENANCE_SCHEMA.empty_table()
-        for table in tables:
+        merged = _SEGMENT_ROWS_SCHEMA.empty_table()
+        read = []
+        for index, table in tables:
             try:
                 merged = pa.concat_tables([merged, table])
             except _CAST_ERRORS:
                 health += SegmentHealth(drifted=1)
-        return merged, health
+                continue
+            read.append(index)
+        return merged, health, read
 
 
 def _journal_segments(paths: LakePaths, surface: str, ticker: str, day: date) -> list[Path]:
@@ -737,13 +966,23 @@ def _journal_segments(paths: LakePaths, surface: str, ticker: str, day: date) ->
 
 
 def _slot_aggregates(
-    con: duckdb.DuckDBPyConnection, paths: LakePaths, surface: str, ticker: str, day: date
+    con: duckdb.DuckDBPyConnection,
+    paths: LakePaths,
+    surface: str,
+    ticker: str,
+    day: date,
+    *,
+    memo: FileMemo | None = None,
 ) -> tuple[list[SlotAggregate], SegmentHealth]:
     """Every slot with recognized rows for one ticker, surface, and day, plus its health.
 
-    The journal rows are registered as an Arrow view for the duration of the query. The
-    sealed partition, when present, is read natively by DuckDB and unioned by name. The
-    partition path is built from validated parts and bound as a parameter.
+    The day's files are counted one file at a time and the counts merged, so a file the
+    memo already holds is not read again. The segments the memo misses are read and
+    counted in one statement, registered as an Arrow view for its duration. The sealed
+    partition, when present, is read natively by DuckDB in a statement of its own. Its
+    path is built from validated parts and bound as a parameter. ``memo`` is ``None``
+    for a caller that wants every file read, which is what a ``QueryContext`` built
+    without one gets.
 
     Compaction seals a ticker-day under the lake lock while this reads without one, so
     the read is lock-free and the partition can change under it in both directions. Each
@@ -768,33 +1007,82 @@ def _slot_aggregates(
     has_partition = partition.is_file()
     if not segments and not has_partition:
         return [], SegmentHealth()
-    rows, health = _load_journal_rows(segments)
+    groups, health = _segment_groups(con, segments, memo)
     if not has_partition:
         has_partition = partition.is_file()
-    params: dict[str, object] = {
-        "data_kind": journal.ROW_KIND_DATA,
-        "gap_kind": journal.ROW_KIND_GAP,
-    }
-    con.register(_JOURNAL_VIEW, rows)
-    try:
-        if has_partition:
-            params["partitions"] = [str(partition)]
-            try:
-                result = con.execute(_SLOT_SQL_JOURNAL_AND_PARTITION, params).fetchall()
-            except _PARTITION_READ_ERRORS:
-                health += SegmentHealth(unreadable_partitions=1)
-                del params["partitions"]
-                result = con.execute(_SLOT_SQL_JOURNAL, params).fetchall()
+    if has_partition:
+        partition_groups, partition_health = _partition_groups(con, partition, memo)
+        groups.extend(partition_groups)
+        health += partition_health
+    return _day_aggregates(groups, health)
+
+
+def _segment_groups(
+    con: duckdb.DuckDBPyConnection, segments: Sequence[Path], memo: FileMemo | None
+) -> tuple[list[SlotGroup], SegmentHealth]:
+    """Every segment's groups, from the memo where it holds them and from a read where not.
+
+    Each segment's identity is taken before any segment is read, which is rule 1 of
+    ``FileMemo``. Only the segments that read are remembered, which is rule 2.
+    """
+    groups: list[SlotGroup] = []
+    missed: list[tuple[Path, FileIdentity | None]] = []
+    for path in segments:
+        identity = _file_identity(path)
+        remembered = _remembered(memo, path, identity)
+        if remembered is None:
+            missed.append((path, identity))
         else:
-            result = con.execute(_SLOT_SQL_JOURNAL, params).fetchall()
+            groups.extend(remembered)
+    if not missed:
+        return groups, SegmentHealth()
+    rows, health, read = _load_journal_rows([path for path, _ in missed])
+    by_segment: dict[int, list[SlotGroup]] = {}
+    if rows.num_rows:
+        con.register(_JOURNAL_VIEW, rows)
+        try:
+            result = con.execute(_SEGMENT_SLOT_SELECT, _kind_params()).fetchall()
+        finally:
+            con.unregister(_JOURNAL_VIEW)
+        for segment, *group in result:
+            by_segment.setdefault(segment, []).append(_slot_group(group))
+    fresh: list[tuple[str, FileIdentity, tuple[SlotGroup, ...]]] = []
+    for index in read:
+        found = tuple(by_segment.get(index, ()))
+        groups.extend(found)
+        path, identity = missed[index]
+        if identity is not None:
+            fresh.append((str(path), identity, found))
+    if memo is not None and fresh:
+        memo.put(fresh)
+    return groups, health
+
+
+def _partition_groups(
+    con: duckdb.DuckDBPyConnection, partition: Path, memo: FileMemo | None
+) -> tuple[list[SlotGroup], SegmentHealth]:
+    """One sealed partition's groups, from the memo or from a read, plus its health.
+
+    A partition that will not read is counted in ``unreadable_partitions`` and gives no
+    groups, so the day falls back to its journal rows alone. It is never remembered, so
+    the next request reads it again and counts it again.
+    """
+    identity = _file_identity(partition)
+    remembered = _remembered(memo, partition, identity)
+    if remembered is not None:
+        return list(remembered), SegmentHealth()
+    params = {**_kind_params(), "partitions": [str(partition)]}
+    con.register(_JOURNAL_VIEW, _PROVENANCE_SCHEMA.empty_table())
+    try:
+        result = con.execute(_SLOT_SQL_JOURNAL_AND_PARTITION, params).fetchall()
+    except _PARTITION_READ_ERRORS:
+        return [], SegmentHealth(unreadable_partitions=1)
     finally:
         con.unregister(_JOURNAL_VIEW)
-    placed, unparseable_rows = _placed_aggregates(result)
-    health = health.with_row_counts(
-        drifted_rows=sum(agg.other_rows for agg in placed),
-        unparseable_stamp_rows=unparseable_rows,
-    )
-    return [agg for agg in placed if agg.has_bound_rows], health
+    found = tuple(_slot_group(row) for row in result)
+    if memo is not None and identity is not None:
+        memo.put([(str(partition), identity, found)])
+    return list(found), SegmentHealth()
 
 
 def _placed_aggregates(result: Sequence[tuple]) -> tuple[list[SlotAggregate], int]:
@@ -1206,6 +1494,10 @@ class QueryContext:
     because ``SessionClock`` keeps its copy private and the Lake panel needs it directly.
     A runway is counted in capture days, and turning those into a date is a walk over
     sessions rather than a division by 365.
+
+    ``memo`` is the service's ``FileMemo``, shared by every request, so a file one panel
+    has read is not read again by the next. A context built without one reads every file
+    on every request.
     """
 
     paths: LakePaths
@@ -1214,6 +1506,7 @@ class QueryContext:
     roster: Mapping[str, tuple[str, ...]]
     calendar: Calendar
     guards: GuardConstants = field(default_factory=GuardConstants)
+    memo: FileMemo | None = None
 
 
 def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
@@ -1374,7 +1667,9 @@ def _latest_cycle(
     days = _dates_desc(ctx.paths, surface, ticker)
     walked = days[:MAX_LOOKBACK_SESSIONS]
     for day in walked:
-        aggregates, day_health = _slot_aggregates(con, ctx.paths, surface, ticker, day)
+        aggregates, day_health = _slot_aggregates(
+            con, ctx.paths, surface, ticker, day, memo=ctx.memo
+        )
         health += day_health
         if not aggregates:
             continue
@@ -1460,7 +1755,9 @@ def query_today(
     strips: list[dict[str, object]] = []
     for symbol in tickers:
         for surface in ctx.roster.get(symbol, ()):
-            aggregates, health = _slot_aggregates(con, ctx.paths, surface, symbol, session_day)
+            aggregates, health = _slot_aggregates(
+                con, ctx.paths, surface, symbol, session_day, memo=ctx.memo
+            )
             strips.append(
                 _strip(
                     symbol,
@@ -1607,19 +1904,9 @@ HISTORY_REPORT_MAX_BYTES = 4 * 1024 * 1024
 # Only the sealed partitions come through here. A ticker-day with journal segments goes
 # to ``_slot_aggregates`` instead, which is the one reader that knows the durability
 # rules and re-checks the partition after reading them.
-_WINDOW_SELECT = """
+_WINDOW_SELECT = f"""
 SELECT filename,
-       slot_ms,
-       count(*) FILTER (WHERE row_kind = $data_kind) AS data_rows,
-       count(*) FILTER (WHERE row_kind = $gap_kind) AS gap_rows,
-       count(*) FILTER (
-           WHERE row_kind IS DISTINCT FROM $data_kind
-             AND row_kind IS DISTINCT FROM $gap_kind
-       ) AS other_rows,
-       bool_or(coalesce(suspect, false)) AS suspect,
-       list_sort(
-           array_agg(DISTINCT error_class) FILTER (WHERE error_class IS NOT NULL)
-       ) AS error_classes
+       slot_ms,{_SLOT_COLUMNS}
 FROM (
     SELECT filename,
            epoch_ms(TRY_CAST(snap_ts AS TIMESTAMPTZ)) AS slot_ms,
@@ -1662,11 +1949,17 @@ def _window_aggregates(
     surface: str,
     tickers: Sequence[str],
     sessions: Sequence[date],
+    *,
+    memo: FileMemo | None = None,
 ) -> dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]]:
     """Every ticker-day's slot aggregates for one surface across the window.
 
-    The sealed partitions are read in one query and the rest per ticker-day, which is
-    what keeps the window's cost growing with bytes rather than with days. A ticker-day
+    A sealed partition the memo already holds is not read at all. The rest of the
+    sealed partitions are read in one query and the other ticker-days one at a time,
+    which is what keeps the window's cost growing with bytes rather than with days. On a
+    steady page the bulk read holds only what compaction sealed since the last refresh,
+    if anything, because ``_WINDOW_SELECT`` keys its groups by file and each file's
+    groups are remembered on their own. A ticker-day
     holding journal segments never joins the bulk read. It goes through
     ``_slot_aggregates``, because that is the reader that unions the journal with the
     partition and re-checks the partition after the segments are read, "so a seal that
@@ -1696,42 +1989,47 @@ def _window_aggregates(
     including the counts and the reports that had nothing to do with it.
     """
     result: dict[tuple[str, date], tuple[list[SlotAggregate], SegmentHealth]] = {}
-    bulk: dict[str, tuple[str, date]] = {}
+    bulk: dict[str, tuple[tuple[str, date], FileIdentity | None]] = {}
     for ticker in tickers:
         for day in sessions:
             if _journal_segments(paths, surface, ticker, day):
-                result[(ticker, day)] = _slot_aggregates(con, paths, surface, ticker, day)
+                result[(ticker, day)] = _slot_aggregates(
+                    con, paths, surface, ticker, day, memo=memo
+                )
                 continue
             partition = paths.partition_path(surface, ticker, day)
-            if partition.is_file():
-                bulk[str(partition)] = (ticker, day)
+            if not partition.is_file():
+                continue
+            identity = _file_identity(partition)
+            remembered = _remembered(memo, partition, identity)
+            if remembered is None:
+                bulk[str(partition)] = ((ticker, day), identity)
+            else:
+                result[(ticker, day)] = _day_aggregates(remembered, SegmentHealth())
     if not bulk:
         return result
-    params = {
-        "data_kind": journal.ROW_KIND_DATA,
-        "gap_kind": journal.ROW_KIND_GAP,
-        "partitions": sorted(bulk),
-    }
+    params = {**_kind_params(), "partitions": sorted(bulk)}
     try:
         rows = con.execute(_WINDOW_SELECT, params).fetchall()
     except Exception:  # noqa: BLE001 - the window must not cost the page, per the docstring
         log.exception("window read failed for %s, so the window falls back per day", surface)
-        for key in bulk.values():
+        for key, _ in bulk.values():
             ticker, day = key
-            result[key] = _slot_aggregates(con, paths, surface, ticker, day)
+            result[key] = _slot_aggregates(con, paths, surface, ticker, day, memo=memo)
         return result
-    grouped: dict[tuple[str, date], list[tuple]] = {key: [] for key in bulk.values()}
+    grouped: dict[str, list[SlotGroup]] = {name: [] for name in bulk}
     for row in rows:
-        key = bulk.get(row[0])
-        if key is not None:
-            grouped[key].append(row[1:])
-    for key, group in grouped.items():
-        placed, unparseable_rows = _placed_aggregates(group)
-        health = SegmentHealth().with_row_counts(
-            drifted_rows=sum(agg.other_rows for agg in placed),
-            unparseable_stamp_rows=unparseable_rows,
-        )
-        result[key] = ([agg for agg in placed if agg.has_bound_rows], health)
+        group = grouped.get(row[0])
+        if group is not None:
+            group.append(_slot_group(row[1:]))
+    fresh: list[tuple[str, FileIdentity, tuple[SlotGroup, ...]]] = []
+    for name, group in grouped.items():
+        key, identity = bulk[name]
+        result[key] = _day_aggregates(group, SegmentHealth())
+        if identity is not None:
+            fresh.append((name, identity, tuple(group)))
+    if memo is not None and fresh:
+        memo.put(fresh)
     return result
 
 
@@ -2394,7 +2692,7 @@ def query_history(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str
         present = [t for t in tickers if surface in ctx.roster.get(t, ())]
         if not present:
             continue
-        window = _window_aggregates(con, ctx.paths, surface, present, days)
+        window = _window_aggregates(con, ctx.paths, surface, present, days, memo=ctx.memo)
         for day, slots in sessions:
             for ticker in present:
                 aggregates, health = window.get((ticker, day), ([], SegmentHealth()))
@@ -2618,6 +2916,10 @@ class DashboardService:
     threshold rather than the pinned default it may have been recalibrated away from. The
     page and the tab icon are injected on the same terms. Each defaults to the bytes
     shipped in the package, and a test that wants neither passes its own.
+
+    The service holds one ``FileMemo`` for its life and hands it to every request, so a
+    file one panel has read is not read again until it changes. A test that wants to move
+    the memo's clock passes its own.
     """
 
     def __init__(
@@ -2630,6 +2932,7 @@ class DashboardService:
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
         icon: bytes | None = None,
+        memo: FileMemo | None = None,
     ) -> None:
         self._paths = LakePaths(Path(lake_root).resolve())
         self._clock = clock
@@ -2638,6 +2941,7 @@ class DashboardService:
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
         self._icon = icon if icon is not None else load_favicon()
+        self._memo = memo if memo is not None else FileMemo()
 
     @property
     def page(self) -> bytes:
@@ -2646,6 +2950,10 @@ class DashboardService:
     @property
     def icon(self) -> bytes:
         return self._icon
+
+    @property
+    def memo(self) -> FileMemo:
+        return self._memo
 
     def roster(self) -> dict[str, tuple[str, ...]]:
         """The lake's current roster, re-read per call so a new ticker appears at once."""
@@ -2673,6 +2981,7 @@ class DashboardService:
             roster=roster,
             calendar=self._calendar,
             guards=self._guards,
+            memo=self._memo,
         )
         cursor = self._con.cursor()
         try:
