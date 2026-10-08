@@ -37,6 +37,7 @@ child.
 from __future__ import annotations
 
 import errno
+import gc
 import os
 import resource
 import signal
@@ -782,6 +783,20 @@ def test_a_marker_that_failed_is_not_written_by_a_second_close(lake_root, monkey
     assert journal.read_segment(writer.path).num_rows == ROWS_PER_SEGMENT
 
 
+def test_a_marker_that_failed_still_closes_the_file(lake_root, monkeypatch):
+    """The descriptor goes even when writing the end-of-stream marker raises."""
+    whole = _written(lake_root, "a", 1).stat().st_size
+    _full_disk_after(monkeypatch, whole - len(EOS))
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    writer.write_cycle(_batch())
+
+    with pytest.raises(OSError, match="No space"):
+        writer.close()
+
+    with pytest.raises(OSError):
+        os.fstat(writer._fd)
+
+
 def _open_descriptors() -> int:
     return len(os.listdir("/dev/fd"))
 
@@ -822,6 +837,37 @@ def test_a_failure_after_the_create_leaves_no_file_and_no_descriptor(
     assert _open_descriptors() == before
 
 
+def test_a_failure_after_the_file_object_exists_closes_the_descriptor_once(lake_root, monkeypatch):
+    """Once the file object owns the descriptor, closing the object is what closes it.
+
+    Closing the bare descriptor instead leaves the object to close the same number again
+    when it is collected. By then another open can hold that number, and the second close
+    shuts that file instead.
+    """
+    path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    path.parent.mkdir(parents=True)
+
+    def refuse(*args, **kwargs):
+        raise _Refused("the stream would not start")
+
+    monkeypatch.setattr(pa.ipc, "new_stream", refuse)
+
+    with pytest.raises(_Refused) as info:
+        journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    # The lowest free number, which is the one the writer's descriptor just gave up.
+    other = os.open(os.devnull, os.O_RDONLY)
+    try:
+        # The traceback holds the writer's frame, which holds the file object.
+        del info
+        gc.collect()
+        os.fstat(other)
+    finally:
+        try:
+            os.close(other)
+        except OSError:
+            pass
+
+
 def test_a_collision_leaves_the_other_writers_file_alone(lake_root):
     """A failed create never removes anything, because the path is someone else's file."""
     path = journal.segment_path(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
@@ -851,6 +897,25 @@ def test_a_removal_that_fails_still_raises_the_write_failure(lake_root, monkeypa
     assert info.value.errno == errno.ENOSPC
     assert writer.closed
     assert writer.path.exists()
+
+
+def test_a_removal_is_made_durable_in_its_directory(lake_root, monkeypatch):
+    """The directory is synced once the file is gone, so a crash cannot bring the file back."""
+    _full_disk_after(monkeypatch, 5000)
+    writer = journal.SegmentWriter.open(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "s", PID)
+    synced: list[tuple[Path, bool]] = []
+    real_fsync_directory = journal._fsync_directory
+
+    def record(directory):
+        synced.append((directory, writer.path.exists()))
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(journal, "_fsync_directory", record)
+
+    with pytest.raises(OSError, match="No space"):
+        writer.write_cycle(_batch())
+
+    assert synced == [(writer.path.parent, False)]
 
 
 # -- 7. a real short write ---------------------------------------------------

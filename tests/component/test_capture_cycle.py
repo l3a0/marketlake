@@ -1524,3 +1524,138 @@ def test_a_failed_write_does_not_hold_its_chain_to_the_end_of_the_cycle(
 
     assert [(error.surface, error.ticker) for error in result.errors] == [(CHAINS, "QQQ")]
     assert alive == [False]
+
+
+def _raise_from_write(monkeypatch, surface: str, ticker: str, error: BaseException) -> None:
+    """The named segment's write raises ``error`` before it touches the disk.
+
+    Nothing else is refused, so the gap row lands.
+    """
+    real_write = capture._CaptureCycle._write
+
+    def write(self, s, t, plan):
+        if (s, t) == (surface, ticker):
+            raise error
+        return real_write(self, s, t, plan)
+
+    monkeypatch.setattr(capture._CaptureCycle, "_write", write)
+
+
+@pytest.mark.parametrize(
+    ("error", "tail"),
+    [
+        (
+            OSError(errno.ENOSPC, "No space\nleft on device"),
+            " (ENOSPC): OSError: [Errno 28] No space left on device; the gap row landed",
+        ),
+        (
+            PermissionError(errno.EACCES, "Permission denied"),
+            " (EACCES): PermissionError: [Errno 13] Permission denied; the gap row landed",
+        ),
+    ],
+    ids=["newline", "oserror-subclass"],
+)
+def test_a_failed_write_line_is_one_line_naming_any_errno(
+    lake_root, monkeypatch, capsys, error, tail
+):
+    """The runbook finds the line by its phrase, so a message never splits it.
+
+    The errno's name is there whenever the failure carries one, a subclass of ``OSError``
+    such as ``PermissionError`` included.
+    """
+    prefix = f"capture: {_EXPECTED_SNAP.isoformat()}: segment write failed: quotes SPY"
+    _raise_from_write(monkeypatch, QUOTES, "SPY", error)
+
+    _cycle(lake_root, cap=1)
+
+    # A message that split the line would print its second half on a line of its own.
+    lines = capsys.readouterr().err.splitlines()
+    assert [line for line in lines if "quotes SPY" in line or "left on" in line] == [prefix + tail]
+
+
+def test_a_gap_row_refusal_prints_on_the_same_line(lake_root, monkeypatch, capsys):
+    """The reason the gap row did not land is part of the one line, however it reads."""
+    _raise_from_write(monkeypatch, QUOTES, "SPY", OSError(errno.ENOSPC, "No space left on device"))
+
+    def broken(self, *args):
+        raise RuntimeError("two\nlines")
+
+    monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", broken)
+
+    _cycle(lake_root, cap=1)
+
+    err = capsys.readouterr().err
+    [line] = _failure_lines(err)
+    assert line.endswith("the gap row did not land: RuntimeError: two lines")
+    assert "lines" not in err.replace(line, "")
+
+
+class _SlowQuotes(CassetteVendor):
+    """The cassette's replies, with the quote batch taking two seconds on the cycle's clock."""
+
+    def __init__(self, cassette, clock) -> None:
+        super().__init__(cassette)
+        self._clock = clock
+
+    def get_quotes(self, *args, **kwargs):
+        reply = super().get_quotes(*args, **kwargs)
+        self._clock.advance(2.0)
+        return reply
+
+
+def test_a_gap_row_keeps_its_fetch_stamps_in_order_and_the_cycles_phase(lake_root, monkeypatch):
+    """The row carries the batch's own fetch stamps, start before end, as a landed row does.
+
+    The quote batch takes time here, so a row whose stamps were swapped would end before it
+    started. The row also carries the cycle's session phase, and its writer is closed.
+    """
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+    clock = ManualClock(start=_CLOCK_START)
+
+    result = capture.run_cycle(
+        clock,
+        _SlowQuotes(load_cassette(CASSETTES / "spy_minimal.json"), clock),
+        _both_options(),
+        lake_root,
+        pid=4242,
+        plan=_ONE_WINDOW,
+        guards=GuardConstants(capture_max_concurrency=1),
+        session_phase="post_equity_close",
+    )
+
+    [path] = _files(lake_root, QUOTES, "SPY")
+    [row] = journal.read_segment(path).to_pylist()
+    landed = _rows(result.segment(QUOTES, "QQQ"))[0]
+    assert row["fetch_ts"] < row["fetch_end_ts"]
+    assert (row["fetch_ts"], row["fetch_end_ts"]) == (landed["fetch_ts"], landed["fetch_end_ts"])
+    assert row["session_phase"] == landed["session_phase"] == "post_equity_close"
+    # The writer was closed, so the row's file ends in its end-of-stream marker.
+    assert path.read_bytes().endswith(b"\xff\xff\xff\xff\x00\x00\x00\x00")
+
+
+def test_a_gap_row_refusal_does_not_keep_its_exception_in_a_cycle(lake_root, monkeypatch):
+    """The refusal is kept only to print it, and never in a frame its traceback holds.
+
+    The traceback holds the frame that caught the refusal. A local there holding the
+    refusal closes a reference cycle, which only the cyclic collector frees, so the frames
+    that built the gap row would outlive the attempt.
+    """
+    _refuse_writes(monkeypatch, {(QUOTES, "SPY"): ["write"]})
+    raised: list[weakref.ref] = []
+
+    def track(error: _Tracked) -> _Tracked:
+        raised.append(weakref.ref(error))
+        return error
+
+    def broken(self, *args):
+        raise track(_Tracked("a bug in the gap plan"))
+
+    monkeypatch.setattr(capture._CaptureCycle, "_gap_plan", broken)
+
+    gc.disable()
+    try:
+        _cycle(lake_root)
+        assert len(raised) == 1
+        assert raised[0]() is None
+    finally:
+        gc.enable()
