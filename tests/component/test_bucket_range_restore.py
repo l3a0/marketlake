@@ -43,6 +43,8 @@ from lake.trimmed import (
     TrimmedLineLost,
     append_trimmed,
     latest_trimmed,
+    read_trimmed,
+    restore_line,
     trim_line,
     trimmed_path,
 )
@@ -1072,3 +1074,36 @@ def test_an_owed_restore_line_is_not_written_once_the_file_is_gone(tmp_path, mon
     assert summary.restore_lines == 0
     assert _kind(root, SPY_1) == "trim"
     assert _unexplained(root) == ()
+
+
+def test_an_owed_restore_line_is_not_written_twice(tmp_path, monkeypatch):
+    """Another run wrote the line between this run's hash and its lock.
+
+    A second identical line breaks no absence rule, and it is still a line the ledger did not
+    need. Mutation this catches: dropping the re-check that the latest line is still a trim
+    line.
+    """
+    root, client, _originals = _lake(tmp_path)
+    sha = latest_entries(root)[SPY_1]["sha256"]
+    _trim_away(root, client, SPY_1, unlink=False)
+    real_sha = bucket.sha256_file
+
+    def hash_then_restore(path):
+        digest = real_sha(path)
+        if Path(path) == root / SPY_1:
+            with lake_lock(root):
+                append_trimmed(
+                    root,
+                    restore_line(SPY_1, sha256=sha, restored_at=STAMP),
+                    source="another-run",
+                    fetched_at=STAMP,
+                )
+        return digest
+
+    monkeypatch.setattr(bucket, "sha256_file", hash_then_restore)
+
+    summary = _run(root, client, last=D1)
+
+    assert summary.restore_lines == 0
+    kinds = [line["kind"] for line in read_trimmed(root) if line["partition"] == SPY_1]
+    assert kinds == ["trim", "restore"]
