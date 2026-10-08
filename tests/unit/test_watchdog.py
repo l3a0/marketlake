@@ -2355,9 +2355,11 @@ def test_an_empty_roster_minute_inside_a_token_death_restarts_the_run():
 def test_a_ticker_that_lands_data_and_retires_restarts_the_run():
     """Test 6, price 1: the minute IWM landed data fed the dead-man.
 
-    SPY and QQQ fail ``http_401`` from 10:00. IWM fails at 10:00, lands data at 10:01 and
-    retires at 10:02. SPY and QQQ reach the threshold at 10:02 and page on their own, and
-    the cause pages at 10:04, dated 10:02, the first minute after the landing.
+    Price 1 is any ticker that lands data and leaves the cycle the next minute, by retiring
+    or by its span closing. This test drives the retiring shape. SPY and QQQ fail
+    ``http_401`` from 10:00. IWM fails at 10:00, lands data at 10:01 and retires at 10:02.
+    SPY and QQQ reach the threshold at 10:02 and page on their own, and the cause pages at
+    10:04, dated 10:02, the first minute after the landing.
     """
     landed = _cycle(
         *_dead(_at(1), "SPY", "QQQ").segments,
@@ -2375,8 +2377,8 @@ def test_a_ticker_that_lands_data_and_retires_restarts_the_run():
 def test_the_token_pull_reads_a_dead_token_on_every_minute_of_a_join():
     """Test 7: the daemon's pull reads one cycle, so a join cannot hold it back.
 
-    ``whole_daemon_cause`` is untouched by the gate, so every minute of the join probe in
-    test 1 reads as a dead token and the pull fires on each.
+    ``whole_daemon_cause`` is untouched by the threshold wait, so every minute of the join
+    probe in test 1 reads as a dead token and the pull fires on each.
     """
     cycles = [_dead(_at(0), "SPY", "QQQ"), _dead(_at(1), "SPY", "QQQ")]
     cycles += [_dead(_at(minute), "SPY", "QQQ", "IWM") for minute in range(2, 6)]

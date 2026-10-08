@@ -485,7 +485,7 @@ class Watchdog:
         dead-man, so the page is dated from when capture stopped rather than from one
         surface's own failure, which can start long before the cause: a chain failing
         ``http_500`` from 10:00 under a token that dies at 10:30 would date the page 10:00
-        (marketlake #747). The gate and ``minutes`` read one number, so ``minutes`` is
+        (marketlake #747). The wait and ``minutes`` read one number, so ``minutes`` is
         never below the threshold. The slot is already in ET, and :meth:`_roll` clears the
         count at the ET date change, so ``since`` always falls inside the session.
 
