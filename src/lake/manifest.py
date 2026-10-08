@@ -107,12 +107,13 @@ from lake.paths import (
 #    puts the tree inside the backup sync root and outside the manifest, and skips it here
 #    by name, so a subdirectory added under it needs nothing added here. None of the five
 #    is a measurement.
-# 4. ``lost+found/`` is the filesystem's, not the lake's. On the hosted VM ``lake_root`` is
-#    the ext4 volume's mount point, where ``mkfs.ext4`` leaves that directory owned by root,
-#    and the Sunday job runs as the owner. The reverse pass names a directory it cannot list,
-#    so without this entry every VM Sunday would withhold the ping for it. A prefix here
-#    matches at the root only, so a ``lost+found`` deeper in the lake is walked like any
-#    other directory, by the rule ``lake.runway`` gives for the same name.
+# 4. ``lost+found/`` is the filesystem's, not the lake's. On the hosted VM ``lake_root`` is the ext4
+#    volume's mount point, where ``mkfs.ext4`` leaves that directory owned by root at mode 0700. The
+#    Sunday job runs as the unprivileged account ``vm-bootstrap.sh`` gives the lake root to, so it
+#    cannot list the directory. The reverse pass names a directory it cannot list, so without this
+#    entry every VM Sunday would withhold the ping for it. A prefix here matches at the root only,
+#    so a ``lost+found`` deeper in the lake is walked like any other directory, by the rule
+#    ``lake.runway`` gives for the same name.
 #
 # None of the quarantine ledger, the corporate-actions ledger and the trimmed ledger is on
 # this list, and each is off it deliberately. Each writer refreshes its own manifest entry in
@@ -207,13 +208,14 @@ class LedgerNotUtf8(ManifestError):
     ``TornLedger``, and the quarantine ledger inherits all of it rather than widening a tuple to
     reach a ``ValueError``.
 
-    **The manifest ledger raises this too, since marketlake #499, and it is not contained.**
-    ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves the manifest,
-    so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
-    ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
-    the sentence above is false of the manifest. It is true of the other two ledgers this class
-    covers, the quarantine ledger and the trimmed ledger, whose three readers in marketlake #782
-    each contain it.
+    **The manifest ledger raises this too, since marketlake #499, and the 18:30 sweep does not
+    contain it.** ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves
+    the manifest, so a damaged one still ends the 18:30 run. Marketlake #517 carries the tuple,
+    and until it lands the sentence above is false of the manifest there. The Sunday job does
+    contain it: ``control_plane.sunday_maintenance`` guards its scrub call (marketlake #441) and
+    names the raise as a problem line that withholds the ping. The sentence above is true of the
+    other two ledgers this class covers, the quarantine ledger and the trimmed ledger, whose
+    three readers in marketlake #782 each contain it.
     """
 
 
@@ -1269,8 +1271,10 @@ def _first_difference(source: bytes, backup: bytes) -> int:
 class BackupScrubResult:
     """The verdict of a scrub over the backup copy.
 
-    ``target`` is the backup root the scrub walked. Every problem line repeats it, or carries
-    the path of the file whose read failed, so a line read on its own names where to look.
+    ``target`` is the backup root the scrub walked. Every problem line repeats it but two. The
+    ``unreadable`` line carries the failed read's own text instead, which names the file when
+    the error carries a path and only the error when the scrub itself raised. The
+    ``bucket_unusable`` line names the setting to repair, since no client reached the target.
 
     Four tuples name what is wrong with the copied files. Each withholds the Sunday
     ping, because each is the copy no longer holding what the lake says it holds.
@@ -1510,14 +1514,14 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     opened, by the check ``scrub`` makes and for its reason: ``rsync -a`` copies a FIFO as a
     FIFO, and reading one blocks.
 
-    Reverse: every file on the backup must be accounted for. A file the lake never
-    recorded is an ``orphan``, and one it recorded past the watermark is ``unaccounted``,
-    which is the watermark failing its own cross-check. ``SCRUB_EXCLUSIONS`` is reused
-    rather than a second list written, so the two scrubs skip the same files and a
-    decision about that list is made once. The price is named rather than hidden: that
-    list skips ``journal/`` and ``reports/``, so a killed sync's temp file under either
-    is not seen. Scanning the journal instead would name every segment in it, because
-    segments carry no manifest entry by rule.
+    Reverse: every file on the backup must be accounted for. A file the lake never recorded is
+    an ``orphan``, and one it recorded past the watermark is ``unaccounted``, which is the
+    watermark failing its own cross-check. ``SCRUB_EXCLUSIONS`` is reused rather than a second
+    list written, so the two scrubs skip the same files and a decision about that list is made
+    once. The price is named rather than hidden: that list skips ``journal/``, ``reports/`` and
+    ``lost+found/``, so a killed sync's temp file under any of them is not seen. Scanning the
+    journal instead would name every segment in it, because segments carry no manifest entry by
+    rule.
 
     ``BACKUP_EXCLUSIONS`` is deliberately not consulted. Its two patterns name a temp
     file, which is renamed away before any entry is appended and so can never be
