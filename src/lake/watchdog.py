@@ -15,10 +15,15 @@ absence markers, or nothing at all, increments too, and fails as ``contracts_abs
 (marketlake #326).
 
 Three consecutive minutes pages, once, on the transition. It stays silent after that
-until a durable cycle resets the counter or the surface leaves the cycle, and re-arms when
-either happens. A flapping surface
-can therefore page many times an hour, which is the honest signal rather than a
-comfortable one.
+until one of three things re-arms it.
+
+1. A durable cycle resets the counter.
+2. The surface leaves the cycle.
+3. The collapse below no longer holds for it, for a quotes ticker that a sampler page
+   named without its own page.
+
+A flapping surface can therefore page many times an hour, which is the honest signal
+rather than a comfortable one.
 
 One failure can take every surface down at once, such as a dead token or a rate
 limit. The watchdog calls that a cause, pages it once under its own title, and then
@@ -36,9 +41,21 @@ of five things happens.
 So a rate limit that runs all session stays one condition, and one surface returning and
 dying again never re-pages the cause.
 
-One case collapses. Every quotes ticker shares one batched request, so all quotes
-counters tripping in the same minute means the sampler died rather than N tickers
-dying at once. That sends one page naming the sampler, never one page per ticker.
+One case collapses. Every quotes ticker shares one batched request, so every quotes
+ticker failing in the same minute, with at least two failing the vendor's way that no
+live cause covers, means the sampler died rather than N tickers dying at once. That sends
+one page naming the sampler rather than one page per ticker. The page names only the
+tickers the failed request explains, which are the ones that recorded a class and that no
+live cause covers under that class. A ticker whose segment write failed recorded nothing
+about the vendor, so it pages under its own title with its write class. A covered ticker
+stays with the cause that covers it. Every ticker the sampler page names counts as paged,
+so one sampler death pages once. A ticker it named without its own page is heard again
+once the collapse no longer explains it and no live cause covers it. The collapse stops
+explaining it when any quotes ticker lands data, when fewer than two tickers still fail
+the vendor's way uncovered, or when the ticker itself stops failing that way, such as when
+its own write fails. It then pages under its own title once its count reaches the
+threshold, unless the collapse holds again by the time it trips. Then it trips inside the
+sampler's set and is heard through a sampler page instead (marketlake #771).
 
 A stall folds too. A slot the loop slept through gaps every watched surface at the
 same moment, so one stall that trips the threshold is one fact and sends one page,
@@ -144,10 +161,10 @@ class Surface:
 class Page:
     """One page the watchdog owes, ready for a publisher.
 
-    ``surfaces`` is what went quiet. It holds one entry for an ordinary page, every
-    quotes ticker for a collapsed sampler page, every surface a cause named, and every
-    surface a stall charged, so a caller can say what it saw without the watchdog
-    formatting prose it may not want.
+    ``surfaces`` is what went quiet. It holds one entry for an ordinary page, the quotes
+    tickers a failed batched request explains for a collapsed sampler page, every surface
+    a cause named, and every surface a stall charged, so a caller can say what it saw
+    without the watchdog formatting prose it may not want.
 
     ``cause`` is the class the failure arrived as, and it is what lets a body say why
     rather than only what. It is ``None`` where there is nothing to name: a slot the loop
@@ -269,6 +286,10 @@ class Watchdog:
         # per ``_release_from``. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
+        # The sampler-set surfaces a sampler page marked paged without their own page.
+        # Each minute ``_pages`` lets go of the ones the collapse no longer explains, so
+        # they leave _paged then and page on their own if they are still failing.
+        self._sampler_absorbed: set[Surface] = set()
         # Whether an overrun has already paged. It is the stall's own once-on-transition
         # flag, kept apart from ``_paged`` so a stall never spends a surface's budget.
         # A durable data cycle proves the loop is running again and re-arms it.
@@ -370,7 +391,12 @@ class Watchdog:
         cause = self._whole_daemon(tally, threshold, result.snap_ts)
         if cause is not None:
             return cause + out_of_span
-        return self._pages(failed, touched, threshold=threshold, classes=classes) + out_of_span
+        return (
+            self._pages(
+                failed, touched, threshold=threshold, classes=classes, recorded=recorded.keys()
+            )
+            + out_of_span
+        )
 
     def missed(self, surfaces: Iterable[Surface], slots: Sequence[datetime]) -> list[Page]:
         """Charge a run of slept-through slots, and page the overrun once.
@@ -538,7 +564,8 @@ class Watchdog:
         a surface sitting at 2 at the close page on the next session's first bad minute
         while claiming three minutes, when eighteen hours passed. A ``_paged`` flag
         carried the same way would silence a genuine page all the next morning, and so
-        would a stall flag, so both are dropped here too.
+        would a stall flag, so both are dropped here too. So is the set a sampler page
+        absorbed, which keeps yesterday's entries out of today's set as a guard.
         """
         day = slot.astimezone(MARKET_TZ).date()
         if day != self._day:
@@ -547,6 +574,7 @@ class Watchdog:
             self._paged.clear()
             self._paged_causes.clear()
             self._paged_overrun = False
+            self._sampler_absorbed.clear()
             self._out_of_span.clear()
             self._paged_out_of_span.clear()
             self._minutes_without_data = 0
@@ -636,7 +664,7 @@ class Watchdog:
             del self._paged_causes[title]
 
     def _drop_departed(self, touched: set[Surface], out_of_span: tuple[str, ...]) -> None:
-        """Forget the counter and the paged flag of every surface that left the cycle.
+        """Forget the counter and the paged flags of every surface that left the cycle.
 
         A live ticker touches every surface it owes on every cycle: capture plans quotes
         for each live ticker and a chain for each live options ticker, and a write that
@@ -666,6 +694,7 @@ class Watchdog:
         for key in gone:
             self._counts.pop(key, None)
             self._paged.discard(key)
+            self._sampler_absorbed.discard(key)
 
     def _out_of_span_pages(self, result: CycleResult, threshold: int) -> list[Page]:
         """Count the tickers the spans left out, and page the ones that newly tripped.
@@ -754,6 +783,7 @@ class Watchdog:
         *,
         threshold: int,
         classes: dict[Surface, str | None],
+        recorded: Iterable[Surface] = (),
     ) -> list[Page]:
         """The pages this minute owes, collapsing a dead sampler into one.
 
@@ -762,11 +792,73 @@ class Watchdog:
         of a newly-tripped set, which would break the parity and send one page per
         ticker at the moment the shared request died.
 
+        The sampler's set is the failed quotes surfaces in ``recorded`` that no live cause
+        covers under their own class. ``recorded`` is the keys of the tally's recorded
+        classes, and ``classes`` cannot stand in, because it also holds each write
+        failure's class. A surface whose write failed is left out, because the batched
+        request answered for it, and so is a surface a live cause still covers, whose page
+        would restate the cause page. The collapse fires when four things hold.
+
+        1. The roster has more than one quotes ticker.
+        2. Every watched quotes surface failed this minute.
+        3. The sampler's set holds at least two surfaces, since a set of one cannot tell
+           a dead request from one ticker failing.
+        4. A surface in the sampler's set tripped.
+
+        The page's surfaces, minutes and class all come from the sampler's set, and every
+        surface in it is marked paged, so one sampler death pages once. The ones that had
+        not paged on their own are kept in ``_sampler_absorbed``. On each minute that
+        reaches the per-surface pages, before ``tripped`` is built, a surface leaves that
+        set and ``_paged`` when conditions 1 to 3 no longer hold, or when they hold and it
+        is outside the sampler's set. Any quotes surface landing data breaks condition 2, a
+        write failure takes its ticker out of the set, and the last batch-mate leaving
+        breaks condition 3. A minute the whole-daemon path answers returns before this
+        method, and so does ``missed``. No page is lost there, because every surface failed
+        in that minute, so no quotes data landed. A released surface already at the
+        threshold that no live cause covers pages under its own title in that minute, and
+        one below the threshold pages when it reaches it (marketlake #771).
+
+        A surface a live cause covers right now is never released, whatever the collapse
+        does, because its own page would restate the cause page. Released instead, it
+        rejoined the sampler's set outside ``_paged`` the next minute it failed a way
+        another cause names, tripped, and sent the sampler page again, once every time the
+        class flipped. The price is that a batch moving whole from a covered failure to
+        another cause's class sends no fresh sampler page, which is how an ordinary surface
+        that has already paged behaves.
+
+        A minute that touched no surface releases nothing, because it says nothing about any
+        surface, the same judgement ``_drop_departed`` makes. Releasing there kept the
+        released tickers' counts, so the first minute they came back still failing sent the
+        sampler page again.
+
         It applies only where a request was actually attempted, and ``observe`` is the
         only caller for that reason. A slot the loop slept through gaps every quotes
         ticker too, and calling that a dead sampler would name a batched request nobody
         made. ``missed`` folds its own page instead and never arrives here.
         """
+        quotes_failed = {key for key in failed if key.surface == QUOTES_SURFACE}
+        quotes_watched = {key for key in watched if key.surface == QUOTES_SURFACE}
+        recorded = set(recorded)
+        sampler = {
+            key
+            for key in quotes_failed
+            if key in recorded
+            and not self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
+        }
+        holds = len(quotes_watched) > 1 and quotes_failed == quotes_watched and len(sampler) >= 2
+        # A ticker a sampler page silenced is heard again once the collapse no longer
+        # explains it, before ``tripped`` is built, so one at the threshold pages now. One
+        # a live cause covers right now stays silenced, or a class flapping in and out of
+        # the cover would re-page the sampler on every flip. A cycle that touched nothing
+        # says nothing about any surface, so it releases none.
+        if watched:
+            explained = (sampler if holds else set()) | {
+                key
+                for key in self._sampler_absorbed
+                if self._covered(key, _WHOLE_DAEMON_CAUSES.get(classes.get(key)))
+            }
+            self._paged -= self._sampler_absorbed - explained
+            self._sampler_absorbed &= explained
         tripped = [
             key
             for key in sorted(failed, key=str)
@@ -776,31 +868,28 @@ class Watchdog:
         ]
         if not tripped:
             return []
-        quotes_failed = {key for key in failed if key.surface == QUOTES_SURFACE}
-        quotes_watched = {key for key in watched if key.surface == QUOTES_SURFACE}
-        collapsed = (
-            len(quotes_watched) > 1
-            and quotes_failed == quotes_watched
-            and any(key.surface == QUOTES_SURFACE for key in tripped)
-        )
+        collapsed = holds and any(key in sampler for key in tripped)
+        if collapsed:
+            self._sampler_absorbed |= sampler - self._paged
+            self._paged |= sampler
         self._paged.update(tripped)
         pages: list[Page] = []
         if collapsed:
             # One batched request died, so in practice every collapsed ticker reports the
             # same class. Naming one of several would pick a winner arbitrarily, so a
             # disagreement names none.
-            shared = {classes.get(key) for key in quotes_failed}
+            shared = {classes.get(key) for key in sampler}
             pages.append(
                 Page(
                     title="Capture down: quote sampler dead",
-                    minutes=max(self._counts[key] for key in quotes_failed),
-                    surfaces=tuple(sorted(quotes_failed, key=str)),
+                    minutes=max(self._counts[key] for key in sampler),
+                    surfaces=tuple(sorted(sampler, key=str)),
                     sampler_collapse=True,
                     cause=shared.pop() if len(shared) == 1 else None,
                 )
             )
         for key in tripped:
-            if collapsed and key.surface == QUOTES_SURFACE:
+            if collapsed and key in sampler:
                 continue
             pages.append(
                 Page(

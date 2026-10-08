@@ -1773,10 +1773,10 @@ class _DeadSampler:
 def test_the_sampler_page_says_how_many_tickers_it_stands_for(size, tmp_path):
     """A folded page has to say how much it folded.
 
-    The design folds every quotes ticker into one page rather than sending N, and the
-    same rule makes compaction's drift page name how many columns it left. Without the
-    count, one page for two tickers and one page for four hundred read identically, and
-    the quotes batch runs to hundreds of symbols per request.
+    The design folds the quotes tickers a failed batched request explains into one page
+    rather than sending N, and the same rule makes compaction's drift page name how many
+    columns it left. Without the count, one page for two tickers and one page for four
+    hundred read identically, and the quotes batch runs to hundreds of symbols per request.
 
     The count comes off the page's own surfaces rather than a constant, so a roster that
     changed mid-session reports what it is now.
@@ -1836,6 +1836,46 @@ def test_a_folded_page_whose_tickers_disagree_still_says_how_many(tmp_path):
     (page,) = rig.transport.sent
     assert page.title == "Capture down: quote sampler dead"
     assert page.body == "3 session minutes without a durable cycle, one page for 4 tickers"
+
+
+class _WriteFailingQuotes:
+    """A cycle runner whose every quotes segment write fails, every cycle.
+
+    The batched request answered and the disk refused the writes, so the cycle carries
+    one ``SegmentError`` per ticker and no segment at all.
+    """
+
+    def __init__(self, tickers: tuple[str, ...]):
+        self._tickers = tickers
+
+    def __call__(
+        self, *, slot: datetime, close_tag: str | None, session_phase: str | None
+    ) -> CycleResult:
+        errors = tuple(
+            SegmentError(journal.QUOTES_SURFACE, ticker, "o_s_error") for ticker in self._tickers
+        )
+        return CycleResult(snap_ts=slot, segments=(), errors=errors)
+
+
+def test_every_quotes_write_failing_pages_each_ticker_rather_than_the_sampler(tmp_path):
+    """A refused write names the ticker and the write class, never the batched request.
+
+    The sampler page sends the operator after a request that answered. Each ticker whose
+    write failed pages under its own title instead, the way a chains write failure already
+    does, and its body names the write class that points at the disk (marketlake #771).
+    """
+    tickers = ("T00", "T01", "T02", "T03")
+    rig = _rig(tmp_path)
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    _run(rig, clock, ticks=4, cycle_runner=_WriteFailingQuotes(tickers))
+
+    assert sorted((page.title, page.body) for page in rig.transport.sent) == [
+        (
+            f"Capture down: {ticker} quotes",
+            "3 session minutes without a durable cycle, failing with o_s_error",
+        )
+        for ticker in tickers
+    ]
 
 
 def test_an_empty_roster_still_runs_the_loop_and_reports(tmp_path):

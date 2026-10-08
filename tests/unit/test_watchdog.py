@@ -1212,7 +1212,8 @@ def test_a_collapse_and_a_surface_page_in_one_minute_each_name_their_own_class()
 
 
 def test_a_collapse_names_no_class_when_a_ticker_that_already_paged_failed_differently():
-    """The sampler's set is every failing quotes ticker, not only the newly tripped ones.
+    """The sampler's set is every failing quotes ticker that recorded a class no live cause
+    covers, not only the newly tripped ones.
 
     A ticker can be gapped on its own when it goes missing from an otherwise healthy
     batch, page for that, and still be failing when the whole batch starts being rejected
@@ -2500,6 +2501,734 @@ def test_a_rate_limit_inside_a_token_death_pages_on_its_own():
         2: [(TOKEN_DEAD_TITLE, "http_401")],
         3: [(QQQ_CHAINS, "http_429")],
     }
+
+
+# -- the sampler page names only what a failed batch explains (marketlake #771) --------
+
+
+def _quotes_write_failed(ticker: str, error_class: str = "o_s_error") -> SegmentError:
+    return SegmentError("quotes", ticker, error_class)
+
+
+def _raised(watchdog: Watchdog, cycles: list[CycleResult]) -> list[tuple]:
+    """Every page the cycles raised, as its cycle index, title, class, minutes and surfaces.
+
+    The index is the cycle's place in ``cycles``, so the result also says when each page
+    went. Surfaces are written as ``str(surface)``, such as ``"SPY quotes"``.
+    """
+    return [
+        (index, page.title, page.cause, page.minutes, tuple(str(key) for key in page.surfaces))
+        for index, cycle in enumerate(cycles)
+        for page in watchdog.observe(cycle)
+    ]
+
+
+@pytest.mark.parametrize(
+    "write_classes",
+    [
+        {"SPY": "o_s_error", "QQQ": "o_s_error"},
+        {"SPY": "o_s_error", "QQQ": "permission_error"},
+    ],
+)
+def test_every_quotes_write_failing_pages_each_ticker_under_its_own_title(write_classes):
+    """Test 1: a refused write is not a dead sampler, whether the write classes agree or not.
+
+    The batched request answered and the disk refused the writes. A write failure records
+    no class from the vendor, so no ticker joins the sampler's set, and each one pages under
+    its own title with its own write class, the way a chains write failure already does.
+    """
+    errors = tuple(_quotes_write_failed(ticker, cls) for ticker, cls in write_classes.items())
+    cycles = [
+        _cycle(_seg("chains", "SPY", "data"), errors=errors, at=_at(minute)) for minute in range(4)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: QQQ quotes", write_classes["QQQ"], 3, ("QQQ quotes",)),
+        (2, "Capture down: SPY quotes", write_classes["SPY"], 3, ("SPY quotes",)),
+    ]
+
+
+def test_one_write_failure_among_vendor_failures_leaves_the_sampler_page_to_the_vendor_failures():
+    """Test 2, on 3 quotes tickers: the write failure pages on its own beside the sampler.
+
+    The sampler page names only the two tickers whose batched request failed, with their
+    shared class and minutes. Folding SPY in would cost the page its class and send the
+    operator after the request for a ticker the disk refused.
+    """
+    cycles = [
+        _cycle(
+            _fail("quotes", "QQQ", "http_500"),
+            _fail("quotes", "IWM", "http_500"),
+            _seg("chains", "SPY", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(minute),
+        )
+        for minute in range(4)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("IWM quotes", "QQQ quotes")),
+        (2, "Capture down: SPY quotes", "o_s_error", 3, ("SPY quotes",)),
+    ]
+
+
+def test_one_write_failure_and_one_vendor_failure_on_two_quotes_tickers_page_one_each():
+    """Test 2, on 2 quotes tickers: a sampler set of one is not a dead sampler.
+
+    One ticker failing the vendor's way cannot tell a dead batched request from one ticker
+    failing, so the floor of two holds the collapse back. Each ticker pages under its own
+    title. That is the price the rule names for today's roster of two.
+    """
+    cycles = [
+        _cycle(
+            _fail("quotes", "QQQ", "http_500"),
+            _seg("chains", "SPY", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(minute),
+        )
+        for minute in range(4)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: QQQ quotes", "http_500", 3, ("QQQ quotes",)),
+        (2, "Capture down: SPY quotes", "o_s_error", 3, ("SPY quotes",)),
+    ]
+
+
+def _every_surface(error_class: str, chains: tuple[str, ...] = ("SPY", "QQQ")) -> list:
+    """SPY, QQQ and IWM quotes and the named chains, every one failing with ``error_class``."""
+    return [_fail("quotes", ticker, error_class) for ticker in ("SPY", "QQQ", "IWM")] + [
+        _fail("chains", ticker, error_class) for ticker in chains
+    ]
+
+
+def test_a_write_failure_under_a_live_rate_limit_pages_alone():
+    """Test 3: a covered ticker stays out of the sampler page.
+
+    The rate limit already paged and still covers QQQ and IWM quotes, which keep failing
+    its way. Only SPY's failing write is news, so it is the only page.
+    """
+    cycles = [_cycle(*_every_surface("http_429"), at=_at(minute)) for minute in range(3)]
+    cycles += [
+        _cycle(
+            _fail("quotes", "QQQ", "http_429"),
+            _fail("quotes", "IWM", "http_429"),
+            _seg("chains", "SPY", "data"),
+            _seg("chains", "QQQ", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(minute),
+        )
+        for minute in range(3, 7)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: rate limited")]
+    assert raised[1:] == [(3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",))]
+
+
+def test_a_quotes_ticker_turning_to_a_rate_limit_under_a_dead_token_pages_alone():
+    """Test 3: the ticker failing another cause's way pages, and the covered ones do not.
+
+    The token-dead cause still covers QQQ and IWM quotes, which keep answering 401. SPY's
+    429 is a different outage with a different remedy, so it pages, and on its own.
+    """
+    cycles = [_cycle(*_every_surface("http_401"), at=_at(minute)) for minute in range(3)]
+    cycles += [
+        _cycle(
+            _fail("quotes", "SPY", "http_429"),
+            _fail("quotes", "QQQ", "http_401"),
+            _fail("quotes", "IWM", "http_401"),
+            _seg("chains", "SPY", "data"),
+            _seg("chains", "QQQ", "data"),
+            at=_at(minute),
+        )
+        for minute in range(3, 8)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: token dead")]
+    assert raised[1:] == [(3, "Capture down: SPY quotes", "http_429", 4, ("SPY quotes",))]
+
+
+def test_two_quotes_tickers_turning_to_a_dead_token_under_a_rate_limit_page_the_sampler():
+    """Test 3: coverage is judged under each ticker's own class.
+
+    The rate limit covers all three quotes tickers. QQQ and IWM turn to 401, which the
+    rate limit does not explain, so they leave its cover and form the sampler's set. SPY
+    still fails the rate limit's way and stays covered, so the page names two, with 401.
+    """
+    cycles = [_cycle(*_every_surface("http_429"), at=_at(minute)) for minute in range(3)]
+    cycles += [
+        _cycle(
+            _fail("quotes", "SPY", "http_429"),
+            _fail("quotes", "QQQ", "http_401"),
+            _fail("quotes", "IWM", "http_401"),
+            _seg("chains", "SPY", "data"),
+            _seg("chains", "QQQ", "data"),
+            at=_at(minute),
+        )
+        for minute in range(3, 8)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: rate limited")]
+    assert raised[1:] == [
+        (3, "Capture down: quote sampler dead", "http_401", 4, ("IWM quotes", "QQQ quotes"))
+    ]
+
+
+def test_a_token_death_healing_into_every_quotes_write_failing_pages_each_ticker():
+    """Test 4: the healed minute sends one page per ticker and no sampler page.
+
+    The chains landing data proves the vendor answered, so each failing write leaves the
+    token-dead cause and pages at once, carrying the outage's minutes. The batched request
+    answered too, so nothing names the sampler.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    cycles = [
+        _cycle(*_every_surface("http_401", chains=tickers), at=_at(minute)) for minute in range(3)
+    ]
+    cycles += [
+        _cycle(
+            *(_seg("chains", ticker, "data") for ticker in tickers),
+            errors=tuple(_quotes_write_failed(ticker) for ticker in tickers),
+            at=_at(minute),
+        )
+        for minute in range(3, 7)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: token dead")]
+    assert raised[1:] == [
+        (3, f"Capture down: {ticker} quotes", "o_s_error", 4, (f"{ticker} quotes",))
+        for ticker in ("IWM", "QQQ", "SPY")
+    ]
+
+
+def test_a_write_failure_that_trips_before_the_sampler_dies_does_not_join_its_page():
+    """Test 5: the write failure pages first, then the sampler page names the rest.
+
+    SPY's write fails from the start, and the batched request dies a minute later. The
+    sampler page goes out when a ticker in its own set trips, and it carries that set's
+    minutes, not the longer run of SPY's write failure.
+    """
+    cycles = [
+        _cycle(
+            _seg("quotes", "QQQ", "data"),
+            _seg("quotes", "IWM", "data"),
+            _seg("chains", "SPY", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(0),
+        )
+    ]
+    cycles += [
+        _cycle(
+            _fail("quotes", "QQQ", "http_500"),
+            _fail("quotes", "IWM", "http_500"),
+            _seg("chains", "SPY", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(minute),
+        )
+        for minute in range(1, 7)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: SPY quotes", "o_s_error", 3, ("SPY quotes",)),
+        (3, "Capture down: quote sampler dead", "http_500", 3, ("IWM quotes", "QQQ quotes")),
+    ]
+
+
+def _sampler_minute(minute: int, failing: dict[str, bool]) -> CycleResult:
+    """One minute of quotes tickers each failing ``http_500`` or landing data, beside a chain.
+
+    ``chains SPY`` lands data every minute, which keeps the cycle off the whole-daemon path
+    and shows that a chain landing is not the batched request answering.
+    """
+    quotes = [
+        _fail("quotes", ticker, "http_500") if down else _seg("quotes", ticker, "data")
+        for ticker, down in failing.items()
+    ]
+    return _cycle(*quotes, _seg("chains", "SPY", "data"), at=_at(minute))
+
+
+def test_tickers_that_trip_a_minute_apart_in_one_sampler_death_page_once():
+    """Test 6: the sampler page marks every ticker it names, not only the ones that tripped.
+
+    QQQ starts failing a minute after SPY, so it is named at 2 minutes and trips a minute
+    later. Marked only on tripping, it sent a second sampler page for the same death.
+    """
+    cycles = [_sampler_minute(minute, {"SPY": True, "QQQ": minute >= 1}) for minute in range(8)]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("QQQ quotes", "SPY quotes"))
+    ]
+
+
+def test_a_ticker_the_sampler_page_named_early_pages_on_its_own_once_its_batch_mate_recovers():
+    """Test 7: a ticker named below the threshold is heard again once the batch answers.
+
+    QQQ had failed one minute when the sampler page named it. SPY lands data at minute 3,
+    which proves the batched request answered, so QQQ, still failing, pages under its own
+    title when it reaches the threshold.
+    """
+    cycles = [
+        _sampler_minute(minute, {"SPY": minute < 3, "QQQ": minute >= 2}) for minute in range(12)
+    ]
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (4, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_tickers_absorbed_by_the_sampler_page_page_on_their_own_when_a_batch_mate_lands():
+    """Test 8: the tickers that tripped with the sampler page are heard in the landing minute.
+
+    All three trip together and the sampler page names them. SPY lands data at minute 5.
+    QQQ and IWM are still failing, so each pages under its own title in that same minute,
+    carrying its full run of minutes rather than restarting the count.
+    """
+    cycles = [
+        _sampler_minute(minute, {"SPY": minute < 5, "QQQ": True, "IWM": True})
+        for minute in range(10)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (
+            2,
+            "Capture down: quote sampler dead",
+            "http_500",
+            3,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
+        (5, "Capture down: IWM quotes", "http_500", 6, ("IWM quotes",)),
+        (5, "Capture down: QQQ quotes", "http_500", 6, ("QQQ quotes",)),
+    ]
+
+
+def test_a_ticker_that_paged_before_the_collapse_does_not_page_again_when_a_batch_mate_lands():
+    """Test 9: the release returns only the tickers the sampler page silenced.
+
+    SPY is missing from the batch on its own and pages for that first. When the batch dies
+    and later answers again, SPY is still failing its own way, but it already had its page.
+    """
+    batch_dead = range(3, 8)
+    cycles = [
+        _cycle(
+            _fail("quotes", "SPY", "quote_missing"),
+            _fail("quotes", "QQQ", "http_500")
+            if minute in batch_dead
+            else _seg("quotes", "QQQ", "data"),
+            _seg("chains", "SPY", "data"),
+            at=_at(minute),
+        )
+        for minute in range(12)
+    ]
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: SPY quotes"),
+        (5, "Capture down: quote sampler dead"),
+    ]
+
+
+def _stall_after_a_sampler_page(slots: int) -> list:
+    """What a stall of ``slots`` pages right after a sampler page whose tickers tripped apart."""
+    watchdog = Watchdog()
+    for minute in range(3):
+        watchdog.observe(_sampler_minute(minute, {"SPY": True, "QQQ": minute >= 1}))
+    roster = [Surface("quotes", "SPY"), Surface("quotes", "QQQ"), Surface("chains", "SPY")]
+    return watchdog.missed(roster, [_at(3 + slot) for slot in range(slots)])
+
+
+def test_a_short_stall_right_after_a_sampler_page_adds_nothing():
+    """Test 10: the tickers the sampler page named count as paged, so a short stall is quiet.
+
+    Every quotes ticker already has a page standing for it, and the chain the stall charged
+    sits below the threshold.
+    """
+    assert _stall_after_a_sampler_page(2) == []
+
+
+def test_a_long_stall_right_after_a_sampler_page_pages_for_the_stall_s_own_minutes():
+    """Test 10: the stall pages once a surface outside the sampler page trips.
+
+    The chain reaches the threshold at the fifth slot, so the stall pages with the five
+    minutes it ran rather than the longer count of a ticker the sampler page already named.
+    """
+    pages = _stall_after_a_sampler_page(5)
+    assert [(page.title, page.minutes) for page in pages] == [("Capture down: loop stalled", 5)]
+
+
+def test_a_sampler_page_from_yesterday_releases_nothing_today():
+    """Test 11: the session date clears the tickers a sampler page silenced.
+
+    Yesterday's sampler page named SPY and QQQ. Today SPY's write fails and QQQ answers 500
+    for three minutes, so each pages on its own. When QQQ lands data, yesterday's page
+    must not hand SPY's page back, or SPY would page a second time for one failure.
+    """
+    watchdog = Watchdog()
+    yesterday = [_sampler_minute(minute, {"SPY": True, "QQQ": True}) for minute in range(4)]
+    assert [page[:2] for page in _raised(watchdog, yesterday)] == [
+        (2, "Capture down: quote sampler dead")
+    ]
+    today = [
+        _cycle(
+            _fail("quotes", "QQQ", "http_500") if minute < 3 else _seg("quotes", "QQQ", "data"),
+            _seg("chains", "SPY", "data"),
+            errors=(_quotes_write_failed("SPY"),),
+            at=_at(minute, day=3),
+        )
+        for minute in range(6)
+    ]
+    assert [page[:2] for page in _raised(watchdog, today)] == [
+        (2, "Capture down: QQQ quotes"),
+        (2, "Capture down: SPY quotes"),
+    ]
+
+
+def test_a_ticker_that_left_and_rejoined_is_not_released_by_the_sampler_page_before_it_left():
+    """Test 11: a ticker leaving the cycle drops out of what the sampler page silenced.
+
+    The sampler page named IWM, which then left the cycle for two minutes and came back
+    with its write failing. It pages for that on its own. When SPY and QQQ land data later,
+    the old sampler page must not hand IWM's page back, or IWM would page a second time.
+    """
+    cycles = []
+    for minute in range(12):
+        down = minute < 9
+        segments = [
+            _fail("quotes", "SPY", "http_500") if down else _seg("quotes", "SPY", "data"),
+            _fail("quotes", "QQQ", "http_500") if down else _seg("quotes", "QQQ", "data"),
+            _seg("chains", "SPY", "data"),
+        ]
+        errors: tuple = ()
+        if minute < 3:
+            segments.append(_fail("quotes", "IWM", "http_500"))
+        elif minute >= 5:
+            errors = (_quotes_write_failed("IWM"),)
+        cycles.append(_cycle(*segments, errors=errors, at=_at(minute)))
+    assert [page[:3] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead", "http_500"),
+        (7, "Capture down: IWM quotes", "o_s_error"),
+    ]
+
+
+# -- a ticker the sampler page silenced is heard once the collapse stops holding ------
+
+
+def test_every_quotes_write_failing_after_a_sampler_page_pages_each_ticker_at_once():
+    """The batched request answered, so the sampler page no longer speaks for any ticker.
+
+    Every quotes write fails from minute 3 while the chain keeps landing data, so no quotes
+    surface lands data all session and the dead-man stays fed. A write failure records no
+    vendor class, so the sampler's set is empty and the collapse no longer holds. Each
+    ticker is already past the threshold and no cause covers it, so each pages under its
+    own title in that minute. Waiting for quotes data left all three silent.
+    """
+    cycles = [
+        _sampler_minute(minute, {"SPY": True, "QQQ": True, "IWM": True}) for minute in range(3)
+    ]
+    cycles += [
+        _cycle(
+            _seg("chains", "SPY", "data"),
+            errors=tuple(_quotes_write_failed(ticker) for ticker in ("SPY", "QQQ", "IWM")),
+            at=_at(minute),
+        )
+        for minute in range(3, 7)
+    ]
+    assert _raised(Watchdog(), cycles) == [
+        (
+            2,
+            "Capture down: quote sampler dead",
+            "http_500",
+            3,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
+        (3, "Capture down: IWM quotes", "o_s_error", 4, ("IWM quotes",)),
+        (3, "Capture down: QQQ quotes", "o_s_error", 4, ("QQQ quotes",)),
+        (3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",)),
+    ]
+
+
+def test_a_ticker_whose_write_fails_after_a_sampler_page_pages_while_the_batch_stays_dead():
+    """A ticker that leaves the sampler's set is heard even while the collapse holds.
+
+    The sampler page names SPY, QQQ and IWM. SPY's write fails from minute 3, so the failed
+    request no longer explains it, and it pages ``o_s_error`` at once. QQQ and IWM still
+    fail the vendor's way, so they stay with the sampler page. IWM then leaves for two
+    minutes, which leaves a sampler's set of one, so QQQ is released and pages too. IWM
+    returns with a fresh count, and when it trips with QQQ the collapse sends a second
+    sampler page. That is the price a ticker that returns already pays (marketlake #570).
+    """
+    cycles = []
+    for minute in range(10):
+        segments = [_fail("quotes", "QQQ", "http_500"), _seg("chains", "SPY", "data")]
+        errors: tuple = ()
+        if minute < 3:
+            segments.append(_fail("quotes", "SPY", "http_500"))
+        else:
+            errors = (_quotes_write_failed("SPY"),)
+        if minute not in (4, 5):
+            segments.append(_fail("quotes", "IWM", "http_500"))
+        cycles.append(_cycle(*segments, errors=errors, at=_at(minute)))
+    assert _raised(Watchdog(), cycles) == [
+        (
+            2,
+            "Capture down: quote sampler dead",
+            "http_500",
+            3,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        ),
+        (3, "Capture down: SPY quotes", "o_s_error", 4, ("SPY quotes",)),
+        (4, "Capture down: QQQ quotes", "http_500", 5, ("QQQ quotes",)),
+        (8, "Capture down: quote sampler dead", "http_500", 9, ("IWM quotes", "QQQ quotes")),
+    ]
+
+
+def test_a_ticker_named_early_pages_at_its_threshold_once_its_only_batch_mate_leaves():
+    """A sampler's set of one is not a dead sampler, so the ticker left in it is heard.
+
+    T0 fails from minute 0 and T1 from minute 2, so the sampler page names T1 below the
+    threshold. T0 then falls outside every capture span. No quotes surface lands data, so
+    waiting for one left T1 silent all session. With T0 gone the collapse no longer holds,
+    and T1 pages under its own title when it reaches the threshold at minute 4.
+    """
+    cycles = []
+    for minute in range(5):
+        segments = [
+            _fail("quotes", "T1", "http_500") if minute >= 2 else _seg("quotes", "T1", "data"),
+            _seg("chains", "T1", "data"),
+        ]
+        if minute < 3:
+            segments.append(_fail("quotes", "T0", "http_500"))
+        out = ("T0",) if minute >= 3 else ()
+        cycles.append(_clamped(*segments, out=out, at=_at(minute)))
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("T0 quotes", "T1 quotes")),
+        (4, "Capture down: T1 quotes", "http_500", 3, ("T1 quotes",)),
+    ]
+
+
+def _batch_minute(minute: int, quotes: dict[str, str], errors: tuple = ()) -> CycleResult:
+    """One minute of quotes tickers each ``"down"`` (``http_500``) or ``"up"`` (data).
+
+    A ticker missing from ``quotes`` is not touched, so it has left the cycle. ``chains
+    SPY`` lands data every minute, as in ``_sampler_minute``.
+    """
+    segments = [
+        _fail("quotes", ticker, "http_500") if state == "down" else _seg("quotes", ticker, "data")
+        for ticker, state in quotes.items()
+    ]
+    return _cycle(*segments, _seg("chains", "SPY", "data"), errors=errors, at=_at(minute))
+
+
+def test_a_second_sampler_page_keeps_the_tickers_the_first_one_silenced():
+    """Two sampler pages in one outage add to what is silenced rather than replace it.
+
+    The first page names SPY and QQQ. IWM joins failing and trips the second page. When SPY
+    lands data, QQQ is still failing, so it pages along with IWM. Keeping only the second
+    page's new tickers would have left QQQ silent.
+    """
+    cycles = []
+    for minute in range(9):
+        quotes = {"SPY": "down" if minute < 7 else "up", "QQQ": "down"}
+        if minute >= 3:
+            quotes["IWM"] = "down"
+        cycles.append(_batch_minute(minute, quotes))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (5, "Capture down: quote sampler dead"),
+        (7, "Capture down: IWM quotes"),
+        (7, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_a_write_failure_recovering_releases_the_tickers_the_sampler_page_silenced():
+    """Any quotes ticker landing data ends the collapse, not only one the page silenced.
+
+    SPY's write fails from the start, so it pages on its own and the sampler page names
+    only QQQ and IWM. When SPY lands data at minute 5, the batch has answered, so QQQ and
+    IWM, still failing, each page under their own title.
+    """
+    cycles = []
+    for minute in range(8):
+        if minute < 5:
+            quotes = {"QQQ": "down", "IWM": "down"}
+            cycles.append(_batch_minute(minute, quotes, (_quotes_write_failed("SPY"),)))
+        else:
+            cycles.append(_batch_minute(minute, {"SPY": "up", "QQQ": "down", "IWM": "down"}))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (2, "Capture down: SPY quotes"),
+        (5, "Capture down: IWM quotes"),
+        (5, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_one_silenced_ticker_leaving_keeps_the_rest_silenced_while_the_collapse_holds():
+    """A departure forgets only the ticker that left, so the rest are still heard later.
+
+    The sampler page names all three. IWM leaves at minute 3, and SPY and QQQ still form a
+    sampler's set of two, so the collapse holds and nothing pages. When SPY lands data at
+    minute 5, QQQ is still failing and pages. Forgetting every silenced ticker on IWM's
+    departure would have left QQQ silent.
+    """
+    cycles = []
+    for minute in range(8):
+        quotes = {"SPY": "down" if minute < 5 else "up", "QQQ": "down"}
+        if minute < 3:
+            quotes["IWM"] = "down"
+        cycles.append(_batch_minute(minute, quotes))
+    assert [page[:2] for page in _raised(Watchdog(), cycles)] == [
+        (2, "Capture down: quote sampler dead"),
+        (5, "Capture down: QQQ quotes"),
+    ]
+
+
+def test_a_cycle_that_touched_nothing_keeps_the_silenced_tickers_silenced():
+    """A cycle that touched no surface says nothing about any of them, so it releases none.
+
+    The sampler page names SPY and QQQ at minute 2. Minute 3 touches nothing, the way a
+    roster with every ticker retired or every ticker out of span does. SPY and QQQ come
+    back still failing, with their counts intact. Releasing them on the empty minute sent
+    the sampler page again the moment they returned.
+    """
+    cycles = [_batch_minute(minute, {"SPY": "down", "QQQ": "down"}) for minute in range(3)]
+    cycles.append(_cycle(at=_at(3)))
+    cycles += [_batch_minute(minute, {"SPY": "down", "QQQ": "down"}) for minute in (4, 5)]
+    assert _raised(Watchdog(), cycles) == [
+        (2, "Capture down: quote sampler dead", "http_500", 3, ("QQQ quotes", "SPY quotes"))
+    ]
+
+
+# -- a silenced ticker a live cause covers stays silenced -----------------------------
+
+
+def _rate_limit_then_flapping_batch(minute: int, covered: str, *, landed: tuple = ()) -> list:
+    """One minute of a rate limit on ``covered`` that turns into a flapping batch.
+
+    Minutes 0 to 2 fail ``covered``'s quotes and chain with ``http_429``, beside any other
+    quotes ticker the caller names in ``landed``, so the rate-limit page goes out at minute
+    2 covering them all. At minute 3 the chain lands data, each ticker in ``landed`` lands
+    data, and every other quotes ticker of SPY, QQQ and IWM records ``quote_absent``. From
+    minute 4 the batch fails all three each minute, ``http_500`` on even minutes and
+    ``http_401`` on odd ones, while the chain keeps landing.
+
+    ``quote_absent`` and ``http_500`` resolve to no cause, so the rate-limit cause still
+    covers ``covered`` in those minutes. ``http_401`` is the dead token's class, so it lifts
+    the cover every other minute. A rate limit is per surface, so the chain landing data
+    does not take ``covered`` out of that cause (marketlake #760). A token-dead cover would
+    not do here, since the same landed data takes a surface failing ``quote_absent`` or
+    ``http_500`` out of it.
+    """
+    tickers = ("SPY", "QQQ", "IWM")
+    if minute < 3:
+        limited = (covered, *landed)
+        return [_fail("quotes", ticker, "http_429") for ticker in limited] + [
+            _fail("chains", covered, "http_429")
+        ]
+    if minute == 3:
+        return [
+            _seg("quotes", ticker, "data")
+            if ticker in landed
+            else _fail("quotes", ticker, "quote_absent")
+            for ticker in tickers
+        ] + [_seg("chains", covered, "data")]
+    error_class = "http_500" if minute % 2 == 0 else "http_401"
+    return [_fail("quotes", ticker, error_class) for ticker in tickers] + [
+        _seg("chains", covered, "data")
+    ]
+
+
+def test_a_covered_ticker_whose_class_flaps_does_not_re_page_the_sampler():
+    """A ticker a live cause covers stays with the sampler page while the cover stands.
+
+    The rate-limit page covers SPY quotes. QQQ and IWM join at minute 3, and from minute 4
+    the batch alternates ``http_500`` and ``http_401``. On a 401 minute SPY leaves the
+    cover and joins the sampler's set, so the sampler page at minute 5 names all three. On
+    a 500 minute the cause covers SPY again, which takes it out of the sampler's set.
+    Releasing it there let it trip on the next 401 minute and send the sampler page again,
+    every other minute without end.
+    """
+    cycles = [
+        _cycle(*_rate_limit_then_flapping_batch(minute, "SPY"), at=_at(minute))
+        for minute in range(21)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: rate limited")]
+    assert raised[1:] == [
+        (
+            5,
+            "Capture down: quote sampler dead",
+            "http_401",
+            6,
+            ("IWM quotes", "QQQ quotes", "SPY quotes"),
+        )
+    ]
+
+
+def test_batch_mates_freed_from_the_cause_by_landing_still_send_one_sampler_page():
+    """The same flapping batch sends one sampler page when every ticker started in the cause.
+
+    QQQ and IWM fail with SPY under the rate limit, so the cause names all three. They
+    land data at minute 3, which takes them out of it, while SPY records ``quote_absent``
+    and stays covered. The flapping batch that follows must page the sampler once.
+    """
+    cycles = [
+        _cycle(
+            *_rate_limit_then_flapping_batch(minute, "SPY", landed=("QQQ", "IWM")),
+            at=_at(minute),
+        )
+        for minute in range(21)
+    ]
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:1]] == [(2, "Capture down: rate limited")]
+    assert [page[:2] for page in raised[1:]] == [(5, "Capture down: quote sampler dead")]
+
+
+def test_a_covered_silenced_ticker_whose_write_fails_beside_landed_data_pages_its_write():
+    """A write failure in a minute data landed lifts the cover, so the ticker is heard.
+
+    The rate-limit cause covers QQQ quotes and the sampler page at minute 5 silenced it.
+    At minute 6 the cause covers it again. At minute 7 its write fails while the chain lands
+    data, which takes it out of the cause, so it pages under its own title with its write
+    class, while SPY and IWM stay with the sampler page.
+    """
+    cycles = [
+        _cycle(*_rate_limit_then_flapping_batch(minute, "QQQ"), at=_at(minute))
+        for minute in range(7)
+    ]
+    cycles.append(
+        _cycle(
+            _fail("quotes", "SPY", "http_401"),
+            _fail("quotes", "IWM", "http_401"),
+            _seg("chains", "QQQ", "data"),
+            errors=(_quotes_write_failed("QQQ"),),
+            at=_at(7),
+        )
+    )
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:2]] == [
+        (2, "Capture down: rate limited"),
+        (5, "Capture down: quote sampler dead"),
+    ]
+    assert raised[2:] == [(7, "Capture down: QQQ quotes", "o_s_error", 8, ("QQQ quotes",))]
+
+
+def test_a_covered_silenced_ticker_failing_another_cause_s_way_alone_pages_that_class():
+    """A class another cause names lifts the cover once the collapse no longer holds.
+
+    The rate-limit cause covers QQQ quotes and the sampler page at minute 5 silenced it.
+    At minute 7 SPY and IWM land data, so the collapse no longer holds, and QQQ alone
+    answers 401, which the rate limit does not explain. It pages under its own title.
+    """
+    cycles = [
+        _cycle(*_rate_limit_then_flapping_batch(minute, "QQQ"), at=_at(minute))
+        for minute in range(7)
+    ]
+    cycles.append(
+        _cycle(
+            _seg("quotes", "SPY", "data"),
+            _fail("quotes", "QQQ", "http_401"),
+            _seg("quotes", "IWM", "data"),
+            _seg("chains", "QQQ", "data"),
+            at=_at(7),
+        )
+    )
+    raised = _raised(Watchdog(), cycles)
+    assert [page[:2] for page in raised[:2]] == [
+        (2, "Capture down: rate limited"),
+        (5, "Capture down: quote sampler dead"),
+    ]
+    assert raised[2:] == [(7, "Capture down: QQQ quotes", "http_401", 8, ("QQQ quotes",))]
 
 
 # -- a ticker joining a dead token (marketlake #768) -----------------------------------
