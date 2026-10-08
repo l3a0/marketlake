@@ -63,6 +63,10 @@ path answers only when the instance has ``instance_metadata_tags`` enabled, whic
     refuses a backup setting, by design, so a target without its scheme would load as a
     relative path. The render is a job rather than the capture path, so it applies the
     bucket jobs' strict checks.
+13. ``lake_window_sessions`` is set and is not a whole number of sessions at or above
+    ``lake.window.window_floor``, marketlake #786. Loading stores the key without judging it,
+    for the reason ``lake.window`` gives, so the render is where a bad window stops before it
+    reaches the VM, rather than on the first night the sweep or the trim reads it.
 
 A refusal is raised outside the handler that caught its cause, as ``config.load_config``
 does, so neither its ``__cause__`` nor its ``__context__`` holds a YAML error. PyYAML
@@ -160,6 +164,7 @@ from lake.config import (
 )
 from lake.outbox import PRIMARY, SHADOW
 from lake.paths import temp_write_path
+from lake.window import WindowRefused, window_sessions
 
 # The four parameters and the ``config.yaml`` key each one fills. The names are literals,
 # because the instance role reads ``/marketlake/config/*`` and a name built from input
@@ -486,7 +491,7 @@ def _check_tag(value: object) -> str:
 
 
 def _check_config(merged: Mapping[str, Any]) -> None:
-    """Refuse a merged mapping the daemon could not load, or a bucket job would refuse."""
+    """Refuse a merged mapping the daemon could not load, or a job would refuse."""
     # The refusal is raised after the handler, so the load error is not its context.
     failure = None
     try:
@@ -510,6 +515,16 @@ def _check_config(merged: Mapping[str, Any]) -> None:
     problems.extend(bucket_credential_problems(config))
     if problems:
         raise RenderRefused(". ".join(problems))
+    # The floor reads the merged guards, so a ``guards:`` override that raises the battery's
+    # trailing median raises the floor with it.
+    # Raised after the handler, the way every refusal here is, so it carries no context.
+    window_problem = None
+    try:
+        window_sessions(config.lake_window_sessions, config.guards)
+    except WindowRefused as exc:
+        window_problem = str(exc)
+    if window_problem is not None:
+        raise RenderRefused(window_problem)
 
 
 def _same(left: object, right: object) -> bool:

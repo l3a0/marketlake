@@ -37,11 +37,16 @@ fake ``sudo`` clears the environment as the real one does. It keeps only ``PATH`
 ``LOG``, ``STATE``, ``TOOLS``, every ``FAKE_*`` variable, the exit-code knobs named
 ``*_RC`` and ``*_RCS``, and the fake ``git``'s ``IS_REPO``, ``BRANCH`` and ``DIRTY``. It
 sets ``HOME`` from ``FAKE_HOME``.
+
+Each fake is a symlink to the one program in ``tests.support.fake_bin``, which sources the
+fake's body, so a Mac scans one new file per process rather than one per fake.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+from tests.support.fake_bin import install
 
 FAKE_SYSTEMCTL = r"""#!/bin/bash
 printf 'systemctl %s\n' "$*" >> "$LOG"
@@ -315,9 +320,6 @@ FAKES = {
 
 
 def install_fakes(bin_dir: Path) -> None:
-    """Write every fake into ``bin_dir``, executable."""
-    bin_dir.mkdir(parents=True, exist_ok=True)
+    """Install every fake into ``bin_dir`` through ``tests.support.fake_bin``."""
     for name, body in FAKES.items():
-        path = bin_dir / name
-        path.write_text(body)
-        path.chmod(0o755)
+        install(bin_dir / name, body)

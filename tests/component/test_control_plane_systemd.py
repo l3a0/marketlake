@@ -27,6 +27,7 @@ from tests.component.test_control_plane_render import (
     SYSTEMD_EXPECTED_FILES,
     SYSTEMD_RENDER_ARGS,
 )
+from tests.support.fake_bin import install
 from tests.support.fake_systemd import install_fakes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -763,23 +764,23 @@ OWNER = "someone"
 def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     """A checkout holding the entry point and a venv interpreter, and the owner's home.
 
-    The interpreter is a wrapper around this test's own, so the real render runs. The
-    owner's ``uv`` is a fake that records the call and where it ran.
+    The entry point is a link to the repository's own file, which finds its checkout from
+    the path it was run by, so it runs against this one. A write through that link
+    rewrites the tracked file, so a test that needs a changed script must unlink it and
+    write its own. The interpreter is a wrapper
+    around this test's own, so the real render runs. The owner's ``uv`` is a fake that
+    records the call and where it ran. Both are links to ``tests.support.fake_bin``'s one
+    program, so none of the three is a new file a Mac scans on its first run.
     """
     checkout = tmp_path / "checkout"
     (checkout / "deploy").mkdir(parents=True)
-    shutil.copy2(ENTRY_POINT, checkout / "deploy" / ENTRY_POINT.name)
-    python = checkout / ".venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n')
-    python.chmod(0o755)
+    (checkout / "deploy" / ENTRY_POINT.name).symlink_to(ENTRY_POINT)
+    install(checkout / ".venv" / "bin" / "python", f'#!/bin/bash\nexec {sys.executable} "$@"\n')
     home = tmp_path / "home"
-    uv = home / ".local" / "bin" / "uv"
-    uv.parent.mkdir(parents=True)
-    uv.write_text(
-        '#!/bin/bash\nprintf \'uv %s in %s\\n\' "$*" "$PWD" >> "$LOG"\nexit "${UV_RC:-0}"\n'
+    install(
+        home / ".local" / "bin" / "uv",
+        '#!/bin/bash\nprintf \'uv %s in %s\\n\' "$*" "$PWD" >> "$LOG"\nexit "${UV_RC:-0}"\n',
     )
-    uv.chmod(0o755)
     return checkout, home
 
 

@@ -171,18 +171,23 @@ reach reads as a rule.
 
 **A run's second night appends nothing.** ``observed_on`` and ``ex_date`` are both the
 boundary session itself, never the night the walk ran. A split stays visible in sealed chains
-forever, so a detector stamping the night it ran would re-derive the same split and fail
-``actions.same_but_for_recorded_at`` every night, appending it again every night forever.
+until marketlake #755 trims its sessions, so a detector stamping the night it ran would
+re-derive the same split and fail ``actions.same_but_for_recorded_at`` every night, appending
+it again every night until then.
 The two dates being equal is worth saying plainly, because the key exists to hold two
 different things apart. A split detected from a root change has no vendor date at all, so the
 boundary session is the only honest answer for either.
 
 **A held split has no way to clear, and that is inherited rather than new.**
 ``report.write_withheld`` says a held finding files again every night and the repetition is
-the record, and nothing prunes ``reports/``. Sealed chains never change, so a split this
-gate refuses is re-derived identically every night. The only resolution is the ``manual``
-entry #286 has not shipped, which is the same gap #284 already carries for dividends.
-Nothing here claims a gate that can be cleared.
+the record, and nothing prunes ``reports/``. A sealed chains partition never changes while it
+is on disk, and a held finding stops the walk's cutoff before its day, so the trim of
+marketlake #787 never drops that day and a split this gate refuses is re-derived identically
+every night. The only resolution is the ``manual`` entry #286 has not shipped, which is the
+same gap #284 already carries for dividends. Nothing here claims a gate that can be cleared.
+On a host with a lake window, a held finding of any kind therefore also stops the trim until
+the hold is resolved. The owner accepted that on 2026-10-07, decision 7 on marketlake #755,
+and the disk-runway alarm covers the growth meanwhile.
 
 **Rescaling is not this module's and never will be.** Rescaling historical strikes in place
 is storage mutation, which is how option databases quietly corrupt themselves. Cross-event
@@ -200,7 +205,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from fnmatch import fnmatchcase
@@ -600,6 +605,21 @@ class SplitConsistency:
 
 
 @dataclass(frozen=True)
+class TickerRefusal:
+    """One ticker the walk refused to judge, and why, in words that name the repair.
+
+    marketlake #786 resumes a ticker whose chains days were trimmed from its saved
+    :class:`WalkState`, and refuses it where a resume would be wrong. A walk from scratch over
+    a trimmed lake lands permanent phantom splits, so a refused ticker is not walked at all
+    and reports no state, which keeps its saved one. ``reason`` reaches the 18:30 sweep's
+    problem line word for word.
+    """
+
+    ticker: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class SplitReport:
     """What one run of the detection did, for the sign-off block.
 
@@ -635,6 +655,9 @@ class SplitReport:
 
     ``states`` holds each ticker's :class:`WalkState` at its cutoff, in ticker order. It is not
     on the sign-off block, because no operator acts on it. A later walk resumes from it.
+
+    ``refused`` holds each ticker the walk would not judge, marketlake #786. It is on the block,
+    and the command exits 1 on one, because a refused ticker's splits went undetected.
     """
 
     ticker_days: int
@@ -648,6 +671,7 @@ class SplitReport:
     scale_covered: int = 0
     scale_unread: tuple[ScaleUnread, ...] = ()
     states: tuple[WalkState, ...] = ()
+    refused: tuple[TickerRefusal, ...] = ()
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -701,6 +725,8 @@ class SplitReport:
         lines.append(f"  scale already recorded: {self.scale_covered}")
         lines.append(f"  scale not compared: {len(self.scale_unread)}")
         lines.extend(by_reason(self.scale_unread))
+        lines.append(f"  refused:   {len(self.refused)}")
+        lines.extend(f"    - {refusal.ticker}: {refusal.reason}" for refusal in self.refused)
         return "\n".join(lines)
 
 
@@ -1490,8 +1516,10 @@ def detect_splits(
     calendar: Calendar,
     resume: Iterable[WalkState] = (),
     edge: date | None = None,
+    refused: Mapping[str, str] | None = None,
+    absent_refusal: Callable[[str, date], str | None] | None = None,
 ) -> SplitReport:
-    """Read every sealed chains ticker-day, gate what it finds, and append what lands.
+    """Read the sealed chains ticker-days, gate what it finds, and append what lands.
 
     Nothing here fetches. ``CHAINS_SCHEMA`` has carried ``option_root`` and the four
     deliverable columns since the capture schema was pinned, so the evidence a split is
@@ -1542,7 +1570,8 @@ def detect_splits(
        the ledger's own record rules refuse, rather than ending the run as a traceback.
     10. The entry lands only when it differs from what ``latest`` already resolves on its
         key, on every field but ``recorded_at``. A split stays visible in sealed chains
-        forever, so without this the ledger would grow by a line every night.
+        until its sessions are trimmed, so without this the ledger would grow by a line every
+        night.
 
     **Both ways the resolution can fail hold the action and file it.** ``UnresolvedSymbol``
     says the master and the lake disagree about a ticker. ``AmbiguousSymbol`` says the master
@@ -1589,8 +1618,19 @@ def detect_splits(
        start does.
     5. The end of the ticker's days, so a retired ticker still gets a cutoff.
 
-    A resume needs the window edge and the policy around it, and marketlake #786 owns both.
-    Nothing in the nightly sweep passes ``resume`` or ``edge`` yet.
+    **Two inputs refuse a ticker rather than walk it**, marketlake #786. A walk from scratch over
+    a trimmed lake lands permanent phantom splits, so a ticker that can neither resume nor walk
+    from scratch is refused: it is not walked, its state is left out of the report, and a
+    :class:`TickerRefusal` names it. The other tickers run as before.
+
+    1. ``refused`` maps each ticker the caller refused before the walk to its reason.
+    2. ``absent_refusal`` is asked when a read meets ``PartitionAbsent``. A reason back refuses
+       the ticker there, which is how a trim that lands while the walk runs is caught. ``None``
+       back skips the day as before.
+
+    The policy around both, the window edge and the saved states lives in
+    :mod:`lake.split_checkpoint`, which the 18:30 sweep and ``detect_splits_from_config`` both
+    call.
     """
     lake_root = Path(lake_root)
     states: dict[str, WalkState] = {}
@@ -1598,6 +1638,11 @@ def detect_splits(
         if state.ticker in states:
             raise ValueError(f"two saved states name {state.ticker}")
         states[state.ticker] = state
+    refused = {} if refused is None else dict(refused)
+    refusals = [TickerRefusal(ticker, refused[ticker]) for ticker in sorted(refused)]
+    for ticker in refused:
+        # A refused ticker reports no state, so its saved one is what the caller keeps.
+        states.pop(ticker, None)
     master = read_master(lake_root)
     recorded_at = clock.now()
     # Read once for the run, so every ticker-day is compared against one snapshot of what the
@@ -1640,6 +1685,8 @@ def detect_splits(
         held.append(HeldFinding(finding=finding, filed_at=filed_at))
 
     for ticker, days in by_ticker(ticker_days):
+        if ticker in refused:
+            continue
         start = states.get(ticker)
         cutoff = _Cutoff(ticker, start)
         previous: Session | None = None
@@ -1664,6 +1711,8 @@ def detect_splits(
         # out-of-scope day after it does. A resume seeds it from the master, since the days at
         # or before the cutoff are not walked again.
         resolved = False
+        # Set when ``absent_refusal`` refuses the ticker partway through its days.
+        refusal: str | None = None
         if start is not None:
             previous = start.previous
             history = SymbolHistory.from_export(start.history)
@@ -1738,6 +1787,10 @@ def detect_splits(
             resolved = True
 
             session = read_session(lake_root, ticker, day, instrument_id)
+            if session == REASON_PARTITION_ABSENT and absent_refusal is not None:
+                refusal = absent_refusal(ticker, day)
+                if refusal is not None:
+                    break
             if isinstance(session, str):
                 skipped.append(Skip(ticker, day, session))
                 unread_since += 1
@@ -1829,6 +1882,10 @@ def detect_splits(
             # the history as it stood before this session, the way ``seen`` is.
             history.observe(session.day, [row for _, row in session.rows])
             previous, unread_since = session, 0
+        if refusal is not None:
+            refusals.append(TickerRefusal(ticker, refusal))
+            states.pop(ticker, None)
+            continue
         # The end of the ticker's days, which is a stopping event only when nothing came first.
         cutoff.stop(
             previous=previous,
@@ -1852,6 +1909,7 @@ def detect_splits(
         scale_covered=scale_covered,
         scale_unread=tuple(scale_unread),
         states=tuple(states[ticker] for ticker in sorted(states)),
+        refused=tuple(refusals),
     )
 
 
@@ -2173,15 +2231,21 @@ def detect_splits_from_config(
     reach past this process, so neither is a seam." ``lake.actions``' command also runs both
     walks through one ``run(clock=clock, config_path=args.config)``, so the default has to live
     here rather than on a signature that call cannot vary.
+
+    **It runs through ``split_checkpoint.walk_splits``, the function the 18:30 sweep runs.** So
+    on a trimmed lake a ticker resumes from the checkpoint or is refused, and is never walked
+    from scratch, which would land permanent phantom splits. It passes no window edge and
+    writes no checkpoint, since it has no session of a sweep to record.
     """
     from lake.config import load_config
+    from lake.split_checkpoint import walk_splits
 
     config = load_config(config_path)
-    return detect_splits(
+    return walk_splits(
         lake_root=config.lake_root,
         clock=SystemClock() if clock is None else clock,
         calendar=ExchangeCalendar() if calendar is None else calendar,
-    )
+    ).report
 
 
 __all__ = [
@@ -2223,6 +2287,7 @@ __all__ = [
     "SplitConsistency",
     "SplitError",
     "SplitReport",
+    "TickerRefusal",
     "UNDERLYING_PRICE",
     "WHOLE_RATIO_GATE",
     "WHOLE_RATIO_TOLERANCE",

@@ -195,6 +195,11 @@ SEGMENT_GLOB = f"{SEGMENT_PREFIX}*{SEGMENT_SUFFIX}"
 # The reference tables named in the design.
 SECURITY_MASTER = "security_master"
 CONTRACTS = "contracts"
+# The split walk's per-ticker checkpoint, marketlake #786. It lives under ``reference/`` because
+# it is rewritten by rename the way the reference tables are, and the bucket keeps every
+# version of what sits there. ``actions/`` would be the wrong home: it holds one all-ticker
+# ledger, and its 30-day noncurrent expiry would delete the earlier checkpoints a repair needs.
+SPLIT_CHECKPOINT = "split_checkpoint"
 
 # The single all-ticker corporate-actions ledger under ``actions/``. It is the third
 # append-only ledger, written on the manifest's own line rules by ``lake.actions``. The
@@ -348,6 +353,11 @@ class LakePaths:
     def contracts_path(self) -> Path:
         """The contracts reference: ``instrument_id`` to contract terms."""
         return self.reference_path(CONTRACTS)
+
+    @property
+    def split_checkpoint_path(self) -> Path:
+        """The split walk's checkpoint: each ticker's saved walk state, marketlake #786."""
+        return self.reference_path(SPLIT_CHECKPOINT)
 
 
 # -- the temp file an atomic write uses --------------------------------------
@@ -583,6 +593,7 @@ __all__ = [
     "REFERENCE_DIR",
     "REPORTS_DIR",
     "SECURITY_MASTER",
+    "SPLIT_CHECKPOINT",
     "SEGMENT_GLOB",
     "SEGMENT_PREFIX",
     "SEGMENT_SUFFIX",

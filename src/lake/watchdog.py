@@ -27,7 +27,12 @@ rather than a comfortable one.
 
 One failure can take every surface down at once, such as a dead token or a rate
 limit. The watchdog calls that a cause, pages it once under its own title, and then
-suppresses the pages of every surface it named. That suppression ends one surface at a
+suppresses the pages of every surface it named. Each later minute in which nothing
+landed data takes in every surface failing the cause's way that the cause has not let go,
+so a ticker that joins mid-outage stays with the cause rather than restating it under its
+own title. A minute with landed data takes nobody in, because a rate limit is per surface,
+and a surface the cause let go is not taken back, because leaving showed it is not failing
+for the cause's reason (marketlake #790). That suppression ends one surface at a
 time, and the cause re-arms only when the last of them has gone. A surface goes when any
 of five things happens.
 
@@ -278,13 +283,20 @@ class Watchdog:
         self._page_minutes = page_minutes
         self._counts: dict[Surface, int] = {}
         self._day: date | None = None
-        # A cause maps to the surfaces its page covers. A surface leaves that set when
+        # A cause maps to the surfaces its page covers. A surface enters that set when
+        # the cause pages, and later on a minute nothing landed data, per ``observe`` and
+        # ``_whole_daemon``. A surface leaves that set when
         # it produces data, when it answers with no contract, when its segment could not
         # be written in a minute another surface landed data, or when the roster drops
         # it, per ``_release``. It leaves the token-dead set alone when it fails a way
         # that does not resolve to a dead token in a minute another surface landed data,
         # per ``_release_from``. A cause whose set empties is dropped, which re-arms it.
         self._paged_causes: dict[str, set[Surface]] = {}
+        # The surfaces each live cause has let go, kept until the cause is dropped. A cause
+        # takes a surface in once. One that left it by any exit but leaving the roster has
+        # shown it is not failing for the cause's reason, so the cause does not take it back
+        # in, per ``_whole_daemon`` (marketlake #790).
+        self._cause_released: dict[str, set[Surface]] = {}
         self._paged: set[Surface] = set()
         # The sampler-set surfaces a sampler page marked paged without their own page.
         # Each minute ``_pages`` lets go of the ones the collapse no longer explains, so
@@ -386,6 +398,17 @@ class Watchdog:
             for key, error_class in recorded.items():
                 if _WHOLE_DAEMON_CAUSES.get(error_class) != TOKEN_DEAD:
                     self._release_from(key, TOKEN_DEAD)
+        else:
+            # Nothing landed, so nothing shows the vendor answered, and a surface failing a
+            # live cause's class is that cause, whatever the others failed with. Left out, a
+            # ticker joining a rate limit beside a chain answering 500 restated it under its
+            # own title (marketlake #790). A minute with landed data takes nobody in here,
+            # because a rate limit is per surface.
+            for key, error_class in recorded.items():
+                title = _WHOLE_DAEMON_CAUSES.get(error_class, "")
+                held = self._paged_causes.get(title)
+                if held is not None and key not in self._cause_released.get(title, ()):
+                    held.add(key)
         threshold = self._threshold()
         out_of_span = self._out_of_span_pages(result, threshold)
         cause = self._whole_daemon(tally, threshold, result.snap_ts)
@@ -532,6 +555,27 @@ class Watchdog:
         ticker joining mid-outage split the cause. Its young counter held the cause back,
         the older surfaces paged on their own, and the cause paged late, dated from the
         join (marketlake #768).
+
+        Once the cause has paged, it keeps taking surfaces in. ``observe`` adds every
+        surface failing a class that resolves to it on any minute in which nothing landed
+        data, and this method adds the rest of a minute that passes the same rule, which is
+        the write failures, as the cause's own first minute does. That reaches a ticker
+        that joined the cycle after the page. Left out, it paged under its own title on the
+        first minute another surface landed data, restating the cause it was failing for,
+        two pages for a ticker with a chain (marketlake #790). A minute in which some
+        surface landed data takes nobody in, because the vendor answered that minute and a
+        rate limit is per surface.
+
+        A cause takes a surface in once. One it let go, by landing data or any other way
+        :meth:`_release` names except leaving the roster, is kept in ``_cause_released``
+        until the cause is dropped, and neither fold adds it back. A surface that left the
+        roster and returns is a join. Leaving showed the surface is not failing for the
+        cause's reason. Taken back in, it stayed covered when it later failed for a reason
+        of its own: a persistent 500 under the rate limit, a 403 under a dead token, or a
+        dead sampler, which sent nothing all session and held the cause live, so the next
+        outage under that title sent no cause page either. The price is a surface that left
+        and then failed the cause's way again. It restates the cause once under its own
+        title, on the first minute another surface lands data after it trips.
         """
         title = _whole_daemon_title(tally)
         if title is None:
@@ -539,7 +583,12 @@ class Watchdog:
         failed = tally.failed
         # The rule passed, so the failed segments recorded exactly one class.
         error_class = next(c for c in tally.recorded.values() if c is not None)
-        if title in self._paged_causes:
+        held = self._paged_causes.get(title)
+        if held is not None:
+            # The cause already paged, and this minute is it again, so it speaks for every
+            # surface failing now. ``observe`` took in the ones that recorded its class, and
+            # this adds the write failures.
+            held |= failed - self._cause_released.get(title, set())
             return []
         minutes = self._minutes_without_data
         if minutes < threshold:
@@ -573,6 +622,7 @@ class Watchdog:
             self._counts.clear()
             self._paged.clear()
             self._paged_causes.clear()
+            self._cause_released.clear()
             self._paged_overrun = False
             self._sampler_absorbed.clear()
             self._out_of_span.clear()
@@ -589,7 +639,7 @@ class Watchdog:
         # still true of them and stays live until the last one is released.
         self._release(key)
 
-    def _release(self, key: Surface) -> None:
+    def _release(self, key: Surface, *, let_go: bool = True) -> None:
         """Take one surface out of the causes covering it, dropping one that empties.
 
         A cause with no surfaces left has nothing to explain, so dropping it re-arms it.
@@ -626,9 +676,9 @@ class Watchdog:
         write failure, and then the cause a second time.
         """
         for title in list(self._paged_causes):
-            self._release_from(key, title)
+            self._release_from(key, title, let_go=let_go)
 
-    def _release_from(self, key: Surface, title: str) -> None:
+    def _release_from(self, key: Surface, title: str, *, let_go: bool = True) -> None:
         """Take one surface out of one cause, dropping the cause if that empties it.
 
         ``_release`` loops over this, so one place drops an emptied cause. A title with no
@@ -655,13 +705,22 @@ class Watchdog:
         its page
         carries the outage's minutes, even when it failed only on the minute the token
         healed. That is the price, the same one a write failure pays.
+
+        ``let_go`` records the surface in ``_cause_released``, so the cause does not take
+        it back in while it stays live (marketlake #790). :meth:`_release_retired` passes
+        ``False``, because leaving the roster says nothing about why the surface was
+        failing.
         """
         held = self._paged_causes.get(title)
         if held is None or key not in held:
             return
         held.discard(key)
+        if let_go:
+            self._cause_released.setdefault(title, set()).add(key)
         if not held:
             del self._paged_causes[title]
+            # A cause emptied by roster drops alone let nothing go, so it has no record.
+            self._cause_released.pop(title, None)
 
     def _drop_departed(self, touched: set[Surface], out_of_span: tuple[str, ...]) -> None:
         """Forget the counter and the paged flags of every surface that left the cycle.
@@ -757,14 +816,18 @@ class Watchdog:
             return
         for key in {key for held in self._paged_causes.values() for key in held}:
             if key not in touched:
-                self._release(key)
+                # Leaving the roster says nothing about why the surface was failing, so the
+                # cause takes it back in if it returns still failing the cause's way. It is
+                # one of the joins marketlake #790 is about.
+                self._release(key, let_go=False)
 
     def _covered(self, key: Surface, title: str | None) -> bool:
         """Whether a live cause speaks for how this surface is failing right now.
 
         ``title`` is the cause this minute's failure resolves to, or ``None`` when it
         resolves to no cause and when nothing was attempted. A cause covers the surface
-        it named while that surface keeps failing its way. An ordinary transient failure
+        it named, or took in after its page, while that surface keeps failing
+        its way. An ordinary transient failure
         counts as still covered, which for the token-dead cause holds only in a minute in
         which nothing landed data. The one thing that lifts the cover is the surface
         failing a way some other cause names, because that is a different outage with a

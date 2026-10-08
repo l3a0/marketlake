@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_bin import checked_links, dispatcher, install
 from tests.support.fake_disk import FAKE_CHMOD, FAKE_RM, FAKE_SLEEP, NEXT_RC
 from tests.support.fake_systemd import install_fakes
 
@@ -184,12 +185,6 @@ class Host:
         )
 
 
-def _executable(path: Path, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body)
-    path.chmod(0o755)
-
-
 def _shim_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
     """The shim's own lines on stderr. The fake git prints its own errors too."""
     return [line for line in proc.stderr.splitlines() if line.startswith("user-data:")]
@@ -199,7 +194,8 @@ def _shim_lines(proc: subprocess.CompletedProcess[str]) -> list[str]:
 def tools(tmp_path_factory) -> Path:
     """Every executable the tests run, written once for the module.
 
-    A Mac checks each new executable file on its first run, so the clone links each
+    A Mac scans each new file on its first run as a program, once per file. So every fake
+    here is a link to ``tests.support.fake_bin``'s one program, and the clone links each
     checkout's ``vm-bootstrap.sh`` to the one here rather than writing a fresh one.
     """
     shared = tmp_path_factory.mktemp("shim-tools")
@@ -210,8 +206,8 @@ def tools(tmp_path_factory) -> Path:
         "rm": FAKE_RM,
         "sleep": FAKE_SLEEP,
     }.items():
-        _executable(shared / "bin" / name, body)
-    _executable(shared / "vm-bootstrap.sh", FAKE_BOOTSTRAP)
+        install(shared / "bin" / name, body)
+    install(shared / "vm-bootstrap.sh", FAKE_BOOTSTRAP)
     return shared
 
 
@@ -230,6 +226,28 @@ def _assert_handed_over(host: Host, proc: subprocess.CompletedProcess[str], pid:
     assert (host.state / "bootstrap-pid").read_text() == str(pid)
     env = (host.state / "bootstrap-env").read_text().splitlines()
     assert not [line for line in env if line.startswith("HOME=")], env
+
+
+# -- the tools -------------------------------------------------------------------------
+
+
+def test_every_executable_is_a_link_to_the_dispatcher(tmp_path, tools, host):
+    # The fixtures the tests run with, so a fake added as its own file anywhere in them
+    # fails here.
+    host.valid_checkout()
+    shared = checked_links(tools)
+    for name in ("bin/git", "bin/sleep", "bin/sudo", "vm-bootstrap.sh"):
+        assert shared[name] == dispatcher().resolve(), name
+    own = checked_links(tmp_path)
+    assert own["home/marketlake/deploy/vm-bootstrap.sh"] == dispatcher().resolve()
+
+
+def test_the_clone_writes_a_link(tmp_path, host):
+    # The fake git's clone builds the checkout at run time, after every fixture.
+    proc, _ = host.run()
+    assert host.ran("sudo") == [host.clone_line()], proc.stderr
+    own = checked_links(tmp_path)
+    assert own["home/marketlake/deploy/vm-bootstrap.sh"] == dispatcher().resolve()
 
 
 # -- the render ------------------------------------------------------------------------

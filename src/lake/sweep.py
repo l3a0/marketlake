@@ -14,7 +14,10 @@ What one run does, in the design's own order.
 1. The corporate-actions poll, so today's split flags before bars land. Two walks over sealed
    rows: ``actions.extract_dividends`` reads quotes and ``splits.detect_splits`` reads chains.
    The split walk takes the calendar as well, because whether two sealed sessions are adjacent
-   is the calendar's answer and not the manifest's. Marketlake #431.
+   is the calendar's answer and not the manifest's. Marketlake #431. It runs through
+   ``split_checkpoint.walk_splits``, which resumes a ticker whose chains days were trimmed
+   from the split checkpoint, and when the window key ``lake_window_sessions`` is set the run
+   writes tonight's checkpoint after the walk. Marketlake #786.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
    the one the clock is in, because a daily bar waits for the next session to seal before
@@ -84,11 +87,12 @@ every session still unlanded rather than only the one its clock sits on.
 **A holiday runs none of the data work.** The schedule is Monday through Friday on both hosts, so
 a non-session weekday is a holiday, and the design has "compaction and the sweep no-op on an
 empty journal". The one-line digest settles it: a run whose walks found something would have
-nowhere to say so. The walks read every sealed ticker-day rather than today's, so a holiday
-run would re-derive yesterday's held findings and file each one again under
-``reports/withheld/`` for no new information. The run still pings, and the Friday branch still
-sets the wake, which the design's pmset table states directly. One side effect is worth
-naming: a holiday never builds the vendor, so it never reads the token.
+nowhere to say so. The walks read every sealed ticker-day rather than today's, or every one
+after a trimmed ticker's saved cutoff, so a holiday run would re-derive yesterday's held
+findings and file each one again under ``reports/withheld/`` for no new information. The run
+still pings, and the Friday branch still sets the wake, which the design's pmset table states
+directly. One side effect is worth naming: a holiday never builds the vendor, so it never
+reads the token.
 
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
@@ -163,9 +167,12 @@ from lake.schema_versions import check_running_version
 from lake.schwab import SchwabVendor, VendorAuthError
 from lake.security_master import SecurityMasterError
 from lake.session import COMPACTION_DELAY
-from lake.splits import SplitReport, detect_splits
+from lake.split_checkpoint import Checkpoint, SplitWalk, walk_splits, write_checkpoint
+from lake.splits import SplitReport
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor
+from lake.window import EdgeNotFound, WindowRefused, window_edge
+from lake.window import window_sessions as window_sessions_of
 
 # The nightly summary's wire shape, per the design's message table. Priority 2 is the silent
 # tier: it lands in the notification drawer without interrupting, which is what makes one
@@ -387,7 +394,8 @@ _BARS_REFUSALS = (
 # ``bars`` calls "what separates a quarantine somebody can sign off from a gap nothing can
 # rebuild". The other three want a human. ``PartitionAbsent`` is a manifested partition gone
 # from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and ``PartialRead`` a
-# schema change (marketlake #530).
+# schema change (marketlake #530). A chains or quotes partition comes back from the bucket
+# through ``python -m lake.bucket restore-range`` (marketlake #784).
 #
 # ``SnapAbsent`` took ``NoSpotClose``'s place when marketlake #618 moved the gate's reference
 # onto the session's own 16:15 row, read by minute. A gap row at that minute is the same
@@ -849,6 +857,97 @@ def _check_disk_runway(
         report.add(f"disk runway unreadable: {type(exc).__name__}: {exc}", ACTION)
 
 
+def _window_edge(
+    window_sessions: int | str | None,
+    guards: GuardConstants | None,
+    *,
+    calendar: Calendar,
+    day: date,
+    report: ReportLines,
+) -> date | None:
+    """Tonight's window edge, or ``None`` when no checkpoint is to be written tonight.
+
+    ``None`` for an absent key, which is every host that does not trim. A value the render
+    should have refused, or an edge the calendar cannot place, files an ``action`` line and
+    writes no checkpoint, so the trim then drops nothing and marketlake #438's runway alarm
+    covers the growth. Neither withholds the ping, because no captured data is at risk.
+    """
+    try:
+        sessions = window_sessions_of(window_sessions, guards or GuardConstants())
+    except WindowRefused as exc:
+        report.add(f"lake window refused: {exc}", ACTION)
+        return None
+    if sessions is None:
+        return None
+    try:
+        return window_edge(calendar, day, sessions)
+    except EdgeNotFound as exc:
+        report.add(f"lake window edge not found: {exc}", ACTION)
+        return None
+    except Exception as exc:  # noqa: BLE001 - a calendar that cannot answer must not cost the record
+        # ``window_edge`` turns every refusal it knows into ``EdgeNotFound``. This is the
+        # backstop for one it does not, the way the Friday wake contains the same calendar.
+        report.add(f"lake window edge not found: {type(exc).__name__}", ACTION)
+        return None
+
+
+def _file_split_refusals(
+    split_report: SplitReport, *, problems: list[str], report: ReportLines
+) -> None:
+    """File each ticker the split walk refused, as a problem and as one bounded report line.
+
+    Each problem withholds the ping and carries the refusal's full text, repair included.
+    ``digest_body`` renders no problem line, so without the report line the phone would read
+    "ping did not land" with no reason. The report line names the tickers, which the roster
+    bounds, and holds one ``": "``, so ``report.redacted`` keeps it whole.
+    """
+    refused = split_report.refused
+    for refusal in refused:
+        problems.append(f"splits did not run for {refusal.ticker}: {refusal.reason}")
+    if refused:
+        names = ", ".join(refusal.ticker for refusal in refused)
+        report.add(f"splits refused {len(refused)} ticker(s): {names}", ACTION)
+
+
+def _write_split_checkpoint(
+    root: Path,
+    walked: SplitWalk,
+    *,
+    day: date,
+    now: datetime,
+    problems: list[str],
+    report: ReportLines,
+) -> None:
+    """Write tonight's split checkpoint, or file why it was not written.
+
+    A failed write withholds the ping, since the trim then reads last night's checkpoint and a
+    night of it repeating is a fault worth a page. The write is contained broadly, the way the
+    battery is, because what can raise here reaches past the ledger families
+    ``_LEDGER_REFUSALS`` names, ``ArrowInvalid`` among them.
+
+    A lake with no chains day has no ticker to save, and writes nothing.
+    """
+    if walked.blocked:
+        problems.append(
+            "split checkpoint not written: the checkpoint on disk cannot be read and a ticker "
+            "still needs it, so it is kept for the repair"
+        )
+        report.add("split checkpoint not written: CheckpointUnreadable", ACTION)
+        return
+    if not walked.entries:
+        return
+    try:
+        write_checkpoint(
+            root,
+            Checkpoint(session_day=day, entries=walked.entries),
+            recorded_at=now,
+            guard=not walked.replaces_unreadable,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed write must not cost the record
+        problems.append(f"split checkpoint not written: {type(exc).__name__}: {exc}")
+        report.add(f"split checkpoint not written: {type(exc).__name__}", ACTION)
+
+
 def _friday_wake(
     *,
     now: datetime,
@@ -936,8 +1035,12 @@ def sweep(
     schedule_reader: ScheduleReader | None,
     schedule_setter: ScheduleSetter | None,
     guards: GuardConstants | None = None,
+    window_sessions: int | str | None = None,
 ) -> SweepOutcome:
     """Run one evening sweep. Every seam is required, and the module docstring says why.
+
+    ``window_sessions`` is ``Config.lake_window_sessions`` as loaded, unjudged. It is a setting
+    rather than a seam, so it defaults to ``None``, an absent key, the way ``guards`` does.
 
     ``publisher`` alone may be ``None``, which sends no digest and escalates no refused ping.
     That is what lets a test drive the run without a page reaching anywhere, and it is the
@@ -1014,15 +1117,34 @@ def sweep(
         # deriving it from a pair, so an uncaptured session cannot move its key and it needs no
         # calendar. The loop stays, because what it holds is the refusal containment and the
         # piece naming, which are still one rule for both.
+        #
+        # **The split walk runs through ``split_checkpoint.walk_splits``**, marketlake #786, which
+        # resumes a ticker whose chains days were trimmed from the checkpoint or refuses it. The
+        # window edge goes in only when the window key is set, because the edge is what the
+        # checkpoint written below is cut at, and nothing is written without the key.
+        edge = _window_edge(window_sessions, guards, calendar=calendar, day=day, report=report)
+        split_walks: list[SplitWalk] = []
+
+        def splits_walk() -> SplitReport:
+            walked = walk_splits(lake_root=root, clock=clock, calendar=calendar, edge=edge)
+            split_walks.append(walked)
+            return walked.report
+
         walks = (
             (DIVIDENDS_PIECE, partial(extract_dividends, lake_root=root, clock=clock)),
-            (SPLITS_PIECE, partial(detect_splits, lake_root=root, clock=clock, calendar=calendar)),
+            (SPLITS_PIECE, splits_walk),
         )
         for name, walk in walks:
             try:
                 pieces.append((name, _ledger_outcome(walk())))
             except _LEDGER_REFUSALS as exc:
                 pieces.append((name, _refused(exc)))
+        for walked in split_walks:
+            _file_split_refusals(walked.report, problems=problems, report=report)
+            if edge is not None:
+                _write_split_checkpoint(
+                    root, walked, day=day, now=now, problems=problems, report=report
+                )
         if closed:
             # **The walk is the backfill, not a single session, and marketlake #422 is why.**
             # A daily bar is fetched only once the calendar-next session has sealed, which at
@@ -1400,6 +1522,7 @@ def sweep_from_config(
         schedule_reader=schedule_reader if schedule_reader is not None else default_reader,
         schedule_setter=schedule_setter if schedule_setter is not None else default_setter,
         guards=config.guards,
+        window_sessions=config.lake_window_sessions,
     )
 
 

@@ -16,41 +16,33 @@ superblock at 4 KiB block 32768.
 from __future__ import annotations
 
 import random
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests.component.test_vm_bootstrap import (
-    BOOTSTRAP,
-    EMPTY,
-    VM,
-    _executable,
-)
-from tests.support.fake_disk import FAKE_LINUX_INSTALL, FAKE_VENV_PYTHON, install_disk_fakes
+from tests.component.test_vm_bootstrap import BOOTSTRAP, EMPTY, VM, build_tools
+from tests.support.fake_bin import checked_links, dispatcher
 from tests.support.real_tools import require_tool
 
 SIZE = 256 * 2**20
 BLOCK = 4096
 FORMATS = "the lake volume holds no ext4 superblock, so it gets an ext4 filesystem"
 MOUNTS = "the lake volume holds an ext4 filesystem, so it mounts without formatting"
+REAL_TOOLS = ("blkid", "mkfs.ext4", "dd", "od")
 
 
 @pytest.fixture(scope="module")
 def real_disk(tmp_path_factory) -> tuple[Path, str]:
     """The harness tools with the real disk tools over the fakes, and the real blkid."""
-    found = {name: require_tool(name) for name in ("blkid", "mkfs.ext4", "dd", "od")}
-    shared = tmp_path_factory.mktemp("vm-real-disk")
-    install_disk_fakes(shared / "bin")
+    found = {name: require_tool(name) for name in REAL_TOOLS}
+    shared = build_tools(tmp_path_factory.mktemp("vm-real-disk"))
+    # Each real tool replaces the fake's link. The fake's body stays under bin/.fake,
+    # where nothing reads it once the name points at the real tool.
     for name, path in found.items():
         link = shared / "bin" / name
         link.unlink(missing_ok=True)
         link.symlink_to(path)
-    for script in (BOOTSTRAP, EMPTY):
-        shutil.copy2(script, shared / script.name)
-    _executable(shared / "linux-install.sh", FAKE_LINUX_INSTALL)
-    _executable(shared / "python", FAKE_VENV_PYTHON)
     return shared, found["blkid"]
 
 
@@ -60,6 +52,19 @@ def vm(tmp_path, real_disk) -> VM:
     with vm.device.open("r+b") as image:
         image.truncate(SIZE)
     return vm
+
+
+def test_every_executable_is_a_link_to_the_dispatcher_or_a_real_tool(tmp_path, real_disk, vm):
+    # The fixtures these tests run with. Only the four real tools may link anywhere but
+    # the dispatcher and the two scripts under test.
+    real = {name: Path(require_tool(name)) for name in REAL_TOOLS}
+    shared = checked_links(real_disk[0], BOOTSTRAP, EMPTY, *real.values())
+    for name, path in real.items():
+        assert shared[f"bin/{name}"] == path.resolve(), name
+    assert shared["bin/findmnt"] == dispatcher().resolve()
+    own = checked_links(tmp_path, BOOTSTRAP, EMPTY)
+    assert own["checkout/deploy/vm-bootstrap.sh"] == BOOTSTRAP.resolve()
+    assert own["home/.local/bin/uv"] == dispatcher().resolve()
 
 
 def _probe(blkid: str, vm: VM) -> subprocess.CompletedProcess[str]:

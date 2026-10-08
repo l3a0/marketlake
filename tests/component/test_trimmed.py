@@ -8,6 +8,7 @@ when it exists, so a lake that never trims scrubs exactly as before.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import date
@@ -23,6 +24,7 @@ from lake.manifest import (
     LedgerNotUtf8,
     ScrubResult,
     TornLedger,
+    append_manifest,
     latest_entries,
     record_partition,
     scrub,
@@ -31,10 +33,12 @@ from lake.manifest import (
 from lake.paths import TRIMMED_FILE
 from lake.trimmed import (
     TrimmedLineLost,
+    TrimmedRepairRefused,
     TrimmedTornTail,
     append_trimmed,
     read_trimmed,
     refresh_trimmed_entry,
+    repair_trimmed_entry,
     restore_line,
     trim_line,
     trimmed_path,
@@ -528,3 +532,369 @@ def test_a_trimmed_file_deleted_mid_check_is_still_a_designed_absence(tmp_path, 
 
     assert result.ok, result
     assert not (root / SPY).exists()
+
+
+# -- the repair of the ledger's manifest entry (marketlake #784) ---------------
+
+
+def _repair(root: Path) -> bool:
+    with lake_lock(root):
+        return repair_trimmed_entry(root, source=SOURCE, fetched_at=STAMP)
+
+
+def _write_line(root: Path, line: dict) -> None:
+    """Append a whole line by hand, with no entry refresh, as a crash before the record leaves."""
+    with trimmed_path(root).open("ab") as handle:
+        handle.write((json.dumps(line, sort_keys=True) + "\n").encode())
+
+
+def test_a_ledger_whose_entry_lags_an_appended_line_is_re_recorded(tmp_path):
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["sha256"] == sha256_file(trimmed_path(root))
+    assert entry["rows"] == 2
+
+
+def test_a_ledger_with_no_entry_at_all_is_re_recorded(tmp_path):
+    root = _lake(tmp_path / "lake")
+    _write_line(root, _trim(SPY, "a" * 64))
+    assert TRIMMED_FILE not in latest_entries(root)
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["sha256"] == sha256_file(trimmed_path(root))
+    assert entry["rows"] == 1
+
+
+def test_a_ledger_in_step_with_its_entry_is_left_alone(tmp_path):
+    """Mutation this catches: dropping the sha comparison, so every call re-records."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    assert _repair(root) is False
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_a_torn_tail_is_refused_and_never_re_recorded(tmp_path):
+    """Mutation this catches: re-recording a torn tail, which certifies the fragment."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "res')
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused, match="Repair by hand under the lock"):
+        _repair(root)
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_with_no_ledger_the_repair_reads_nothing_and_writes_nothing(tmp_path):
+    """A host that never trims stays byte-identical and fails exactly as it did.
+
+    The manifest here is damaged, so a repair that read it would raise. Mutation this catches:
+    reading the manifest before checking the ledger exists.
+    """
+    root = _lake(tmp_path / "lake")
+    with (root / "manifest.jsonl").open("ab") as handle:
+        handle.write(b"\xff damaged\n")
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    assert _repair(root) is False
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+    assert not trimmed_path(root).exists()
+
+
+_LINE = json.dumps({"kind": "trim", "partition": SPY}).encode()
+
+
+@pytest.mark.parametrize(
+    ("raw", "cause"),
+    [
+        (b'{"partition": "\xff"}\n' + _LINE + b"\n", "LedgerNotUtf8"),
+        (b"\xef\xbb\xbf" + _LINE + b"\n", "LedgerHasByteOrderMark"),
+        (b"{\n" + _LINE + b"\n", "TornLedger"),
+    ],
+)
+def test_an_unreadable_ledger_refuses_naming_its_cause_and_the_hand_repair(tmp_path, raw, cause):
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).write_bytes(raw)
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    assert cause in str(exc.value)
+    assert "Repair by hand under the lock" in str(exc.value)
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_a_ledger_that_lost_lines_refuses_through_the_row_count_guard(tmp_path):
+    """``record_partition``'s guard raises ``RowCountRegression``, which is no ``ManifestError``."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _append(root, _trim(SPY_NEXT, "b" * 64))
+    first_line = trimmed_path(root).read_bytes().splitlines(keepends=True)[0]
+    trimmed_path(root).write_bytes(first_line)
+
+    with pytest.raises(TrimmedRepairRefused, match="lines were lost"):
+        _repair(root)
+
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 2
+
+
+def test_a_ledger_path_that_cannot_be_read_refuses_rather_than_raise(tmp_path):
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).mkdir()
+
+    with pytest.raises(TrimmedRepairRefused, match="IsADirectoryError"):
+        _repair(root)
+
+
+def test_a_ledger_edited_in_place_is_refused_and_the_scrub_still_reports_it(tmp_path):
+    """One character changed, the line count the same. Re-recording it would bless the edit.
+
+    Mutation this catches: re-recording on any sha disagreement whose tail parses, which quiets
+    the Sunday scrub's sha check on the ledger, and compaction would do it every night.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    _append(root, _trim(SPY_NEXT, "b" * 64))
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes().replace(b'"version_id": "v1"', b'"version_id": "v2"', 1))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused, match="edited in place or the bytes rotted"):
+        _repair(root)
+
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+    assert TRIMMED_FILE in scrub(root).sha_mismatches
+
+
+def test_an_edit_in_place_behind_an_appended_line_is_still_refused(tmp_path):
+    """A line landed after the entry does not excuse an edit to the lines the entry covers."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    path = trimmed_path(root)
+    path.write_bytes(path.read_bytes().replace(b'"version_id": "v1"', b'"version_id": "v2"', 1))
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    with pytest.raises(TrimmedRepairRefused, match="edited in place"):
+        _repair(root)
+
+
+def test_a_damaged_manifest_is_named_as_the_manifest_and_not_the_ledger(tmp_path):
+    """The repair for a damaged manifest is not the ledger's, so the text names manifest.jsonl."""
+    root = _lake(tmp_path / "lake")
+    _write_line(root, _trim(SPY, "a" * 64))
+    manifest = root / "manifest.jsonl"
+    manifest.write_bytes(manifest.read_bytes() + b'{"partition": "\xff"}\n')
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    text = str(exc.value)
+    assert text.startswith(f"{manifest}: the manifest could not be read (LedgerNotUtf8")
+    assert "Repair manifest.jsonl by hand" in text
+    assert "last line whole" not in text
+
+
+@pytest.mark.parametrize(
+    "between",
+    [b"\n", " \n".encode(), b"\n\n"],
+    ids=["blank-line", "no-break-space-line", "two-blank-lines"],
+)
+def test_an_entry_recorded_over_trailing_blank_lines_still_re_records_an_append(tmp_path, between):
+    """The reader skips a line holding only whitespace, Unicode whitespace included.
+
+    No writer leaves one, and a hand edit can. Compaction runs this repair every night, so
+    counting such a line differently from the reader would refuse, and page, every night.
+    Mutation this catches: counting lines by any rule but ``parse_jsonl``'s, or accepting only
+    the offset right after the last counted line.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(between)
+    # Recorded by hand, as a person repairing the ledger would. The strict append's tail check
+    # reads a last line of only U+00A0 as garbled, so it would refuse to record over one.
+    record_partition(root, TRIMMED_FILE, source=SOURCE, rows=1, fetched_at=STAMP)
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+    entry = latest_entries(root)[TRIMMED_FILE]
+    assert entry["rows"] == 2 and entry["sha256"] == sha256_file(trimmed_path(root))
+
+
+def test_a_blank_line_inside_the_recorded_lines_still_re_records_an_append(tmp_path):
+    root = _lake(tmp_path / "lake")
+    line = (json.dumps(_trim(SPY, "a" * 64), sort_keys=True) + "\n").encode()
+    trimmed_path(root).write_bytes(line + " \n".encode() + line)
+    with lake_lock(root):
+        refresh_trimmed_entry(root, source=SOURCE, fetched_at=STAMP)
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 2
+    _write_line(root, restore_line(SPY, sha256="a" * 64, restored_at=STAMP))
+
+    assert _repair(root) is True
+
+
+def test_an_empty_ledger_recorded_at_no_rows_re_records_a_later_append(tmp_path):
+    """A first append whose write landed nothing leaves an empty ledger, which the repair records
+    at zero rows. A later append that crashes before its record is still a lagging append.
+
+    Mutation this catches: dropping the zero-row case, which reads it as lost lines.
+    """
+    root = _lake(tmp_path / "lake")
+    trimmed_path(root).write_bytes(b"")
+    assert _repair(root) is True
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 0
+    _write_line(root, _trim(SPY, "a" * 64))
+
+    assert _repair(root) is True
+
+    assert latest_entries(root)[TRIMMED_FILE]["rows"] == 1
+
+
+def test_an_undecodable_line_after_the_entry_refuses_in_the_readers_words(tmp_path):
+    """Mutation this catches: decoding before the reader runs, which names a bare
+    ``UnicodeDecodeError`` rather than the ledger refusal the Sunday scrub also prints.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"partition": "\xff"}\n')
+        handle.write((json.dumps(_trim(SPY_NEXT, "b" * 64), sort_keys=True) + "\n").encode())
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    assert "LedgerNotUtf8" in str(exc.value)
+    assert "UnicodeDecodeError" not in str(exc.value)
+
+
+# -- ported from the mutation lens on PR #810 ---------------------------------------
+
+
+def test_a_torn_tail_refusal_carries_the_torn_tail_repair_once(tmp_path):
+    """The torn tail names its own repair, so the generic hand repair is not appended to it."""
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, "a" * 64))
+    with trimmed_path(root).open("ab") as handle:
+        handle.write(b'{"kind": "res')
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    assert str(exc.value).count("Repair by hand under the lock") == 1
+
+
+# -- rot inside the recorded lines, and the line rule (review batch 3 on PR #810) ----
+
+_L1 = json.dumps({"partition": "a", "kind": "trim"})
+_L2 = json.dumps({"partition": "b", "kind": "trim"})
+_L3 = json.dumps({"partition": "c", "kind": "restore"})
+
+
+def _recorded_ledger(root: Path, recorded: bytes, rows: int) -> None:
+    """A ledger whose manifest entry records exactly ``recorded`` at ``rows`` lines."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "manifest.jsonl").write_bytes(b"")
+    trimmed_path(root).write_bytes(recorded)
+    with lake_lock(root):
+        append_manifest(
+            root,
+            partition=TRIMMED_FILE,
+            source=SOURCE,
+            sha256=hashlib.sha256(recorded).hexdigest(),
+            rows=rows,
+            fetched_at=STAMP,
+            guard=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "appended"),
+    [
+        ("high-bit-flip", True),
+        ("quote-flip", True),
+        ("byte-order-mark", True),
+        ("high-bit-flip", False),
+    ],
+)
+def test_rot_inside_the_recorded_lines_gets_the_bucket_repair_not_a_re_record(
+    tmp_path, damage, appended
+):
+    """Damage inside the lines the entry covers is rot or an edit, and its repair is the bucket's
+    copy. The reader names such damage by its own class, with advice to re-record the entry,
+    which would bless it, and #787 would page that advice every night.
+
+    Mutation this catches: running the reader's checks ahead of the comparison of the recorded
+    lines.
+    """
+    root = tmp_path / "lake"
+    recorded = f"{_L1}\n{_L2}\n".encode()
+    _recorded_ledger(root, recorded, 2)
+    body = bytearray(recorded + (f"{_L3}\n".encode() if appended else b""))
+    if damage == "high-bit-flip":
+        body[5] ^= 0x80
+    elif damage == "quote-flip":
+        body[body.index(b'"', 1)] ^= 0x01
+    else:
+        body[0:0] = b"\xef\xbb\xbf"
+    trimmed_path(root).write_bytes(bytes(body))
+    manifest = (root / "manifest.jsonl").read_bytes()
+
+    with pytest.raises(TrimmedRepairRefused) as exc:
+        _repair(root)
+
+    text = str(exc.value)
+    assert "edited in place or the bytes rotted" in text
+    assert "recover the ledger from the bucket's copy" in text
+    assert "last line whole" not in text
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+@pytest.mark.parametrize(
+    ("recorded", "appended", "rows"),
+    [
+        (f"{_L1}\n{_L2}\n", f"{_L3}\n", 2),
+        (f"{_L1}\r\n{_L2}\r\n", f"{_L3}\r\n", 2),
+        (f"{_L1}\r\n{_L2}\r\n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\n  \n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\r\n", f"{_L3}\n", 2),
+        (f"\n{_L1}\n\n{_L2}\n", f"{_L3}\n", 2),
+        ("", f"{_L1}\n", 0),
+        ("\n\n", f"{_L1}\n", 0),
+        (f"{_L1}\n{_L2}\n\u3000\n", f"{_L3}\n", 2),
+        (f"{_L1}\n{_L2}\n\x85", f"{_L3}\n", 2),
+    ],
+    ids=[
+        "lf",
+        "crlf",
+        "crlf-then-lf",
+        "trailing-blank-lines",
+        "trailing-crlf-blank",
+        "blank-lines-between",
+        "empty",
+        "only-blank-lines",
+        "ideographic-space-line",
+        "next-line-separator",
+    ],
+)
+def test_the_recorded_offset_is_found_by_the_readers_line_rule(recorded, appended, rows):
+    """Mutation this catches: splitting on a newline alone, which misses the line breaks
+    ``str.splitlines`` honours, such as U+0085, the next-line separator.
+    """
+    ends = trimmed._prefix_ends(recorded + appended, rows)
+
+    assert ends is not None and len(recorded.encode()) in ends, ends

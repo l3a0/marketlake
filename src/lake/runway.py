@@ -1,16 +1,18 @@
 """The disk runway: what the lake holds, how fast it grows, and how long the disk lasts.
 
-Two consumers read this module and it is deliberately a leaf, importing only the standard
+Three consumers read this module and it is deliberately a leaf, importing only the standard
 library, :mod:`lake.calendar` and :mod:`lake.paths`. The dashboard's Lake panel renders
 what it returns. The evening sweep, :mod:`lake.sweep`, files an ``action`` line in the
 nightly report when the headroom runs under ``HEADROOM_WEEKS`` and pages when it runs under
-``PAGE_FLOOR_WEEKS``, which is marketlake #438. One computation with two consumers is the
-point: two independent ones would drift, and a panel and an alarm disagreeing about how
-long the disk lasts is worse than either being wrong alone.
+``PAGE_FLOOR_WEEKS``, which is marketlake #438. The range restore in :mod:`lake.bucket`
+refuses a restore that would leave less than the journal reserve free, through
+:func:`reserve_shortfall` (marketlake #784). One computation with several consumers is the
+point: independent ones would drift, and a panel and an alarm disagreeing about how long
+the disk lasts is worse than either being wrong alone.
 
 That is also why it is a module of its own rather than a part of :mod:`lake.dashboard`.
 The sweep has no reason to import the dashboard's DuckDB query layer to read a number off
-the disk, and a computation living in one consumer invites the other to grow a copy.
+the disk, and a computation living in one consumer invites the others to grow a copy.
 
 Five decisions are worth reading before the code.
 
@@ -530,6 +532,43 @@ def _exhaustion(
     return None, True
 
 
+def busiest_sealed_day(usage: Usage, *, today: date, window_days: int = GROWTH_WINDOW_DAYS) -> int:
+    """The largest one day's sealed bytes in the window ending ``today``, today's included.
+
+    This is the journal reserve's basis, per module docstring decision 5. A journal scales
+    with the session it compacts into, and a stuck segment counted here would be multiplied
+    ``JOURNAL_RESERVE_SESSIONS`` times over, so each day counts its sealed bytes only. A
+    window with no dated bytes answers 0.
+
+    :func:`assess` reads it for the Lake panel and the evening sweep, and the range restore in
+    :mod:`lake.bucket` reads it for :func:`reserve_shortfall`. One computation keeps the panel
+    and the refusal from disagreeing about the reserve.
+    """
+    start = today - timedelta(days=window_days - 1)
+    return max(
+        (usage.sealed_bytes(day) for day in usage.day_bytes if start <= day <= today),
+        default=0,
+    )
+
+
+def reserve_shortfall(*, free: int, planned: int, busiest_sealed_day: int) -> int:
+    """How many bytes a write of ``planned`` bytes would leave the journal reserve short.
+
+    The reserve is ``JOURNAL_RESERVE_SESSIONS`` times ``busiest_sealed_day``, and it has to be
+    free after the write, because the next session's journal lands on the same volume and
+    compaction frees it only at close+15. The answer is 0 when ``free - planned`` covers the
+    reserve exactly or with room to spare, and otherwise the bytes missing. It never raises, as
+    nothing in this module does, so the caller words the refusal.
+
+    The busiest sealed day is an argument rather than read from the disk here, because the two
+    callers find it differently. The range restore in :mod:`lake.bucket` adds partitions to a
+    live lake and reads it with :func:`busiest_sealed_day`. Marketlake #785 rebuilds an empty
+    volume, which holds no sealed day to read, and derives it from the bucket's listing.
+    """
+    reserve = JOURNAL_RESERVE_SESSIONS * busiest_sealed_day
+    return max(0, reserve - (free - planned))
+
+
 def assess(
     lake_root: Path | str,
     *,
@@ -574,11 +613,9 @@ def assess(
     capturing = [(day, size) for day, size in rate if size > 0]
     peak_day, peak = max(capturing, key=lambda item: item[1]) if capturing else (None, 0)
     mean = sum(size for _day, size in capturing) // len(capturing) if capturing else None
-    # The reserve's basis is the busiest day's sealed bytes, today's included, per decision
-    # 5. A journal scales with the session it compacts into, and a stuck segment read here
-    # would be multiplied thirteen times over.
-    sealed_peak = max((usage.sealed_bytes(day) for day, _size in window), default=0)
-    reserve = JOURNAL_RESERVE_SESSIONS * sealed_peak
+    reserve = JOURNAL_RESERVE_SESSIONS * busiest_sealed_day(
+        usage, today=today, window_days=window_days
+    )
 
     capture_days_left: int | None = None
     exhausts_on: date | None = None
