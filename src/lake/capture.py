@@ -1340,7 +1340,7 @@ def _fetch_concurrently(
     3. **Within one fetch, only this thread moves the clock.** Submissions are
        ``guards.capture_stagger_ms`` apart, slept on the injected clock here, so a volley
        leaves over about a second rather than in one instant, clear of Schwab's burst
-       rejection (429-005). This thread stamps
+       rejection. This thread stamps
        each unit's ``fetch_ts`` just before its first submission. Pool threads make vendor
        calls and parse the responses, and read the clock once more to stamp when their own
        task finished. A unit's ``fetch_end_ts`` is the latest of its tasks' finish stamps, so
