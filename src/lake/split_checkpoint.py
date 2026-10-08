@@ -653,11 +653,13 @@ def walk_splits(
     # walk skipped as reversible, or through a held finding. So it gets the state a walk from
     # scratch starts from, which holds no day and lets the trim drop nothing. Dropping its
     # entry instead would shrink the checkpoint and trip the manifest's row-count guard.
+    # A resumed ticker always reports a state, its saved one at the least, so only a refused
+    # ticker is kept out here. Its saved entry stays.
     stated = {state.ticker for state in report.states}
-    not_walked = {state.ticker for state in resume} | {r.ticker for r in report.refused}
+    refused_now = {refusal.ticker for refusal in report.refused}
     starts = [
         starting_state(ticker)
-        for ticker in sorted(set(_chains_days(manifest)) - not_walked - stated)
+        for ticker in sorted(set(_chains_days(manifest)) - refused_now - stated)
     ]
     return SplitWalk(
         report=report,
