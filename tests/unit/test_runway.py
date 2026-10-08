@@ -1353,3 +1353,21 @@ def test_assess_takes_its_reserve_from_the_shared_busiest_sealed_day(
     reading = assess(tmp_path, today=today, calendar=_weekday_calendar(today, 60))
 
     assert reading.reserve == 13 * 7
+
+
+# -- ported from the mutation lens on PR #810 ---------------------------------------
+
+
+def test_assess_reads_the_busiest_sealed_day_over_its_own_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A narrower window leaves out a larger day the default thirty-day window would count."""
+    today = date(2026, 9, 30)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-29.parquet", 4096)
+    _write(tmp_path, "chains/ticker=SPY/date=2026-09-10.parquet", 5 * 4096)
+    monkeypatch.setattr(runway.shutil, "disk_usage", lambda path: _Space(10**9, 10**10))
+    sealed = walk(tmp_path).sealed_bytes(date(2026, 9, 29))
+
+    reading = assess(tmp_path, today=today, calendar=_weekday_calendar(today, 60), window_days=7)
+
+    assert reading.reserve == 13 * sealed

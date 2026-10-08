@@ -1254,3 +1254,212 @@ def test_a_bucket_refusal_mid_run_says_how_far_it_got(tmp_path, monkeypatch, cap
     assert "1 partition(s) were restored before this stop" in line
     assert (root / SPY_1).read_bytes() == originals[SPY_1]
     assert _strays(root) == []
+
+
+# -- ported from the mutation lens on PR #810 ---------------------------------------
+
+
+def test_a_session_reached_during_the_run_stops_before_the_download(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    clock = ManualClock(datetime(2026, 8, 31, 8, 0, tzinfo=MARKET_TZ))
+    listing = bucket.list_bucket
+
+    def slow_listing(*args, **kwargs):
+        result = listing(*args, **kwargs)
+        clock.set(MONDAY_BOUND)
+        return result
+
+    monkeypatch.setattr(bucket, "list_bucket", slow_listing)
+
+    with pytest.raises(RangeRestoreRefused, match="next session"):
+        restore_range(
+            root,
+            TARGET,
+            client=client,
+            clock=clock,
+            calendar=CALENDAR,
+            surface="chains",
+            ticker="SPY",
+            first=D1,
+            last=D1,
+            free_space=lambda path: PLENTY,
+        )
+
+    assert not [kwargs for name, kwargs in client.calls if name == "get_object"]
+    assert not (root / SPY_1).exists()
+
+
+def test_the_restored_file_and_its_directory_are_flushed(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    flushed: list[int] = []
+    fsync = os.fsync
+
+    def spy(fd):
+        flushed.append(os.fstat(fd).st_ino)
+        return fsync(fd)
+
+    monkeypatch.setattr(bucket.os, "fsync", spy)
+
+    _run(root, client, last=D1)
+
+    assert (root / SPY_1).stat().st_ino in flushed
+    assert (root / SPY_1).parent.stat().st_ino in flushed
+
+
+def test_a_rename_failure_refuses_keeps_no_temp_and_counts_nothing(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+
+    def denied(source, destination):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(bucket.os, "replace", denied)
+
+    line = _refuses(root, client, last=D1)
+
+    assert "Permission denied" in line
+    assert "restored before this stop" not in line
+    assert _strays(root) == []
+    assert not (root / SPY_1).exists()
+
+
+def test_the_summary_counts_the_bytes_and_names_the_bucket(tmp_path):
+    root, client, originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    (root / SPY_2).unlink()
+
+    summary = _run(root, client)
+
+    assert summary.restored_bytes == len(originals[SPY_1]) + len(originals[SPY_2])
+    assert summary.target == str(TARGET)
+
+
+def test_a_run_with_nothing_to_download_never_reaches_the_bucket(tmp_path):
+    root, client, _originals = _lake(tmp_path)
+    client.calls.clear()
+
+    summary = _run(root, client, free=0)
+
+    assert summary.present == 3 and summary.restored == 0
+    assert client.calls == []
+
+
+def test_a_ticker_whose_directory_is_gone_comes_back(tmp_path):
+    root, client, originals = _lake(tmp_path)
+    (root / QQQ_1).unlink()
+    (root / QQQ_1).parent.rmdir()
+
+    summary = _run(root, client, ticker="QQQ", last=D1)
+
+    assert summary.restored == 1
+    assert (root / QQQ_1).read_bytes() == originals[QQQ_1]
+
+
+def test_the_repaired_restore_line_records_the_manifest_sha(tmp_path):
+    root, client, originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1, unlink=False)
+
+    _run(root, client, last=D1)
+
+    line = latest_trimmed(root)[SPY_1]
+    assert line["kind"] == "restore"
+    assert line["sha256"] == hashlib.sha256(originals[SPY_1]).hexdigest()
+    assert line["restored_at"] == MONDAY_19.isoformat()
+
+
+def test_the_ledger_repair_names_the_range_restore_as_its_writer(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+
+    def crash(*args, **kwargs):
+        raise Crash("killed between the append and the record")
+
+    monkeypatch.setattr(trimmed, "_record", crash)
+    with pytest.raises(Crash):
+        _run(root, client, last=D1)
+    monkeypatch.undo()
+
+    assert _run(root, client, last=D1).ledger_repaired
+    entry = latest_entries(root)["trimmed.jsonl"]
+    assert entry["source"] == bucket.RANGE_RESTORE_SOURCE
+    assert entry["fetched_at"] == MONDAY_19.isoformat()
+
+
+def test_the_summary_line_names_every_count(tmp_path):
+    summary = bucket.RangeRestoreSummary(
+        target="s3://b/p",
+        selected=5,
+        restored=2,
+        restored_bytes=3_500_000,
+        present=3,
+        restore_lines=1,
+        ledger_repaired=True,
+        temps_removed=["a.tmp-1"],
+    )
+
+    assert summary.render() == (
+        "restored 2 of 5 selected partition(s) from s3://b/p (3.5 MB), 3 already present, "
+        "1 restore line(s) written, 1 leftover temp file(s) removed, and the trimmed "
+        "ledger's manifest entry re-recorded"
+    )
+
+
+def test_the_command_prints_each_removed_temp(tmp_path, monkeypatch, capsys):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    (root / (SPY_1 + ".tmp-99999")).write_bytes(b"half")
+    config = write_config(tmp_path, root)
+    config.write_text(config.read_text() + KEYS)
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+
+    code = bucket.main(_argv(config), clock=ManualClock(MONDAY_19), calendar=CALENDAR)
+
+    assert code == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"restore-range: removed a leftover temp file: {SPY_1}.tmp-99999"
+    assert out[1].startswith("restore-range: restored 1 of 3")
+
+
+@pytest.mark.parametrize("bad", ["20260824", "2026-8-24", "2026-08-32"])
+def test_a_date_argument_not_written_as_yyyy_mm_dd_exits_2(tmp_path, capsys, bad):
+    config = write_config(tmp_path, tmp_path / "lake")
+    argv = _argv(config)
+    argv[argv.index("--from") + 1] = bad
+
+    with pytest.raises(SystemExit) as exc:
+        bucket.main(argv, clock=ManualClock(MONDAY_19), calendar=CALENDAR)
+
+    assert exc.value.code == 2
+    assert "expected a date as YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_leftover_temps_are_removed_and_reported_in_name_order(tmp_path):
+    root, client, _originals = _lake(tmp_path)
+    (root / SPY_1).unlink()
+    names = [f"{SPY_1}.tmp-{pid}" for pid in (9, 7, 12, 31, 100, 4, 2, 5, 88, 61)]
+    for name in names:
+        (root / name).write_bytes(b"half")
+
+    summary = _run(root, client, last=D1)
+
+    assert summary.temps_removed == sorted(names)
+
+
+def test_the_ledger_repair_runs_even_when_the_selection_refuses(tmp_path, monkeypatch):
+    root, client, _originals = _lake(tmp_path)
+    _trim_away(root, client, SPY_1)
+
+    def crash(*args, **kwargs):
+        raise Crash("killed between the append and the record")
+
+    monkeypatch.setattr(trimmed, "_record", crash)
+    with pytest.raises(Crash):
+        _run(root, client, last=D1)
+    monkeypatch.undo()
+
+    with pytest.raises(RangeRestoreRefused, match="records no chains partitions"):
+        _run(root, client, ticker="SPYY")
+
+    assert latest_entries(root)["trimmed.jsonl"]["sha256"] == sha256_file(trimmed_path(root))
