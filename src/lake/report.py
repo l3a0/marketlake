@@ -33,9 +33,9 @@ Three rules hold for everything written here, and each has a failure behind it.
 
 1. **A file, never a ledger, and never a row.** The scrub's reverse pass asks every file
    under the lake root for a manifest entry, and its exclusion set is enumerated rather
-   than implied: ``{manifest.jsonl, journal/, reports/}``. So a file under ``reports/``
-   is already covered by name and a manifest entry for one would turn a report into a
-   checksum failure on the following Sunday. A report is not a measurement.
+   than implied: ``{manifest.jsonl, journal/, reports/, lost+found/}``. So a file under
+   ``reports/`` is already covered by name and a manifest entry for one would turn a report
+   into a checksum failure on the following Sunday. A report is not a measurement.
 2. **Each producer gets its own subdirectory.** ``reports/alerts/`` is the publisher's,
    and ``alert.undelivered`` counts the files in it as pages that never reached the
    phone. The Now panel shows that count as ``pages_failed_to_send``. A guard finding

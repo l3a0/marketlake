@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date
 from pathlib import Path
 
 import pytest
 
+from lake import manifest as manifest_module
 from lake import trimmed
 from lake.lock import lake_lock
 from lake.manifest import (
@@ -448,12 +450,12 @@ def test_an_unreadable_ledger_alone_fails_the_scrub(tmp_path):
     assert not result.ok
 
 
-def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
-    """Mutation this catches: catching ``ManifestError`` alone, so an ``OSError`` raises.
+def test_a_ledger_that_is_not_a_regular_file_fails_closed_without_being_read(tmp_path):
+    """Mutation this catches: dropping the regular-file gate in front of the ledger read.
 
-    A directory at the ledger's path is a read that fails with ``IsADirectoryError``, the
-    unreadable half of "torn or unreadable". It needs no ``chmod``, which a root runner ignores.
-    The directory carries no manifest entry, so the forward pass never hashes it.
+    A directory at the ledger's path would raise ``IsADirectoryError`` from the read, and a FIFO
+    there would block it forever, so the scrub checks the type first and never opens either.
+    The directory carries no manifest entry, so the forward pass never reaches it.
     """
     root = _lake(tmp_path / "lake")
     (root / SPY).unlink()
@@ -462,9 +464,74 @@ def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
     result = scrub(root)
 
     assert result.missing == (SPY,)
-    assert result.trimmed_unreadable is not None
-    assert result.trimmed_unreadable.startswith("IsADirectoryError: ")
+    assert result.trimmed_unreadable == "not a regular file"
+    assert result.unreadable == ()
     assert not result.ok
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file with no permission bits")
+def test_an_unreadable_ledger_fails_closed_rather_than_raise(tmp_path):
+    """Mutation this catches: catching ``ManifestError`` alone, so an ``OSError`` raises.
+
+    A ledger at mode 000 is a regular file whose read fails with ``PermissionError``, the
+    unreadable half of "torn or unreadable". The ledger carries no manifest entry, so the
+    forward pass never hashes it and the refusal comes from the ledger read alone.
+    """
+    root = _lake(tmp_path / "lake")
+    (root / SPY).unlink()
+    path = trimmed_path(root)
+    path.write_bytes(b"")
+    path.chmod(0)
+    try:
+        result = scrub(root)
+    finally:
+        path.chmod(0o644)
+
+    assert result.missing == (SPY,)
+    assert result.trimmed_unreadable is not None
+    assert result.trimmed_unreadable.startswith("PermissionError: ")
+    assert not result.ok
+
+
+def test_a_symlinked_trimmed_ledger_is_read_through_its_link(tmp_path):
+    """Mutation this catches: a regular-file gate that does not follow symlinks.
+
+    A ledger reached through a link is still a regular file to read, so the trimmed partition
+    stays a designed absence rather than every absence counting as missing.
+    """
+    root = _lake(tmp_path / "lake")
+    _trim_away(root, SPY)
+    outside = tmp_path / "outside.jsonl"
+    trimmed_path(root).rename(outside)
+    trimmed_path(root).symlink_to(outside)
+
+    result = scrub(root)
+
+    assert result.trimmed_unreadable is None
+    assert result.ok, result
+
+
+def test_a_trimmed_file_deleted_mid_check_is_still_a_designed_absence(tmp_path, monkeypatch):
+    """Mutation this catches: recording a file that vanished mid-check as unreadable.
+
+    The trim's unlink can land between the scrub's ``exists()`` and its hash. The scrub would
+    have called the file a designed absence a moment later, so it does now.
+    """
+    root = _lake(tmp_path / "lake")
+    _append(root, _trim(SPY, latest_entries(root)[SPY]["sha256"]))
+    real = manifest_module.sha256_file
+
+    def unlink_then_read(path: Path) -> str:
+        if Path(path) == root / SPY:
+            Path(path).unlink()
+        return real(path)
+
+    monkeypatch.setattr(manifest_module, "sha256_file", unlink_then_read)
+
+    result = scrub(root)
+
+    assert result.ok, result
+    assert not (root / SPY).exists()
 
 
 # -- the repair of the ledger's manifest entry (marketlake #784) ---------------

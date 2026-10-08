@@ -1394,12 +1394,12 @@ def test_a_prior_read_that_raises_lands_the_minute_with_per_window_markers(
 def test_a_refused_manifest_still_stops_the_cycle_at_the_append_after_the_segments_land(
     lake_root, cap
 ):
-    # A manifest holding a byte that will not decode refuses at every read. The prior-batch
-    # read is contained, so the cycle writes its segments. Then its own manifest append
-    # reads the manifest again and raises, which ``manifest._latest_by_partition`` and
-    # ``lake.daemon`` decide is correct. This test records both halves, so a change to
-    # either one is seen rather than inherited. The append reads before it writes, so the
-    # refusal leaves the manifest exactly as it was.
+    # A manifest holding a byte that will not decode refuses at every read. The prior-batch read is
+    # contained, so the cycle writes its segments. Then its own manifest append reads the manifest
+    # again and raises. The manifest's readers leave each caller to decide whether a raise stops it,
+    # and ``lake.daemon`` decides that it does. This test records both halves, so a change to either
+    # one is seen rather than inherited. The append reads before it writes, so the refusal leaves
+    # the manifest exactly as it was.
     _prior_cycle(lake_root)
     ledger = manifest_path(lake_root)
     raw = ledger.read_bytes()

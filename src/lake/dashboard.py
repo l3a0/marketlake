@@ -2110,12 +2110,10 @@ def _open_quarantines(root: Path) -> tuple[list[dict[str, object]], str | None]:
     """Every partition the quarantine ledger currently withholds, and what refused a read.
 
     Contained, and deliberately not where the ledger throws. ``_latest_by_partition``
-    raises on a body line that parses and names no partition, and it names the only two
-    callers allowed to survive that: "the close+5 guard's prologue and the marking pass.
-    Every other caller is a place where stopping is correct." Stopping is not correct
-    here, because the heatmap and the nightly reports have nothing to do with the
-    ledger, and ``_serve``'s blanket catch would turn one damaged line into a 500 for
-    the whole panel.
+    raises on a body line that parses and names no partition, and its docstring leaves each
+    caller to decide whether the raise stops it. Stopping is not correct here, because the
+    heatmap and the nightly reports have nothing to do with the ledger, and ``_serve``'s
+    blanket catch would turn one damaged line into a 500 for the whole panel.
 
     Catching at this boundary rather than widening the ledger's rule leaves that rule and
     its docstring true. ``_capture_spans`` already keeps the same promise for the same

@@ -76,6 +76,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -84,6 +85,7 @@ from pathlib import Path
 from lake.paths import (
     DATE_PREFIX,
     JOURNAL_DIR,
+    LOST_AND_FOUND,
     MANIFEST_FILE,
     QUARANTINE_FILE,
     REPORTS_DIR,
@@ -93,7 +95,7 @@ from lake.paths import (
 
 # What the reverse scrub excludes, enumerated and not implied. The reverse pass asks
 # every file under the lake root for a manifest entry, so the few that never get one
-# have to be named here. Three are.
+# have to be named here. Four are.
 #
 # 1. The manifest cannot cover itself.
 # 2. Journal segments are manifest-less by rule, so the whole tree is out.
@@ -105,6 +107,13 @@ from lake.paths import (
 #    puts the tree inside the backup sync root and outside the manifest, and skips it here
 #    by name, so a subdirectory added under it needs nothing added here. None of the five
 #    is a measurement.
+# 4. ``lost+found/`` is the filesystem's, not the lake's. On the hosted VM ``lake_root`` is the ext4
+#    volume's mount point, where ``mkfs.ext4`` leaves that directory owned by root at mode 0700. The
+#    Sunday job runs as the unprivileged account ``vm-bootstrap.sh`` gives the lake root to, so it
+#    cannot list the directory. The reverse pass names a directory it cannot list, so without this
+#    entry every VM Sunday would withhold the ping for it. A prefix here matches at the root only,
+#    so a ``lost+found`` deeper in the lake is walked like any other directory, by the rule
+#    ``lake.runway`` gives for the same name.
 #
 # None of the quarantine ledger, the corporate-actions ledger and the trimmed ledger is on
 # this list, and each is off it deliberately. Each writer refreshes its own manifest entry in
@@ -114,7 +123,12 @@ from lake.paths import (
 #
 # An entry ending in ``/`` is a directory prefix. Any other entry is an exact filename
 # at the lake root. The lock adds no file to skip, because it locks the manifest itself.
-SCRUB_EXCLUSIONS: tuple[str, ...] = (MANIFEST_FILE, f"{JOURNAL_DIR}/", f"{REPORTS_DIR}/")
+SCRUB_EXCLUSIONS: tuple[str, ...] = (
+    MANIFEST_FILE,
+    f"{JOURNAL_DIR}/",
+    f"{REPORTS_DIR}/",
+    f"{LOST_AND_FOUND}/",
+)
 
 
 # What a quarantine entry has to say for its partition to read. The ledger records
@@ -194,13 +208,14 @@ class LedgerNotUtf8(ManifestError):
     ``TornLedger``, and the quarantine ledger inherits all of it rather than widening a tuple to
     reach a ``ValueError``.
 
-    **The manifest ledger raises this too, since marketlake #499, and it is not contained.**
-    ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves the manifest,
-    so a damaged one still ends the 18:30 run. ``control_plane.sunday_maintenance`` calls
-    ``scrub`` with no ``try`` around it. Marketlake #517 carries the tuple, and until it lands
-    the sentence above is false of the manifest. It is true of the other two ledgers this class
-    covers, the quarantine ledger and the trimmed ledger, whose three readers in marketlake #782
-    each contain it.
+    **The manifest ledger raises this too, since marketlake #499, and the 18:30 sweep does not
+    contain it.** ``sweep._BARS_REFUSALS`` names no ``ManifestError`` and the bar walk resolves
+    the manifest, so a damaged one still ends the 18:30 run. Marketlake #517 carries the tuple,
+    and until it lands the sentence above is false of the manifest there. The Sunday job does
+    contain it: ``control_plane.sunday_maintenance`` guards its scrub call (marketlake #441) and
+    names the raise as a problem line that withholds the ping. The sentence above is true of the
+    other two ledgers this class covers, the quarantine ledger and the trimmed ledger, whose
+    three readers in marketlake #782 each contain it.
     """
 
 
@@ -447,12 +462,12 @@ def _latest_by_partition(entries: Sequence[dict], path: Path) -> dict[str, dict]
     can interpret. This file is the lake's integrity root, so a reader that quietly stepped
     over damage in it would make every check downstream weaker than it reads.
 
-    Raising is safe precisely because the two callers that must survive it already catch
-    it: the close+5 guard's prologue and the marking pass. Both catch bare ``Exception``, so
-    the second shape needs nothing from them that the first did not already have. What it
-    gains them is a message naming this ledger and the entry, where a bare ``TypeError``
-    named neither. Every other caller is a place where stopping is correct, and the
-    compaction child's own silence pages.
+    So a damaged line stops the read, and each caller decides whether stopping the read
+    stops it too. A caller that must keep going catches ``ManifestError``, or a broader class,
+    at its own boundary and names the damage there, and a caller that leaves the raise alone
+    has decided that stopping is correct. Both shapes raising one class with a message naming
+    this ledger and the entry is what lets a caller decide, where a bare ``TypeError`` named
+    neither.
     """
     latest: dict[str, dict] = {}
     for position, entry in enumerate(entries, start=1):
@@ -1000,38 +1015,59 @@ def append_quarantine(lake_root: Path, entry: dict) -> dict:
 
 # -- the two-way scrub -------------------------------------------------------
 
+# The reason a scrub gives for a path it will not open because it is not a regular file. A
+# FIFO there does not raise on a read, it blocks until a writer appears, so the scrub checks
+# the file's type before it hashes anything.
+NOT_A_REGULAR_FILE = "not a regular file"
+
 
 @dataclass(frozen=True)
 class ScrubResult:
     """The verdict of a two-way scrub.
 
-    Three tuples of partition paths name what is wrong, and in which direction.
+    Four tuples name what is wrong, and in which direction. The first three hold
+    lake-relative paths. ``unreadable`` holds a path and a reason.
 
     - ``missing``: a manifest entry whose file is gone. A forward-pass failure.
     - ``sha_mismatches``: a file present but not matching its last recorded sha. A
       forward-pass failure.
     - ``orphans``: a data file with no manifest entry. A reverse-pass failure.
+    - ``unreadable``: a path either pass could not read, each entry the lake-relative path, or
+      the words ``the lake root`` when the root itself would not list, then a colon and the
+      reason. The reason is the error's class, as in ``rel: PermissionError``, or the
+      words ``not a regular file``. The forward pass sets it for a manifested file it could
+      not reach, open, or hash, and for one that is a directory, a FIFO or a socket. The
+      reverse pass sets it for a directory it could not list and for a file it could not
+      stat. An unreadable file may be intact, so it is not ``missing``, which would send the
+      operator to the wrong repair. The tuple is sorted and not de-duplicated, because the
+      reverse pass skipping every manifested path is what keeps one fault from being named
+      twice.
 
     ``trimmed_unreadable`` is the refusal text of a trimmed ledger the scrub could not read, or
     ``None`` when it read or is absent. With it set, the scrub cannot tell a partition removed on
-    purpose from one lost, so every absent file is in ``missing`` and the scrub fails closed. It
-    is a field rather than a raise because ``control_plane.sunday_maintenance`` calls the scrub
-    with no guard, and a raise would cost the canary and the ping with the cause only in the job
-    log.
+    purpose from one lost, so every absent file is in ``missing`` and the scrub fails closed.
+
+    Both are fields rather than raises because a raise would hide every other finding. One
+    file the scrub cannot read says nothing about whether the others are missing or wrong, and
+    a scrub that stopped at it would leave them unnamed.
+    ``control_plane.sunday_maintenance`` still guards the call, for the faults that leave no
+    per-path answer at all, such as a ``manifest.jsonl`` it cannot read.
     """
 
     missing: tuple[str, ...]
     sha_mismatches: tuple[str, ...]
     orphans: tuple[str, ...]
     trimmed_unreadable: str | None = None
+    unreadable: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
-        """Whether the scrub found nothing wrong in either direction, and read every ledger."""
+        """Whether the scrub found nothing wrong in either direction, and read every path."""
         return not (
             self.missing
             or self.sha_mismatches
             or self.orphans
+            or self.unreadable
             or self.trimmed_unreadable is not None
         )
 
@@ -1074,11 +1110,42 @@ def scrub(lake_root: Path) -> ScrubResult:
     A file the trimmed ledger records as removed on purpose is a designed absence, which
     ``lake.trimmed.is_designed_absence`` decides, and is not ``missing``. The ledger is read
     only when it exists, so a lake that never trims scrubs exactly as before. A ledger that
-    cannot be read sets ``trimmed_unreadable`` and leaves every absent file in ``missing``.
+    cannot be read, or is not a regular file, sets ``trimmed_unreadable`` and leaves every
+    absent file in ``missing``.
+
+    Each manifested path is checked in a fixed order. ``exists()`` comes first, and a path it
+    answers False for is absent: a symlink loop, a regular file where a parent directory
+    should be, and a dangling symlink all land there, since a file behind any of them cannot
+    be intact. Then ``stat`` decides whether the path is a regular file, before anything
+    opens it. A FIFO does not raise when read, it blocks until a writer appears, and no
+    Sunday job carries a timeout, so a path that is not a regular file is ``unreadable`` as
+    ``not a regular file`` and never opened. Only then is the file hashed. A
+    ``FileNotFoundError`` anywhere in that order means the file vanished mid-check, so it
+    takes the absent branch, which is what the scrub would have reported a moment later. Any
+    other ``OSError`` is ``unreadable`` under its class name, such as a parent directory the
+    job cannot search or a file it cannot read.
 
     Reverse pass: every data file under the lake root must have a manifest entry. The
-    enumerated exclusion set is skipped. The lock adds nothing to skip, because it
-    locks the manifest, which is already excluded.
+    enumerated exclusion set is skipped, and an excluded directory is never entered, so
+    ``lost+found/`` at the root and anything under ``journal/`` or ``reports/`` cannot be
+    reported unreadable. The lock adds nothing to skip, because it locks the manifest,
+    which is already excluded. The walk is ``os.walk`` with an ``onerror`` callback rather
+    than ``Path.rglob``, which drops a directory it cannot list and reports nothing, so a
+    subtree holding only orphans would scrub clean. A directory that will not list is
+    ``unreadable``, and the lake root itself reads as ``the lake root``. A directory below
+    the root that vanished before it was listed is skipped, because compaction prunes an
+    emptied one under the lake lock, which is the rule ``lake.runway.walk`` gives. A
+    manifested path is skipped before anything stats it, since the forward pass already
+    answered for it, and so is a directory at a manifested path that will not list. That is
+    what keeps one fault from being named twice. A file whose ``is_file()`` raises is
+    ``unreadable`` too. ``is_file()`` follows symlinks, so a symlinked file is checked like
+    any other and a FIFO is skipped without being opened. A symlinked directory is not
+    descended, as ``rglob`` did not descend one, because the link may point outside the lake
+    and the files there are no orphans of it.
+
+    The walk copies ``lake.runway.walk``'s rules rather than calling it, because that walk
+    returns byte and file counts and no list of files. The price is two walks carrying the
+    same ``lost+found`` and vanished-directory rules, which can drift.
     """
     # Local: ``lake.trimmed`` builds on this module, so a module-level import would be circular.
     from lake.trimmed import is_designed_absence, latest_trimmed, trimmed_path
@@ -1088,14 +1155,21 @@ def scrub(lake_root: Path) -> ScrubResult:
 
     trimmed: dict = {}
     trimmed_unreadable: str | None = None
-    if trimmed_path(root).exists():
-        try:
-            trimmed = latest_trimmed(root)
-        except (ManifestError, OSError) as exc:
-            trimmed_unreadable = f"{type(exc).__name__}: {exc}"
+    ledger = trimmed_path(root)
+    try:
+        if ledger.exists():
+            # Checked here rather than in ``read_trimmed``, whose other callers rely on a
+            # directory raising ``IsADirectoryError``. A FIFO would block the read forever.
+            if not stat.S_ISREG(ledger.stat().st_mode):
+                trimmed_unreadable = NOT_A_REGULAR_FILE
+            else:
+                trimmed = latest_trimmed(root)
+    except (ManifestError, OSError) as exc:
+        trimmed_unreadable = f"{type(exc).__name__}: {exc}"
 
     missing: list[str] = []
     sha_mismatches: list[str] = []
+    unreadable: list[str] = []
     for partition, entry in latest.items():
         compacted = _compacted_partition_for_segment(partition)
         if compacted is not None and compacted in latest:
@@ -1103,21 +1177,55 @@ def scrub(lake_root: Path) -> ScrubResult:
             # already be deleted, so it is not a forward-pass failure.
             continue
         path = root / partition
-        if not path.exists():
-            # An unreadable ledger leaves ``trimmed`` empty, so every absence lands here.
-            if not is_designed_absence(partition, latest, trimmed):
-                missing.append(partition)
-        elif sha256_file(path) != entry["sha256"]:
-            sha_mismatches.append(partition)
+        try:
+            if path.exists():
+                if not stat.S_ISREG(path.stat().st_mode):
+                    unreadable.append(f"{partition}: {NOT_A_REGULAR_FILE}")
+                elif sha256_file(path) != entry["sha256"]:
+                    sha_mismatches.append(partition)
+                continue
+        except FileNotFoundError:
+            # Gone between one check and the next, so it is absent like any other.
+            pass
+        except OSError as exc:
+            unreadable.append(f"{partition}: {type(exc).__name__}")
+            continue
+        # An unreadable ledger leaves ``trimmed`` empty, so every absence lands here.
+        if not is_designed_absence(partition, latest, trimmed):
+            missing.append(partition)
 
     orphans: list[str] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if _is_excluded(rel, SCRUB_EXCLUSIONS):
-            continue
-        if rel not in latest:
+
+    def listing_failed(exc: OSError) -> None:
+        """Name a directory that would not list, unless it vanished below the root."""
+        filename = getattr(exc, "filename", None)
+        if isinstance(exc, FileNotFoundError) and filename is not None and Path(filename) != root:
+            return
+        # ``os.walk`` builds every name it lists from ``root``, so each one sits under it.
+        rel = Path(filename).relative_to(root).as_posix() if filename is not None else "."
+        if rel in latest:
+            # A directory at a manifested path. The forward pass already named it, and in a
+            # parent that lists but cannot be searched it named it with this same entry.
+            return
+        where = "the lake root" if rel in ("", ".") else rel
+        unreadable.append(f"{where}: {type(exc).__name__}")
+
+    for parent, dirs, names in os.walk(root, onerror=listing_failed):
+        base = Path(parent)
+        prefix = base.relative_to(root).as_posix()
+        prefix = "" if prefix == "." else f"{prefix}/"
+        # Pruned in place, which is how ``os.walk`` is told not to descend.
+        dirs[:] = [name for name in dirs if not _is_excluded(f"{prefix}{name}/", SCRUB_EXCLUSIONS)]
+        for name in names:
+            rel = f"{prefix}{name}"
+            if _is_excluded(rel, SCRUB_EXCLUSIONS) or rel in latest:
+                continue
+            try:
+                if not (base / name).is_file():
+                    continue
+            except OSError as exc:
+                unreadable.append(f"{rel}: {type(exc).__name__}")
+                continue
             orphans.append(rel)
 
     return ScrubResult(
@@ -1125,6 +1233,7 @@ def scrub(lake_root: Path) -> ScrubResult:
         tuple(sorted(sha_mismatches)),
         tuple(sorted(orphans)),
         trimmed_unreadable=trimmed_unreadable,
+        unreadable=tuple(sorted(unreadable)),
     )
 
 
@@ -1162,10 +1271,12 @@ def _first_difference(source: bytes, backup: bytes) -> int:
 class BackupScrubResult:
     """The verdict of a scrub over the backup copy.
 
-    ``target`` is the backup root the scrub walked, and every finding repeats it, so a
-    line read on its own names the disk it came from.
+    ``target`` is the backup root the scrub walked. Every problem line repeats it but two. The
+    ``unreadable`` line carries the failed read's own text instead, which names the file when
+    the error carries a path and only the error when the scrub itself raised. The
+    ``bucket_unusable`` line names the setting to repair, since no client reached the target.
 
-    Three tuples name what is wrong with the copied files. Each withholds the Sunday
+    Four tuples name what is wrong with the copied files. Each withholds the Sunday
     ping, because each is the copy no longer holding what the lake says it holds.
 
     - ``missing``: the backup carried this partition at its own watermark and does not
@@ -1177,6 +1288,13 @@ class BackupScrubResult:
       locked snapshot, so a file can never arrive ahead of its line. Seeing one means
       the copy's manifest is shorter than the copy, which makes the watermark a number
       that cannot be trusted.
+    - ``not_regular``: the backup carries this partition as something other than a regular
+      file, such as a FIFO the nightly ``rsync -a`` copied as a FIFO, or a directory. The
+      scrub never opens it, because a FIFO blocks a read until a writer appears. It is not a
+      sha mismatch, because that sends the operator to restore the file, and while the copy
+      still holds a FIFO the next nightly sync blocks forever opening it. So its line says to
+      remove the entry from the copy first. One such entry makes no other reading wrong, so
+      it does not stop the walk, and it stays out of ``matched``.
 
     Four fields name a scrub that could not run to the end. Each stops the walk where it
     stands, because every answer past it would be derived from a reading already known
@@ -1184,7 +1302,10 @@ class BackupScrubResult:
     not run is a week nothing looked at the copy.
 
     - ``target_missing``: the backup target is not a mounted directory.
-    - ``unreadable``: a read of the target failed partway through.
+    - ``unreadable``: a read the backup scrub needed failed, of the target or of the lake's
+      own manifest. The scrub's own ``except OSError`` sets it for a read that fails partway,
+      and ``control_plane.sunday_maintenance`` sets it when the scrub raises, such as on a
+      lake manifest line naming no partition.
     - ``manifest_missing``: the target is mounted and carries no usable manifest copy,
       either because the file is absent or because it holds no entries while the lake
       holds some. So no sync has ever landed, or the copy's integrity root is gone.
@@ -1236,6 +1357,7 @@ class BackupScrubResult:
     missing: tuple[str, ...] = ()
     sha_mismatches: tuple[str, ...] = ()
     unaccounted: tuple[str, ...] = ()
+    not_regular: tuple[str, ...] = ()
     orphans: tuple[str, ...] = ()
     pending: tuple[str, ...] = ()
     target_missing: bool = False
@@ -1307,12 +1429,15 @@ class BackupScrubResult:
                 "backup manifest copy diverged from the lake's at byte "
                 f"{self.manifest_diverged_at}: {self.target}"
             )
-        if not (self.missing or self.sha_mismatches or self.unaccounted):
+        if not (self.missing or self.sha_mismatches or self.unaccounted or self.not_regular):
             return None
+        # Named only when set, so a copy holding only regular files renders this line exactly
+        # as it did before the field existed.
+        not_regular = f" not_regular={len(self.not_regular)}" if self.not_regular else ""
         return (
             f"backup scrub failed: missing={len(self.missing)} "
             f"sha_mismatches={len(self.sha_mismatches)} "
-            f"unaccounted={len(self.unaccounted)}: {self.target}"
+            f"unaccounted={len(self.unaccounted)}{not_regular}: {self.target}"
         )
 
     @property
@@ -1324,6 +1449,10 @@ class BackupScrubResult:
         operator handed "sha_mismatches=1" and nothing else cannot act on it.
         """
         lines = _named("backup file does not match the lake", self.sha_mismatches)
+        lines += _named(
+            "backup path is not a regular file, so remove it from the copy first",
+            self.not_regular,
+        )
         lines += _named("backup file gone", self.missing)
         lines += _named("backup holds a file its manifest copy does not reach", self.unaccounted)
         lines += _named("backup file the lake never recorded", self.orphans)
@@ -1380,16 +1509,19 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     Forward: every partition inside the watermark must exist on the backup and match the
     sha the lake recorded for it. A slice-1 segment entry superseded by its compacted
     partition inside the same watermark is skipped, the same rule and for the same
-    reason, because compaction unlinked the segment before the sync ran.
+    reason, because compaction unlinked the segment before the sync ran. A partition the
+    copy carries as something other than a regular file is ``not_regular`` and is never
+    opened, by the check ``scrub`` makes and for its reason: ``rsync -a`` copies a FIFO as a
+    FIFO, and reading one blocks.
 
-    Reverse: every file on the backup must be accounted for. A file the lake never
-    recorded is an ``orphan``, and one it recorded past the watermark is ``unaccounted``,
-    which is the watermark failing its own cross-check. ``SCRUB_EXCLUSIONS`` is reused
-    rather than a second list written, so the two scrubs skip the same files and a
-    decision about that list is made once. The price is named rather than hidden: that
-    list skips ``journal/`` and ``reports/``, so a killed sync's temp file under either
-    is not seen. Scanning the journal instead would name every segment in it, because
-    segments carry no manifest entry by rule.
+    Reverse: every file on the backup must be accounted for. A file the lake never recorded is
+    an ``orphan``, and one it recorded past the watermark is ``unaccounted``, which is the
+    watermark failing its own cross-check. ``SCRUB_EXCLUSIONS`` is reused rather than a second
+    list written, so the two scrubs skip the same files and a decision about that list is made
+    once. The price is named rather than hidden: that list skips ``journal/``, ``reports/`` and
+    ``lost+found/``, so a killed sync's temp file under any of them is not seen. Scanning the
+    journal instead would name every segment in it, because segments carry no manifest entry by
+    rule.
 
     ``BACKUP_EXCLUSIONS`` is deliberately not consulted. Its two patterns name a temp
     file, which is renamed away before any entry is appended and so can never be
@@ -1415,6 +1547,10 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
     copy = manifest_path(target)
     if not copy.exists():
         return BackupScrubResult(target=str(target), manifest_missing=True)
+    if not stat.S_ISREG(copy.stat().st_mode):
+        # A FIFO here would block the read below forever, as one at a partition would. Every
+        # later answer reads this ledger, so it stops the walk rather than being one finding.
+        return BackupScrubResult(target=str(target), unreadable=f"{copy}: {NOT_A_REGULAR_FILE}")
 
     source_bytes = manifest_path(root).read_bytes() if manifest_path(root).exists() else b""
     backup_bytes = copy.read_bytes()
@@ -1440,6 +1576,7 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
 
     missing: list[str] = []
     sha_mismatches: list[str] = []
+    not_regular: list[str] = []
     matched: list[tuple[str, str]] = []
     for partition, entry in copied.items():
         compacted = _compacted_partition_for_segment(partition)
@@ -1448,6 +1585,8 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
         path = target / partition
         if not path.exists():
             missing.append(partition)
+        elif not stat.S_ISREG(path.stat().st_mode):
+            not_regular.append(partition)
         elif sha256_file(path) != entry["sha256"]:
             sha_mismatches.append(partition)
         else:
@@ -1468,6 +1607,7 @@ def _backup_scrub(root: Path, target: Path) -> BackupScrubResult:
         missing=tuple(sorted(missing)),
         sha_mismatches=tuple(sorted(sha_mismatches)),
         unaccounted=tuple(sorted(unaccounted)),
+        not_regular=tuple(sorted(not_regular)),
         orphans=tuple(sorted(orphans)),
         pending=tuple(sorted(set(latest) - set(copied))),
         matched=tuple(sorted(matched)),

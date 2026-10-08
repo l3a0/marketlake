@@ -14,10 +14,14 @@ is exercising the primary scrub alone. The copy is a plain file copy, never an
 
 from __future__ import annotations
 
+import errno
 import io
+import os
 import shutil
+import stat
 import subprocess
 import urllib.error
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -30,6 +34,7 @@ from lake.metadata import JournalMetadata, stamp_assertion_pid
 from tests.support.backup import FAIL, WRONG, FakeBackupReader, mirror_lake
 from tests.support.calendar import et, weekday_sessions
 from tests.support.clock import ManualClock
+from tests.support.fifo import without_blocking
 from tests.support.lake import FixtureLake
 from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
@@ -396,7 +401,11 @@ def test_a_missing_lake_root_is_a_failure_not_a_clean_scrub(tmp_path):
     outcome, pinger = _run(tmp_path / "nowhere")
     assert outcome.pinged is False
     assert pinger.urls == []
-    assert any("lake root missing" in p for p in outcome.problems)
+    # One lake line. The scrub is skipped, since its walk would name the missing root again.
+    assert [p for p in outcome.problems if p.startswith(("lake", "scrub"))] == [
+        f"lake root missing: {tmp_path / 'nowhere'}"
+    ]
+    assert outcome.scrub is None
     # A machine with no lake has no copy of one either, and both are named.
     assert any("backup target not mounted" in p for p in outcome.problems)
 
@@ -448,7 +457,7 @@ def test_every_failure_is_named_at_once(fixture_lake):
     outcome, _ = _run(root, schedule="", canary=lambda: False, mint=et(2026, 8, 20, 12, 0))
     kinds = [p.split(":")[0].split(" ")[0] for p in outcome.problems]
     assert kinds == ["scrub", "canary", "token"]
-    assert [line.split(" ")[0] for line in outcome.report] == ["weekday"]
+    assert [line.split(" ")[0] for line in outcome.report] == ["weekday", "lake"]
     assert outcome.pinged is False
 
 
@@ -1507,8 +1516,8 @@ def test_a_reminder_for_a_failing_canary_names_a_failed_pull_too(fixture_lake):
 # -- the trimmed ledger --------------------------------------------------------------
 
 # Marketlake #782. The scrub reads ``trimmed.jsonl`` only when it exists, and a ledger it could
-# not read reaches the operator as problem lines rather than a raise, because this job calls the
-# scrub with no guard and a raise would cost the canary and the ping.
+# not read reaches the operator as problem lines rather than a raise, because a raise would hide
+# every other finding the scrub made that week.
 
 TRIMMED_DAY = date(2026, 8, 28)
 
@@ -1583,3 +1592,535 @@ def test_a_torn_trimmed_ledger_is_two_problem_lines_and_never_a_raise(fixture_la
     )
     assert "trimmed on purpose" in named[0]
     assert outcome.pinged is False and pinger.urls == []
+
+
+# -- a lake path the scrub cannot read -----------------------------------------------
+
+# Marketlake #441. A path the scrub cannot read is a named finding rather than a raise, because
+# every other Sunday check runs after the scrub. Each finding withholds the ping, is named in
+# ``report`` by its path, and leaves the canary and the coverage assertion running. The cases
+# that come back clean or ``missing`` sit with the scrub's own tests in
+# ``tests/component/test_manifest.py``.
+
+_no_root_chmod = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root reads and lists past every permission bit"
+)
+
+
+@contextmanager
+def _mode(path: Path, mode: int):
+    """Hold ``path`` at ``mode`` for the block, and restore its mode whatever happens."""
+    original = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+def _withheld_and_still_ran(outcome, pinger) -> None:
+    """The ping is withheld, and the canary and the coverage assertion ran all the same."""
+    assert outcome.pinged is False and pinger.urls == []
+    assert outcome.canary_passed is True and outcome.covered is True
+
+
+@_no_root_chmod
+def test_an_unlistable_directory_names_itself_and_the_manifested_file_inside(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    with _mode(root / "chains" / "ticker=SPY", 0):
+        outcome, pinger = _run(root)
+
+    # Two facts. The directory stands for orphans nobody could look for, and the file is a
+    # manifested partition the forward pass could not reach.
+    assert outcome.scrub.unreadable == (
+        f"{CHAINS}: PermissionError",
+        "chains/ticker=SPY: PermissionError",
+    )
+    assert outcome.scrub.missing == ()
+    assert "scrub failed: missing=0 sha_mismatches=0 orphans=0 unreadable=2" in outcome.problems
+    assert f"lake path could not be read: {CHAINS}: PermissionError" in outcome.report
+    assert "lake path could not be read: chains/ticker=SPY: PermissionError" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_an_unsearchable_directory_names_the_manifested_file_once(fixture_lake):
+    # At 0444 the directory lists, and both passes would raise on the file inside it. The
+    # reverse pass skips a manifested path before it stats anything, so the file is named once.
+    root = _clean_lake(fixture_lake)
+    with _mode(root / "chains" / "ticker=SPY", 0o444):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == (f"{CHAINS}: PermissionError",)
+    assert outcome.scrub.missing == ()
+    assert "scrub failed: missing=0 sha_mismatches=0 orphans=0 unreadable=1" in outcome.problems
+    assert f"lake path could not be read: {CHAINS}: PermissionError" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_directory_at_a_manifested_path_is_not_a_regular_file(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    (root / QUOTES).unlink()
+    (root / QUOTES).mkdir()
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == (f"{QUOTES}: not a regular file",)
+    assert outcome.scrub.missing == () and outcome.scrub.sha_mismatches == ()
+    assert f"lake path could not be read: {QUOTES}: not a regular file" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_a_manifested_file_with_no_read_permission_is_unreadable_not_missing(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    with _mode(root / CHAINS, 0):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == (f"{CHAINS}: PermissionError",)
+    assert outcome.scrub.missing == ()
+    assert f"lake path could not be read: {CHAINS}: PermissionError" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_directory_at_the_trimmed_ledger_is_three_lines(fixture_lake):
+    # One fault, two consequences. The ledger cannot be read, so every trimmed partition counts
+    # as missing, and the ledger's own manifest entry names a path that is not a file.
+    from lake.trimmed import trimmed_path
+
+    root = _clean_lake(fixture_lake)
+    rel = _trim_away(root, fixture_lake)
+    trimmed_path(root).unlink()
+    trimmed_path(root).mkdir()
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.trimmed_unreadable == "not a regular file"
+    assert outcome.scrub.unreadable == ("trimmed.jsonl: not a regular file",)
+    assert outcome.scrub.missing == (rel,)
+    lake_problems = [p for p in outcome.problems if not p.startswith(("backup", "restore"))]
+    assert lake_problems == [
+        "scrub failed: missing=1 sha_mismatches=0 orphans=0 unreadable=1 trimmed_ledger=unreadable",
+        "trimmed ledger unreadable, so every absent file counts as missing: not a regular file",
+    ]
+    assert [line for line in outcome.report if line.startswith("lake")] == [
+        f"lake file missing: {rel}",
+        "lake path could not be read: trimmed.jsonl: not a regular file",
+    ]
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_directory_at_the_quarantine_ledger_is_not_a_regular_file(fixture_lake):
+    from lake.manifest import append_manifest
+
+    root = _clean_lake(fixture_lake)
+    append_manifest(
+        root, partition="quarantine.jsonl", source="battery", sha256="s", rows=0, fetched_at=None
+    )
+    (root / "quarantine.jsonl").mkdir()
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == ("quarantine.jsonl: not a regular file",)
+    assert outcome.scrub.trimmed_unreadable is None
+    assert "scrub failed: missing=0 sha_mismatches=0 orphans=0 unreadable=1" in outcome.problems
+    assert "lake path could not be read: quarantine.jsonl: not a regular file" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+@pytest.mark.parametrize(
+    ("mode", "named"),
+    [
+        pytest.param(0o000, "bars: PermissionError", id="000"),
+        pytest.param(0o444, "bars/orphan.parquet: PermissionError", id="0444"),
+    ],
+)
+def test_an_orphan_only_subtree_the_walk_cannot_read_is_named(fixture_lake, mode, named):
+    # ``rglob`` dropped a mode-000 directory and reported nothing, so this lake scrubbed clean
+    # and pinged. At 0444 it raised from ``is_file()`` instead.
+    root = _clean_lake(fixture_lake)
+    orphan = root / "bars" / "orphan.parquet"
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"written without its entry")
+    with _mode(orphan.parent, mode):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == (named,)
+    assert outcome.scrub.orphans == ()
+    assert f"lake path could not be read: {named}" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_fifo_at_a_manifested_path_is_named_without_being_opened(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    fifo = root / QUOTES
+    fifo.unlink()
+    os.mkfifo(fifo)
+
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
+
+    assert outcome.scrub.unreadable == (f"{QUOTES}: not a regular file",)
+    assert f"lake path could not be read: {QUOTES}: not a regular file" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_fifo_at_the_trimmed_ledger_is_named_without_being_opened(fixture_lake):
+    from lake.trimmed import trimmed_path
+
+    root = _clean_lake(fixture_lake)
+    rel = _trim_away(root, fixture_lake)
+    fifo = trimmed_path(root)
+    fifo.unlink()
+    os.mkfifo(fifo)
+
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
+
+    assert outcome.scrub.trimmed_unreadable == "not a regular file"
+    assert outcome.scrub.unreadable == ("trimmed.jsonl: not a regular file",)
+    assert outcome.scrub.missing == (rel,)
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_a_nested_lost_and_found_is_walked_and_named(fixture_lake):
+    # Only the root's ``lost+found`` is the filesystem's. One deeper is the lake's.
+    root = _clean_lake(fixture_lake)
+    nested = root / "chains" / "lost+found"
+    nested.mkdir()
+    with _mode(nested, 0):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == ("chains/lost+found: PermissionError",)
+    assert "lake path could not be read: chains/lost+found: PermissionError" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_read_failing_another_way_is_named_by_its_class(fixture_lake, monkeypatch):
+    # Every permission case raises ``PermissionError``, so only this one fails a catch narrowed
+    # to it. An ``EIO`` that reached the guard would hide every other finding.
+    from lake import manifest
+
+    root = _clean_lake(fixture_lake)
+    real = manifest.sha256_file
+
+    def failing(path: Path) -> str:
+        if root in Path(path).parents:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return real(path)
+
+    monkeypatch.setattr(manifest, "sha256_file", failing)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == (f"{CHAINS}: OSError", f"{QUOTES}: OSError")
+    assert f"lake path could not be read: {CHAINS}: OSError" in outcome.report
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_every_lake_finding_is_named_in_order_beside_the_backup_notes(fixture_lake):
+    from lake.manifest import append_manifest
+
+    day = date(2026, 8, 28)
+    fixture_lake.with_chains("SPY", day).with_quotes("SPY", day).with_chains("QQQ", day)
+    root = fixture_lake.build()
+    mirror_lake(root, _backup_of(root))
+    gone_from_lake = "chains/ticker=QQQ/date=2026-08-28.parquet"
+    (root / gone_from_lake).unlink()
+    (root / CHAINS).write_bytes(b"rot")
+    (root / QUOTES).unlink()
+    (_backup_of(root) / QUOTES).unlink()
+    (root / "bars").mkdir()
+    (root / "bars" / "orphan.parquet").write_bytes(b"written without its entry")
+    # Manifested in reverse order, so the forward pass meets them out of order and only the
+    # sort puts them right. Appended after the copy, so the backup counts them as pending.
+    for partition in ("zz/inner.parquet", "aa/inner.parquet"):
+        append_manifest(
+            root, partition=partition, source="capture", sha256="s", rows=1, fetched_at=None
+        )
+        (root / partition).mkdir(parents=True)
+
+    outcome, pinger = _run(root, schedule="")
+
+    alarm_lines = outcome.alarms.problems
+    assert alarm_lines
+    assert outcome.report == (
+        *alarm_lines,
+        f"lake file missing: {gone_from_lake}",
+        f"lake file missing: {QUOTES}",
+        f"lake file does not match its sha: {CHAINS}",
+        "lake file has no manifest entry: bars/orphan.parquet",
+        "lake path could not be read: aa/inner.parquet: not a regular file",
+        "lake path could not be read: zz/inner.parquet: not a regular file",
+        f"backup file gone: {QUOTES}",
+        "backup behind the lake by 2 partitions",
+    )
+    assert "scrub failed: missing=2 sha_mismatches=1 orphans=1 unreadable=2" in outcome.problems
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_lake_lines_are_capped_at_three_per_kind(fixture_lake):
+    # A disk going bad names every file it carries. One report line per path would bury every
+    # other finding the run made, so each kind names three and counts the rest.
+    from lake.manifest import append_manifest
+
+    root = _clean_lake(fixture_lake)
+    (root / "w").mkdir()
+    (root / "o").mkdir()
+    for name in ("a", "b", "c", "d"):
+        # Manifested and never written, so missing.
+        append_manifest(
+            root,
+            partition=f"m/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        # Manifested with a sha the bytes do not have.
+        (root / f"w/{name}.parquet").write_bytes(b"x")
+        append_manifest(
+            root,
+            partition=f"w/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        # A directory at a manifested path, so unreadable.
+        append_manifest(
+            root,
+            partition=f"u/{name}.parquet",
+            source="capture",
+            sha256="s",
+            rows=1,
+            fetched_at=None,
+        )
+        (root / f"u/{name}.parquet").mkdir(parents=True)
+        # Written with no entry, so an orphan.
+        (root / f"o/{name}.parquet").write_bytes(b"x")
+
+    outcome, pinger = _run(root)
+
+    assert [line for line in outcome.report if line.startswith("lake")] == [
+        "lake file missing: m/a.parquet",
+        "lake file missing: m/b.parquet",
+        "lake file missing: m/c.parquet",
+        "lake file missing: and 1 more",
+        "lake file does not match its sha: w/a.parquet",
+        "lake file does not match its sha: w/b.parquet",
+        "lake file does not match its sha: w/c.parquet",
+        "lake file does not match its sha: and 1 more",
+        "lake file has no manifest entry: o/a.parquet",
+        "lake file has no manifest entry: o/b.parquet",
+        "lake file has no manifest entry: o/c.parquet",
+        "lake file has no manifest entry: and 1 more",
+        "lake path could not be read: u/a.parquet: not a regular file",
+        "lake path could not be read: u/b.parquet: not a regular file",
+        "lake path could not be read: u/c.parquet: not a regular file",
+        "lake path could not be read: and 1 more",
+    ]
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_a_directory_at_a_manifested_path_in_an_unsearchable_parent_is_named_once_on_sunday(
+    fixture_lake,
+):
+    # The forward pass and the walk's error callback would each build the same entry for it.
+    # The walk leaves a manifested path to the forward pass, so the path is named once.
+    from lake.manifest import append_manifest
+
+    root = _clean_lake(fixture_lake)
+    parent = root / "bars"
+    (parent / "d.parquet").mkdir(parents=True)
+    append_manifest(
+        root, partition="bars/d.parquet", source="sweep", sha256="s", rows=1, fetched_at=None
+    )
+    with _mode(parent, 0o444):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub.unreadable == ("bars/d.parquet: PermissionError",)
+    assert "scrub failed: missing=0 sha_mismatches=0 orphans=0 unreadable=1" in outcome.problems
+    assert [line for line in outcome.report if line.startswith("lake")] == [
+        "lake path could not be read: bars/d.parquet: PermissionError"
+    ]
+    _withheld_and_still_ran(outcome, pinger)
+
+
+# -- a scrub that raises -------------------------------------------------------------
+
+# A fault that leaves the scrub nothing to say per path still raises from it. Each of the
+# three scrub calls is guarded, so the raise becomes a problem line and the rest of the run
+# goes on. The damage is made before the copy, so the copy carries the same bytes and the
+# path scrub reaches the line. Damage that rewrites bytes the copy already holds stops the
+# path scrub at the diverged manifest before it parses a line, and a test of the backup
+# guard would then pass with the guard deleted. A damaged line appended after a clean copy
+# is different: the copy stays a strict prefix, the scrub resolves the whole lake manifest,
+# and the guard fires.
+
+
+def _damaged_then_copied(fixture_lake: FixtureLake, old: bytes, new: bytes) -> Path:
+    """A clean two-partition lake whose manifest has ``old`` replaced once, then copied."""
+    fixture_lake.with_chains("SPY", date(2026, 8, 28))
+    fixture_lake.with_quotes("SPY", date(2026, 8, 28))
+    root = fixture_lake.build()
+    path = root / "manifest.jsonl"
+    raw = path.read_bytes()
+    assert old in raw
+    path.write_bytes(raw.replace(old, new, 1))
+    mirror_lake(root, _backup_of(root))
+    return root
+
+
+def _tracebacks_printed(err: str) -> int:
+    """How many stack traces ``err`` holds, counting a chained cause as part of its trace."""
+    chained = err.count("The above exception was the direct cause") + err.count(
+        "During handling of the above exception"
+    )
+    return err.count("Traceback (most recent call last)") - chained
+
+
+def _manifest_named(root: Path) -> str:
+    return str(root / "manifest.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "lake", "backup"),
+    [
+        pytest.param(
+            b"capture",
+            b"captur\xff",
+            lambda root: "lake scrub could not run: LedgerNotUtf8: ",
+            lambda root: [],
+            id="not utf-8",
+        ),
+        pytest.param(
+            b'"partition"',
+            b'"partitioX"',
+            lambda root: (
+                f"lake scrub could not run: ManifestError: {_manifest_named(root)}: entry 1 "
+                "names no partition"
+            ),
+            lambda root: [
+                "backup could not be read: the backup scrub raised ManifestError: "
+                f"{_manifest_named(root)}: entry 1 names no partition"
+            ],
+            id="no partition",
+        ),
+        pytest.param(
+            b'"sha256"',
+            b'"sha25X"',
+            lambda root: "lake scrub could not run: KeyError: 'sha256'",
+            lambda root: ["backup could not be read: the backup scrub raised KeyError: 'sha256'"],
+            id="no sha256",
+        ),
+    ],
+)
+def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
+    fixture_lake, capsys, old, new, lake, backup
+):
+    root = _damaged_then_copied(fixture_lake, old, new)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub is None
+    lake_line, *backup_lines = outcome.problems
+    assert lake_line.startswith(lake(root))
+    assert backup_lines == backup(root)
+    if backup_lines:
+        # The guard's result is the backup's own unreadable finding: no restore test, and not
+        # the shadow host's skip line.
+        assert outcome.backup.unreadable is not None and outcome.restore is None
+    else:
+        assert outcome.backup.ok and outcome.restore is not None
+    assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
+    # Each guard that fired kept the stack trace, so a bug in a scrub is not lost to the line.
+    assert _tracebacks_printed(capsys.readouterr().err) == 1 + len(backup_lines)
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_an_unreadable_lake_manifest_is_named_by_each_scrub(fixture_lake):
+    # Made after the copy, since the copy refuses an unreadable file. The backup scrub names
+    # it through its own ``except OSError``.
+    root = _clean_lake(fixture_lake)
+    with _mode(root / "manifest.jsonl", 0):
+        outcome, pinger = _run(root)
+
+    assert outcome.scrub is None
+    lake_line, backup_line = outcome.problems
+    assert lake_line.startswith("lake scrub could not run: PermissionError: ")
+    assert backup_line.startswith("backup could not be read: PermissionError: ")
+    assert outcome.restore is None
+    _withheld_and_still_ran(outcome, pinger)
+
+
+@_no_root_chmod
+def test_a_lake_root_whose_parent_cannot_be_searched_is_a_problem_not_a_raise(tmp_path):
+    lake = FixtureLake(tmp_path / "locked" / "lake")
+    lake.with_chains("SPY", date(2026, 8, 28))
+    root = lake.build()
+    backup = mirror_lake(root, tmp_path / "ssd")
+    pinger = FakePinger()
+    with _mode(tmp_path / "locked", 0):
+        outcome = cp.sunday_maintenance(
+            lake_root=root,
+            backup_target=backup,
+            now=SUNDAY_20,
+            calendar=CALENDAR,
+            schedule_reader=lambda: REPEAT_ONLY,
+            pinger=pinger,
+            ping_url=URL,
+            mint=FRESH_MINT,
+            canary=_passing_canary,
+        )
+
+    assert outcome.scrub is None
+    lake_line, backup_line = outcome.problems
+    assert lake_line.startswith("lake scrub could not run: PermissionError: ")
+    assert backup_line.startswith("backup could not be read: PermissionError: ")
+    _withheld_and_still_ran(outcome, pinger)
+
+
+# -- a backup path that is not a regular file ----------------------------------------
+
+# ``rsync -a`` copies a FIFO as a FIFO, so the copy can hold one the lake scrub has already
+# named. Reading it would block the job, so the backup scrub records it per file and goes on.
+
+
+def test_a_fifo_on_the_copy_is_named_without_being_opened_and_the_walk_finishes(fixture_lake):
+    root = _clean_lake(fixture_lake)
+    fifo = _backup_of(root) / QUOTES
+    fifo.unlink()
+    os.mkfifo(fifo)
+
+    outcome, pinger = without_blocking(fifo, lambda: _run(root))
+
+    assert outcome.backup.not_regular == (QUOTES,)
+    assert outcome.backup.walked is True
+    # The restore test ran, on the one file the scrub matched.
+    assert outcome.restore is not None and outcome.restore.restored == (CHAINS,)
+    assert outcome.problems == (
+        "backup scrub failed: missing=0 sha_mismatches=0 unaccounted=0 not_regular=1: "
+        f"{_backup_of(root)}",
+    )
+    assert (
+        f"backup path is not a regular file, so remove it from the copy first: {QUOTES}"
+        in outcome.report
+    )
+    _withheld_and_still_ran(outcome, pinger)
+
+
+def test_a_directory_on_the_copy_is_not_a_regular_file_and_the_walk_finishes(fixture_lake):
+    # A check narrowed to FIFOs would send this to the stopping ``IsADirectoryError`` branch.
+    root = _clean_lake(fixture_lake)
+    (_backup_of(root) / QUOTES).unlink()
+    (_backup_of(root) / QUOTES).mkdir()
+
+    outcome, pinger = _run(root)
+
+    assert outcome.backup.not_regular == (QUOTES,)
+    assert outcome.backup.walked is True and outcome.backup.unreadable is None
+    assert outcome.restore is not None
+    _withheld_and_still_ran(outcome, pinger)

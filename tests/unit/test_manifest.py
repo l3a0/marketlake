@@ -311,8 +311,15 @@ def test_data_files_and_the_two_other_ledgers_are_not_excluded():
     assert not _is_excluded("actions/corporate_actions.jsonl", SCRUB_EXCLUSIONS)
 
 
-def test_enumerated_exclusion_set_is_exactly_the_three_documented_members():
-    assert SCRUB_EXCLUSIONS == ("manifest.jsonl", "journal/", "reports/")
+def test_enumerated_exclusion_set_is_exactly_the_four_documented_members():
+    assert SCRUB_EXCLUSIONS == ("manifest.jsonl", "journal/", "reports/", "lost+found/")
+
+
+def test_lost_and_found_is_excluded_at_the_root_only():
+    # A prefix matches at the root alone. A ``lost+found`` deeper in the lake is not the
+    # filesystem's, so the reverse pass still walks it.
+    assert _is_excluded("lost+found/#12345", SCRUB_EXCLUSIONS)
+    assert not _is_excluded("bars/lost+found/#12345", SCRUB_EXCLUSIONS)
 
 
 # -- a ledger line nobody can interpret ------------------------------------------------

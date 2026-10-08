@@ -478,7 +478,8 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
     the role's credentials first. ``_AssumeRoleFailed`` is STS turning that down, so it
     is *refused* or *unreachable* as ``lake.aws_session`` sorted it where it was caught,
     with the detail ``AssumeRole <code>``. Without this branch every caller would re-raise
-    it, and the Sunday job would stop before its canary.
+    it, and the Sunday job's guard would name it only as a scrub that raised, rather than as
+    the refusal or the outage it is. The guard still withholds the ping either way.
     """
     from botocore.exceptions import BotoCoreError, ClientError
 
@@ -1501,7 +1502,7 @@ class RestoreSummary:
     without a lake. ``restored`` says whether the files were moved into the destination.
     ``finished_move`` says the run found a download that had already verified and only
     finished moving it. ``unrecorded`` names each restored file the restored manifest
-    does not record, outside ``journal/`` and ``reports/``. A torn last manifest line
+    does not record, outside the scrub's exclusion set. A torn last manifest line
     leaves one behind. Each was verified against the checksum S3 stored at upload, so it
     is named rather than failed.
     """

@@ -25,6 +25,7 @@ Five properties are covered here, because each one is what a reader's field rest
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -44,6 +45,7 @@ from lake.metadata import (
     stamp_ping,
 )
 from lake.tickers import Roster
+from tests.support.fifo import without_blocking
 
 ET = ZoneInfo("America/New_York")
 MINTED = datetime(2026, 8, 30, 20, 5, tzinfo=ET)  # a Sunday evening re-auth
@@ -270,6 +272,28 @@ def test_a_corrupt_stamp_reads_as_an_empty_record(lake_root):
     path.write_text("{not json at all")
 
     assert read_metadata(lake_root) == JournalMetadata()
+
+
+def test_a_fifo_at_the_stamp_reads_as_empty_without_being_opened(lake_root):
+    # The Sunday run reads the stamp on every attempt, and a read of a FIFO blocks until a
+    # writer appears. The daemon's own writers read it first too, before they replace it.
+    path = metadata_path(lake_root)
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+
+    assert without_blocking(path, lambda: read_metadata(lake_root)) == JournalMetadata()
+    without_blocking(path, lambda: stamp_ping(lake_root, at=PING))
+    assert read_metadata(lake_root).dead_man_last_ping == PING
+
+
+def test_a_stamp_reached_through_a_symlink_still_reads(lake_root, tmp_path):
+    real = tmp_path / "elsewhere.json"
+    real.write_text(json.dumps({ASSERTION_PID: 4242}))
+    path = metadata_path(lake_root)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(real)
+
+    assert read_metadata(lake_root).assertion_pid == 4242
 
 
 def test_a_stamp_that_is_json_but_not_an_object_reads_as_empty(lake_root):

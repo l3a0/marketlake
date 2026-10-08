@@ -3145,9 +3145,8 @@ def test_a_check_that_cleared_drops_out_of_the_row_while_the_other_holds(
 
 
 def test_a_damaged_quarantine_ledger_is_reported_and_never_raised(fixture_lake: FixtureLake):
-    # ``_latest_by_partition`` raises on a body line naming no partition, and names the
-    # only two callers allowed to survive it: the close+5 guard's prologue and the
-    # marking pass. This is neither, and ``_serve`` would turn the raise into a 500 for
+    # ``_latest_by_partition`` raises on a body line naming no partition, and leaves each
+    # caller to decide whether that stops it. ``_serve`` would turn the raise into a 500 for
     # the whole panel, so it is caught at this boundary and reported as a value.
     build_lake(fixture_lake)
     fixture_lake.with_quarantine({"note": "a line that parses and names no partition"})

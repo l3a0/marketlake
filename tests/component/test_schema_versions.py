@@ -252,8 +252,8 @@ def test_the_ledger_is_manifested_so_the_reverse_scrub_finds_no_orphan(lake_root
     assert entry["fetched_at"] == NOW.isoformat()
 
     # The reverse pass asks every file under the lake root for an entry, and its exclusion
-    # set is {manifest.jsonl, journal/, reports/}. ``reference/`` is not on it, so the
-    # ledger is covered with nothing added to the scrub.
+    # set is {manifest.jsonl, journal/, reports/, lost+found/}. ``reference/`` is not on
+    # it, so the ledger is covered with nothing added to the scrub.
     result = scrub(lake_root)
     assert result.orphans == ()
     assert result.missing == ()

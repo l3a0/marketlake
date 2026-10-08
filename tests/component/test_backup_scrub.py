@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date
 from pathlib import Path
 
 from lake.manifest import backup_scrub, scrub
 from lake.paths import MANIFEST_FILE
 from tests.support.backup import mirror_lake
+from tests.support.fifo import without_blocking
 from tests.support.lake import FixtureLake, sample_chains_table
 
 DAY = date(2026, 8, 28)
@@ -445,6 +447,21 @@ def test_a_manifest_copy_truncated_to_nothing_is_not_a_clean_watermark(fixture_l
     assert result.ok is False
 
 
+def test_a_fifo_where_the_manifest_copy_should_be_stops_the_walk_unopened(fixture_lake):
+    # ``rsync -a`` copies a FIFO as a FIFO, and reading one blocks until a writer appears. Every
+    # later answer reads this ledger, so the walk stops here and names it.
+    root, target = _backed_up(fixture_lake)
+    copy = target / MANIFEST_FILE
+    copy.unlink()
+    os.mkfifo(copy)
+
+    result = without_blocking(copy, lambda: backup_scrub(root, target))
+
+    assert result.unreadable == f"{copy}: not a regular file"
+    assert result.walked is False and result.matched == ()
+    assert result.problem == f"backup could not be read: {copy}: not a regular file"
+
+
 def test_a_plain_file_where_the_target_should_be_is_not_a_mounted_disk(fixture_lake):
     # The repair for an unmounted disk and the repair for a disk carrying no backup are
     # different, so the finding has to tell them apart.
@@ -474,6 +491,42 @@ def test_a_read_that_fails_is_a_named_finding_rather_than_a_raise(fixture_lake):
     assert result.unreadable is not None
     assert result.ok is False
     assert result.problem.startswith("backup could not be read: PermissionError")
+
+
+def test_a_symlinked_file_on_the_copy_is_hashed_through_its_link(fixture_lake, tmp_path):
+    # The regular-file check follows symlinks, as ``exists()`` does, so a partition the copy
+    # reaches through a link is checked by its bytes rather than called not a regular file.
+    root, target = _backed_up(fixture_lake)
+    real = tmp_path / "outside.parquet"
+    (target / CHAINS).rename(real)
+    (target / CHAINS).symlink_to(real)
+
+    result = backup_scrub(root, target)
+
+    assert result.not_regular == ()
+    assert result.ok, result.problem
+
+
+def test_backup_not_regular_paths_are_sorted_and_capped(fixture_lake):
+    # Manifested in an order that is not sorted, so only the sort puts the named lines right,
+    # and more of them than the cap names, so the last line counts the rest.
+    for ticker in ("SPY", "QQQ", "IWM", "DIA", "XLF"):
+        fixture_lake.with_chains(ticker, DAY)
+    root = fixture_lake.build()
+    target = mirror_lake(root, root.parent / "ssd")
+    for path in target.glob("chains/**/*.parquet"):
+        path.unlink()
+        path.mkdir()
+
+    result = backup_scrub(root, target)
+
+    label = "backup path is not a regular file, so remove it from the copy first"
+    assert [line for line in result.notes if line.startswith(label)] == [
+        f"{label}: chains/ticker=DIA/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=IWM/date={DAY.isoformat()}.parquet",
+        f"{label}: chains/ticker=QQQ/date={DAY.isoformat()}.parquet",
+        f"{label}: and 2 more",
+    ]
 
 
 def test_many_wrong_files_name_a_few_and_then_say_how_many(fixture_lake):

@@ -31,8 +31,8 @@ Three properties follow from where the writer sits, and each is deliberate.
    would drop perishable minutes.
 2. *The integrity scrub covers the file with nothing added.* The scrub's reverse pass
    asks every file under the lake root for a manifest entry, and its exclusion set is
-   ``{manifest.jsonl, journal/, reports/}``. ``reference/`` is not on it, so a file
-   written without its entry is reported as an orphan.
+   ``{manifest.jsonl, journal/, reports/, lost+found/}``. ``reference/`` is not on it, so a
+   file written without its entry is reported as an orphan.
 3. *Re-running is harmless.* A second run finds the running version already recorded
    with the same shape and writes nothing at all, so it adds no manifest entry either.
 

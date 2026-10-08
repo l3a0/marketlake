@@ -537,6 +537,114 @@ def test_the_sunday_job_reports_suspended_versioning_and_still_pings(tmp_path):
     assert any("versioning is Suspended" in line for line in outcome.report)
 
 
+# A damaged lake manifest reaches the bucket scrub too, marketlake #441. ``bucket_scrub`` reads
+# the lake's manifest through ``read_ledger`` before it touches the bucket, so a line naming no
+# partition raises there whatever the bucket holds, and the Sunday job's guard turns that into
+# the backup's own unreadable finding. ``read_ledger`` decodes with a replacement, and
+# ``_bucket_scrub`` reads a missing ``sha256`` with ``entry.get``, so neither of those raises.
+# The bucket's copy carries the same damaged bytes, so the prefix check passes and each cell
+# reaches the read it is about. ``first_upload`` refuses a lake whose manifest names no
+# partition or no ``sha256``, so the copy is stored directly rather than uploaded after the
+# damage.
+
+
+def _tracebacks_printed(err: str) -> int:
+    """How many stack traces ``err`` holds, counting a chained cause as part of its trace."""
+    chained = err.count("The above exception was the direct cause") + err.count(
+        "During handling of the above exception"
+    )
+    return err.count("Traceback (most recent call last)") - chained
+
+
+def _damaged_with_its_copy(root: Path, old: bytes, new: bytes) -> tuple[Path, FakeS3]:
+    lake, client = _uploaded(root)
+    path = manifest_path(lake)
+    raw = path.read_bytes()
+    assert old in raw
+    damaged = raw.replace(old, new, 1)
+    path.write_bytes(damaged)
+    client.store(_key("manifest.jsonl"), damaged)
+    return lake, client
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "lake_line", "backup_lines"),
+    [
+        pytest.param(
+            b"capture",
+            b"captur\xff",
+            lambda lake: "lake scrub could not run: LedgerNotUtf8: ",
+            lambda lake: [],
+            id="not utf-8",
+        ),
+        pytest.param(
+            b'"partition"',
+            b'"partitioX"',
+            lambda lake: (
+                f"lake scrub could not run: ManifestError: {manifest_path(lake)}: entry 1 names "
+                "no partition"
+            ),
+            lambda lake: [
+                "backup could not be read: the backup scrub raised ManifestError: "
+                f"{manifest_path(lake)}: entry 1 names no partition"
+            ],
+            id="no partition",
+        ),
+        pytest.param(
+            b'"sha256"',
+            b'"sha25X"',
+            lambda lake: "lake scrub could not run: KeyError: 'sha256'",
+            lambda lake: [
+                "backup scrub failed: missing=0 sha_mismatches=1 unaccounted=0: s3://lake-backup/lake"
+            ],
+            id="no sha256",
+        ),
+    ],
+)
+def test_a_damaged_lake_manifest_is_a_problem_line_on_a_bucket_target(
+    tmp_path, capsys, old, new, lake_line, backup_lines
+):
+    lake, client = _damaged_with_its_copy(tmp_path / "lake", old, new)
+    capsys.readouterr()
+
+    outcome, pinger = _sunday(lake, client)
+
+    assert outcome.scrub is None
+    first, *rest = outcome.problems
+    assert first.startswith(lake_line(lake))
+    assert rest == backup_lines(lake)
+    raised = outcome.backup.unreadable is not None
+    if raised:
+        # The guard's result: no restore test, and not the shadow host's skip line.
+        assert outcome.restore is None
+    assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
+    # The lake guard always fired here, and the bucket guard when the bucket scrub raised.
+    # Each kept the stack trace, so a bug in a scrub is not lost to the line.
+    assert _tracebacks_printed(capsys.readouterr().err) == 1 + raised
+    assert pinger.urls == []
+    assert outcome.canary_passed and outcome.covered is True
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file with no permission bits")
+def test_an_unreadable_lake_manifest_is_named_by_the_lake_and_the_bucket_scrub(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    path = manifest_path(lake)
+    path.chmod(0)
+    try:
+        outcome, pinger = _sunday(lake, client)
+    finally:
+        path.chmod(0o644)
+
+    assert outcome.scrub is None
+    lake_line, backup_line = outcome.problems
+    assert lake_line.startswith("lake scrub could not run: PermissionError: ")
+    assert backup_line.startswith("backup could not be read: PermissionError: ")
+    assert outcome.restore is None
+    assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
+    assert pinger.urls == []
+    assert outcome.canary_passed and outcome.covered is True
+
+
 # The restore test's bucket half, marketlake #640. Week 34's rotation slot holds neither
 # fixture file, so the test reads the next slot that holds one, which is the quotes
 # partition's. ``tests/component/test_control_plane_sunday.py`` asserts the same pick for
