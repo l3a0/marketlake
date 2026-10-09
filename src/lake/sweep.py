@@ -1627,7 +1627,9 @@ def _build_parser():
         description=(
             "The evening vendor sweep: poll corporate actions, fetch the session's bars, "
             "set the Sunday wake on a Friday on macOS, ping, file the nightly report and "
-            "send its digest. It fetches the session the clock is in."
+            "send its digest. It fetches the session the clock is in. On a weekday whose "
+            "ping landed it then replaces itself with python -m lake.compact "
+            "--after-vendor-sweep, which uploads what it wrote."
         ),
     )
     parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")

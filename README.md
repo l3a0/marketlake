@@ -346,14 +346,22 @@ The restore, command 3, runs on either.
 5. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
-   Compaction prints the upload's throughput to its log, in the line the first upload
-   prints.
+   On a weekday the 18:30 vendor sweep then hands off to compaction again, with
+   `python -m lake.compact --after-vendor-sweep`, which uploads the bars and actions the
+   sweep just wrote and pings the `evening-upload` check
+   ([#833](https://github.com/l3a0/marketlake/issues/833)). Each run prints the upload's
+   throughput to its log, in the line the first upload prints. The close+15 run's line lands
+   in the daemon's log, and the evening run's lands in the eod-sweep job's log after the
+   sweep's own block and its `sweep: handing off` line.
 
 **The trim needs no command either, and only the VM runs it.** `config/vm.yaml` sets
 `lake_window_sessions`, and on a primary host with a bucket target the close+15 compaction
 then drops each chains partition older than that many sessions once its bucket copy hashes
 to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). The trim's lines, then any
-pruned ticker directories, end the compaction log.
+pruned ticker directories, end the compaction log. They also end the eod-sweep job's log,
+because the compaction run the vendor sweep hands off to reaches the trim too. That run
+normally prints `trim     refused: the checkpoint is tonight's`, since the sweep has just
+written tonight's split checkpoint and a trim runs only on a session after the checkpoint's.
 The laptop's `config.yaml` must never set `lake_window_sessions`. Since the cutover
 ([#638](https://github.com/l3a0/marketlake/issues/638)) the laptop runs `role: shadow`,
 which the trim's role gate refuses. A switch back to `primary` would pass that gate, and
