@@ -28,6 +28,8 @@ beside the laptop until the cutover in
 [#638](https://github.com/l3a0/marketlake/issues/638) made it the primary capture host.
 Its lake volume holds a window of recent chains sessions, and the close+15 compaction trims
 older chains partitions once each is verified in the bucket ([#787](https://github.com/l3a0/marketlake/issues/787)).
+A trimmed range is read by restoring it from the bucket into a directory outside the live
+lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -240,9 +242,10 @@ credentials, such as a VM with no instance profile or a laptop that carries the 
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: assume_role` in `config.yaml`.
 
-Six commands go with the bucket. The first two and the range restore refuse with exit 2 on a
-shadow host, which is any host whose config sets `role` to something other than `primary`.
-The restore, command 3, and the resync, command 5, run on either.
+Seven commands go with the bucket. The first two and the range restore refuse with exit 2 on
+a shadow host, which is any host whose config sets `role` to something other than `primary`.
+The restore, command 3, the resync, command 5, and the reading restore, command 6, run on
+either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -392,7 +395,32 @@ The restore, command 3, and the resync, command 5, run on either.
    a crash left. Its last lines are the roster check's verdict, the running schema
    version's, and, when `backup_target` is not the bucket it read, a line saying so, since
    that host's next close+15 would not upload there.
-6. The nightly upload needs no command. Once `backup_target` names the bucket, the
+6. `uv run python -m lake.bucket restore-for-reading <dir> --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30 --target s3://example-lake-backup/lake`
+   restores a chosen range from the bucket into an empty directory outside the live lake, so
+   a session the VM's trim removed can be read there
+   ([#837](https://github.com/l3a0/marketlake/issues/837)). It takes the range `restore-range`
+   takes, selected from the bucket's own `manifest.jsonl`, and brings what a reader needs
+   beside it: each ticker's next chains partition after the range, the same tickers' `bars/`
+   on the range's days, the corporate-actions and quarantine ledgers, and everything under
+   `reference/`. It downloads, verifies and moves files in as the restore, command 3, does,
+   and it leaves out no partition the trim removed. It runs on either role, so the laptop
+   can run it. `<dir>` must be empty or not exist yet, and the command refuses with exit 2
+   when `<dir>` is `lake_root` or sits inside it. A finished directory is no longer empty,
+   so a second range goes to a new directory. Put `<dir>` on a disk, not on a `tmpfs`, which
+   holds its files in memory and may be what `/tmp` is on the VM. The journal reserve applies
+   only when `<dir>` is on `lake_root`'s filesystem, which on the laptop every directory is.
+   A file that fails is named with what it is to the range, `<dir>` holds no reading set, and
+   the command exits 1. A file that does not match its SHA-256 means either an upload is
+   running or stopped part-way, so run it again after the next complete nightly upload, or
+   the bucket's current version is damaged, which the "When the lake is gone" steps below
+   repair into `<dir>/.marketlake-restoring` with no write to the bucket. The directory is for
+   reading only. Its `manifest.jsonl` names partitions it does not hold, so never make it a
+   daemon's or a job's `lake_root`. Pass `lake_root=` to every read, since a call without it
+   reads the configured live lake, and pass `end` at the range's last day to
+   `continuity_view` and `load_contract_life`, which otherwise read the next partition too.
+   `uv run python -m lake.dashboard --lake-root <dir> --port <free port>` shows it, on a port
+   other than the resident dashboard's 8765.
+7. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    On a weekday the 18:30 vendor sweep then hands off to compaction again, with

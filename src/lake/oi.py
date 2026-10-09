@@ -319,8 +319,9 @@ def oi_view(
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed reads as absent:
     this raises ``BaselineAbsent`` with ``REASON_PARTITION_ABSENT``, the same answer as a
     session never captured. Nothing nightly calls this door. Reading a trimmed session means
-    restoring it into a directory outside the live lake, and the tool that restores a range
-    there is marketlake #837, deferred.
+    restoring it into a directory outside the live lake, which ``python -m lake.bucket
+    restore-for-reading`` does (marketlake #837). It also brings each ticker's next chains
+    partition after the range, so the range's last day reads there as it does on the full lake.
     """
     session_text = day.isoformat() if isinstance(day, date) else str(day)
     session = date.fromisoformat(session_text)
