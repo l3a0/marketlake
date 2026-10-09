@@ -39,9 +39,9 @@ def test_the_vm_runs_as_the_primary():
     """The VM is the primary capture host since #638's cutover.
 
     The cutover flipped ``role`` to ``primary`` in its own pull request and inverted this
-    test in the same change. The way back sets it to ``shadow`` and inverts it again, so a
-    VM and the laptop never both run as primary, paging the owner and uploading to one
-    bucket.
+    test in the same change. The way back sets it to ``shadow`` and inverts it again. This
+    test reads only the VM's tracked file. Keeping the laptop from also running as primary
+    is the way back's order, which #638 writes down.
     """
     role = _settings()["role"]
     assert type(role) is str

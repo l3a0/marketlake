@@ -641,6 +641,8 @@ These need the real world. They run by hand, off CI.
    1. On the apply's evening: `/var/log/cloud-init-output.log`, the daemon's `role=shadow` start line in its journal, and `journal/metadata.json` advancing each minute. `df -h /` and `du -sh ~/.cache/uv ~/marketlake/.venv` check the 16 GiB root volume, estimated at 5 to 6 GB used.
    2. At the next open: data segments under `lake_root`, and ping lines in the outbox.
 
+   It ran under `role: shadow` on 2026-10-07 and 2026-10-08. Since [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover, `config/vm.yaml` says `primary`, and a primary on an empty lake refuses its roster and its daemon will not start. So a VM built from scratch now needs the restore before this check, and the check as written applies only with the role set back to `shadow`.
+
 10. A `replace_instance` dispatch keeps the lake volume and its data, and the new instance's bootstrap mounts the volume without formatting it ([#686](https://github.com/l3a0/marketlake/issues/686)). It runs on the first apply's own evening, right after check 9's first part, while the volume holds only the first boot's files.
 
 ## When the alert channels get created
