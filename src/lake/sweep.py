@@ -32,6 +32,9 @@ What one run does, in the design's own order.
 5. The ping.
 6. The dated report file under ``reports/``.
 7. The digest, at priority 2.
+8. The hand-off. ``main`` replaces this process with ``python -m lake.compact
+   --after-vendor-sweep``, which uploads what the steps above wrote and pings the
+   ``evening-upload`` check. Marketlake #833.
 
 **The disk-runway check runs ahead of step 1**, right after the schema-version check and
 before any walk, and on a holiday too. ``lake.runway`` computes the runway and this job is
@@ -94,6 +97,40 @@ still pings, and the Friday branch still sets the wake, which the design's pmset
 directly. One side effect is worth naming: a holiday never builds the vendor, so it never
 reads the token.
 
+**Why the run hands off to compaction, and when it does not.** The close+15 compaction is
+the only upload, and it runs two hours before this job writes its bars partitions, its
+actions ledger lines and its reference-table updates. Without a second upload that output
+reaches the bucket about 22 hours later, and a restore made in between is a day behind on
+bars and actions. So ``main`` ends a run with ``os.execv`` on ``python -m lake.compact
+--after-vendor-sweep``. An ``exec`` replaces this program with compaction's inside the same
+process. That hands back all of this run's memory first, and it leaves compaction as the
+job's own main process, so launchd and systemd track it with no change to the plist or the
+unit. A child this run waited on would stack on its memory, and a detached one would be
+killed with the job's process group when this run exited.
+
+``sweep`` decides the hand-off and carries the answer on ``SweepOutcome``, because only it
+holds the clock and the calendar. Three conditions must all hold.
+
+1. The ``eod-sweep`` ping landed, or was recorded on a shadow. The gate is the ping rather
+   than ``SweepOutcome.ok``, because ``ok`` also needs every held finding filed, the report
+   file written and the digest delivered. Those three leave ``eod-sweep`` green, and gating
+   the upload on them would turn ``evening-upload`` red for a fact outside the upload.
+2. The day's compaction moment has passed, or the day is not a session. That is the runway
+   check's own gate, read from the same variable. A catch-up run can land inside capture,
+   and compaction started from here does not inherit the daemon's refusal to compact
+   there.
+3. The day is a weekday, the rule ``control_plane.holiday_compaction_moment`` uses. A VM down
+   across Friday 18:30 sweeps on the weekend, and that output waits for Monday's close+15
+   rather than being the first weekend upload. On a Sunday evening it could overlap the
+   Sunday scrub, which takes no lock.
+
+A weekday holiday passes all three, so ``evening-upload`` hears a ping every weekday, as
+``compaction`` and ``eod-sweep`` do. ``main`` prints one line before the ``exec`` naming the
+hand-off, and one line naming what held it back when it does not hand off. It flushes both
+streams first, because an ``exec`` discards whatever Python still holds in a buffer and a
+piped hand run would lose the sign-off block. After a hand-off the job's exit status is
+compaction's.
+
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
 effect. So :func:`sweep` requires seven and defaults none: the clock, the calendar, the vendor
@@ -103,10 +140,16 @@ reader may each be ``None`` on a host with no wake to set or read back, which is
 ``sweep_from_config`` picks that from ``control_plane.is_macos``. A ``None`` setter skips
 the Friday branch, and a ``None`` reader skips only its read-back. The whole module runs
 offline in a test, with no network and no shelling out.
+
+The ``exec`` is not a seam ``main`` accepts either. ``main`` builds the argument list itself
+and calls ``os.execv`` through the module, so a test patches ``os.execv``, and
+``tests/conftest.py`` refuses it in every test that does not.
 """
 
 from __future__ import annotations
 
+import os
+import shlex
 import subprocess
 import sys
 from collections import Counter
@@ -599,6 +642,12 @@ class SweepOutcome:
     nothing and a night that judged the lake and found it clean are different answers and a
     block that printed neither would render them the same. ``lake.battery.render`` states that
     rule for the hand run and this is the same rule for the job's own block.
+
+    ``hand_off`` says whether :func:`main` replaces this process with the evening upload, and
+    ``held_back`` names the conditions that stopped it when it does not. The module docstring
+    lists the three. Both default to no hand-off, so an outcome built anywhere but
+    :func:`sweep` never starts an upload. Neither reaches ``Nightly``, so the report file and
+    the dashboard read the same night they read before marketlake #833.
     """
 
     nightly: Nightly
@@ -607,6 +656,8 @@ class SweepOutcome:
     battery: BatteryReport | None = None
     filed_at: Path | None = None
     filing_error: str | None = None
+    hand_off: bool = False
+    held_back: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -1022,6 +1073,23 @@ def _friday_wake(
     return problems, report
 
 
+def _held_back(*, pinged: bool, compacted: bool, day: date) -> str | None:
+    """What stops tonight's hand-off to the evening upload, or ``None`` when nothing does.
+
+    Every condition that failed is named, joined into one phrase, so the line ``main`` prints
+    says the whole reason. ``compacted`` is the runway check's gate, computed once in
+    :func:`sweep` and handed here rather than worked out a second time.
+    """
+    reasons = []
+    if not pinged:
+        reasons.append(f"the {EOD_SWEEP_SLUG} ping did not land")
+    if not compacted:
+        reasons.append("the day's compaction moment has not passed")
+    if day.weekday() not in control_plane._PY_WEEKDAYS:
+        reasons.append(f"{day.isoformat()} is a weekend")
+    return ", ".join(reasons) if reasons else None
+
+
 def sweep(
     *,
     lake_root: Path | str,
@@ -1103,7 +1171,12 @@ def sweep(
     # has no journal to wait for, and the ``not session`` arm short-circuits first because
     # ``option_close`` refuses a non-session. Gating on ``today in usage.unsealed`` instead
     # would silence the night a compaction failed, which is a night this check is for.
-    if not session or calendar.option_close(day) + COMPACTION_DELAY <= now:
+    #
+    # The same answer gates the hand-off to the evening upload at the end of the run, for the
+    # same reason: compaction started from this job inherits none of the daemon's refusal to
+    # compact inside capture. It is computed once so the two cannot disagree.
+    compacted = not session or calendar.option_close(day) + COMPACTION_DELAY <= now
+    if compacted:
         _check_disk_runway(
             root, day=day, now=now, calendar=calendar, publisher=publisher, report=report
         )
@@ -1459,6 +1532,7 @@ def sweep(
     if publisher is not None:
         delivered = publisher.publish(digest, now=now).sent
 
+    held_back = _held_back(pinged=pinged, compacted=compacted, day=day)
     return SweepOutcome(
         nightly=nightly,
         digest=digest,
@@ -1466,6 +1540,8 @@ def sweep(
         filed_at=filed_at,
         filing_error=filing_error,
         battery=battery,
+        hand_off=held_back is None,
+        held_back=held_back,
     )
 
 
@@ -1526,6 +1602,23 @@ def sweep_from_config(
     )
 
 
+def evening_upload_command(config_path: str | Path | None) -> list[str]:
+    """The argv this job execs to upload the evening's output, modelled on the daemon's.
+
+    ``daemon.compaction_command`` is the pattern. ``sys.executable`` runs the same interpreter
+    this job runs, and ``--config`` is forwarded only when this run was given one, so
+    compaction reads the config this run read. ``--after-vendor-sweep`` is what makes
+    compaction ping ``evening-upload`` rather than ``compaction``. It is spelled here rather
+    than read from ``lake.compact``, which would load the compaction engine into this job for
+    one string. ``tests/unit/test_unattended_entries.py`` runs this argv through compaction's
+    own parser, so a spelling that drifted fails there.
+    """
+    args = [sys.executable, "-m", "lake.compact", "--after-vendor-sweep"]
+    if config_path is not None:
+        args += ["--config", str(config_path)]
+    return args
+
+
 def _build_parser():
     import argparse
 
@@ -1570,6 +1663,19 @@ def main(
     for the Sunday command, where it returns ``0 if pinged else 1``. Two for an operator
     mistake in one of the three files the config directory holds, which
     ``config.input_errors_exit`` already turns into one line.
+
+    **A run that hands off returns no code of its own.** After the sign-off block it prints a
+    line naming the hand-off, flushes both streams and calls ``os.execv`` on
+    :func:`evening_upload_command`, so the process becomes compaction and the exit status is
+    compaction's. That replaces this run's exit 1 on a night whose ping landed but whose
+    report file or digest failed, and nothing reads that code today. An ``exec`` that raises
+    ``OSError``, such as a ``FileNotFoundError`` after a deploy rebuilt the virtualenv, prints
+    one line and returns 1. Only ``OSError`` is caught, so the suite's guard on ``os.execv``,
+    which raises a ``BaseException``, still fails a test that reaches it unpatched.
+
+    ``os.execv`` is looked up on the module when it is called, rather than imported by name,
+    so a test that patches ``os.execv`` reaches this call. With a patch that returns, the run
+    falls through to its own exit code, which a real ``exec`` never does.
     """
     args = _build_parser().parse_args(argv)
 
@@ -1585,6 +1691,23 @@ def main(
             schedule_reader=schedule_reader,
         )
     print(outcome.render())
+    if outcome.hand_off:
+        argv_out = evening_upload_command(args.config)
+        print(f"sweep: handing off to python {shlex.join(argv_out[1:])}")
+        # An ``exec`` discards whatever Python still buffers, and a pipe is block-buffered, so
+        # without this a piped hand run loses the block above.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(sys.executable, argv_out)
+        except OSError as exc:
+            print(
+                f"sweep: hand-off to compaction failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    elif outcome.held_back is not None:
+        print(f"sweep: no hand-off to compaction: {outcome.held_back}")
     return 0 if outcome.ok else 1
 
 
@@ -1602,6 +1725,7 @@ __all__ = [
     "count_gaps",
     "count_quarantined",
     "digest_body",
+    "evening_upload_command",
     "main",
     "set_sunday_wake",
     "sweep",

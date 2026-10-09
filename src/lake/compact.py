@@ -10,6 +10,13 @@ target and pings. The backup target is a mounted directory, copied with ``rsync`
 bucket, uploaded to by ``lake.bucket``. On a host whose config sets a window, the job then
 trims chains partitions older than the window, which ``lake.trim`` decides.
 
+The same job runs a second time on a weekday evening. The 18:30 vendor sweep writes bars,
+the actions ledger and reference-table updates into the lake after close+15 has uploaded
+it, so the sweep replaces its own process with ``python -m lake.compact
+--after-vendor-sweep``. With nothing left to seal, that run only uploads, and it pings the
+``evening-upload`` check instead of ``compaction``. On a night the close+15 run failed to
+seal, it seals what that run left, so it doubles as its retry.
+
 Every ``close+N`` here counts from the *option* close, the capture stop at 16:15 ET on a
 regular day and 13:15 on an early close. It never counts from the 16:00 equity close, even
 though the option close is itself fifteen minutes past that. So close+15 is 16:30 and
@@ -180,12 +187,14 @@ from lake.chain_plan import ChainPlan, Window, default_chain_plan_path, load_cha
 from lake.clock import Clock, SystemClock
 from lake.config import BucketTarget, GuardConstants, input_errors_exit, load_config
 
-# The health-check slug this job pings. It is the compaction-plus-backup check from the
-# design's steady-state set. Log the slug, never the ping URL, which carries the secret
-# ping key. It is defined beside its five sibling slugs in ``lake.control_plane``, which
-# the install renderer reads to name every check the operator has to arm, and re-exported
-# here so every consumer still reads it from the job that pings it.
-from lake.control_plane import COMPACTION_SLUG
+# The health-check slugs this job pings. ``COMPACTION_SLUG`` is the compaction-plus-backup
+# check from the design's steady-state set, which the close+15 run pings.
+# ``EVENING_UPLOAD_SLUG`` is the check the run after the vendor sweep pings instead, under
+# ``--after-vendor-sweep``. Log the slug, never the ping URL, which carries the secret ping
+# key. Both are defined beside their sibling slugs in ``lake.control_plane``, which the
+# install renderer reads to name every check the operator has to arm, and re-exported here
+# so every consumer still reads them from the job that pings them.
+from lake.control_plane import COMPACTION_SLUG, EVENING_UPLOAD_SLUG
 from lake.journal import ROW_KIND_DATA
 from lake.lock import lake_lock
 from lake.manifest import (
@@ -645,6 +654,10 @@ class CompactionResult:
     whose config sets no window, which never trims. ``pruned`` lists each empty
     ``chains/ticker=T/`` directory the pass after the trim removed, on any host that holds a
     ``trimmed.jsonl``.
+
+    ``slug`` is the check this run pinged, or would have pinged. It is ``compaction`` for the
+    close+15 run and ``evening-upload`` for the run after the vendor sweep, and ``render``
+    prints it, so the log names the check a missing ping would page.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -658,6 +671,7 @@ class CompactionResult:
     ledger_repair: LedgerRepair | None = None
     trim: TrimResult | None = None
     pruned: tuple[str, ...] = ()
+    slug: str = COMPACTION_SLUG
 
     @property
     def changed(self) -> bool:
@@ -700,7 +714,7 @@ class CompactionResult:
         lines = [
             f"compaction: sealed={len(self.sealed)} verified={len(self.verified)} "
             f"skipped={len(self.skipped)} refused={len(self.refused)} "
-            f"backed_up={self.backed_up} pinged={self.pinged} slug={COMPACTION_SLUG}"
+            f"backed_up={self.backed_up} pinged={self.pinged} slug={self.slug}"
         ]
         if self.problem is not None:
             lines.append(f"  {self.problem}")
@@ -2276,6 +2290,7 @@ def compact(
     backup_target: Path | str | BucketTarget,
     pinger: Pinger | None = None,
     ping_url: str | None = None,
+    slug: str = COMPACTION_SLUG,
     publisher: Publisher | None = None,
     guards: GuardConstants | None = None,
     plan_path: Path | str | None = None,
@@ -2309,7 +2324,10 @@ def compact(
     refuses it again and files again, and ``changed`` stays true until a human clears it.
 
     ``pinger`` is optional so a caller without a health check, like a test, can skip
-    it. When given, ``ping_url`` is required.
+    it. When given, ``ping_url`` is required. ``slug`` names the check ``ping_url`` feeds. A
+    refused ping pages under it and the result carries it, so it has to match the URL.
+    ``main`` passes ``evening-upload`` with that check's URL under ``--after-vendor-sweep``,
+    and ``compaction`` otherwise.
 
     ``backup`` is required and has no default, so a caller cannot skip the backup by
     forgetting it. ``None`` is the shadow role's answer, passed on purpose by ``main``. The
@@ -2466,9 +2484,7 @@ def compact(
                 problem = f"ping failed: {type(exc).__name__}"
                 # A refused ping feeds no check, so no check will ever go silent to
                 # report it. This page is the only thing that can.
-                escalate_ping_failure(
-                    exc, slug=COMPACTION_SLUG, publisher=publisher, now=clock.now()
-                )
+                escalate_ping_failure(exc, slug=slug, publisher=publisher, now=clock.now())
 
         # The trim runs after the ping, still in this hold, so a trim fault never reads as a
         # sealing fault on the alarm that watches capture. It never raises. The pass after it
@@ -2512,6 +2528,7 @@ def compact(
         ledger_repair=ledger_repair,
         trim=trim_result,
         pruned=pruned,
+        slug=slug,
     )
 
 
@@ -2593,12 +2610,20 @@ def recompact_ticker_day(
 
 # -- the command-line entry --------------------------------------------------
 
+# The flag the vendor sweep passes when it hands off to this job. ``lake.sweep`` spells the
+# argv it execs itself rather than importing this module, which would load the compaction
+# engine into the sweep for one string. ``tests/unit/test_unattended_entries.py`` runs that
+# argv through this parser, so the two spellings cannot part without a failure.
+AFTER_VENDOR_SWEEP_FLAG = "--after-vendor-sweep"
+
 
 def build_parser() -> argparse.ArgumentParser:
     """The ``python -m lake.compact`` argument parser.
 
     With no subcommand it runs the close+15 job. The ``recompact`` subcommand is the
-    human-invoked repair for one ticker-day.
+    human-invoked repair for one ticker-day. ``--after-vendor-sweep`` runs the same job and
+    pings ``evening-upload`` in place of ``compaction``. The vendor sweep passes it when it
+    hands off, and ``main`` refuses it beside ``recompact``.
     """
     parser = argparse.ArgumentParser(
         prog="python -m lake.compact",
@@ -2607,6 +2632,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     parser.add_argument(
         "--plan", help="Path to chain_plan.json (defaults to the standard machine-owned file)."
+    )
+    parser.add_argument(
+        AFTER_VENDOR_SWEEP_FLAG,
+        action="store_true",
+        help=(
+            "Run as the upload after the evening vendor sweep: ping the evening-upload check "
+            "instead of compaction. The vendor sweep passes this when it hands off."
+        ),
     )
     sub = parser.add_subparsers(dest="command")
     repair = sub.add_parser(
@@ -2652,12 +2685,25 @@ def main(
     ``clock`` and ``calendar`` stay injectable. A system clock and an exchange calendar
     never reach past this process, so a test injects them with no live effect.
 
-    The daemon dispatches this job itself at close+15, so the scheduled run comes from
-    in there rather than from here. This entry stays for the hand run: a catch-up after
-    a machine was off for a day, or a run under the operator's eye. Both reach the same
-    ``compact`` below, and its lake-root lock is what keeps the two from racing.
+    The daemon dispatches this job itself at close+15, and it spawns this entry to do it.
+    This entry also serves the hand run, a catch-up after a machine was off for a day or a
+    run under the operator's eye, and the run after the 18:30 vendor sweep. That sweep
+    replaces its own process with this entry under ``--after-vendor-sweep``, which uploads
+    the evening's bars and actions and pings ``evening-upload`` rather than ``compaction``.
+    Every one of them reaches the same ``compact`` below, and its lake-root lock is what
+    keeps them from racing.
     """
     args = build_parser().parse_args(argv)
+    if args.after_vendor_sweep and args.command == "recompact":
+        # argparse takes a top-level flag ahead of the subcommand and keeps it, so without
+        # this line the pair parses and the repair runs with the flag ignored. Refused before
+        # the config load, so the operator's mistake is the one line printed.
+        print(
+            f"compact: {AFTER_VENDOR_SWEEP_FLAG} is the nightly job's flag and does not "
+            "combine with recompact",
+            file=sys.stderr,
+        )
+        return 2
     with input_errors_exit("compact"):
         config = load_config(args.config)
     clock = clock if clock is not None else SystemClock()
@@ -2695,6 +2741,7 @@ def main(
         )
     else:
         backup = RsyncBackup()
+    slug = EVENING_UPLOAD_SLUG if args.after_vendor_sweep else COMPACTION_SLUG
     try:
         result = compact(
             config.lake_root,
@@ -2703,7 +2750,8 @@ def main(
             backup=backup,
             backup_target=config.backup_target,
             pinger=sends.pinger,
-            ping_url=config.healthchecks_url(COMPACTION_SLUG),
+            ping_url=config.healthchecks_url(slug),
+            slug=slug,
             publisher=Publisher(
                 lake_root=config.lake_root,
                 transport=sends.transport,
@@ -2725,14 +2773,16 @@ def main(
         raise SystemExit(2) from None
     print(result.render())
     if isinstance(backup, bucket.BucketBackup) and backup.last is not None:
-        # The nightly throughput, the same line the first upload prints. Compaction runs as
+        # The nightly throughput, the same line the first upload prints. The close+15 run is
         # the daemon's child and shares its stdout, so this lands in the daemon's log, which
-        # is where the night's rate is read.
+        # is where the night's rate is read. The run after the vendor sweep replaced the
+        # sweep's process, so its line lands in the eod-sweep job's log after the sweep's.
         print(f"compact: {backup.last.render()}")
     return 0
 
 
 __all__ = [
+    "AFTER_VENDOR_SWEEP_FLAG",
     "COMPACTION_SLUG",
     "COMPACTION_SOURCE",
     "CompactionResult",
@@ -2740,6 +2790,7 @@ __all__ = [
     "DAMAGED_SEGMENT_EVENT",
     "DAMAGED_SEGMENT_TITLE",
     "DamagedSegments",
+    "EVENING_UPLOAD_SLUG",
     "LedgerRepair",
     "PAGE_SEGMENT_CAP",
     "PartitionMismatch",

@@ -10,9 +10,11 @@ capture never starts.
 
 The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one plist per job
 from, so a job added there is covered here with no edit. The compaction child joins it
-with the argv ``daemon.compaction_command`` builds, and the token pull the daemon spawns in
-auth death with the argv ``daemon.token_pull_command`` builds. Each entry runs in process under
-``runpy`` with the entry's own arguments, and stops at the config load, because the suite's
+with the argv ``daemon.compaction_command`` builds, the token pull the daemon spawns in
+auth death with the argv ``daemon.token_pull_command`` builds, and the evening upload the
+vendor sweep execs with the argv ``sweep.evening_upload_command`` builds. Each entry runs
+in process under ``runpy`` with the entry's own arguments, and stops at the config load,
+because the suite's
 config directory is an empty throwaway. That exit is the first stop between the entry and
 live work. The conftest's network and subprocess guards catch some of what lies past it,
 but not a server bound to a local port or a loop that never calls out. So the precondition
@@ -30,7 +32,7 @@ import sys
 
 import pytest
 
-from lake import config, daemon
+from lake import config, daemon, sweep
 from lake import control_plane as cp
 from tests.support.config_guard import is_protected
 
@@ -56,10 +58,17 @@ COMPACTION = "compaction"
 # ``--config`` nor ``--token``, so the live argv is the one built from two ``None``s.
 TOKEN_PULL = "token-pull"
 
+# The third entry the product starts for itself: the upload the 18:30 vendor sweep
+# replaces its own process with (marketlake #833). The installed eod-sweep job passes no
+# ``--config``, so the live argv is the one built from ``None``. Running it here is what
+# covers the join between the flag the sweep spells and the one compaction's parser takes.
+EVENING_UPLOAD = "evening-upload"
+
 # Every unattended entry, as a label and the argv it starts with.
 ENTRIES = [(job.label, job.program_arguments) for job in JOBS] + [
     (COMPACTION, tuple(daemon.compaction_command(None))),
     (TOKEN_PULL, tuple(daemon.token_pull_command(None, None))),
+    (EVENING_UPLOAD, tuple(sweep.evening_upload_command(None))),
 ]
 
 # Every current entry exits at the config load in well under a second. The deadline is

@@ -60,6 +60,8 @@ from tests.component.test_eod_sweep import (
     PING_URL,
     SESSION,
     _CountingVendorSource,
+    _handed_off,
+    _record_execs,
     _RecordingSetter,
     _roster,
     _schedule_text,
@@ -1028,6 +1030,7 @@ def test_the_window_key_in_config_yaml_reaches_the_checkpoint(
     monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: LONG_CALENDAR)
+    execs = _record_execs(monkeypatch)
 
     sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -1039,6 +1042,8 @@ def test_the_window_key_in_config_yaml_reaches_the_checkpoint(
     capsys.readouterr()
 
     assert read_checkpoint(root).cutoffs() == {"SPY": EARLY}
+    # The checkpoint is written before the hand-off, so the upload it starts carries it.
+    assert execs.calls == _handed_off(config)
 
 
 def test_a_checkpoint_write_that_raises_is_filed_and_withholds_the_ping(

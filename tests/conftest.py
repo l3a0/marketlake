@@ -1,14 +1,15 @@
 """Shared fixtures that expose the four seams, the fixture-lake builder and a loopback STS.
 
-It also carries three guards, one redirect, one deletion, one host pin, and one check on
+It also carries four guards, one redirect, one deletion, one host pin, and one check on
 the outcome. The network guard fails any test that reaches another machine from inside
 this process. The subprocess guard fails any test that shells out to rsync, launchctl,
-pmset, tmutil, systemctl, or timedatectl. The config-directory guard fails any test that
-writes under the machine's real ``~/.config/marketlake/``, and its other half, the
-predicate deciding what counts as that directory, sits in
+pmset, tmutil, systemctl, or timedatectl. The exec guard fails any test that would
+replace this process through ``os.execv`` or ``os.execve``. The config-directory guard
+fails any test that writes under the machine's real ``~/.config/marketlake/``, and its
+other half, the predicate deciding what counts as that directory, sits in
 ``tests/support/config_guard.py`` so a child can ask without importing this file. The
 redirect points this process, and every child that inherits its environment, at a
-throwaway config directory, which is what covers the children the three guards cannot
+throwaway config directory, which is what covers the children the four guards cannot
 reach. The deletion drops an inherited ``MARKETLAKE_CONFIG``, which names a config file
 rather than a directory and so is not moved by that redirect. The host pin makes every
 test run as macOS unless it asks for Linux, so CI's Linux runner takes the same branch as
@@ -408,6 +409,46 @@ def _no_subprocess() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(subprocess, "run", _refuser(subprocess.run))
         mp.setattr(subprocess, "Popen", _refuser(subprocess.Popen))
+        yield
+
+
+# -- the exec guard ----------------------------------------------------------------------
+
+# The evening vendor sweep ends a run by replacing its own process with compaction, through
+# ``os.execv`` in ``sweep.main`` (marketlake #833). Several tests call ``sweep.main`` on an ok
+# weekday evening, which is exactly the run that hands off. A test that forgot to patch the
+# ``exec`` would not fail. It would replace the pytest process with ``python -m lake.compact``
+# against whatever config the test wrote, and the run would end there with no report. So
+# both ``exec`` forms that take an argument list are refused here, the same way the
+# subprocess guard above refuses a named program.
+
+
+class ExecInTest(BaseException):
+    """Raised when a test reaches ``os.execv`` or ``os.execve``.
+
+    It derives from ``BaseException`` for ``SubprocessAccessInTest``'s reason, and one more.
+    ``sweep.main`` catches ``OSError`` around its ``exec`` and turns it into exit 1, so a
+    guard that was an ``OSError`` would become an exit code, and four of the tests that reach
+    the hand-off do not assert theirs.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_exec() -> Iterator[None]:
+    """Fail any test that would replace this process through ``os.execv`` or ``os.execve``.
+
+    Autouse, for ``_no_network``'s reason. A test patches ``os.execv`` with a recorder on its
+    own ``monkeypatch``, which lands on top of this patch and is undone first. The fixture
+    holds its own ``MonkeyPatch`` for the reason ``_no_network`` does: a test calling
+    ``monkeypatch.undo()`` must not disarm it.
+    """
+
+    def refuse(path: object, *args: object, **kwargs: object) -> None:
+        raise ExecInTest(f"a test tried to exec {path}. Patch os.execv with a recorder instead.")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "execv", refuse)
+        mp.setattr(os, "execve", refuse)
         yield
 
 

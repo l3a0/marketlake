@@ -8,9 +8,10 @@ Standard-IA, versioning on, no Object Lock, and credentials with a narrow policy
 
 Five jobs live here.
 
-1. **The nightly upload**, ``BucketBackup``, runs where ``RsyncBackup`` runs, inside the
-   close+15 compaction's lake-root lock. It uploads what changed since the last night
-   and never deletes.
+1. **The nightly upload**, ``BucketBackup``, runs where ``RsyncBackup`` runs, inside
+   compaction's lake-root lock. That is the close+15 run, and again the run the 18:30
+   vendor sweep hands off to, which uploads the sweep's output the same evening
+   (marketlake #833). It uploads what changed since the last upload and never deletes.
 2. **The first upload**, ``python -m lake.bucket first-upload``, is run by hand. It
    compares every object rather than trusting the bucket's copy of the manifest, so it
    both seeds an empty bucket and re-baselines one whose copy a human repaired. It refuses
@@ -261,6 +262,12 @@ ASSUME_ROLE = "AssumeRole"
 # makes the ping late, which pages and then recovers when the ping lands. Stopping at
 # 17:00 would page the same way and leave the night's files off the bucket, so the
 # budget runs to the sweep instead.
+#
+# The run the vendor sweep hands off to, near 18:32, takes the same budget (marketlake
+# #833). No job follows it before the next session, so the budget and the session bound
+# below are what limit it. Its check, ``evening-upload``, expects the ping by about 20:15,
+# the hand-off plus a seal plus this budget and ``IN_FLIGHT_ALLOWANCE``, so a run inside
+# its own deadline never pages.
 #
 # **The session bounds it too.** A compaction run by hand, the catch-up ``compact.main``
 # describes, can start at any hour. One started during a session would hold the lock

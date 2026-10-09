@@ -23,7 +23,9 @@ before any probe. The working directory matters under ``-m``, because
 Python puts it first on ``sys.path``. The compaction child and the token pull the daemon
 spawns run the same way, with the argv ``daemon.compaction_command`` or
 ``daemon.token_pull_command`` builds and the daemon job's environment and working
-directory, which each inherits because its spawn passes neither. The host is
+directory, which each inherits because its spawn passes neither. The evening upload the
+vendor sweep execs runs with the argv ``sweep.evening_upload_command`` builds and the
+eod-sweep job's environment and working directory, which an ``exec`` keeps. The host is
 built per test with ``HOME`` under ``tmp_path``, which makes the child's config directory
 and ``sunday``'s ``--token`` throwaway without editing the job. The job's environment carries no
 ``MARKETLAKE_CONFIG_DIR``, so the suite's redirect does not reach the child, and the
@@ -39,11 +41,17 @@ from pathlib import Path
 import pytest
 
 from lake import control_plane as cp
-from lake import daemon
+from lake import daemon, sweep
 from lake.config import CONFIG_PATH_ENV
 from lake.paths import CONFIG_DIR_ENV, CONFIG_DIR_PARTS, CONFIG_FILE
 from tests.support.config_guard import is_protected
-from tests.unit.test_unattended_entries import COMPACTION, JOBS, TOKEN_PULL, stderr_label
+from tests.unit.test_unattended_entries import (
+    COMPACTION,
+    EVENING_UPLOAD,
+    JOBS,
+    TOKEN_PULL,
+    stderr_label,
+)
 
 # The repository root, two levels up from this file. launchd starts every job there.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,25 +111,31 @@ def started_environment(host_kind: str, job: cp.Job, home: Path) -> dict[str, st
 def fresh_entry(host_kind: str, label: str, home: Path) -> tuple[list[str], dict[str, str], str]:
     """The argv, environment and working directory the entry with this label starts with.
 
-    The compaction child and the token pull are not jobs of either host. The daemon spawns
-    each with ``subprocess.Popen`` and no ``env`` or ``cwd``, so each starts with the daemon
-    job's.
+    The compaction child, the token pull and the evening upload are not jobs of either host.
+    The daemon spawns the first two with ``subprocess.Popen`` and no ``env`` or ``cwd``, so
+    each starts with the daemon job's. The vendor sweep replaces its own process with the
+    third through ``os.execv``, which keeps the eod-sweep job's environment and working
+    directory, so that job is its parent.
     """
     children = {
-        COMPACTION: lambda: daemon.compaction_command(None),
-        TOKEN_PULL: lambda: daemon.token_pull_command(None, None),
+        COMPACTION: (cp.DAEMON_LABEL, lambda: daemon.compaction_command(None)),
+        TOKEN_PULL: (cp.DAEMON_LABEL, lambda: daemon.token_pull_command(None, None)),
+        EVENING_UPLOAD: (cp.EOD_SWEEP_LABEL, lambda: sweep.evening_upload_command(None)),
     }
     if label in children:
-        parent = fresh_job(host_kind, cp.DAEMON_LABEL, home)
+        parent_label, argv = children[label]
+        parent = fresh_job(host_kind, parent_label, home)
         env = started_environment(host_kind, parent, home)
-        return children[label](), env, parent.working_directory
+        return argv(), env, parent.working_directory
     job = fresh_job(host_kind, label, home)
     env = started_environment(host_kind, job, home)
     return list(job.program_arguments), env, job.working_directory
 
 
 @pytest.mark.parametrize("host_kind", ["launchd", "systemd"])
-@pytest.mark.parametrize("label", [job.label for job in JOBS] + [COMPACTION, TOKEN_PULL])
+@pytest.mark.parametrize(
+    "label", [job.label for job in JOBS] + [COMPACTION, TOKEN_PULL, EVENING_UPLOAD]
+)
 def test_the_entry_imports_cleanly_from_a_fresh_interpreter(host_kind, label, tmp_path):
     home = tmp_path / "home"
     home.mkdir()

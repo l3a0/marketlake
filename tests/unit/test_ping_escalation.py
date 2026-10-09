@@ -30,7 +30,7 @@ import pytest
 
 from lake.alert import CAP_REACHED, PAGE_PRIORITY, POST_FAILED, Delivery, Publisher
 from lake.calendar import MARKET_TZ
-from lake.compact import COMPACTION_SLUG
+from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG
 from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
 from lake.deadman import CAPTURE_SLUG
 from lake.runner import (
@@ -59,6 +59,7 @@ LIVE_SLUGS = (
     SUNDAY_SLUG,
     CAPTURE_SLUG,
     EOD_SWEEP_SLUG,
+    EVENING_UPLOAD_SLUG,
 )
 
 

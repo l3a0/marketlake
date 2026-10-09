@@ -40,13 +40,15 @@
 # There is no third script. A reinstall is these two, in that order, and nothing
 # else, so it cannot drift from what an install and an uninstall mean.
 #
-# Six dead-man checks go silent when these jobs stop:
-# capture, pre-open, sunday, compaction, calendar-probe and eod-sweep.
+# Seven dead-man checks go silent when these jobs stop:
+# capture, pre-open, sunday, compaction, calendar-probe, eod-sweep and evening-upload.
 # Each pages once its own deadline passes, which for capture is inside the weekday
-# capture window and for sunday is Sunday 23:30. One of them has no label of
-# its own in the list below: the daemon spawns compaction at close+15, so
-# booting the daemon out stops that job exactly as surely as it stops capture.
-# Pause all six from healthchecks first if the machine is meant to
+# capture window and for sunday is Sunday 23:30. Two of them have no label
+# of their own in the list below. The daemon spawns compaction at close+15,
+# so booting the daemon out stops that job exactly as surely as it stops capture.
+# The vendor sweep hands off to the run that pings evening-upload, so
+# booting com.marketlake.eod-sweep out stops that run too.
+# Pause all seven from healthchecks first if the machine is meant to
 # stay uninstalled. A check that has been pinged once does not go back to `new` on
 # its own, so simply stopping the jobs is not enough to keep them quiet.
 set -euo pipefail
