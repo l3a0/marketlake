@@ -71,7 +71,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from lake import trimmed
-from lake.bucket import BucketReadError, UploadSummary, current_digest, read_ledger
+from lake.bucket import (
+    BucketReadError,
+    UploadSummary,
+    current_digest,
+    read_ledger,
+    usable_version_id,
+)
 from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import BucketTarget
@@ -615,7 +621,7 @@ def _one(
             return
         run.skipped.append(f"{rel}: the bucket answered the read with {exc.code}")
         return
-    if found.version_id is None or found.version_id == "null":
+    if not usable_version_id(found.version_id):
         raise _Stop(
             f"the bucket's read of {rel} named no version, so the bucket is not versioned and a "
             "trim line would record nothing a repair could use. Turn versioning on"

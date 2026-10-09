@@ -269,6 +269,52 @@ def test_a_plain_get_that_misnames_the_current_version_fails_grant_seven(fake, s
     ) in lines
 
 
+class _NamesOneId(FakeS3):
+    """Every PUT and every plain ``GetObject`` names the same unusable id."""
+
+    def __init__(self, version_id: str) -> None:
+        super().__init__()
+        self.fixed = version_id
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        response["VersionId"] = self.fixed
+        return response
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            response["VersionId"] = self.fixed
+        return response
+
+
+@pytest.mark.parametrize("version", ["NULL", "Null", "  "])
+def test_an_id_that_names_no_version_fails_grant_seven_even_when_the_put_named_it(version):
+    """Mutation this catches: grant seven judging the id by anything but
+    ``bucket.usable_version_id``, which the trim judges by too."""
+    passed, lines = _run(_NamesOneId(version))
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 7 GetObject") for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("version", "usable"),
+    [
+        (None, False),
+        ("", False),
+        ("   ", False),
+        ("null", False),
+        ("NULL", False),
+        ("nUlL", False),
+        (7, False),
+        ("v1", True),
+        ("3HL4kqtJlcpXroDTDmJ", True),
+    ],
+)
+def test_usable_version_id_refuses_every_id_that_names_no_version(version, usable):
+    assert bucket.usable_version_id(version) is usable
+
+
 @pytest.mark.parametrize(("fake", "code"), [(FakeS3, 0), (_DeniesMismatch, 1)])
 def test_the_command_exits_one_when_any_behavior_fails(tmp_path, monkeypatch, capsys, fake, code):
     config = write_config(tmp_path, tmp_path / "lake")

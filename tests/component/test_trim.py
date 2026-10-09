@@ -463,8 +463,10 @@ def test_a_bucket_that_refuses_or_cannot_be_reached_stops_the_run(lake_root, err
     assert _lines(lake_root) == []
 
 
-@pytest.mark.parametrize("version", [None, "null"])
+@pytest.mark.parametrize("version", [None, "null", "NULL", "", "  "])
 def test_a_read_that_names_no_version_stops_the_run(lake_root, version):
+    """Mutation this catches: judging the id by anything but ``bucket.usable_version_id``."""
+
     class _Unversioned(FakeS3):
         def get_object(self, **kwargs):
             response = super().get_object(**kwargs)

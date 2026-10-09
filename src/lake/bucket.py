@@ -1493,6 +1493,17 @@ def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator
     return read
 
 
+def usable_version_id(version: object) -> bool:
+    """Whether a ``VersionId`` names a version a repair could read back.
+
+    ``None`` is a response that carried no id. ``"null"``, in any case, is what an unversioned
+    bucket returns. An empty or whitespace-only id names nothing. The trim (marketlake #787)
+    and :func:`live_check` both judge an id here, so the trim never records an id the live
+    check would have failed.
+    """
+    return isinstance(version, str) and bool(version.strip()) and version.lower() != "null"
+
+
 @dataclass(frozen=True)
 class CurrentDigest:
     """What :func:`current_digest` read: the current version's SHA-256 and its id.
@@ -1518,7 +1529,7 @@ def current_digest(client: Any, target: BucketTarget, rel: str) -> CurrentDigest
     and raises as itself.
 
     A ``VersionId`` of ``"null"``, which an unversioned bucket returns, is passed through as
-    given. Deciding what it means is the caller's.
+    given. Deciding what it means is the caller's, through :func:`usable_version_id`.
     """
     digest = hashlib.sha256()
     try:
@@ -2644,7 +2655,7 @@ def live_check(
         StorageClass=STORAGE_CLASS,
     )
     old_id, new_id = first.get("VersionId"), second.get("VersionId")
-    distinct = bool(old_id) and bool(new_id) and old_id != new_id and old_id != "null"
+    distinct = usable_version_id(old_id) and usable_version_id(new_id) and old_id != new_id
     report(distinct, f"3 two PUTs to one key returned versions {old_id} and {new_id}")
     try:
         kept = client.get_object(Bucket=target.bucket, Key=key, VersionId=old_id)["Body"].read()
@@ -2685,7 +2696,7 @@ def live_check(
         body = response["Body"].read()
         version = response.get("VersionId")
         held = "the current version's bytes" if body == replacement else "other bytes"
-        named = version == new_id and version not in (None, "", "null")
+        named = version == new_id and usable_version_id(version)
         shown = f"VersionId {version}" if named else f"VersionId {version}, not {new_id}"
         return body == replacement and named, f"of the probe returned {held} with {shown}"
 
@@ -2999,6 +3010,7 @@ __all__ = [
     "rsync_excluded",
     "session_bound",
     "stored_sha256",
+    "usable_version_id",
     "walk_lake",
     "watermark",
 ]
