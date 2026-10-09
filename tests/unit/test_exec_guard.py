@@ -32,27 +32,32 @@ from tests.conftest import ExecInTest
 # ``posix`` is never patched, so its two are the real ones however this file is reached.
 _REAL_EXECS = (os.execv, os.execve, posix.execv, posix.execve)
 
+# Every exec below targets this. With the guard gone, the real exec replaces pytest with it,
+# so the run ends with code 97. A target that exits 0, or an interactive interpreter, would
+# instead end the run green with every later test unrun.
+LOUD = [sys.executable, "-c", "import os; os._exit(97)"]
+
 
 def test_execv_is_refused_and_names_the_program():
     with pytest.raises(ExecInTest, match="python"):
-        os.execv(sys.executable, ["python", "-c", "pass"])
+        os.execv(sys.executable, LOUD)
 
 
 def test_execve_is_refused():
     with pytest.raises(ExecInTest):
-        os.execve(sys.executable, ["python", "-c", "pass"], {})
+        os.execve(sys.executable, LOUD, {})
 
 
 def test_the_refusal_escapes_an_except_oserror_and_an_except_exception():
     # The two catches a production path could put around an exec. Neither may swallow it.
     with pytest.raises(ExecInTest):
         try:
-            os.execv(sys.executable, ["python"])
+            os.execv(sys.executable, LOUD)
         except OSError:
             pytest.fail("the guard was caught as an OSError")
     with pytest.raises(ExecInTest):
         try:
-            os.execv(sys.executable, ["python"])
+            os.execv(sys.executable, LOUD)
         except Exception:  # noqa: BLE001 - the catch under test
             pytest.fail("the guard was caught as an Exception")
     assert not issubclass(ExecInTest, Exception)
@@ -61,12 +66,12 @@ def test_the_refusal_escapes_an_except_oserror_and_an_except_exception():
 def test_a_recorder_patched_on_top_replaces_the_guard_for_its_test(monkeypatch):
     calls = []
     monkeypatch.setattr(os, "execv", lambda path, argv: calls.append((path, argv)))
-    os.execv(sys.executable, ["python", "-c", "pass"])
-    assert calls == [(sys.executable, ["python", "-c", "pass"])]
+    os.execv(sys.executable, LOUD)
+    assert calls == [(sys.executable, LOUD)]
     monkeypatch.undo()
     # Undoing the test's own patch puts the guard back, not the real exec.
     with pytest.raises(ExecInTest):
-        os.execv(sys.executable, ["python"])
+        os.execv(sys.executable, LOUD)
 
 
 def test_lake_sweep_binds_no_exec_function_by_name():

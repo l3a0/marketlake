@@ -3946,6 +3946,28 @@ def test_a_withheld_ping_does_not_hand_off(fixture_lake: FixtureLake):
     assert outcome.held_back == f"the {EOD_SWEEP_SLUG} ping did not land"
 
 
+@pytest.mark.parametrize(
+    ("now", "second"),
+    [
+        (SATURDAY_CATCH_UP, f"{SATURDAY_CATCH_UP.date().isoformat()} is a weekend"),
+        (BEFORE_COMPACTION, "the day's compaction moment has not passed"),
+    ],
+    ids=["weekend", "before-compaction"],
+)
+def test_two_conditions_that_fail_together_are_both_named_in_order(
+    fixture_lake: FixtureLake, now: datetime, second: str
+):
+    """The line ``main`` prints says the whole reason, so a run held back twice names both.
+
+    The cases above take one condition away each, which a reason list cut to its first or last
+    entry would still pass.
+    """
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root, now=now, pinger=_UnreachablePinger())
+    assert outcome.hand_off is False
+    assert outcome.held_back == f"the {EOD_SWEEP_SLUG} ping did not land, {second}"
+
+
 def test_the_gate_is_the_ping_and_not_ok(fixture_lake: FixtureLake, monkeypatch):
     """A report file that could not be written leaves ``ok`` false and the ping landed.
 
@@ -3958,6 +3980,52 @@ def test_the_gate_is_the_ping_and_not_ok(fixture_lake: FixtureLake, monkeypatch)
     outcome, _, _ = _run(root)
     assert outcome.ok is False
     assert outcome.hand_off is True
+
+
+def test_a_digest_that_did_not_go_still_hands_off(fixture_lake: FixtureLake):
+    """An undelivered digest leaves ``ok`` false, and the ping that is the gate still landed."""
+    root = _lake(fixture_lake, judged=())
+    transport = FakeTransport()
+    publisher = Publisher(lake_root=root, transport=transport, secrets=("unsealed",))
+    outcome, _, _ = _run(root, publisher=publisher, transport=transport)
+    assert outcome.delivered is False
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+    assert outcome.held_back is None
+
+
+def test_a_finding_that_could_not_be_filed_still_hands_off(fixture_lake: FixtureLake, monkeypatch):
+    """An unfiled finding leaves ``ok`` false and does not withhold the ping, so it uploads.
+
+    The setup is ``test_a_finding_that_could_not_be_filed_reaches_the_count_and_the_exit_code``'s.
+    """
+    from lake import bars as bars_module
+
+    root = _lake(fixture_lake, judged=(SESSION,))
+    monkeypatch.setattr(
+        bars_module,
+        "write_withheld",
+        lambda *a, **k: (_ for _ in ()).throw(PermissionError("read-only")),
+    )
+    source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
+    outcome, _, _ = _run(root, vendor_source=source)
+    assert outcome.nightly.unfiled == 1
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+    assert outcome.held_back is None
+
+
+def test_an_outcome_built_outside_the_sweep_never_hands_off():
+    """Both fields default to no hand-off, so only :func:`sweep.sweep` can start an upload."""
+    from lake.alert import Message
+
+    outcome = sweep.SweepOutcome(
+        nightly=report.Nightly(day=SESSION, session=True, pinged=True),
+        digest=Message(event=NIGHTLY_EVENT, title="t", body="b"),
+        delivered=True,
+    )
+    assert outcome.hand_off is False
+    assert outcome.held_back is None
 
 
 def test_the_upload_argv_forwards_the_config_only_when_given():
@@ -4014,12 +4082,28 @@ def test_a_run_that_does_not_hand_off_says_what_held_it_back(
     assert "handing off" not in printed
 
 
+@pytest.mark.parametrize(
+    ("error", "line"),
+    [
+        (
+            FileNotFoundError(2, "No such file or directory"),
+            "FileNotFoundError: [Errno 2] No such file or directory",
+        ),
+        (PermissionError(13, "Permission denied"), "PermissionError: [Errno 13] Permission denied"),
+        (OSError(8, "Exec format error"), "OSError: [Errno 8] Exec format error"),
+    ],
+    ids=["enoent", "eacces", "enoexec"],
+)
 def test_an_exec_that_fails_prints_one_line_and_exits_1(
-    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path, error: OSError, line: str
 ):
-    """``FileNotFoundError`` is what a deploy that rebuilt the virtualenv leaves behind."""
+    """``FileNotFoundError`` is what a deploy that rebuilt the virtualenv leaves behind.
+
+    The catch is the whole ``OSError`` class, so a target that is not executable, or not a
+    program at all, ends the run the same way.
+    """
     config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
-    execs = _record_execs(monkeypatch, raises=FileNotFoundError(2, "No such file or directory"))
+    execs = _record_execs(monkeypatch, raises=error)
 
     code = sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -4032,10 +4116,28 @@ def test_an_exec_that_fails_prints_one_line_and_exits_1(
 
     assert code == 1
     assert execs.calls == _handed_off(config)
-    assert captured.err.splitlines() == [
-        "sweep: hand-off to compaction failed: FileNotFoundError: "
-        "[Errno 2] No such file or directory"
-    ]
+    assert captured.err.splitlines() == [f"sweep: hand-off to compaction failed: {line}"]
+
+
+def test_an_exec_that_raises_anything_but_an_os_error_is_not_an_exit_code(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """Only ``OSError`` is caught, so a bug in the hand-off ends the run as a bug does."""
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+
+    def broken(path: str, argv: list[str]) -> None:
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(os, "execv", broken)
+    with pytest.raises(ValueError, match="embedded null byte"):
+        sweep.main(
+            ["--config", str(config), "--tickers", str(tickers)],
+            clock=ManualClock(EVENING),
+            vendor_source=_CountingVendorSource(),
+            schedule_setter=_RecordingSetter(),
+            schedule_reader=lambda: _schedule_text(),
+        )
+    capsys.readouterr()
 
 
 # The child below runs ``sweep.main`` with the sweep itself replaced by a canned outcome
