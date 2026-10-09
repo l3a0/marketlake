@@ -127,12 +127,11 @@ jobs:
           AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
           TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
           BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
-          BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
           OWNER_SSH_CIDR: ${{ secrets.OWNER_SSH_CIDR }}
           SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
           missing=0
-          for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
+          for name in AWS_PLAN_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
@@ -163,7 +162,6 @@ jobs:
       - name: Plan
         env:
           TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
-          TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
           TF_VAR_owner_ssh_cidr: ${{ secrets.OWNER_SSH_CIDR }}
           TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
@@ -199,12 +197,11 @@ jobs:
           AWS_APPLY_ROLE_ARN: ${{ secrets.AWS_APPLY_ROLE_ARN }}
           TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
           BACKUP_BUCKET: ${{ secrets.BACKUP_BUCKET }}
-          BACKUP_POLICY_NAME: ${{ vars.BACKUP_POLICY_NAME }}
           OWNER_SSH_CIDR: ${{ secrets.OWNER_SSH_CIDR }}
           SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
         run: |
           missing=0
-          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET BACKUP_POLICY_NAME OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
+          for name in AWS_APPLY_ROLE_ARN TF_STATE_BUCKET BACKUP_BUCKET OWNER_SSH_CIDR SSH_PUBLIC_KEY; do
             if [ -z "${!name}" ]; then
               echo "::error::$name is empty. infra/README.md says where to set it."
               missing=1
@@ -252,7 +249,6 @@ jobs:
         if: steps.freshness.outputs.state == 'fresh'
         env:
           TF_VAR_backup_bucket: ${{ secrets.BACKUP_BUCKET }}
-          TF_VAR_backup_policy_name: ${{ vars.BACKUP_POLICY_NAME }}
           TF_VAR_owner_ssh_cidr: ${{ secrets.OWNER_SSH_CIDR }}
           TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
           REPLACE_INSTANCE: ${{ inputs.replace_instance }}

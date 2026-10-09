@@ -43,18 +43,12 @@ stay out of every tracked file, every issue and every comment.
 4. The owner's home address, which may SSH to the VM. The commands below read it from
    the network and never print it.
 
-`<policy-name>` is the name of the old `marketlake-backup` user's inline policy. It lives
-in a repository variable, which GitHub does not mask in logs, so it is not a secret. It is
-still written only on the laptop and in GitHub's settings. Since
-[#737](https://github.com/l3a0/marketlake/issues/737) no resource uses it, so any valid
-IAM policy name works until [#741](https://github.com/l3a0/marketlake/issues/741) removes
-the variable.
-
 The rest are read when they are needed.
 
 - `<github-user-id>` is the owner's numeric GitHub id, which step 8 reads.
-- `<backup-key-id>` is the id of the old `marketlake-backup` user's access key, which
-  [Retire the old users](#retire-the-old-users) reads.
+- `<backup-key-id>` is the id of the old `marketlake-backup` user's access key, and
+  `<policy-name>` is the name of that user's inline policy. Both are read in
+  [Retire the old users](#retire-the-old-users).
 - `<switch-time>` is when the laptop's `config.yaml` moved to `assume_role`, in UTC as
   `2026-10-07T21:00:00Z`. The CloudTrail lookup reads every event since then.
 - `<branch>` and `<n>` are the pull request's branch and number.
@@ -71,15 +65,13 @@ unreplaced is a redirection in zsh.
 This section records the run for
 [PR #698](https://github.com/l3a0/marketlake/pull/698), merged 2026-10-06, which added
 `infra.yml`. A rerun with `infra.yml` already on `main`, such as a rebuild into a fresh
-account, differs in five steps.
+account, differs in four steps.
 
 1. Step 3 finds no `marketlake-backup` user, so it skips the user lookups.
-2. Steps 4 and 9 take any valid IAM policy name for `<policy-name>`, until
-   [#741](https://github.com/l3a0/marketlake/issues/741) removes the variable.
-3. Step 7 applies the bootstrap from a worktree at `origin/main` rather than at a pull
+2. Step 7 applies the bootstrap from a worktree at `origin/main` rather than at a pull
    request's branch.
-4. Step 10 drops out, since no pull request needs a plan.
-5. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
+3. Step 10 drops out, since no pull request needs a plan.
+4. Step 11 replaces the merge with a manual run of `infra.yml` on `main`, which is
    `gh workflow run infra.yml --repo l3a0/marketlake --ref main`. Its first apply in a
    fresh account also creates `aws_iam_role_policy_attachment.instance_ssm`, which
    [#695](https://github.com/l3a0/marketlake/issues/695) added after the recorded run, and
@@ -135,8 +127,8 @@ does not last from one command to the next. That is why every `aws` command belo
 
 ### 3. Read the values recorded nowhere
 
-Nothing tracked names the backup bucket, the old backup user's policy, or whether the
-account already holds a GitHub OIDC provider, so read each from AWS.
+Nothing tracked names the backup bucket, or says whether the account already holds a
+GitHub OIDC provider, so read both from AWS.
 
 List the buckets, to find `<backup-bucket>`.
 
@@ -146,9 +138,8 @@ aws s3api list-buckets --profile marketlake-admin
 
 The next two commands read the old `marketlake-backup` user, which the recorded run
 imported. [#737](https://github.com/l3a0/marketlake/issues/737) replaced that user with a
-role of the same name and stopped importing it. Once the owner has deleted the user, or in
-a fresh account, there is no user to read, so skip both, and use any valid IAM policy name
-for `<policy-name>` until [#741](https://github.com/l3a0/marketlake/issues/741).
+role of the same name and stopped importing it. The owner deleted the user on 2026-10-09,
+so there is no user left to read, and a rerun skips both.
 
 List the IAM users, to confirm `marketlake-backup` exists.
 
@@ -156,9 +147,9 @@ List the IAM users, to confirm `marketlake-backup` exists.
 aws iam list-users --profile marketlake-admin
 ```
 
-List the user's inline policies. The one name it prints is `<policy-name>`. An import
-adopts a resource that already exists into the state, rather than creating it. The
-recorded run's import of the user's policy needed that name, so there was no safe guess.
+List the user's inline policies. An import adopts a resource that already exists into
+the state, rather than creating it. The recorded run's import of the user's policy needed
+the one name this printed, so there was no safe guess.
 
 ```bash
 aws iam list-user-policies --user-name marketlake-backup --profile marketlake-admin
@@ -227,15 +218,12 @@ EOF
 printf 'bucket = "%s"\n' "<state-bucket>" > ~/.config/marketlake/infra/live.tfbackend
 ```
 
-`live.tfvars` holds the two values the live configuration needs. Nothing reads
-`backup_policy_name` since [#737](https://github.com/l3a0/marketlake/issues/737), yet the
-variable still has no default, so it takes any valid IAM policy name until
-[#741](https://github.com/l3a0/marketlake/issues/741) removes it.
+`live.tfvars` holds the backup bucket's name. The recorded run also wrote
+`backup_policy_name`, which [#741](https://github.com/l3a0/marketlake/issues/741) removed.
 
 ```bash
 cat > ~/.config/marketlake/infra/live.tfvars <<'EOF'
-backup_bucket      = "<backup-bucket>"
-backup_policy_name = "<policy-name>"
+backup_bucket = "<backup-bucket>"
 EOF
 ```
 
@@ -404,8 +392,8 @@ gh api repos/l3a0/marketlake/environments/infra --jq .can_admins_bypass
 
 ### 9. Set the secrets and the variables
 
-Nothing tracked names the account, the buckets, the user's policy, the owner's address
-or the VM's key, so the workflow reads them from seven settings.
+Nothing tracked names the account, the buckets, the owner's address or the VM's key, so
+the workflow reads them from six settings.
 
 1. The secret `AWS_APPLY_ROLE_ARN`, the apply role's ARN, the identifier AWS gives each
    resource. It sits on the `infra` environment, so the apply job can read it only after
@@ -413,13 +401,9 @@ or the VM's key, so the workflow reads them from seven settings.
 2. The secret `AWS_PLAN_ROLE_ARN`, the plan role's ARN, on the repository.
 3. The secret `TF_STATE_BUCKET`, the state bucket's name, on the repository.
 4. The secret `BACKUP_BUCKET`, the backup bucket's name, on the repository.
-5. The variable `BACKUP_POLICY_NAME`, the name of the old `marketlake-backup` user's
-   inline policy, on the repository. CI still refuses an empty value, and nothing reads it
-   since [#737](https://github.com/l3a0/marketlake/issues/737), so any valid IAM policy
-   name works until [#741](https://github.com/l3a0/marketlake/issues/741) removes it.
-6. The secret `OWNER_SSH_CIDR`, the owner's address as a `/32`, the one address that may
+5. The secret `OWNER_SSH_CIDR`, the owner's address as a `/32`, the one address that may
    SSH to the VM, on the repository.
-7. The variable `SSH_PUBLIC_KEY`, the public half of the VM's SSH key, on the
+6. The variable `SSH_PUBLIC_KEY`, the public half of the VM's SSH key, on the
    repository.
 
 The last two arrived with the VM in [#686](https://github.com/l3a0/marketlake/issues/686),
@@ -443,10 +427,6 @@ printf '%s' "<state-bucket>" | gh secret set TF_STATE_BUCKET --repo l3a0/marketl
 
 ```bash
 printf '%s' "<backup-bucket>" | gh secret set BACKUP_BUCKET --repo l3a0/marketlake
-```
-
-```bash
-gh variable set BACKUP_POLICY_NAME --body "<policy-name>" --repo l3a0/marketlake
 ```
 
 The owner's address comes from AWS's address echo service, which answers with the
@@ -493,7 +473,7 @@ The environment's secrets should include `AWS_APPLY_ROLE_ARN`.
 gh secret list --env infra --repo l3a0/marketlake
 ```
 
-The repository's variables should include `BACKUP_POLICY_NAME` and `SSH_PUBLIC_KEY`.
+The repository's variables should include `SSH_PUBLIC_KEY`.
 
 ```bash
 gh variable list --repo l3a0/marketlake
@@ -856,8 +836,10 @@ so it follows [Changing the bootstrap](#changing-the-bootstrap).
    in place of this step and the next.
 2. Merge, then approve the `tofu apply (live)` run, as in
    [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change), which creates the
-   user, the two roles and their policies. Its plan summary also shows four `forget` rows,
-   one for each old user and its policy, which leave the state and keep existing in AWS.
+   user, the two roles and their policies. That apply's plan summary also showed four
+   `forget` rows, one for each old user and its policy, which left the state and kept
+   existing in AWS. Since [#741](https://github.com/l3a0/marketlake/issues/741) deleted
+   those `removed` blocks, a plan shows none.
    Every approved apply carries everything on `main`, so refuse a run whose plan summary
    shows `aws_instance.vm` or `aws_ebs_volume.lake`. That run would boot the hosted VM
    early. Merge and apply this before the hosted VM's pull request merges, or hold that

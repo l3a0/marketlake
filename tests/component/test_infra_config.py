@@ -307,8 +307,7 @@ def test_command_role_sets_only_its_three_arguments(address: str) -> None:
 def test_every_removed_block_keeps_the_resource(config: str) -> None:
     """A ``removed`` block without ``destroy = false`` plans a delete. The apply role
     may not delete a user or its policy, so that apply fails partway through, and a
-    bare block forgets but warns. This passes when no ``removed`` block remains, so
-    #741 deletes the blocks without editing it."""
+    bare block forgets but warns."""
     for path in sorted((INFRA / config).glob("*.tf")):
         with path.open() as f:
             parsed = hcl2.load(f, serialization_options=_OPTIONS)
@@ -318,16 +317,6 @@ def test_every_removed_block_keeps_the_resource(config: str) -> None:
                 f"infra/{config}/{path.name}'s removed block for {block.get('from')} "
                 "does not carry destroy = false"
             )
-
-
-# The addresses main's state holds for the laptop's two old users. A removed block that
-# names anything else forgets nothing, and the plan deletes the old address instead.
-_FORGOTTEN = [
-    "aws_iam_user.backup",
-    "aws_iam_user.token_writer",
-    "aws_iam_user_policy.backup",
-    "aws_iam_user_policy.token_writer",
-]
 
 
 def test_rosters_cover_every_command_resource() -> None:
@@ -351,16 +340,6 @@ def test_rosters_cover_every_command_resource() -> None:
         for name in named
     )
     assert roles == sorted(COMMAND_ROLES)
-
-
-def test_removed_blocks_forget_exactly_the_old_users() -> None:
-    """Either all four old addresses are forgotten, or #741 has deleted every block."""
-    froms = []
-    for path in sorted((INFRA / "live").glob("*.tf")):
-        with path.open() as f:
-            parsed = hcl2.load(f, serialization_options=_OPTIONS)
-        froms += [block["from"] for block in parsed.get("removed", [])]
-    assert sorted(froms) in ([], [f"${{{a}}}" for a in _FORGOTTEN])
 
 
 def test_bootstrap_holds_only_known_resource_types() -> None:
