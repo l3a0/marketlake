@@ -12,8 +12,9 @@ Two format notes match the design.
    sha256, its row count, and a fetch time. So both directions of the integrity scrub
    have something to check.
 2. Journal segments are Arrow IPC. Arrow IPC appends self-contained record batches, so
-   a segment torn mid-write stays readable up to its last complete batch. Segments are
-   manifest-less by rule, so the builder writes them without a manifest entry.
+   a segment torn mid-write stays readable up to its last complete batch. The scrub skips
+   ``journal/`` as a whole tree, so the builder writes segments without a manifest entry,
+   though capture records each segment it writes.
 
 The default schemas here are *fixture* schemas. They carry the provenance columns and
 a few vendor columns, enough to stand in for real partitions. They are not the pinned

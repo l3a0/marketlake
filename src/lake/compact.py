@@ -1473,7 +1473,7 @@ def _trim_step(
 
     1. The window has to clear its floor, which ``window.window_sessions`` judges.
     2. The role ``outbox.senders`` resolved has to be primary. A shadow's own trimmed ledger
-       would be reverted by the resync marketlake #832 plans, which would leave its trims
+       would be reverted by the resync (marketlake #832), which would leave its trims
        unexplained.
     3. The backup has to be a ``BucketBackup`` uploading to a ``BucketTarget``, whose last
        upload carries the deadline and the watermark the trim reads. A non-``None`` backup

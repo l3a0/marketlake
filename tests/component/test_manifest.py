@@ -501,8 +501,8 @@ def test_reverse_pass_catches_an_orphan(fixture_lake):
 def test_exclusion_set_is_honored(fixture_lake):
     lake = fixture_lake
     lake.with_chains("SPY", DAY)
-    # A journal segment (manifest-less by rule) and the manifest itself must not read
-    # as orphans.
+    # A journal segment, which the scrub skips with the rest of journal/, and the manifest
+    # itself must not read as orphans.
     lake.with_journal_segment(
         "chains", "SPY", DAY, sample_chains_table(), start_ts="20260824T160000", pid=4242
     )

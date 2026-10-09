@@ -1642,7 +1642,10 @@ lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of
 
 `deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of a whole lake. The
 close+15 compaction's trim deletes too, one chains partition at a time and only after the
-bucket's copy is verified, recording each in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). After the
+bucket's copy is verified, recording each in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). The
+resync's `--apply` deletes on purpose as well, only the covered journal segments and `bars/`
+partitions that the resuming host alone recorded
+([#832](https://github.com/l3a0/marketlake/issues/832)). After the
 cutover the same VM runs `role: primary`, where emptying the lake would delete every
 minute since the last nightly upload. So it refuses, and deletes nothing, unless all
 four of these hold:
