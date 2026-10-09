@@ -1231,6 +1231,15 @@
       bytes(lake.lake_bytes) + " across " + plural(lake.lake_files, "file", "files");
     var box = byId("lake-entries");
     clear(box);
+    // The oldest chains session on disk, and the tickers holding it. On a host that trims
+    // chains older than its window, this day moves forward every night, so a day that
+    // stands still is a trim that keeps stopping. The tickers tell one ticker held back
+    // from a trim that stopped for every ticker.
+    var oldest = lake.oldest_chains;
+    box.appendChild(el("p", oldest
+      ? "Oldest chains session on disk: " + oldest.day + ", held by " +
+        oldest.tickers.join(", ") + "."
+      : "No chains partition on disk.", "muted"));
     var wrap = el("div", null, "table-wrap");
     var table = el("table");
     var head = el("tr");

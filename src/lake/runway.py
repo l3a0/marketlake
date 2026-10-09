@@ -122,12 +122,14 @@ from pathlib import Path
 
 from lake.calendar import Calendar
 from lake.paths import (
+    CHAINS,
     JOURNAL_DIR,
     JSONL_SUFFIX,
     LOST_AND_FOUND,
     PARQUET_SUFFIX,
     TIMING_DIR,
     parse_date_dir,
+    parse_partition_rel,
 )
 
 # How many trailing calendar days the growth rate is measured over. It matches the
@@ -202,6 +204,20 @@ class Entry:
 
 
 @dataclass(frozen=True)
+class OldestChains:
+    """The oldest chains session still on disk, and every ticker holding a partition for it.
+
+    The trim (marketlake #787) drops chains partitions older than the window, so this day
+    moves forward each night a trim runs and stands still when it stops. ``tickers`` is
+    sorted, and names the ticker that holds the day back when one ticker's walk keeps its
+    partitions while the others trim.
+    """
+
+    day: date
+    tickers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Usage:
     """One read of the lake tree: what it holds, when it arrived, and what refused.
 
@@ -233,6 +249,11 @@ class Usage:
 
     ``refusals`` names what would not read, capped at ``NAMED_REFUSALS`` with
     ``refused`` holding the true count.
+
+    ``oldest_chains`` is the oldest chains partition's day and the tickers holding one for
+    it, or ``None`` when the lake holds no chains partition. It is read from the partition
+    paths alone, never from ``day_bytes``, whose oldest day is usually a quotes day that no
+    trim removes. It has a default so a ``Usage`` built directly keeps working.
     """
 
     entries: tuple[Entry, ...]
@@ -244,6 +265,7 @@ class Usage:
     files: int
     refusals: tuple[str, ...]
     refused: int
+    oldest_chains: OldestChains | None = None
 
     @property
     def total(self) -> int:
@@ -391,6 +413,10 @@ def walk(lake_root: Path | str) -> Usage:
     ``lost+found`` at the root is dropped before it is listed, for the reason the module
     docstring gives. One anywhere else is not the filesystem's, so it is walked and an
     unreadable one is still refused.
+
+    The same pass finds the oldest chains session on disk, by reading each path under
+    ``chains/`` with ``paths.parse_partition_rel``, so the panel can show how far a trim
+    has reached without a second walk.
     """
     root = Path(lake_root).resolve()
     entry_bytes: dict[str, int] = {}
@@ -400,6 +426,8 @@ def walk(lake_root: Path | str) -> Usage:
     journal_bytes: dict[date, int] = {}
     dated = undated = files = refused = 0
     refusals: list[str] = []
+    oldest_day: date | None = None
+    oldest_tickers: set[str] = set()
 
     def refuse(where: object, exc: OSError) -> None:
         """Name a refused path relative to the lake root, never absolutely.
@@ -466,6 +494,12 @@ def walk(lake_root: Path | str) -> Usage:
             entry = parts[0]
             entry_bytes[entry] = entry_bytes.get(entry, 0) + size
             entry_files[entry] = entry_files.get(entry, 0) + 1
+            ref = parse_partition_rel("/".join(parts)) if entry == CHAINS else None
+            if ref is not None and ref.surface == CHAINS:
+                if oldest_day is None or ref.day < oldest_day:
+                    oldest_day, oldest_tickers = ref.day, {ref.ticker}
+                elif ref.day == oldest_day:
+                    oldest_tickers.add(ref.ticker)
             timing = _is_timing_file(parts)
             day = _timing_day(parts) if timing else _day_of(parts)
             if day is None:
@@ -491,6 +525,11 @@ def walk(lake_root: Path | str) -> Usage:
         files=files,
         refusals=tuple(refusals),
         refused=refused,
+        oldest_chains=(
+            None
+            if oldest_day is None
+            else OldestChains(day=oldest_day, tickers=tuple(sorted(oldest_tickers)))
+        ),
     )
 
 

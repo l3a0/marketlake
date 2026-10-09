@@ -2810,6 +2810,11 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     An absent surface is a true zero and says so. Today ``actions/`` has never been
     written, and ``bars/`` did not exist the day this panel was specified, so absence is
     the ordinary case rather than the exotic one.
+
+    ``oldest_chains`` names the oldest chains session on disk and the tickers holding it,
+    or is ``None`` on a lake with no chains partition. On a host that trims (marketlake
+    #787) the day moves forward each night, so a day that stops moving is a trim that keeps
+    stopping, and the tickers say whether one ticker is held back while the rest trim.
     """
     try:
         runway = assess(
@@ -2824,6 +2829,7 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
 
     usage = runway.usage
     present = {entry.name for entry in usage.entries}
+    oldest = usage.oldest_chains
     return {
         "as_of": _iso(ctx.now),
         "error": None,
@@ -2859,6 +2865,11 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
         "short": runway.short,
         "refusals": list(usage.refusals),
         "refused": usage.refused,
+        "oldest_chains": (
+            None
+            if oldest is None
+            else {"day": oldest.day.isoformat(), "tickers": list(oldest.tickers)}
+        ),
     }
 
 
