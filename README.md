@@ -226,9 +226,9 @@ two steps change as follows.
    Run `first-upload` only on the host whose lake the bucket should hold, because it
    replaces the bucket's `manifest.jsonl`. It refuses when some path's latest entry in the
    bucket's copy is one this lake never recorded, such as the other host's sessions after
-   a switch, since replacing the copy would drop them from the bucket's record. Run `live-check` in the
-   same order, after the IAM role's write half is turned on, since the check writes probe
-   objects.
+   a switch, since replacing the copy would drop them from the bucket's record. Run
+   `live-check` in the same order, after the IAM role's write half is turned on, since the
+   check writes probe objects.
 
 The client asks the instance metadata service for credentials only when `config.yaml`
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
@@ -271,7 +271,8 @@ The restore, command 3, runs on either.
    `first-upload` refuses too.
    [#832](https://github.com/l3a0/marketlake/issues/832) adds the resync that brings the
    lake level. A line damaged in either manifest that still parses reads the same way.
-   When the damage is in the lake's own `manifest.jsonl`, the fix is to repair that line. `networkQuality -s`, built into macOS, measures upload capacity beforehand.
+   When the damage is in the lake's own `manifest.jsonl`, the fix is to repair that line.
+   `networkQuality -s`, built into macOS, measures upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
    downloads the current version of every object into `<dest>`, less what the next
    sentences leave out. `<dest>` must be empty or not exist yet, and the restore verifies
