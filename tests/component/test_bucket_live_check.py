@@ -45,7 +45,10 @@ def test_a_bucket_that_behaves_as_documented_passes_all_seven(tmp_path):
         "listed 1 object(s)"
     ) in lines
     assert "live-check: PASS 6 GetBucketVersioning returned Enabled" in lines
-    assert "live-check: PASS 7 GetObject of the probe returned the current version's bytes" in lines
+    assert (
+        "live-check: PASS 7 GetObject of the probe returned the current version's bytes "
+        "with VersionId v2"
+    ) in lines
     assert lines[-1].startswith("live-check: delete live-check/live-check-20261005T230000Z/")
     # The check runs on the VM too, where the credentials come from an instance profile,
     # so the line names the credentials rather than a key.
@@ -226,7 +229,44 @@ class _ServesFirstVersion(FakeS3):
 def test_a_plain_get_of_old_bytes_fails_grant_seven():
     passed, lines = _run(_ServesFirstVersion())
     assert not passed
-    assert "live-check: FAIL 7 GetObject of the probe returned other bytes" in lines
+    assert (
+        "live-check: FAIL 7 GetObject of the probe returned other bytes with VersionId v1, not v2"
+    ) in lines
+
+
+class _NamesNoVersion(FakeS3):
+    """A plain ``GetObject`` that serves the current bytes and names no version."""
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            del response["VersionId"]
+        return response
+
+
+class _NamesTheOldVersion(FakeS3):
+    """A plain ``GetObject`` that serves the current bytes and names the first version."""
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            response["VersionId"] = self.objects[kwargs["Key"]][0].version_id
+        return response
+
+
+@pytest.mark.parametrize(
+    ("fake", "shown"),
+    [(_NamesNoVersion, "VersionId None, not v2"), (_NamesTheOldVersion, "VersionId v1, not v2")],
+)
+def test_a_plain_get_that_misnames_the_current_version_fails_grant_seven(fake, shown):
+    # The bytes are right. The trim records the id the read returns, so a wrong or missing id
+    # fails the grant even then.
+    passed, lines = _run(fake())
+    assert not passed
+    assert (
+        f"live-check: FAIL 7 GetObject of the probe returned the current version's bytes with "
+        f"{shown}"
+    ) in lines
 
 
 @pytest.mark.parametrize(("fake", "code"), [(FakeS3, 0), (_DeniesMismatch, 1)])

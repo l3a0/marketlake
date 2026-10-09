@@ -2484,7 +2484,9 @@ def live_check(
 
     5. ``ListObjectsV2`` under the check's own prefix lists the probe.
     6. ``GetBucketVersioning`` answers ``Enabled``.
-    7. A plain ``GetObject`` of the probe returns the bytes of its current version.
+    7. A plain ``GetObject`` of the probe returns the bytes of its current version, and the
+       ``VersionId`` of that version. The trim records that id on its trim line
+       (marketlake #787), and a response without it would stop every trim.
 
     On the assume-role path the first request is where the role is assumed. A refusal
     there is STS's and not S3's verdict on behavior 1, so it is raised for ``main`` to
@@ -2590,9 +2592,13 @@ def live_check(
         return status == "Enabled", f"returned {status or 'no status'}"
 
     def current() -> tuple[bool, str]:
-        body = client.get_object(Bucket=target.bucket, Key=key)["Body"].read()
+        response = client.get_object(Bucket=target.bucket, Key=key)
+        body = response["Body"].read()
+        version = response.get("VersionId")
         held = "the current version's bytes" if body == replacement else "other bytes"
-        return body == replacement, f"of the probe returned {held}"
+        named = version == new_id and version not in (None, "", "null")
+        shown = f"VersionId {version}" if named else f"VersionId {version}, not {new_id}"
+        return body == replacement and named, f"of the probe returned {held} with {shown}"
 
     grant(5, "ListObjectsV2", listing)
     grant(6, "GetBucketVersioning", versioning)

@@ -239,8 +239,10 @@ The whole-lake restore runs on either.
    3's read-back of the first version fails with them, and the check says to confirm in
    the console that the probe key shows two versions. Three more lines prove the read
    grants the scrub and the restore need: a `ListObjectsV2` under the probe's prefix,
-   `GetBucketVersioning`, and a plain `GetObject` of the probe. So one run covers all four
-   of the role's S3 actions, even while `backup_target` is still a path.
+   `GetBucketVersioning`, and a plain `GetObject` of the probe, which has to name the
+   current version's `VersionId` as well as return its bytes, because the trim records that
+   id. So one run covers all four of the role's S3 actions, even while `backup_target` is
+   still a path.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
    an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,
