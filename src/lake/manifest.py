@@ -1751,8 +1751,11 @@ class RestoreResult:
         it accepted. Neither upload replaces an object whose stored checksum matches, and a
         sealed partition is written once, so its rotted current version is usually its
         only version. The repair is to put the lake's own copy of the file back by hand,
-        which ``README.md`` describes. A failed read there is the network or the bucket's
-        credentials rather than a cable.
+        which ``README.md`` describes. A partition the VM's trim removed (marketlake #787)
+        has no lake copy, and its single bucket version is its only copy. This test reads no
+        lake on purpose, so it cannot tell a trimmed partition from a present one, and the
+        line says so for every file rather than for the trimmed ones. A failed read there is
+        the network or the bucket's credentials rather than a cable.
         """
         lines = _named("restore read back bytes that do not match the manifest", self.mismatches)
         if self.mismatches and self.bucket:
@@ -1763,7 +1766,8 @@ class RestoreResult:
                 "at rest, and no upload replaces an object whose stored checksum matches. "
                 "Once the lake scrub passes on the file, put the lake's own copy back with "
                 "aws s3api put-object --checksum-algorithm SHA256, as README.md's bucket "
-                "section describes"
+                "section describes. A partition trimmed from the lake has no lake copy, and its "
+                "single bucket version is its only copy"
             )
         elif self.mismatches:
             lines.append(

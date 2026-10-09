@@ -28,14 +28,17 @@ It holds two kinds of line, told apart by ``kind``.
 2. A **restore line** supersedes a trim line for the same partition. It is never a deletion of
    the trim line, for the reason un-quarantine is a superseding entry.
 
-There is no kind that holds a partition back from the next trim. The owner decided on
-2026-10-07 (decision 5 on marketlake #755) that reading trimmed data restores the range into a
-directory outside the live lake, so nothing in the live lake needs such a hold.
+A restore line also holds its partition back from the trim until a split checkpoint from a
+session after the restore's day exists, which clause 6 in ``lake.trim`` decides, so a range
+restore lasts until the walk that needs it. No kind of line holds a partition for a reader. The
+owner decided on 2026-10-07 (decision 5 on marketlake #755) that reading trimmed data restores
+the range into a directory outside the live lake, the tool deferred to marketlake #837, so
+nothing in the live lake needs that kind of hold.
 
 A **designed absence** is a partition whose latest manifest sha equals the sha on its latest
 trimmed line, where that latest line is a trim line. A trim line beside a file that is still
 present, which a crash between the line and the unlink leaves, reads as present to every reader
-of the lake, because such a reader asks only about a file it already found absent. The rebuild in
+of the lake, because each one also finds the file absent before it counts it. The rebuild in
 ``lake.bucket.restore_lake`` asks about every key the bucket lists, and leaves out each one this
 calls designed, because the lake it rebuilds removed that file on purpose (marketlake #785). Any
 other missing file is still lost.
@@ -254,11 +257,13 @@ def is_designed_absence(
     entry per partition and ``trimmed_latest`` is :func:`latest_by_partition`'s answer. So a
     rebuild can ask it about the bucket's copies of both ledgers, where no local file exists.
 
-    A reader of the lake asks it only about a file it already found absent. A trim line beside a
-    present file is what a crash between the line and the unlink leaves, and that file is
-    present. The rebuild in ``lake.bucket.restore_lake`` is the one caller that asks about a file
-    it can see. It asks about every key the bucket lists, since the bucket never deletes and
-    still holds each trimmed partition, and leaves out each key this calls designed.
+    A reader of the lake counts a designed absence only for a file it finds absent. Most ask
+    only once the file is found absent. ``split_checkpoint._designed_absences`` asks first and
+    checks the file after, which gives the same answer. A trim line beside a present file is
+    what a crash between the line and the unlink leaves, and that file is present. The rebuild
+    in ``lake.bucket.restore_lake`` is the one caller that acts on this answer with no file to
+    check. It asks about every key the bucket lists, since the bucket never deletes and still
+    holds each trimmed partition, and leaves out each key this calls designed.
 
     The sha comparison is what keeps a re-sealed partition honest. Should a partition be trimmed
     and later receive a new manifest entry with different bytes, the old trim line no longer

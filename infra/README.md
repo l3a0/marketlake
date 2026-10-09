@@ -1583,16 +1583,19 @@ restore onto the VM.
    `config.yaml`, so the VM's restore rebuilds its trimmed lake
    ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out each partition
    the bucket's `trimmed.jsonl` says the VM removed on purpose, and the rest fits the
-   volume once trimming runs. A failed render writes nothing. On a new instance that
-   leaves no `config.yaml`, and the restore exits 2 on the missing file rather than
-   falling back to a whole-lake restore. On a kept instance the restore reads the file the
-   last good render wrote, which sets the key too. The "When the lake is gone" steps in
+   volume. A failed render writes nothing. On a new instance that leaves no `config.yaml`,
+   and the restore exits 2 on the missing file rather than falling back to a whole-lake
+   restore. On a kept instance the restore reads the file the last good render wrote, which
+   sets the key too. The "When the lake is gone" steps in
    [README.md](../README.md) say how to repair a refusal over the bucket's
    `trimmed.jsonl`. A one-off whole-lake restore passes `--config` naming a copy of
    `config.yaml` with the `lake_window_sessions` line deleted, not blanked, since a blank
    value refuses, and passes `--target` naming the bucket. The VM reaches the bucket
    through its instance profile, so the copy can hold placeholder values for the four
-   secrets and no secret is copied.
+   secrets and no secret is copied. A whole lake restored into the VM's own `lake_root`
+   lasts only until the trim runs again, because the VM's own `config.yaml` still sets the
+   key. Each partition it brings back beside a trim line takes the trim's recovery path and
+   is trimmed again.
 4. The restore refuses, with exit 2 and before any download, when the volume would be left
    with less free space than the journal reserve, 13 times the busiest sealed day in the
    bucket. Grow the lake volume first, as item 3 under
@@ -1637,7 +1640,9 @@ lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of
 3. Restore as the owner, with the command above.
 4. Rerun the bootstrap. Its install starts the stopped units.
 
-`deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of lake data. After the
+`deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of a whole lake. The
+close+15 compaction's trim deletes too, one chains partition at a time and only after the
+bucket's copy is verified, recording each in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). After the
 cutover the same VM runs `role: primary`, where emptying the lake would delete every
 minute since the last nightly upload. So it refuses, and deletes nothing, unless all
 four of these hold:

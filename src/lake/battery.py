@@ -829,6 +829,12 @@ def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list
     cannot: a sealed partition is immutable, there is no backfill, and :func:`trailing_medians`
     takes only sessions before the one it judges, so a whole-lake re-run is deterministic.
 
+    That holds on a lake nothing trimmed. On a host that trims chains past its window
+    (marketlake #787), a hand-run whole-lake pass finds fewer partitions, and
+    :func:`trailing_medians` runs on fewer sessions for the oldest days the window still holds.
+    So a re-run there can differ from the verdict the night itself reached. The nightly run is
+    unaffected, because the window is at least as long as the trailing median's reach.
+
     A name that does not parse as a date is skipped rather than raising. The walk is over a
     directory the operator can put a file in, and one stray name must not cost the run.
     """

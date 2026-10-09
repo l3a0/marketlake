@@ -764,6 +764,15 @@ def test_a_rotted_object_the_scrub_matched_fails_the_restore_and_withholds(tmp_p
         "put the lake's own copy back with aws s3api put-object --checksum-algorithm SHA256" in line
         for line in outcome.report
     )
+    # A partition the trim removed has no lake copy, and the line says so whichever file it
+    # is, because the restore test reads no lake (marketlake #787).
+    assert any(
+        line.endswith(
+            "A partition trimmed from the lake has no lake copy, and its single bucket version "
+            "is its only copy"
+        )
+        for line in outcome.report
+    )
     assert pinger.urls == []
 
 

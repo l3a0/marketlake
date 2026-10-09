@@ -16,11 +16,15 @@ code that depends on it untested.
    valid base64, so the value decodes, to 48 bytes. A value that decodes to the wrong 32
    bytes is refused as ``BadDigest``, HTTP 400.
 2. **Every PUT is a new version.** A key keeps a list of versions, newest last, so a test
-   can count versions to prove a second run sent nothing.
+   can count versions to prove a second run sent nothing. ``GetObject`` answers with the
+   ``VersionId`` of the version it served, on a plain read of the current version as on a
+   read of a named one, which is what S3 does on a versioned bucket.
 
 ``HeadObject`` on a missing key answers a bare 404, as S3 does for a key that holds
 ``s3:ListBucket``, and its error carries no body. ``fail_with`` makes every call raise one
 chosen error, which is how a test models a revoked key or a network that is down.
+``on_put`` and ``on_get`` run before a ``PutObject`` or a ``GetObject`` is answered, so a
+test can fail or time one kind of call alone.
 """
 
 from __future__ import annotations
@@ -89,12 +93,14 @@ class FakeS3:
         page_size: int = 1000,
         versioning: str | None = "Enabled",
         on_put=None,
+        on_get=None,
         deny_versioned_get: bool = False,
     ) -> None:
         self.bucket = bucket
         self.page_size = page_size
         self.versioning = versioning
         self.on_put = on_put
+        self.on_get = on_get
         self.deny_versioned_get = deny_versioned_get
         self.objects: dict[str, list[Version]] = {}
         self.calls: list[tuple[str, dict]] = []
@@ -201,17 +207,20 @@ class FakeS3:
 
     def get_object(self, **kwargs) -> dict:
         self._enter("get_object", kwargs)
+        if self.on_get is not None:
+            self.on_get(kwargs)
         versions = self.objects.get(kwargs["Key"])
         if not versions:
             raise client_error("NoSuchKey", "GetObject", 404)
         wanted = kwargs.get("VersionId")
         if wanted is None:
-            return {"Body": io.BytesIO(versions[-1].body)}
+            current = versions[-1]
+            return {"Body": io.BytesIO(current.body), "VersionId": current.version_id}
         if self.deny_versioned_get:
             raise client_error("AccessDenied", "GetObject", 403)
         for version in versions:
             if version.version_id == wanted:
-                return {"Body": io.BytesIO(version.body)}
+                return {"Body": io.BytesIO(version.body), "VersionId": version.version_id}
         raise client_error("NoSuchVersion", "GetObject", 404)
 
     def list_objects_v2(self, **kwargs) -> dict:

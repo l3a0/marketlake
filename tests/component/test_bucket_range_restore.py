@@ -108,9 +108,11 @@ def _lake(tmp_path: Path) -> tuple[Path, FakeS3, dict[str, bytes]]:
 
 
 def _trim_away(root: Path, client: FakeS3, rel: str, *, unlink: bool = True) -> str:
-    """Trim a partition the way marketlake #787 will: the trim line, then the unlink.
+    """Trim a partition in the order ``lake.trim`` does: the trim line, then the unlink.
 
-    It returns the bucket version the trim line records. ``unlink=False`` leaves the file, which
+    It stands in for the trim's bucket checks so a test can trim one chosen partition, and
+    ``tests/component/test_compaction_trim.py`` drives the real trim into the rebuild. It
+    returns the bucket version the trim line records. ``unlink=False`` leaves the file, which
     is what a trim that crashed between its line and its unlink leaves.
     """
     version = client.versions(TARGET.key(rel))[-1].version_id
