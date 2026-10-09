@@ -35,16 +35,17 @@ def _settings() -> dict:
     return yaml.safe_load(TRACKED_SETTINGS.read_text(encoding="utf-8"))
 
 
-def test_the_vm_runs_as_a_shadow():
-    """The VM shadows the laptop until the cutover.
+def test_the_vm_runs_as_the_primary():
+    """The VM is the primary capture host since #638's cutover.
 
-    #638's cutover flips ``role`` to ``primary`` in its own pull request and inverts this
-    test in the same change. Until then a VM that captured as primary would page the
-    owner and upload to the primary's bucket beside the laptop.
+    The cutover flipped ``role`` to ``primary`` in its own pull request and inverted this
+    test in the same change. The way back sets it to ``shadow`` and inverts it again, so a
+    VM and the laptop never both run as primary, paging the owner and uploading to one
+    bucket.
     """
     role = _settings()["role"]
     assert type(role) is str
-    assert role == "shadow"
+    assert role == "primary"
 
 
 def test_the_settings_hold_exactly_the_six_keys():

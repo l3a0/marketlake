@@ -1333,8 +1333,10 @@ describe the instance can read it. The boot takes two steps.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
-and the journal, not in healthchecks. The VM runs as `role: shadow`, and a shadow's pings
-go to its own `journal/outbox/` rather than to healthchecks.
+and the journal, not in healthchecks. A VM runs as the `role` that `config/vm.yaml` names.
+As `primary`, which it has been since [#638](https://github.com/l3a0/marketlake/issues/638)'s
+cutover, its pings reach healthchecks. As `shadow`, they go to its own `journal/outbox/`
+instead.
 
 Read the first boot on the apply's evening. Find the address as in
 [Find the VM's address](#find-the-vms-address), then open a session from the laptop.
