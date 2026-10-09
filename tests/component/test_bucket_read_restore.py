@@ -1162,6 +1162,78 @@ def test_the_plan_must_still_fit_on_another_filesystem(tmp_path):
         )
 
 
+def test_every_number_in_the_floor_line_is_its_own(tmp_path):
+    """A plan past a megabyte and a shortfall of a few hundred KB give four distinct figures.
+
+    The simple bucket's plan is a few KB, so in the previous floor test the plan and the
+    shortfall both print as 0.0 MB and the free space as 1000.0 MB, the floor's own figure.
+    Here they print as 1.2, 1000.0, 1000.9 and 0.3 MB. Catches the shortfall computed as 0, as
+    1, as ``free - floor`` or without the plan, and the line printing one figure in another's
+    place: the shortfall or 0 for the plan, the floor, ``free - needed`` or ``floor + needed``
+    for the free space, and the plan or 0 for the shortfall.
+    """
+    root, client = _simple(tmp_path)
+    grown = _chains("SPY", D3)
+    _record_in_bucket(client, grown, client.body(f"lake/{grown}") + b"\0" * 1_234_567)
+    needed = _needed(client)
+    assert needed > 1_000_000
+    free = needed + FLOOR - 345_678
+    short = tmp_path / "short"
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, short, root, free=free, device_of=_devices(root, same=False))
+
+    assert str(refused.value) == _floor_line(short, root, needed=needed, free=free)
+    assert ", 0.3 MB short of that floor" in str(refused.value)
+
+
+@pytest.mark.parametrize(("under", "shown"), [(49_999, "0.0"), (50_000, "0.1")])
+def test_the_floor_shortfall_is_exact_where_its_rounding_turns(tmp_path, under, shown):
+    """A shortfall of 49,999 bytes prints as 0.0 MB and one of 50,000 as 0.1 MB.
+
+    Catches the shortfall off by one byte either way, which no figure that rounds away from
+    a 0.05 MB boundary can show.
+    """
+    root, client = _simple(tmp_path)
+    needed = _needed(client)
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(
+            client,
+            tmp_path / "short",
+            root,
+            free=needed + FLOOR - under,
+            device_of=_devices(root, same=False),
+        )
+
+    assert f", {shown} MB short of that floor" in str(refused.value)
+
+
+def test_the_floor_is_read_from_runway(tmp_path, monkeypatch):
+    """A floor of 5 MB moves the boundary, the floor line and the reserve line's floor clause.
+
+    Catches ``restore_for_reading`` or ``_floor_refusal`` comparing against or printing a
+    literal 1 GB rather than ``runway.OFF_LAKE_FREE_FLOOR_BYTES``, and the reserve line's
+    floor clause written as the literal text 1000.0 MB. At the real floor each of these
+    prints and decides exactly as the constant does, so only a changed floor shows them.
+    """
+    monkeypatch.setattr(runway, "OFF_LAKE_FREE_FLOOR_BYTES", 5_000_000)
+    root, client = _simple(tmp_path)
+    needed = _needed(client)
+    elsewhere = _devices(root, same=False)
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, tmp_path / "short", root, free=needed + 5_000_000 - 1, device_of=elsewhere)
+    summary = _read(client, tmp_path / "exact", root, free=needed + 5_000_000, device_of=elsewhere)
+    monkeypatch.setattr(runway, "JOURNAL_RESERVE_SESSIONS", 10**9)
+    with pytest.raises(RestoreRefused) as reserve:
+        _read(client, tmp_path / "r", root, free=needed + 1, device_of=_devices(root, same=True))
+
+    assert "must keep 5.0 MB free beside it" in str(refused.value)
+    assert summary.restored is True
+    assert str(reserve.value).endswith("only 5.0 MB free beside the plan")
+
+
 def test_a_lake_root_that_cannot_be_statted_keeps_the_reserve(tmp_path):
     """With nothing to prove the filesystems apart, the reserve applies.
 
