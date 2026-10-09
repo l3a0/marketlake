@@ -6,8 +6,9 @@
 #
 #     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]
 #
-# The owner runs it by hand, and the CI half of #676 runs it through SSM Run Command after
-# each merge. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
+# The owner runs it by hand. It is also built for the CI half of #676, pull request #854,
+# which once merged runs it through SSM Run Command after the owner approves a merge's
+# deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
 # lists every line with what the owner does next. The progress goes to
 # /var/lib/marketlake/deploy.log, mode 0600, because a line from the bootstrap can carry a
 # config value and SSM keeps only the start of stdout.
@@ -37,8 +38,11 @@
 #        when the daemon's cgroup holds a process besides its main one, such as a
 #        compaction. It keeps the window's next_span_start for step 6;
 #     4. fetches origin main as the owner, and refuses with exit 2 a sha not on
-#        origin/main, a sha behind HEAD, a dirty tree or a branch other than main. Root
-#        then fast-forwards the checkout as the owner, holding the install lock;
+#        origin/main, a sha behind HEAD, a dirty tree or a branch other than main. It
+#        repeats step 3's busy checks, since the fetch can take minutes. Root then
+#        fast-forwards the checkout as the owner, holding the install lock. A merge that
+#        fails partway leaves HEAD where it was under a half-moved tree, so the script
+#        resets and cleans the tree back to that HEAD, holding the lock again;
 #     5. runs deploy/vm-bootstrap.sh from the new checkout, on every run, under a cap;
 #     6. decides whether a restart is owed: when the record is absent or names another
 #        sha, or when needrestart names a com.marketlake.* service still mapping a
@@ -48,7 +52,9 @@
 #        it restarts nothing;
 #     7. rolls back after a failed daemon restart, or after a failed bootstrap in a run
 #        that moved HEAD, by resetting to the previous HEAD and running the bootstrap
-#        again. After a failed daemon restart it restarts the daemon again;
+#        again. After a failed bootstrap it first waits for the busy checks, as before a
+#        restart, and rolls nothing back when they do not clear. After a failed daemon
+#        restart it restarts the daemon again;
 #     8. removes the record before every daemon restart, and writes it after a restart
 #        that held, following a bootstrap that exited 0. So the record names the running
 #        sha or is absent, and absent owes a restart.
@@ -66,8 +72,9 @@
 # back ends before that span opens. A test checks the sum against the window's margin.
 #
 # Unlike the refusals of the other deploy/ scripts, every last line goes to stdout, the
-# usage error included, because CI reads the host's outcome from there. CI prints that
-# line in a public log, so it holds only this script's own words, shas and counts, never
+# usage error included, because the CI side is built to read the host's outcome from
+# there. It prints that line in a public log, so the line holds only this script's own
+# words, shas and counts, never
 # a config value, a host path or a line of a step's output. A reason names the failed
 # step and points at deploy.log. Exit 0 comes only with a "deployed:" line for the
 # requested sha, and that line only with exit 0, and the wrapper reads any other pairing
@@ -88,7 +95,7 @@ FETCH_SECONDS=300                # git fetch, once
 INSTALL_LOCK_WAIT_SECONDS=600    # the install lock, for the merge and for a rollback's reset
 BOOTSTRAP_SECONDS=4500           # each of two bootstraps, the deploy's and a rollback's
 BOOTSTRAP_KILL_SECONDS=60        # timeout's wait between SIGTERM and SIGKILL
-BUSY_WAIT_SECONDS=900            # the wait for the busy checks before the restart
+BUSY_WAIT_SECONDS=900            # the wait for the busy checks, before a restart or a rollback
 RESTART_CHECK_SECONDS=180        # each of two restarts with their hold check
 REST_SECONDS=120                 # the window check, needrestart and the rest
 
@@ -105,7 +112,9 @@ UNKNOWN="outcome unknown: read deploy.log"
 FAILED_STEP=", with a failed step in deploy.log"
 NOT_RUN_BEFORE=", which has not run before"
 SHA_RE='^[0-9a-f]{40}$'
-EPOCH_RE='^[0-9]+$'
+# No leading zero, because bash reads one as octal, and 0999 is then an error rather than
+# a number.
+EPOCH_RE='^(0|[1-9][0-9]*)$'
 
 # Every variable the exit trap reads is set before the trap is.
 ROOT="${MARKETLAKE_INSTALL_ROOT:-}"
@@ -253,7 +262,7 @@ DEPLOY_LOCK="$ROOT/run/marketlake-deploy.lock"
 
 if [[ $INNER == 0 ]]; then
   # SSM's total timeout is the delivery timeout plus the document's, so a command to an
-  # agent that was down could otherwise start hours after its CI job ended.
+  # agent that was down could otherwise start hours after the CI job that sent it ended.
   if expired; then
     finish 3 "not deployed: the request expired"
   fi
@@ -276,7 +285,9 @@ if [[ $INNER == 0 ]]; then
   fi
   # Without -p StandardOutput a transient unit writes to the journal, which is not mode
   # 0600. Without --pipe, a write the agent stopped reading cannot kill the deploy with
-  # SIGPIPE.
+  # SIGPIPE. OOMPolicy=continue keeps the unit running when the kernel kills a child for
+  # memory, such as uv sync on a 2 GiB host, so that reads as a failed bootstrap and
+  # reaches the rollback rather than stopping the whole unit.
   ENVS=(--setenv="PATH=$PATH" --setenv="MARKETLAKE_DEPLOY_RESULT=$WRAPPER_RESULT")
   if [[ "${MARKETLAKE_INSTALL_TEST:-}" == 1 ]]; then
     ENVS+=(--setenv="MARKETLAKE_INSTALL_ROOT=$ROOT" --setenv="MARKETLAKE_INSTALL_TEST=1")
@@ -285,7 +296,7 @@ if [[ $INNER == 0 ]]; then
   if [[ -n "$NOT_AFTER" ]]; then
     INNER_ARGS+=(--not-after "$NOT_AFTER")
   fi
-  systemd-run --unit="$DEPLOY_UNIT" --wait --collect --quiet \
+  systemd-run --unit="$DEPLOY_UNIT" --wait --collect --quiet -p OOMPolicy=continue \
     -p "StandardOutput=append:$DEPLOY_LOG" -p "StandardError=append:$DEPLOY_LOG" \
     "${ENVS[@]}" "$SELF" "${INNER_ARGS[@]}" >&2 || true
 
@@ -308,10 +319,10 @@ if [[ $INNER == 0 ]]; then
   if [[ $READ == 0 || "$CONTENT" != *" "* || "$CONTENT" == *$'\n'* || -z "$LINE" ]]; then
     finish 1 "$UNKNOWN"
   fi
-  # 0 to 3 only. 127 means a missing script to CI, and 194 would make the SSM agent
-  # reboot the instance.
+  # 0 to 3 only. 127 would mean a missing script to the CI side, and 194 would make the
+  # SSM agent reboot the instance.
   # Exit 0 comes only with a deployed line for the requested sha, and that line only with
-  # exit 0, because CI pairs them and reads any other pairing as unknown.
+  # exit 0, because the CI side pairs them and reads any other pairing as unknown.
   OK=0
   if [[ "$LINE" == "deployed: $SHA" || "$LINE" == "deployed: $SHA (already current)" ]]; then
     OK=1
@@ -522,6 +533,28 @@ fi
 if ! git_owner merge-base --is-ancestor "$PREV" "$SHA" >/dev/null 2>&1; then
   finish 2 "not deployed: $SHA is behind the checkout's HEAD, $PREV"
 fi
+# The fetch and the checks above can take minutes, in which a timer job can start.
+BUSY_RC=0
+busy_check || BUSY_RC=$?
+case "$BUSY_RC" in
+  0) ;;
+  1) finish 3 "not deployed: $BUSY_REASON" ;;
+  *) finish 1 "not deployed: $BUSY_REASON" ;;
+esac
+
+# Returns the tree to PREV after a merge that failed partway, as the owner and holding the
+# install lock. clean takes -fd and never -x, so ignored files such as the venv stay. The
+# tree was clean before the merge, so nothing of the owner's is lost.
+restore_tree() {
+  local head dirty
+  logged flock -w "$INSTALL_LOCK_WAIT_SECONDS" "$INSTALL_LOCK" \
+    sudo -u "$OWNER" -H /bin/sh -c 'git -C "$1" reset -q --hard "$2" && git -C "$1" clean -fdq' \
+    restore "$CHECKOUT" "$PREV" || return 1
+  head="$(git_owner rev-parse HEAD)" || return 1
+  dirty="$(git_owner status --porcelain)" || return 1
+  [[ "$head" == "$PREV" && -z "$dirty" ]]
+}
+
 # Root takes the install lock, because a boot empties /run and the owner cannot create the
 # file there. flock releases it when the merge exits, before the bootstrap takes it.
 say "fast-forwarding $CHECKOUT from $PREV to $SHA, holding $INSTALL_LOCK"
@@ -529,10 +562,20 @@ logged flock -w "$INSTALL_LOCK_WAIT_SECONDS" "$INSTALL_LOCK" \
   sudo -u "$OWNER" -H git -C "$CHECKOUT" merge --ff-only "$SHA" || true
 HEAD_NOW="$(git_owner rev-parse HEAD)" || HEAD_NOW=""
 if [[ "$HEAD_NOW" != "$SHA" ]]; then
-  if [[ "$HEAD_NOW" == "$PREV" ]]; then
+  if [[ "$HEAD_NOW" != "$PREV" ]]; then
+    finish 1 "$UNKNOWN"
+  fi
+  # git writes the files one at a time and moves HEAD only once all are written, so a
+  # merge that failed partway leaves HEAD at PREV under a half-moved tree. A clean tree
+  # means it moved nothing, or never got the lock.
+  if DIRTY="$(git_owner status --porcelain)" && [[ -z "$DIRTY" ]]; then
     finish 1 "not deployed: the merge of $SHA failed, or another run held the install lock for $INSTALL_LOCK_WAIT_SECONDS seconds"
   fi
-  finish 1 "$UNKNOWN"
+  say "the failed merge changed the tree, so resetting it to $PREV"
+  if ! restore_tree; then
+    finish 1 "$UNKNOWN"
+  fi
+  finish 1 "not deployed: the merge of $SHA failed, and the tree was restored"
 fi
 MOVED=0
 if [[ "$PREV" != "$SHA" ]]; then
@@ -696,9 +739,13 @@ case "$BOOT_RC" in
   0|4) ;;
   *)
     # The daemon still runs the code it started with, so nothing restarts. A bootstrap
-    # that failed on a moved tree is undone.
+    # that failed on a moved tree is undone, once nothing reads the tree. A wait that runs
+    # out leaves the tree moved and the restart owed, as before a restart.
     REASON="the bootstrap of $SHA exited $BOOT_RC"
     if [[ $MOVED == 1 ]]; then
+      if ! wait_until_clear; then
+        finish 1 "$NOT_RESTARTED"
+      fi
       rollback "$REASON" 0
     fi
     if [[ $OWED == 1 ]]; then

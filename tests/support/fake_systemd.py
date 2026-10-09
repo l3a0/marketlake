@@ -46,7 +46,8 @@ creates the file and runs the command, unless the next code in ``FLOCK_FILE_RCS`
 0, which it exits with instead, as a lock held for the whole wait makes the real one. The
 fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. Its
 home field is ``FAKE_GETENT_HOME`` when that is set, even to nothing, and ``FAKE_HOME``
-otherwise. The
+otherwise. Its name field is ``FAKE_GETENT_NAME`` when that is set, as a directory that
+matches names without regard to case answers with the canonical one. The
 fake ``sudo`` clears the environment as the real one does. It keeps only ``PATH``,
 ``LOG``, ``STATE``, ``TOOLS``, every ``FAKE_*`` variable, the exit-code knobs named
 ``*_RC`` and ``*_RCS``, and the fake ``git``'s ``IS_REPO``, ``BRANCH`` and ``DIRTY``. It
@@ -56,9 +57,12 @@ sets ``HOME`` from ``FAKE_HOME``.
 
 1. ``timeout`` runs its command, unless ``FAKE_TIMEOUT_EXPIRES`` names the command's
    file name, which it answers with 124, as a command that ran out of time.
+   ``FAKE_TIMEOUT_BUSY`` names a service it leaves activating before the command runs,
+   as a timer job that starts during the deploy's fetch would be.
 2. ``systemd-run`` starts its command with only the ``--setenv`` pairs, systemd's default
-   ``PATH`` where no pair sets one, and the harness variables the fake ``sudo`` keeps, so a
-   variable the caller forgot to pass is missing, as on a real host. It sets
+   ``PATH`` where no pair sets one, the harness variables the fake ``sudo`` keeps, and the
+   fake ``systemctl``'s knobs, so a variable the caller forgot to pass is missing, as on a
+   real host. It sets
    ``INVOCATION_ID``, marks the unit active while the command runs, and keeps the
    command's pid in ``$STATE/inner-pid``. Output goes to the files the ``-p
    StandardOutput=append:`` and ``StandardError=append:`` properties name, and to
@@ -357,7 +361,8 @@ exec /usr/bin/env -i "${keep[@]}" "$@"
 FAKE_GETENT = """#!/bin/bash
 printf 'getent %s\\n' "$*" >> "$LOG"
 if [[ "$1" == "passwd" && ( "$2" == "$FAKE_OWNER" || "$2" == 1000 ) ]]; then
-  echo "$FAKE_OWNER:x:1000:1000:Some One:${FAKE_GETENT_HOME-$FAKE_HOME}:/bin/bash"
+  name="${FAKE_GETENT_NAME:-$FAKE_OWNER}"
+  echo "$name:x:1000:1000:Some One:${FAKE_GETENT_HOME-$FAKE_HOME}:/bin/bash"
   exit 0
 fi
 exit 2
@@ -441,6 +446,10 @@ shift
 case " ${FAKE_TIMEOUT_EXPIRES:-} " in
   *" ${1##*/} "*) exit 124 ;;
 esac
+if [[ -n "${FAKE_TIMEOUT_BUSY:-}" ]]; then
+  mkdir -p "$STATE/activating"
+  : > "$STATE/activating/$FAKE_TIMEOUT_BUSY"
+fi
 exec "$@"
 """
 
@@ -494,6 +503,7 @@ for name in $(compgen -e); do
   case "$name" in
     PATH) ;;
     LOG|STATE|TOOLS|FAKE_*|*_RC|*_RCS|IS_REPO|BRANCH|DIRTY) keep+=("$name=${!name}") ;;
+    FAIL_SHOW|FAIL_START|RESTART_MODE|RESTART_DELAY) keep+=("$name=${!name}") ;;
   esac
 done
 keep+=(${pairs[@]+"${pairs[@]}"} "INVOCATION_ID=fake$RANDOM$RANDOM")

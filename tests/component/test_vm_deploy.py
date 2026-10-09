@@ -31,12 +31,15 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from lake import control_plane as cp
 from lake import deploy_window
+from lake.calendar import MARKET_TZ
+from tests.support.clock import ManualClock
 from tests.support.fake_bin import body_path, checked_links, dispatcher, install
 from tests.support.fake_disk import FAKE_VENV_PYTHON, install_disk_fakes
 from tests.support.fake_systemd import NEXT_RC, install_deploy_fakes
@@ -497,7 +500,7 @@ def test_the_wrapper_starts_the_inner_run_as_a_unit_with_its_log(vm):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     [run] = vm.ran("systemd-run ")
     assert run.startswith(
-        "systemd-run --unit=marketlake-deploy --wait --collect --quiet"
+        "systemd-run --unit=marketlake-deploy --wait --collect --quiet -p OOMPolicy=continue"
         f" -p StandardOutput=append:{vm.deploy_log} -p StandardError=append:{vm.deploy_log}"
         f" --setenv=PATH={vm.env['PATH']} --setenv=MARKETLAKE_DEPLOY_RESULT={vm.root}/run/"
         "marketlake-deploy.result."
@@ -595,12 +598,16 @@ def test_no_record_owes_a_restart_on_the_same_sha(vm):
     assert vm.recorded() == vm.c["c1"]
 
 
-def test_a_malformed_record_reads_as_absent(vm):
-    vm.record("not a sha")
-    proc = vm.deploy(vm.c["c1"])
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _outcome(proc) == f"deployed: {vm.c['c1']}"
-    assert vm.recorded() == vm.c["c1"]
+def test_a_malformed_record_reads_as_absent_and_is_never_printed(vm):
+    """The record is a file on the host, so its text must not reach the public line."""
+    vm.record("RECORD-TEXT-FROM-THE-HOST")
+    proc = vm.deploy(vm.c["c1"], BOOTSTRAP_RCS="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c1']}, and the last recorded deploy is none"
+    )
+    assert "RECORD-TEXT" not in proc.stdout
+    assert vm.recorded() == "RECORD-TEXT-FROM-THE-HOST"
 
 
 # -- deployed, with a suffix -----------------------------------------------------------
@@ -702,6 +709,12 @@ def test_a_failed_bootstrap_on_a_moved_tree_rolls_back_without_a_restart(vm):
     assert vm.bootstraps() == [vm.c["c3"], vm.c["c1"]]
     assert not vm.ran("restart.sh")
     assert vm.recorded() == vm.c["c1"]
+    # The busy checks run again between the failed bootstrap and the reset.
+    calls = vm.calls()
+    listing = "systemctl list-units --type=service --all --no-legend --plain com.marketlake.*"
+    reset = next(i for i, line in enumerate(calls) if "reset --keep" in line)
+    first_boot = calls.index(f"bootstrap {vm.c['c3']}")
+    assert listing in calls[first_boot:reset], calls
 
 
 def test_a_rollback_bootstrap_exit_4_adds_the_failed_step(vm):
@@ -713,31 +726,55 @@ def test_a_rollback_bootstrap_exit_4_adds_the_failed_step(vm):
 
 
 @pytest.mark.parametrize(
-    ("env", "line"),
+    ("env", "line", "record"),
     [
         (
             {"DAEMON_RESTART_RCS": "1"},
             "rollback to {c1} failed: restart.sh daemon exited 1, and then restart.sh daemon"
             " exited 1",
+            None,
         ),
         (
             {"BOOTSTRAP_RCS": "1"},
             "rollback to {c1} failed: the bootstrap of {c3} exited 1, and the rollback's"
             " bootstrap exited 1",
+            "c1",
         ),
         (
             {"BOOTSTRAP_RCS": "0 2", "DAEMON_RESTART_RCS": "1"},
             "rollback to {c1} failed: restart.sh daemon exited 1, and the rollback's bootstrap"
             " exited 2",
+            None,
+        ),
+        (
+            {"DAEMON_RESTART_RCS": "1 0", "FLOCK_FILE_RCS": "0 1"},
+            "rollback to {c1} failed: restart.sh daemon exited 1, and the reset to it failed",
+            None,
         ),
     ],
-    ids=["restart again", "bootstrap again", "bootstrap after a restart"],
+    ids=["restart again", "bootstrap again", "bootstrap after a restart", "reset"],
 )
-def test_a_rollback_that_fails_too_says_so(vm, env, line):
+def test_a_rollback_that_fails_too_says_so(vm, env, line, record):
+    """A daemon restart removes the record, and nothing after a failed rollback writes it."""
+    vm.record(vm.c["c1"])
     proc = vm.deploy(vm.c["c3"], **env)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _outcome(proc) == line.format(**vm.c)
-    assert vm.recorded() is None or vm.recorded() == vm.c["c1"]
+    assert vm.recorded() == (None if record is None else vm.c[record])
+
+
+def test_a_failed_reset_stops_the_rollback_before_its_bootstrap(vm):
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(vm.c["c3"], DAEMON_RESTART_RCS="1 0", FLOCK_FILE_RCS="0 1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"rollback to {vm.c['c1']} failed: restart.sh daemon exited 1, and the reset to it failed"
+    )
+    # The tree stays where the merge put it, and nothing runs or restarts on it again.
+    assert vm.head() == vm.c["c3"]
+    assert vm.bootstraps() == [vm.c["c3"]]
+    assert vm.ran("restart.sh") == ["restart.sh daemon"]
+    assert vm.recorded() is None
 
 
 # -- not restarted ---------------------------------------------------------------------
@@ -760,24 +797,64 @@ def test_a_busy_service_that_outlasts_the_wait_leaves_the_restart_owed(vm):
 
 
 def test_a_span_too_close_for_a_restart_leaves_it_owed(vm):
+    vm.record(vm.c["c1"])
     soon = str(int(time.time()) + 100)
     proc = vm.deploy(vm.c["c3"], FAKE_NEXT_SPAN=soon)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _outcome(proc) == (
-        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is none"
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is {vm.c['c1']}"
     )
     assert not vm.ran("sleep")
     assert not vm.ran("restart.sh")
+    assert vm.head() == vm.c["c3"]
+    assert vm.recorded() == vm.c["c1"]
 
 
-def test_a_failed_bootstrap_on_an_unmoved_tree_leaves_an_owed_restart(vm):
+@pytest.mark.parametrize("record", [None, "c2"], ids=["no record", "another sha"])
+def test_a_failed_bootstrap_on_an_unmoved_tree_leaves_an_owed_restart(vm, record):
+    if record is not None:
+        vm.record(vm.c[record])
     proc = vm.deploy(vm.c["c1"], BOOTSTRAP_RCS="1")
     assert proc.returncode == 1, proc.stdout + proc.stderr
+    named = "none" if record is None else vm.c[record]
     assert _outcome(proc) == (
-        f"not restarted: the tree is at {vm.c['c1']}, and the last recorded deploy is none"
+        f"not restarted: the tree is at {vm.c['c1']}, and the last recorded deploy is {named}"
     )
     assert vm.bootstraps() == [vm.c["c1"]]
     assert not vm.ran("restart.sh")
+    assert vm.recorded() == (None if record is None else vm.c[record])
+
+
+# A failed bootstrap on a moved tree rolls back only once nothing reads the tree, the same
+# wait the restart takes.
+
+
+def test_a_busy_service_after_a_failed_bootstrap_leaves_the_tree_moved(vm):
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(vm.c["c3"], BOOTSTRAP_RCS="1 0", FAKE_BOOTSTRAP_BUSY=SWEEP)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is {vm.c['c1']}"
+    )
+    assert vm.ran("sleep") == ["sleep 30"] * 30
+    assert vm.head() == vm.c["c3"]
+    assert vm.bootstraps() == [vm.c["c3"]]
+    assert not [line for line in vm.calls() if "reset" in line]
+    assert not vm.ran("restart.sh")
+    assert vm.recorded() == vm.c["c1"]
+
+
+def test_a_span_too_close_after_a_failed_bootstrap_leaves_the_tree_moved(vm):
+    vm.record(vm.c["c1"])
+    soon = str(int(time.time()) + 100)
+    proc = vm.deploy(vm.c["c3"], BOOTSTRAP_RCS="1 0", FAKE_NEXT_SPAN=soon)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is {vm.c['c1']}"
+    )
+    assert vm.head() == vm.c["c3"]
+    assert vm.bootstraps() == [vm.c["c3"]]
+    assert vm.recorded() == vm.c["c1"]
 
 
 def test_a_stopped_daemon_does_not_count_as_busy_in_the_wait(vm):
@@ -864,6 +941,78 @@ def test_an_install_lock_held_through_the_wait_is_not_deployed(vm):
     _assert_untouched(vm)
 
 
+def test_a_service_that_starts_during_the_fetch_refuses_the_merge(vm):
+    proc = vm.deploy(vm.c["c2"], FAKE_TIMEOUT_BUSY=SWEEP)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: {SWEEP} is activating"
+    _assert_untouched(vm)
+
+
+def _commit_that_writes_into_deploy(vm: VM) -> str:
+    """Give the checkout an origin of its own whose main adds a file under deploy/.
+
+    The new commit adds NEWFILE, changes VERSION and adds deploy/extra. git writes them in
+    index order, so with deploy/ read-only the merge fails after it wrote the first two.
+    """
+    origin = vm.tmp / "origin-extra.git"
+    _git(vm.tmp, "clone", "-q", "--bare", str(vm.tools.origin), str(origin))
+    work = vm.tmp / "work-extra"
+    _git(vm.tmp, "clone", "-q", str(origin), str(work))
+    (work / "NEWFILE").write_text("extra\n")
+    (work / "VERSION").write_text("extra\n")
+    (work / "deploy" / "extra").write_text("extra\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "extra")
+    _git(work, "push", "-q", "origin", "main")
+    _git(vm.checkout, "remote", "set-url", "origin", str(origin))
+    return _git(work, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("restored", [True, False], ids=["restored", "restore fails"])
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_a_merge_that_fails_partway_restores_the_tree(vm, restored):
+    sha = _commit_that_writes_into_deploy(vm)
+    deploy = vm.checkout / "deploy"
+    deploy.chmod(0o555)
+    try:
+        env = {} if restored else {"FLOCK_FILE_RCS": "0 1"}
+        proc = vm.deploy(sha, **env)
+    finally:
+        deploy.chmod(0o755)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert vm.head() == vm.c["c1"]
+    assert not vm.ran("bootstrap ")
+    assert not vm.ran("restart.sh")
+    status = _git(vm.checkout, "status", "--porcelain")
+    if restored:
+        assert _outcome(proc) == (
+            f"not deployed: the merge of {sha} failed, and the tree was restored"
+        )
+        assert status == ""
+        assert (vm.checkout / "VERSION").read_text() == "c1\n"
+        assert not (vm.checkout / "NEWFILE").exists()
+        # The ignored venv survives the clean.
+        assert (vm.checkout / ".venv" / "bin" / "python").is_symlink()
+    else:
+        assert _outcome(proc) == UNKNOWN
+        # The merge really did write files before it failed.
+        assert "?? NEWFILE" in status.splitlines()
+        assert "M VERSION" in status
+
+
+def test_a_head_moved_elsewhere_by_the_merge_is_an_unknown_outcome(vm):
+    """A post-merge hook stands for anything else that moves HEAD under the merge."""
+    hook = vm.checkout / ".git" / "hooks" / "post-merge"
+    hook.write_text(f"#!/bin/sh\nexec git reset -q --hard {vm.c['c2']}\n")
+    hook.chmod(0o755)
+    proc = vm.deploy(vm.c["c3"])
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == UNKNOWN
+    assert vm.head() == vm.c["c2"]
+    assert not vm.ran("bootstrap ")
+    assert not vm.ran("restart.sh")
+
+
 @pytest.mark.parametrize("state", ["stopped", "activating", "failed"])
 def test_a_daemon_that_is_not_active_is_left_alone(vm, state):
     vm.stop(DAEMON)
@@ -902,8 +1051,12 @@ def test_the_window_refusal_is_the_last_line(vm):
             {"FAKE_NEXT_SPAN": "soon"},
             "not deployed: python -m lake.deploy_window printed no next_span_start line",
         ),
+        (
+            {"FAKE_NEXT_SPAN": "04102444800"},
+            "not deployed: python -m lake.deploy_window printed no next_span_start line",
+        ),
     ],
-    ids=["exit 1", "one line", "not a number"],
+    ids=["exit 1", "one line", "not a number", "a leading zero"],
 )
 def test_a_window_check_that_fails_is_not_deployed(vm, env, line):
     proc = vm.deploy(vm.c["c2"], **env)
@@ -1009,9 +1162,14 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
             ["--sha", "a" * 40, "--not-after", "soon"],
             "not deployed: --not-after must be epoch seconds",
         ),
+        # bash reads a leading zero as octal, and 0999 is no octal number.
+        (
+            ["--sha", "a" * 40, "--not-after", "0999"],
+            "not deployed: --not-after must be epoch seconds",
+        ),
         (["--sha", "a" * 40, "--help"], None),
     ],
-    ids=["nothing", "no value", "not hex", "bad expiry", "unknown flag"],
+    ids=["nothing", "no value", "not hex", "bad expiry", "octal expiry", "unknown flag"],
 )
 def test_a_usage_error_is_one_line_on_stdout(vm, argv, line):
     proc = vm.run([str(vm.script), *argv])
@@ -1051,8 +1209,15 @@ def test_a_unit_that_never_ran_is_an_unknown_outcome(vm):
 
 @pytest.mark.parametrize(
     "content",
-    ["7 deployed: x\\n", "194 deployed: x\\n", "deployed\\n", "0 deployed: x\\nmore\\n", "0 \\n"],
-    ids=["code 7", "code 194", "no code", "two lines", "no line"],
+    [
+        "7 deployed: x\\n",
+        "194 deployed: x\\n",
+        "deployed\\n",
+        "1\\n",
+        "1 not deployed: x\\nmore\\n",
+        "1 \\n",
+    ],
+    ids=["code 7", "code 194", "no code", "code only", "two lines", "no line"],
 )
 def test_a_malformed_result_is_an_unknown_outcome(vm, content):
     proc = vm.deploy(vm.c["c2"], FAKE_SYSTEMD_RUN="result", FAKE_RESULT=content)
@@ -1093,6 +1258,25 @@ def test_any_other_pairing_of_code_and_line_is_unknown(vm, code, line):
     assert _outcome(proc) == UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "eastern",
+    [
+        datetime(2026, 10, 12, 12, 0),  # a Monday inside the weekday span, in EDT
+        datetime(2026, 10, 12, 6, 0),  # less than the margin before that span
+        datetime(2026, 12, 13, 21, 0),  # inside the Sunday span, in EST
+    ],
+    ids=["in a span", "in the margin", "in winter"],
+)
+def test_the_real_window_refusal_has_the_shape_the_script_repeats(capsys, eastern):
+    """The script passes the window's line to the public log only when it has this shape."""
+    pattern = re.search(r"^WINDOW_LINE_RE='(.+)'$", VM_DEPLOY.read_text(), flags=re.MULTILINE)
+    assert pattern is not None
+    now = eastern.replace(tzinfo=MARKET_TZ).astimezone(UTC)
+    assert deploy_window.main([], clock=ManualClock(now)) == deploy_window.REFUSED
+    first = capsys.readouterr().out.splitlines()[0]
+    assert re.fullmatch(pattern.group(1), first), first
+
+
 def test_a_window_line_of_another_shape_is_not_repeated(vm):
     proc = vm.deploy(vm.c["c2"], FAKE_WINDOW_RC="3", FAKE_WINDOW_LINE=f"refused, see {vm.root}/etc")
     assert proc.returncode == 3, proc.stdout + proc.stderr
@@ -1106,6 +1290,118 @@ def test_an_owner_with_no_account_is_not_named(vm):
     assert _outcome(proc) == (
         "not deployed: the OWNER in bootstrap.conf names no account on this host"
     )
+
+
+@pytest.mark.parametrize(
+    ("conf", "line"),
+    [
+        (None, "not deployed: /etc/marketlake/bootstrap.conf is missing"),
+        (
+            f"OWNER={OWNER}\nnot a pair\n",
+            "not deployed: bootstrap.conf holds a line that is not KEY=VALUE",
+        ),
+        (
+            f"OWNER={OWNER}\nOWNER={OWNER}\n",
+            "not deployed: bootstrap.conf sets OWNER twice",
+        ),
+        (
+            f"OWNER={OWNER}\nLAKE_VOLUME_ID={VOLUME_ID}\nLAKE_VOLUME_ID={VOLUME_ID}\n",
+            "not deployed: bootstrap.conf sets LAKE_VOLUME_ID twice",
+        ),
+        (
+            f"OWNER={OWNER}\nREGION=us-east-1\n",
+            "not deployed: bootstrap.conf holds an unknown key",
+        ),
+        (
+            f"LAKE_VOLUME_ID={VOLUME_ID}\n",
+            "not deployed: bootstrap.conf must set OWNER to an account name",
+        ),
+        (
+            "OWNER=1000\n",
+            "not deployed: bootstrap.conf must set OWNER to an account name",
+        ),
+    ],
+    ids=["missing", "not a pair", "owner twice", "volume twice", "unknown key", "no owner", "uid"],
+)
+def test_a_bootstrap_conf_it_cannot_use_is_refused(vm, conf, line):
+    if conf is None:
+        vm.conf.unlink()
+    else:
+        vm.conf.write_text(conf)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert _outcome(proc) == line
+    assert not vm.ran("systemd-run")
+
+
+@pytest.mark.parametrize(
+    ("env", "line"),
+    [
+        (
+            {"FAKE_GETENT_NAME": "Someone"},
+            "not deployed: the OWNER in bootstrap.conf is a uid. Give the account name",
+        ),
+        (
+            {"FAKE_GETENT_HOME": ""},
+            "not deployed: the OWNER in bootstrap.conf has no home directory",
+        ),
+    ],
+    ids=["another name", "no home"],
+)
+def test_an_account_entry_it_cannot_use_is_refused(vm, env, line):
+    proc = vm.deploy(vm.c["c2"], **env)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert _outcome(proc) == line
+    assert not vm.ran("systemd-run")
+
+
+def test_a_state_directory_it_cannot_create_is_not_deployed(vm):
+    (vm.root / "var" / "lib").mkdir(parents=True)
+    vm.var.write_text("a file where the directory goes\n")
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: could not create /var/lib/marketlake at mode 0700"
+    assert not vm.ran("systemd-run")
+
+
+def test_a_deploy_log_it_cannot_create_is_not_deployed(vm):
+    vm.deploy_log.mkdir(parents=True)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: could not create deploy.log at mode 0600"
+    assert not vm.ran("systemd-run")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_a_result_file_it_cannot_create_is_not_deployed(vm):
+    run = vm.root / "run"
+    run.chmod(0o555)
+    try:
+        proc = vm.deploy(vm.c["c2"])
+    finally:
+        run.chmod(0o755)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: could not create a result file in /run"
+    assert not vm.ran("systemd-run")
+
+
+def test_a_daemon_show_that_fails_is_not_deployed(vm):
+    proc = vm.deploy(vm.c["c2"], FAIL_SHOW=DAEMON)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: systemctl show failed for {DAEMON}"
+    _assert_untouched(vm)
+
+
+def test_a_main_pid_of_0_after_a_restart_is_not_running(vm):
+    """systemd reads MainPID=0 for an active unit whose process has not started yet."""
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(vm.c["c3"], RESTART_DELAY="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    reason = "the daemon was not running after its restart"
+    assert _outcome(proc) == f"rollback to {vm.c['c1']} failed: {reason}, and then {reason}"
+    # The first read after the restart answers 0, so no hold check sleeps.
+    assert not vm.ran("sleep 120")
+    assert vm.recorded() is None
 
 
 def test_a_signal_during_the_run_reports_an_unknown_outcome(vm):
