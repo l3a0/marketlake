@@ -59,7 +59,9 @@ import sys
 from pathlib import Path
 
 from tests.support.fake_bin import install
-from tests.support.fake_systemd import install_fakes
+from tests.support.fake_systemd import NEXT_RC, install_fakes
+
+__all__ = ["NEXT_RC", "install_disk_fakes"]
 
 FAKE_UUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 
@@ -291,22 +293,6 @@ fi
 exec /bin/cat "$@"
 """
 
-# A sequence of exit codes, one per call, read from a space-separated list. The last code
-# repeats once the list runs out, and an empty list answers 0. The count lives in $STATE,
-# so a sequence survives across processes.
-NEXT_RC = r"""next_rc() {
-  local name="$1" list="$2" n=0 i=0 rc=0 code
-  if [[ -f "$STATE/count-$name" ]]; then n="$(<"$STATE/count-$name")"; fi
-  printf '%s' "$((n + 1))" > "$STATE/count-$name"
-  for code in $list; do
-    rc="$code"
-    if [[ $i == "$n" ]]; then break; fi
-    i=$((i + 1))
-  done
-  echo "$rc"
-}
-"""
-
 # The checkout's deploy/linux-install.sh, which test_control_plane_systemd.py runs for real.
 FAKE_LINUX_INSTALL = (
     "#!/bin/bash\n"
@@ -316,7 +302,9 @@ FAKE_LINUX_INSTALL = (
 )
 
 # The checkout's venv interpreter. The render and the roster read stdin, which the fake
-# keeps so a test can check what each was fed.
+# keeps so a test can check what each was fed. The deploy window prints its two lines,
+# FAKE_WINDOW_LINE and a next_span_start of FAKE_NEXT_SPAN, and exits FAKE_WINDOW_RC.
+# FAKE_WINDOW_BAD prints one line with no span instead.
 FAKE_VENV_PYTHON = (
     "#!/bin/bash\n"
     'printf \'venv-python %s\\n\' "$*" >> "$LOG"\n'
@@ -325,6 +313,11 @@ FAKE_VENV_PYTHON = (
   lake.vm_config) cat > "$STATE/stdin-render"; exit "$(next_rc render "${RENDER_RCS:-}")" ;;
   lake.token_store) exit "$(next_rc pull "${PULL_RCS:-}")" ;;
   lake.roster) cat > "$STATE/stdin-roster"; exit "$(next_rc roster "${ROSTER_RCS:-}")" ;;
+  lake.deploy_window)
+    if [[ -n "${FAKE_WINDOW_BAD:-}" ]]; then echo "a deploy may start now"; exit 0; fi
+    echo "${FAKE_WINDOW_LINE:-a deploy may start now, and until Mon 2026-10-12 04:30 EDT}"
+    echo "next_span_start=${FAKE_NEXT_SPAN:-4102444800}"
+    exit "${FAKE_WINDOW_RC:-0}" ;;
 esac
 echo "fake venv python: unexpected module $2" >&2
 exit 9

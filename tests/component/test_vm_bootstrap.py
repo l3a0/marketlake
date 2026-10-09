@@ -47,6 +47,9 @@ ROOT_LINE = "LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n"
 SYNC = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT} --sync-only"
 INSTALL = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}"
 FINISHED = "vm-bootstrap: finished with a failed step, listed above"
+# The last line of a run whose final install succeeded after a config step failed, which
+# exits 4 so a deploy can tell it from a run that stopped before the units.
+CONFIG_FAILED = "vm-bootstrap: installed the units, but a config step failed, listed above"
 VM_YAML = (
     "role: shadow\n"
     f"lake_root: {LAKE_ROOT}\n"
@@ -731,7 +734,8 @@ def test_uv_is_installed_when_the_version_differs(vm, installed):
     [curl] = vm.ran("curl")
     installer = curl.split(" -o ")[1].split()[0]
     assert curl == (
-        f"curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-all-errors -o {installer}"
+        "curl --proto =https --tlsv1.2 -fsSL --retry 5 --retry-all-errors"
+        f" --connect-timeout 20 --max-time 300 -o {installer}"
         f" https://astral.sh/uv/{UV_VERSION}/install.sh"
     )
     # mktemp makes the file in the test's temporary directory, so the check below that it
@@ -922,7 +926,7 @@ def test_the_render_retries_exits_1_and_3(vm, rcs):
 
 def test_a_render_refusal_is_final_and_skips_what_reads_config(vm):
     proc = vm.bootstrap(RENDER_RCS="2")
-    assert proc.returncode == 1
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     assert len(vm.ran("venv-python -m lake.vm_config")) == 1
     assert not vm.ran("sleep")
     assert not vm.ran("venv-python -m lake.token_store")
@@ -933,12 +937,12 @@ def test_a_render_refusal_is_final_and_skips_what_reads_config(vm):
     # The units are still installed, into the restart loop a missing config.yaml causes.
     assert vm.ran("linux-install") == [SYNC, INSTALL]
     assert vm.index("venv-python -m lake.vm_config render") < vm.index(INSTALL)
-    assert proc.stderr.splitlines()[-1] == FINISHED
+    assert proc.stderr.splitlines()[-1] == CONFIG_FAILED
 
 
 def test_the_render_retries_are_bounded(vm):
     proc = vm.bootstrap(RENDER_RCS="3")
-    assert proc.returncode == 1
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     assert len(vm.ran("venv-python -m lake.vm_config")) == 6
     assert vm.ran("sleep") == ["sleep 20"] * 5
     assert "the config render exited 3 on all 6 attempts" in proc.stderr
@@ -951,7 +955,7 @@ def test_the_pull_retries_exit_3_and_stops_on_2(vm):
     assert len(vm.ran("venv-python -m lake.token_store")) == 2
     (vm.state / "count-pull").unlink()
     refused = vm.bootstrap(PULL_RCS="2")
-    assert refused.returncode == 1
+    assert refused.returncode == 4, refused.stdout + refused.stderr
     assert len(vm.ran("venv-python -m lake.token_store")) == 1
     assert "the token pull exited 2, which is not retried" in refused.stderr
     # The roster does not need the token, so it still runs.
@@ -960,20 +964,40 @@ def test_the_pull_retries_exit_3_and_stops_on_2(vm):
 
 def test_a_roster_refusal_prints_and_finishes_the_run(vm):
     proc = vm.bootstrap(ROSTER_RCS="2")
-    assert proc.returncode == 1
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     assert len(vm.ran("venv-python -m lake.roster")) == 1
     assert "vm-bootstrap: the roster apply exited 2" in proc.stderr.splitlines()
     assert vm.ran("linux-install") == [SYNC, INSTALL]
     assert vm.index("venv-python -m lake.roster apply") < vm.index(INSTALL)
-    assert proc.stderr.splitlines()[-1] == FINISHED
+    assert proc.stderr.splitlines()[-1] == CONFIG_FAILED
 
 
 def test_a_lock_that_never_frees_skips_the_python_steps(vm):
     proc = vm.bootstrap(FLOCK_RC="1")
-    assert proc.returncode == 1
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     assert vm.ran("linux-install")
     assert not vm.ran("venv-python")
     assert "held" in proc.stderr
+    assert proc.stderr.splitlines()[-1] == CONFIG_FAILED
+
+
+@pytest.mark.parametrize(
+    ("env", "line"),
+    [
+        ({"RENDER_RCS": "2"}, "the config render exited 2, which is not retried"),
+        ({"ROSTER_RCS": "2"}, "the roster apply exited 2"),
+    ],
+    ids=["render", "roster"],
+)
+def test_a_failed_config_step_and_a_failed_last_install_exit_1(vm, env, line):
+    """Exit 4 promises the units are installed, so a failed last install outranks it."""
+    proc = vm.bootstrap(INSTALL_RCS="0 2", **env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    errors = proc.stderr.splitlines()
+    assert f"vm-bootstrap: {line}" in errors
+    assert any("the install that starts the units did not finish" in e for e in errors)
+    assert errors[-1] == FINISHED
+    assert CONFIG_FAILED not in errors
 
 
 # -- refusals before anything runs -----------------------------------------------------

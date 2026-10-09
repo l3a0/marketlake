@@ -4273,13 +4273,22 @@ def needrestart_dropin() -> str:
     a patched glibc reaches the daemon only at its next restart. Setting
     ``$nrconf{restart}`` would cover this too, and is rejected because it changes how every
     service on the host restarts.
+
+    The second rule covers ``marketlake-deploy.service``, the transient unit
+    ``deploy/vm-deploy.sh`` runs in (marketlake #676). An unattended upgrade between 01:00
+    and 03:00 Eastern falls inside the hours a deploy may run, and a restart of that unit
+    would stop the deploy between its merge and its restart. Its name is not
+    ``com.marketlake.deploy``, because the deploy's busy check lists the
+    ``com.marketlake.*`` services and would refuse itself.
     """
     return (
         "# Marketlake: keep needrestart from restarting the marketlake units after apt runs.\n"
         "# A restart would cost the daemon its in-flight cycle mid-session. needrestart lists\n"
         "# them as deferred instead, and `needrestart -b` names what still maps an old\n"
-        "# library, so a patched glibc reaches them at their next restart.\n"
+        "# library, so a patched glibc reaches them at their next restart. A running deploy\n"
+        "# is deferred too, so an upgrade cannot stop it between its merge and its restart.\n"
         "$nrconf{override_rc}->{qr(^com\\.marketlake\\.)} = 0;\n"
+        "$nrconf{override_rc}->{qr(^marketlake-deploy\\.service$)} = 0;\n"
     )
 
 
