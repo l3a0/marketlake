@@ -10,7 +10,7 @@ variable "state_bucket" {
 }
 
 variable "backup_bucket" {
-  description = "The lake's backup bucket, which both roles may not read objects from."
+  description = "The lake's backup bucket, whose objects the plan and apply roles may not read."
   type        = string
   nullable    = false
 
