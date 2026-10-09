@@ -195,8 +195,8 @@ two steps change as follows.
    profile `marketlake-instance`, whose S3 policies carry the same four actions as the
    laptop's role, split in two. The read half, `s3:ListBucket`, `s3:GetBucketVersioning`
    and `s3:GetObject`, is always on, so a restore runs on the VM with no stored key. The
-   write half, `s3:PutObject` alone, is on only while the VM is the primary, which it
-   has been since the cutover, so a shadow VM holds no write credential to the primary's bucket
+   write half, `s3:PutObject` alone, is for a primary VM. The cutover turns it on as the
+   VM becomes primary, and a shadow VM holds no write credential to the primary's bucket
    ([#686](https://github.com/l3a0/marketlake/issues/686)). The VM also requires
    metadata tokens.
 2. Step 2's key lines become one setting. The VM's `config.yaml` is written at deploy

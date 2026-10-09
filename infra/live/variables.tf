@@ -30,9 +30,10 @@ variable "adopt_existing" {
 }
 
 variable "instance_s3_enabled" {
-  # #638's cutover flipped this default to true, when the VM became the primary. CI
-  # passes no value for it, so only this default decides the write half in CI. The way
-  # back sets it to false again before the VM returns to `role: shadow`.
+  # #638's cutover pull request set this default to true, to apply just before the VM's
+  # role flips to primary. CI passes no value for it, so only this default decides the
+  # write half in CI. The way back sets it to false again before the VM returns to
+  # `role: shadow`.
   description = "Give marketlake-instance s3:PutObject on the backup bucket, the write half of its S3 access. The read half is always on."
   type        = bool
   default     = true

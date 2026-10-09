@@ -39,8 +39,8 @@ variables {
 run "instance_s3_write_half_is_on_by_default" {
   command = plan
 
-  # #638's cutover flipped the default, because the VM is now the primary. The way back
-  # turns it off again, and inverts this assert.
+  # #638's cutover pull request flipped the default, as the VM becomes the primary. The
+  # way back turns it off again and inverts this assert.
   assert {
     condition     = length(aws_iam_role_policy.instance_s3) == 1
     error_message = "marketlake-instance has no S3 write access by default, so the primary VM's nightly upload would be refused."
@@ -72,6 +72,21 @@ run "instance_s3_write_half_is_on_by_default" {
   assert {
     condition     = aws_iam_role_policy.instance_s3_read.name == "backup-bucket-read"
     error_message = "The S3 read half is not named backup-bucket-read."
+  }
+}
+
+run "instance_s3_write_half_is_absent_when_disabled" {
+  command = plan
+
+  variables {
+    instance_s3_enabled = false
+  }
+
+  # A shadow VM, before the cutover or after the way back, holds no write credential to
+  # the primary's bucket.
+  assert {
+    condition     = length(aws_iam_role_policy.instance_s3) == 0
+    error_message = "Turning instance_s3_enabled off leaves marketlake-instance its S3 write half, a write credential on a shadow host."
   }
 }
 
