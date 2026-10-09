@@ -1,13 +1,15 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and sixteen things are not in one.
+``tofu test`` sees one configuration's plan, and seventeen things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
-2. Every policy attached to a role. An assert names the attachments it knows about, so
-   a second attachment of the same type passes it. The plan role is trusted on every
-   pull request from a branch here with no approval, so any write it gains lets an
-   unreviewed branch change the account.
+2. Every policy attached to each of the bootstrap's three roles, the plan, apply and
+   deploy roles. An assert names the attachments it knows about, so a second attachment
+   of the same type passes it. The plan role is trusted on every pull request from a
+   branch here with no approval, so any write it gains lets an unreviewed branch change
+   the account. The deploy role carries no ``ReadOnlyAccess``, so an attachment there
+   would widen it past the one document it may send.
 3. Whether the live backend's key is the one the apply role may write. A mismatch
    passes every pull request check and fails the first apply after the merge.
 4. The backend's own settings. Without ``use_lockfile`` two applies can write the state
@@ -52,6 +54,9 @@
 16. The shim template's variables. A third one could carry a value into ``user_data``,
     which anyone who can describe the instance reads, and the plan shows only the
     rendered text.
+17. Each bootstrap role's ``depends_on`` on GitHub's OIDC provider. The trust names the
+    provider by a string, so nothing else orders the role after the provider on a first
+    apply, and a plan shows no ordering.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -138,6 +143,7 @@ LIVE_TYPES = {
     "aws_key_pair",
     "aws_ebs_volume",
     "aws_volume_attachment",
+    "aws_ssm_document",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -374,7 +380,7 @@ def test_live_roles_leave_their_policies_to_separate_resources() -> None:
 def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     resources = _resources("bootstrap")
     roles = sorted(a.split(".")[1] for a in resources if a.startswith("aws_iam_role."))
-    assert roles == ["apply", "plan"]
+    assert roles == ["apply", "deploy", "plan"]
     for role in roles:
         body = resources[f"aws_iam_role.{role}"]
         assert "managed_policy_arns" not in body and "inline_policy" not in body
@@ -394,11 +400,23 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
             inline.setdefault(role, []).append(_jsonencode_argument(body["policy"])["Statement"])
 
     assert sorted(attached) == [("apply", READ_ONLY), ("plan", READ_ONLY)]
-    assert sorted(inline) == ["apply", "plan"]
+    assert sorted(inline) == ["apply", "deploy", "plan"]
     assert len(inline["apply"]) == 1
+    assert len(inline["deploy"]) == 1
     assert len(inline["plan"]) == 1
     plan_effects = [statement["Effect"] for statement in inline["plan"][0]]
     assert plan_effects and set(plan_effects) == {"Deny"}
+    deploy_effects = [statement["Effect"] for statement in inline["deploy"][0]]
+    assert deploy_effects and set(deploy_effects) == {"Allow"}
+
+
+@pytest.mark.parametrize("role", ["apply", "deploy", "plan"])
+def test_bootstrap_role_waits_for_the_oidc_provider(role: str) -> None:
+    """Each trust names the provider through a string built from the account id, not a
+    reference, so only ``depends_on`` orders the role after the provider on a first
+    apply into a fresh account. A plan shows no ordering."""
+    body = _resources("bootstrap")[f"aws_iam_role.{role}"]
+    assert body.get("depends_on") == ["${aws_iam_openid_connect_provider.github}"], body
 
 
 def test_apply_role_writes_exactly_the_live_state_and_its_lock() -> None:

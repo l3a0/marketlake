@@ -1,7 +1,7 @@
 # What CI applies: the backup bucket, the instance role, the laptop's identity, the
 # user marketlake-command with the two roles it assumes, marketlake-backup for the
-# bucket and marketlake-token-writer for the Schwab token, and the hosted VM with its
-# lake volume. The apply role in
+# bucket and marketlake-token-writer for the Schwab token, the hosted VM with its lake
+# volume, and the SSM document that deploys main to the VM. The apply role in
 # infra/bootstrap/roles.tf grants writes on exactly these. infra/README.md carries the
 # runbook, and docs/design.md's "Infrastructure, defined" carries the reasoning.
 
