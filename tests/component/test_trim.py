@@ -2,9 +2,10 @@
 
 ``lake.trim.trim`` drops a chains partition only when all seven clauses hold, writes its trim
 line before it unlinks, recovers a crash between the two by re-running the whole selection, and
-never raises. The window's floor is at least 22 sessions, so these tests call the trim with a
-window of 3 over two weeks of tiny partitions, each stored in the fake bucket, and the floor and
-gate tests run at the ``compact`` level in ``test_compaction_trim.py``.
+never raises. A window cannot go below ``window.window_floor``, which is longer than two weeks,
+so these tests call the trim directly with a window of 3 over two weeks of tiny partitions,
+each stored in the fake bucket. The floor and gate tests run at the ``compact`` level in
+``test_compaction_trim.py``.
 
 The lake below holds SPY and QQQ on every weekday from 2026-08-17 to 2026-08-28. Tonight is
 Friday 2026-08-28 at 16:30, the checkpoint is Thursday's, and its cutoffs sit at the window edge,

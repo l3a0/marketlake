@@ -30,8 +30,8 @@ nothing.
 6. Its day is at or before the latest checkpoint's cutoff for its ticker, and tonight is a
    session strictly after the checkpoint's own session day whose option-close deadline has
    passed. The checkpoint's sha has to match its manifest entry. A partition whose latest
-   trimmed-ledger line is a restore line waits until a checkpoint written after the restore,
-   so a range restore survives until the walk that needs it.
+   trimmed-ledger line is a restore line waits until a checkpoint from a session after the
+   restore's day, so a range restore survives until the walk that needs it.
 7. It is not withheld by ``manifest.latest_quarantine``.
 
 **The write order** for each partition is the trim line, appended and read back by
@@ -143,8 +143,6 @@ class TrimResult:
     set when the upload's deadline came first. Each names its repair.
 
     ``window`` and ``edge`` are the window the run judged by and the last day it could drop.
-    ``pruned`` lists each ``chains/ticker=T/`` directory the empty-directory pass removed,
-    which ``compact`` fills in.
     """
 
     window: int | None = None
@@ -199,9 +197,10 @@ def rot_page_body(findings: Sequence[RotFinding]) -> str:
     """The one page a run sends for every rotted bucket copy it met.
 
     One page rather than one per partition, for the reason ``compact._page_drift`` gives: a
-    wide fault would spend the publisher's daily cap on one fact. It names each good copy and
-    the bucket version, and the repair, which is to put the lake's good copy back as a new
-    version. The trim itself never writes to the bucket.
+    wide fault would spend the publisher's daily cap on one fact. It names up to
+    :data:`ROT_PAGE_CAP` partitions, each with its bucket version and whether the lake's
+    copy matches the manifest, counts the rest, and gives the repair, which is to put the
+    lake's good copy back as a new version. The trim itself never writes to the bucket.
     """
     named = []
     for finding in findings[:ROT_PAGE_CAP]:
@@ -513,8 +512,9 @@ def _select(
         line = trimmed_latest.get(rel)
         kind = None if line is None else line.get(trimmed.KIND_FIELD)
         if kind is not None and kind != trimmed.TRIM_KIND:
-            # A restore line holds the partition until a checkpoint written after it. A line of
-            # any other kind is not one this code wrote, so it holds the partition too.
+            # A restore line holds the partition until a checkpoint from a session after the
+            # restore's day. A line of any other kind is not one this code wrote, so it holds
+            # the partition too.
             if kind != trimmed.RESTORE_KIND or not _restored_before(line, checkpoint.session_day):
                 continue
         position = ledger.last.get(rel)

@@ -71,9 +71,11 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   tracked `config/vm.yaml` because it writes `config.yaml`.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
-- `src/lake/trim.py` is the one path that deletes a sealed partition. On a primary host
-  whose config sets `lake_window_sessions`, compaction drops chains partitions older than
-  that window once each is verified in the bucket, and records each in `trimmed.jsonl`.
+- `src/lake/trim.py` is the only code that deletes a sealed partition on its own, and
+  the hand-run `compact.recompact_ticker_day` is the only code that replaces one. On a
+  primary host with a bucket target whose config sets `lake_window_sessions`, compaction
+  drops chains partitions older than that window once each is verified in the bucket,
+  and records each in `trimmed.jsonl`.
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
   keeping the old file when any input is wrong.
@@ -312,24 +314,26 @@ The whole-lake restore runs on either.
 **The trim needs no command either, and only the VM runs it.** `config/vm.yaml` sets
 `lake_window_sessions`, and on a primary host with a bucket target the close+15 compaction
 then drops each chains partition older than that many sessions once its bucket copy hashes
-to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). Its lines end the compaction log.
+to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). The trim's lines, then any
+pruned ticker directories, end the compaction log.
 The laptop's `config.yaml` must never set `lake_window_sessions`. The laptop's role and its
 `s3://` target pass the trim's other two gates, so the key's absence is the only thing that
-keeps the laptop's own compaction from trimming. A laptop that resyncs from the bucket after
-a trim still holds a trimmed lake without the key, because the resync ([#832](https://github.com/l3a0/marketlake/issues/832)) skips the
-partitions the bucket's trimmed ledger says were removed on purpose.
+keeps the laptop's own compaction from trimming. Once the resync [#832](https://github.com/l3a0/marketlake/issues/832) plans
+lands, a laptop that resyncs from the bucket after a trim will hold a trimmed lake without
+the key, because that resync will skip the partitions the bucket's trimmed ledger says
+were removed on purpose.
 
 The restore brings back current versions only, so a file that fails it is repaired by
 hand. Which repair fits depends on whether the lake still holds a good copy.
 
 While the lake is alive and still holds the file, the repair is the lake's own copy. A
-partition the VM's trim removed has no lake copy: its single bucket version is its only copy,
-so rot in it has no repair here. The Sunday job's sample reads
-only objects whose stored SHA-256 the scrub matched, so a sample mismatch is rot at rest
-in an object whose stored checksum is right. A sealed partition is written once, so its
-rotted current version is usually its only version, and neither upload replaces an
-object whose stored checksum matches. Once the Sunday lake scrub passes on the file, put
-it back with the bucket's credentials, as a single PUT carrying its SHA-256:
+partition the VM's trim removed has no lake copy. Its single bucket version is its only
+copy, so rot in it has no repair here. The Sunday job's sample reads only objects whose
+stored SHA-256 the scrub matched, so a sample mismatch is rot at rest in an object whose
+stored checksum is right. A sealed partition is written once, so its rotted current version
+is usually its only version, and neither upload replaces an object whose stored checksum
+matches. Once the Sunday lake scrub passes on the file, put it back with the bucket's
+credentials, as a single PUT carrying its SHA-256:
 
 ```bash
 aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256

@@ -145,10 +145,11 @@ The job's rules, each glossed at first use.
    sends the ledger under a stale sha. A host with no ``trimmed.jsonl`` reads and writes
    nothing there. After the ping, still in the lock hold, a primary host with a bucket target
    and a ``lake_window_sessions`` key trims chains partitions older than its window, once each
-   is verified in the bucket (marketlake #787). The trim is the one path that deletes a sealed
-   partition, and it records each one in ``trimmed.jsonl`` first. It never raises, so a trim
-   fault withholds no ping and loses none of the night's lines. Then every empty
-   ``chains/ticker=T/`` goes, on any host that holds a trimmed ledger.
+   is verified in the bucket (marketlake #787). The trim is the only code that deletes a
+   sealed partition on its own, and the hand-run ``recompact_ticker_day`` is the only code
+   that replaces one. The trim records each partition in ``trimmed.jsonl`` first. It never
+   raises, so a trim fault withholds no ping and loses none of the night's lines. Then every
+   empty ``chains/ticker=T/`` goes, on any host that holds a trimmed ledger.
 
 This module reads no wall clock. ``clock`` and ``calendar`` are injected, and every
 session-relative moment comes from the session clock over them.
@@ -1457,7 +1458,8 @@ def _trim_step(
 
     1. The window has to clear its floor, which ``window.window_sessions`` judges.
     2. The role ``outbox.senders`` resolved has to be primary. A shadow's own trimmed ledger
-       is reverted by the catch-up that resumes it, which would leave its trims unexplained.
+       would be reverted by the resync marketlake #832 plans, which would leave its trims
+       unexplained.
     3. The backup has to be a ``BucketBackup`` uploading to a ``BucketTarget``, whose last
        upload carries the deadline and the watermark the trim reads. A non-``None`` backup
        alone says only that ``main`` built one, which a primary with a path target also has.
@@ -2296,11 +2298,13 @@ def compact(
     a caller that passes neither never trims. ``main`` passes the role ``outbox.senders``
     resolved and the config's ``lake_window_sessions``.
 
-    The run is idempotent. A second run over the same lake seals nothing, rewrites no plan,
-    trims nothing it trimmed before, and reports ``changed`` false. The trim is the one
-    step that deletes a sealed partition, and on its first run it deletes only what the
-    window, the bucket and the checkpoint allow. It still backs up and
-    pings, because a job that correctly no-ops is healthy. A refused ticker-day is the one
+    The run is idempotent. A second run over the same lake seals nothing and rewrites no
+    plan. Its trim sends no read for a partition the first run trimmed, but it can trim one
+    the first run left at the upload's deadline or skipped. So the second run reports
+    ``changed`` false only when its trim found nothing more to drop. The trim is the one
+    step that deletes a sealed partition, and it deletes only what the window, the bucket
+    and the checkpoint allow. A run with nothing to do still backs up and pings, because a
+    job that correctly no-ops is healthy. A refused ticker-day is the one
     thing that repeats rather than settling. Its segments are still there, so every run
     refuses it again and files again, and ``changed`` stays true until a human clears it.
 
