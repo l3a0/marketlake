@@ -1617,7 +1617,9 @@ lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of
 3. Restore as the owner, with the command above.
 4. Rerun the bootstrap. Its install starts the stopped units.
 
-`deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of lake data. After the
+`deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of a whole lake. The
+close+15 compaction's trim deletes too, one chains partition at a time and only after the
+bucket's copy is verified, recording each in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). After the
 cutover the same VM runs `role: primary`, where emptying the lake would delete every
 minute since the last nightly upload. So it refuses, and deletes nothing, unless all
 four of these hold:

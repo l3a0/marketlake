@@ -55,8 +55,9 @@ ever reaching a segment.
 
 Read time is the only place this can happen. A compacted partition is immutable, and that
 immutability is what the manifest protocol, the two-way integrity scrub, and the backup all
-rest on. Rewriting a sealed partition to heal it would trade those guarantees for one
-convenience.
+rest on. The one deletion, the VM's trim of chains past its window (marketlake #787),
+removes a whole partition and records it in ``trimmed.jsonl``, and it never rewrites one.
+Rewriting a sealed partition to heal it would trade those guarantees for one convenience.
 
 Two rules keep the healing honest.
 

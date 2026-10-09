@@ -283,6 +283,11 @@ def settlement_view(
     A session whose chain holds no contract expiring on it returns an empty table at
     ``SETTLEMENT_VIEW_SCHEMA``. That is a real answer rather than an ambiguous one, because
     every way this read can fail raises before the roster is built.
+
+    **On a trimmed lake** (marketlake #787) a session the VM's trim removed raises
+    ``PartitionAbsent``, the same answer as a session never captured. Nothing nightly calls
+    this door. A reader of a trimmed session restores it into an empty directory first and
+    reads there.
     """
     session_text = day.isoformat() if isinstance(day, date) else str(day)
     session = date.fromisoformat(session_text)

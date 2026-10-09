@@ -1501,6 +1501,12 @@ def load_contract_life(
 
     ``ticker``, ``lake_root`` and ``include_quarantined`` carry the meanings ``load_contract``
     gives them.
+
+    **On a trimmed lake** (marketlake #787) a session the VM's trim removed drops out of a range
+    with no error, because the read lists sessions from disk. Nothing nightly calls this door.
+    A reader of trimmed sessions restores the range into an empty directory first and reads
+    there. A partition removed between the directory check and its listing raises
+    ``FileNotFoundError`` rather than this door's own refusal.
     """
     root = resolve_lake_root(lake_root)
     thread = _thread(root, occ_symbol)

@@ -26,6 +26,8 @@ Schwab token to the VM's config parameters. cloud-init takes a new VM from nothi
 running daemon with no login, through `deploy/vm-bootstrap.sh`. The VM ran as a shadow
 beside the laptop until the cutover in
 [#638](https://github.com/l3a0/marketlake/issues/638) made it the primary capture host.
+Its lake volume holds a window of recent chains sessions, and the close+15 compaction trims
+older chains partitions once each is verified in the bucket ([#787](https://github.com/l3a0/marketlake/issues/787)).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -69,6 +71,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   tracked `config/vm.yaml` because it writes `config.yaml`.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
+- `src/lake/trim.py` is the one path that deletes a sealed partition. On a primary host
+  whose config sets `lake_window_sessions`, compaction drops chains partitions older than
+  that window once each is verified in the bucket, and records each in `trimmed.jsonl`.
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
   keeping the old file when any input is wrong.
@@ -304,10 +309,22 @@ The whole-lake restore runs on either.
    Compaction prints the upload's throughput to its log, in the line the first upload
    prints.
 
+**The trim needs no command either, and only the VM runs it.** `config/vm.yaml` sets
+`lake_window_sessions`, and on a primary host with a bucket target the close+15 compaction
+then drops each chains partition older than that many sessions once its bucket copy hashes
+to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). Its lines end the compaction log.
+The laptop's `config.yaml` must never set `lake_window_sessions`. The laptop's role and its
+`s3://` target pass the trim's other two gates, so the key's absence is the only thing that
+keeps the laptop's own compaction from trimming. A laptop that resyncs from the bucket after
+a trim still holds a trimmed lake without the key, because the resync ([#832](https://github.com/l3a0/marketlake/issues/832)) skips the
+partitions the bucket's trimmed ledger says were removed on purpose.
+
 The restore brings back current versions only, so a file that fails it is repaired by
 hand. Which repair fits depends on whether the lake still holds a good copy.
 
-While the lake is alive, the repair is the lake's own copy. The Sunday job's sample reads
+While the lake is alive and still holds the file, the repair is the lake's own copy. A
+partition the VM's trim removed has no lake copy: its single bucket version is its only copy,
+so rot in it has no repair here. The Sunday job's sample reads
 only objects whose stored SHA-256 the scrub matched, so a sample mismatch is rot at rest
 in an object whose stored checksum is right. A sealed partition is written once, so its
 rotted current version is usually its only version, and neither upload replaces an

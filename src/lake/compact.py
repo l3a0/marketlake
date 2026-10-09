@@ -1,13 +1,14 @@
-"""The close+15 compaction, backup, and nightly window re-tune.
+"""The close+15 compaction, nightly window re-tune, backup, and trim.
 
 The capture loop writes a day's cycles into journal segments, one Arrow IPC file per
 surface, ticker, and writer session. A *segment* is that file. Reading a day back from
 dozens of segments is slow and fragile, so once the day is final the segments are merged
 into one Parquet *partition* per surface and ticker, checksummed into the manifest, and
 deleted. That merge is *compaction*. This module is the close+15 job that does it, then
-copies the lake to the backup target, then re-sizes the chain chunk plan from what the day
-captured. The backup target is a mounted directory, copied with ``rsync``, or a bucket,
-uploaded to by ``lake.bucket``.
+re-sizes the chain chunk plan from what the day captured, then copies the lake to the backup
+target and pings. The backup target is a mounted directory, copied with ``rsync``, or a
+bucket, uploaded to by ``lake.bucket``. On a host whose config sets a window, the job then
+trims chains partitions older than the window, which ``lake.trim`` decides.
 
 Every ``close+N`` here counts from the *option* close, the capture stop at 16:15 ET on a
 regular day and 13:15 on an early close. It never counts from the 16:00 equity close, even
@@ -139,6 +140,15 @@ The job's rules, each glossed at first use.
    zero would merge its windows into their neighbours, and a wider window is a wider
    request, which is the body limit this plan exists to stay under. The rebuilt plan is
    written to ``chain_plan.json`` atomically, and only when it changed.
+9. *The trimmed ledger, then the trim.* Just before the backup, the trimmed ledger's manifest
+   entry is re-recorded when a trim or restore line landed without it, so the upload never
+   sends the ledger under a stale sha. A host with no ``trimmed.jsonl`` reads and writes
+   nothing there. After the ping, still in the lock hold, a primary host with a bucket target
+   and a ``lake_window_sessions`` key trims chains partitions older than its window, once each
+   is verified in the bucket (marketlake #787). The trim is the one path that deletes a sealed
+   partition, and it records each one in ``trimmed.jsonl`` first. It never raises, so a trim
+   fault withholds no ping and loses none of the night's lines. Then every empty
+   ``chains/ticker=T/`` goes, on any host that holds a trimmed ledger.
 
 This module reads no wall clock. ``clock`` and ``calendar`` are injected, and every
 session-relative moment comes from the session clock over them.
@@ -2279,11 +2289,17 @@ def compact(
     it, because its segments disagree about a column type or because one no longer
     matches the hash taken when it closed, and then it is filed, reported under
     ``refused``, and left exactly as the capture wrote it. The window re-tune then
-    profiles the latest sealed day's chains partitions. The backup runs last, and the ping
-    only after it.
+    profiles the latest sealed day's chains partitions. The trimmed ledger's entry is
+    repaired next, then the backup runs, and the ping only after it. The trim runs after the
+    ping, and only when ``role`` is primary, ``window_sessions`` judges to a window, and the
+    backup is a bucket upload that left a deadline and a watermark. Both default to off, so
+    a caller that passes neither never trims. ``main`` passes the role ``outbox.senders``
+    resolved and the config's ``lake_window_sessions``.
 
-    The run is idempotent. A second run over the same lake seals nothing, deletes
-    nothing, rewrites no plan, and reports ``changed`` false. It still backs up and
+    The run is idempotent. A second run over the same lake seals nothing, rewrites no plan,
+    trims nothing it trimmed before, and reports ``changed`` false. The trim is the one
+    step that deletes a sealed partition, and on its first run it deletes only what the
+    window, the bucket and the checkpoint allow. It still backs up and
     pings, because a job that correctly no-ops is healthy. A refused ticker-day is the one
     thing that repeats rather than settling. Its segments are still there, so every run
     refuses it again and files again, and ``changed`` stays true until a human clears it.
@@ -2297,8 +2313,8 @@ def compact(
     skipped. A runner that did nothing would not do, because ``backed_up`` turns true
     after any sync that returns, and the result would claim a copy that was never made.
 
-    ``publisher`` carries the schema-drift page, the damaged-segment page and the
-    refused-ping page, and it follows
+    ``publisher`` carries the schema-drift page, the damaged-segment page, the
+    trimmed-ledger page, the trim's rot page and the refused-ping page, and it follows
     ``pinger`` exactly. Both reach past this process, so ``main`` gets them from
     ``outbox`` and never accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a

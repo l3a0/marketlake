@@ -47,7 +47,9 @@ own matching rules, because the uploader walks the tree itself and ``rsync`` is 
 there to apply them. Nothing but the range restore writes under the lake root. It writes
 only partitions the lake's own manifest already records, a restore line in the trimmed
 ledger, and that ledger's manifest entry, which are what any lake writer leaves, so
-switching back to a path stays free.
+switching back to a path stays free. The trim that deletes old chains partitions lives in
+``lake.trim`` for that reason (marketlake #787), and ``current_digest``, the read it checks
+a partition's bucket copy with, writes nothing.
 
 **The client is built from ``config.yaml`` alone, with one exception.** On the
 instance-profile path its credentials come from the EC2 instance metadata service, and

@@ -1010,7 +1010,7 @@ def _slot_aggregates(
        Counting a row twice for the few seconds both copies exist is the price, and it
        changes no slot's status.
     2. The partition went away, or its bytes stopped being readable Parquet, between the
-       check and the read. That is a restore, a repair, or a torn write, and DuckDB
+       check and the read. That is a restore, a repair, a trim, or a torn write, and DuckDB
        raises out of the read. The rows fall back to the journal alone and the loss is
        counted in ``unreadable_partitions``, so the request degrades instead of dying.
 
@@ -1609,6 +1609,13 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     and the starvation verdict are never null either, because each holds whether or not
     anything has ever been stamped. The owed-through instant is null only where no
     session has closed yet, which is a lake younger than its first close.
+
+    **A retired ticker on a trimmed lake** (marketlake #787). A retired ticker stays on the
+    panel on purpose, and its chains days come from disk. Once the VM's trim drops its last
+    chains partition and compaction's empty-directory pass removes ``chains/ticker=T/``,
+    ``_tickers_in`` no longer lists it on ``chains``, and it stays on the panel through
+    ``quotes/``. Without the pass the row would show a null last capture, the case the bound
+    above says it must not imply.
     """
     spans_by_ticker = _capture_spans(ctx.paths, ctx.roster)
     owed_through = _capture_owed_through(ctx)
@@ -1747,6 +1754,11 @@ def query_today(
     over both of those, so a real cycle is never hidden. A gap row wins over pending but
     not over out of scope, because the design pins minutes before the epoch as out of
     scope and never gaps.
+
+    **On a trimmed lake** (marketlake #787) a chosen date the VM's trim removed raises
+    nothing. Every slot renders ``STATUS_MISSING``, which looks the same as a capture outage.
+    The panel reads only the lake it is pointed at, so a trimmed day is read by pointing a
+    dashboard at a range restored into an empty directory.
     """
     session_day = day if day is not None else ctx.session.session_date()
     payload: dict[str, object] = {
