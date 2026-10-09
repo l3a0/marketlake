@@ -1012,8 +1012,9 @@ def _reserve(client: FakeS3) -> int:
 def _huge_reserve(client: FakeS3, monkeypatch) -> int:
     """Raise the reserve past the floor, which the simple bucket's few KB never reach.
 
-    The sessions are a literal chosen here so the reserve is at least twice the floor, and the
-    reserve returned is that literal times the busiest sealed day, written out by ``_reserve``.
+    The sessions are computed from the literal ``FLOOR`` so the reserve is more than twice the
+    floor, and the reserve returned is that count times the busiest sealed day, which ``_reserve``
+    reads off the bucket.
     """
     busiest = _reserve(client) // RESERVE_SESSIONS
     sessions = 2 * FLOOR // busiest + 1
