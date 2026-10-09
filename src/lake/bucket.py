@@ -149,6 +149,7 @@ from lake.paths import (
     LOST_AND_FOUND,
     MANIFEST_FILE,
     TEMP_MARKER,
+    TRIMMED_FILE,
     parse_date_dir,
     parse_partition_rel,
     temp_write_path,
@@ -778,7 +779,15 @@ def list_bucket(client: Any, target: BucketTarget) -> dict[str, int]:
 
 @dataclass
 class UploadSummary:
-    """What one upload did, for the line a job prints."""
+    """What one upload did, for the line a job prints.
+
+    ``deadline`` and ``watermark`` are set by the nightly upload and left ``None`` by the first
+    upload, which shares this type. ``deadline`` is the moment the upload had to stop by.
+    ``watermark`` is the number of manifest entries the bucket's copy carried when the upload
+    started, so an entry at a lower position was already in the bucket before tonight. The
+    trim after compaction (marketlake #787) reads both: it stops between partitions at the
+    same deadline, and it drops only a partition whose entry sits below that watermark.
+    """
 
     target: str
     puts: int = 0
@@ -787,6 +796,8 @@ class UploadSummary:
     seconds: float = 0.0
     rebaselined: bool = False
     uploaded: list[str] = field(default_factory=list)
+    deadline: datetime | None = None
+    watermark: int | None = None
 
     def render(self) -> str:
         """One line naming what went up and how fast."""
@@ -796,6 +807,30 @@ class UploadSummary:
             f"uploaded {self.puts} file(s), {megabytes:.1f} MB in {self.seconds:.0f} s "
             f"({rate:.1f} Mbit/s), skipped {self.skipped} already in the bucket: {self.target}"
         )
+
+
+def _checksum_refusal(rel: str) -> str:
+    """The one line ``ChecksumRefused`` carries for ``rel``.
+
+    Every file names rot and the two benign races. The trimmed ledger names a fourth cause,
+    because a trim or restore line can land without its manifest entry being refreshed, and
+    compaction's ledger repair is what re-records that entry before the upload. A refusal of
+    ``trimmed.jsonl`` therefore means the repair did not run or refused, and the line sends
+    the operator to the repair rather than to the bucket.
+    """
+    message = (
+        f"S3 refused {rel}: its bytes no longer match its manifest entry's SHA-256. Rot does "
+        "this, and so do two benign causes: a recompact while a first upload runs, and a live "
+        "journal segment growing while a compaction runs by hand in a session"
+    )
+    if rel == TRIMMED_FILE:
+        message += (
+            ". A fourth cause is a trim or restore line that landed without its manifest "
+            "entry, which compaction's ledger repair re-records before the upload unless it "
+            "refused. Read the compaction_trimmed_ledger page or run "
+            "lake.trimmed.repair_trimmed_entry by hand under the lock"
+        )
+    return message + ". Run the job again, and treat a repeat as rot"
 
 
 class _Uploader:
@@ -852,13 +887,7 @@ class _Uploader:
             )
         except Exception as exc:
             if _error_code(exc) == BAD_DIGEST:
-                raise ChecksumRefused(
-                    f"S3 refused {rel}: its bytes no longer match its manifest entry's "
-                    "SHA-256. Rot does this, and so do two benign causes: a recompact while a "
-                    "first upload runs, and a live journal segment growing while a "
-                    "compaction runs by hand in a session. Run the job again, and treat a "
-                    "repeat as rot"
-                ) from exc
+                raise ChecksumRefused(_checksum_refusal(rel)) from exc
             raise
         self.summary.puts += 1
         self.summary.put_bytes += len(data)
@@ -1041,7 +1070,8 @@ def nightly_upload(
     Nothing is deleted from the bucket and nothing is written under the lake root. The
     deadline is the earlier of ``budget`` past the start and ``session_bound``. It is
     checked before every request, the first included, so an upload started inside a
-    session sends nothing.
+    session sends nothing. The summary returned carries that deadline and the watermark
+    the upload started from, for the trim that runs after it.
     """
     root = Path(lake_root)
     started = clock.monotonic()
@@ -1053,6 +1083,7 @@ def nightly_upload(
     bound = session_bound(now, clock=clock, calendar=calendar)
     if bound is not None and bound < deadline:
         deadline, why = bound, "ahead of the next session's capture start"
+    summary.deadline = deadline
     uploader.guards.append(uploader.deadline(deadline, why, "the next night carries on"))
     uploader.check()
     ledger = read_ledger(root)
@@ -1068,6 +1099,7 @@ def nightly_upload(
             f"{FIRST_UPLOAD_COMMAND} by hand: {target}"
         )
     mark = watermark(ledger.raw, copy.length)
+    summary.watermark = mark
     if mark == 0 and ledger.entries:
         # A copy of zero bytes, or one shorter than a whole line, is a prefix of any
         # manifest, and would start a whole-lake upload inside compaction's lock.
@@ -1095,7 +1127,9 @@ class BucketBackup:
 
     ``client`` is an S3 client. ``compact.main`` passes a ``ClientFromConfig``, and a
     test passes a fake. ``clock`` and ``calendar`` set the deadline. ``last`` is what
-    the most recent ``sync`` did, and ``compact.main`` prints it as one line.
+    the most recent ``sync`` did, and ``compact.main`` prints it as one line. A ``sync``
+    that raises leaves ``last`` at ``None``, so nothing reads an earlier night's summary
+    as tonight's. The trim reads ``client`` and ``last`` after the upload.
     """
 
     def __init__(
@@ -1112,9 +1146,15 @@ class BucketBackup:
         self._budget = budget
         self.last: UploadSummary | None = None
 
+    @property
+    def client(self) -> Any:
+        """The S3 client every request of this backup goes through."""
+        return self._client
+
     def sync(self, source: Path, target: Path | BucketTarget) -> None:
         if not isinstance(target, BucketTarget):
             raise TypeError(f"BucketBackup uploads to a bucket target, not {target!r}")
+        self.last = None
         client = self._client
         self.last = nightly_upload(
             source,
@@ -1449,6 +1489,53 @@ def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator
             raise BucketReadError(rel, *failure) from exc
 
     return read
+
+
+@dataclass(frozen=True)
+class CurrentDigest:
+    """What :func:`current_digest` read: the current version's SHA-256 and its id.
+
+    ``sha256`` is 64 hex characters, the form ``manifest.jsonl`` records. ``version_id`` is
+    the ``VersionId`` the response carried, or ``None`` when it carried none.
+    """
+
+    sha256: str
+    version_id: str | None
+
+
+def current_digest(client: Any, target: BucketTarget, rel: str) -> CurrentDigest:
+    """Hash the bucket's current version of ``rel`` and keep the ``VersionId`` it came with.
+
+    The trim (marketlake #787) checks a partition's bucket copy with this before it drops the
+    lake's copy. The body streams in ``_READ_CHUNK`` pieces into one SHA-256, so a partition of
+    a few hundred megabytes is never held in memory whole, and it is closed when the read ends.
+    Nothing is written anywhere, which keeps this module's rule that only the range restore
+    writes under the lake root. A bucket failure on the request or partway through the body
+    raises ``BucketReadError`` the way :func:`bucket_reader` maps it, so a missing key reads as
+    ``absent`` and a lost grant as ``refused``. Anything that is not a bucket failure is a bug
+    and raises as itself.
+
+    A ``VersionId`` of ``"null"``, which an unversioned bucket returns, is passed through as
+    given. Deciding what it means is the caller's.
+    """
+    digest = hashlib.sha256()
+    try:
+        response = client.get_object(Bucket=target.bucket, Key=target.key(rel))
+        body = response["Body"]
+        try:
+            while chunk := body.read(_READ_CHUNK):
+                digest.update(chunk)
+        finally:
+            body.close()
+    except Exception as exc:
+        failure = _read_failure(exc)
+        if failure is None:
+            raise
+        raise BucketReadError(rel, *failure) from exc
+    version = response.get("VersionId")
+    return CurrentDigest(
+        sha256=digest.hexdigest(), version_id=None if version is None else str(version)
+    )
 
 
 # -- the restore command ------------------------------------------------------
@@ -2872,6 +2959,7 @@ __all__ = [
     "ClientFromConfig",
     "ChecksumRefused",
     "CopyState",
+    "CurrentDigest",
     "FirstUploadRefused",
     "Ledger",
     "ManifestedFileMissing",
@@ -2892,6 +2980,7 @@ __all__ = [
     "build_parser",
     "client_from_config",
     "connect",
+    "current_digest",
     "first_upload",
     "first_upload_files",
     "hex_to_b64",

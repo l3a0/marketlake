@@ -878,3 +878,98 @@ def test_the_nightly_upload_still_refuses_a_designed_absence_among_its_pending_e
     with pytest.raises(ManifestedFileMissing, match=rel):
         nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
     assert _key("manifest.jsonl") not in [put["Key"] for put in client.puts()]
+
+
+# -- what the summary hands the trim (marketlake #787) --------------------------------
+
+
+def test_the_nightly_summary_carries_its_deadline_and_the_watermark_it_started_from(tmp_path):
+    """Mutation this catches: a watermark read after the upload, or a deadline left unset.
+
+    The trim drops only a partition whose entry sat in the bucket before tonight, so the mark
+    has to be the one the upload started from. After the upload the bucket's copy carries the
+    new entry too, and a mark read then would let tonight's seal be trimmed the same night.
+    """
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    before = len(manifest_path(lake).read_text().splitlines())
+    _seal_another_day(lake)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert summary.watermark == before
+    assert summary.watermark < len(manifest_path(lake).read_text().splitlines())
+    assert summary.deadline == EVENING + NIGHTLY_UPLOAD_BUDGET
+
+
+def test_the_nightly_summary_carries_the_session_bound_when_it_comes_first(tmp_path):
+    # Started at 08:00 on a session morning, the open less the in-flight PUT and the margin
+    # comes before the 75-minute budget, so the deadline is that bound.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    start = _et(NEXT, 8, 0)
+    clock = ManualClock(start)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    bound = bucket.session_bound(start, clock=clock, calendar=CALENDAR)
+    assert bound is not None and bound < start + NIGHTLY_UPLOAD_BUDGET
+    assert summary.deadline == bound
+
+
+def test_the_first_upload_leaves_the_deadline_and_watermark_unset(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    summary = first_upload(lake, TARGET, client=FakeS3(), clock=_clock(), calendar=CALENDAR)
+    assert summary.deadline is None
+    assert summary.watermark is None
+
+
+def test_a_trimmed_ledger_refused_at_upload_names_the_ledger_repair(tmp_path):
+    """Marketlake #787. Mutation this catches: dropping the trimmed ledger's fourth cause.
+
+    A line that landed without its manifest entry refresh leaves the entry's sha behind the
+    bytes. Past the watermark the upload sends the bytes under the stale sha and S3 refuses
+    them, and the line has to send the operator to the ledger repair.
+    """
+    from lake.trimmed import append_trimmed, trim_line, trimmed_path
+
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    rel = _seal_another_day(lake)
+    line = trim_line(
+        rel,
+        sha256=sha256_file(lake / rel),
+        version_id="v1",
+        verified_at="2026-08-25T16:40:00-04:00",
+        trimmed_at="2026-08-25T16:41:00-04:00",
+    )
+    with lake_lock(lake):
+        append_trimmed(lake, line, source="test-trim", fetched_at=None)
+    with trimmed_path(lake).open("a") as ledger:
+        ledger.write('{"kind": "restore", "partition": "x", "sha256": "y", "restored_at": "z"}\n')
+
+    with pytest.raises(ChecksumRefused) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert message.startswith("S3 refused trimmed.jsonl: ")
+    assert "A fourth cause is a trim or restore line" in message
+    assert "lake.trimmed.repair_trimmed_entry" in message
+    assert "\n" not in message
+
+
+def test_a_partition_refused_at_upload_names_no_ledger_repair(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    rel = _seal_another_day(lake)
+    (lake / rel).write_bytes(b"rotted bytes")
+    with pytest.raises(ChecksumRefused) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    message = str(refused.value)
+    assert message.startswith(f"S3 refused {rel}: ")
+    assert "fourth cause" not in message
+    assert message.endswith("Run the job again, and treat a repeat as rot")
