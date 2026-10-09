@@ -571,6 +571,35 @@ def test_an_unlink_refused_by_permission_stops_only_its_ticker(lake_root, monkey
     assert "chown" in held
 
 
+@pytest.mark.parametrize("crashed", [False, True], ids=["fresh", "recovering"])
+def test_an_unwritable_ticker_directory_holds_its_ticker_without_a_line_each_night(
+    lake_root, crashed
+):
+    """Mutation this catches: dropping the writability check before the ``GetObject``, which
+    lets the unlink's refusal append a fresh trim line every night the directory stays so."""
+    client = _build(lake_root)
+    first = _rel("QQQ", SESSIONS[0])
+    if crashed:
+        _crashed_before_unlink(lake_root, first)
+    before = [line for line in _lines(lake_root) if "QQQ" in line["partition"]]
+    ticker_dir = lake_root / "chains" / "ticker=QQQ"
+    ticker_dir.chmod(0o500)
+    try:
+        nights = [_trim(lake_root, client), _trim(lake_root, client)]
+    finally:
+        ticker_dir.chmod(0o755)
+    assert [line for line in _lines(lake_root) if "QQQ" in line["partition"]] == before
+    assert [rel for rel in _gets(client) if "QQQ" in rel] == []
+    for result in nights:
+        assert result.stopped is None
+        assert result.lined == ()
+        (held,) = result.held
+        assert held.startswith("chains/ticker=QQQ/: ")
+        assert "chown" in held and "chmod" in held
+    assert list(nights[0].trimmed) == [rel for rel in _expected() if "SPY" in rel]
+    assert all((lake_root / rel).exists() for rel in _expected() if "QQQ" in rel)
+
+
 def test_a_ticker_directory_that_cannot_be_searched_holds_only_its_ticker(lake_root):
     """Mutations this catches: letting the ``lstat`` error stop the run, and naming the
     directory by its absolute path."""

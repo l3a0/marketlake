@@ -47,11 +47,14 @@ cannot be reached, a ``GetObject`` with no usable ``VersionId``, any exception f
 step, and an unlink error other than a missing file or a permission refusal. A permission
 refusal on the unlink stops only that ticker, because the fault is the ticker's directory. So
 does a partition whose presence cannot be checked, which an unsearchable ticker directory
-causes. Each of those lines names the directory relative to the lake root and the ``chown``
-and ``chmod`` that repair it, and no line the trim prints names an absolute path. A
-hash mismatch is rot: the partition is kept, the lake's own copy is hashed so the page can say
-which copy is good, and nothing is ever written to the bucket. Anything else skips only its
-partition. The deadline the upload ran under is checked between partitions.
+causes, and so does a ticker directory the trim cannot write and search, which it checks
+before the ``GetObject``. That check writes no line, so a directory left unwritable does not
+gain a fresh trim line every night, and the unlink's refusal stays as the backstop. Each of
+those lines names the directory relative to the lake root and the ``chown`` and ``chmod``
+that repair it, and no line the trim prints names an absolute path. A hash mismatch is rot:
+the partition is kept, the lake's own copy is hashed so the page can say which copy is good,
+and nothing is ever written to the bucket. Anything else skips only its partition. The
+deadline the upload ran under is checked between partitions.
 
 **This never raises.** ``compact.main`` prints the night's result only when ``compact``
 returns, so a raise here would lose the night's sealed lines. Every outcome is a field of
@@ -601,6 +604,17 @@ def _one(
         # trim line to supersede, so the file stays and nothing is written for it.
         if candidate.recovering:
             run.restore(rel, candidate.sha256)
+        return
+    ticker_dir = (run.root / rel).parent
+    if not os.access(ticker_dir, os.W_OK | os.X_OK):
+        # The unlink would be refused after the line landed, and the next night would append
+        # another line for the same file. Checking first writes nothing until it is repaired.
+        name = ticker_dir.relative_to(run.root).as_posix()
+        run.hold(
+            candidate.ref.ticker,
+            f"{name}/: the directory is not writable and searchable, so the rest of "
+            f"{candidate.ref.ticker} waits. {_ticker_repair(name)}",
+        )
         return
     try:
         found = current_digest(client, target, rel)
