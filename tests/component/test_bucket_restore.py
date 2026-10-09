@@ -694,7 +694,7 @@ def test_a_run_killed_while_moving_files_in_finishes_on_the_next_run(tmp_path, m
 
     monkeypatch.setattr(os, "rename", failing_second)
     with pytest.raises(
-        bucket.RestoreRefused, match="run the restore again, which finishes the move"
+        bucket.RestoreRefused, match="run the same command again, which finishes the move"
     ):
         restore_lake(dest, TARGET, client=client)
     monkeypatch.setattr(os, "rename", real_rename)
@@ -930,7 +930,7 @@ def test_a_failed_first_move_leaves_a_directory_the_next_run_finishes(tmp_path, 
 
     monkeypatch.setattr(os, "rename", failing_first)
     with pytest.raises(
-        bucket.RestoreRefused, match="run the restore again, which finishes the move"
+        bucket.RestoreRefused, match="run the same command again, which finishes the move"
     ):
         restore_lake(dest, TARGET, client=client)
     client.calls.clear()
@@ -1083,7 +1083,7 @@ def test_a_live_manifest_at_the_destination_stops_the_finishing_run(tmp_path, mo
         _main(config, client, monkeypatch, dest)
 
     line = _refused(capsys, exc)
-    assert "gained a manifest.jsonl" in line and "run the restore again" in line
+    assert "gained a manifest.jsonl" in line and "run the same command again" in line
     assert (dest / "manifest.jsonl").read_text() == '{"live": "entry"}\n'
     assert (dest / WORK / "manifest.jsonl").is_file()
 

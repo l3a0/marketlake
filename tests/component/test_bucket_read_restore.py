@@ -175,7 +175,8 @@ def _inventory(tmp_path: Path) -> Inventory:
     """Every kind of file a reading restore must take or leave, in one bucket.
 
     Chains for SPY on five days, with the range D2 to D3, the next partition D4 and a later
-    D5. A second ticker and a quotes partition inside the range's dates. ``1m`` and ``1d`` bars
+    D5. A second ticker with a partition inside the range's dates and its own next partition
+    on D4, and a quotes partition inside the range's dates. ``1m`` and ``1d`` bars
     inside and outside the range, and a second ticker's. The actions ledger, quarantine, the
     three reference tables, a report, a manifested journal segment and an unmanifested file
     under ``reference/``. Then SPY's D2 is trimmed and the nightly upload carries the trim.
@@ -184,7 +185,7 @@ def _inventory(tmp_path: Path) -> Inventory:
     lake = FixtureLake(tmp_path / "lake")
     for day in (D1, D2, D3, D4, D5):
         lake.with_chains("SPY", day)
-    lake.with_chains("QQQ", D2).with_quotes("SPY", D2)
+    lake.with_chains("QQQ", D2).with_chains("QQQ", D4).with_quotes("SPY", D2)
     for ticker, freq, day in (
         ("SPY", "1m", D2),
         ("SPY", "1d", D2),
@@ -243,7 +244,9 @@ def test_a_reading_restore_holds_the_range_and_what_a_reader_needs_and_nothing_e
 
     Catches leaving out ``reference/``, ``quarantine.jsonl``, the bars, the actions ledger or
     the next partition, and planning from the listing, which would take the report, the
-    segment, the unrecorded file, the trimmed ledger and every other ticker and day.
+    segment, the unrecorded file, the trimmed ledger and every other ticker and day. Catches
+    too a next partition taken for a ticker the range did not select, which would bring QQQ's
+    D4.
     """
     lake = _inventory(tmp_path)
     dest = tmp_path / "reading"
@@ -269,7 +272,7 @@ def test_a_reading_restore_holds_the_range_and_what_a_reader_needs_and_nothing_e
 
 
 def test_every_ticker_takes_each_ticker_s_range_and_bars(tmp_path):
-    """Leaving out ``--ticker`` takes QQQ's partition and bars too, and QQQ has no next one.
+    """Leaving out ``--ticker`` takes QQQ's partition, bars and next partition too.
 
     Catches a selection that ignores ``ticker=None`` and a bars plan built from the argument
     rather than from the tickers the range selected.
@@ -279,9 +282,10 @@ def test_every_ticker_takes_each_ticker_s_range_and_bars(tmp_path):
 
     summary = _read(lake.client, dest, lake.root, ticker=None)
 
-    extra = (_chains("QQQ", D2), _bars("QQQ", "1d", D2))
+    extra = (_chains("QQQ", D2), _chains("QQQ", D4), _bars("QQQ", "1d", D2))
     assert _files(dest) == _bucket_files(lake.client, (*PLANNED, *extra))
     assert summary.range_by_ticker == {"QQQ": 1, "SPY": 2}
+    assert summary.count("next") == 2
 
 
 def test_a_quotes_range_takes_no_next_chains_partition(tmp_path):
@@ -300,36 +304,69 @@ def test_a_quotes_range_takes_no_next_chains_partition(tmp_path):
     assert summary.count("next") == 0
 
 
+def test_the_next_partition_is_a_chains_one_past_a_quotes_partition_in_a_chains_gap(tmp_path):
+    """SPY has chains on D2 and D4 and quotes on D3, so D4's chains is the next partition.
+
+    Catches the next-partition search taking any surface, which would take D3's quotes, the
+    earliest partition past the range, and leave D4's chains out.
+    """
+    lake = FixtureLake(tmp_path / "lake")
+    for day in (D1, D2, D4):
+        lake.with_chains("SPY", day, sample_chains_table())
+    lake.with_quotes("SPY", D3)
+    lake.with_reference("schema_versions", chain._ledger_table())
+    root = lake.build()
+    client = _upload(root)
+    dest = tmp_path / "reading"
+
+    summary = _read(client, dest, root, first=D2, last=D2)
+
+    assert _files(dest) == _bucket_files(
+        client, (_chains("SPY", D2), _chains("SPY", D4), LEDGER, "manifest.jsonl")
+    )
+    assert summary.count("next") == 1
+
+
 # -- 1. each view reads the same answer --------------------------------------------------
 
 
-def test_load_chain_reads_the_range_as_the_source_lake_does_and_excludes_the_quarantined(
-    tmp_path,
-):
-    """``load_chain`` on both sessions of the range, one of them quarantined.
+def test_load_chain_reads_a_trimmed_range_as_the_untrimmed_lake_did(tmp_path):
+    """``load_chain`` on both sessions of the range, after the trim removed both from the lake.
+
+    The answers are read from the source lake before the trim. Then both partitions are trimmed
+    with the range restore tests' ``_trim_away``, and the real ``nightly_upload`` carries the
+    trim, so the bucket holds what an uploaded trimmed lake holds and the lake holds neither
+    session. One of the two is quarantined, so it is withheld and comes back only with
+    ``include_quarantined=True``.
 
     Catches leaving out ``quarantine.jsonl``, where the reading directory serves the flagged
-    partition with no error, and leaving out ``reference/``, where the schema-version ledger is
-    missing and the read raises ``PartialRead``.
+    partition with no error, leaving out ``reference/``, where the schema-version ledger is
+    missing and the read raises ``PartialRead``, and a plan that takes only what the live lake
+    still holds, where both sessions read as absent.
     """
     source = chain._lake(
         FixtureLake(tmp_path / "lake"),
         quarantine=[{"partition": chain.FULL_PARTITION, "verdict": "delayed_feed"}],
     )
+    with pytest.raises(PartitionQuarantined):
+        load_chain("SPY", chain.FULL_DAY, lake_root=source)
+    half = load_chain("SPY", chain.HALF_DAY, lake_root=source)
+    full = load_chain("SPY", chain.FULL_DAY, lake_root=source, include_quarantined=True)
     client = _upload(source)
+    trimmed = (chain.FULL_PARTITION, f"chains/ticker=SPY/date={chain.HALF_DAY}.parquet")
+    for rel in trimmed:
+        _trim_away(source, client, rel)
+    nightly_upload(source, TARGET, client=client, clock=ManualClock(MONDAY_19), calendar=CALENDAR)
+    assert not any((source / rel).exists() for rel in trimmed)
+    assert "lake/trimmed.jsonl" in client.keys()
     dest = tmp_path / "reading"
 
     _read(client, dest, source, first=chain.FULL_DAY, last=chain.HALF_DAY)
 
-    for root in (source, dest):
-        with pytest.raises(PartitionQuarantined):
-            load_chain("SPY", chain.FULL_DAY, lake_root=root)
-    assert load_chain("SPY", chain.HALF_DAY, lake_root=dest).equals(
-        load_chain("SPY", chain.HALF_DAY, lake_root=source)
-    )
-    assert load_chain("SPY", chain.FULL_DAY, lake_root=dest, include_quarantined=True).equals(
-        load_chain("SPY", chain.FULL_DAY, lake_root=source, include_quarantined=True)
-    )
+    with pytest.raises(PartitionQuarantined):
+        load_chain("SPY", chain.FULL_DAY, lake_root=dest)
+    assert load_chain("SPY", chain.HALF_DAY, lake_root=dest).equals(half)
+    assert load_chain("SPY", chain.FULL_DAY, lake_root=dest, include_quarantined=True).equals(full)
 
 
 def test_settlement_view_reads_the_session_as_the_source_lake_does(tmp_path):
@@ -399,19 +436,23 @@ def test_continuity_view_reads_across_the_split_as_the_source_lake_does(tmp_path
 
 
 def test_load_contract_life_reads_the_range_as_the_source_lake_does(tmp_path):
-    """``load_contract_life`` with ``end`` at the range's last day.
+    """``load_contract_life`` with ``end`` at the range's last day, across the remap.
 
-    Catches leaving out ``reference/``, where the master that threads the contract is missing.
+    The range ends on ``SEALED[3]``, the boundary where the contract was re-symboled, so one of
+    its four rows is reached only through the master.
+
+    Catches leaving out ``reference/``, where the master that threads the contract is missing
+    and the read finds the old symbol's three rows alone.
     """
     source = life._lake(FixtureLake(tmp_path / "lake"), master=life._master())
     client = _upload(source)
     dest = tmp_path / "reading"
-    last = life.SEALED[2]
+    last = life.SEALED[3]
 
     _read(client, dest, source, first=life.SEALED[0], last=last)
 
     answer = load_contract_life(life.OLD, end=last, lake_root=dest)
-    assert answer.num_rows == 3
+    assert answer.num_rows == 4
     assert answer.equals(load_contract_life(life.OLD, end=last, lake_root=source))
 
 
@@ -585,6 +626,7 @@ def test_a_mismatched_file_names_its_role_and_both_causes(tmp_path, monkeypatch,
     )
     assert "a run after the next complete nightly upload passes" in err[1]
     assert '"When the lake is gone"' in err[1] and str(dest / WORK) in err[1]
+    assert "When the bucket holds an earlier good version" in err[1]
     assert len(err) == 3
 
 
@@ -660,6 +702,30 @@ def test_a_lake_root_that_cannot_be_statted_falls_back_to_the_resolved_path(tmp_
         _read(client, gone / "reading", gone)
 
 
+@pytest.mark.parametrize("inside", ["root", "under"])
+def test_a_missing_lake_root_behind_a_symbolic_link_still_refuses(tmp_path, inside):
+    """A missing ``lake_root`` spelled through a linked parent refuses itself and what is under it.
+
+    The destination resolves through the link, so the fallback must resolve ``lake_root`` too.
+    Catches a fallback that compares against ``lake_root`` as spelled, which reads the
+    destination as outside and restores into the path the live lake would take.
+    """
+    _root, client = _simple(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    lake_root = link / "gone"
+    dest = lake_root if inside == "root" else lake_root / "reading"
+    client.calls.clear()
+
+    with pytest.raises(RestoreRefused, match="is inside lake_root"):
+        _read(client, dest, lake_root)
+
+    assert os.listdir(real) == []
+    assert client.calls == []
+
+
 def test_a_destination_that_is_a_symbolic_link_loop_is_one_line(tmp_path):
     """Catches the inside check letting a loop's resolve error out as a traceback."""
     root, client = _simple(tmp_path)
@@ -677,6 +743,91 @@ def test_a_destination_beside_lake_root_with_a_shared_prefix_is_outside(tmp_path
     summary = _read(client, tmp_path / "lake-reading", root)
 
     assert summary.restored is True
+
+
+def _linked_work(tmp_path: Path, root: Path) -> Path:
+    """A destination whose working directory is a link to a directory inside ``lake_root``."""
+    inner = root / "inner"
+    inner.mkdir()
+    dest = tmp_path / "reading"
+    dest.mkdir()
+    (dest / WORK).symlink_to(inner)
+    return dest
+
+
+@pytest.mark.parametrize("command", ["reading", "restore"])
+def test_a_working_directory_that_is_a_symbolic_link_refuses_and_writes_nothing(tmp_path, command):
+    """A linked ``.marketlake-restoring`` would send every download wherever it points.
+
+    Both commands share the check. Catches dropping it, where the downloads land in the
+    directory inside the live lake that the link names.
+    """
+    root, client = _simple(tmp_path)
+    dest = _linked_work(tmp_path, root)
+    before = _files(root)
+    client.calls.clear()
+
+    with pytest.raises(RestoreRefused) as refused:
+        if command == "reading":
+            _read(client, dest, root)
+        else:
+            bucket.restore_lake(dest, TARGET, client=client)
+
+    assert str(refused.value) == (
+        f"{dest / WORK} is a symbolic link, and the files would land wherever it points, so "
+        "nothing was restored. Remove it, since a restore makes its own working directory"
+    )
+    assert _files(root) == before
+    assert os.listdir(root / "inner") == []
+    assert client.calls == []
+
+
+def _skip_as_root() -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes, so chmod cannot make the local failure")
+
+
+def test_a_destination_that_cannot_be_read_is_one_line_through_main(tmp_path, monkeypatch, capsys):
+    """A destination nobody can list exits 2 with one line rather than a traceback.
+
+    Catches the ``OSError`` from reading the destination escaping ``_destination_state``.
+    """
+    _skip_as_root()
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    dest.mkdir()
+    dest.chmod(0)
+    client.calls.clear()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
+    finally:
+        dest.chmod(0o755)
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"{LABEL}: reading {dest} failed (PermissionError: ")
+    assert err.endswith(", so nothing was restored\n")
+    assert err.count("\n") == 1
+    assert client.calls == []
+    assert os.listdir(dest) == []
+
+
+def test_a_destination_that_cannot_be_read_refuses_the_restore_too(tmp_path):
+    """Catches the same ``OSError`` escaping the ``restore`` command's call."""
+    _skip_as_root()
+    _root, client = _simple(tmp_path)
+    dest = tmp_path / "restored"
+    dest.mkdir()
+    dest.chmod(0)
+    client.calls.clear()
+    try:
+        with pytest.raises(RestoreRefused, match=r"^reading .* failed \(PermissionError: "):
+            bucket.restore_lake(dest, TARGET, client=client)
+    finally:
+        dest.chmod(0o755)
+
+    assert client.calls == []
 
 
 # -- 4. the journal reserve ----------------------------------------------------------------

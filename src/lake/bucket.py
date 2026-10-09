@@ -2037,8 +2037,9 @@ RESTORE_WORK_DIR = ".marketlake-restoring"
 # write.
 RESTORE_MARKER = ".marketlake-restore"
 
-# The file that says every file in the working directory verified. A run that finds it
-# finishes moving the files into the destination and downloads nothing.
+# The file that says every file in the working directory verified, and which command and
+# range made it. A run of that same command and range that finds it finishes moving the files
+# into the destination and downloads nothing. Any other run refuses with nothing moved.
 VERIFIED_MARKER = ".marketlake-verified"
 
 # The suffix a file carries while its download is in flight. It is renamed onto its own
@@ -2061,7 +2062,9 @@ _RESERVED = frozenset(
 
 
 class RestoreRefused(BucketRefusal):
-    """The restore command refused to start, or stopped, with one line for an operator."""
+    """The restore or the reading restore refused to start, or stopped, with one line for an
+    operator.
+    """
 
 
 def _free_bytes(path: Path) -> int:
@@ -2163,11 +2166,24 @@ def _destination_state(dest: Path) -> str:
     1. A symbolic link is refused, because the files would land wherever it points.
     2. A destination that exists and is not a directory is refused.
     3. An absent destination needs an existing parent, and is created later.
-    4. A directory counts as empty when it holds nothing but ``lost+found`` and the
+    4. A working directory that is a symbolic link is refused, for the same reason as the
+       destination. Every download and every move goes through it.
+    5. A directory counts as empty when it holds nothing but ``lost+found`` and the
        working directory. Anything else refuses, which keeps a restore off a live lake.
-    5. A working directory with files in it and no marker was not made by a restore,
+    6. A working directory with files in it and no marker was not made by a restore,
        and is refused rather than pruned.
+
+    A destination that cannot be read, such as one whose mode lets nobody list it, refuses
+    with one line rather than raising its ``OSError``. Both commands call this first.
     """
+    try:
+        return _destination_kind(dest)
+    except OSError as exc:
+        raise RestoreRefused(_local(f"reading {dest}", exc) + ", so nothing was restored") from None
+
+
+def _destination_kind(dest: Path) -> str:
+    """:func:`_destination_state`'s checks, which may raise an ``OSError``."""
     if dest.is_symlink():
         raise RestoreRefused(
             f"{dest} is a symbolic link. Name the directory it points to, so nothing was restored"
@@ -2179,6 +2195,11 @@ def _destination_state(dest: Path) -> str:
             raise RestoreRefused(f"{dest.parent} does not exist, so nothing was restored")
         return "download"
     work = dest / RESTORE_WORK_DIR
+    if work.is_symlink():
+        raise RestoreRefused(
+            f"{work} is a symbolic link, and the files would land wherever it points, so "
+            "nothing was restored. Remove it, since a restore makes its own working directory"
+        )
     if work.is_dir() and (work / VERIFIED_MARKER).is_file():
         return "move"
     others = sorted(set(os.listdir(dest)) - {LOST_AND_FOUND, RESTORE_WORK_DIR})
@@ -2203,7 +2224,7 @@ def _destination_state(dest: Path) -> str:
     if work.is_dir() and any(work.iterdir()) and not (work / RESTORE_MARKER).is_file():
         raise RestoreRefused(
             f"{work} holds files and no restore made it, so nothing was restored. Move it "
-            "aside and run the restore again"
+            "aside and run the same command again"
         )
     return "download"
 
@@ -2382,13 +2403,13 @@ def _check_before_move(work: Path, dest: Path) -> None:
             f"{dest} gained a {present[MANIFEST_FILE]} while the verified restore waited in "
             f"{work}, so something is using it as a lake and nothing was moved. Stop what "
             f"writes there, remove {dest / present[MANIFEST_FILE]} if it holds nothing worth "
-            "keeping, and run the restore again"
+            "keeping, and run the same command again"
         )
     clashes = sorted(present[name] for name in staged.keys() & present.keys())
     if clashes:
         raise RestoreRefused(
             f"{dest} holds {clashes[0]}, which the restore is about to move in from {work}, "
-            "so nothing was moved. Move it aside and run the restore again"
+            "so nothing was moved. Move it aside and run the same command again"
         )
     try:
         files = json.loads((work / VERIFIED_MARKER).read_text())["files"]
@@ -2405,7 +2426,7 @@ def _check_before_move(work: Path, dest: Path) -> None:
     if gaps:
         raise RestoreRefused(
             f"{work} no longer holds {gaps[0]} as it verified, so nothing was moved. Delete "
-            f"{work} and run the restore again"
+            f"{work} and run the same command again"
         )
 
 
@@ -2435,7 +2456,7 @@ def _finish_or_refuse(work: Path, dest: Path) -> None:
     except OSError as exc:
         raise RestoreRefused(
             f"every file verified and {_local(f'moving them from {work} into {dest}', exc)}. "
-            "Fix that and run the restore again, which finishes the move"
+            "Fix that and run the same command again, which finishes the move"
         ) from None
 
 
@@ -4864,9 +4885,11 @@ def _read_restore_command(
             f"{READING_MODE}: a file that does not match its SHA-256 has one of two causes. An "
             "upload is running or stopped part-way, so the bucket's current version is newer "
             "than its manifest.jsonl, and a run after the next complete nightly upload passes. "
-            'Or the current version is damaged, and the README\'s "When the lake is gone" '
-            f"console steps put a good version into {summary.work}. They write nothing to the "
-            "bucket, so they work from a shadow host too",
+            "Or the current version is damaged. When the bucket holds an earlier good version, "
+            'the README\'s "When the lake is gone" console steps put it into '
+            f"{summary.work}. They write nothing to the bucket, so they work from a shadow host "
+            "too. A partition the trim removed usually has a single bucket version, so it has "
+            "none to recover",
             file=sys.stderr,
         )
     print(
