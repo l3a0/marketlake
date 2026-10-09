@@ -1,7 +1,8 @@
-# Two roles, each assumed through GitHub's OIDC provider. Every policy is a
-# jsonencode() literal rather than an aws_iam_policy_document, because under tofu
+# Three roles, each assumed through GitHub's OIDC provider: the plan role, the apply
+# role, and the deploy role that .github/workflows/deploy.yml uses (#676). Every policy
+# is a jsonencode() literal rather than an aws_iam_policy_document, because under tofu
 # test's mock provider that data source returns a random string and no test could read
-# the document. The statements are written out in full in both roles, rather than
+# the document. The statements are written out in full in each role, rather than
 # shared through a local, so tests/component/test_infra_config.py can read them from
 # the parse.
 
@@ -306,6 +307,100 @@ resource "aws_iam_role_policy" "apply" {
         Condition = {
           StringEquals = { "aws:RequestedRegion" = "us-east-1" }
         }
+      },
+      {
+        # The deploy's SSM document in infra/live/deploy.tf (#676). The provider calls
+        # UpdateDocumentDefaultVersion after every update, and without it SendCommand
+        # would keep running the old content. The prefix lets a tightened document take
+        # a new name with no bootstrap apply. No ssm:ModifyDocumentPermission, which
+        # would share the document with another account.
+        Sid    = "DeployDocumentWrite"
+        Effect = "Allow"
+        Action = [
+          "ssm:CreateDocument",
+          "ssm:UpdateDocument",
+          "ssm:UpdateDocumentDefaultVersion",
+          "ssm:DeleteDocument",
+        ]
+        Resource = ["arn:aws:ssm:us-east-1:${local.account_id}:document/marketlake-deploy*"]
+      },
+    ]
+  })
+}
+
+# -- the deploy role ----------------------------------------------------------------
+
+# Trusted only in the `deploy` environment, which needs the owner's approval, and only
+# on `main`, like the apply role. .github/workflows/deploy.yml assumes it to ask the VM
+# to deploy one commit through the SSM document marketlake-deploy, and nothing else.
+# Its session lasts five hours, longer than the job's 240 minutes.
+resource "aws_iam_role" "deploy" {
+  name                 = "marketlake-deploy"
+  max_session_duration = 18000
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = local.github_oidc_provider_arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "${local.github_subject_prefix}:environment:deploy"
+          "token.actions.githubusercontent.com:ref" = "refs/heads/main"
+        }
+      }
+    }]
+  })
+
+  depends_on = [aws_iam_openid_connect_provider.github]
+}
+
+# No ReadOnlyAccess, and no ssm:CancelCommand, which the deploy never needs and which
+# would stop only the host's wrapper anyway. The document marketlake-deploy can only ask
+# the VM to move forward to a commit already on main. AWS-RunShellScript would let any
+# step in the job run any command as root on the VM, so no grant names it.
+resource "aws_iam_role_policy" "deploy" {
+  name = "deploy-to-vm"
+  role = aws_iam_role.deploy.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # DescribeInstances has no resource-level permissions.
+        Sid      = "FindTheVm"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = ["*"]
+      },
+      {
+        # IAM checks a statement's condition against every resource in the request, and
+        # the document carries no marketlake:host tag, so the instance and the document
+        # sit in separate statements.
+        Sid      = "SendToTheCaptureHost"
+        Effect   = "Allow"
+        Action   = ["ssm:SendCommand"]
+        Resource = ["arn:aws:ec2:us-east-1:${local.account_id}:instance/*"]
+        Condition = {
+          StringEquals = { "ssm:resourceTag/marketlake:host" = "capture" }
+        }
+      },
+      {
+        Sid      = "SendTheDeployDocument"
+        Effect   = "Allow"
+        Action   = ["ssm:SendCommand"]
+        Resource = ["arn:aws:ssm:us-east-1:${local.account_id}:document/marketlake-deploy*"]
+      },
+      {
+        # GetCommandInvocation has no resource types, so this reads any Run Command's
+        # output in the account. That is accepted while this deploy is the account's
+        # only Run Command user.
+        Sid      = "ReadTheDeployResult"
+        Effect   = "Allow"
+        Action   = ["ssm:GetCommandInvocation"]
+        Resource = ["*"]
       },
     ]
   })
