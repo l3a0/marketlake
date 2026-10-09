@@ -45,7 +45,10 @@ def test_a_bucket_that_behaves_as_documented_passes_all_seven(tmp_path):
         "listed 1 object(s)"
     ) in lines
     assert "live-check: PASS 6 GetBucketVersioning returned Enabled" in lines
-    assert "live-check: PASS 7 GetObject of the probe returned the current version's bytes" in lines
+    assert (
+        "live-check: PASS 7 GetObject of the probe returned the current version's bytes "
+        "with VersionId v2"
+    ) in lines
     assert lines[-1].startswith("live-check: delete live-check/live-check-20261005T230000Z/")
     # The check runs on the VM too, where the credentials come from an instance profile,
     # so the line names the credentials rather than a key.
@@ -86,6 +89,38 @@ def test_a_bucket_without_versions_fails_behavior_three():
     passed, lines = _run(_Unversioned())
     assert not passed
     assert any(line.startswith("live-check: FAIL 3 ") for line in lines)
+
+
+class _FirstPutUnversioned(FakeS3):
+    """A bucket whose first PUT to a key names no version and whose later PUTs name one.
+
+    That is what a bucket that turned versioning on between the two PUTs answers. The two ids
+    differ, so only ``usable_version_id`` tells the first one names nothing.
+    """
+
+    def __init__(self, first: str | None):
+        super().__init__()
+        self.first = first
+        self.seen: set[str] = set()
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        if kwargs["Key"] in self.seen:
+            return response
+        self.seen.add(kwargs["Key"])
+        response = {key: value for key, value in response.items() if key != "VersionId"}
+        if self.first is not None:
+            response["VersionId"] = self.first
+        return response
+
+
+@pytest.mark.parametrize("first", ["null", "NULL", "", None], ids=["null", "NULL", "empty", "none"])
+def test_two_puts_whose_first_id_names_no_version_fail_behavior_three(first):
+    """Mutation this catches: behavior three judging two ids distinct by ``!=`` alone rather
+    than through ``bucket.usable_version_id``, which the trim judges a version by too."""
+    passed, lines = _run(_FirstPutUnversioned(first))
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 3 two PUTs to one key") for line in lines)
 
 
 class _DeniesMismatch(FakeS3):
@@ -226,7 +261,141 @@ class _ServesFirstVersion(FakeS3):
 def test_a_plain_get_of_old_bytes_fails_grant_seven():
     passed, lines = _run(_ServesFirstVersion())
     assert not passed
-    assert "live-check: FAIL 7 GetObject of the probe returned other bytes" in lines
+    assert (
+        "live-check: FAIL 7 GetObject of the probe returned other bytes with VersionId v1, not v2"
+    ) in lines
+
+
+class _ServesFirstBytesAsCurrent(FakeS3):
+    """A plain ``GetObject`` that names the current version and serves the first one's bytes."""
+
+    def get_object(self, **kwargs):
+        if "VersionId" in kwargs:
+            return super().get_object(**kwargs)
+        versions = self.objects[kwargs["Key"]]
+        response = super().get_object(**kwargs, VersionId=versions[0].version_id)
+        response["VersionId"] = versions[-1].version_id
+        return response
+
+
+def test_a_plain_get_of_old_bytes_under_the_current_id_fails_grant_seven():
+    """Mutation this catches: grant seven judging the id alone. The id here is right, so only
+    the bytes fail it."""
+    passed, lines = _run(_ServesFirstBytesAsCurrent())
+    assert not passed
+    assert (
+        "live-check: FAIL 7 GetObject of the probe returned other bytes with VersionId v2"
+    ) in lines
+
+
+class _NamesNoVersion(FakeS3):
+    """A plain ``GetObject`` that serves the current bytes and names no version."""
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            del response["VersionId"]
+        return response
+
+
+class _NamesTheOldVersion(FakeS3):
+    """A plain ``GetObject`` that serves the current bytes and names the first version."""
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            response["VersionId"] = self.objects[kwargs["Key"]][0].version_id
+        return response
+
+
+@pytest.mark.parametrize(
+    ("fake", "shown"),
+    [(_NamesNoVersion, "VersionId None, not v2"), (_NamesTheOldVersion, "VersionId v1, not v2")],
+)
+def test_a_plain_get_that_misnames_the_current_version_fails_grant_seven(fake, shown):
+    # The bytes are right. The trim records the id the read returns, so a wrong or missing id
+    # fails the grant even then.
+    passed, lines = _run(fake())
+    assert not passed
+    assert (
+        f"live-check: FAIL 7 GetObject of the probe returned the current version's bytes with "
+        f"{shown}"
+    ) in lines
+
+
+class _NamesOneId(FakeS3):
+    """Every PUT and every plain ``GetObject`` names the same unusable id."""
+
+    def __init__(self, version_id: str) -> None:
+        super().__init__()
+        self.fixed = version_id
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        response["VersionId"] = self.fixed
+        return response
+
+    def get_object(self, **kwargs):
+        response = super().get_object(**kwargs)
+        if "VersionId" not in kwargs:
+            response["VersionId"] = self.fixed
+        return response
+
+
+@pytest.mark.parametrize("version", ["NULL", "Null", "  "])
+def test_an_id_that_names_no_version_fails_grant_seven_even_when_the_put_named_it(version):
+    """Mutation this catches: grant seven judging the id by anything but
+    ``bucket.usable_version_id``, which the trim judges by too."""
+    passed, lines = _run(_NamesOneId(version))
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 7 GetObject") for line in lines)
+
+
+class _NamesNoSecondVersion(FakeS3):
+    """The second PUT to a key answers an id that names no version, unlike the first."""
+
+    def __init__(self, version_id: str) -> None:
+        super().__init__()
+        self.fixed = version_id
+        self.puts: dict[str, int] = {}
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        count = self.puts[kwargs["Key"]] = self.puts.get(kwargs["Key"], 0) + 1
+        if count > 1:
+            response["VersionId"] = self.fixed
+        return response
+
+
+@pytest.mark.parametrize("version", ["NULL", "Null", "  "])
+def test_a_second_put_naming_no_version_fails_behavior_three(version):
+    """Mutation this catches: behavior three judging the ids by anything but
+    ``bucket.usable_version_id``. The earlier check, ``old_id != "null"`` on the first id alone,
+    passed a first id of ``v1`` and a second of ``NULL``."""
+    passed, lines = _run(_NamesNoSecondVersion(version))
+    assert not passed
+    assert any(
+        line.startswith("live-check: FAIL 3 two PUTs to one key returned versions v1 and")
+        for line in lines
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "usable"),
+    [
+        (None, False),
+        ("", False),
+        ("   ", False),
+        ("null", False),
+        ("NULL", False),
+        ("nUlL", False),
+        (7, False),
+        ("v1", True),
+        ("3HL4kqtJlcpXroDTDmJ", True),
+    ],
+)
+def test_usable_version_id_refuses_every_id_that_names_no_version(version, usable):
+    assert bucket.usable_version_id(version) is usable
 
 
 @pytest.mark.parametrize(("fake", "code"), [(FakeS3, 0), (_DeniesMismatch, 1)])

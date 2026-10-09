@@ -1,6 +1,6 @@
 """The disk runway: what the lake holds, how fast it grows, and how long the disk lasts.
 
-Four consumers read this module and it is deliberately a leaf, importing only the standard
+Five consumers read this module and it is deliberately a leaf, importing only the standard
 library, :mod:`lake.calendar` and :mod:`lake.paths`.
 
 1. The dashboard's Lake panel renders what it returns.
@@ -12,6 +12,9 @@ library, :mod:`lake.calendar` and :mod:`lake.paths`.
 4. The ``restore`` command in :mod:`lake.bucket` refuses the same way on the directory it
    fills, with the busiest sealed day read off the bucket's listing by
    :func:`listing_busiest_sealed_day` (marketlake #785).
+5. :mod:`lake.window` reads :data:`GROWTH_WINDOW_DAYS` to derive the smallest window a host
+   may keep, because :func:`assess` reads the busiest day over that many calendar days
+   (marketlake #786).
 
 One computation with several consumers is the point: independent ones would drift, and a
 panel and an alarm disagreeing about how long the disk lasts is worse than either being
@@ -131,12 +134,14 @@ from pathlib import Path
 
 from lake.calendar import Calendar
 from lake.paths import (
+    CHAINS,
     JOURNAL_DIR,
     JSONL_SUFFIX,
     LOST_AND_FOUND,
     PARQUET_SUFFIX,
     TIMING_DIR,
     parse_date_dir,
+    parse_partition_rel,
 )
 
 # How many trailing calendar days the growth rate is measured over. It matches the
@@ -211,6 +216,46 @@ class Entry:
 
 
 @dataclass(frozen=True)
+class OldestChains:
+    """The oldest chains session still on disk, and every ticker holding a partition for it.
+
+    The trim (marketlake #787) drops chains partitions older than the window, so this day
+    moves forward each night a trim runs and stands still when it stops. ``tickers`` is
+    sorted, and names the ticker that holds the day back when one ticker's walk keeps its
+    partitions while the others trim.
+    """
+
+    day: date
+    tickers: tuple[str, ...]
+
+
+class _OldestChainsSeen:
+    """The oldest chains session among the paths seen so far, for :func:`walk` and
+    :func:`listing_usage` alike, so the two read it by one rule.
+
+    Each path is read with ``paths.parse_partition_rel``, and only a chains partition counts.
+    """
+
+    def __init__(self) -> None:
+        self.day: date | None = None
+        self.tickers: set[str] = set()
+
+    def see(self, parts: Sequence[str]) -> None:
+        ref = parse_partition_rel("/".join(parts)) if parts[0] == CHAINS else None
+        if ref is None or ref.surface != CHAINS:
+            return
+        if self.day is None or ref.day < self.day:
+            self.day, self.tickers = ref.day, {ref.ticker}
+        elif ref.day == self.day:
+            self.tickers.add(ref.ticker)
+
+    def result(self) -> OldestChains | None:
+        if self.day is None:
+            return None
+        return OldestChains(day=self.day, tickers=tuple(sorted(self.tickers)))
+
+
+@dataclass(frozen=True)
 class Usage:
     """One read of the lake tree: what it holds, when it arrived, and what refused.
 
@@ -242,6 +287,11 @@ class Usage:
 
     ``refusals`` names what would not read, capped at ``NAMED_REFUSALS`` with
     ``refused`` holding the true count.
+
+    ``oldest_chains`` is the oldest chains partition's day and the tickers holding one for
+    it, or ``None`` when the lake holds no chains partition. It is read from the partition
+    paths alone, never from ``day_bytes``, whose oldest day is usually a quotes day that no
+    trim removes. It has a default so a ``Usage`` built directly keeps working.
     """
 
     entries: tuple[Entry, ...]
@@ -253,6 +303,7 @@ class Usage:
     files: int
     refusals: tuple[str, ...]
     refused: int
+    oldest_chains: OldestChains | None = None
 
     @property
     def total(self) -> int:
@@ -399,6 +450,10 @@ def walk(lake_root: Path | str) -> Usage:
     ``lost+found`` at the root is dropped before it is listed, for the reason the module
     docstring gives. One anywhere else is not the filesystem's, so it is walked and an
     unreadable one is still refused.
+
+    The same pass finds the oldest chains session on disk, by reading each path under
+    ``chains/`` with ``paths.parse_partition_rel``, so the panel can show how far a trim
+    has reached without a second walk.
     """
     root = Path(lake_root).resolve()
     entry_bytes: dict[str, int] = {}
@@ -408,6 +463,7 @@ def walk(lake_root: Path | str) -> Usage:
     journal_bytes: dict[date, int] = {}
     dated = undated = files = refused = 0
     refusals: list[str] = []
+    oldest = _OldestChainsSeen()
 
     def refuse(where: object, exc: OSError) -> None:
         """Name a refused path relative to the lake root, never absolutely.
@@ -474,6 +530,7 @@ def walk(lake_root: Path | str) -> Usage:
             entry = parts[0]
             entry_bytes[entry] = entry_bytes.get(entry, 0) + size
             entry_files[entry] = entry_files.get(entry, 0) + 1
+            oldest.see(parts)
             day, segment = path_day(parts)
             if day is None:
                 undated += size
@@ -498,6 +555,7 @@ def walk(lake_root: Path | str) -> Usage:
         files=files,
         refusals=tuple(refusals),
         refused=refused,
+        oldest_chains=oldest.result(),
     )
 
 
@@ -583,6 +641,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
     unsealed: set[date] = set()
     journal_bytes: dict[date, int] = {}
     dated = undated = files = 0
+    oldest = _OldestChainsSeen()
     for key, size in listing.items():
         if key.endswith("/") and size == 0:
             continue
@@ -593,6 +652,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
         entry = parts[0]
         entry_bytes[entry] = entry_bytes.get(entry, 0) + size
         entry_files[entry] = entry_files.get(entry, 0) + 1
+        oldest.see(parts)
         day, segment = path_day(parts)
         if day is None:
             undated += size
@@ -615,6 +675,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
         files=files,
         refusals=(),
         refused=0,
+        oldest_chains=oldest.result(),
     )
 
 

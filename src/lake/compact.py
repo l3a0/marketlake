@@ -1,13 +1,14 @@
-"""The close+15 compaction, backup, and nightly window re-tune.
+"""The close+15 compaction, nightly window re-tune, backup, and trim.
 
 The capture loop writes a day's cycles into journal segments, one Arrow IPC file per
 surface, ticker, and writer session. A *segment* is that file. Reading a day back from
 dozens of segments is slow and fragile, so once the day is final the segments are merged
 into one Parquet *partition* per surface and ticker, checksummed into the manifest, and
 deleted. That merge is *compaction*. This module is the close+15 job that does it, then
-copies the lake to the backup target, then re-sizes the chain chunk plan from what the day
-captured. The backup target is a mounted directory, copied with ``rsync``, or a bucket,
-uploaded to by ``lake.bucket``.
+re-sizes the chain chunk plan from what the day captured, then copies the lake to the backup
+target and pings. The backup target is a mounted directory, copied with ``rsync``, or a
+bucket, uploaded to by ``lake.bucket``. On a host whose config sets a window, the job then
+trims chains partitions older than the window, which ``lake.trim`` decides.
 
 Every ``close+N`` here counts from the *option* close, the capture stop at 16:15 ET on a
 regular day and 13:15 on an early close. It never counts from the 16:00 equity close, even
@@ -139,6 +140,16 @@ The job's rules, each glossed at first use.
    zero would merge its windows into their neighbours, and a wider window is a wider
    request, which is the body limit this plan exists to stay under. The rebuilt plan is
    written to ``chain_plan.json`` atomically, and only when it changed.
+9. *The trimmed ledger, then the trim.* Just before the backup, the trimmed ledger's manifest
+   entry is re-recorded when a trim or restore line landed without it, so the upload never
+   sends the ledger under a stale sha. A host with no ``trimmed.jsonl`` reads and writes
+   nothing there. After the ping, still in the lock hold, a primary host with a bucket target
+   and a ``lake_window_sessions`` key trims chains partitions older than its window, once each
+   is verified in the bucket (marketlake #787). The trim is the only code that deletes a
+   sealed partition on its own, and the hand-run ``recompact_ticker_day`` is the only code
+   that replaces one. The trim records each partition in ``trimmed.jsonl`` first. It never
+   raises, so a trim fault withholds no ping and loses none of the night's lines. Then every
+   empty ``chains/ticker=T/`` goes, on any host that holds a trimmed ledger.
 
 This module reads no wall clock. ``clock`` and ``calendar`` are injected, and every
 session-relative moment comes from the session clock over them.
@@ -155,12 +166,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from lake import bucket, journal, outbox
+from lake import bucket, journal, outbox, trimmed
+from lake import window as lake_window
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import ChainPlan, Window, default_chain_plan_path, load_chain_plan
@@ -213,6 +226,9 @@ from lake.runner import (
 )
 from lake.session import SessionClock
 
+if TYPE_CHECKING:  # ``lake.trim`` reads ``_durable`` from here, so it is imported where used.
+    from lake.trim import TrimResult
+
 # The manifest ``source`` for a compacted partition entry.
 COMPACTION_SOURCE = "compaction"
 
@@ -256,6 +272,18 @@ DAMAGED_SEGMENT_TITLE = "Damaged segment at the merge"
 # widest damage is the page that never arrives. The files under
 # ``reports/damaged_segments/`` name every segment either way.
 PAGE_SEGMENT_CAP = 4
+
+# The event and title on the page compaction sends when the trimmed ledger's manifest entry
+# could not be re-recorded before the upload (marketlake #787). The ledger, not a segment,
+# is what refused, so it carries neither constant above.
+TRIMMED_LEDGER_EVENT = "compaction_trimmed_ledger"
+TRIMMED_LEDGER_TITLE = "Trimmed ledger not repaired"
+
+# The event and title on the page the trim's rot findings send, once a run (marketlake #787).
+# The bucket's copy of a partition no longer hashes to its manifest sha, which is rot at rest
+# in the copy the trim would have kept, so the partition stays in the lake.
+TRIM_ROT_EVENT = "compaction_trim_rot"
+TRIM_ROT_TITLE = "Rot in the bucket's copy"
 
 # Why a ticker-day was refused, one value per refusal the sweep catches.
 # ``RefusedTickerDay.reason`` carries it, and ``CompactionResult.render`` words each one.
@@ -581,6 +609,19 @@ class RetuneResult:
 
 
 @dataclass(frozen=True)
+class LedgerRepair:
+    """What compaction's repair of the trimmed ledger's manifest entry did.
+
+    ``rerecorded`` is true when the entry was re-recorded from the ledger's bytes, which
+    appends one manifest line. ``refusal`` is the refusal's text when the repair could not
+    run, which names the hand repair. Exactly one of the two is set.
+    """
+
+    rerecorded: bool
+    refusal: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionResult:
     """What one close+15 run did.
 
@@ -595,6 +636,15 @@ class CompactionResult:
     and ``render`` then says the backup was skipped. ``problem`` names a ping that failed,
     which leaves ``pinged`` false. The seal and the backup already happened, so the run's
     report is worth more than the lost ping.
+
+    ``ledger_repair`` is what the repair of the trimmed ledger's manifest entry did before
+    the backup, or ``None`` when there was nothing to repair, which includes every host with
+    no ``trimmed.jsonl``.
+
+    ``trim`` is what the trim after the ping did (marketlake #787), or ``None`` on a host
+    whose config sets no window, which never trims. ``pruned`` lists each empty
+    ``chains/ticker=T/`` directory the pass after the trim removed, on any host that holds a
+    ``trimmed.jsonl``.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -605,6 +655,9 @@ class CompactionResult:
     pinged: bool
     problem: str | None = None
     refused: tuple[RefusedTickerDay, ...] = ()
+    ledger_repair: LedgerRepair | None = None
+    trim: TrimResult | None = None
+    pruned: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
@@ -619,10 +672,25 @@ class CompactionResult:
         inside the lake and inside the backup sync root, so the run did change the lake.
         A run whose every ticker-day was refused would otherwise report itself the way an
         already-sealed lake does.
+
+        A re-recorded trimmed-ledger entry counts, because it appends a manifest line. A
+        refused repair alone does not, because it writes nothing. The trim counts when it
+        appended a line or unlinked a file, and the pass after it counts when it removed a
+        directory. A trim that only refused, stopped or paged changed nothing.
         """
         debris = any(item.segments for item in self.verified)
         rewrote = self.retune is not None and self.retune.written
-        return bool(self.sealed) or bool(self.refused) or debris or rewrote
+        repaired = self.ledger_repair is not None and self.ledger_repair.rerecorded
+        trimmed_any = self.trim is not None and self.trim.changed
+        return (
+            bool(self.sealed)
+            or bool(self.refused)
+            or debris
+            or rewrote
+            or repaired
+            or trimmed_any
+            or bool(self.pruned)
+        )
 
     def render(self) -> str:
         """A human-readable summary. It names slugs and paths, never a ping URL."""
@@ -670,6 +738,15 @@ class CompactionResult:
                 f"  retune   {self.retune.day.isoformat()} {verdict}: "
                 f"splits={list(self.retune.splits)} merges={list(self.retune.merges)}"
             )
+        if self.ledger_repair is not None:
+            if self.ledger_repair.rerecorded:
+                lines.append("  ledger   re-recorded the trimmed ledger's manifest entry")
+            else:
+                lines.append(f"  ledger   not repaired: {self.ledger_repair.refusal}")
+        if self.trim is not None:
+            lines.extend(self.trim.render())
+        for rel in self.pruned:
+            lines.append(f"  pruned   {rel}/ held no partition")
         return "\n".join(lines)
 
 
@@ -1322,6 +1399,154 @@ def _page_drift(
         what="schema-drift",
         now=now,
     )
+
+
+def _repair_trimmed_ledger(
+    root: Path, *, clock: Clock, publisher: Publisher | None
+) -> LedgerRepair | None:
+    """Re-record the trimmed ledger's manifest entry before the upload reads it.
+
+    A trim or range-restore line that landed without its entry refresh leaves the entry's
+    sha behind the bytes. Behind the watermark the upload carries on and the bucket's copy
+    of the ledger lags. Past it the upload raises ``ChecksumRefused`` every night, the ping
+    is withheld, and the trim that would write the next line never runs again. So the repair
+    runs here, after the re-tune and just before ``backup.sync``, the one step it has to
+    precede. It does not run at the start of the lock hold, where the sweep and the manifest
+    read have no ``try`` around them and a raise would leave every journal unsealed.
+
+    ``trimmed.repair_trimmed_entry`` is the gate on the ledger existing. It returns before
+    reading anything on a host with no ``trimmed.jsonl``, so that host stays byte-identical,
+    and the gate is the ledger rather than the window key because a rolled-back host keeps
+    its ledger after the key is removed. Every failure it meets raises
+    ``TrimmedRepairRefused``, which this pages once and returns, so the backup still runs.
+    """
+    try:
+        rerecorded = trimmed.repair_trimmed_entry(
+            root, source=COMPACTION_SOURCE, fetched_at=clock.now().isoformat()
+        )
+    except trimmed.TrimmedRepairRefused as exc:
+        refusal = str(exc)
+        _page(
+            publisher,
+            event=TRIMMED_LEDGER_EVENT,
+            title=TRIMMED_LEDGER_TITLE,
+            body=refusal,
+            what="trimmed-ledger",
+            now=clock.now(),
+        )
+        return LedgerRepair(rerecorded=False, refusal=refusal)
+    return LedgerRepair(rerecorded=True) if rerecorded else None
+
+
+def _trim_step(
+    root: Path,
+    *,
+    role: str | None,
+    window_sessions: int | str | None,
+    guards: GuardConstants,
+    backup: BackupRunner | None,
+    backup_target: Path | str | BucketTarget,
+    ledger_repair: LedgerRepair | None,
+    clock: Clock,
+    calendar: Calendar,
+) -> TrimResult | None:
+    """Judge whether tonight's run may trim, and run the trim when it may. Never raises.
+
+    ``None`` means the config sets no window, which is every host that never trims, the
+    laptop included, so its result prints nothing new. Every other gate that refuses returns
+    a result naming why.
+
+    1. The window has to clear its floor, which ``window.window_sessions`` judges.
+    2. The role ``outbox.senders`` resolved has to be primary. A shadow's own trimmed ledger
+       would be reverted by the resync (marketlake #832), which would leave its trims
+       unexplained.
+    3. The backup has to be a ``BucketBackup`` uploading to a ``BucketTarget``, whose last
+       upload carries the deadline and the watermark the trim reads. A non-``None`` backup
+       alone says only that ``main`` built one, which a primary with a path target also has.
+    4. The trimmed ledger's entry has to have been repaired or found in step, because the
+       trim writes to that ledger.
+    """
+    from lake.trim import TrimResult, describe, trim
+
+    try:
+        try:
+            window = lake_window.window_sessions(window_sessions, guards)
+        except lake_window.WindowRefused as exc:
+            return TrimResult(refused=str(exc))
+        if window is None:
+            return None
+        if role != outbox.PRIMARY:
+            return TrimResult(
+                window=window,
+                refused=f"the role is {role!r}, and only a primary host trims its lake",
+            )
+        if not isinstance(backup, bucket.BucketBackup) or not isinstance(
+            backup_target, BucketTarget
+        ):
+            return TrimResult(
+                window=window,
+                refused="the backup target is not a bucket, so no copy can be verified before "
+                "a partition is dropped",
+            )
+        summary = backup.last
+        if summary is None or summary.deadline is None or summary.watermark is None:
+            return TrimResult(
+                window=window,
+                refused="the nightly upload left no deadline or watermark to trim by",
+            )
+        if ledger_repair is not None and ledger_repair.refusal is not None:
+            return TrimResult(
+                window=window,
+                refused="the trimmed ledger's manifest entry was not repaired, so no line is "
+                "written to it tonight. The page names the hand repair",
+            )
+        return trim(
+            root,
+            window=window,
+            client=backup.client,
+            target=backup_target,
+            upload=summary,
+            clock=clock,
+            calendar=calendar,
+        )
+    except Exception as exc:
+        return TrimResult(
+            stopped=f"an unforeseen error before the trim, {describe(root, exc)}. The next "
+            "close+15 tries again"
+        )
+
+
+def _prune_trimmed_tickers(root: Path) -> tuple[str, ...]:
+    """Remove each empty ``chains/ticker=T/`` on a host that holds a trimmed ledger.
+
+    A trim's unlink can empty a ticker's directory, and so can a range restore refused after
+    its ``mkdir`` (marketlake #816), on hosts that never trim too. An empty one makes the
+    dashboard list the ticker on ``chains`` with no days. The pass is gated on the ledger,
+    not on the window, so a host rolled back from trimming still runs it, and a host that
+    never held a ledger reads nothing and changes nothing. It runs as a pass on every run
+    rather than right after an unlink, so a crash between the two leaves nothing for good.
+    Only an empty directory goes, so this never deletes data. Neither an ``rmdir`` nor the
+    listing is fsynced, and a lost ``rmdir`` is redone the next night.
+    """
+    try:
+        if not trimmed.trimmed_path(root).exists():
+            return ()
+        with os.scandir(root / CHAINS) as entries:
+            tickers = sorted(
+                entry.path
+                for entry in entries
+                if entry.name.startswith(TICKER_PREFIX) and entry.is_dir(follow_symlinks=False)
+            )
+    except OSError:
+        return ()
+    removed: list[str] = []
+    for path in tickers:
+        try:
+            os.rmdir(path)
+        except OSError:
+            continue  # not empty, or already gone
+        removed.append(Path(path).relative_to(root).as_posix())
+    return tuple(removed)
 
 
 def _write_partition(table: pa.Table, partition: Path) -> None:
@@ -2054,6 +2279,8 @@ def compact(
     publisher: Publisher | None = None,
     guards: GuardConstants | None = None,
     plan_path: Path | str | None = None,
+    role: str | None = None,
+    window_sessions: int | str | None = None,
 ) -> CompactionResult:
     """Run the close+15 job: sweep, seal, re-tune, back up, ping.
 
@@ -2064,12 +2291,20 @@ def compact(
     it, because its segments disagree about a column type or because one no longer
     matches the hash taken when it closed, and then it is filed, reported under
     ``refused``, and left exactly as the capture wrote it. The window re-tune then
-    profiles the latest sealed day's chains partitions. The backup runs last, and the ping
-    only after it.
+    profiles the latest sealed day's chains partitions. The trimmed ledger's entry is
+    repaired next, then the backup runs, and the ping only after it. The trim runs after the
+    ping, and only when ``role`` is primary, ``window_sessions`` judges to a window, and the
+    backup is a bucket upload that left a deadline and a watermark. Both default to off, so
+    a caller that passes neither never trims. ``main`` passes the role ``outbox.senders``
+    resolved and the config's ``lake_window_sessions``.
 
-    The run is idempotent. A second run over the same lake seals nothing, deletes
-    nothing, rewrites no plan, and reports ``changed`` false. It still backs up and
-    pings, because a job that correctly no-ops is healthy. A refused ticker-day is the one
+    The run is idempotent. A second run over the same lake seals nothing and rewrites no
+    plan. Its trim sends no read for a partition the first run trimmed, but it can trim one
+    the first run left at the upload's deadline or skipped. So the second run reports
+    ``changed`` false only when its trim found nothing more to drop. The trim is the one
+    step that deletes a sealed partition, and it deletes only what the window, the bucket
+    and the checkpoint allow. A run with nothing to do still backs up and pings, because a
+    job that correctly no-ops is healthy. A refused ticker-day is the one
     thing that repeats rather than settling. Its segments are still there, so every run
     refuses it again and files again, and ``changed`` stays true until a human clears it.
 
@@ -2082,8 +2317,8 @@ def compact(
     skipped. A runner that did nothing would not do, because ``backed_up`` turns true
     after any sync that returns, and the result would claim a copy that was never made.
 
-    ``publisher`` carries the schema-drift page, the damaged-segment page and the
-    refused-ping page, and it follows
+    ``publisher`` carries the schema-drift page, the damaged-segment page, the
+    trimmed-ledger page, the trim's rot page and the refused-ping page, and it follows
     ``pinger`` exactly. Both reach past this process, so ``main`` gets them from
     ``outbox`` and never accepts them, and a test drives
     this helper with a fake instead. It is optional for the same reason ``pinger`` is: a
@@ -2210,6 +2445,9 @@ def compact(
                 refused=refused,
             )
 
+        # The trimmed ledger's entry has to match its bytes before the upload reads it.
+        ledger_repair = _repair_trimmed_ledger(root, clock=clock, publisher=publisher)
+
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
         backed_up = False
@@ -2232,6 +2470,36 @@ def compact(
                     exc, slug=COMPACTION_SLUG, publisher=publisher, now=clock.now()
                 )
 
+        # The trim runs after the ping, still in this hold, so a trim fault never reads as a
+        # sealing fault on the alarm that watches capture. It never raises. The pass after it
+        # runs on every exit from it, gated on the ledger rather than on the window.
+        trim_result: TrimResult | None = None
+        try:
+            trim_result = _trim_step(
+                root,
+                role=role,
+                window_sessions=window_sessions,
+                guards=guards,
+                backup=backup,
+                backup_target=backup_target,
+                ledger_repair=ledger_repair,
+                clock=clock,
+                calendar=calendar,
+            )
+            if trim_result is not None and trim_result.rot:
+                from lake.trim import rot_page_body
+
+                _page(
+                    publisher,
+                    event=TRIM_ROT_EVENT,
+                    title=TRIM_ROT_TITLE,
+                    body=rot_page_body(trim_result.rot),
+                    what="trim-rot",
+                    now=clock.now(),
+                )
+        finally:
+            pruned = _prune_trimmed_tickers(root)
+
     return CompactionResult(
         sealed=tuple(sealed),
         verified=tuple(verified),
@@ -2241,6 +2509,9 @@ def compact(
         backed_up=backed_up,
         pinged=pinged,
         problem=problem,
+        ledger_repair=ledger_repair,
+        trim=trim_result,
+        pruned=pruned,
     )
 
 
@@ -2441,6 +2712,10 @@ def main(
             ),
             guards=config.guards,
             plan_path=args.plan,
+            # The trim's two gates. ``outbox.role_of`` reads an absent role as primary, so the
+            # role passed is the one ``senders`` resolved, never the raw key.
+            role=sends.role,
+            window_sessions=config.lake_window_sessions,
         )
     except bucket.BucketRefusal as exc:
         # Only the bucket form raises this, so the path form keeps its own behavior for
@@ -2465,6 +2740,7 @@ __all__ = [
     "DAMAGED_SEGMENT_EVENT",
     "DAMAGED_SEGMENT_TITLE",
     "DamagedSegments",
+    "LedgerRepair",
     "PAGE_SEGMENT_CAP",
     "PartitionMismatch",
     "REFUSED_SEGMENT_DAMAGED",
@@ -2478,6 +2754,10 @@ __all__ = [
     "SealedPartition",
     "SegmentSchemaConflict",
     "SkippedDay",
+    "TRIM_ROT_EVENT",
+    "TRIM_ROT_TITLE",
+    "TRIMMED_LEDGER_EVENT",
+    "TRIMMED_LEDGER_TITLE",
     "WindowProfile",
     "build_parser",
     "compact",

@@ -86,6 +86,12 @@ CASES = [
         False,
         id="a kind that is not trim is not designed",
     ),
+    pytest.param(
+        [{key: value for key, value in _trim().items() if key != "sha256"}],
+        {PART: {"partition": PART, "rows": 10}},
+        False,
+        id="a trim line and an entry that both carry no sha are not designed",
+    ),
 ]
 
 

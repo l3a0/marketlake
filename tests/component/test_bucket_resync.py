@@ -728,16 +728,20 @@ class Crash(Exception):
 
 
 class _HookedS3(FakeS3):
-    """A fake bucket that runs ``on_get`` before each ``GetObject`` of a data file."""
+    """A fake bucket that runs ``hook`` before each ``GetObject`` of a data file.
 
-    def __init__(self, source: FakeS3, on_get) -> None:
+    It is not ``FakeS3``'s own ``on_get``, which runs on every ``GetObject``, the manifest's
+    included.
+    """
+
+    def __init__(self, source: FakeS3, hook) -> None:
         super().__init__()
         self.objects = source.objects
-        self.on_get = on_get
+        self.hook = hook
 
     def get_object(self, **kwargs) -> dict:
         if kwargs["Key"] != MANIFEST_KEY:
-            self.on_get(kwargs["Key"])
+            self.hook(kwargs["Key"])
         return super().get_object(**kwargs)
 
 
