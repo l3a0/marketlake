@@ -117,6 +117,11 @@ REQUIRED = [
 # ``compact.main`` reaches it the same way, through the ``Publisher`` its schema-drift
 # page sends on, so both names are forbidden there: the publisher it builds and the
 # transport that publisher holds.
+#
+# ``sweep.main`` replaces its own process with the evening upload through ``os.execv``
+# (marketlake #833). It builds that call itself, so the exec is absent from its signature
+# and a test patches ``os.execv`` instead. ``sweep.main`` still accepts the vendor source and
+# the schedule seams, so this row covers the new seam only.
 FORBIDDEN = [
     (compact.main, "backup"),
     (compact.main, "pinger"),
@@ -143,6 +148,7 @@ FORBIDDEN = [
     (bucket.main, "client"),
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),
+    (sweep.main, "execv"),
 ]
 
 

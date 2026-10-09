@@ -1062,6 +1062,11 @@ def _start_compaction(runner: CompactionRunner, args: Sequence[str]) -> None:
     child writes to the daemon's own stdout and stderr, and its lines land in the daemon's
     log.
 
+    This is one of two compaction runs on a weekday, and the only one the daemon starts.
+    The other follows the 18:30 vendor sweep, which replaces its own process with
+    ``python -m lake.compact --after-vendor-sweep``. That run pings ``evening-upload`` rather
+    than ``compaction`` and writes to the eod-sweep job's log rather than this one.
+
     A spawn that never started is the one failure this call can still see, and it is
     caught by ``_dispatched`` rather than here. The two spellings named the same event,
     because this call does nothing but spawn, and one place deciding what a dispatched

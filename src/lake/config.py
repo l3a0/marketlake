@@ -128,7 +128,7 @@ def default_config_path() -> Path:
 
 
 # The healthchecks host. Pings go by slug, in the form ``hc-ping.com/<ping-key>/<slug>``.
-# The config holds the one rotatable ping key, never six immutable UUID URLs.
+# The config holds the one rotatable ping key, never an immutable UUID URL per check.
 HEALTHCHECKS_HOST = "hc-ping.com"
 
 # The Schwab callback key, spelled once. The re-auth refuses without it and names it,

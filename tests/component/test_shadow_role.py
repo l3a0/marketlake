@@ -35,6 +35,7 @@ from lake.control_plane import (
     CALENDAR_PROBE_SLUG,
     COMPACTION_SLUG,
     EOD_SWEEP_SLUG,
+    EVENING_UPLOAD_SLUG,
     PRE_OPEN_SLUG,
     SUNDAY_DAEMON_DOWN_EVENT,
     SUNDAY_DAEMON_DOWN_TITLE,
@@ -51,7 +52,9 @@ from tests.component.test_eod_sweep import (
     MONDAY,
     NEXT_MONDAY,
     _CountingVendorSource,
+    _handed_off,
     _lake,
+    _record_execs,
     _RecordingSetter,
     _schedule_text,
 )
@@ -410,12 +413,45 @@ def test_the_compaction_twin_records_its_ping_and_skips_the_backup(tmp_path, cap
     assert BACKUP_SKIPPED in out
 
 
+def test_the_evening_upload_twin_records_its_own_check(tmp_path, capsys):
+    """The run the vendor sweep hands off to, on a shadow: no upload, and its own check.
+
+    Recorded as ``evening-upload`` rather than ``compaction``, so the outbox says which of
+    the two compaction runs a line came from.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root, role="shadow")
+    now = et(2026, 8, 24, 18, 32)
+
+    code = compact.main(
+        [
+            "--after-vendor-sweep",
+            "--config",
+            str(config),
+            "--plan",
+            str(tmp_path / "chain_plan.json"),
+        ],
+        clock=ManualClock(now),
+        calendar=FakeCalendar(
+            {now.date(): SessionTimes(open=et(2026, 8, 24, 9, 30), close=et(2026, 8, 24, 16, 0))}
+        ),
+    )
+
+    assert code == 0
+    assert _outbox(lake_root, now.date()) == [_ping(now, "compact", EVENING_UPLOAD_SLUG)]
+    out = capsys.readouterr().out
+    assert f"backed_up=False pinged=True slug={EVENING_UPLOAD_SLUG}" in out
+    assert BACKUP_SKIPPED in out
+
+
 def test_the_sweep_twin_records_its_ping_and_digest(fixture_lake, tmp_path, monkeypatch):
     root = _lake(fixture_lake)
     config = write_config(tmp_path, lake_root=root, role="shadow")
     tickers = tmp_path / "tickers.yaml"
     tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    execs = _record_execs(monkeypatch)
 
     code = sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -426,6 +462,9 @@ def test_the_sweep_twin_records_its_ping_and_digest(fixture_lake, tmp_path, monk
     )
 
     assert code == 0
+    # A recorded ping counts as landed, so a shadow hands off too. Its compaction then skips
+    # the upload and records its own ping, which the evening-upload twin below reads.
+    assert execs.calls == _handed_off(config)
     assert _outbox(root, EVENING.date()) == [
         _ping(EVENING, "sweep", EOD_SWEEP_SLUG),
         _page(

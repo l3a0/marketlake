@@ -71,7 +71,7 @@ from lake.journal import ROW_KIND_DATA
 from lake.paths import CONFIG_DIR_PARTS, TEMP_MARKER
 
 # The health-check slug the slice-1 runner pings. It is its own check, deliberately
-# separate from the steady-state six, because it retires with this launchd entry when
+# separate from the steady-state checks, because it retires with this launchd entry when
 # the slice-2 per-cycle dead-man check supersedes it. Log the slug, never the ping URL,
 # which carries the secret ping key.
 SLICE1_RUNNER_SLUG = "slice1-capture"

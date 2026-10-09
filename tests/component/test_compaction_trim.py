@@ -26,7 +26,7 @@ from lake import compact as compact_module
 from lake.alert import Publisher
 from lake.bucket import BucketBackup, first_upload, nightly_upload, restore_lake
 from lake.calendar import MARKET_TZ
-from lake.compact import TRIM_ROT_EVENT, TRIM_ROT_TITLE, compact
+from lake.compact import EVENING_UPLOAD_SLUG, TRIM_ROT_EVENT, TRIM_ROT_TITLE, compact
 from lake.config import BucketTarget
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
@@ -274,6 +274,81 @@ def test_main_passes_the_resolved_role_and_the_key(lake_root, tmp_path, monkeypa
     )
     assert "  trim     window=22 edge=2026-07-29 trimmed=2 " in capsys.readouterr().out
     assert not (lake_root / _rel("SPY", OLD[0])).exists()
+
+
+def _evening_config(tmp_path: Path, lake_root: Path) -> Path:
+    """A primary's config with a bucket target and the window key, as the VM's carries."""
+    config = write_config(tmp_path, lake_root, role="primary")
+    text = config.read_text().replace(
+        f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {TARGET}"
+    )
+    config.write_text(
+        text
+        + "bucket_access_key_id: AKIDCONFIG\n"
+        + "bucket_secret_access_key: secret-bucket-key\n"
+        + "bucket_region: us-east-2\n"
+        + f"lake_window_sessions: {WINDOW}\n"
+    )
+    return config
+
+
+def _after_vendor_sweep(tmp_path: Path, config: Path) -> int:
+    """The run the vendor sweep hands off to, at 18:32 on tonight's session (marketlake #833)."""
+    return compact_module.main(
+        [
+            "--after-vendor-sweep",
+            "--config",
+            str(config),
+            "--plan",
+            str(tmp_path / "chain_plan.json"),
+        ],
+        clock=ManualClock(_et(TONIGHT, 18, 32)),
+        calendar=CALENDAR,
+    )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_day", "trimmed"),
+    [(TONIGHT, False), (YESTERDAY, True)],
+    ids=["tonights-checkpoint-refuses", "yesterdays-checkpoint-trims"],
+)
+def test_the_run_after_the_vendor_sweep_trims_nothing_by_tonights_checkpoint(
+    lake_root, tmp_path, monkeypatch, capsys, checkpoint_day, trimmed
+):
+    """The 18:30 vendor sweep writes tonight's checkpoint, so its upload drops nothing.
+
+    ``trim`` trims only on a session strictly after the checkpoint's own, and the vendor sweep
+    writes ``Checkpoint(session_day=tonight)``. So the run it hands off to reaches the trim and
+    is refused there, before any bucket read. The config carries the window key, a bucket
+    target and a primary role, because without any one of them the trim is never reached and
+    a case asserting only "no GET" would pass while proving nothing.
+
+    The control case keeps yesterday's checkpoint, as on a night the vendor sweep wrote none,
+    and the same run trims both old partitions. That is what shows the refusal line can fail.
+    """
+    client = _lake(lake_root, tonight=False)
+    if checkpoint_day == TONIGHT:
+        _checkpoint(lake_root, TONIGHT, {"SPY": EDGE})
+    events: list[str] = []
+    client.on_get = lambda kwargs: events.append(f"get {TARGET.rel(kwargs['Key'])}")
+    pinger = FakePinger()
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+
+    code = _after_vendor_sweep(tmp_path, _evening_config(tmp_path, lake_root))
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert pinger.urls == [f"https://hc-ping.com/secret-key/{EVENING_UPLOAD_SLUG}"]
+    if trimmed:
+        assert "  trim     window=22 edge=2026-07-29 trimmed=2 " in out, out
+        assert events == [f"get {_rel('SPY', day)}" for day in OLD]
+        assert not any((lake_root / _rel("SPY", day)).exists() for day in OLD)
+    else:
+        assert f"  trim     refused: the checkpoint is tonight's, {TONIGHT.isoformat()}" in out, out
+        assert events == []
+        assert not any(call[0] == "get_object" for call in client.calls), client.calls
+        assert all((lake_root / _rel("SPY", day)).exists() for day in OLD)
 
 
 def test_two_rotted_copies_send_one_page(lake_root):

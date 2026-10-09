@@ -1806,7 +1806,7 @@ def test_the_rendered_reauth_script_runs_and_forwards_its_arguments(tmp_path):
 PING_NOW = "Ping Now"
 
 # Every check the install tells the operator to arm, read from the renderer's own
-# constants rather than spelled here. Five of the six ping only when their own job
+# constants rather than spelled here. Six of the seven ping only when their own job
 # succeeds, so a failing install leaves each row in the never-pinged state where it
 # cannot page. ``calendar-probe`` arms itself by the next weekday 09:35 and is in the
 # list anyway, because a roster with one member left out is how the gap comes back.
@@ -1817,6 +1817,7 @@ ARMED_SLUGS = (
     "COMPACTION_SLUG",
     "CALENDAR_PROBE_SLUG",
     "EOD_SWEEP_SLUG",
+    "EVENING_UPLOAD_SLUG",
 )
 
 # The one place the block uses the word capture as English rather than as the slug. The
@@ -1906,8 +1907,8 @@ def test_the_step_reads_every_slug_rather_than_spelling_it(tmp_path, capsys):
     test is what separates them, and it is the rename that would otherwise ship an
     install pointing the operator at a row that no longer exists.
 
-    Every one of the six is renamed, one at a time, because a block that reads one slug
-    and spells the other five is the half-fix this section exists to stop. That is also
+    Every one of the seven is renamed, one at a time, because a block that reads one slug
+    and spells the other six is the half-fix this section exists to stop. That is also
     why the renderer reads ``live_check_slugs()`` on each call rather than a tuple bound
     at import: a frozen roster would leave this check unable to fail. The original
     has to be gone from the block afterwards, so a renderer that read the constant and
@@ -2009,17 +2010,17 @@ def test_the_arming_step_asks_for_a_press_on_every_check_and_on_no_other(tmp_pat
     Read off the instruction rather than off the block, and compared as a set rather than
     as a search. Presence alone would pass an install that named ``capture`` to press and
     said the rest arm themselves, and a one-way search would pass one that sent the
-    operator hunting for a sixth row no job pings. The quantifier is asserted for the same
-    reason: an instruction to press one of six is not an instruction to press six.
+    operator hunting for an eighth row no job pings. The quantifier is asserted for the same
+    reason: an instruction to press one of seven is not an instruction to press seven.
 
     The slugs are also all the step may carry, because a ping URL is a secret and the
     renderer's output is tracked.
 
-    ``lake.control_plane`` defines all six, so the three read through ``lake.deadman``,
+    ``lake.control_plane`` defines all seven, so the four read through ``lake.deadman``,
     ``lake.compact`` and ``lake.sweep`` assert that the job re-exports the same constant
     the renderer names rather than a second spelling of it.
     """
-    from lake.compact import COMPACTION_SLUG
+    from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG
     from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
     from lake.deadman import CAPTURE_SLUG
     from lake.sweep import EOD_SWEEP_SLUG
@@ -2031,6 +2032,7 @@ def test_the_arming_step_asks_for_a_press_on_every_check_and_on_no_other(tmp_pat
         COMPACTION_SLUG,
         CALENDAR_PROBE_SLUG,
         EOD_SWEEP_SLUG,
+        EVENING_UPLOAD_SLUG,
     ]
     assert len(set(slugs)) == len(slugs), slugs
     for text in _rendered_install(tmp_path, capsys):
