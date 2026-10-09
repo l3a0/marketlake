@@ -83,6 +83,12 @@ fires once at 18:30 on weekdays, under launchd's ``StartCalendarInterval`` with
 ``RunAtLoad`` false and under a systemd timer whose ``Persistent=true`` folds missed fires
 into one run.
 
+One re-run does not answer the same. On a host that trims chains past its window
+(marketlake #787), a hand re-run over an old day whose previous chains days were trimmed
+finds no chains baseline within its walk, so its chains half reports the way a day with no
+readable baseline does, below, rather than the way the night did. The nightly run is
+unaffected, because the window always holds the previous session.
+
 **A day with no readable baseline reports and does not page.** With no baseline there is no
 way to separate a field that stopped arriving from one that never arrived, which is the
 false-positive class #265 measured. The row-count band already names this shape

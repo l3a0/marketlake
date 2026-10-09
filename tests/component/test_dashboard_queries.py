@@ -4459,6 +4459,46 @@ def test_a_lake_root_that_is_not_there_reports_a_refusal_and_not_an_empty_lake(t
     assert payload["capture_days_left"] is None
 
 
+def test_the_lake_panel_names_the_oldest_chains_session_not_the_oldest_day(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #787. Mutation this catches: reading the oldest day off the walk's merged
+    per-day count.
+
+    No trim removes quotes, so the lake's oldest day is a quotes day once chains are trimmed.
+    The panel has to name the oldest chains day, or a trim that keeps stopping looks the same
+    as one that works.
+    """
+    fixture_lake.with_quotes("SPY", date(2026, 8, 10))
+    fixture_lake.with_chains("SPY", MONDAY).with_chains("QQQ", MONDAY)
+    fixture_lake.with_chains("SPY", MONDAY + timedelta(days=1))
+    root = fixture_lake.build()
+    # A file under ``chains/`` that is not a partition says nothing about the oldest session.
+    stray = root / "chains" / "ticker=SPY" / "date=2026-08-03.parquet.tmp"
+    stray.write_bytes(b"half written")
+    payload = service_over(root).run_query("lake", {})
+    assert payload["oldest_chains"] == {"day": MONDAY.isoformat(), "tickers": ["QQQ", "SPY"]}
+
+
+def test_the_lake_panel_names_the_one_ticker_a_trim_held_back(fixture_lake: FixtureLake):
+    # A ticker whose split walk stopped before its first day keeps every partition while the
+    # others trim. The panel names it, so the operator sees one ticker held rather than a trim
+    # that stopped for the whole lake.
+    fixture_lake.with_chains("SPY", MONDAY).with_chains("QQQ", THURSDAY)
+    fixture_lake.with_chains("QQQ", MONDAY)
+    payload = service_over(fixture_lake.build()).run_query("lake", {})
+    assert payload["oldest_chains"] == {"day": THURSDAY.isoformat(), "tickers": ["QQQ"]}
+
+
+def test_the_lake_panel_names_no_oldest_chains_session_without_a_chains_partition(
+    fixture_lake: FixtureLake,
+):
+    fixture_lake.with_quotes("SPY", MONDAY)
+    payload = service_over(fixture_lake.build()).run_query("lake", {})
+    assert payload["error"] is None
+    assert payload["oldest_chains"] is None
+
+
 def test_the_lake_panel_runs_no_sql_at_all(root: Path):
     # The sizes are a walk and the free space is a ``shutil.disk_usage`` call, which is the
     # one thing any panel reports from outside ``lake_root``. It could not have gone

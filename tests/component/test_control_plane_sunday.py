@@ -1523,7 +1523,8 @@ TRIMMED_DAY = date(2026, 8, 28)
 
 
 def _trim_away(root: Path, fixture_lake: FixtureLake) -> str:
-    """Trim the lake's chains partition the way #787 will: the line, its entry, the unlink."""
+    """Trim the lake's chains partition in the order ``lake.trim`` does: the line, its entry,
+    the unlink."""
     from lake.lock import lake_lock
     from lake.manifest import latest_entries
     from lake.trimmed import append_trimmed, trim_line

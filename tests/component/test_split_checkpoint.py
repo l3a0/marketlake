@@ -6,9 +6,9 @@ saved state. marketlake #786 saves the states in ``reference/split_checkpoint.pa
 ticker from it only when the ticker has a designed absence, and refuses a ticker where a resume
 would be wrong.
 
-**How these tests trim.** The way marketlake #787 will: the partition file is unlinked and a trim
-line naming its manifest sha is appended to ``trimmed.jsonl``, and the manifest entry stays. That
-is what makes the absence designed rather than lost.
+**How these tests trim.** In the order ``lake.trim`` does: a trim line naming the partition's
+manifest sha is appended to ``trimmed.jsonl``, then the partition file is unlinked, and the manifest
+entry stays. That is what makes the absence designed rather than lost.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def _partition(day: date, ticker: str = "SPY") -> str:
 
 
 def _trim(root: Path, *days: date, ticker: str = "SPY", unlink: bool = True) -> None:
-    """Trim each day the way marketlake #787 will: a trim line, then the unlink."""
+    """Trim each day in the order ``lake.trim`` does: a trim line, then the unlink."""
     manifest = latest_entries(root)
     with lake_lock(root):
         for day in days:

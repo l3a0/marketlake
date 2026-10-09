@@ -451,10 +451,11 @@ def _designed_absences(
 ) -> dict[str, list[date]]:
     """Each ticker's chains days that are gone from disk on purpose, in date order.
 
-    Only a partition the ledger's latest line trims is asked about, and only once its file is
-    found absent, which is how ``trimmed.is_designed_absence`` says a reader of the lake asks it.
-    A trim line beside a file still present, which a crash between the line and the unlink
-    leaves, is a present file, and its ticker walks from scratch over it.
+    A day counts only when ``trimmed.is_designed_absence`` calls its partition designed and its
+    file is found absent. The ledger is asked first and the disk second, so only a partition
+    the predicate calls designed costs an ``lstat``, and the answer is the one a check of the
+    disk first would give. A trim line beside a file still present, which a crash between the
+    line and the unlink leaves, is a present file, and its ticker walks from scratch over it.
     """
     found: dict[str, list[date]] = {}
     for partition in trimmed:
