@@ -1674,6 +1674,23 @@ def test_a_crash_before_the_ledger_moves_leaves_this_lakes_trim_lines(tmp_path, 
     assert not (vm / TRIMMED).exists()
 
 
+def test_a_partition_this_lake_lost_rather_than_trimmed_is_not_downloaded(tmp_path):
+    from lake.trimmed import append_trimmed, restore_line
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # The laptop's ledger names SPY_1, but its latest line is a restore, so the file that is
+    # now gone was lost rather than trimmed. The resync levels the manifests and leaves a loss
+    # to the scrub and the range restore.
+    sha = hashlib.sha256((laptop / SPY_1).read_bytes()).hexdigest()
+    line = restore_line(SPY_1, sha256=sha, restored_at="2026-08-25T20:00:00-04:00")
+    append_trimmed(laptop, line, source="restore", fetched_at=None)
+    (laptop / SPY_1).unlink()
+
+    summary = _resync(laptop, client)
+
+    assert SPY_1 not in dict(summary.downloads)
+
+
 def test_a_designed_absence_held_with_the_trimmed_bytes_applies_and_scrubs_clean(tmp_path):
     from lake.manifest import scrub
     from lake.trimmed import append_trimmed, trim_line
