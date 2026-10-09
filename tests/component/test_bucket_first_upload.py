@@ -1,29 +1,35 @@
 """The first-upload command, ``python -m lake.bucket first-upload``, driven through ``main``.
 
 The owner runs it by hand to seed the bucket, and again to re-baseline a bucket whose
-copy of ``manifest.jsonl`` stopped being a prefix of the lake's. It compares every object
-rather than trusting a watermark, prints its throughput, and refuses with one printed
-line and exit 2 rather than a traceback. ``main`` builds the client from the config, so a
-test replaces ``bucket.client_from_config`` and drives the rest of the wiring unchanged.
+copy of ``manifest.jsonl`` a human repaired. It compares every object rather than trusting
+a watermark, prints its throughput, and refuses with one printed line and exit 2 rather
+than a traceback. It refuses a copy where some path's latest entry is one this lake never
+recorded, because replacing that copy would drop another host's sessions from the bucket's
+record
+(marketlake #832). ``main`` builds the client from the config, so a test replaces
+``bucket.client_from_config`` and drives the rest of the wiring unchanged.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 
 from lake import bucket
 from lake.bucket import UploadSummary, nightly_upload
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
-from lake.manifest import manifest_path
+from lake.manifest import append_manifest, manifest_path, sha256_file
+from lake.paths import LakePaths
 from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
-from tests.support.lake import FixtureLake
+from tests.support.lake import FixtureLake, sample_chains_table
 
 DAY = date(2026, 8, 28)
 TARGET = "s3://lake-backup/lake"
@@ -86,6 +92,8 @@ def test_a_second_run_compares_every_object_and_sends_nothing(tmp_path, monkeypa
     assert _main(config, client, monkeypatch) == 0
 
     assert client.puts() == []
+    # A copy that is a prefix is never downloaded to look for another host's entries.
+    assert "get_object" not in [name for name, _ in client.calls]
     out = capsys.readouterr().out
     assert "uploaded 0 file(s)" in out
     # A copy that was already whole was not replaced, so the run does not say it was.
@@ -423,3 +431,298 @@ def test_a_missing_file_whose_entry_has_no_sha_refuses_as_missing_as_before(
         "stops rather than let the bucket's watermark claim it"
     )
     assert "lake/manifest.jsonl" not in client.put_keys()
+
+
+# -- a copy holding another host's entries -------------------------------------------
+
+# Marketlake #832. The first upload replaces the bucket's manifest.jsonl outright, so a copy
+# where some path's latest entry is one this lake never recorded refuses, before the listing
+# and again under the lock before the manifest PUT. The check reads only a copy that is
+# present and not a prefix.
+
+MANIFEST_KEY = "lake/manifest.jsonl"
+
+
+def _entry(partition: str, sha: str = "f" * 64) -> bytes:
+    """An entry another host appended, for a path and sha this lake never recorded."""
+    entry = {"fetched_at": None, "partition": partition, "rows": 1, "sha256": sha, "source": "x"}
+    return (json.dumps(entry, sort_keys=True) + "\n").encode()
+
+
+# Four foreign entries. The first holds a newline, and only the first three are named.
+FOREIGN = (
+    "chains/ticker=SPY/\ndate=2026-10-09",
+    "quotes/ticker=SPY/date=2026-10-09.parquet",
+    "bars/ticker=SPY/date=2026-10-09.parquet",
+    "chains/ticker=QQQ/date=2026-10-09.parquet",
+)
+
+
+# How the refusal counts them: the paths whose latest entry in the copy's tail is foreign.
+NEVER = (
+    "the latest entry in the tail of the bucket's manifest.jsonl is one this lake never recorded"
+)
+
+
+class _ManifestS3(FakeS3):
+    """A fake bucket that runs ``after_head`` after each ``HeadObject`` of the manifest.
+
+    ``get_error`` is raised by every ``GetObject``.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.after_head = None
+        self.get_error: BaseException | None = None
+
+    def head_object(self, **kwargs) -> dict:
+        response = super().head_object(**kwargs)
+        if kwargs["Key"] == MANIFEST_KEY and self.after_head is not None:
+            self.after_head()
+        return response
+
+    def get_object(self, **kwargs) -> dict:
+        if self.get_error is not None:
+            self.calls.append(("get_object", dict(kwargs)))
+            raise self.get_error
+        return super().get_object(**kwargs)
+
+
+def _gets(client: FakeS3) -> list[dict]:
+    return [kwargs for name, kwargs in client.calls if name == "get_object"]
+
+
+def _seeded_foreign(tmp_path: Path, monkeypatch, client: FakeS3) -> tuple[Path, Path, bytes]:
+    """A seeded bucket whose copy then gains another host's four entries."""
+    lake, config = _setup(tmp_path)
+    assert _main(config, client, monkeypatch) == 0
+    copy = client.body(MANIFEST_KEY) + b"".join(_entry(rel) for rel in FOREIGN)
+    client.store(MANIFEST_KEY, copy)
+    client.calls.clear()
+    return lake, config, copy
+
+
+def test_a_foreign_copy_refuses_with_exit_2_and_no_put(tmp_path, monkeypatch, capsys):
+    client = FakeS3()
+    _, config, copy = _seeded_foreign(tmp_path, monkeypatch, client)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 4 path(s) {NEVER}" in line
+    named = ", ".join(repr(rel) for rel in FOREIGN[:3])
+    assert f"({named} and 1 more)" in line
+    assert FOREIGN[3] not in line
+    assert "marketlake #832" in line
+    assert "after 0 PUT(s)" in line
+    assert client.puts() == []
+    assert client.body(MANIFEST_KEY) == copy
+    # The guard runs before the listing.
+    assert "list_objects_v2" not in [name for name, _ in client.calls]
+
+
+def test_a_copy_that_turns_foreign_mid_run_refuses_before_the_manifest_put(
+    tmp_path, monkeypatch, capsys
+):
+    # Another host's upload lands while the unlocked pass sends a new partition. The check
+    # under the lock sees it and stops before the manifest PUT.
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    path = LakePaths(lake).chains_partition_path("SPY", date(2026, 8, 31))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(sample_chains_table(), path)
+    rel = path.relative_to(lake).as_posix()
+    append_manifest(
+        lake, partition=rel, source="compaction", sha256=sha256_file(path), rows=1, fetched_at=None
+    )
+
+    def other_host(kwargs, data):
+        if kwargs["Key"] != MANIFEST_KEY:
+            client.store(MANIFEST_KEY, seeded + _entry(FOREIGN[1]))
+
+    client.on_put = other_host
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 1 path(s) {NEVER}" in line and repr(FOREIGN[1]) in line
+    assert "after 1 PUT(s)" in line
+    assert client.put_keys() == [f"lake/{rel}"]
+    assert client.body(MANIFEST_KEY) == seeded + _entry(FOREIGN[1])
+
+
+def test_a_failed_read_of_the_copy_refuses_with_one_line(tmp_path, monkeypatch, capsys):
+    client = _ManifestS3()
+    _, config, _ = _seeded_foreign(tmp_path, monkeypatch, client)
+    client.get_error = client_error("AccessDenied", "GetObject", 403)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert "refused the request (AccessDenied)" in line
+    assert client.puts() == []
+
+
+def test_a_head_that_crosses_into_the_sunday_window_stops_before_the_get(
+    tmp_path, monkeypatch, capsys
+):
+    client = _ManifestS3()
+    _, config, _ = _seeded_foreign(tmp_path, monkeypatch, client)
+    clock = ManualClock(SUNDAY_1950)
+    client.after_head = lambda: clock.advance(10 * 60)
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        bucket.main(
+            ["first-upload", "--config", str(config), "--target", TARGET],
+            clock=clock,
+            calendar=CALENDAR,
+        )
+
+    assert "19:55 to 23:30" in _refused(capsys, exited)
+    assert _gets(client) == []
+    assert client.puts() == []
+
+
+def test_a_copy_changed_between_the_head_and_the_get_refuses_saying_so(
+    tmp_path, monkeypatch, capsys
+):
+    client = _ManifestS3()
+    _, config, copy = _seeded_foreign(tmp_path, monkeypatch, client)
+    # The new bytes read alone as a hand repair, which would let the upload go on.
+    first = copy[: copy.index(b"\n") + 1] + b'{"x": 1}\n'
+    client.after_head = lambda: client.store(MANIFEST_KEY, first)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert "changed between its HEAD and its GET" in line
+    assert "another host may be uploading now" in line
+    assert client.puts() == []
+
+
+def test_a_hand_repaired_copy_is_still_re_baselined(tmp_path, monkeypatch, capsys):
+    # A damaged first line in the copy names no entry this lake lacks, so the guard reads it
+    # as a hand repair and lets the first upload replace it, as before marketlake #832.
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    raw = manifest_path(lake).read_bytes()
+    client.store(MANIFEST_KEY, b"#" + raw[1:] + b'{"x": 1}\n')
+    client.calls.clear()
+
+    assert _main(config, client, monkeypatch) == 0
+
+    assert client.body(MANIFEST_KEY) == raw
+    # Read once before the listing and once under the lock.
+    assert len(_gets(client)) == 2
+
+
+# -- added by the mutation lens on PR #840 ----------------------------------------------
+
+
+def test_exactly_three_foreign_entries_are_counted_alone_and_named_with_no_more(
+    tmp_path, monkeypatch, capsys
+):
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    # The tail repeats one line this lake recorded, so the tail is 4 and the foreign 3.
+    own = seeded[: seeded.index(b"\n") + 1]
+    client.store(MANIFEST_KEY, seeded + own + b"".join(_entry(rel) for rel in FOREIGN[:3]))
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    named = ", ".join(repr(rel) for rel in FOREIGN[:3])
+    assert f"on 3 path(s) {NEVER} ({named})," in line
+    assert "more" not in line
+
+
+def test_two_unrecorded_entries_on_one_path_name_the_path_once(tmp_path, monkeypatch, capsys):
+    _, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    tail = _entry(FOREIGN[1], "1" * 64) + _entry(FOREIGN[1], "2" * 64) + _entry(FOREIGN[2])
+    client.store(MANIFEST_KEY, seeded + tail)
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 2 path(s) {NEVER} ({FOREIGN[1]!r}, {FOREIGN[2]!r})," in line
+    assert client.puts() == []
+
+
+def test_another_hosts_entry_fused_onto_a_torn_fragment_refuses_with_no_manifest_put(
+    tmp_path, monkeypatch, capsys
+):
+    # Read as a hand repair, the copy would be replaced, dropping the fused entry from the
+    # bucket's record.
+    _, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    copy = seeded + _entry("quotes/q", "q" * 64)[:30] + _entry(FOREIGN[1])
+    client.store(MANIFEST_KEY, copy)
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 1 path(s) {NEVER} ({FOREIGN[1]!r})," in line
+    assert MANIFEST_KEY not in client.put_keys()
+    assert client.body(MANIFEST_KEY) == copy
+
+
+def test_the_check_under_the_lock_reads_the_ledger_as_it_stands_then(tmp_path, monkeypatch, capsys):
+    # After the unlocked guard, the lake records a new partition and the bucket's copy is
+    # hand repaired to the lake's new manifest with its first byte damaged. Every entry in
+    # it is in the lake under the lock, so the run re-baselines rather than refuse.
+    lake, config = _setup(tmp_path)
+    client = _ManifestS3()
+    assert _main(config, client, monkeypatch) == 0
+    path = LakePaths(lake).chains_partition_path("SPY", date(2026, 8, 31))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(sample_chains_table(), path)
+    rel = path.relative_to(lake).as_posix()
+
+    def repaired_after_first_head():
+        client.after_head = None
+        append_manifest(
+            lake,
+            partition=rel,
+            source="compaction",
+            sha256=sha256_file(path),
+            rows=1,
+            fetched_at=None,
+        )
+        raw = manifest_path(lake).read_bytes()
+        client.store(MANIFEST_KEY, b"#" + raw[1:])
+
+    client.after_head = repaired_after_first_head
+    client.calls.clear()
+
+    assert _main(config, client, monkeypatch) == 0
+
+    assert client.body(MANIFEST_KEY) == manifest_path(lake).read_bytes()
