@@ -11,8 +11,8 @@
 # It acts only on units whose files are present, so it finishes on a partial
 # install too. It leaves the lake and the config directory.
 #
-# If this host is the primary, six dead-man checks go silent when these units stop:
-# capture, pre-open, sunday, compaction, calendar-probe and eod-sweep.
+# If this host is the primary, seven dead-man checks go silent when these units stop:
+# capture, pre-open, sunday, compaction, calendar-probe, eod-sweep and evening-upload.
 # Pause them in healthchecks first if the host is meant to stay uninstalled. A
 # shadow host feeds none of them, so uninstalling one silences nothing.
 set -euo pipefail
@@ -63,4 +63,4 @@ rm -f "$NEEDRESTART_DIR/marketlake.conf"
 # 4. Reload, so systemd forgets the units.
 echo "+ systemctl daemon-reload"
 systemctl daemon-reload
-echo "uninstall.sh: done. On a primary host the six dead-man checks now go silent and page."
+echo "uninstall.sh: done. On a primary host the seven dead-man checks now go silent and page."

@@ -17,7 +17,7 @@ from lake import bucket
 from lake import compact as compact_module
 from lake.bucket import BucketBackup, UploadDeadline, WatermarkMissing, first_upload
 from lake.chain_plan import ChainPlanError
-from lake.compact import COMPACTION_SLUG, compact
+from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG, compact
 from lake.config import BucketTarget
 from lake.paths import LakePaths
 from tests.component.test_compaction import (
@@ -173,6 +173,84 @@ def test_main_uploads_to_a_bucket_target_and_pings(lake_root, tmp_path, monkeypa
     assert lines[0].endswith("skipped 0 already in the bucket: s3://lake-backup/lake")
     for value in ("secret-bucket-key", "AKIDCONFIG"):
         assert value not in captured.out and value not in captured.err
+
+
+def test_main_after_the_vendor_sweep_uploads_and_pings_the_evening_upload_check(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """The run the 18:30 vendor sweep hands off to (marketlake #833).
+
+    It is the same job on the same upload path, so the only difference to see is the check it
+    feeds. A second ping to ``compaction`` would page nothing, because the close+15 run has
+    already met that check for the day.
+    """
+    client = _seeded(lake_root)
+    # A day the close+15 run left unsealed, so this run also seals it, the retry night.
+    _segment(lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a")
+    config = _bucket_config(tmp_path, lake_root)
+    pinger = FakePinger()
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+
+    code = compact_module.main(
+        [
+            "--after-vendor-sweep",
+            "--config",
+            str(config),
+            "--plan",
+            str(tmp_path / "chain_plan.json"),
+        ],
+        clock=_clock_at(DAY, 18, 32),
+        calendar=_calendar(),
+    )
+
+    assert code == 0
+    assert client.put_keys()[-1] == "lake/manifest.jsonl"
+    assert pinger.urls == [f"https://hc-ping.com/secret-key/{EVENING_UPLOAD_SLUG}"]
+    out = capsys.readouterr().out
+    assert f"pinged=True slug={EVENING_UPLOAD_SLUG}" in out
+    assert any(line.startswith("compact: uploaded ") for line in out.splitlines()), out
+
+
+def test_after_the_vendor_sweep_refuses_recompact_before_reading_the_config(tmp_path, capsys):
+    """An argparse flag ahead of the subcommand parses, and the repair would ignore it."""
+    missing = tmp_path / "absent.yaml"
+    code = compact_module.main(
+        [
+            "--after-vendor-sweep",
+            "--config",
+            str(missing),
+            "recompact",
+            "chains",
+            "SPY",
+            "2026-08-24",
+        ]
+    )
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "compact: --after-vendor-sweep is the nightly job's flag and does not combine with "
+        "recompact"
+    ]
+
+
+def test_the_result_renders_the_slug_it_was_given():
+    result = compact_module.CompactionResult(
+        sealed=(),
+        verified=(),
+        skipped=(),
+        retune=None,
+        backed_up=True,
+        pinged=True,
+        slug=EVENING_UPLOAD_SLUG,
+    )
+    first = result.render().splitlines()[0]
+    assert first.endswith(f"pinged=True slug={EVENING_UPLOAD_SLUG}"), first
+    default = compact_module.CompactionResult(
+        sealed=(), verified=(), skipped=(), retune=None, backed_up=True, pinged=True
+    )
+    assert default.render().splitlines()[0].endswith(f"slug={COMPACTION_SLUG}")
 
 
 def test_main_refuses_an_empty_bucket_with_one_line_and_no_ping(

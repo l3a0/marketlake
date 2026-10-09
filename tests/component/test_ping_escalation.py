@@ -34,7 +34,7 @@ from lake import compact as compact_module
 from lake import control_plane as cp
 from lake import probe_calendar as probe_module
 from lake.alert import Delivery, Message
-from lake.compact import COMPACTION_SLUG, compact
+from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG, compact
 from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.probe_calendar import ProbeResult, report
@@ -337,6 +337,41 @@ def test_the_compaction_entry_pages_through_a_real_publisher(tmp_path, monkeypat
     assert code == 0
     assert [m.body.split(":")[0] for m in _refused_pages(transport)] == [COMPACTION_SLUG]
     assert PING_KEY not in capsys.readouterr().out
+
+
+def test_the_run_after_the_vendor_sweep_pages_a_refused_ping_under_its_own_slug(
+    tmp_path, monkeypatch, capsys
+):
+    """A refused ``evening-upload`` ping must not page as a refused ``compaction`` ping.
+
+    The page names the check that went unfed, and the operator acts on that name: a
+    ``compaction`` page sends them to the 16:30 seal, which ran fine.
+    """
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root)
+    transport = FakeTransport()
+    refusing = Refusing(slug=EVENING_UPLOAD_SLUG)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: refusing)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
+    monkeypatch.setattr(compact_module, "RsyncBackup", FakeBackup)
+    code = compact_module.main(
+        [
+            "--after-vendor-sweep",
+            "--config",
+            str(config),
+            "--plan",
+            str(tmp_path / "chain_plan.json"),
+        ],
+        clock=ManualClock(et(2026, 8, 24, 18, 32)),
+        calendar=FakeCalendar(
+            {DAY: SessionTimes(open=et(2026, 8, 24, 9, 30), close=et(2026, 8, 24, 16, 0))}
+        ),
+    )
+    assert code == 0
+    assert refusing.urls == [_url(EVENING_UPLOAD_SLUG)]
+    assert [m.body.split(":")[0] for m in _refused_pages(transport)] == [EVENING_UPLOAD_SLUG]
+    assert f"slug={EVENING_UPLOAD_SLUG}" in capsys.readouterr().out
 
 
 def test_the_calendar_probe_entry_pages_through_a_real_publisher(tmp_path, monkeypatch):

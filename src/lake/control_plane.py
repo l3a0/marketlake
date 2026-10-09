@@ -281,7 +281,7 @@ CALENDAR_PROBE_SLUG = "calendar-probe"
 PRE_OPEN_SLUG = "pre-open"
 SUNDAY_SLUG = "sunday"
 
-# The slug of the dead-man check the daemon feeds. It sits here with its five siblings
+# The slug of the dead-man check the daemon feeds. It sits here with its six siblings
 # rather than in ``lake.deadman`` because the install renderer names it too, and
 # ``lake.deadman`` imports this module. Reaching the other way would load a second copy
 # of this module under ``python -m lake.control_plane``. ``lake.deadman`` re-exports it,
@@ -290,12 +290,14 @@ SUNDAY_SLUG = "sunday"
 # for a job that no longer runs, so deleting it is an operator step.
 CAPTURE_SLUG = "capture"
 
-# The slug of the check the nightly compaction-plus-backup run pings. It sits here for
-# the reason above rather than in ``lake.compact``, because the install renderer names
-# it too. Reaching into ``lake.compact`` from here would make every process that imports
-# this module load the compaction engine, the daemon included, and the daemon spawns
-# compaction as a separate process on purpose. ``lake.compact`` imports it back and
-# re-exports it, so every consumer still reads it from there.
+# The slug of the check the close+15 compaction-plus-backup run pings. A weekday evening
+# runs compaction twice, and the run after the vendor sweep pings ``EVENING_UPLOAD_SLUG``
+# below instead. This slug sits here for the reason above rather than in ``lake.compact``,
+# because the install renderer names it too. Reaching into ``lake.compact`` from here would
+# make every process that imports this module load the compaction engine, the daemon
+# included, and the daemon spawns compaction as a separate process on purpose.
+# ``lake.compact`` imports it back and re-exports it, so every consumer still reads it
+# from there.
 COMPACTION_SLUG = "compaction"
 
 # The slug of the check the 18:30 vendor sweep pings. It sits here for the reason its two
@@ -304,6 +306,14 @@ COMPACTION_SLUG = "compaction"
 # corporate-actions walks and pyarrow behind them. ``lake.sweep`` imports it back and
 # re-exports it, so every consumer still reads it from there.
 EOD_SWEEP_SLUG = "eod-sweep"
+
+# The slug of the check the compaction run after the vendor sweep pings, the upload of
+# that evening's bars and actions. The vendor sweep hands off to ``python -m lake.compact
+# --after-vendor-sweep``, and the flag swaps ``compaction`` for this slug, so a failed
+# evening upload pages under its own name rather than meeting a check the close+15 run
+# already fed that day. It sits here for the reason its neighbours give, and
+# ``lake.compact`` imports it back and re-exports it beside ``COMPACTION_SLUG``.
+EVENING_UPLOAD_SLUG = "evening-upload"
 
 
 def live_check_slugs() -> tuple[str, ...]:
@@ -319,7 +329,7 @@ def live_check_slugs() -> tuple[str, ...]:
     and the next check added would have left both behind again. Both read this instead.
 
     It is a function rather than a constant, and that is not decoration. A tuple bound at
-    import freezes the six spellings, and the rendering's own guard renames a slug under
+    import freezes the seven spellings, and the rendering's own guard renames a slug under
     the renderer and asserts the rendering moved. Reading the constants on each call is
     what keeps that guard able to fail, and a rendering is built once per install.
 
@@ -334,6 +344,7 @@ def live_check_slugs() -> tuple[str, ...]:
         COMPACTION_SLUG,
         CALENDAR_PROBE_SLUG,
         EOD_SWEEP_SLUG,
+        EVENING_UPLOAD_SLUG,
     )
 
 
@@ -874,7 +885,10 @@ def eod_sweep_job(host: Host) -> Job:
     It runs ``python -m lake.sweep``: the corporate-actions walks, the bar fetch, the
     nightly report file, the ping, and the digest. On a Friday on the Mac it also sets
     the Sunday one-shot wake and reads it back, which is why install step 6 no longer
-    asks the operator to do that by hand.
+    asks the operator to do that by hand. On a weekday whose ``eod-sweep`` ping landed, it
+    then replaces itself with ``python -m lake.compact --after-vendor-sweep``, which
+    uploads the evening's output and pings ``evening-upload``. So this one job feeds two
+    checks, and after a hand-off its exit status is compaction's.
 
     **It carries no arguments**, which is the shape ``daemon_job`` and
     ``calendar_probe_job`` take rather than ``sunday_job``'s. That job passes ``--token``
@@ -3646,9 +3660,11 @@ def uninstall_script(host: LaunchdHost) -> str:
         " these jobs stop:",
         f"# {_listed(live_check_slugs())}.",
         "# Each pages once its own deadline passes, which for capture is inside the weekday",
-        f"# capture window and for {SUNDAY_SLUG} is Sunday 23:30. One of them has no label of",
-        f"# its own in the list below: the daemon spawns {COMPACTION_SLUG} at close+15, so",
-        "# booting the daemon out stops that job exactly as surely as it stops capture.",
+        f"# capture window and for {SUNDAY_SLUG} is Sunday 23:30. Two of them have no label",
+        f"# of their own in the list below. The daemon spawns {COMPACTION_SLUG} at close+15,",
+        "# so booting the daemon out stops that job exactly as surely as it stops capture.",
+        f"# The vendor sweep hands off to the run that pings {EVENING_UPLOAD_SLUG}, so",
+        f"# booting {EOD_SWEEP_LABEL} out stops that run too.",
         f"# Pause all {_spelled(len(live_check_slugs()))} from healthchecks first if the"
         " machine is meant to",
         "# stay uninstalled. A check that has been pinged once does not go back to `new` on",
@@ -3955,7 +3971,7 @@ def _arm_checks_step_lines() -> list[str]:
     Every live check is named, because what arms a row is its first ping rather than its
     first run. healthchecks keeps a check that has never been pinged in a ``new`` state,
     which never goes down and never sends, so a job that fails every run leaves its row
-    silent instead of paging. What separates the six is what arms each of them when
+    silent instead of paging. What separates the seven is what arms each of them when
     nobody presses.
 
     1. ``capture`` takes the daemon's tagged idle heartbeat through the weekday envelope
@@ -3978,6 +3994,10 @@ def _arm_checks_step_lines() -> list[str]:
        and it pings on its success condition alone. An install made on a machine whose
        token is dead reaches the bar fetch, fails it, and withholds the ping every
        evening, which leaves the row reading ``Never`` for as long as that lasts.
+    7. ``evening-upload`` has no install-time path either, and no plist of its own. The
+       vendor sweep hands off to it with ``python -m lake.compact --after-vendor-sweep``
+       once its own ping lands, so it runs only after an 18:30 sweep that pinged, and an
+       install whose sweep never pings leaves this row reading ``Never`` too.
 
     Running the jobs instead does not arm the install that needs arming. ``self-check``
     exits 1 when it did not ping, and the script runs under ``set -e``, so the one
@@ -5091,6 +5111,7 @@ __all__ = [
     "COMPACTION_SLUG",
     "EOD_SWEEP_LABEL",
     "EOD_SWEEP_SLUG",
+    "EVENING_UPLOAD_SLUG",
     "EXECUTING_STATES",
     "CANARY_RETRY",
     "CANARY_SYMBOL",

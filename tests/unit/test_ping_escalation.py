@@ -30,7 +30,7 @@ import pytest
 
 from lake.alert import CAP_REACHED, PAGE_PRIORITY, POST_FAILED, Delivery, Publisher
 from lake.calendar import MARKET_TZ
-from lake.compact import COMPACTION_SLUG
+from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG
 from lake.control_plane import CALENDAR_PROBE_SLUG, PRE_OPEN_SLUG, SUNDAY_SLUG
 from lake.deadman import CAPTURE_SLUG
 from lake.runner import (
@@ -50,7 +50,7 @@ from tests.support.transport import FakeTransport
 
 NOW = datetime(2026, 9, 14, 16, 30, tzinfo=MARKET_TZ)
 
-# The six checks a live job feeds. The retired slice-1 slug is deliberately absent, and
+# The seven checks a live job feeds. The retired slice-1 slug is deliberately absent, and
 # the test at the bottom of this file is what keeps it absent.
 LIVE_SLUGS = (
     COMPACTION_SLUG,
@@ -59,6 +59,7 @@ LIVE_SLUGS = (
     SUNDAY_SLUG,
     CAPTURE_SLUG,
     EOD_SWEEP_SLUG,
+    EVENING_UPLOAD_SLUG,
 )
 
 

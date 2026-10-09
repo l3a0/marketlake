@@ -22,7 +22,10 @@ import errno
 import json
 import os
 import re
+import shlex
 import subprocess
+import sys
+import urllib.error
 from contextlib import contextmanager
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
@@ -305,6 +308,42 @@ class _RecordingSetter:
         self.sundays.append(sunday)
         if self._raises is not None:
             raise self._raises
+
+
+class _ExecRecorder:
+    """Stands in for ``os.execv``, recording each call rather than replacing the process.
+
+    ``sweep.main`` ends a run that hands off with ``os.execv`` on the evening upload, so every
+    command test on an ok weekday evening reaches it. ``tests/conftest.py`` refuses the real
+    one, and a test that reaches it patches this in. A real ``exec`` never returns, and this
+    one does, so ``main`` falls through to the sweep's own exit code.
+    """
+
+    def __init__(self, raises: OSError | None = None) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+        self._raises = raises
+
+    def __call__(self, path: str, argv: list[str]) -> None:
+        self.calls.append((path, list(argv)))
+        if self._raises is not None:
+            raise self._raises
+
+
+def _record_execs(monkeypatch: pytest.MonkeyPatch, raises: OSError | None = None) -> _ExecRecorder:
+    """Patch ``os.execv`` with a recorder for this test, on top of the conftest's guard."""
+    recorder = _ExecRecorder(raises)
+    monkeypatch.setattr(os, "execv", recorder)
+    return recorder
+
+
+def _handed_off(config: Path) -> list[tuple[str, list[str]]]:
+    """The one ``exec`` a run given ``--config config`` makes when it hands off.
+
+    Spelled out rather than built with ``sweep.evening_upload_command``, so a builder that
+    dropped the flag or the config fails every command test as well as its own.
+    """
+    argv = [sys.executable, "-m", "lake.compact", "--after-vendor-sweep", "--config", str(config)]
+    return [(sys.executable, argv)]
 
 
 def _schedule_text(*, one_shot: date | None = SUNDAY) -> str:
@@ -1564,6 +1603,7 @@ def test_the_command_runs_the_sweep_and_reports_what_it_did(
     monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    execs = _record_execs(monkeypatch)
 
     code = sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -1577,6 +1617,11 @@ def test_the_command_runs_the_sweep_and_reports_what_it_did(
     assert f"Vendor sweep for {SESSION.isoformat()} (session)" in printed
     assert f"slug={EOD_SWEEP_SLUG}" in printed
     assert "hc-ping" not in printed, "the command printed a ping URL"
+    assert execs.calls == _handed_off(config)
+    # The hand-off line is the block's last, so the log says why compaction's output follows.
+    assert printed.splitlines()[-1] == (
+        f"sweep: handing off to python -m lake.compact --after-vendor-sweep --config {config}"
+    )
 
 
 def test_the_mac_friday_command_sets_the_wake_and_reads_it_back_by_default(
@@ -1605,6 +1650,7 @@ def test_the_mac_friday_command_sets_the_wake_and_reads_it_back_by_default(
     monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    execs = _record_execs(monkeypatch)
 
     sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -1615,6 +1661,8 @@ def test_the_mac_friday_command_sets_the_wake_and_reads_it_back_by_default(
 
     assert setter.sundays == [SUNDAY]
     assert f"sunday one-shot wake missing for {SUNDAY.isoformat()}" in printed
+    # A Friday is a weekday, so the Mac run hands off once the wake is set.
+    assert execs.calls == _handed_off(config)
 
 
 class _HostTouched(BaseException):
@@ -1645,6 +1693,7 @@ def test_the_linux_friday_command_sets_no_wake(
     monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    execs = _record_execs(monkeypatch)
 
     code = sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -1656,6 +1705,8 @@ def test_the_linux_friday_command_sets_no_wake(
     assert code == 0, printed
     assert "sunday one-shot wake not set" not in printed
     assert "pmset" not in printed
+    # The VM is the primary, and its Friday evening hands off like any other weekday's.
+    assert execs.calls == _handed_off(config)
 
 
 def test_on_linux_a_setter_passed_alone_gets_no_live_reader(
@@ -1682,6 +1733,7 @@ def test_on_linux_a_setter_passed_alone_gets_no_live_reader(
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
 
     setter = _RecordingSetter()
+    execs = _record_execs(monkeypatch)
     sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
         clock=ManualClock(FRIDAY_EVENING),
@@ -1692,6 +1744,7 @@ def test_on_linux_a_setter_passed_alone_gets_no_live_reader(
 
     assert setter.sundays == [SUNDAY]
     assert "pmset" not in printed
+    assert execs.calls == _handed_off(config)
 
 
 def test_a_friday_with_no_reader_sets_the_wake_and_reads_nothing_back(fixture_lake: FixtureLake):
@@ -2808,6 +2861,7 @@ def test_the_command_hands_the_batterys_threshold_to_the_battery(
     monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
     monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
     monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    execs = _record_execs(monkeypatch)
 
     sweep.main(
         ["--config", str(config), "--tickers", str(tickers)],
@@ -2819,6 +2873,7 @@ def test_the_command_hands_the_batterys_threshold_to_the_battery(
     capsys.readouterr()
 
     assert seen == [7], "the battery was handed the pinned default, not the config's"
+    assert execs.calls == _handed_off(config)
 
 
 def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLake, monkeypatch):
@@ -3809,3 +3864,364 @@ def test_a_refusal_named_by_its_class_alone_is_filed_as_it_is(
     monkeypatch.setattr(sweep, "assess", outside)
     outcome, _, _ = _run(root)
     assert _runway_lines(outcome) == ["disk runway walk refused: 1 path, OSError"]
+
+
+# -- the hand-off to the evening upload ------------------------------------------------
+#
+# Marketlake #833. ``sweep`` decides whether ``main`` replaces the process with
+# ``python -m lake.compact --after-vendor-sweep``, and three conditions must hold: the
+# ``eod-sweep`` ping landed, the day's compaction moment has passed or the day is no session,
+# and the day is a weekday. The cases below take each condition away on its own, so a gate
+# that dropped one of them fails exactly one case.
+
+# 16:20 on the Monday session: after the equity close, so the bar walk runs and the ping can
+# land, and before the 16:30 compaction moment. The only catch-up that isolates that gate.
+BEFORE_COMPACTION = datetime.fromisoformat("2026-09-14T16:20:00-04:00")
+# A Saturday catch-up, the weekend run a VM down across Friday 18:30 makes once it is back.
+SATURDAY_CATCH_UP = datetime.fromisoformat("2026-09-19T10:00:00-04:00")
+# A Sunday evening run at the sweep's own hour, the other day the weekday rule must stop.
+SUNDAY_EVENING = datetime.fromisoformat("2026-09-20T18:30:00-04:00")
+
+
+class _UnreachablePinger:
+    """A pinger the network never carried. No status comes back, so nothing pages."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def ping(self, url: str) -> None:
+        self.urls.append(url)
+        raise urllib.error.URLError(OSError("connection refused"))
+
+
+def test_a_weekday_session_evening_hands_off(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root)
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+    assert outcome.held_back is None
+
+
+def test_a_catch_up_inside_capture_does_not_hand_off(fixture_lake: FixtureLake):
+    """Compaction started from here does not inherit the daemon's refusal inside capture.
+
+    The ping lands, so the compaction moment is the only condition that holds the run back.
+    """
+    root = _lake(fixture_lake)
+    outcome, pinger, _ = _run(root, now=BEFORE_COMPACTION)
+    assert pinger.urls == [PING_URL]
+    assert outcome.hand_off is False
+    assert outcome.held_back == "the day's compaction moment has not passed"
+
+
+@pytest.mark.parametrize("now", [SATURDAY_CATCH_UP, SUNDAY_EVENING], ids=["saturday", "sunday"])
+def test_a_weekend_catch_up_does_not_hand_off(fixture_lake: FixtureLake, now: datetime):
+    """A weekend day is no session, so it pings like a holiday, and the weekday rule stops it.
+
+    Saturday and Sunday both run, because a rule that let either day through would upload on it.
+    """
+    root = _lake(fixture_lake)
+    outcome, pinger, _ = _run(root, now=now)
+    assert outcome.nightly.session is False
+    assert pinger.urls == [PING_URL]
+    assert outcome.hand_off is False
+    assert outcome.held_back == f"{now.date().isoformat()} is a weekend"
+
+
+def test_a_weekday_holiday_hands_off(fixture_lake: FixtureLake):
+    """So ``evening-upload`` hears a ping every weekday, as ``compaction`` and ``eod-sweep`` do."""
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root, holidays=(SESSION,))
+    assert outcome.nightly.session is False
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+
+
+def test_a_withheld_ping_does_not_hand_off(fixture_lake: FixtureLake):
+    """The gate is the ping that landed, which a failed ping does not satisfy."""
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root, pinger=_UnreachablePinger())
+    assert outcome.nightly.pinged is False
+    assert outcome.hand_off is False
+    assert outcome.held_back == f"the {EOD_SWEEP_SLUG} ping did not land"
+
+
+@pytest.mark.parametrize(
+    ("now", "second"),
+    [
+        (SATURDAY_CATCH_UP, f"{SATURDAY_CATCH_UP.date().isoformat()} is a weekend"),
+        (BEFORE_COMPACTION, "the day's compaction moment has not passed"),
+    ],
+    ids=["weekend", "before-compaction"],
+)
+def test_two_conditions_that_fail_together_are_both_named_in_order(
+    fixture_lake: FixtureLake, now: datetime, second: str
+):
+    """The line ``main`` prints says the whole reason, so a run held back twice names both.
+
+    The cases above take one condition away each, which a reason list cut to its first or last
+    entry would still pass.
+    """
+    root = _lake(fixture_lake)
+    outcome, _, _ = _run(root, now=now, pinger=_UnreachablePinger())
+    assert outcome.hand_off is False
+    assert outcome.held_back == f"the {EOD_SWEEP_SLUG} ping did not land, {second}"
+
+
+def test_the_gate_is_the_ping_and_not_ok(fixture_lake: FixtureLake, monkeypatch):
+    """A report file that could not be written leaves ``ok`` false and the ping landed.
+
+    ``eod-sweep`` stays green on such a night, so the upload still runs.
+    """
+    root = _lake(fixture_lake)
+    monkeypatch.setattr(
+        sweep, "write_nightly", lambda *a, **k: (_ for _ in ()).throw(PermissionError("read-only"))
+    )
+    outcome, _, _ = _run(root)
+    assert outcome.ok is False
+    assert outcome.hand_off is True
+
+
+def test_a_digest_that_did_not_go_still_hands_off(fixture_lake: FixtureLake):
+    """An undelivered digest leaves ``ok`` false, and the ping that is the gate still landed."""
+    root = _lake(fixture_lake, judged=())
+    transport = FakeTransport()
+    publisher = Publisher(lake_root=root, transport=transport, secrets=("unsealed",))
+    outcome, _, _ = _run(root, publisher=publisher, transport=transport)
+    assert outcome.delivered is False
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+    assert outcome.held_back is None
+
+
+def test_a_finding_that_could_not_be_filed_still_hands_off(fixture_lake: FixtureLake, monkeypatch):
+    """An unfiled finding leaves ``ok`` false and does not withhold the ping, so it uploads.
+
+    The setup is ``test_a_finding_that_could_not_be_filed_reaches_the_count_and_the_exit_code``'s.
+    """
+    from lake import bars as bars_module
+
+    root = _lake(fixture_lake, judged=(SESSION,))
+    monkeypatch.setattr(
+        bars_module,
+        "write_withheld",
+        lambda *a, **k: (_ for _ in ()).throw(PermissionError("read-only")),
+    )
+    source = _CountingVendorSource(_cassette(close=SETTLED_CLOSE * 1.05))
+    outcome, _, _ = _run(root, vendor_source=source)
+    assert outcome.nightly.unfiled == 1
+    assert outcome.nightly.pinged is True
+    assert outcome.hand_off is True
+    assert outcome.held_back is None
+
+
+def test_an_outcome_built_outside_the_sweep_never_hands_off():
+    """Both fields default to no hand-off, so only :func:`sweep.sweep` can start an upload."""
+    from lake.alert import Message
+
+    outcome = sweep.SweepOutcome(
+        nightly=report.Nightly(day=SESSION, session=True, pinged=True),
+        digest=Message(event=NIGHTLY_EVENT, title="t", body="b"),
+        delivered=True,
+    )
+    assert outcome.hand_off is False
+    assert outcome.held_back is None
+
+
+def test_the_upload_argv_forwards_the_config_only_when_given():
+    assert sweep.evening_upload_command(None) == [
+        sys.executable,
+        "-m",
+        "lake.compact",
+        "--after-vendor-sweep",
+    ]
+    assert sweep.evening_upload_command("/c.yaml") == [
+        sys.executable,
+        "-m",
+        "lake.compact",
+        "--after-vendor-sweep",
+        "--config",
+        "/c.yaml",
+    ]
+
+
+def _command_setup(fixture_lake: FixtureLake, monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    """A config and a tickers file for a command test, with the two senders replaced."""
+    from tests.support.config import write_config
+
+    root = _lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: weekday_sessions(MONDAY, NEXT_MONDAY))
+    return config, tickers
+
+
+def test_a_run_that_does_not_hand_off_says_what_held_it_back(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+    execs = _record_execs(monkeypatch)
+
+    code = sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(BEFORE_COMPACTION),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    printed = capsys.readouterr().out
+
+    assert code == 0, printed
+    assert execs.calls == []
+    assert printed.splitlines()[-1] == (
+        "sweep: no hand-off to compaction: the day's compaction moment has not passed"
+    )
+    assert "handing off" not in printed
+
+
+@pytest.mark.parametrize(
+    ("error", "line"),
+    [
+        (
+            FileNotFoundError(2, "No such file or directory"),
+            "FileNotFoundError: [Errno 2] No such file or directory",
+        ),
+        (PermissionError(13, "Permission denied"), "PermissionError: [Errno 13] Permission denied"),
+        (OSError(8, "Exec format error"), "OSError: [Errno 8] Exec format error"),
+    ],
+    ids=["enoent", "eacces", "enoexec"],
+)
+def test_an_exec_that_fails_prints_one_line_and_exits_1(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path, error: OSError, line: str
+):
+    """``FileNotFoundError`` is what a deploy that rebuilt the virtualenv leaves behind.
+
+    The catch is the whole ``OSError`` class, so a target that is not executable, or not a
+    program at all, ends the run the same way.
+    """
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+    execs = _record_execs(monkeypatch, raises=error)
+
+    code = sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert execs.calls == _handed_off(config)
+    assert captured.err.splitlines() == [f"sweep: hand-off to compaction failed: {line}"]
+
+
+def test_an_exec_that_raises_anything_but_an_os_error_is_not_an_exit_code(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """Only ``OSError`` is caught, so a bug in the hand-off ends the run as a bug does."""
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+
+    def broken(path: str, argv: list[str]) -> None:
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(os, "execv", broken)
+    with pytest.raises(ValueError, match="embedded null byte"):
+        sweep.main(
+            ["--config", str(config), "--tickers", str(tickers)],
+            clock=ManualClock(EVENING),
+            vendor_source=_CountingVendorSource(),
+            schedule_setter=_RecordingSetter(),
+            schedule_reader=lambda: _schedule_text(),
+        )
+    capsys.readouterr()
+
+
+# The child below runs ``sweep.main`` with the sweep itself replaced by a canned outcome
+# that hands off, and the upload replaced by a harmless ``python -c``. What it exercises is
+# the part no in-process test can: a real ``exec`` from a process whose stdout is a pipe.
+_HAND_OFF_CHILD = """
+import sys
+from datetime import date
+
+from lake import sweep
+from lake.alert import Message
+from lake.report import Nightly
+
+outcome = sweep.SweepOutcome(
+    nightly=Nightly(day=date(2026, 9, 14), session=True, pinged=True),
+    digest=Message(event="nightly_summary", title="Nightly 2026-09-14", body="ok"),
+    delivered=True,
+    hand_off=True,
+)
+sweep.sweep_from_config = lambda **kwargs: outcome
+sweep.evening_upload_command = lambda config_path: [
+    sys.executable, "-c", "print('the upload ran')"
+]
+raise SystemExit(sweep.main([]))
+"""
+
+
+def test_a_piped_hand_off_keeps_the_sweeps_block_ahead_of_the_upload(tmp_path):
+    """A pipe is block-buffered, and an ``exec`` discards what Python still buffers.
+
+    So without the flush the sweep's block never reaches the log and only the upload's output
+    does. ``PYTHONUNBUFFERED`` is removed so the child buffers the way the job does, and the
+    child's ``HOME`` and config directory are throwaway, so nothing in it can reach the real
+    ``~/.config/marketlake/``.
+    """
+    from lake.config import CONFIG_PATH_ENV
+    from lake.paths import CONFIG_DIR_ENV
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONUNBUFFERED"}
+    env.pop(CONFIG_PATH_ENV, None)
+    env["HOME"] = str(home)
+    env[CONFIG_DIR_ENV] = str(tmp_path / "config")
+
+    finished = subprocess.run(
+        [sys.executable, "-c", _HAND_OFF_CHILD],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert finished.returncode == 0, finished.stderr
+    lines = finished.stdout.splitlines()
+    assert lines[0] == "Vendor sweep for 2026-09-14 (session)", finished.stdout
+    target = shlex.join(["-c", "print('the upload ran')"])
+    hand_off = lines.index(f"sweep: handing off to python {target}")
+    assert lines[hand_off + 1 :] == ["the upload ran"], finished.stdout
+
+
+def test_an_unpatched_hand_off_reaches_the_suites_exec_guard(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """The catch around the ``exec`` is ``OSError`` alone, so the guard escapes ``main``.
+
+    A wider catch would turn the guard into exit 1, and four of the command tests that reach
+    the hand-off do not assert their exit code, so they would stay green with nothing
+    recorded. This case reaches the hand-off with no recorder and expects the guard itself.
+    """
+    from tests.conftest import ExecInTest
+
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+    # The precondition, asserted before the run: with the guard gone this case would really
+    # replace the test process with compaction.
+    assert os.execv.__qualname__ == "_no_exec.<locals>.refuse", os.execv
+
+    with pytest.raises(ExecInTest):
+        sweep.main(
+            ["--config", str(config), "--tickers", str(tickers)],
+            clock=ManualClock(EVENING),
+            vendor_source=_CountingVendorSource(),
+            schedule_setter=_RecordingSetter(),
+            schedule_reader=lambda: _schedule_text(),
+        )
+    capsys.readouterr()

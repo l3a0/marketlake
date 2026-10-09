@@ -29,11 +29,10 @@ mock_provider "aws" {
 # The address is from TEST-NET-3, a range reserved for documentation, and the key is not
 # a key.
 variables {
-  backup_bucket      = "example-lake-backup"
-  backup_policy_name = "example-policy"
-  adopt_existing     = false
-  owner_ssh_cidr     = "203.0.113.7/32"
-  ssh_public_key     = "ssh-ed25519 AAAAexamplenotakey"
+  backup_bucket  = "example-lake-backup"
+  adopt_existing = false
+  owner_ssh_cidr = "203.0.113.7/32"
+  ssh_public_key = "ssh-ed25519 AAAAexamplenotakey"
 }
 
 run "instance_s3_write_half_is_on_by_default" {
@@ -192,15 +191,14 @@ run "instance_role_is_trusted_by_ec2_alone" {
   }
 }
 
-run "empty_names_fail_validation" {
+run "an_empty_bucket_name_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket      = ""
-    backup_policy_name = ""
+    backup_bucket = ""
   }
 
-  expect_failures = [var.backup_bucket, var.backup_policy_name]
+  expect_failures = [var.backup_bucket]
 }
 
 # Each policy is compared with its own literal rather than with the other, because
@@ -437,11 +435,10 @@ run "an_arn_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket      = "arn:aws:s3:::example-state"
-    backup_policy_name = "arn:aws:s3:::example-state"
+    backup_bucket = "arn:aws:s3:::example-state"
   }
 
-  expect_failures = [var.backup_bucket, var.backup_policy_name]
+  expect_failures = [var.backup_bucket]
 }
 
 run "a_two_character_bucket_name_fails_validation" {
@@ -458,11 +455,10 @@ run "a_name_with_a_space_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket      = "has space"
-    backup_policy_name = "has space"
+    backup_bucket = "has space"
   }
 
-  expect_failures = [var.backup_bucket, var.backup_policy_name]
+  expect_failures = [var.backup_bucket]
 }
 
 # The mock account id is also what a hard-coded ARN would carry, so plan once under a

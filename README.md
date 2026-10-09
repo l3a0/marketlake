@@ -265,9 +265,11 @@ The restore, command 3, and the resync, command 5, run on either.
    still a path.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
-   an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,
-   while the Sunday job may be scrubbing the bucket, and a run begun just before 19:55
-   stops when the window opens. Its last step holds the lake-root lock, and that step
+   an evening after the 18:30 sweep, once the evening upload that follows it has
+   finished, since that upload holds the lake-root lock. On the VM,
+   `systemctl is-active com.marketlake.eod-sweep.service` prints `inactive` once it
+   has. It does not run on Sunday from 19:55 to 23:30, while the Sunday job may be
+   scrubbing the bucket, and a run begun just before 19:55 stops when the window opens. Its last step holds the lake-root lock, and that step
    stops 30 minutes before the next session opens, so start it with the evening ahead of
    it. It refuses when the lake's own `manifest.jsonl` is empty or missing while the
    bucket's is not, which is what a wrong `lake_root` looks like. Each stop leaves the
@@ -401,14 +403,22 @@ The restore, command 3, and the resync, command 5, run on either.
 6. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
-   Compaction prints the upload's throughput to its log, in the line the first upload
-   prints.
+   On a weekday the 18:30 vendor sweep then hands off to compaction again, with
+   `python -m lake.compact --after-vendor-sweep`, which uploads the bars and actions the
+   sweep just wrote and pings the `evening-upload` check
+   ([#833](https://github.com/l3a0/marketlake/issues/833)). Each run prints the upload's
+   throughput to its log, in the line the first upload prints. The close+15 run's line lands
+   in the daemon's log, and the evening run's lands in the eod-sweep job's log after the
+   sweep's own block and its `sweep: handing off` line.
 
 **The trim needs no command either, and only the VM runs it.** `config/vm.yaml` sets
 `lake_window_sessions`, and on a primary host with a bucket target the close+15 compaction
 then drops each chains partition older than that many sessions once its bucket copy hashes
 to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). The trim's lines, then any
-pruned ticker directories, end the compaction log.
+pruned ticker directories, end the compaction log. They also end the eod-sweep job's log,
+because the compaction run the vendor sweep hands off to reaches the trim too. That run
+normally prints `trim     refused: the checkpoint is tonight's`, since the sweep has just
+written tonight's split checkpoint and a trim runs only on a session after the checkpoint's.
 The laptop's `config.yaml` must never set `lake_window_sessions`. Since the cutover
 ([#638](https://github.com/l3a0/marketlake/issues/638)) the laptop runs `role: shadow`,
 which the trim's role gate refuses. A switch back to `primary` would pass that gate, and
@@ -512,6 +522,10 @@ moves or the install runs, the timer jobs, the compaction the daemon starts at c
 and any module the running daemon imports for the first time all run the new code. A
 deploy therefore waits for the session's close before it updates the checkout or installs,
 not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
+On a weekday evening it also waits for the upload after the vendor sweep, which runs in the
+eod-sweep unit from about 18:32 ET and can run past 20:00 on a night it retries a failed
+seal or upload ([#833](https://github.com/l3a0/marketlake/issues/833)). Once it has finished,
+`systemctl is-active com.marketlake.eod-sweep.service` prints `inactive`.
 
 Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern
 time:
