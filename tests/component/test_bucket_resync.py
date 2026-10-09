@@ -15,6 +15,11 @@ The cases follow item 4 of the issue.
 3. The refusals on this lake's own tail, each cleared by moving the file out.
 4. The checks before any download: the listing, the stored SHA-256 and the journal reserve.
 5. The guards, and the command's lines.
+6. ``--apply``: the commit keeps the manifest's inode, a change during the downloads refuses
+   at the commit, every stop leaves no temp file, and a re-run finishes after a crash.
+7. The job probe a systemd host asks, which reads ``ActiveState``.
+8. Both directions end to end against one fake bucket, the first test that uploads from a
+   restored lake.
 
 Every refusal is one line, so each test that meets one asserts ``"\\n" not in message``.
 Expected digests are read from the files the test wrote, never through the code under test.
@@ -154,20 +159,29 @@ def _switched(tmp_path: Path) -> tuple[Path, Path, FakeS3, dict[str, bytes]]:
     return laptop, vm, client, files
 
 
+def _idle(label: str) -> bool:
+    """A job probe that finds no job executing."""
+    return False
+
+
 def _resync(
     root: Path,
     client: FakeS3,
     *,
-    now: datetime = TUESDAY_20,
+    now: datetime | ManualClock = TUESDAY_20,
     free: int = PLENTY,
     euid: int = OWNER,
+    apply: bool = False,
+    probe=_idle,
 ) -> bucket.ResyncSummary:
     return resync(
         root,
         TARGET,
         client=client,
-        clock=ManualClock(now),
+        clock=now if isinstance(now, ManualClock) else ManualClock(now),
         calendar=CALENDAR,
+        apply=apply,
+        job_probe=probe,
         geteuid=lambda: euid,
         free_space=lambda _: free,
     )
@@ -654,6 +668,7 @@ def _config(tmp_path: Path, lake_root: Path, *, role: str | None = None) -> Path
 def _main(config: Path, client: FakeS3, monkeypatch, *argv: str, now=TUESDAY_20) -> int:
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
     monkeypatch.setattr(bucket.os, "geteuid", lambda: OWNER)
+    monkeypatch.setattr(bucket, "default_job_probe", lambda: _idle)
     return bucket.main(
         ["resync", "--config", str(config), "--target", str(TARGET), *argv],
         clock=ManualClock(now),
@@ -672,7 +687,8 @@ def test_the_dry_run_prints_one_line_per_fact_and_writes_nothing(tmp_path, monke
     assert out[0].startswith("resync: shared ")
     assert f"resync: delete {BARS_2} (the next sweep regenerates it)" in out
     assert out[-1] == (
-        f"resync: dry run: 3 download(s), 0.0 MB, 1 deletion(s), must stop by {WEDNESDAY_BOUND}"
+        "resync: dry run: 3 download(s), 0.0 MB, 1 deletion(s), must stop by "
+        f"{WEDNESDAY_BOUND}. Run again with --apply"
     )
     assert _snapshot(laptop) == before
 
@@ -702,3 +718,400 @@ def test_a_bucket_failure_exits_2_with_one_line(tmp_path, monkeypatch, capsys):
     assert exited.value.code == 2
     (line,) = capsys.readouterr().err.splitlines()
     assert line.startswith("resync: the bucket refused the request (AccessDenied)")
+
+
+# -- 6. --apply ----------------------------------------------------------------------------
+
+
+class Crash(Exception):
+    """A process death injected between two steps. No branch of the command catches it."""
+
+
+class _HookedS3(FakeS3):
+    """A fake bucket that runs ``on_get`` before each ``GetObject`` of a data file."""
+
+    def __init__(self, source: FakeS3, on_get) -> None:
+        super().__init__()
+        self.objects = source.objects
+        self.on_get = on_get
+
+    def get_object(self, **kwargs) -> dict:
+        if kwargs["Key"] != MANIFEST_KEY:
+            self.on_get(kwargs["Key"])
+        return super().get_object(**kwargs)
+
+
+def _strays(root: Path) -> list[str]:
+    """Every temp file left anywhere under the lake root."""
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if ".tmp-" in p.name)
+
+
+def _crash(*args) -> None:
+    raise Crash
+
+
+def test_apply_brings_the_lake_level_and_keeps_the_manifests_inode(tmp_path):
+    from lake.manifest import scrub
+
+    laptop, _vm_root, client, files = _switched(tmp_path)
+    inode = manifest_path(laptop).stat().st_ino
+    expected = client.body(MANIFEST_KEY)
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    assert manifest_path(laptop).read_bytes() == expected
+    assert manifest_path(laptop).stat().st_ino == inode
+    assert summary.entries == len(expected.splitlines())
+    for rel, data in files.items():
+        assert (laptop / rel).read_bytes() == data
+    assert (laptop / QUARANTINE).read_bytes() == client.body(TARGET.key(QUARANTINE))
+    assert not (laptop / BARS_2).exists()
+    assert _strays(laptop) == []
+    assert scrub(laptop).ok
+    # A second run finds the lake level.
+    assert _resync(laptop, client, apply=True).level
+
+
+def test_apply_on_a_lake_that_only_appends_cuts_a_torn_last_line_first(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _vm_session(vm, client)
+    # A torn write left part of the bucket's next line on the end of the laptop's manifest.
+    expected = client.body(MANIFEST_KEY)
+    lake_raw = manifest_path(laptop).read_bytes()
+    with manifest_path(laptop).open("ab") as handle:
+        handle.write(expected[len(lake_raw) : len(lake_raw) + 20])
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert manifest_path(laptop).read_bytes() == expected
+    # The torn fragment is the start of the bucket's first tail entry, so the tail counts
+    # from that entry's own line rather than from the line after the fragment.
+    assert (summary.bucket_tail, summary.bucket_first) == (2, SPY_2)
+
+
+def test_the_dry_run_never_asks_the_job_probe(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    def probe(label: str) -> bool:
+        pytest.fail("the dry run asked whether a job was executing")
+
+    assert _resync(laptop, client, probe=probe).downloads
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["com.marketlake.daemon", "com.marketlake.eod-sweep", "com.marketlake.sunday"],
+)
+def test_an_executing_job_refuses_apply_before_any_request(tmp_path, label):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+
+    message = _refused(laptop, client, apply=True, probe=lambda asked: asked == label)
+
+    assert label in message
+    assert "changed nothing" in message
+    assert client.calls == []
+    assert _snapshot(laptop) == before
+
+
+def test_a_job_that_starts_during_the_downloads_refuses_at_the_commit(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+    asked: list[str] = []
+
+    def probe(label: str) -> bool:
+        # Idle at the start and before each of the three downloads, then the daemon is up at
+        # the commit.
+        asked.append(label)
+        return len(asked) > 4 * 3
+
+    message = _refused(laptop, client, apply=True, probe=probe)
+
+    assert "com.marketlake.daemon is executing" in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_lake_writer_during_the_downloads_refuses_at_the_commit(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    def sweep(_key: str) -> None:
+        if not (laptop / "bars/late.parquet").exists():
+            _record(laptop, "bars/late.parquet", b"late", source="sweep")
+
+    message = _refused(laptop, _HookedS3(client, sweep), apply=True)
+
+    assert "the lake's manifest.jsonl changed while the resync downloaded" in message
+    assert (laptop / BARS_2).exists()
+    assert _strays(laptop) == []
+
+
+def test_an_upload_to_the_bucket_during_the_downloads_refuses_at_the_commit(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+
+    def upload(_key: str) -> None:
+        if not client.body(MANIFEST_KEY).endswith(b"late\n"):
+            client.store(MANIFEST_KEY, client.body(MANIFEST_KEY) + b"late\n")
+
+    message = _refused(laptop, _HookedS3(client, upload), apply=True)
+
+    assert "the bucket's manifest.jsonl changed while the resync downloaded" in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_download_that_does_not_hash_to_its_entry_refuses_and_keeps_no_temp(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+
+    def replace(key: str) -> None:
+        if key == TARGET.key(SPY_2):
+            client.store(key, b"replaced after the check")
+
+    message = _refused(laptop, _HookedS3(client, replace), apply=True)
+
+    assert repr(SPY_2) in message
+    assert "does not hash" in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_session_reached_during_the_downloads_stops_and_discards_them(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+    clock = ManualClock(TUESDAY_20)
+
+    def late(_key: str) -> None:
+        clock.advance(13 * 3600)
+
+    message = _refused(laptop, _HookedS3(client, late), apply=True, now=clock)
+
+    assert "ahead of the next session's capture start" in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_leftover_temp_beside_a_target_is_removed_and_named(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    stale = laptop / f"{SPY_2}.tmp-99999"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"a crashed run's download")
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.temps_removed == [f"{SPY_2}.tmp-99999"]
+    assert f"resync: removed a leftover temp file: {SPY_2}.tmp-99999" in summary.lines()
+    assert _strays(laptop) == []
+
+
+def test_a_crash_before_the_manifest_rewrite_is_finished_by_the_next_run(tmp_path, monkeypatch):
+    laptop, _vm_root, client, files = _switched(tmp_path)
+    lake_raw = manifest_path(laptop).read_bytes()
+    expected = client.body(MANIFEST_KEY)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bucket, "_rewrite_manifest", _crash)
+        with pytest.raises(Crash):
+            _resync(laptop, client, apply=True)
+    # The files moved in and the bars partition went, and the manifest is still the lake's.
+    assert manifest_path(laptop).read_bytes() == lake_raw
+    assert (laptop / SPY_2).read_bytes() == files[SPY_2]
+    assert not (laptop / BARS_2).exists()
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    assert summary.downloads == []
+    assert manifest_path(laptop).read_bytes() == expected
+
+
+@pytest.mark.parametrize("past", [0, 7, 200])
+def test_a_crash_part_way_through_the_manifest_rewrite_is_finished_by_the_next_run(
+    tmp_path, monkeypatch, past
+):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+    with monkeypatch.context() as patched:
+        patched.setattr(bucket, "_rewrite_manifest", _crash)
+        with pytest.raises(Crash):
+            _resync(laptop, client, apply=True)
+    # What a crash after the truncate leaves: the shared bytes and part of the bucket's tail,
+    # cut mid-line, written in place.
+    shared = len(b"".join(expected.splitlines(keepends=True)[:-2]))
+    with manifest_path(laptop).open("r+b") as handle:
+        handle.truncate(shared)
+        handle.seek(shared)
+        handle.write(expected[shared : shared + past])
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    assert summary.lake_tail == 0
+    assert manifest_path(laptop).read_bytes() == expected
+
+
+def test_the_rewrite_keeps_the_lock_held_by_another_descriptor(tmp_path):
+    import fcntl
+    import os
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+    keep = len(b"".join(expected.splitlines(keepends=True)[:-2]))
+    holder = os.open(manifest_path(laptop), os.O_RDONLY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        bucket._rewrite_manifest(laptop, keep, expected[keep:], expected)
+        other = os.open(manifest_path(laptop), os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(other)
+    finally:
+        os.close(holder)
+    assert manifest_path(laptop).read_bytes() == expected
+
+
+def test_the_command_applies_and_prints_its_verdict_lines(tmp_path, monkeypatch, capsys):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    config = _config(tmp_path, laptop)
+
+    assert _main(config, client, monkeypatch, "--apply") == 0
+
+    out = capsys.readouterr().out.splitlines()
+    entries = len(client.body(MANIFEST_KEY).splitlines())
+    assert (
+        "resync: applied: 3 download(s), 0.0 MB, 1 deletion(s), and manifest.jsonl now holds "
+        f"the bucket's {entries} entries"
+    ) in out
+    # The roster check and the schema-version check report after the commit, and a roster
+    # that cannot be read is a warning, since the lake is already written.
+    assert any(line.startswith("resync: warning: tickers file not found") for line in out)
+    assert any("schema version" in line for line in out)
+    assert out[-1].startswith(f"resync: backup_target is {tmp_path / 'ssd'}, not {TARGET}")
+    assert manifest_path(laptop).read_bytes() == client.body(MANIFEST_KEY)
+
+
+def test_the_command_names_no_backup_target_that_is_already_the_bucket(
+    tmp_path, monkeypatch, capsys
+):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    config = _config(tmp_path, laptop)
+    text = config.read_text()
+    config.write_text(
+        text.replace(f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {TARGET}")
+    )
+
+    assert _main(config, client, monkeypatch, "--apply") == 0
+
+    assert "backup_target is" not in capsys.readouterr().out
+
+
+# -- 7. the probe a systemd host asks ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "code", "executing"),
+    [
+        ("activating\n", 0, True),
+        ("active\n", 0, True),
+        ("deactivating\n", 0, True),
+        ("reloading\n", 0, True),
+        ("inactive\n", 0, False),
+        ("failed\n", 0, False),
+        ("", 1, True),
+    ],
+)
+def test_the_systemd_probe_reads_the_active_state(monkeypatch, stdout, code, executing):
+    import subprocess
+
+    from lake import control_plane
+
+    seen: list[list[str]] = []
+
+    def run(args, **kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert control_plane.systemctl_executing_probe("com.marketlake.eod-sweep") is executing
+    assert seen == [
+        ["systemctl", "show", "-p", "ActiveState", "--value", "com.marketlake.eod-sweep.service"]
+    ]
+
+
+@pytest.mark.parametrize("macos", [True, False])
+def test_the_job_probe_follows_the_host(monkeypatch, macos):
+    from lake import control_plane
+
+    monkeypatch.setattr(control_plane, "is_macos", lambda: macos)
+
+    expected = control_plane.launchctl_probe if macos else control_plane.systemctl_executing_probe
+    assert bucket.default_job_probe() is expected
+
+
+# -- 8. both directions, end to end ------------------------------------------------------
+
+WEDNESDAY_19 = datetime(2026, 8, 26, 19, 0, tzinfo=MARKET_TZ)
+WEDNESDAY_20 = datetime(2026, 8, 26, 20, 0, tzinfo=MARKET_TZ)
+THURSDAY_19 = datetime(2026, 8, 27, 19, 0, tzinfo=MARKET_TZ)
+SPY_3 = "chains/ticker=SPY/date=2026-08-26.parquet"
+SPY_4 = "chains/ticker=SPY/date=2026-08-27.parquet"
+SEGMENT_3 = "journal/date=2026-08-26/surface=chains/ticker=SPY/seg-20260826T1330-52.arrows"
+
+
+def _upload(root: Path, client: FakeS3, now: datetime) -> None:
+    nightly_upload(root, TARGET, client=client, clock=ManualClock(now), calendar=CALENDAR)
+
+
+def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, monkeypatch):
+    # The laptop uploads, the VM is restored from the bucket and uploads its Tuesday session,
+    # and the shadow laptop's sweep grows a tail.
+    laptop, vm, client, _files = _switched(tmp_path)
+    vm_tuesday = client.body(MANIFEST_KEY)
+
+    # The switch back. The laptop's nightly upload refuses, and so does the first upload.
+    with pytest.raises(bucket.WatermarkMissing) as refused:
+        _upload(laptop, client, TUESDAY_20)
+    assert bucket.RESYNC_COMMAND in str(refused.value)
+    with pytest.raises(bucket.FirstUploadRefused):
+        first_upload(
+            laptop, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR
+        )
+    laptop_config = _config(tmp_path / "laptop-config", laptop)
+    before = _snapshot(laptop)
+    assert _main(laptop_config, client, monkeypatch) == 0
+    assert _snapshot(laptop) == before
+    assert _main(laptop_config, client, monkeypatch, "--apply") == 0
+    assert manifest_path(laptop).read_bytes() == vm_tuesday
+
+    # The laptop's Wednesday session uploads, and the bucket still names the VM's session.
+    _record(laptop, SPY_3, b"laptop chains 2026-08-26")
+    _upload(laptop, client, WEDNESDAY_19)
+    laptop_wednesday = client.body(MANIFEST_KEY)
+    assert laptop_wednesday.startswith(vm_tuesday)
+    assert f'"{SPY_2}"'.encode() in laptop_wednesday
+
+    # The shadow VM captured the same session with its own bytes, and a segment beside it.
+    _record(vm, SEGMENT_3, b"vm segment", source="capture")
+    _record(vm, SPY_3, b"vm chains 2026-08-26")
+
+    # The return to the VM. Its upload refuses, and the resync brings it level.
+    with pytest.raises(bucket.WatermarkMissing):
+        _upload(vm, client, WEDNESDAY_20)
+    vm_config = _config(tmp_path / "vm-config", vm, role="shadow")
+    assert _main(vm_config, client, monkeypatch, now=WEDNESDAY_20) == 0
+    assert _main(vm_config, client, monkeypatch, "--apply", now=WEDNESDAY_20) == 0
+    assert manifest_path(vm).read_bytes() == laptop_wednesday
+    assert (vm / SPY_3).read_bytes() == b"laptop chains 2026-08-26"
+    assert not (vm / SEGMENT_3).exists()
+
+    # The VM's Thursday session uploads with the laptop's Wednesday session still named.
+    _record(vm, SPY_4, b"vm chains 2026-08-27")
+    _upload(vm, client, THURSDAY_19)
+    assert client.body(MANIFEST_KEY).startswith(laptop_wednesday)
+    assert client.body(TARGET.key(SPY_3)) == b"laptop chains 2026-08-26"

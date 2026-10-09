@@ -978,6 +978,45 @@ def systemctl_probe(label: str) -> bool:
     return result.returncode == 0
 
 
+# The ``ActiveState`` values in which a unit's process may be running. A calendar job's
+# service is ``Type=oneshot`` and reads ``activating`` for its whole run, which
+# ``systemctl_probe``'s ``is-active`` answers as down, so a probe asking whether a job is
+# executing reads the state itself (marketlake #832).
+EXECUTING_STATES = frozenset({"activating", "active", "deactivating", "reloading"})
+
+
+def parse_active_state(stdout: str, returncode: int) -> bool:
+    """Whether ``systemctl show -p ActiveState --value`` describes a unit that may be executing.
+
+    A state in ``EXECUTING_STATES`` at exit 0 is executing, and any other state at exit 0,
+    such as ``inactive`` or ``failed``, is not. A non-zero exit, such as a bus that could not
+    be reached, says nothing about the unit, so it reads as executing: the caller is a
+    command about to write under the lake root, and it refuses rather than guess.
+    """
+    if returncode != 0:
+        return True
+    return stdout.strip() in EXECUTING_STATES
+
+
+def systemctl_executing_probe(label: str) -> bool:
+    """Whether ``<label>.service`` may be executing, by its ``ActiveState``.
+
+    The resync in ``lake.bucket`` asks this of the daemon, the vendor sweep and the Sunday job
+    before it writes under the lake root. The service is named in full, because a calendar
+    job's ``.timer`` is active all day and its ``.service`` is what runs. A test injects a
+    fake instead.
+    """
+    import subprocess  # lazy: only a real run shells out
+
+    result = subprocess.run(
+        ["systemctl", "show", "-p", "ActiveState", "--value", f"{label}.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parse_active_state(result.stdout, result.returncode)
+
+
 # Whether the host's clock is synchronized, as a problem sentence or ``None``. The real
 # one shells out to ``timedatectl`` on Linux. macOS passes none. A test injects a
 # callable.
@@ -5018,6 +5057,7 @@ __all__ = [
     "COMPACTION_SLUG",
     "EOD_SWEEP_LABEL",
     "EOD_SWEEP_SLUG",
+    "EXECUTING_STATES",
     "CANARY_RETRY",
     "CANARY_SYMBOL",
     "DAEMON_LABEL",
@@ -5118,6 +5158,7 @@ __all__ = [
     "parse_exclusions",
     "parse_launchctl_print",
     "parse_ntp_synchronized",
+    "parse_active_state",
     "PMSET_BINARY",
     "parse_pmset_schedule",
     "pmset_schedule_args",
@@ -5139,6 +5180,7 @@ __all__ = [
     "sunday_run",
     "sunday_wake_command",
     "systemctl_probe",
+    "systemctl_executing_probe",
     "timedatectl_clock_probe",
     "tmutil_exclusion_commands",
     "tmutil_exclusion_targets",

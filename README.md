@@ -345,7 +345,15 @@ The restore, command 3, and the resync, command 5, run on either.
    an `onboard`, `retire` or `seed_spans` change to the capture spans, a quarantine
    sign-off, or any other file the bucket does not record. Move such a file out of the
    lake by hand, or redo the decision on the new primary after the switch, then run it
-   again.
+   again. Run it again with `--apply` to carry the plan out, as the owner and not under
+   `sudo`, with the daemon stopped. It refuses while the daemon, the 18:30 sweep or the
+   Sunday job is executing. It downloads each file beside its target with the lake-root
+   lock released, then takes the lock to move the files in, delete the planned files, and
+   rewrite `manifest.jsonl` in place to equal the bucket's. A run that stops discards its
+   downloads, and running it again finishes what a crash left. Its last lines are the
+   roster check's verdict, the running schema version's, and, when `backup_target` is not
+   the bucket it read, a line saying so, since that host's next close+15 would not upload
+   there.
 6. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
