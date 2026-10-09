@@ -1527,3 +1527,608 @@ def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, mon
     _upload(vm, client, THURSDAY_19)
     assert client.body(MANIFEST_KEY).startswith(laptop_wednesday)
     assert client.body(TARGET.key(SPY_3)) == b"laptop chains 2026-08-26"
+
+
+# -- 9. the mutation lens's additions (PR #847) -------------------------------------------
+
+
+def _keep(expected: bytes) -> int:
+    """The length of the shared bytes in ``_switched``'s pair: all but the last two lines."""
+    return len(b"".join(expected.splitlines(keepends=True)[:-2]))
+
+
+def test_an_append_only_resync_says_this_hosts_tail_is_empty(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _vm_session(vm, client)
+    shared = len(manifest_path(laptop).read_bytes().splitlines())
+
+    lines = _resync(laptop, client).lines()
+
+    assert lines[0] == (
+        f"resync: shared {shared} entries; bucket tail from {SPY_2!r} (2 entries); "
+        "this host's tail is empty"
+    )
+
+
+def test_a_bucket_copy_ending_in_a_torn_line_says_its_tail_is_empty(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    client.store(MANIFEST_KEY, client.body(MANIFEST_KEY) + b'{"partition": "chains/ti')
+
+    lines = _resync(laptop, client).lines()
+
+    assert lines[0].endswith("; the bucket's tail is empty; this host's tail is empty")
+
+
+def test_the_summary_lines_scale_megabytes_and_name_every_warning():
+    summary = bucket.ResyncSummary(
+        target=str(TARGET),
+        bucket_first=SPY_2,
+        bucket_tail=1,
+        downloads=[(SPY_2, 1_500_000), (QUOTES_2, 2_000_000)],
+        warnings=["the first", "the second"],
+    )
+
+    lines = summary.lines()
+
+    assert f"resync: download {SPY_2} (1.5 MB)" in lines
+    assert f"resync: download {QUOTES_2} (2.0 MB)" in lines
+    assert lines[-2:] == ["resync: warning: the first", "resync: warning: the second"]
+    assert summary.counts() == "2 download(s), 3.5 MB, 0 deletion(s)"
+
+
+def test_a_sunday_run_must_stop_by_the_sunday_wake(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    summary = _resync(laptop, client, now=datetime(2026, 8, 30, 15, 0, tzinfo=MARKET_TZ))
+
+    assert summary.stop_by is not None
+    assert summary.stop_by.isoformat() == "2026-08-30T19:55:00-04:00"
+
+
+def test_a_bucket_line_naming_no_partition_refuses_in_one_line(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    line = len(client.body(MANIFEST_KEY).splitlines()) + 1
+    copy = client.body(MANIFEST_KEY) + b'{"rows": 1}\n' + _entry(SPY_2, "0" * 64)
+    client.store(MANIFEST_KEY, copy)
+
+    message = _refused(laptop, client)
+
+    assert message.startswith(f"line {line} of the bucket's manifest.jsonl ")
+    assert "the resync changed nothing" in message
+
+
+def test_a_bucket_tail_repeating_an_entry_this_lake_holds_only_appends(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    lake_raw = manifest_path(laptop).read_bytes()
+    (again,) = [
+        line for line in lake_raw.splitlines(keepends=True) if f'"{SPY_1}"'.encode() in line
+    ]
+    client.store(MANIFEST_KEY, lake_raw + again)
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    assert summary.downloads == []
+    assert manifest_path(laptop).read_bytes() == lake_raw + again
+
+
+def test_a_lake_whose_manifest_is_one_torn_line_refuses_and_keeps_it(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+    manifest_path(laptop).write_bytes(expected[:20])
+    before = _snapshot(laptop)
+
+    # The lake shares no whole line with the bucket's copy, so the commit would cut its
+    # manifest to 0 bytes first, and a crash there would leave a manifest no run accepts.
+    message = _refused(laptop, client, apply=True)
+
+    assert "share no whole line" in message
+    assert _snapshot(laptop) == before
+
+
+@pytest.mark.parametrize("rel", ["chains//date=2026-08-25.parquet", "MANIFEST.JSONL"])
+def test_a_bucket_path_the_restore_would_refuse_refuses(tmp_path, rel):
+    laptop, client = _laptop(tmp_path)
+    client.store(MANIFEST_KEY, client.body(MANIFEST_KEY) + _entry(rel, "0" * 64))
+
+    message = _refused(laptop, client)
+
+    assert repr(rel) in message
+    assert "outside the lake" in message
+
+
+def test_a_bucket_path_through_a_symlink_out_of_the_lake_refuses(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (laptop / "chains" / "ticker=EVIL").symlink_to(outside, target_is_directory=True)
+    rel = "chains/ticker=EVIL/date=2026-08-25.parquet"
+    client.store(TARGET.key(rel), b"evil")
+    copy = client.body(MANIFEST_KEY) + _entry(rel, hashlib.sha256(b"evil").hexdigest())
+    client.store(MANIFEST_KEY, copy)
+
+    message = _refused(laptop, client)
+
+    assert repr(rel) in message
+    assert "outside the lake" in message
+
+
+def test_a_file_the_plan_cannot_hash_refuses_in_one_line(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    (laptop / QUARANTINE).chmod(0)
+    try:
+        message = _refused(laptop, client)
+    finally:
+        (laptop / QUARANTINE).chmod(0o644)
+
+    assert message.startswith(f"hashing {QUARANTINE} failed (PermissionError")
+    assert message.endswith("so the resync changed nothing")
+
+
+def _with_case_twins(tmp_path: Path, tail_rel: str) -> tuple[Path, FakeS3]:
+    """A laptop lake whose manifest names two paths differing only by case, with no files.
+
+    The bucket's copy is that manifest plus one entry for ``tail_rel``.
+    """
+    laptop, client = _laptop(tmp_path)
+    twins = (
+        "chains/ticker=QQQ/date=2026-08-24.parquet",
+        "chains/ticker=qqq/date=2026-08-24.parquet",
+    )
+    for rel in twins:
+        append_manifest(
+            laptop, partition=rel, source="compaction", sha256="0" * 64, rows=1, fetched_at=None
+        )
+    data = b"the bucket's tail"
+    client.store(TARGET.key(tail_rel), data)
+    copy = manifest_path(laptop).read_bytes() + _entry(tail_rel, hashlib.sha256(data).hexdigest())
+    client.store(MANIFEST_KEY, copy)
+    return laptop, client
+
+
+def test_a_case_clash_among_paths_the_resync_does_not_download_refuses_nothing(tmp_path):
+    laptop, client = _with_case_twins(tmp_path, SPY_2)
+
+    assert dict(_resync(laptop, client).downloads) == {SPY_2: len(b"the bucket's tail")}
+
+
+def test_a_download_beside_a_level_path_that_differs_only_by_case_refuses(tmp_path):
+    # The bucket's tail names SPY_1 in lower case, while its shared entries name SPY_1 itself.
+    laptop, client = _with_case_twins(tmp_path, SPY_1.replace("SPY", "spy"))
+
+    message = _refused(laptop, client)
+
+    assert "differs only by case" in message
+
+
+def test_a_file_only_this_lake_names_that_is_already_gone_is_not_listed_for_deletion(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    (laptop / BARS_2).unlink()
+
+    assert _resync(laptop, client).deletions == []
+
+
+def test_a_schema_version_ledger_only_the_bucket_rewrote_warns_nothing(tmp_path):
+    laptop, vm, client, _files = _switched(tmp_path)
+    _record(vm, SCHEMA_LEDGER, b"vm ledger", source="reference")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
+
+    summary = _resync(laptop, client)
+
+    assert SCHEMA_LEDGER in dict(summary.downloads)
+    assert summary.warnings == []
+
+
+def test_downloads_the_bucket_no_longer_lists_are_all_named(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    del client.objects[TARGET.key(QUOTES_2)]
+    del client.objects[TARGET.key(SPY_2)]
+
+    message = _refused(laptop, client)
+
+    assert repr(QUOTES_2) in message
+    assert repr(SPY_2) in message
+
+
+class _VanishingS3(FakeS3):
+    """A fake bucket that loses one object right after it answers a listing."""
+
+    def __init__(self, source: FakeS3, key: str) -> None:
+        super().__init__()
+        self.objects = source.objects
+        self.key = key
+
+    def list_objects_v2(self, **kwargs) -> dict:
+        response = super().list_objects_v2(**kwargs)
+        self.objects.pop(self.key, None)
+        return response
+
+
+def test_a_download_deleted_between_the_listing_and_its_head_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    message = _refused(laptop, _VanishingS3(client, TARGET.key(QUOTES_2)))
+
+    assert repr(QUOTES_2) in message
+    assert "no current version" in message
+
+
+def test_the_journal_reserve_counts_the_planned_downloads(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    big = b"s" * 3_000_000
+    _record(vm, SEGMENT_2, big, source="capture")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
+    assert _resync(laptop, client).downloads == [(SEGMENT_2, len(big))]
+
+    # One byte to spare after the download is short of any reserve on a lake with a sealed day.
+    message = _refused(laptop, client, free=len(big) + 1)
+
+    assert "journal reserve" in message
+
+
+def test_free_space_that_cannot_be_read_refuses_in_one_line(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    def unreadable(_root: Path) -> int:
+        raise PermissionError(13, "Permission denied")
+
+    with pytest.raises(ResyncRefused) as refused:
+        resync(
+            laptop,
+            TARGET,
+            client=client,
+            clock=ManualClock(TUESDAY_20),
+            calendar=CALENDAR,
+            job_probe=_idle,
+            geteuid=lambda: OWNER,
+            free_space=unreadable,
+        )
+
+    message = str(refused.value)
+    assert "\n" not in message
+    assert message.startswith(f"reading free space under {laptop} failed (PermissionError")
+
+
+def test_a_file_the_resync_deletes_is_not_named_as_replaced_by_the_next_upload(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    client.store(TARGET.key(BARS_2), b"an object of another size at the same key")
+
+    summary = _resync(laptop, client)
+
+    assert (BARS_2, "the next sweep regenerates it") in summary.deletions
+    assert summary.unrecorded == []
+
+
+def test_a_kept_file_the_buckets_copy_does_not_record_is_named_when_its_object_differs(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # A file no manifest entry names, which the resync leaves where it is.
+    rel = "chains/ticker=QQQ/date=2026-08-25.parquet"
+    (laptop / rel).parent.mkdir(parents=True, exist_ok=True)
+    (laptop / rel).write_bytes(b"never recorded")
+    client.store(TARGET.key(rel), b"an object of another size")
+
+    assert _resync(laptop, client).unrecorded == [rel]
+
+
+def test_the_rewrite_flushes_the_cut_before_the_append_and_the_append_after(tmp_path, monkeypatch):
+    import os
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+    events: list[str] = []
+    real = {name: getattr(os, name) for name in ("ftruncate", "write")}
+    real_flush = bucket._flush_fd
+
+    def spy(name: str):
+        def call(*args):
+            events.append(name)
+            return real[name](*args)
+
+        return call
+
+    def flush(fd: int) -> None:
+        events.append("flush")
+        real_flush(fd)
+
+    for name in real:
+        monkeypatch.setattr(bucket.os, name, spy(name))
+    monkeypatch.setattr(bucket, "_flush_fd", flush)
+    bucket._rewrite_manifest(laptop, _keep(expected), expected[_keep(expected) :], expected)
+    monkeypatch.undo()
+
+    assert events == ["ftruncate", "flush", "write", "flush"]
+
+
+def test_the_rewrite_finishes_a_short_write(tmp_path, monkeypatch):
+    import os
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+    real_write = os.write
+    monkeypatch.setattr(bucket.os, "write", lambda fd, data: real_write(fd, bytes(data[:7])))
+
+    bucket._rewrite_manifest(laptop, _keep(expected), expected[_keep(expected) :], expected)
+    monkeypatch.undo()
+
+    assert manifest_path(laptop).read_bytes() == expected
+
+
+def test_a_rewrite_that_does_not_read_back_as_the_bucket_copy_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    expected = client.body(MANIFEST_KEY)
+
+    with pytest.raises(ResyncRefused) as refused:
+        bucket._rewrite_manifest(
+            laptop, _keep(expected), expected[_keep(expected) :], expected + b"x"
+        )
+
+    assert "does not read back as the bucket's manifest.jsonl" in str(refused.value)
+
+
+def test_a_lake_root_with_an_empty_manifest_refuses(tmp_path):
+    _, client = _laptop(tmp_path)
+    client.calls.clear()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    manifest_path(empty).write_bytes(b"")
+
+    message = _refused(empty, client)
+
+    assert "holds no manifest.jsonl, or an empty one" in message
+    assert client.calls == []
+
+
+def test_apply_on_a_lake_the_bucket_copy_is_a_prefix_of_changes_nothing(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    _laptop_sweep(laptop)
+    before = _snapshot(laptop)
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.level
+    assert not summary.applied
+    assert _snapshot(laptop) == before
+
+
+def test_the_temp_sweep_and_the_commit_each_run_under_the_lake_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    events: list[str] = []
+    real_lock, real_temps, real_rewrite = (
+        bucket.lake_lock,
+        bucket._leftover_temps,
+        bucket._rewrite_manifest,
+    )
+
+    @contextmanager
+    def lock(*args, **kwargs):
+        with real_lock(*args, **kwargs):
+            events.append("lock")
+            try:
+                yield
+            finally:
+                events.append("unlock")
+
+    def temps(path: Path) -> list[Path]:
+        events.append("temps")
+        return real_temps(path)
+
+    def rewrite(*args) -> None:
+        events.append("rewrite")
+        real_rewrite(*args)
+
+    monkeypatch.setattr(bucket, "lake_lock", lock)
+    monkeypatch.setattr(bucket, "_leftover_temps", temps)
+    monkeypatch.setattr(bucket, "_rewrite_manifest", rewrite)
+
+    assert _resync(laptop, client, apply=True).applied
+
+    assert events == ["lock", "temps", "temps", "temps", "unlock", "lock", "rewrite", "unlock"]
+
+
+def test_a_job_that_starts_after_the_first_download_stops_the_rest(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    fetched: list[str] = []
+
+    message = _refused(
+        laptop, _HookedS3(client, fetched.append), apply=True, probe=lambda _label: bool(fetched)
+    )
+
+    assert "is executing" in message
+    assert len(fetched) == 1
+    assert _strays(laptop) == []
+
+
+def test_a_download_the_bucket_deleted_after_its_head_refuses_and_keeps_no_temp(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+
+    def vanish(key: str) -> None:
+        client.objects.pop(key, None)
+
+    message = _refused(laptop, _HookedS3(client, vanish), apply=True)
+
+    assert "holds no current version" in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_download_the_bucket_refuses_raises_for_main_and_keeps_no_temp(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    def deny(_key: str) -> None:
+        raise client_error("AccessDenied", "GetObject", 403)
+
+    with pytest.raises(Exception) as raised:
+        _resync(laptop, _HookedS3(client, deny), apply=True)
+
+    assert not isinstance(raised.value, ResyncRefused)
+    assert bucket._one_line(raised.value, TARGET) is not None
+    assert _strays(laptop) == []
+
+
+def test_a_download_that_cannot_be_written_refuses_in_one_line(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    directory = (laptop / SPY_2).parent
+    directory.chmod(0o555)
+    try:
+        message = _refused(laptop, client, apply=True)
+    finally:
+        directory.chmod(0o755)
+
+    assert message.startswith(f"writing {SPY_2}.tmp-")
+    assert message.endswith("so the resync changed nothing")
+
+
+def test_a_commit_that_cannot_delete_refuses_in_one_line_and_a_rerun_finishes(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    lake_raw = manifest_path(laptop).read_bytes()
+    directory = (laptop / BARS_2).parent
+    directory.chmod(0o555)
+    try:
+        message = _refused(laptop, client, apply=True)
+    finally:
+        directory.chmod(0o755)
+
+    assert message.startswith(f"committing the resync under {laptop} failed")
+    assert manifest_path(laptop).read_bytes() == lake_raw
+    assert _resync(laptop, client, apply=True).applied
+    assert manifest_path(laptop).read_bytes() == client.body(MANIFEST_KEY)
+
+
+def test_a_manifest_that_cannot_be_read_at_the_commit_refuses_in_one_line(tmp_path, monkeypatch):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    manifest = manifest_path(laptop)
+    real = Path.read_bytes
+    fetched: list[str] = []
+
+    def read_bytes(self: Path) -> bytes:
+        if fetched and self == manifest:
+            raise OSError(5, "Input/output error")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    message = _refused(laptop, _HookedS3(client, fetched.append), apply=True)
+
+    assert message.startswith(f"reading {manifest} failed (OSError: Input/output error)")
+
+
+def test_a_copy_without_a_checksum_that_grows_during_the_downloads_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    client.store(MANIFEST_KEY, client.body(MANIFEST_KEY), checksum=None)
+    before = _snapshot(laptop)
+
+    def upload(_key: str) -> None:
+        if not client.body(MANIFEST_KEY).endswith(b"late\n"):
+            client.store(MANIFEST_KEY, client.body(MANIFEST_KEY) + b"late\n", checksum=None)
+
+    message = _refused(laptop, _HookedS3(client, upload), apply=True)
+
+    assert "the bucket's manifest.jsonl changed while the resync downloaded" in message
+    assert _snapshot(laptop) == before
+
+
+def test_a_copy_replaced_by_other_bytes_of_its_length_during_the_downloads_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+    original = client.body(MANIFEST_KEY)
+    other = original[:-2] + bytes([original[-2] ^ 1]) + b"\n"
+
+    def upload(_key: str) -> None:
+        if client.body(MANIFEST_KEY) != other:
+            client.store(MANIFEST_KEY, other)
+
+    message = _refused(laptop, _HookedS3(client, upload), apply=True)
+
+    assert "the bucket's manifest.jsonl changed while the resync downloaded" in message
+    assert _snapshot(laptop) == before
+
+
+def test_apply_flushes_each_download_and_each_directory_it_changes(tmp_path, monkeypatch):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    flushed: list[str] = []
+    real_directory, real_file = bucket._fsync_path, bucket._flush_file
+
+    def spy(real):
+        def call(path: Path) -> None:
+            flushed.append(Path(path).relative_to(laptop).as_posix())
+            real(path)
+
+        return call
+
+    monkeypatch.setattr(bucket, "_fsync_path", spy(real_directory))
+    monkeypatch.setattr(bucket, "_flush_file", spy(real_file))
+
+    assert _resync(laptop, client, apply=True).applied
+
+    temps = sorted(rel.split(".tmp-")[0] for rel in flushed if ".tmp-" in rel)
+    assert temps == sorted([SPY_2, QUARANTINE, QUOTES_2])
+    directories = [rel for rel in flushed if ".tmp-" not in rel]
+    assert directories == [
+        Path(SPY_2).parent.as_posix(),
+        ".",
+        Path(QUOTES_2).parent.as_posix(),
+        Path(BARS_2).parent.as_posix(),
+    ]
+
+
+def test_a_run_at_the_session_bound_itself_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+
+    message = _refused(laptop, client, now=datetime.fromisoformat(WEDNESDAY_BOUND))
+
+    assert "ahead of the next session's capture start" in message
+
+
+def test_the_command_prints_one_line_when_there_is_nothing_to_do(tmp_path, monkeypatch, capsys):
+    laptop, client = _laptop(tmp_path)
+    config = _config(tmp_path, laptop)
+
+    assert _main(config, client, monkeypatch) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "resync: nothing to do, the bucket's manifest.jsonl is this lake's or a prefix of it: "
+        f"{TARGET}"
+    ]
+
+
+def test_a_roster_refusal_after_the_commit_prints_a_warning_and_exits_0(
+    tmp_path, monkeypatch, capsys
+):
+    from lake import roster, tickers
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    config = _config(tmp_path, laptop)
+
+    def refuse(*args, **kwargs):
+        raise roster.RosterError("the spans disagree\nwith the roster")
+
+    monkeypatch.setattr(roster, "check_lake", refuse)
+    monkeypatch.setattr(tickers, "load_tickers", lambda *args, **kwargs: [])
+
+    assert _main(config, client, monkeypatch, "--apply") == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert "resync: warning: the spans disagree with the roster" in out
+
+
+def test_the_command_reports_the_schema_version_check_by_its_verdict(tmp_path, monkeypatch, capsys):
+    from lake.schema_versions import check_running_version
+
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    config = _config(tmp_path, laptop)
+
+    assert _main(config, client, monkeypatch, "--apply") == 0
+
+    out = capsys.readouterr().out.splitlines()
+    version = check_running_version(laptop)
+    expected = (
+        f"resync: schema version {version.version} is recorded in the lake"
+        if version.ok
+        else f"resync: warning: schema version: {version.summary}"
+    )
+    assert expected in out
