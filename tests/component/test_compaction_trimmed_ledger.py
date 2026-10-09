@@ -140,6 +140,41 @@ def test_a_stale_entry_behind_the_watermark_is_re_recorded_after_the_seal(lake_r
     assert "  ledger   re-recorded the trimmed ledger's manifest entry" in result.render()
 
 
+def test_the_repair_runs_after_the_re_tune_and_before_the_upload(lake_root, monkeypatch):
+    """Mutation this catches: moving the repair to between the seal loop and the re-tune,
+    which keeps its manifest line after the seal's and so passes the test above.
+    """
+    _lake(lake_root)
+    _append(lake_root)
+    client = _seed(lake_root)
+    with trimmed_path(lake_root).open("a") as ledger:
+        ledger.write(json.dumps(_line(lake_root)) + "\n")
+    _tonight(lake_root)
+    events: list[str] = []
+    real_retune = compact_module._retune
+    real_repair = compact_module._repair_trimmed_ledger
+
+    def retune(*args, **kwargs):
+        events.append("retune")
+        return real_retune(*args, **kwargs)
+
+    def repair(*args, **kwargs):
+        events.append("repair")
+        return real_repair(*args, **kwargs)
+
+    monkeypatch.setattr(compact_module, "_retune", retune)
+    monkeypatch.setattr(compact_module, "_repair_trimmed_ledger", repair)
+    publisher, _ = _paging(lake_root)
+
+    result = _job(lake_root, client, events, publisher)
+
+    assert result.retune is not None
+    assert result.ledger_repair == LedgerRepair(rerecorded=True)
+    assert events[:2] == ["retune", "repair"]
+    assert events[2].startswith("put ")
+    assert events[-1] == "ping"
+
+
 def test_a_torn_tail_past_the_watermark_pages_and_the_upload_withholds_the_ping(lake_root):
     _lake(lake_root)
     client = _seed(lake_root)
