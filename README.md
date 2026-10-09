@@ -343,35 +343,46 @@ The restore, command 3, and the resync, command 5, run on either.
    copy. A version that does not match is repaired by "Putting a version back for the range
    restore" below, and a refusal for a trimmed partition names the version its trim line
    recorded.
-5. `uv run python -m lake.bucket resync --target s3://example-lake-backup/lake` brings
-   this lake level with the bucket on a host about to become primary again, after the other
-   host was primary ([#832](https://github.com/l3a0/marketlake/issues/832)). It reads the
+5. `uv run python -m lake.bucket resync --target s3://example-lake-backup/lake` brings this
+   lake level with the bucket on a host about to become primary again, after the other host
+   was primary ([#832](https://github.com/l3a0/marketlake/issues/832)). It reads the
    bucket's `manifest.jsonl` and finds the entries both copies share. Past them, the
-   bucket's copy holds the other host's sessions, and this lake holds what its own sweep and
-   battery wrote while it was the shadow. It plans to download each file the bucket's
-   entries name that this lake lacks or holds with other bytes, and to drop this lake's own
-   entries. It prints one line per download and per deletion, then a last line counting
-   them and naming the time the run must stop by. It sends no write to the bucket, so it
-   runs under either role. It refuses with exit 2 when this lake's own `manifest.jsonl` is
-   empty or missing, which is what a wrong `lake_root` looks like, when the bucket holds no
-   `manifest.jsonl`, when run as root, on Sunday from 19:55 to 23:30, and inside a session
-   or within 30 minutes of its open. It also refuses when the two copies differ only by a
-   hand repair, which `first-upload` is for, and when the bucket's current version of a
-   file is newer than its `manifest.jsonl` names, which the other host's unfinished upload
-   leaves. It refuses, too, when this lake's own entries hold something the bucket's copy
-   would lose: a chains or quotes partition or a journal segment the bucket does not hold,
-   an `onboard`, `retire` or `seed_spans` change to the capture spans, a quarantine
-   sign-off, or any other file the bucket does not record. Move such a file out of the
+   bucket's copy holds the other host's sessions, and this lake holds what it captured,
+   compacted, swept and judged with the battery while it was the shadow. It plans to
+   download each file the bucket's entries name that this lake lacks or holds with other
+   bytes, and to drop this lake's own entries. It prints one line per download and per
+   deletion, then a last line counting them and naming the time the run must stop by. It
+   sends no write to the bucket, so it runs under either role. It refuses with exit 2 when
+   this lake's own `manifest.jsonl` is empty or missing, which is what a wrong `lake_root`
+   looks like, when the bucket holds no `manifest.jsonl`, when run as root, on Sunday from
+   19:55 to 23:30, and inside a session or within 30 minutes of its open. It refuses when
+   either `manifest.jsonl` holds a line that is not a whole entry, other than a torn last
+   line, and names that line for a repair by hand. It also refuses when the two copies
+   differ only by a hand repair, which `first-upload` is for, when they share no whole line,
+   since the rewrite would empty this lake's `manifest.jsonl` before writing the bucket's,
+   and when the bucket's current version of a file is newer than its `manifest.jsonl` names,
+   which the other host's unfinished upload leaves. It refuses, too, when this lake holds a
+   file the bucket's copy would lose or leave unrecorded. That covers a chains or quotes
+   partition or a journal segment the bucket does not hold, and any other file only this
+   lake's own entries name, whatever bytes it holds now, except the covered segments and
+   `bars/` partitions it deletes. It covers a partition the bucket's `trimmed.jsonl` says
+   was removed on purpose while this lake still holds a file there. It also covers an
+   `onboard`, `retire` or `seed_spans` change to the capture spans and a quarantine
+   sign-off, while the file still holds this lake's own version. Move such a file out of the
    lake by hand, or redo the decision on the new primary after the switch, then run it
-   again. Run it again with `--apply` to carry the plan out, as the owner and not under
-   `sudo`, with the daemon stopped. It refuses while the daemon, the 18:30 sweep or the
-   Sunday job is executing. It downloads each file beside its target with the lake-root
-   lock released, then takes the lock to move the files in, delete the planned files, and
-   rewrite `manifest.jsonl` in place to equal the bucket's. A run that stops discards its
-   downloads, and running it again finishes what a crash left. Its last lines are the
-   roster check's verdict, the running schema version's, and, when `backup_target` is not
-   the bucket it read, a line saying so, since that host's next close+15 would not upload
-   there.
+   again. It refuses when a file it would download or delete differs only by case from
+   another path either manifest names, because on macOS the two are one file. It refuses
+   when the volume would be left with less free space than the journal reserve, 13 times the
+   busiest sealed day in the bucket, counted with the downloads in place. Run it again with
+   `--apply` to carry the plan out, as the owner and not under `sudo`, with the daemon
+   stopped. It refuses while the daemon, the 18:30 sweep or the Sunday job is executing, or
+   while `launchctl` or `systemctl` cannot say whether one is. It downloads each file beside
+   its target with the lake-root lock released, then takes the lock to move the files in,
+   delete the planned files, and rewrite `manifest.jsonl` in place to equal the bucket's. A
+   run that stops discards its downloads, and running it again finishes what a crash left.
+   Its last lines are the roster check's verdict, the running schema version's, and, when
+   `backup_target` is not the bucket it read, a line saying so, since that host's next
+   close+15 would not upload there.
 6. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
