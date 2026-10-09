@@ -41,7 +41,7 @@ printf '%s\n' "$@" > "$STATE/argv"
 printf '%s' "$$" > "$STATE/pid"
 pwd > "$STATE/cwd"
 printf '%s' "$PATH" > "$STATE/path"
-echo "${VM_DEPLOY_LINE:-deployed: $2}"
+echo "${VM_DEPLOY_LINE:-deployed: $4}"
 exit "${VM_DEPLOY_RC:-0}"
 """
 
@@ -171,15 +171,39 @@ def test_the_step_runs_vm_deploy_with_the_two_parameters(host, rc):
     assert proc.stdout == line + "\n"
     assert proc.stderr == ""
     assert (host.state / "argv").read_text().splitlines() == [
-        "--sha",
-        SHA,
         "--not-after",
         NOT_AFTER,
+        "--sha",
+        SHA,
     ]
     # exec replaces the step's shell, so the exit code is vm-deploy.sh's own.
     assert (host.state / "pid").read_text() == str(pid)
     assert (host.state / "cwd").read_text() == "/\n"
     assert (host.state / "path").read_text() == host.script_path
+
+
+def test_a_newline_after_the_sha_cuts_off_nothing_the_host_needs(host):
+    """``--sha`` comes last. Were a stray newline ever to follow the substituted sha,
+    the line would still end on it, and ``--not-after`` would not drop into a command of
+    its own while the deploy ran without an expiry."""
+    host.write_step(substituted(sha=SHA + "\n"))
+    proc, _ = host.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (host.state / "argv").read_text().splitlines() == [
+        "--not-after",
+        NOT_AFTER,
+        "--sha",
+        SHA,
+    ]
+
+
+@pytest.mark.parametrize("owner", ["some.one-x", "_svc", "a_b.c-d9"])
+def test_an_owner_with_dots_dashes_and_underscores_is_accepted(host, owner):
+    """The account rule vm-bootstrap.sh applies allows these characters."""
+    host.conf.write_text(f"OWNER={owner}\nLAKE_VOLUME_ID=vol-0fedcba9876543210\n")
+    proc, _ = host.run(FAKE_OWNER=owner)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert host.ran()
 
 
 def test_a_conf_without_a_final_newline_is_read(host):
@@ -258,9 +282,31 @@ def test_a_malformed_conf_is_refused(host, text, reason):
 
 def test_an_owner_with_no_account_is_refused(host):
     proc, _ = host.run(FAKE_OWNER="nobody-else")
-    _refused(proc, host, f"OWNER {OWNER} names no account on this host")
+    _refused(proc, host, "the OWNER in bootstrap.conf names no account on this host")
 
 
 def test_an_account_with_no_home_is_refused(host):
     proc, _ = host.run(FAKE_GETENT_HOME="")
-    _refused(proc, host, f"account {OWNER} has no home directory")
+    _refused(proc, host, "the OWNER in bootstrap.conf has no home directory")
+
+
+@pytest.mark.parametrize(
+    ("text", "env"),
+    [
+        ("OWNER={name}\n", {"FAKE_OWNER": "nobody-else"}),
+        ("OWNER={name}\n", {"FAKE_OWNER": "{name}", "FAKE_GETENT_HOME": ""}),
+        ("OWNER={name}\nOWNER={name}\n", {"FAKE_OWNER": "{name}"}),
+        ("OWNER={name}\nEXTRA={name}\n", {"FAKE_OWNER": "{name}"}),
+        ("OWNER={name}/x\n", {"FAKE_OWNER": "{name}"}),
+    ],
+    ids=["no-account", "no-home", "owner-twice", "unknown-key", "bad-name"],
+)
+def test_a_refusal_never_prints_a_config_value(host, text, env):
+    """send-deploy.sh prints the step's line in a public log, so the line holds only the
+    step's own words, never the owner's name or any other value from the conf."""
+    name = "zq7owner-sentinel"
+    host.conf.write_text(text.format(name=name))
+    proc, _ = host.run(**{key: value.format(name=name) for key, value in env.items()})
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("not deployed: ")
+    assert name not in proc.stdout + proc.stderr

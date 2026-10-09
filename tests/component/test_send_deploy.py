@@ -318,6 +318,119 @@ def test_anything_else_is_outcome_unknown(runner, invocation, last):
     _assert_reported(runner, result, 1, UNKNOWN, status, code)
 
 
+# Each row of the host's table, under the code it pairs with, so in the near misses below
+# only the row's pattern can refuse the line.
+_ROWS = {
+    "deployed": ("Success:0", f"deployed: {SHA}"),
+    "already-current": ("Success:0", f"deployed: {SHA} (already current)"),
+    "failed-step": ("Failed:1", f"deployed: {SHA}, with a failed step in deploy.log"),
+    "dashboard": ("Failed:1", f"deployed: {SHA}, but the dashboard did not restart"),
+    "rolled-back": ("Failed:1", f"rolled back to {OTHER}: the daemon did not hold"),
+    "rollback-failed": ("Failed:1", f"rollback to {OTHER} failed: the bootstrap exited 1"),
+    "not-restarted": (
+        "Failed:1",
+        f"not restarted: the tree is at {SHA}, and the last recorded deploy is {OTHER}",
+    ),
+    "not-restarted-none": (
+        "Failed:1",
+        f"not restarted: the tree is at {SHA}, and the last recorded deploy is none",
+    ),
+    "not-deployed": ("Failed:2", "not deployed: the daemon is not active"),
+    "unknown": ("Failed:1", "outcome unknown: read deploy.log"),
+}
+
+# A row whose last part is a reason, which is any text, has no suffix that breaks it, but
+# its reason must hold at least one character.
+_REASON_ENDS = {
+    "rolled-back": f"rolled back to {OTHER}: ",
+    "rollback-failed": f"rollback to {OTHER} failed: ",
+    "not-deployed": "not deployed: ",
+}
+
+_NEAR_MISSES = [
+    *[(f"{name}-prefixed", inv, f"note: {line}") for name, (inv, line) in _ROWS.items()],
+    *[
+        (f"{name}-suffixed", inv, f"{line}!")
+        for name, (inv, line) in _ROWS.items()
+        if name not in _REASON_ENDS
+    ],
+    *[
+        (f"{name}-41-hex-{sha[:2]}", inv, line.replace(sha, sha + "0"))
+        for name, (inv, line) in _ROWS.items()
+        for sha in (SHA, OTHER)
+        if sha in line
+    ],
+    *[(f"{name}-empty-reason", _ROWS[name][0], end) for name, end in _REASON_ENDS.items()],
+]
+
+
+def test_every_row_has_each_kind_of_near_miss():
+    ids = {case[0] for case in _NEAR_MISSES}
+    for name, (_, line) in _ROWS.items():
+        assert f"{name}-prefixed" in ids, name
+        assert f"{name}-suffixed" in ids or f"{name}-empty-reason" in ids, name
+        if SHA in line or OTHER in line:
+            assert any(i.startswith(f"{name}-41-hex-") for i in ids), name
+
+
+@pytest.mark.parametrize(
+    ("invocation", "last"),
+    [case[1:] for case in _NEAR_MISSES],
+    ids=[case[0] for case in _NEAR_MISSES],
+)
+def test_a_line_that_only_resembles_a_row_is_outcome_unknown(runner, invocation, last):
+    runner.host_says(last)
+    result = runner.run(INVOCATIONS=invocation)
+    status, code = invocation.split(":")
+    _assert_reported(runner, result, 1, UNKNOWN, status, code)
+
+
+@pytest.mark.parametrize(
+    ("invocation", "last"),
+    [
+        # Exit 0 comes only with a deployed line for the requested sha, as the host's
+        # wrapper prints it.
+        ("Success:0", f"deployed: {OTHER}"),
+        ("Success:0", f"deployed: {OTHER} (already current)"),
+        *[("Success:0", line) for inv, line in _ROWS.values() if inv != "Success:0"],
+        # That line comes only with exit 0, whichever sha it names.
+        *[("Failed:1", line) for inv, line in _ROWS.values() if inv == "Success:0"],
+        ("Failed:1", f"deployed: {OTHER}"),
+        ("Failed:1", f"deployed: {OTHER} (already current)"),
+        # Exits 2 and 3 come only with a not deployed line.
+        *[
+            (f"Failed:{code}", line)
+            for code in (2, 3)
+            for _, line in _ROWS.values()
+            if not line.startswith("not deployed: ")
+        ],
+    ],
+)
+def test_a_host_line_under_a_code_its_row_never_exits_with_is_outcome_unknown(
+    runner, invocation, last
+):
+    runner.host_says(last)
+    result = runner.run(INVOCATIONS=invocation)
+    status, code = invocation.split(":")
+    _assert_reported(runner, result, 1, UNKNOWN, status, code)
+
+
+@pytest.mark.parametrize(
+    "invocation", ["Cancelled:2", "Cancelled:1", "ExecutionTimedOut:1", "Undeliverable:3"]
+)
+def test_a_host_line_counts_only_under_failed(runner, invocation):
+    """Only a Failed status carries the host's exit, whatever the output ends on."""
+    runner.host_says("not deployed: the daemon is not active")
+    result = runner.run(INVOCATIONS=invocation)
+    status, code = invocation.split(":")
+    _assert_reported(runner, result, 1, UNKNOWN, status, code)
+
+
+def test_a_code_with_trailing_text_is_unreadable(runner):
+    result = runner.run(INVOCATIONS=f"Failed:1{SENTINEL}")
+    _assert_reported(runner, result, 1, UNKNOWN, "Failed", "unreadable")
+
+
 def test_a_reply_that_is_neither_a_status_nor_a_code_prints_neither(runner):
     result = runner.run(INVOCATIONS=f"{SENTINEL}:{SENTINEL}")
     _assert_reported(runner, result, 1, UNKNOWN, "unreadable", "unreadable")
@@ -395,10 +508,13 @@ def test_the_send_names_the_instance_the_document_and_the_window(runner):
         "--timeout-seconds 600 --query Command.CommandId --output text"
     )
     assert "--targets" not in calls[1]
-    for call in calls[2:]:
-        assert call.startswith(
-            f"aws ssm get-command-invocation --command-id {COMMAND_ID} --instance-id {INSTANCE} "
-        ), call
+    # Both reads ask for text. The fake answers whatever the query and the format, so
+    # only the argv shows them.
+    read = f"aws ssm get-command-invocation --command-id {COMMAND_ID} --instance-id {INSTANCE} "
+    assert calls[2:] == [
+        read + "--query [StatusDetails,ResponseCode] --output text",
+        read + "--query StandardOutputContent --output text",
+    ]
     assert (
         result.stdout.splitlines()[0]
         == f"send-deploy: sent {SHA} to the VM, and waiting for it to end"
@@ -479,6 +595,7 @@ def test_a_sha_that_is_not_a_commit_sends_nothing(runner, sha):
     assert result.returncode == 1
     assert _summary(result) == "not sent: GITHUB_SHA is not a 40-digit commit"
     assert runner.calls("aws") == []
+    assert runner.summary.read_text().startswith("### Deploy of invalid\n\n")
 
 
 @pytest.mark.parametrize("name", ["DEPLOY_DOCUMENT", "DEPLOY_TAG_KEY", "DEPLOY_TAG_VALUE"])
@@ -495,4 +612,5 @@ def test_no_summary_file_still_prints_the_summary(runner):
         ["/bin/bash", str(SEND)], env=env, capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
     assert re.search(rf"^send-deploy: deployed: {SHA}$", result.stdout, re.MULTILINE)

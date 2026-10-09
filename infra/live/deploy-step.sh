@@ -12,7 +12,8 @@
 # It finds the checkout the way the user-data shim made it: the owner from
 # /etc/marketlake/bootstrap.conf, read line by line and never sourced, then the owner's
 # home from getent. Any refusal here prints one line on stdout and exits 2, which
-# deploy/send-deploy.sh reports as the host's line. A checkout without vm-deploy.sh makes
+# deploy/send-deploy.sh reports as the host's line. That line lands in a public log, so
+# it holds only this script's own words and never a value read from the conf. A checkout without vm-deploy.sh makes
 # the exec below exit 127, which send-deploy.sh reports as a VM that needs the manual
 # first deploy. docs/design.md's "Infrastructure, defined" carries the reasoning.
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -57,12 +58,14 @@ entry="$(getent passwd "$owner")" || entry=""
 # getent resolves a uid as well as a name, so the entry must start with the name.
 case "$entry" in
   "$owner":*) ;;
-  *) not_deployed "OWNER $owner names no account on this host" ;;
+  *) not_deployed "the OWNER in bootstrap.conf names no account on this host" ;;
 esac
 home="$(printf '%s\n' "$entry" | cut -d: -f6)"
 if [ -z "$home" ]; then
-  not_deployed "account $owner has no home directory"
+  not_deployed "the OWNER in bootstrap.conf has no home directory"
 fi
 
+# The sha goes last, so a stray newline after it would cut off nothing. Were --not-after
+# last, a newline after the sha would start a deploy with no expiry.
 # shellcheck disable=SC1083 # the agent replaces both placeholders before the step runs
-exec "$home/marketlake/deploy/vm-deploy.sh" --sha {{ sha }} --not-after {{ notAfter }}
+exec "$home/marketlake/deploy/vm-deploy.sh" --not-after {{ notAfter }} --sha {{ sha }}

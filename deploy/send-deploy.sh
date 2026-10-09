@@ -31,7 +31,8 @@
 # /var/lib/marketlake/deploy.log on the VM.
 #
 # It exits with the host's code, 0 to 3, only when the output ends on a line from the
-# host's table, and with 1 otherwise. A stale run, whose commit main has moved past, is
+# host's table and the code is one that line comes with, and with 1 otherwise. So exit 0
+# needs a deployed line naming GITHUB_SHA. A stale run, whose commit main has moved past, is
 # the workflow's to skip, not this script's.
 #
 # Written for bash 3.2 as well as a current bash, because the test suite runs it on a Mac.
@@ -159,19 +160,25 @@ done
 
 # -- 4. the outcome -----------------------------------------------------------------
 
-# One pattern per row of the host's table of last lines. A <sha> is 40 hex digits, and a
-# <reason> is any text.
+# One pattern per row of the host's table of last lines, and beside it the exit codes
+# that row comes with. A <sha> is 40 hex digits, and a <reason> is any text. Exit 0 comes
+# only with a deployed line for the sha this run sent, bare or already current, and the
+# host prints that line with no other code. Exits 2 and 3 come only with not deployed.
 SHA_RE='[0-9a-f]{40}'
+SUFFIXES=", with a failed step in deploy\\.log(, but the dashboard did not restart)?|, but the dashboard did not restart"
 HOST_LINES=(
-  "^deployed: $SHA_RE( \\(already current\\))?(, with a failed step in deploy\\.log)?(, but the dashboard did not restart)?\$"
+  "^deployed: $SHA( \\(already current\\))?\$"
+  "^deployed: $SHA_RE( \\(already current\\))?($SUFFIXES)\$"
   "^rolled back to $SHA_RE: .+\$"
   "^rollback to $SHA_RE failed: .+\$"
   "^not restarted: the tree is at $SHA_RE, and the last recorded deploy is ($SHA_RE|none)\$"
   "^not deployed: .+\$"
   "^outcome unknown: read deploy\\.log\$"
 )
+HOST_CODES=("0" "1" "1" "1" "1" "1 2 3" "1")
 
 HOST_LINE=""
+LINE_CODES=""
 if output="$(aws ssm get-command-invocation \
   --command-id "$COMMAND_ID" --instance-id "$INSTANCE" \
   --query StandardOutputContent --output text 2> "$WORK/err")"; then
@@ -182,20 +189,21 @@ if output="$(aws ssm get-command-invocation \
       last="$line"
     fi
   done <<< "$output"
-  for pattern in "${HOST_LINES[@]}"; do
+  for i in "${!HOST_LINES[@]}"; do
+    pattern="${HOST_LINES[$i]}"
     if [[ "$last" =~ $pattern ]]; then
       HOST_LINE="$last"
+      LINE_CODES="${HOST_CODES[$i]}"
       break
     fi
   done
 fi
 
-if [[ "$STATUS" == Success && "$CODE" == 0 && -n "$HOST_LINE" ]]; then
-  finish 0 "$HOST_LINE"
-fi
-if [[ "$STATUS" == Failed && -n "$HOST_LINE" ]]; then
-  case "$CODE" in
-    1 | 2 | 3) finish "$CODE" "$HOST_LINE" ;;
+# The host's line counts only beside the status and code it exits with. Any other pairing
+# falls through to the rows below, and from there to outcome unknown.
+if [[ -n "$HOST_LINE" && " $LINE_CODES " == *" $CODE "* ]]; then
+  case "$STATUS:$CODE" in
+    Success:0 | Failed:1 | Failed:2 | Failed:3) finish "$CODE" "$HOST_LINE" ;;
   esac
 fi
 if [[ "$STATUS" == Failed && "$CODE" == 127 ]]; then

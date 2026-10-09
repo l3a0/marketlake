@@ -1,6 +1,6 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and sixteen things are not in one.
+``tofu test`` sees one configuration's plan, and seventeen things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
@@ -54,6 +54,9 @@
 16. The shim template's variables. A third one could carry a value into ``user_data``,
     which anyone who can describe the instance reads, and the plan shows only the
     rendered text.
+17. Each bootstrap role's ``depends_on`` on GitHub's OIDC provider. The trust names the
+    provider by a string, so nothing else orders the role after the provider on a first
+    apply, and a plan shows no ordering.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -405,6 +408,15 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     assert plan_effects and set(plan_effects) == {"Deny"}
     deploy_effects = [statement["Effect"] for statement in inline["deploy"][0]]
     assert deploy_effects and set(deploy_effects) == {"Allow"}
+
+
+@pytest.mark.parametrize("role", ["apply", "deploy", "plan"])
+def test_bootstrap_role_waits_for_the_oidc_provider(role: str) -> None:
+    """Each trust names the provider through a string built from the account id, not a
+    reference, so only ``depends_on`` orders the role after the provider on a first
+    apply into a fresh account. A plan shows no ordering."""
+    body = _resources("bootstrap")[f"aws_iam_role.{role}"]
+    assert body.get("depends_on") == ["${aws_iam_openid_connect_provider.github}"], body
 
 
 def test_apply_role_writes_exactly_the_live_state_and_its_lock() -> None:

@@ -751,9 +751,9 @@ run "deploy_document_runs_only_vm_deploy" {
       for line in split("\n", jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0]) :
       line if strcontains(line, "{{")
       ] == [
-      "exec \"$home/marketlake/deploy/vm-deploy.sh\" --sha {{ sha }} --not-after {{ notAfter }}",
+      "exec \"$home/marketlake/deploy/vm-deploy.sh\" --not-after {{ notAfter }} --sha {{ sha }}",
     ]
-    error_message = "The deploy step does not run exactly deploy/vm-deploy.sh with --sha and --not-after."
+    error_message = "The deploy step does not run exactly deploy/vm-deploy.sh with --not-after and then --sha."
   }
 
   assert {

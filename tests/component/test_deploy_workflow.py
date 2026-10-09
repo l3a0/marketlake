@@ -26,6 +26,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,23 @@ def test_the_credentials_stay_masked_and_last_the_job() -> None:
     }
     # The job's timeout must fit inside the session.
     assert _job()["timeout-minutes"] * 60 <= step["with"]["role-duration-seconds"]
+
+
+def test_the_checkout_keeps_no_token() -> None:
+    """The head check reads ``main`` anonymously, so the checkout leaves no token in
+    ``.git/config`` for a later step to find."""
+    assert _uses("actions/checkout")["with"] == {"persist-credentials": False}
+
+
+def test_the_region_is_the_one_the_deploy_role_names() -> None:
+    region = _workflow()["env"]["AWS_REGION"]
+    regions = {
+        resource.split(":")[3]
+        for statement in _deploy_statements()
+        for resource in statement["Resource"]
+        if resource != "*"
+    }
+    assert regions == {region}
 
 
 def test_no_script_interpolates_an_expression() -> None:
@@ -263,6 +281,73 @@ def test_the_head_check_skips_only_a_superseded_commit(
         assert summary.read_text().startswith(f"Skipped: main has moved past {_SHA}")
     else:
         assert summary.read_text() == ""
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    ).stdout.strip()
+
+
+def test_the_head_check_reads_main_and_not_a_branch_whose_name_ends_like_it(
+    tmp_path: Path,
+) -> None:
+    """``git ls-remote origin refs/heads/main`` matches the ref's tail, so it also lists
+    branches named ``a/refs/heads/main`` and ``z/refs/heads/main``, which sort before and
+    after it. The step must take the line for ``refs/heads/main`` itself, neither the
+    first nor the last. Real git, against a bare repository on disk."""
+    source = tmp_path / "source"
+    _git(tmp_path, "init", "-q", str(source))
+    _git(source, "commit", "-q", "--allow-empty", "-m", "older")
+    older = _git(source, "rev-parse", "HEAD")
+    _git(source, "commit", "-q", "--allow-empty", "-m", "newer")
+    newer = _git(source, "rev-parse", "HEAD")
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    _git(source, "push", "-q", str(origin), f"{newer}:refs/heads/main")
+    _git(source, "push", "-q", str(origin), f"{older}:refs/heads/a/refs/heads/main")
+    _git(source, "push", "-q", str(origin), f"{older}:refs/heads/z/refs/heads/main")
+    work = tmp_path / "work"
+    _git(tmp_path, "init", "-q", str(work))
+    _git(work, "remote", "add", "origin", str(origin))
+    listed = _git(work, "ls-remote", "origin", "refs/heads/main").splitlines()
+    assert [line.split()[1] for line in listed] == [
+        "refs/heads/a/refs/heads/main",
+        "refs/heads/main",
+        "refs/heads/z/refs/heads/main",
+    ]
+
+    step = _step("Check that main still points at this commit")
+    git = shutil.which("git")
+    assert git
+    git_dir = Path(git).parent
+    for sha, state in ((newer, "fresh"), (older, "stale")):
+        output = work / "output"
+        output.write_text("")
+        (work / "summary").write_text("")
+        script = work / "step.sh"
+        script.write_text(step["run"])
+        result = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+            env={
+                "PATH": f"{git_dir}:/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GITHUB_SHA": sha,
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(work / "summary"),
+            },
+            cwd=work,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert output.read_text() == f"state={state}\n", sha
 
 
 # -- the workflow against the configurations -------------------------------------------

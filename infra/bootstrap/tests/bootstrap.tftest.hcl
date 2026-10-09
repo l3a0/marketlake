@@ -470,7 +470,7 @@ run "state_bucket_and_oidc_provider" {
 
   assert {
     condition     = aws_iam_openid_connect_provider.github.url == "https://token.actions.githubusercontent.com"
-    error_message = "The OIDC provider is not GitHub's, so neither role's trust matches a token."
+    error_message = "The OIDC provider is not GitHub's, so no role's trust matches a token."
   }
 }
 
