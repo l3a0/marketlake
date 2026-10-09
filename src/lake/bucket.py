@@ -100,6 +100,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -148,6 +149,7 @@ from lake.control_plane import (
     VENDOR_SWEEP,
     WallClockTime,
 )
+from lake.journal import F_FULLFSYNC
 from lake.lock import lake_lock
 from lake.manifest import (
     _NAMED_PATHS,
@@ -937,11 +939,23 @@ def bucket_divergence(bucket_raw: bytes, lake_raw: bytes) -> Divergence:
     The shared bytes are cut where the two first differ, then back to the last newline
     before that, or to 0 when there is none.
     """
+    return _divergence(bucket_raw, lake_raw, _entries)
+
+
+def _divergence(
+    bucket_raw: bytes, lake_raw: bytes, entries: Callable[[bytes], list[dict]]
+) -> Divergence:
+    """:func:`bucket_divergence`, with the lines of each side read by ``entries``.
+
+    The nightly upload and the first upload read with :func:`_entries`, which steps over a
+    damaged line. The resync reads with :func:`_whole_entries`, which refuses one, so every
+    count and view it prints comes from the one parse it checked.
+    """
     cut = _first_difference(lake_raw, bucket_raw)
     shared_bytes = lake_raw.rfind(b"\n", 0, cut) + 1
-    bucket_tail = _entries(bucket_raw[shared_bytes:])
-    lake_tail = _entries(lake_raw[shared_bytes:])
-    recorded = {_pair(entry) for entry in _entries(lake_raw)}
+    bucket_tail = entries(bucket_raw[shared_bytes:])
+    lake_tail = entries(lake_raw[shared_bytes:])
+    recorded = {_pair(entry) for entry in entries(lake_raw)}
     latest: dict[str, tuple[int, dict]] = {}
     for index, entry in enumerate(bucket_tail):
         latest[entry["partition"]] = (index, entry)
@@ -952,7 +966,7 @@ def bucket_divergence(bucket_raw: bytes, lake_raw: bytes) -> Divergence:
     )
     return Divergence(
         shared_bytes=shared_bytes,
-        shared=len(_entries(lake_raw[:shared_bytes])),
+        shared=len(entries(lake_raw[:shared_bytes])),
         bucket_tail=len(bucket_tail),
         bucket_first=bucket_tail[0]["partition"] if bucket_tail else None,
         lake_tail=len(lake_tail),
@@ -3143,6 +3157,81 @@ def _sha256_stream(path: Path) -> str:
     return digest.hexdigest()
 
 
+class _DamagedLine(Exception):
+    """A manifest line :func:`_whole_entries` cannot read as an entry, by its 1-based number."""
+
+    def __init__(self, number: int) -> None:
+        super().__init__(number)
+        self.number = number
+
+
+def _whole_entries(raw: bytes) -> list[dict]:
+    """Every entry in ``raw``, raising :class:`_DamagedLine` on a line that is not one.
+
+    This is the resync's one parse of both manifests, so the latest entry for each path, both
+    tails and every count come from the same lines. A blank line is skipped. The last line,
+    when no newline ends it and it does not parse, is a write that did not finish, and it is
+    dropped, the rule ``manifest.parse_jsonl`` applies to a torn tail. Any other line must be
+    a JSON object naming a string ``partition``.
+
+    The nightly upload's :func:`_entries` steps over such a line instead, which suits a
+    classifier and not a command that rewrites the lake. ``parse_jsonl`` stops at it, and
+    either rule on one side of the resync would leave an entry counted in one view and missing
+    from another. A fused line would hide the entry torn into it, or the entries after it,
+    and a partition that is a number or ``null`` would reach a string method as a traceback.
+    So the resync refuses and names the line, and the repair is fixing it by hand.
+    """
+    entries: list[dict] = []
+    lines = raw.split(b"\n")
+    for number, line in enumerate(lines, start=1):
+        text = line.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        try:
+            value = json.loads(text)
+        except (ValueError, RecursionError):
+            if number == len(lines):
+                continue
+            raise _DamagedLine(number) from None
+        if not _is_entry(value):
+            raise _DamagedLine(number)
+        entries.append(value)
+    return entries
+
+
+def _flush_fd(fd: int) -> None:
+    """Flush a file's bytes to stable storage, past the drive's own cache where it can.
+
+    On macOS that is ``fcntl(fd, F_FULLFSYNC)``, because plain ``fsync`` stops at the drive
+    cache there, as ``lake.journal`` explains beside ``F_FULLFSYNC``. Elsewhere it is
+    ``os.fsync``. A directory takes plain ``fsync`` through :func:`_fsync_path`, because
+    ``F_FULLFSYNC`` does not apply to a directory.
+    """
+    if F_FULLFSYNC is not None:
+        fcntl.fcntl(fd, F_FULLFSYNC)
+    else:  # pragma: no cover - non-macOS path
+        os.fsync(fd)
+
+
+def _flush_file(path: Path) -> None:
+    """:func:`_flush_fd` on a file named by its path."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        _flush_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _missing_dirs(root: Path, path: Path) -> list[Path]:
+    """Each directory between ``root`` and ``path`` that does not exist yet, deepest last."""
+    missing = [
+        parent
+        for parent in path.parents
+        if parent != root and parent.is_relative_to(root) and not parent.exists()
+    ]
+    return missing[::-1]
+
+
 def _stop_by(now: datetime, *, clock: Clock, calendar: Calendar) -> datetime | None:
     """The first moment a run started at ``now`` must have finished by, or ``None``.
 
@@ -3217,16 +3306,26 @@ def _plan_resync(
             "the bucket's manifest.jsonl changed between its HEAD and its GET, so another host "
             f"may be uploading now. Run the resync again once that upload ends: {target}"
         )
-    try:
-        bucket_entries = parse_jsonl(bucket_raw.decode("utf-8", "replace"))
-        bucket_latest = _latest_by_partition(bucket_entries, Path(MANIFEST_FILE))
-    except ManifestError as exc:
-        raise refuse(f"the bucket's {exc}, so the resync changed nothing: {target}") from None
+
+    # Both manifests are read once, by one rule, and every view below comes from that read.
+    def parsed(raw: bytes, where: str, suffix: str) -> list[dict]:
+        try:
+            return _whole_entries(raw)
+        except _DamagedLine as damaged:
+            raise refuse(
+                f"line {damaged.number} of {where} is not a whole entry naming a partition, so "
+                "the two manifests cannot be compared and the resync changed nothing. Repair "
+                f"that line by hand, then run the resync again{suffix}"
+            ) from None
+
+    bucket_entries = parsed(bucket_raw, "the bucket's manifest.jsonl", f": {target}")
+    parsed(lake_raw, str(manifest_path(root)), "")
     if not bucket_entries:
         raise refuse(
             f"the bucket's manifest.jsonl of {len(bucket_raw)} byte(s) carries no whole entry, "
             f"so --target may name the wrong bucket or prefix: {target}"
         )
+    bucket_latest = {entry["partition"]: entry for entry in bucket_entries}
 
     # Step 3, the classification.
     if lake_raw.startswith(bucket_raw):
@@ -3237,9 +3336,8 @@ def _plan_resync(
         # commit also leaves. Nothing of this lake's own is past the shared bytes, so the
         # resync only appends, and a torn last line of the lake's is cut back first.
         keep = lake_raw.rfind(b"\n") + 1
-        lake_tail: list[dict] = []
     else:
-        split = bucket_divergence(bucket_raw, lake_raw)
+        split = _divergence(bucket_raw, lake_raw, _whole_entries)
         if not split.foreign:
             raise refuse(
                 "the bucket's manifest.jsonl is not a prefix of the lake's and holds no entry "
@@ -3247,9 +3345,19 @@ def _plan_resync(
                 f"it, so the resync changed nothing. Run {FIRST_UPLOAD_COMMAND} by hand: {target}"
             )
         keep = split.shared_bytes
-        lake_tail = _entries(lake_raw[keep:])
-    bucket_tail = _entries(bucket_raw[keep:])
-    summary.shared = len(_entries(lake_raw[:keep]))
+    if keep == 0:
+        # The commit cuts the manifest back to the shared bytes before it appends the
+        # bucket's tail. With none shared, a crash between the two would leave an empty
+        # manifest, which the guard on a wrong lake_root then refuses on every run.
+        raise refuse(
+            "this lake's manifest.jsonl and the bucket's share no whole line, so the resync "
+            "would empty the lake's before writing the bucket's, and a crash between the two "
+            "would leave a manifest no run accepts. The resync changed nothing. Repair the "
+            f"damaged first line by hand, then run the resync again: {target}"
+        )
+    bucket_tail = _whole_entries(bucket_raw[keep:])
+    lake_tail = _whole_entries(lake_raw[keep:])
+    summary.shared = len(_whole_entries(lake_raw[:keep]))
     summary.bucket_tail = len(bucket_tail)
     summary.bucket_first = bucket_tail[0]["partition"] if bucket_tail else None
     summary.lake_tail = len(lake_tail)
@@ -3285,6 +3393,7 @@ def _plan_resync(
 
     downloads: dict[str, str] = {}
     lake_only: list[str] = []
+    trimmed_here: list[str] = []
     for rel in paths:
         entry = bucket_latest.get(rel)
         if entry is None:
@@ -3294,23 +3403,28 @@ def _plan_resync(
         if compacted is not None and compacted in bucket_latest:
             continue
         if is_designed_absence(rel, bucket_latest, trimmed_latest):
+            # The bucket's manifest still names the path, and its trimmed ledger says the
+            # file is gone on purpose. A file left here would sit under an entry for other
+            # bytes, which the scrub reads as a mismatch.
+            if (root / rel).exists():
+                trimmed_here.append(rel)
             continue
         sha = str(entry.get("sha256"))
         if held(rel) != sha:
             downloads[rel] = sha
-    by_case: dict[str, set[str]] = {}
-    for rel in bucket_latest:
-        by_case.setdefault(rel.casefold(), set()).add(rel)
-    clashes = sorted(rel for rel in downloads if len(by_case.get(rel.casefold(), ())) > 1)
-    if clashes:
+    if trimmed_here:
         raise refuse(
-            f"the bucket's manifest.jsonl names {_quoted(clashes)} beside a path that differs "
-            "only by case, and on a filesystem that ignores case one would overwrite the "
-            f"other, so the resync changed nothing: {target}"
+            f"the bucket's {TRIMMED_FILE} says {_quoted(trimmed_here)} was removed on purpose, "
+            "and this lake still holds a file there, which the bucket's manifest.jsonl would "
+            "then describe wrongly, so the resync changed nothing. Move each file out of the "
+            "lake by hand, then run the resync again"
         )
 
-    # Step 5, the refusals on this lake's own tail. Each fires only while the file on disk
-    # still holds that tail's latest sha for its path, so moving the file out is the repair.
+    # Step 5, the refusals on this lake's own tail. A file only this lake's tail names is
+    # deleted when it is on the delete list, and refuses otherwise, whatever its bytes. Left
+    # on disk with no entry, it is an orphan to the scrub, and a segment would be merged
+    # unchecked by the next compaction. A human decision refuses only while the file on disk
+    # still holds that tail's sha for its path, so moving the file out is the repair.
     def holds_mine(rel: str) -> bool:
         return held(rel) == str(lake_latest[rel].get("sha256"))
 
@@ -3330,8 +3444,6 @@ def _plan_resync(
             summary.deletions.append((rel, f"covered by {compacted}"))
         elif rel.split("/", 1)[0] == BARS:
             summary.deletions.append((rel, "the next sweep regenerates it"))
-        elif not holds_mine(rel):
-            continue
         elif parse_partition_rel(rel) is not None or (
             ref is not None and (ref.surface, ref.ticker, ref.day) not in bucket_days
         ):
@@ -3374,6 +3486,22 @@ def _plan_resync(
             f"this lake's own entries past the shared ones rewrote {LEDGER_PARTITION}, and the "
             "bucket's version replaces it. Run python -m lake.schema_versions on the primary "
             "after the switch to record the running version again"
+        )
+
+    # Every file the resync writes or deletes, case-folded, against every path the bucket's
+    # manifest names and every path this lake's own tail names. On a filesystem that ignores
+    # case two of them are one file, so the commit could rename a download in and then
+    # delete it, or overwrite one download with another.
+    by_case: dict[str, set[str]] = {}
+    for rel in set(bucket_latest) | set(lake_latest):
+        by_case.setdefault(rel.casefold(), set()).add(rel)
+    written = set(downloads) | {rel for rel, _ in summary.deletions}
+    clashes = sorted(rel for rel in written if len(by_case[rel.casefold()]) > 1)
+    if clashes:
+        raise refuse(
+            f"the resync would write or delete {_quoted(clashes)} beside a path that differs "
+            "only by case, and on a filesystem that ignores case the two are one file, so the "
+            f"resync changed nothing: {target}"
         )
 
     # Step 7's checks, before the first download: every planned file is in the listing, its
@@ -3442,14 +3570,17 @@ JobProbe = Callable[[str], bool]
 def default_job_probe() -> JobProbe:
     """The host's job probe, chosen when it is asked for so a test can replace the choice.
 
-    On macOS it is ``launchctl_probe``. On systemd it is ``systemctl_executing_probe``, which
-    reads ``ActiveState``, because a timer's ``Type=oneshot`` service reads ``activating``
-    while it runs, which ``systemctl_probe``'s ``is-active`` answers as down.
+    On macOS it is ``launchctl_executing_probe``, and on systemd it is
+    ``systemctl_executing_probe``. Both read a call that failed as a job that may be
+    executing, so the resync refuses rather than guess. The self-check's ``launchctl_probe``
+    reads a failed call as down, which suits an alarm and not a command about to write. The
+    systemd one reads ``ActiveState``, because a timer's ``Type=oneshot`` service reads
+    ``activating`` while it runs, which ``systemctl_probe``'s ``is-active`` answers as down.
     """
     from lake import control_plane
 
     if control_plane.is_macos():
-        return control_plane.launchctl_probe
+        return control_plane.launchctl_executing_probe
     return control_plane.systemctl_executing_probe
 
 
@@ -3459,22 +3590,30 @@ def _rewrite_manifest(root: Path, keep: int, tail: bytes, expected: bytes) -> No
     The file keeps its inode, because ``lake_lock`` is a ``flock`` on a descriptor of this
     file, and a new file renamed over it would let the next locker lock the new inode while
     the holder still locks the old one. So the file is opened ``O_WRONLY | O_APPEND`` without
-    ``O_TRUNC``, truncated to ``keep`` and flushed, then ``tail`` goes in one write and is
-    flushed, and the whole file must then read back as ``expected``. A crash leaves the file
-    as it was or as a byte prefix of ``expected``, and a re-run finishes from either. The
-    lock's own descriptor is never touched, so the lock holds throughout.
+    ``O_TRUNC``, truncated to ``keep`` and flushed, then ``tail`` is written and flushed, and
+    the whole file must then read back as ``expected``. Each flush is :func:`_flush_fd`'s. A
+    crash leaves the file as it was or as a byte prefix of ``expected``, and a re-run finishes
+    from either. ``keep`` is never 0, since the plan refuses a rewind that shares no whole
+    line, so the file is never empty between the two writes. The lock's own descriptor is
+    never touched, so the lock holds throughout.
     """
     path = manifest_path(root)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND)
     try:
         os.ftruncate(fd, keep)
-        os.fsync(fd)
+        _flush_fd(fd)
         view = memoryview(tail)
         while view:
-            # One write in practice. The loop only finishes a short write, which a regular
-            # file returns for nothing this size.
-            view = view[os.write(fd, view) :]
-        os.fsync(fd)
+            # Linux returns a short write at disk full, as ``manifest._append_once`` says, and
+            # the next call then raises the error. ``_append_once`` never writes twice, since
+            # another writer could land between the calls. This caller holds the lake-root
+            # lock, so it finishes the write, and a call that writes nothing raises rather
+            # than loop.
+            written = os.write(fd, view)
+            if written == 0:
+                raise OSError(f"{path}: a write took 0 of the {len(view)} bytes left")
+            view = view[written:]
+        _flush_fd(fd)
     finally:
         os.close(fd)
     if path.read_bytes() != expected:
@@ -3508,36 +3647,46 @@ def resync(
        probe, since it writes nothing and takes no lock, so a classification can be read while
        the daemon is up. The Sunday scrub window, and ``session_bound``.
     2. Read: the bucket's copy B, with the HEAD-then-GET read :func:`_read_bucket_manifest`
-       makes, and the lake's L.
+       makes, and the lake's L. Both are parsed once by :func:`_whole_entries`, and a line in
+       either that is not a whole entry, other than a torn last line, refuses and names its
+       line number and its manifest.
     3. Classify: an absent B, or one with no whole entry, refuses and names the target. B
        equal to L, or a prefix of it, is level and has nothing to do. L a byte prefix of B
-       only appends. Otherwise :func:`bucket_divergence` decides: entries this lake never
-       recorded make a rewind of this lake's own tail, and none make a hand repair, which
-       refuses and names the first upload, since a rewind would revert it.
+       only appends. Otherwise the test :func:`bucket_divergence` applies decides: entries
+       this lake never recorded make a rewind of this lake's own tail, and none make a hand
+       repair, which refuses and names the first upload, since a rewind would revert it. A
+       resync whose two manifests share no whole line refuses, since the commit would empty
+       the lake's manifest before writing B's.
     4. Plan: every path either tail names, aimed at its latest entry in B. A file on disk
        with that sha is skipped, and one that differs or is absent is downloaded. A segment
        whose compacted partition B records is skipped, and so is a designed absence judged
-       against B's own ``trimmed.jsonl``, read by :func:`read_bucket_trimmed`. A path only
-       this lake's tail names is judged in step 5. Every path passes the restore's safety
-       checks first, and a download beside a path B names that differs only by case refuses.
-    5. Refusals on this lake's tail, each only while the file on disk still holds that tail's
-       sha for its path. A chains or quotes partition B does not name, or a journal segment
-       no compacted partition and no segment of B covers, may be the only copy. An entry for
-       the capture spans, or a signoff in the quarantine ledger, is a human decision the
-       bucket's copy would silently replace. A file only this lake records that step 6 does
-       not delete. An entry for the schema-version ledger is a warning instead.
+       against B's own ``trimmed.jsonl``, read by :func:`read_bucket_trimmed`. A designed
+       absence this lake holds a file for refuses. A path only this lake's tail names is
+       judged in step 5. Every path passes the restore's safety checks first.
+    5. Refusals on this lake's tail. A file only this lake's tail names, on disk and outside
+       step 6's list, refuses whatever its bytes: a chains or quotes partition B does not
+       name, or a journal segment no compacted partition and no segment of B covers, may be
+       the only copy, and any other such file is one the resync would leave unrecorded. An
+       entry for the capture spans, or a signoff in the quarantine ledger, is a human
+       decision the bucket's copy would silently replace, and refuses only while the file on
+       disk still holds that tail's sha for its path. An entry for the schema-version ledger
+       is a warning instead. Last, a download or a deletion whose path differs only by case
+       from another path B names or this lake's tail names refuses.
     6. Deletions: a file only this lake's tail names, on disk, goes when it is a journal
-       segment whose compacted partition B records, or a ``bars/`` partition.
+       segment whose compacted partition B records, or a ``bars/`` partition, whatever its
+       bytes.
     7. Checks: every download is in the listing, its stored SHA-256 equals B's entry, and the
        free space left covers the journal reserve. A stored SHA-256 that differs means the
        other host's last upload stopped before its ``manifest.jsonl`` or is still running.
        With ``apply``, stale temp files beside each target are removed under the lock, and
        each file then downloads unlocked to ``paths.temp_write_path``'s name, must hash to
-       B's entry, and is flushed. The guards run again before every download.
+       B's entry, and is flushed by :func:`_flush_fd`. The guards run again before every
+       download.
     8. Commit, under ``lake_lock``: the guards run again, L must read as it did and B's HEAD
        must answer as it did. Each download is renamed into place and flushed with its
-       directory, step 6's files are deleted, and :func:`_rewrite_manifest` cuts the
-       manifest back to the shared bytes and appends B's tail in place.
+       directory and the parent of each directory a download created, step 6's files are
+       deleted, and :func:`_rewrite_manifest` cuts the manifest back to the shared bytes and
+       appends B's tail in place.
 
     A refusal or any other stop removes this run's temp files, so a run that stops at its
     deadline discards its downloads and the next one fetches them again. Every refusal
@@ -3613,14 +3762,16 @@ def resync(
                 + ", so the resync changed nothing"
             ) from None
         read = bucket_reader(client, target)
+        created: set[Path] = set()
         for rel, sha in plan.downloads.items():
             guard()
             temp = temp_write_path(root / rel, os.getpid())
+            created.update(_missing_dirs(root, temp))
             temps.append(temp)
             try:
                 actual, _size = _download_to(read, rel, temp)
                 if actual == sha:
-                    _fsync_path(temp)
+                    _flush_file(temp)
             except BucketReadError as exc:
                 if not exc.absent:
                     raise
@@ -3664,6 +3815,10 @@ def resync(
                 for rel, temp in zip(plan.downloads, temps, strict=True):
                     os.replace(temp, root / rel)
                     _fsync_path((root / rel).parent)
+                # A directory a download created is an entry in its parent, which a crash
+                # could lose with every file under it, so each parent is flushed too.
+                for parent in sorted({directory.parent for directory in created}):
+                    _fsync_path(parent)
                 for rel, _why in summary.deletions:
                     (root / rel).unlink(missing_ok=True)
                     _fsync_path((root / rel).parent)
@@ -3682,7 +3837,7 @@ def resync(
                 # refusal is the one line the operator needs.
                 pass
     summary.applied = True
-    summary.entries = len(_entries(plan.bucket_raw))
+    summary.entries = len(_whole_entries(plan.bucket_raw))
     return summary
 
 
@@ -4199,6 +4354,7 @@ __all__ = [
     "FIRST_UPLOAD_COMMAND",
     "FULL_OBJECT",
     "IN_FLIGHT_ALLOWANCE",
+    "JobProbe",
     "LIVE_PROBE_BYTES",
     "MAX_PUT_BYTES",
     "NIGHTLY_UPLOAD_BUDGET",
@@ -4245,6 +4401,7 @@ __all__ = [
     "build_parser",
     "client_from_config",
     "connect",
+    "default_job_probe",
     "first_upload",
     "first_upload_files",
     "hex_to_b64",

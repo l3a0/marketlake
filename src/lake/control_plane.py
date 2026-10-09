@@ -956,6 +956,40 @@ def launchctl_probe(label: str) -> bool:
     return result.returncode == 0 and parse_launchctl_print(result.stdout)
 
 
+# ``launchctl print``'s exit code for a label that is not in the domain, which is how a job
+# booted out of launchd reads. ``restart_script``'s docstring names the same code.
+LAUNCHCTL_NOT_IN_DOMAIN = 113
+
+
+def launchctl_executing_probe(label: str) -> bool:
+    """Whether ``label``'s job may be executing, with a failed ``launchctl`` call read as yes.
+
+    ``launchctl_probe`` answers the self-check, where a call that failed reads as down, so
+    the missed ping pages. The resync in ``lake.bucket`` asks before it writes under the lake
+    root, so it reads the same call the other way, as ``parse_active_state`` does on systemd.
+
+    1. Exit 0 is parsed for a running state, as ``launchctl_probe`` parses it.
+    2. Exit ``LAUNCHCTL_NOT_IN_DOMAIN`` means launchd holds no such label, so nothing of it
+       is executing.
+    3. Any other exit says nothing about the job, so it reads as executing.
+
+    A test injects a fake instead.
+    """
+    import subprocess  # lazy: only a real run shells out
+
+    result = subprocess.run(
+        ["launchctl", "print", f"{LAUNCHD_DOMAIN}/{label}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == LAUNCHCTL_NOT_IN_DOMAIN:
+        return False
+    if result.returncode != 0:
+        return True
+    return parse_launchctl_print(result.stdout)
+
+
 def systemctl_probe(label: str) -> bool:
     """The Linux probe: ``systemctl is-active --quiet <label>``, read by its exit code.
 
@@ -5151,7 +5185,9 @@ __all__ = [
     "install_script",
     "restart_script",
     "uninstall_script",
+    "launchctl_executing_probe",
     "launchctl_probe",
+    "LAUNCHCTL_NOT_IN_DOMAIN",
     "live_check_slugs",
     "main",
     "next_sunday_wake",

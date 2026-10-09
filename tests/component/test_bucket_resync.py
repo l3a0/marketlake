@@ -320,6 +320,101 @@ def test_a_hand_repair_refuses_and_names_the_first_upload(tmp_path):
     assert FIRST_UPLOAD_COMMAND in message
 
 
+def test_a_rewind_that_shares_no_whole_line_refuses_before_any_download(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # Rot in the laptop's first line that still parses. The two copies then share no whole
+    # line, so a rewind would cut the manifest to 0 bytes before writing the bucket's, and a
+    # crash between the two would leave an empty manifest the next run refuses.
+    first, rest = manifest_path(laptop).read_bytes().split(b"\n", 1)
+    entry = json.loads(first)
+    entry["rows"] += 1
+    manifest_path(laptop).write_bytes(json.dumps(entry).encode() + b"\n" + rest)
+    before = _snapshot(laptop)
+
+    message = _refused(laptop, client, apply=True)
+
+    assert "share no whole line" in message
+    assert "first line" in message
+    assert _gets(client) == [MANIFEST_KEY]
+    assert _snapshot(laptop) == before
+
+
+def _torn(rel: str) -> bytes:
+    """The start of an entry for ``rel`` that a short write left with no newline."""
+    return b'{"fetched_at": null, "partition": "' + rel.encode()
+
+
+def test_a_fused_line_in_the_buckets_tail_refuses_naming_its_line(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    copy = client.body(MANIFEST_KEY)
+    line = len(copy.splitlines()) + 1
+    # The VM's torn write fused with its next append, and a whole entry follows. Read with
+    # the rule a reader applies, the entries past the fused line would be lost from the
+    # plan while still reaching the lake's manifest.
+    for rel in (SPY_2, QUOTES_2):
+        data = f"vm {rel}".encode()
+        client.store(TARGET.key(rel), data)
+        copy += (_torn(SPY_2) if rel == SPY_2 else b"") + _entry(
+            rel, hashlib.sha256(data).hexdigest()
+        )
+    client.store(MANIFEST_KEY, copy)
+
+    message = _refused(laptop, client)
+
+    assert f"line {line} of the bucket's manifest.jsonl" in message
+    assert "by hand" in message
+    assert message.endswith(str(TARGET))
+
+
+def test_a_fused_line_in_this_lakes_tail_refuses_naming_its_line(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # The laptop's capture of a ticker the bucket never saw tore its manifest entry, and the
+    # next append fused onto it. That file may be the only copy of the capture.
+    rel = "chains/ticker=QQQ/date=2026-08-25.parquet"
+    (laptop / rel).parent.mkdir(parents=True, exist_ok=True)
+    (laptop / rel).write_bytes(b"the laptop's only copy")
+    line = len(manifest_path(laptop).read_bytes().splitlines()) + 1
+    with manifest_path(laptop).open("ab") as handle:
+        handle.write(_torn(rel))
+    _record(laptop, "bars/late.parquet", b"late", source="sweep")
+
+    message = _refused(laptop, client)
+
+    assert f"line {line} of {manifest_path(laptop)}" in message
+    assert "by hand" in message
+
+
+@pytest.mark.parametrize("partition", [5, None, True, ["a"]])
+def test_a_bucket_entry_whose_partition_is_not_a_string_refuses_naming_its_line(
+    tmp_path, partition
+):
+    laptop, client = _laptop(tmp_path)
+    copy = client.body(MANIFEST_KEY)
+    line = len(copy.splitlines()) + 1
+    client.store(
+        MANIFEST_KEY,
+        copy
+        + _entry(SPY_2, "0" * 64).replace(
+            json.dumps(SPY_2).encode(), json.dumps(partition).encode()
+        ),
+    )
+
+    message = _refused(laptop, client)
+
+    assert f"line {line} of the bucket's manifest.jsonl" in message
+
+
+def test_a_damaged_first_line_in_the_buckets_copy_names_that_line(tmp_path):
+    laptop, client = _laptop(tmp_path)
+    lines = client.body(MANIFEST_KEY).splitlines(keepends=True)
+    client.store(MANIFEST_KEY, b"not json\n" + b"".join(lines[1:]))
+
+    message = _refused(laptop, client)
+
+    assert "line 1 of the bucket's manifest.jsonl" in message
+    assert "carries no whole entry" not in message
+
+
 class _ChangingS3(FakeS3):
     """A fake bucket whose ``manifest.jsonl`` gains a line between its HEAD and its GET."""
 
@@ -408,6 +503,30 @@ def test_a_designed_absence_in_the_buckets_ledger_is_not_downloaded(tmp_path):
     assert "trimmed.jsonl" in planned
 
 
+def test_a_designed_absence_this_lake_holds_on_disk_refuses(tmp_path):
+    from lake.trimmed import append_trimmed, trim_line
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    sha = _record(vm, SPY_2, b"vm chains 2026-08-25")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
+    line = trim_line(SPY_2, sha256=sha, version_id="v1", verified_at="s", trimmed_at="s")
+    append_trimmed(vm, line, source="test-trim", fetched_at=None)
+    (vm / SPY_2).unlink()
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
+    # The shadow laptop sealed the same session with its own bytes. Left on disk, they would
+    # sit under the bucket's entry for the VM's bytes, which the scrub reads as a mismatch.
+    _record(laptop, SPY_2, b"laptop chains 2026-08-25")
+
+    message = _refused(laptop, client)
+
+    assert repr(SPY_2) in message
+    assert "removed on purpose" in message
+    assert "Move each file out of the lake by hand" in message
+    (laptop / SPY_2).unlink()
+    assert SPY_2 not in dict(_resync(laptop, client).downloads)
+
+
 def test_a_buckets_trimmed_ledger_that_is_missing_refuses(tmp_path):
     laptop, client = _laptop(tmp_path)
     copy = client.body(MANIFEST_KEY) + _entry("trimmed.jsonl", "0" * 64, source="trim")
@@ -443,6 +562,44 @@ def test_a_download_beside_a_path_that_differs_only_by_case_refuses(tmp_path):
     message = _refused(laptop, client)
 
     assert "differs only by case" in message
+
+
+def test_a_download_and_a_deletion_that_differ_only_by_case_refuse(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # The laptop's tail names BARS_2, which the resync deletes. On a filesystem that ignores
+    # case, a download of the same path in another case is that file, so the commit would
+    # rename the download in and then unlink it.
+    other = BARS_2.replace("ticker=SPY", "ticker=spy")
+    data = b"vm bars in another case"
+    client.store(TARGET.key(other), data)
+    client.store(
+        MANIFEST_KEY,
+        client.body(MANIFEST_KEY) + _entry(other, hashlib.sha256(data).hexdigest()),
+    )
+
+    message = _refused(laptop, client)
+
+    assert "differs only by case" in message
+    assert repr(other) in message
+
+
+def test_a_download_beside_a_path_this_lakes_tail_names_in_another_case_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    mine = "reference/other_table.parquet"
+    _record(laptop, mine, b"laptop only", source="reference")
+    (laptop / mine).unlink()
+    theirs = "reference/Other_table.parquet"
+    data = b"vm table"
+    client.store(TARGET.key(theirs), data)
+    client.store(
+        MANIFEST_KEY,
+        client.body(MANIFEST_KEY) + _entry(theirs, hashlib.sha256(data).hexdigest()),
+    )
+
+    message = _refused(laptop, client)
+
+    assert "differs only by case" in message
+    assert repr(theirs) in message
 
 
 def test_a_covered_segment_only_this_lake_names_is_deleted(tmp_path):
@@ -513,24 +670,55 @@ def test_a_segment_the_buckets_segments_share_a_day_with_is_not_the_only_copy(tm
     assert repr(mine) in message
 
 
-def test_a_file_only_this_lake_holds_with_other_bytes_on_disk_is_not_refused(tmp_path):
-    laptop, vm, client, _files = _switched(tmp_path)
-    rel = "chains/ticker=QQQ/date=2026-08-25.parquet"
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("chains/ticker=QQQ/date=2026-08-25.parquet", id="chains"),
+        pytest.param(SEGMENT_2.replace("-41.arrows", "-77.arrows"), id="segment"),
+        pytest.param("reference/other_table.parquet", id="other"),
+    ],
+)
+def test_a_file_only_this_lake_holds_refuses_whatever_its_bytes(tmp_path, rel):
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    # The VM's segment of the same day keeps the laptop's segment from being the only copy.
+    _record(vm, SEGMENT_2, b"vm segment", source="capture")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
     _record(laptop, rel, b"recorded", source="capture")
+    # Bytes that no longer match the laptop's entry. Left on disk with no entry, the file
+    # would be an orphan to the scrub, and a segment would be merged unchecked.
     (laptop / rel).write_bytes(b"replaced since")
 
-    assert _resync(laptop, client).downloads
+    message = _refused(laptop, client)
+
+    assert repr(rel) in message
+    assert "Move each file out of the lake by hand" in message
 
 
 def test_a_capture_spans_rewrite_in_this_lakes_tail_refuses(tmp_path):
     laptop, vm, client, _files = _switched(tmp_path)
+    _record(vm, SPANS, b"the vm's spans", source="reference")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
     _record(laptop, SPANS, b"the laptop's spans", source="reference")
 
     message = _refused(laptop, client)
 
     assert "human decision" in message
     assert repr(SPANS) in message
+    # Once the laptop's file is moved aside, the bucket's version replaces what is there.
     (laptop / SPANS).write_bytes(b"moved aside and replaced")
+    assert SPANS in dict(_resync(laptop, client).downloads)
+
+
+def test_a_capture_spans_file_only_this_lake_names_is_cleared_by_moving_it_out(tmp_path):
+    laptop, vm, client, _files = _switched(tmp_path)
+    _record(laptop, SPANS, b"the laptop's spans", source="reference")
+
+    assert "human decision" in _refused(laptop, client)
+    # The bucket names no spans file, so other bytes left there would be unrecorded.
+    (laptop / SPANS).write_bytes(b"replaced in place")
+    assert repr(SPANS) in _refused(laptop, client)
+    (laptop / SPANS).unlink()
     assert _resync(laptop, client).downloads
 
 
@@ -879,6 +1067,103 @@ def test_a_download_that_does_not_hash_to_its_entry_refuses_and_keeps_no_temp(tm
     assert _strays(laptop) == []
 
 
+class _BrokenBody:
+    """A response body that gives up a first chunk, then fails as a dropped read would."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def read(self, _size: int) -> bytes:
+        self.reads += 1
+        if self.reads == 1:
+            return b"the first chunk"
+        raise client_error("InternalError", "GetObject", 500)
+
+    def close(self) -> None:
+        pass
+
+
+class _FailingGetS3(FakeS3):
+    """A fake bucket whose ``GetObject`` of one key fails, on the request or in its body."""
+
+    def __init__(self, source: FakeS3, key: str, *, in_body: bool) -> None:
+        super().__init__()
+        self.objects = source.objects
+        self.key = key
+        self.in_body = in_body
+
+    def get_object(self, **kwargs) -> dict:
+        if kwargs["Key"] != self.key:
+            return super().get_object(**kwargs)
+        if self.in_body:
+            return {"Body": _BrokenBody()}
+        raise client_error("InternalError", "GetObject", 500)
+
+
+@pytest.mark.parametrize("in_body", [False, True], ids=["request", "body"])
+def test_a_download_that_fails_leaves_no_temp_file(tmp_path, in_body):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    before = _snapshot(laptop)
+    failing = _FailingGetS3(client, TARGET.key(SPY_2), in_body=in_body)
+
+    with pytest.raises(bucket.BucketReadError) as raised:
+        _resync(laptop, failing, apply=True)
+
+    assert bucket._one_line(raised.value, TARGET) is not None
+    assert _strays(laptop) == []
+    assert _snapshot(laptop) == before
+
+
+def test_apply_flushes_the_manifest_and_each_download_past_the_drive_cache(tmp_path, monkeypatch):
+    import os
+    import types
+
+    laptop, _vm_root, client, files = _switched(tmp_path)
+    full = object()
+    flushed: set[int] = set()
+
+    def fcntl(fd, command, *args):
+        assert command is full
+        flushed.add(os.fstat(fd).st_ino)
+        return 0
+
+    monkeypatch.setattr(bucket, "F_FULLFSYNC", full)
+    monkeypatch.setattr(bucket, "fcntl", types.SimpleNamespace(fcntl=fcntl))
+
+    assert _resync(laptop, client, apply=True).applied
+
+    expected = {manifest_path(laptop).stat().st_ino, (laptop / QUARANTINE).stat().st_ino}
+    expected |= {(laptop / rel).stat().st_ino for rel in files}
+    assert expected <= flushed
+
+
+def test_apply_flushes_the_parent_of_each_directory_a_download_creates(tmp_path, monkeypatch):
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _record(vm, SEGMENT_2, b"segment bytes", source="capture")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
+    created = [
+        parent
+        for parent in (laptop / SEGMENT_2).parents
+        if parent.is_relative_to(laptop) and parent != laptop and not parent.exists()
+    ]
+    assert created
+    flushed: list[Path] = []
+    real = bucket._fsync_path
+
+    def record(path: Path) -> None:
+        flushed.append(Path(path))
+        real(path)
+
+    monkeypatch.setattr(bucket, "_fsync_path", record)
+
+    assert _resync(laptop, client, apply=True).applied
+
+    assert (laptop / SEGMENT_2).read_bytes() == b"segment bytes"
+    for directory in created:
+        assert directory.parent in flushed
+
+
 def test_a_session_reached_during_the_downloads_stops_and_discards_them(tmp_path):
     laptop, _vm_root, client, _files = _switched(tmp_path)
     before = _snapshot(laptop)
@@ -1044,14 +1329,54 @@ def test_the_systemd_probe_reads_the_active_state(monkeypatch, stdout, code, exe
     ]
 
 
+@pytest.mark.parametrize(
+    ("stdout", "code", "executing"),
+    [
+        ("\tstate = running\n", 0, True),
+        ("\tstate = waiting\n", 0, False),
+        ("", 113, False),
+        ("", 1, True),
+        ("", 5, True),
+    ],
+)
+def test_the_launchd_probe_reads_a_failed_call_as_executing(monkeypatch, stdout, code, executing):
+    import subprocess
+
+    from lake import control_plane
+
+    seen: list[list[str]] = []
+
+    def run(args, **kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert control_plane.launchctl_executing_probe("com.marketlake.eod-sweep") is executing
+    assert seen == [
+        ["launchctl", "print", f"{control_plane.LAUNCHD_DOMAIN}/com.marketlake.eod-sweep"]
+    ]
+    # The self-check's probe keeps reading any failed call as not running.
+    seen.clear()
+    assert control_plane.launchctl_probe("com.marketlake.eod-sweep") is (code == 0 and executing)
+
+
 @pytest.mark.parametrize("macos", [True, False])
 def test_the_job_probe_follows_the_host(monkeypatch, macos):
     from lake import control_plane
 
     monkeypatch.setattr(control_plane, "is_macos", lambda: macos)
 
-    expected = control_plane.launchctl_probe if macos else control_plane.systemctl_executing_probe
+    expected = (
+        control_plane.launchctl_executing_probe
+        if macos
+        else control_plane.systemctl_executing_probe
+    )
     assert bucket.default_job_probe() is expected
+
+
+def test_the_job_probe_is_exported():
+    assert {"JobProbe", "default_job_probe"} <= set(bucket.__all__)
 
 
 # -- 8. both directions, end to end ------------------------------------------------------
@@ -1071,8 +1396,9 @@ def _upload(root: Path, client: FakeS3, now: datetime) -> None:
 def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, monkeypatch):
     # The laptop uploads, the VM is restored from the bucket and uploads its Tuesday session,
     # and the shadow laptop's sweep grows a tail.
-    laptop, vm, client, _files = _switched(tmp_path)
+    laptop, vm, client, files = _switched(tmp_path)
     vm_tuesday = client.body(MANIFEST_KEY)
+    bucket_quarantine = client.body(TARGET.key(QUARANTINE))
 
     # The switch back. The laptop's nightly upload refuses, and so does the first upload.
     with pytest.raises(bucket.WatermarkMissing) as refused:
@@ -1082,12 +1408,19 @@ def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, mon
         first_upload(
             laptop, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR
         )
-    laptop_config = _config(tmp_path / "laptop-config", laptop)
+    # The resuming host is still the shadow when it runs the resync.
+    laptop_config = _config(tmp_path / "laptop-config", laptop, role="shadow")
     before = _snapshot(laptop)
     assert _main(laptop_config, client, monkeypatch) == 0
     assert _snapshot(laptop) == before
     assert _main(laptop_config, client, monkeypatch, "--apply") == 0
     assert manifest_path(laptop).read_bytes() == vm_tuesday
+    # The VM's files came down, the laptop's own bars partition went, and the quarantine
+    # ledger is the bucket's.
+    for rel, data in files.items():
+        assert (laptop / rel).read_bytes() == data
+    assert not (laptop / BARS_2).exists()
+    assert (laptop / QUARANTINE).read_bytes() == bucket_quarantine
 
     # The laptop's Wednesday session uploads, and the bucket still names the VM's session.
     _record(laptop, SPY_3, b"laptop chains 2026-08-26")
@@ -1095,16 +1428,23 @@ def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, mon
     laptop_wednesday = client.body(MANIFEST_KEY)
     assert laptop_wednesday.startswith(vm_tuesday)
     assert f'"{SPY_2}"'.encode() in laptop_wednesday
+    assert client.body(TARGET.key(SPY_2)) == files[SPY_2]
 
     # The shadow VM captured the same session with its own bytes, and a segment beside it.
     _record(vm, SEGMENT_3, b"vm segment", source="capture")
     _record(vm, SPY_3, b"vm chains 2026-08-26")
 
-    # The return to the VM. Its upload refuses, and the resync brings it level.
-    with pytest.raises(bucket.WatermarkMissing):
+    # The return to the VM. Its upload refuses, and so does the first upload, and the resync
+    # brings it level.
+    with pytest.raises(bucket.WatermarkMissing) as refused:
         _upload(vm, client, WEDNESDAY_20)
+    assert bucket.RESYNC_COMMAND in str(refused.value)
+    with pytest.raises(bucket.FirstUploadRefused):
+        first_upload(vm, TARGET, client=client, clock=ManualClock(WEDNESDAY_20), calendar=CALENDAR)
     vm_config = _config(tmp_path / "vm-config", vm, role="shadow")
+    before = _snapshot(vm)
     assert _main(vm_config, client, monkeypatch, now=WEDNESDAY_20) == 0
+    assert _snapshot(vm) == before
     assert _main(vm_config, client, monkeypatch, "--apply", now=WEDNESDAY_20) == 0
     assert manifest_path(vm).read_bytes() == laptop_wednesday
     assert (vm / SPY_3).read_bytes() == b"laptop chains 2026-08-26"
