@@ -75,6 +75,14 @@ def test_the_span_is_read_from_the_roster_and_the_assertion_window():
     span = dw.refused_span(SATURDAY, [early, late], window)
     assert span is not None
     assert span.end == et(SATURDAY, 13, 0).astimezone(UTC)
+
+    # One that ends earlier leaves the last start plus the tail as the end.
+    def short(day: date) -> cp.AssertionWindow:
+        return cp.AssertionWindow(et(day, 5, 0), et(day, 7, 0))
+
+    span = dw.refused_span(SATURDAY, [early, late], short)
+    assert span is not None
+    assert span.end == et(SATURDAY, 11, 15).astimezone(UTC)
     # A day with no schedule refuses nothing, whatever its window says.
     assert dw.refused_span(SUNDAY, [early, late], window) is None
 
@@ -212,6 +220,26 @@ def test_the_margin_is_measured_in_real_minutes_when_the_clocks_spring_forward()
     allowed = dw.decide(et(SPRING_FORWARD, 0, 0), units, _no_window)
     assert allowed.code == dw.ALLOWED
     assert allowed.line == "a deploy may start now, and until Sun 2026-03-08 00:00 EST"
+
+
+def test_a_weekly_span_a_week_ahead_is_found():
+    """Decided after this Saturday's span, the next one is a full week away."""
+    units = [_job("weekly", cp.WallClockTime(6, 0), (5,))]
+    verdict = dw.decide(et(SATURDAY, 12), units, _no_window)
+    assert verdict.code == dw.ALLOWED
+    assert verdict.next_span_start == et(SATURDAY + timedelta(7), 5, 30).astimezone(UTC)
+
+
+def test_a_gap_of_exactly_the_margin_frees_the_earlier_end():
+    """Saturday's span ends at 23:15 and Sunday's starts 210 minutes later, at 02:45."""
+    units = [
+        _job("late", cp.WallClockTime(23, 0), (5,)),
+        _job("early", cp.WallClockTime(3, 15), (6,)),
+    ]
+    verdict = dw.decide(et(SATURDAY, 23), units, _no_window)
+    assert verdict.code == dw.REFUSED
+    assert "next at Sat 2026-10-10 23:15 EDT" in verdict.line
+    assert dw.decide(et(SATURDAY, 23, 15), units, _no_window).code == dw.ALLOWED
 
 
 # -- the entry -------------------------------------------------------------------------

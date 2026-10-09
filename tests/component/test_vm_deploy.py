@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -111,8 +112,8 @@ esac
 # The checkout's bootstrap. It logs the HEAD it ran at and exits with the next code in
 # BOOTSTRAP_RCS. FAKE_BOOTSTRAP_BUSY names a service it leaves activating, as a timer job
 # that starts during the run would be, FAKE_BOOTSTRAP_PROCS rewrites the daemon's
-# cgroup.procs, and FAKE_BOOTSTRAP_TERM sends SIGTERM to the inner run the fake
-# systemd-run started.
+# cgroup.procs, FAKE_BOOTSTRAP_NO_PROCS removes it, and FAKE_BOOTSTRAP_SIGNAL sends the
+# signal it names to the inner run the fake systemd-run started.
 FAKE_BOOTSTRAP = (
     "#!/bin/bash\n"
     + NEXT_RC
@@ -129,8 +130,12 @@ if [[ -n "${FAKE_BOOTSTRAP_PROCS:-}" ]]; then
   group="$MARKETLAKE_INSTALL_ROOT/sys/fs/cgroup/system.slice/com.marketlake.daemon.service"
   printf '%s\n' $FAKE_BOOTSTRAP_PROCS > "$group/cgroup.procs"
 fi
-if [[ -n "${FAKE_BOOTSTRAP_TERM:-}" ]]; then
-  kill -TERM "$(<"$STATE/inner-pid")"
+if [[ -n "${FAKE_BOOTSTRAP_NO_PROCS:-}" ]]; then
+  group="$MARKETLAKE_INSTALL_ROOT/sys/fs/cgroup/system.slice/com.marketlake.daemon.service"
+  rm -f "$group/cgroup.procs"
+fi
+if [[ -n "${FAKE_BOOTSTRAP_SIGNAL:-}" ]]; then
+  kill -"$FAKE_BOOTSTRAP_SIGNAL" "$(<"$STATE/inner-pid")"
 fi
 exit "$(next_rc bootstrap "${BOOTSTRAP_RCS:-}")"
 """
@@ -383,6 +388,20 @@ def _outcome(proc: subprocess.CompletedProcess[str]) -> str:
     return lines[0]
 
 
+def _wrapped(vm: VM, name: str, body: str, real: Path) -> str:
+    """A PATH whose first directory holds ``name``, which runs ``body`` and then ``real``.
+
+    The fake ``sudo`` and ``systemd-run`` keep ``PATH``, so the wrapper answers in the
+    inner run and for the owner as well.
+    """
+    wrap = vm.tmp / f"wrap-{name}"
+    wrap.mkdir()
+    script = wrap / name
+    script.write_text(f'#!/bin/bash\n{body}exec {real} "$@"\n')
+    script.chmod(0o755)
+    return f"{wrap}:{vm.path(needrestart=True)}"
+
+
 def _assert_untouched(vm: VM) -> None:
     """Nothing moved, ran or restarted."""
     calls = vm.calls()
@@ -536,15 +555,23 @@ def test_a_wider_mode_left_by_hand_is_reset(vm):
 
 def test_only_result_files_older_than_a_day_are_deleted(vm):
     old = vm.root / "run" / "marketlake-deploy.result.old"
+    hours = vm.root / "run" / "marketlake-deploy.result.hours"
     fresh = vm.root / "run" / "marketlake-deploy.result.new"
-    old.write_text("")
-    fresh.write_text("")
+    other = vm.root / "run" / "sshd.pid"
+    for path in (old, hours, fresh, other):
+        path.write_text("")
     two_days_ago = time.time() - 2 * 86400
     os.utime(old, (two_days_ago, two_days_ago))
+    os.utime(other, (two_days_ago, two_days_ago))
+    two_hours_ago = time.time() - 2 * 3600
+    os.utime(hours, (two_hours_ago, two_hours_ago))
     proc = vm.deploy(vm.c["c2"])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not old.exists()
+    assert hours.exists()
     assert fresh.exists()
+    # /run holds other services' files, and the sweep takes only its own.
+    assert other.exists()
 
 
 def test_a_deploy_of_the_recorded_head_is_already_current(vm):
@@ -857,6 +884,50 @@ def test_a_span_too_close_after_a_failed_bootstrap_leaves_the_tree_moved(vm):
     assert vm.recorded() == vm.c["c1"]
 
 
+def test_the_wait_reads_the_span_before_every_poll(vm):
+    """A clock that moves 30 seconds per sleep reaches a span 11 minutes away mid-wait.
+
+    The clock starts at FAKE_NOW and reads no real time, so the count of polls is exact.
+    """
+    count_sleeps = (
+        'if [[ "${1:-}" == "+%s" ]]; then\n'
+        '  n="$(grep -c "^sleep " "$LOG" || true)"\n'
+        "  echo $(( FAKE_NOW + n * 30 ))\n"
+        "  exit 0\n"
+        "fi\n"
+    )
+    path = _wrapped(vm, "date", count_sleeps, Path("/bin/date"))
+    vm.record(vm.c["c1"])
+    now = int(time.time())
+    # 180 seconds for the restart's check, and 480 more for 16 polls.
+    soon = str(now + 180 + 480)
+    proc = vm.deploy(
+        vm.c["c3"], FAKE_BOOTSTRAP_BUSY=SWEEP, FAKE_NEXT_SPAN=soon, FAKE_NOW=str(now), PATH=path
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is {vm.c['c1']}"
+    )
+    # A wait that read the span only once would sleep all 30 polls.
+    assert vm.ran("sleep") == ["sleep 30"] * 16
+    assert "the next refused span starts within 180 seconds" in vm.deploy_log.read_text()
+    assert not vm.ran("restart.sh")
+    assert vm.recorded() == vm.c["c1"]
+
+
+def test_a_cgroup_the_wait_cannot_read_restarts_nothing(vm):
+    """A busy check that cannot tell keeps the wait going, as a busy one does."""
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(vm.c["c3"], FAKE_BOOTSTRAP_NO_PROCS="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is {vm.c['c1']}"
+    )
+    assert vm.ran("sleep") == ["sleep 30"] * 30
+    assert not vm.ran("restart.sh")
+    assert vm.recorded() == vm.c["c1"]
+
+
 def test_a_stopped_daemon_does_not_count_as_busy_in_the_wait(vm):
     """A daemon left in back-off by the bootstrap's enable --now goes to the restart."""
     vm.record(vm.c["c1"])
@@ -1065,6 +1136,28 @@ def test_a_window_check_that_fails_is_not_deployed(vm, env, line):
     _assert_untouched(vm)
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "a deploy may start now\n4102444800\n",
+        "a deploy may start now\nnext_span_start=4102444800\nmore\n",
+        "\nnext_span_start=4102444800\n",
+    ],
+    ids=["no prefix", "a third line", "an empty first line"],
+)
+def test_window_output_of_another_shape_is_not_deployed(vm, output):
+    python = vm.checkout / ".venv" / "bin" / "python"
+    python.unlink()
+    python.write_text(f"#!/bin/bash\nprintf '%s' {shlex.quote(output)}\n")
+    python.chmod(0o755)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        "not deployed: python -m lake.deploy_window printed no next_span_start line"
+    )
+    _assert_untouched(vm)
+
+
 def test_a_running_timer_service_refuses_the_deploy(vm):
     vm.activating(SWEEP)
     proc = vm.deploy(vm.c["c2"])
@@ -1081,6 +1174,36 @@ def test_a_waiting_timer_does_not_refuse_the_deploy(vm):
     assert "systemctl list-units --type=service --all --no-legend --plain com.marketlake.*" in (
         vm.calls()
     )
+
+
+def test_a_failed_timer_service_does_not_refuse_the_deploy(vm):
+    """A failed oneshot is not running, so it reads nothing."""
+    (vm.state / "failed").mkdir(exist_ok=True)
+    (vm.state / "failed" / SWEEP).write_text("")
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"deployed: {vm.c['c2']}"
+
+
+@pytest.mark.parametrize("failing", [None, 0, 1], ids=["every call", "first call", "second call"])
+def test_a_list_units_that_fails_is_not_deployed(vm, failing):
+    """The busy checks run before the fetch and again before the merge, and each must refuse."""
+    if failing is None:
+        proc = vm.deploy(vm.c["c2"], LIST_UNITS_RC="1")
+    else:
+        fail_one = (
+            'if [[ "${1:-}" == list-units ]]; then\n'
+            "  n=0\n"
+            '  if [[ -f "$STATE/list-count" ]]; then n="$(<"$STATE/list-count")"; fi\n'
+            '  echo "$((n + 1))" > "$STATE/list-count"\n'
+            f"  if [[ $n == {failing} ]]; then exit 1; fi\n"
+            "fi\n"
+        )
+        path = _wrapped(vm, "systemctl", fail_one, vm.tools.path / "bin" / "systemctl")
+        proc = vm.deploy(vm.c["c2"], PATH=path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: systemctl list-units failed"
+    _assert_untouched(vm)
 
 
 def test_a_second_process_in_the_daemons_cgroup_refuses_the_deploy(vm):
@@ -1158,8 +1281,15 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
         ([], "not deployed: --sha must be 40 lowercase hex digits"),
         (["--sha"], None),
         (["--sha", "ABC"], "not deployed: --sha must be 40 lowercase hex digits"),
+        (["--sha", "C" * 40], "not deployed: --sha must be 40 lowercase hex digits"),
+        (["--sha", "a" * 41], "not deployed: --sha must be 40 lowercase hex digits"),
+        (["--sha", "g" + "a" * 40], "not deployed: --sha must be 40 lowercase hex digits"),
         (
             ["--sha", "a" * 40, "--not-after", "soon"],
+            "not deployed: --not-after must be epoch seconds",
+        ),
+        (
+            ["--sha", "a" * 40, "--not-after", "9999999999x"],
             "not deployed: --not-after must be epoch seconds",
         ),
         # bash reads a leading zero as octal, and 0999 is no octal number.
@@ -1169,7 +1299,18 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
         ),
         (["--sha", "a" * 40, "--help"], None),
     ],
-    ids=["nothing", "no value", "not hex", "bad expiry", "octal expiry", "unknown flag"],
+    ids=[
+        "nothing",
+        "no value",
+        "not hex",
+        "upper case",
+        "41 digits",
+        "a prefix",
+        "bad expiry",
+        "expiry suffix",
+        "octal expiry",
+        "unknown flag",
+    ],
 )
 def test_a_usage_error_is_one_line_on_stdout(vm, argv, line):
     proc = vm.run([str(vm.script), *argv])
@@ -1277,8 +1418,17 @@ def test_the_real_window_refusal_has_the_shape_the_script_repeats(capsys, easter
     assert re.fullmatch(pattern.group(1), first), first
 
 
-def test_a_window_line_of_another_shape_is_not_repeated(vm):
-    proc = vm.deploy(vm.c["c2"], FAKE_WINDOW_RC="3", FAKE_WINDOW_LINE=f"refused, see {vm.root}/etc")
+@pytest.mark.parametrize(
+    "line",
+    [
+        "refused, see {root}/etc",
+        "a deploy may start next at Mon 2026-10-12 18:45 EDT, because see /etc/x",
+        "x a deploy may start next at Mon 2026-10-12 18:45 EDT, because the jobs run",
+    ],
+    ids=["another shape", "a path in the reason", "text before"],
+)
+def test_a_window_line_of_another_shape_is_not_repeated(vm, line):
+    proc = vm.deploy(vm.c["c2"], FAKE_WINDOW_RC="3", FAKE_WINDOW_LINE=line.format(root=vm.root))
     assert proc.returncode == 3, proc.stdout + proc.stderr
     assert _outcome(proc) == "not deployed: the window refuses a deploy now, see deploy.log"
 
@@ -1332,6 +1482,21 @@ def test_a_bootstrap_conf_it_cannot_use_is_refused(vm, conf, line):
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert _outcome(proc) == line
     assert not vm.ran("systemd-run")
+
+
+@pytest.mark.parametrize(
+    "conf",
+    [
+        f"OWNER={OWNER}\n\nLAKE_VOLUME_ID={VOLUME_ID}\n",
+        f"LAKE_VOLUME_ID={VOLUME_ID}\nOWNER={OWNER}",
+    ],
+    ids=["a blank line", "no final newline"],
+)
+def test_a_bootstrap_conf_the_bootstrap_accepts_is_accepted(vm, conf):
+    vm.conf.write_text(conf)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"deployed: {vm.c['c2']}"
 
 
 @pytest.mark.parametrize(
@@ -1392,6 +1557,69 @@ def test_a_daemon_show_that_fails_is_not_deployed(vm):
     _assert_untouched(vm)
 
 
+def test_a_daemon_show_that_fails_in_the_busy_check_is_not_deployed(vm):
+    """The first read, the running check, succeeds, and the busy check's read fails."""
+    fail_second = (
+        'if [[ "${1:-}" == show ]]; then\n'
+        "  n=0\n"
+        '  if [[ -f "$STATE/show-count" ]]; then n="$(<"$STATE/show-count")"; fi\n'
+        '  echo "$((n + 1))" > "$STATE/show-count"\n'
+        '  if [[ $n == 1 ]]; then echo "Failed to get properties" >&2; exit 1; fi\n'
+        "fi\n"
+    )
+    path = _wrapped(vm, "systemctl", fail_second, vm.tools.path / "bin" / "systemctl")
+    proc = vm.deploy(vm.c["c2"], PATH=path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: systemctl show failed for {DAEMON}"
+    _assert_untouched(vm)
+
+
+def _git_status_fails(vm: VM, call: int) -> str:
+    """A PATH whose ``git status --porcelain`` fails on the given call, counting from 0."""
+    fail_status = (
+        'case " $* " in\n'
+        '  *" status --porcelain "*)\n'
+        "    n=0\n"
+        '    if [[ -f "$STATE/status-count" ]]; then n="$(<"$STATE/status-count")"; fi\n'
+        '    echo "$((n + 1))" > "$STATE/status-count"\n'
+        f"    if [[ $n == {call} ]]; then echo 'fatal: index file corrupt' >&2; exit 128; fi ;;\n"
+        "esac\n"
+    )
+    return _wrapped(vm, "git", fail_status, vm.tools.path / "system" / "git")
+
+
+def test_a_git_status_that_fails_is_not_deployed(vm):
+    proc = vm.deploy(vm.c["c2"], PATH=_git_status_fails(vm, 0))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: git status failed, see deploy.log"
+    _assert_untouched(vm)
+
+
+def test_a_git_status_that_fails_after_a_failed_merge_is_an_unknown_outcome(vm):
+    """A status that cannot be read says nothing about the tree, so it never reads clean."""
+    proc = vm.deploy(vm.c["c2"], FLOCK_FILE_RCS="1", PATH=_git_status_fails(vm, 1))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == UNKNOWN
+    _assert_untouched(vm)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_a_git_status_that_fails_after_the_restore_is_an_unknown_outcome(vm):
+    sha = _commit_that_writes_into_deploy(vm)
+    deploy = vm.checkout / "deploy"
+    deploy.chmod(0o555)
+    try:
+        # The first read finds the tree clean, the second finds the failed merge's files,
+        # and the third, after the reset, fails.
+        proc = vm.deploy(sha, PATH=_git_status_fails(vm, 2))
+    finally:
+        deploy.chmod(0o755)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == UNKNOWN
+    assert vm.head() == vm.c["c1"]
+    assert not vm.ran("bootstrap ")
+
+
 def test_a_main_pid_of_0_after_a_restart_is_not_running(vm):
     """systemd reads MainPID=0 for an active unit whose process has not started yet."""
     vm.record(vm.c["c1"])
@@ -1404,12 +1632,13 @@ def test_a_main_pid_of_0_after_a_restart_is_not_running(vm):
     assert vm.recorded() is None
 
 
-def test_a_signal_during_the_run_reports_an_unknown_outcome(vm):
-    proc = vm.deploy(vm.c["c3"], FAKE_BOOTSTRAP_TERM="1")
+@pytest.mark.parametrize("signal", ["TERM", "HUP"])
+def test_a_signal_during_the_run_reports_an_unknown_outcome(vm, signal):
+    proc = vm.deploy(vm.c["c3"], FAKE_BOOTSTRAP_SIGNAL=signal)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _outcome(proc) == UNKNOWN
     assert (vm.state / "last-result").read_text() == f"1 {UNKNOWN}\n"
-    # The trap exits 1. Killed by the signal, bash would exit 143.
+    # The trap exits 1. Killed by the signal, bash would exit 128 plus its number.
     assert (vm.state / "inner-rc").read_text() == "1"
     # The run stopped after the merge and before any restart.
     assert vm.head() == vm.c["c3"]
