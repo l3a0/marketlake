@@ -94,11 +94,12 @@ _MINUTES_PER_DAY = 24 * 60
 # timeout. A malformed response instead raises ``http.client.HTTPException``, which is
 # not an ``OSError``, so catching only the socket family would let it through.
 #
-# Every job pings as its last step, after the work is done, and prints its verdict after
-# that. So a raising ping used to cost the verdict as well as the ping. The ping is lost
-# either way and healthchecks pages for it after the grace. Losing the report too is
-# what these catches prevent. It lives here beside the protocol rather than in one
-# caller, because every call site needs the same answer.
+# Every job pings once its work is done and prints its verdict after that. Compaction
+# also runs its trim and its empty-directory pass after the ping, and neither raises, so
+# its verdict still prints. A raising ping used to cost the verdict as well as the ping.
+# The ping is lost either way and healthchecks pages for it after the grace. Losing the
+# report too is what these catches prevent. It lives here beside the protocol rather than
+# in one caller, because every call site needs the same answer.
 #
 # Only the exception's type is ever reported. The URL carries the ping key, and the
 # design's rule is that it never reaches a log.
