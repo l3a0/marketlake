@@ -13,16 +13,19 @@ an apply makes them. OpenTofu keeps a record of which real resources each config
 manages, called its state, and both states sit in one S3 bucket under separate keys.
 
 1. `infra/bootstrap/` holds what CI needs before it can run: the state bucket, GitHub's
-   OIDC provider, and two roles that GitHub Actions assumes without a stored AWS key. The
-   OIDC provider lets a workflow trade a short-lived token that GitHub signs for temporary
-   AWS credentials. The plan role reads, and pull requests may assume it. The apply role
-   writes, and only the `infra` environment on `main` may assume it. CI cannot apply the
-   configuration that creates it, so the owner applies this one from the laptop.
+   OIDC provider, and three roles that GitHub Actions assumes without a stored AWS key.
+   The OIDC provider lets a workflow trade a short-lived token that GitHub signs for
+   temporary AWS credentials. The plan role reads, and pull requests may assume it. The
+   apply role writes, and only the `infra` environment on `main` may assume it. The
+   deploy role can only ask the VM to deploy a commit, and only the `deploy` environment
+   on `main` may assume it. CI cannot apply the configuration that creates them, so the
+   owner applies this one from the laptop.
 2. `infra/live/` holds the backup bucket, the instance role `marketlake-instance` with its
    read of the bucket and the config parameters, the laptop's one IAM user,
    `marketlake-command` ([#737](https://github.com/l3a0/marketlake/issues/737)), and the
-   hosted VM with its security group, key pair and lake volume. That user can only assume
-   two roles: `marketlake-backup`, which reaches the bucket, and
+   hosted VM with its security group, key pair and lake volume, and the SSM document
+   `marketlake-deploy` that [Deploy from CI](#deploy-from-ci) sends to the VM. That user
+   can only assume two roles: `marketlake-backup`, which reaches the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
    applies it after a merge to `main` once the owner approves the run. Either starts on
@@ -300,7 +303,7 @@ Plan it, and read the plan before applying anything.
 AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-<n>/infra/bootstrap" plan -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
 ```
 
-On the first run the plan imports the state bucket and creates eight resources.
+On a first run today the plan imports the state bucket and creates ten resources.
 
 1. The state bucket's versioning.
 2. The GitHub OIDC provider.
@@ -310,9 +313,12 @@ On the first run the plan imports the state bucket and creates eight resources.
 6. The apply role.
 7. The apply role's attachment of `ReadOnlyAccess`.
 8. The apply role's inline policy.
+9. The deploy role, `marketlake-deploy`, which
+   [#676](https://github.com/l3a0/marketlake/issues/676) added after the recorded run.
+10. The deploy role's inline policy.
 
 When step 3 found an existing provider, the plan imports the provider instead of creating
-it, so it shows two imports and seven creates. The plan destroys nothing. A later run,
+it, so it shows two imports and nine creates. The plan destroys nothing. A later run,
 against state that already exists, plans only what the pull request changes. Treat a plan
 that destroys anything as coming from a stale checkout until shown otherwise.
 
@@ -389,6 +395,10 @@ was left out or ignored.
 ```bash
 gh api repos/l3a0/marketlake/environments/infra --jq .can_admins_bypass
 ```
+
+A rebuild also creates the `deploy` environment, which arrived after the recorded run.
+[The `deploy` environment and its secret](#the-deploy-environment-and-its-secret) gives
+its commands.
 
 ### 9. Set the secrets and the variables
 
@@ -478,6 +488,9 @@ The repository's variables should include `SSH_PUBLIC_KEY`.
 ```bash
 gh variable list --repo l3a0/marketlake
 ```
+
+A rebuild also sets `AWS_DEPLOY_ROLE_ARN` on the `deploy` environment, as
+[The `deploy` environment and its secret](#the-deploy-environment-and-its-secret) says.
 
 ### 10. Re-run the pull request's plan
 
@@ -1240,7 +1253,7 @@ runs the daemon.
       for the shadow day only. Every earlier session the VM runs costs the laptop the
       same.
    2. The VM runs the commit it cloned at first boot, and nothing pulls new code onto it
-      until [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy. So the apply
+      until a deploy runs, as [Deploy a commit](#deploy-a-commit) says. So the apply
       follows the merges of the two blockers of
       [#638](https://github.com/l3a0/marketlake/issues/638) that change code the VM runs:
       [#702](https://github.com/l3a0/marketlake/issues/702), and
@@ -1434,10 +1447,11 @@ Three things call for a rerun.
    way the bootstrap ended with exit 4, and the daemon restarts every ten seconds
    without a `config.yaml`. Put a missing parameter, or fix a missing tag in
    `infra/live/vm.tf` through an approved apply, as the render's line says. Then rerun.
-2. **Code merged after the apply.** Nothing pulls on its own until
-   [#676](https://github.com/l3a0/marketlake/issues/676). Deploy the merged commit, as
+2. **Code merged after the apply.** A merge reaches the VM through
+   [Deploy from CI](#deploy-from-ci) once the owner approves its run, or by hand, as
    [Deploy a commit](#deploy-a-commit) says. The deploy runs the bootstrap and restarts
-   the daemon when it is owed, because the install restarts nothing.
+   the daemon when it is owed, because the install restarts nothing. Timers start fresh
+   processes and pick up new code by themselves.
 
 3. **A larger lake volume.** Raise `lake_volume_gib` in a reviewed pull request. The
    apply grows the volume in place, and nothing grows the ext4 filesystem on it until the
@@ -1902,13 +1916,171 @@ printf 'ssh_public_key = "%s"\n' "$(cat ~/.ssh/marketlake_vm.pub)" >> ~/.config/
 Run each once. A second run adds a second line for the same name, which OpenTofu
 refuses. After the home address changes, edit the `owner_ssh_cidr` line in place.
 
+## Deploy from CI
+
+Since the cutover the VM is the primary capture host, so code merged to `main` has to
+reach it, and a deploy at the wrong moment loses captured minutes for good.
+`.github/workflows/deploy.yml` asks the VM to deploy each push to `main`, once the owner
+approves the run in
+[the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy)
+([#676](https://github.com/l3a0/marketlake/issues/676)). Nobody logs in and no key is
+stored. The design's "Infrastructure, defined" carries the reasoning.
+
+The run takes four steps.
+
+1. It refuses an empty `AWS_DEPLOY_ROLE_ARN`.
+2. It skips, with a green summary, when `main` has moved past the run's commit. The newer
+   commit's own run deploys it.
+3. It assumes `marketlake-deploy` through OIDC.
+4. It runs `deploy/send-deploy.sh`. The script finds the one running instance tagged
+   `marketlake:host = capture`, sends it the SSM document `marketlake-deploy` with the
+   commit and a ten-minute delivery window, waits for the command to end, and prints one
+   summary.
+
+The VM, not the moment of approval, decides whether a deploy is safe. An approval during
+the hours it refuses fails the run with exit 3 and names the time a deploy may start. A
+re-run after that time asks for approval again, and then deploys.
+
+The repository is public, so the run's log and its summary show only the summary line,
+`StatusDetails` and `ResponseCode`. The VM keeps the full output in
+`/var/lib/marketlake/deploy.log`. This table says what each summary means.
+
+| Summary | Exit | What it means |
+| --- | --- | --- |
+| A line from the table of last lines that `vm-deploy.sh` prints, under [Deploy a commit](#deploy-a-commit) | 0 to 3 | The VM ran the deploy and printed that line. |
+| `vm-deploy.sh is missing on the VM, so run the manual first deploy` | 1 | The VM's checkout predates `vm-deploy.sh`. Run step 1 of [The owner's first deploy](#the-owners-first-deploy). |
+| `not delivered, so re-run` | 1 | The command never reached the VM, for example while the SSM agent was down. Re-run the job. |
+| `not started` | 1 | The command was cancelled before it started. |
+| `outcome unknown: ...` | 1 | Compare `HEAD` with `/var/lib/marketlake/deployed` on the VM, and read `deploy.log`. When they differ, re-run the deploy for `HEAD`. |
+| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of running instances with the tag when it is not exactly one, or a `DescribeInstances` reply that is not an instance id. |
+
+### The `deploy` environment and its secret
+
+[The `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy)
+requires the owner's approval, as
+[the `infra` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)
+does, until the job has run cleanly enough times to drop it.
+[#851](https://github.com/l3a0/marketlake/issues/851) holds that decision. Only the owner
+creates it, edits it or approves its runs, per the "Deployment approvals" section of
+[`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06). GitHub
+creates a missing environment, with no protection rules, the first time a job names it.
+So the owner creates `deploy`, or protects the one a run created, with the same settings
+[step 8](#8-create-the-infra-environment) gives `infra`. The `PUT` below does either.
+
+```bash
+gh api -X PUT repos/l3a0/marketlake/environments/deploy --input - <<'EOF'
+{"prevent_self_review": false,
+ "can_admins_bypass": false,
+ "reviewers": [{"type": "User", "id": <github-user-id>}],
+ "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+```
+
+```bash
+gh api -X POST repos/l3a0/marketlake/environments/deploy/deployment-branch-policies -f name=main -f type=branch
+```
+
+Read it back as step 8 does, with `deploy` in place of `infra`. The protection must list
+`required_reviewers` and `branch_policy`, the branch policies must print `["main"]`, and
+`can_admins_bypass` must print `false`.
+
+The deploy role's ARN is a secret on the `deploy` environment, never on the repository.
+So a run in an environment nobody protected finds it empty and stops before it assumes
+anything. Set it once the bootstrap apply has created the role.
+
+```bash
+aws iam get-role --role-name marketlake-deploy --query Role.Arn --output text --profile marketlake-admin | gh secret set AWS_DEPLOY_ROLE_ARN --env deploy --repo l3a0/marketlake
+```
+
+```bash
+gh secret list --env deploy --repo l3a0/marketlake
+```
+
+### The owner's first deploy
+
+A deploy may start, and so may a pull by hand, from 18:45 to 04:30 ET on a weekday
+night, all of Saturday, Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. The
+first deploy takes seven steps, in order.
+
+1. Pull on the VM inside those hours and run the manual first deploy that
+   [Deploy a commit](#deploy-a-commit) describes, so `vm-deploy.sh` exists there.
+2. Create the `deploy` environment with the owner as required reviewer, `main` as its
+   only deployment branch, and admin bypass off, as
+   [The `deploy` environment and its secret](#the-deploy-environment-and-its-secret)
+   says. Leave self-review allowed, since the owner merges.
+3. Apply `infra/bootstrap/` from `main`, per
+   [Changing the bootstrap](#changing-the-bootstrap). Then set `AWS_DEPLOY_ROLE_ARN` as
+   a secret on `deploy`.
+4. Approve the waiting run in
+   [the `infra` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)
+   that the merge of [PR #854](https://github.com/l3a0/marketlake/pull/854) queued, which
+   creates the document, outside 09:25 to 16:15 ET.
+5. Approve the run that the merge queued in
+   [the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy),
+   inside the hours above, and read its
+   summary.
+6. Check what only the VM can show.
+   1. Confirm that this command prints `KillMode=process`.
+
+      ```bash
+      systemctl show -p KillMode snap.amazon-ssm-agent.amazon-ssm-agent.service
+      ```
+
+   2. Confirm that this command prints the format the busy check parses.
+
+      ```bash
+      systemctl list-units --type=service --all --no-legend --plain 'com.marketlake.*'
+      ```
+
+   3. Start a hand run, and from a second shell send SIGKILL to the wrapper's process
+      group, as SSM's timeout would. Then confirm that `marketlake-deploy.service` runs
+      to the end, that `/var/lib/marketlake/deployed` names the sha, that
+      `journalctl -u marketlake-deploy` holds no deploy output, and that `deploy.log`
+      shows the run.
+7. Check what IAM allows, from an admin session. Read the role's ARN, the VM's instance id
+   and the account into shell variables, so no command prints them.
+
+   ```bash
+   role="$(aws iam get-role --role-name marketlake-deploy --query Role.Arn --output text --profile marketlake-admin)"
+   ```
+
+   ```bash
+   instance="$(aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture Name=instance-state-name,Values=running --query 'Reservations[].Instances[].InstanceId' --output text --profile marketlake-admin --region us-east-1)"
+   ```
+
+   ```bash
+   account="$(aws sts get-caller-identity --query Account --output text --profile marketlake-admin)"
+   ```
+
+   `ssm:SendCommand` with `AWS-RunShellScript` must print `implicitDeny`.
+
+   ```bash
+   aws iam simulate-principal-policy --policy-source-arn "$role" --action-names ssm:SendCommand --resource-arns "arn:aws:ssm:us-east-1::document/AWS-RunShellScript" --query 'EvaluationResults[].EvalDecision' --output text --profile marketlake-admin
+   ```
+
+   With `marketlake-deploy`, a send to the VM must be allowed only with the tag in the
+   context. The first command must print `allowed` and the second `implicitDeny`.
+
+   ```bash
+   aws iam simulate-principal-policy --policy-source-arn "$role" --action-names ssm:SendCommand --resource-arns "arn:aws:ec2:us-east-1:$account:instance/$instance" --context-entries "ContextKeyName=ssm:resourceTag/marketlake:host,ContextKeyValues=capture,ContextKeyType=string" --query 'EvaluationResults[].EvalDecision' --output text --profile marketlake-admin
+   ```
+
+   ```bash
+   aws iam simulate-principal-policy --policy-source-arn "$role" --action-names ssm:SendCommand --resource-arns "arn:aws:ec2:us-east-1:$account:instance/$instance" --query 'EvaluationResults[].EvalDecision' --output text --profile marketlake-admin
+   ```
+
+   The same send on the document must print `allowed`.
+
+   ```bash
+   aws iam simulate-principal-policy --policy-source-arn "$role" --action-names ssm:SendCommand --resource-arns "arn:aws:ssm:us-east-1:$account:document/marketlake-deploy" --query 'EvaluationResults[].EvalDecision' --output text --profile marketlake-admin
+   ```
+
+   The trust's `ref` condition is proven only by the live run in step 5, as it is for
+   the apply role.
+
 ## Bootstrap changes already known
 
-One open issue on the MVP 2 path changes `infra/bootstrap/`.
-[#676](https://github.com/l3a0/marketlake/issues/676) adds a deploy role, and follows the
-order under [Changing the bootstrap](#changing-the-bootstrap). The issue carries its own
-scope.
-
+No open issue on the MVP 2 path changes `infra/bootstrap/`.
 [#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
-also changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to
-accept a second environment, and its body gives the order for that change.
+changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to accept a
+second environment, and its body gives the order for that change.

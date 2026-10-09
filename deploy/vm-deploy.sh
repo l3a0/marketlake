@@ -6,9 +6,8 @@
 #
 #     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]
 #
-# The owner runs it by hand. It is also built for the CI half of #676, pull request #854,
-# which once merged runs it through SSM Run Command after the owner approves a merge's
-# deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
+# The owner runs it by hand, and the CI half of #676 runs it through SSM Run Command,
+# by way of infra/live/deploy-step.sh, after the owner approves a merge's deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
 # lists every line with what the owner does next. The progress goes to
 # /var/lib/marketlake/deploy.log, mode 0600, because a line from the bootstrap can carry a
 # config value and SSM keeps only the start of stdout.
@@ -72,7 +71,7 @@
 # back ends before that span opens. A test checks the sum against the window's margin.
 #
 # Unlike the refusals of the other deploy/ scripts, every last line goes to stdout, the
-# usage error included, because the CI side is built to read the host's outcome from
+# usage error included, because the CI side reads the host's outcome from
 # there. It prints that line in a public log, so the line holds only this script's own
 # words, shas and counts, never
 # a config value, a host path or a line of a step's output. A reason names the failed
