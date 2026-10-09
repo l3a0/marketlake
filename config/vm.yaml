@@ -20,7 +20,10 @@
 # 2026-10-07 (decision 1 on #755), to be set once du was measured per surface. #786 measured
 # it on 2026-10-08, and chains were nearly all of each session's growth, so 22 stands. The
 # render refuses a value under the floor that the readers of sealed chains need, which
-# lake.window derives. Removing the key stops both the checkpoint and the trim.
+# lake.window derives. The key also picks what `lake.bucket restore` brings back: with it,
+# the restore rebuilds this trimmed lake from the bucket, #785. Removing the key stops the
+# checkpoint and the trim, and makes the restore bring back the whole lake, which does not fit
+# the volume once trimming has run.
 role: primary
 lake_root: /srv/marketlake
 token_store: store

@@ -149,9 +149,10 @@ instead, and the procedure after the steps says what changes for it.
 1. Create an access key for the user `marketlake-command` in the AWS console. The key stays
    out of code, so no secret reaches the infrastructure's state. A key made minutes ago may
    not be active yet.
-2. Put the key and the role's ARN in `config.yaml`, run the first upload, restore the whole
-   lake once from the bucket with the `restore` command below, and only then change
-   `backup_target`.
+2. Put the key and the role's ARN in `config.yaml`, run the first upload, restore the lake
+   once from the bucket with the `restore` command below, and only then change
+   `backup_target`. The laptop's config sets no `lake_window_sessions`, so that restore
+   brings back the whole lake.
 
 The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target` ends in
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
@@ -237,7 +238,7 @@ by mistake, refuses with one line naming both fixes: attach the instance profile
 
 Five commands go with the bucket. The first two and the range restore refuse with exit 2 on a
 shadow host, which is any host whose config sets `role` to something other than `primary`.
-The whole-lake restore runs on either.
+The restore, command 3, runs on either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -264,27 +265,48 @@ The whole-lake restore runs on either.
    upload refuses with a line naming it. `networkQuality -s`, built into macOS, measures
    upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
-   downloads the current version of every object into `<dest>`, which must be empty or
-   not exist yet, and verifies each file before `<dest>` is filled. A file the manifest
-   records must match its latest entry, and any other file must match the SHA-256 S3
-   stored when it was uploaded. A journal segment whose day the manifest records as
-   compacted stays out, so the restored lake holds what the lake it came from holds. The
-   download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
-   files are moved up into `<dest>` only once every file has verified, with
-   `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
-   no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working
-   directory and downloads only what is not already there and correct, and a run killed
-   while moving files in finishes the move. Before moving anything it checks that each
-   verified file is still there at its recorded size, and refuses when `<dest>` has
-   gained a `manifest.jsonl` or a name it is about to move in, which is what a daemon
-   started on that root looks like. It refuses with exit 2 when `<dest>` holds
-   anything but `lost+found` and the working directory, which keeps it off a live lake,
-   when `<dest>` is a symbolic link, and when its filesystem is too small. Two keys that
-   differ only by case are named as failures, because on macOS one would overwrite the
-   other. A year-end lake
-   is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
-   empty `lake_root` is seeded. This restore uploads nothing and takes no lock, which is why
-   a shadow host may run it.
+   downloads the current version of every object into `<dest>`, less what the next
+   sentences leave out. `<dest>` must be empty or not exist yet, and the restore verifies
+   each file before it fills `<dest>`. A file the manifest records must match its latest
+   entry, and any other file must match the SHA-256 S3 stored when it was uploaded. A
+   journal segment whose day the manifest records as compacted stays out, so the restore
+   brings back no segment the lake already compacted. On a host whose config sets no
+   `lake_window_sessions`, such as the laptop, the restored lake holds every file the
+   bucket's manifest records, including any partition the hosted VM trimmed. On a host
+   whose config sets the key, which is the hosted VM, the restore rebuilds that host's
+   trimmed lake ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out
+   each partition the bucket's `trimmed.jsonl` says was removed on purpose, so the
+   restored lake holds what the bucket holds, less those. A partition trimmed after the
+   ledger last uploaded comes back, and the next trim removes it again. A removed
+   partition the bucket no longer holds is named on its own line and fails nothing. A
+   malformed window key, or one under the smallest window the lake's own readers need,
+   refuses with exit 2 before any request. For a one-off whole-lake restore on such a
+   host, pass `--config` naming a copy of `config.yaml` with the `lake_window_sessions`
+   line deleted, not blanked, since a blank value refuses. The VM's restore reaches the
+   bucket through its instance profile and uses none of the four secrets every config
+   holds, so placeholder values serve for those in that copy. The download lands in a
+   hidden working directory, `<dest>/.marketlake-restoring`, and its files are moved up
+   into `<dest>` only once every file has verified, with `manifest.jsonl` moved last. A
+   file that fails is named on its own line, `<dest>` gets no `manifest.jsonl`, and the
+   command exits 1. Running it again resumes in the working directory and downloads only
+   what is not already there and correct, and a run killed while moving files in finishes
+   the move. Before moving anything it checks that each verified file is still there at
+   its recorded size, and refuses when `<dest>` has gained a `manifest.jsonl` or a name it
+   is about to move in, which is what a daemon started on that root looks like. It refuses
+   with exit 2 when `<dest>` holds anything but `lost+found` and the working directory,
+   which keeps it off a live lake, when `<dest>` is a symbolic link, and when its
+   filesystem is too small. Too small means short of the download, or short of the
+   download plus the journal reserve, 13 times the busiest sealed day in the bucket, which
+   the next session's journal needs on the same volume. The reserve line says how much to
+   free. On the hosted VM it also names the fix: raise `lake_volume_gib`, apply, and rerun
+   the bootstrap, as [infra/README.md](infra/README.md) says. On a host that keeps a
+   window, the restore also refuses with exit 2, before any data file downloads, when the
+   bucket's manifest records a `trimmed.jsonl` the bucket lacks, or one that is damaged or
+   does not match the manifest's entry. A bucket whose manifest records no `trimmed.jsonl`
+   does not refuse. Two keys that differ only by case are named as failures, because on
+   macOS one would overwrite the other. A year-end lake is about 154 GB. `<dest>` may be a
+   volume's mount point, which is how a new host's empty `lake_root` is seeded. This
+   restore uploads nothing and takes no lock, which is why a shadow host may run it.
 4. `uv run python -m lake.bucket restore-range --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30`
    puts chosen chains or quotes partitions back into the live lake at `lake_root`, for a
    partition lost by accident or a rollback of trimming. Leave out `--ticker` to take every
@@ -353,6 +375,16 @@ no `s3:GetObjectVersion`, so this is a console step.
    restore again. It finds the manifest's hash there and does not download the damaged
    current version. A file the manifest does not record is checked against the current
    version's stored checksum instead, so an earlier version of one never verifies.
+
+On a host that keeps a window, the restore reads the bucket's `trimmed.jsonl` before any data
+file, and the same repair covers it. A nightly upload stopped between the ledger's PUT and the
+manifest's leaves the ledger newer than the bucket manifest's entry. The restore then refuses,
+names the entry's SHA-256, and leaves `<dest>/.marketlake-restoring` holding the bucket's
+`manifest.jsonl`. Recover the version with that SHA-256 by steps 1 to 3 and put it at
+`<dest>/.marketlake-restoring/trimmed.jsonl`. The next run reads it there and sends no
+request for the bucket's copy. When the bucket holds no current `trimmed.jsonl` at all, put
+the matching version back as the current one, as the next procedure describes, checking the
+download against the SHA-256 the refusal names.
 
 **Putting a version back for the range restore.** The range restore reads current versions
 only, so a partition it refuses because the bucket's current version does not match the

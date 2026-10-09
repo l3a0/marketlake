@@ -1570,7 +1570,7 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
 A restore is not part of the first boot. The shadow day captures beside the laptop and
 needs no history. [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover filled the
 VM's lake by emptying the shadow lake with `deploy/vm-empty-shadow-lake.sh` and then
-restoring from the bucket. Two facts hold for any
+restoring from the bucket. Four facts hold for any
 restore onto the VM.
 
 1. The instance role reads the bucket from the first boot, so `bucket restore` runs on
@@ -1579,6 +1579,26 @@ restore onto the VM.
    [`replace_instance`](#replace-the-instance-and-the-approval-window). The shim is in
    the instance's `ignore_changes`, so a kept instance never learns a new volume's id,
    and its bootstrap would wait for the old device.
+3. `config/vm.yaml` sets `lake_window_sessions`, and the bootstrap renders it into
+   `config.yaml`, so the VM's restore rebuilds its trimmed lake
+   ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out each partition
+   the bucket's `trimmed.jsonl` says the VM removed on purpose, and the rest fits the
+   volume once trimming runs. A failed render writes nothing. On a new instance that
+   leaves no `config.yaml`, and the restore exits 2 on the missing file rather than
+   falling back to a whole-lake restore. On a kept instance the restore reads the file the
+   last good render wrote, which sets the key too. The "When the lake is gone" steps in
+   [README.md](../README.md) say how to repair a refusal over the bucket's
+   `trimmed.jsonl`. A one-off whole-lake restore passes `--config` naming a copy of
+   `config.yaml` with the `lake_window_sessions` line deleted, not blanked, since a blank
+   value refuses, and passes `--target` naming the bucket. The VM reaches the bucket
+   through its instance profile, so the copy can hold placeholder values for the four
+   secrets and no secret is copied.
+4. The restore refuses, with exit 2 and before any download, when the volume would be left
+   with less free space than the journal reserve, 13 times the busiest sealed day in the
+   bucket. Grow the lake volume first, as item 3 under
+   [Rerun the bootstrap](#rerun-the-bootstrap) says: raise `lake_volume_gib`, apply, and
+   rerun the bootstrap so `resize2fs` grows the filesystem. Then run the restore again. A
+   whole-lake restore needs more room, not less.
 
 The order depends on the `role` in `config/vm.yaml`.
 
