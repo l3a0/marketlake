@@ -160,7 +160,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from lake import bucket, journal, outbox
+from lake import bucket, journal, outbox, trimmed
 from lake.alert import REFUSED, Message, Publisher
 from lake.calendar import Calendar, ExchangeCalendar
 from lake.chain_plan import ChainPlan, Window, default_chain_plan_path, load_chain_plan
@@ -256,6 +256,12 @@ DAMAGED_SEGMENT_TITLE = "Damaged segment at the merge"
 # widest damage is the page that never arrives. The files under
 # ``reports/damaged_segments/`` name every segment either way.
 PAGE_SEGMENT_CAP = 4
+
+# The event and title on the page compaction sends when the trimmed ledger's manifest entry
+# could not be re-recorded before the upload (marketlake #787). The ledger, not a segment,
+# is what refused, so it carries neither constant above.
+TRIMMED_LEDGER_EVENT = "compaction_trimmed_ledger"
+TRIMMED_LEDGER_TITLE = "Trimmed ledger not repaired"
 
 # Why a ticker-day was refused, one value per refusal the sweep catches.
 # ``RefusedTickerDay.reason`` carries it, and ``CompactionResult.render`` words each one.
@@ -581,6 +587,19 @@ class RetuneResult:
 
 
 @dataclass(frozen=True)
+class LedgerRepair:
+    """What compaction's repair of the trimmed ledger's manifest entry did.
+
+    ``rerecorded`` is true when the entry was re-recorded from the ledger's bytes, which
+    appends one manifest line. ``refusal`` is the refusal's text when the repair could not
+    run, which names the hand repair. Exactly one of the two is set.
+    """
+
+    rerecorded: bool
+    refusal: str | None = None
+
+
+@dataclass(frozen=True)
 class CompactionResult:
     """What one close+15 run did.
 
@@ -595,6 +614,10 @@ class CompactionResult:
     and ``render`` then says the backup was skipped. ``problem`` names a ping that failed,
     which leaves ``pinged`` false. The seal and the backup already happened, so the run's
     report is worth more than the lost ping.
+
+    ``ledger_repair`` is what the repair of the trimmed ledger's manifest entry did before
+    the backup, or ``None`` when there was nothing to repair, which includes every host with
+    no ``trimmed.jsonl``.
     """
 
     sealed: tuple[SealedPartition, ...]
@@ -605,6 +628,7 @@ class CompactionResult:
     pinged: bool
     problem: str | None = None
     refused: tuple[RefusedTickerDay, ...] = ()
+    ledger_repair: LedgerRepair | None = None
 
     @property
     def changed(self) -> bool:
@@ -619,10 +643,14 @@ class CompactionResult:
         inside the lake and inside the backup sync root, so the run did change the lake.
         A run whose every ticker-day was refused would otherwise report itself the way an
         already-sealed lake does.
+
+        A re-recorded trimmed-ledger entry counts, because it appends a manifest line. A
+        refused repair alone does not, because it writes nothing.
         """
         debris = any(item.segments for item in self.verified)
         rewrote = self.retune is not None and self.retune.written
-        return bool(self.sealed) or bool(self.refused) or debris or rewrote
+        repaired = self.ledger_repair is not None and self.ledger_repair.rerecorded
+        return bool(self.sealed) or bool(self.refused) or debris or rewrote or repaired
 
     def render(self) -> str:
         """A human-readable summary. It names slugs and paths, never a ping URL."""
@@ -670,6 +698,11 @@ class CompactionResult:
                 f"  retune   {self.retune.day.isoformat()} {verdict}: "
                 f"splits={list(self.retune.splits)} merges={list(self.retune.merges)}"
             )
+        if self.ledger_repair is not None:
+            if self.ledger_repair.rerecorded:
+                lines.append("  ledger   re-recorded the trimmed ledger's manifest entry")
+            else:
+                lines.append(f"  ledger   not repaired: {self.ledger_repair.refusal}")
         return "\n".join(lines)
 
 
@@ -1322,6 +1355,43 @@ def _page_drift(
         what="schema-drift",
         now=now,
     )
+
+
+def _repair_trimmed_ledger(
+    root: Path, *, clock: Clock, publisher: Publisher | None
+) -> LedgerRepair | None:
+    """Re-record the trimmed ledger's manifest entry before the upload reads it.
+
+    A trim or range-restore line that landed without its entry refresh leaves the entry's
+    sha behind the bytes. Behind the watermark the upload carries on and the bucket's copy
+    of the ledger lags. Past it the upload raises ``ChecksumRefused`` every night, the ping
+    is withheld, and the trim that would write the next line never runs again. So the repair
+    runs here, after the re-tune and just before ``backup.sync``, the one step it has to
+    precede. It does not run at the start of the lock hold, where the sweep and the manifest
+    read have no ``try`` around them and a raise would leave every journal unsealed.
+
+    ``trimmed.repair_trimmed_entry`` is the gate on the ledger existing. It returns before
+    reading anything on a host with no ``trimmed.jsonl``, so that host stays byte-identical,
+    and the gate is the ledger rather than the window key because a rolled-back host keeps
+    its ledger after the key is removed. Every failure it meets raises
+    ``TrimmedRepairRefused``, which this pages once and returns, so the backup still runs.
+    """
+    try:
+        rerecorded = trimmed.repair_trimmed_entry(
+            root, source=COMPACTION_SOURCE, fetched_at=clock.now().isoformat()
+        )
+    except trimmed.TrimmedRepairRefused as exc:
+        refusal = str(exc)
+        _page(
+            publisher,
+            event=TRIMMED_LEDGER_EVENT,
+            title=TRIMMED_LEDGER_TITLE,
+            body=refusal,
+            what="trimmed-ledger",
+            now=clock.now(),
+        )
+        return LedgerRepair(rerecorded=False, refusal=refusal)
+    return LedgerRepair(rerecorded=True) if rerecorded else None
 
 
 def _write_partition(table: pa.Table, partition: Path) -> None:
@@ -2210,6 +2280,9 @@ def compact(
                 refused=refused,
             )
 
+        # The trimmed ledger's entry has to match its bytes before the upload reads it.
+        ledger_repair = _repair_trimmed_ledger(root, clock=clock, publisher=publisher)
+
         # Backup first. A raised backup propagates before the ping, so a single-copy
         # window pages through the missed ping rather than being reported as healthy.
         backed_up = False
@@ -2241,6 +2314,7 @@ def compact(
         backed_up=backed_up,
         pinged=pinged,
         problem=problem,
+        ledger_repair=ledger_repair,
     )
 
 
@@ -2465,6 +2539,7 @@ __all__ = [
     "DAMAGED_SEGMENT_EVENT",
     "DAMAGED_SEGMENT_TITLE",
     "DamagedSegments",
+    "LedgerRepair",
     "PAGE_SEGMENT_CAP",
     "PartitionMismatch",
     "REFUSED_SEGMENT_DAMAGED",
@@ -2478,6 +2553,8 @@ __all__ = [
     "SealedPartition",
     "SegmentSchemaConflict",
     "SkippedDay",
+    "TRIMMED_LEDGER_EVENT",
+    "TRIMMED_LEDGER_TITLE",
     "WindowProfile",
     "build_parser",
     "compact",
