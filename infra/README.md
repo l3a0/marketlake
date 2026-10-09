@@ -1754,6 +1754,13 @@ Changes to the instance itself stop capture too. A changed `instance_type` stops
 starts the instance, and a replacement of the instance or of the volume's attachment
 stops it.
 
+On a weekday evening an apply that stops the instance or cuts its egress also kills the
+upload after the vendor sweep, which runs in the eod-sweep unit from about 18:32 ET
+([#833](https://github.com/l3a0/marketlake/issues/833)). That loses nothing, since the
+bucket's manifest goes up last and the next upload re-sends what is pending, but it
+pages "Evening upload". Approve once `systemctl is-active com.marketlake.eod-sweep.service`
+on the VM prints `inactive`.
+
 A new instance comes only from a manual run with the `replace_instance` input set. It
 adds `-replace=aws_instance.vm` to the apply's plan and names no other address, so the
 lake volume and its data stay. The laptop apply could replace the instance too, but it

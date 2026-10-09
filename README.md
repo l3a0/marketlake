@@ -462,6 +462,10 @@ moves or the install runs, the timer jobs, the compaction the daemon starts at c
 and any module the running daemon imports for the first time all run the new code. A
 deploy therefore waits for the session's close before it updates the checkout or installs,
 not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
+On a weekday evening it also waits for the upload after the vendor sweep, which runs in the
+eod-sweep unit from about 18:32 ET and can run past 20:00 on a night it retries a failed
+seal ([#833](https://github.com/l3a0/marketlake/issues/833)). Once it has finished,
+`systemctl is-active com.marketlake.eod-sweep.service` prints `inactive`.
 
 Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern
 time:
