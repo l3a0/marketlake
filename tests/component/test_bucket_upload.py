@@ -446,6 +446,49 @@ def test_a_non_bucket_error_from_the_get_re_raises(tmp_path):
         nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
 
 
+# -- added by the mutation lens on PR #840 ----------------------------------------------
+
+
+def test_an_os_error_that_is_not_a_bucket_failure_re_raises(tmp_path):
+    # BucketReadError is an OSError, so a catch widened to OSError would swallow this bug
+    # into the neutral line.
+    client = _ManifestS3()
+    lake, _ = _foreign_lake(tmp_path, client)
+    client.get_error = PermissionError("a real bug")
+
+    with pytest.raises(PermissionError):
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+
+def test_the_foreign_count_leaves_out_tail_entries_the_lake_recorded(tmp_path):
+    client = FakeS3()
+    lake = _lake(tmp_path / "lake")
+    _seed(lake, client)
+    raw = manifest_path(lake).read_bytes()
+    # The bucket's tail repeats one of the lake's own lines, then holds another host's.
+    client.store(_key("manifest.jsonl"), raw + raw[: raw.index(b"\n") + 1] + _vm_line())
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "then holds 2 entries from" in message
+    assert "1 of the bucket's are entries this lake never recorded" in message
+
+
+def test_a_copy_larger_than_one_read_chunk_is_read_whole(tmp_path, monkeypatch):
+    # The live manifest runs to megabytes, past bucket_reader's 1 MiB chunk. A read of the
+    # first chunk alone fails the HEAD's hash and reads as a copy changed mid-read.
+    monkeypatch.setattr(bucket, "_READ_CHUNK", 64)
+    client = FakeS3()
+    lake, _ = _foreign_lake(tmp_path, client)
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert "never recorded" in str(refused.value)
+
+
 # -- 1, 5, 6. what goes up, in what order, and only once -------------------------
 
 

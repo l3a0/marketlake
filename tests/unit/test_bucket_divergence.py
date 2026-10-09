@@ -234,3 +234,33 @@ def test_a_fused_line_inside_the_shared_bytes_does_not_stop_the_count():
     assert split.shared == 2
     assert _foreign(split) == [(VM, "f" * 64)]
     assert (split.bucket_first, split.lake_first) == (VM, LAPTOP)
+
+
+# -- added by the mutation lens on PR #840 ---------------------------------------------
+
+
+def test_a_copy_saved_with_crlf_endings_shares_nothing():
+    # A hand repair saved by an editor that writes CRLF differs from the lake on A's own
+    # newline byte, so no whole line is shared.
+    split = bucket_divergence((A + B).replace(b"\n", b"\r\n"), A + B)
+
+    assert (split.shared_bytes, split.shared) == (0, 0)
+    assert (split.bucket_tail, split.lake_tail) == (2, 2)
+    assert split.bucket_first == json.loads(A)["partition"]
+    assert split.foreign == ()
+
+
+def test_a_tail_entry_the_lake_recorded_inside_the_shared_bytes_is_not_foreign():
+    # The bucket's tail repeats a pair the lake recorded before the two parted.
+    split = bucket_divergence(A + B + A, A + B + C)
+
+    assert split.shared_bytes == len(A + B)
+    assert split.bucket_tail == 1
+    assert split.foreign == ()
+
+
+def test_two_different_non_string_shas_on_one_path_both_read_as_none():
+    path = json.loads(C)["partition"]
+    split = bucket_divergence(A + _line(path, ["rotted"]), A + _line(path, 7))
+
+    assert split.foreign == ()

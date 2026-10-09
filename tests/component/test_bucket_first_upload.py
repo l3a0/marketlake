@@ -620,3 +620,62 @@ def test_a_hand_repaired_copy_is_still_re_baselined(tmp_path, monkeypatch, capsy
     assert client.body(MANIFEST_KEY) == raw
     # Read once before the listing and once under the lock.
     assert len(_gets(client)) == 2
+
+
+# -- added by the mutation lens on PR #840 ----------------------------------------------
+
+
+def test_exactly_three_foreign_entries_are_counted_alone_and_named_with_no_more(
+    tmp_path, monkeypatch, capsys
+):
+    lake, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    # The tail repeats one line this lake recorded, so the tail is 4 and the foreign 3.
+    own = seeded[: seeded.index(b"\n") + 1]
+    client.store(MANIFEST_KEY, seeded + own + b"".join(_entry(rel) for rel in FOREIGN[:3]))
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    named = ", ".join(repr(rel) for rel in FOREIGN[:3])
+    assert f"holds 3 entries this lake never recorded ({named})," in line
+    assert "more" not in line
+
+
+def test_the_check_under_the_lock_reads_the_ledger_as_it_stands_then(
+    tmp_path, monkeypatch, capsys
+):
+    # After the unlocked guard, the lake records a new partition and the bucket's copy is
+    # hand repaired to the lake's new manifest with its first byte damaged. Every entry in
+    # it is in the lake under the lock, so the run re-baselines rather than refuse.
+    lake, config = _setup(tmp_path)
+    client = _ManifestS3()
+    assert _main(config, client, monkeypatch) == 0
+    path = LakePaths(lake).chains_partition_path("SPY", date(2026, 8, 31))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(sample_chains_table(), path)
+    rel = path.relative_to(lake).as_posix()
+
+    def repaired_after_first_head():
+        client.after_head = None
+        append_manifest(
+            lake,
+            partition=rel,
+            source="compaction",
+            sha256=sha256_file(path),
+            rows=1,
+            fetched_at=None,
+        )
+        raw = manifest_path(lake).read_bytes()
+        client.store(MANIFEST_KEY, b"#" + raw[1:])
+
+    client.after_head = repaired_after_first_head
+    client.calls.clear()
+
+    assert _main(config, client, monkeypatch) == 0
+
+    assert client.body(MANIFEST_KEY) == manifest_path(lake).read_bytes()
