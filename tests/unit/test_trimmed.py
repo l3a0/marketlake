@@ -3,24 +3,29 @@
 Marketlake #782. A designed absence is a partition whose latest manifest sha equals the sha on
 its latest trimmed line, where that latest line is a trim line. Every reader of the lake that
 meets an absent file asks ``is_designed_absence``, so this file checks the predicate's table and
-that it decides from data alone, with no file on disk to stat.
+that it decides from data alone, with no file on disk to stat. It also checks
+``parse_trimmed``, the parse of a ledger's bytes that marketlake #785's restore reads the
+bucket's copy with, and that ``read_trimmed`` goes through it.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
 import os
 from pathlib import Path
 
 import pytest
 
-from lake.manifest import ManifestError
+from lake import trimmed as trimmed_module
+from lake.manifest import LedgerHasByteOrderMark, LedgerNotUtf8, ManifestError, TornLedger
 from lake.trimmed import (
     KIND_FIELD,
     RESTORE_KIND,
     TRIM_KIND,
     is_designed_absence,
     latest_by_partition,
+    parse_trimmed,
     restore_line,
     trim_line,
 )
@@ -176,3 +181,62 @@ def test_the_schema_has_a_trim_kind_and_a_restore_kind_and_no_hold():
 def test_a_line_naming_no_usable_partition_refuses_by_position(line, says):
     with pytest.raises(ManifestError, match=says):
         latest_by_partition([_trim(), line])
+
+
+# -- parsing a ledger's bytes --------------------------------------------------------
+#
+# Marketlake #785. The restore parses the bucket's copy of the ledger, which has no lake root, so
+# ``parse_trimmed`` takes bytes. ``read_trimmed`` calls it, so the damage refusals stay one
+# implementation.
+
+
+def _ledger(*lines: dict) -> bytes:
+    return "".join(json.dumps(line, sort_keys=True) + "\n" for line in lines).encode()
+
+
+def test_parse_trimmed_reads_whole_lines_and_discards_a_torn_tail():
+    raw = _ledger(_trim(), _restore()) + b'{"kind": "tr'
+
+    assert parse_trimmed(raw, "trimmed.jsonl") == [_trim(), _restore()]
+
+
+@pytest.mark.parametrize(
+    ("raw", "refusal"),
+    [
+        pytest.param(
+            _ledger(_trim()) + b'{"kind": "tr\n' + _ledger(_restore()),
+            TornLedger,
+            id="hidden-tear",
+        ),
+        pytest.param(b"\xff\n", LedgerNotUtf8, id="bad-utf8"),
+        pytest.param(b"\xef\xbb\xbf" + _ledger(_trim()), LedgerHasByteOrderMark, id="bom"),
+    ],
+)
+def test_parse_trimmed_refuses_damage_in_this_ledgers_words(raw, refusal):
+    with pytest.raises(refusal) as refused:
+        parse_trimmed(raw, "trimmed.jsonl")
+
+    message = str(refused.value)
+    assert "trimmed.jsonl" in message
+    assert "trimmed on purpose" in message
+
+
+def test_read_trimmed_parses_through_parse_trimmed(tmp_path, monkeypatch):
+    """Equal answers would also pass for a copy of the parse, so the call itself is checked.
+
+    Mutation this catches: ``read_trimmed`` keeping a parse of its own, which the restore's
+    reading of the bucket's copy would then not share.
+    """
+    raw = _ledger(_trim())
+    (tmp_path / "trimmed.jsonl").write_bytes(raw)
+    calls: list[tuple[bytes, Path]] = []
+    answer = [{"partition": "from the stand-in"}]
+
+    def stand_in(data: bytes, path: Path | str) -> list[dict]:
+        calls.append((data, Path(path)))
+        return answer
+
+    monkeypatch.setattr(trimmed_module, "parse_trimmed", stand_in)
+
+    assert trimmed_module.read_trimmed(tmp_path) is answer
+    assert calls == [(raw, tmp_path / "trimmed.jsonl")]

@@ -34,8 +34,11 @@ directory outside the live lake, so nothing in the live lake needs such a hold.
 
 A **designed absence** is a partition whose latest manifest sha equals the sha on its latest
 trimmed line, where that latest line is a trim line. A trim line beside a file that is still
-present, which a crash between the line and the unlink leaves, reads as present, because callers
-ask only about a file they already found absent. Any other missing file is still lost.
+present, which a crash between the line and the unlink leaves, reads as present to every reader
+of the lake, because such a reader asks only about a file it already found absent. The rebuild in
+``lake.bucket.restore_lake`` asks about every key the bucket lists, and leaves out each one this
+calls designed, because the lake it rebuilds removed that file on purpose (marketlake #785). Any
+other missing file is still lost.
 
 Times are injected. Every stamp is passed in by the caller as text. Nothing here reads a clock.
 """
@@ -179,14 +182,29 @@ def read_trimmed(lake_root: Path) -> list[dict]:
     path = trimmed_path(lake_root)
     if not path.exists():
         return []
+    return parse_trimmed(path.read_bytes(), path)
+
+
+def parse_trimmed(raw: bytes, path: Path | str) -> list[dict]:
+    """The trimmed-ledger lines ``raw`` holds, in file order, with a torn trailing line discarded.
+
+    This is :func:`read_trimmed`'s parse with no file read, so the ledger's damage refusals are
+    one implementation. A read that stops in the body raises ``TornLedger``, bytes that do not
+    decode raise ``LedgerNotUtf8``, and a byte-order mark raises ``LedgerHasByteOrderMark``.
+    ``path`` only names the ledger in those refusals.
+
+    The restore in :mod:`lake.bucket` parses the bucket's copy of the ledger through this, and
+    that copy has no lake root for :func:`read_trimmed` to take.
+    """
+    where = Path(path)
     text = _decode(
-        path,
-        path.read_bytes(),
+        where,
+        raw,
         consequence=_UTF8_CONSEQUENCE,
         mark_consequence=_MARK_CONSEQUENCE,
     )
     entries = parse_jsonl(text)
-    _refuse_hidden_entries(path, text, entries, consequence=_HIDDEN_CONSEQUENCE)
+    _refuse_hidden_entries(where, text, entries, consequence=_HIDDEN_CONSEQUENCE)
     return entries
 
 
@@ -235,8 +253,12 @@ def is_designed_absence(
     **This takes data and never stats a file.** ``manifest_latest`` is the manifest's latest
     entry per partition and ``trimmed_latest`` is :func:`latest_by_partition`'s answer. So a
     rebuild can ask it about the bucket's copies of both ledgers, where no local file exists.
-    Callers ask it only about a file they already found absent. A trim line beside a present file
-    is what a crash between the line and the unlink leaves, and that file is present.
+
+    A reader of the lake asks it only about a file it already found absent. A trim line beside a
+    present file is what a crash between the line and the unlink leaves, and that file is
+    present. The rebuild in ``lake.bucket.restore_lake`` is the one caller that asks about a file
+    it can see. It asks about every key the bucket lists, since the bucket never deletes and
+    still holds each trimmed partition, and leaves out each key this calls designed.
 
     The sha comparison is what keeps a re-sealed partition honest. Should a partition be trimmed
     and later receive a new manifest entry with different bytes, the old trim line no longer
@@ -536,6 +558,7 @@ __all__ = [
     "is_designed_absence",
     "latest_by_partition",
     "latest_trimmed",
+    "parse_trimmed",
     "read_trimmed",
     "refresh_trimmed_entry",
     "repair_trimmed_entry",

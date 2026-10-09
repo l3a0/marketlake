@@ -1,14 +1,21 @@
 """The disk runway: what the lake holds, how fast it grows, and how long the disk lasts.
 
-Three consumers read this module and it is deliberately a leaf, importing only the standard
-library, :mod:`lake.calendar` and :mod:`lake.paths`. The dashboard's Lake panel renders
-what it returns. The evening sweep, :mod:`lake.sweep`, files an ``action`` line in the
-nightly report when the headroom runs under ``HEADROOM_WEEKS`` and pages when it runs under
-``PAGE_FLOOR_WEEKS``, which is marketlake #438. The range restore in :mod:`lake.bucket`
-refuses a restore that would leave less than the journal reserve free, through
-:func:`reserve_shortfall` (marketlake #784). One computation with several consumers is the
-point: independent ones would drift, and a panel and an alarm disagreeing about how long
-the disk lasts is worse than either being wrong alone.
+Four consumers read this module and it is deliberately a leaf, importing only the standard
+library, :mod:`lake.calendar` and :mod:`lake.paths`.
+
+1. The dashboard's Lake panel renders what it returns.
+2. The evening sweep, :mod:`lake.sweep`, files an ``action`` line in the nightly report when
+   the headroom runs under ``HEADROOM_WEEKS`` and pages when it runs under
+   ``PAGE_FLOOR_WEEKS``, which is marketlake #438.
+3. The range restore in :mod:`lake.bucket` refuses a restore that would leave less than the
+   journal reserve free, through :func:`reserve_shortfall` (marketlake #784).
+4. The ``restore`` command in :mod:`lake.bucket` refuses the same way on the directory it
+   fills, with the busiest sealed day read off the bucket's listing by
+   :func:`listing_busiest_sealed_day` (marketlake #785).
+
+One computation with several consumers is the point: independent ones would drift, and a
+panel and an alarm disagreeing about how long the disk lasts is worse than either being
+wrong alone.
 
 That is also why it is a module of its own rather than a part of :mod:`lake.dashboard`.
 The sweep has no reason to import the dashboard's DuckDB query layer to read a number off
@@ -338,39 +345,38 @@ class Runway:
         return self.exhausts_on <= self.window_end + timedelta(weeks=PAGE_FLOOR_WEEKS)
 
 
-def _day_of(parts: Sequence[str]) -> date | None:
-    """The day a lake-relative path names, or ``None`` when no component names one.
+def path_day(parts: Sequence[str]) -> tuple[date | None, bool]:
+    """The day a lake-relative path's ``parts`` name, and whether the path is a journal segment.
 
-    ``parse_date_dir`` is the one date rule and it is strict, because
-    ``date.fromisoformat`` alone accepts ``20260824`` and ``2026-W35-1``. The last
-    component has ``.parquet`` stripped first, which is what ``parse_partition_rel``
-    does before handing it the same parser, "so a partition file name and a journal date
-    directory are read by one rule rather than two".
+    The day is ``None`` when no component names one, and such a path is never a segment. This is
+    the one path rule. :func:`walk` sorts every file on disk by it, and :func:`listing_usage`
+    sorts every key in a bucket listing by it, so the two readings cannot drift apart.
 
-    ``parse_partition_rel`` itself is not the caller here. It returns ``None`` for
-    ``bars``, whose path carries a ``freq=`` level and so has four components rather than
-    three, and the walk has to attribute those bytes too.
+    1. **A request timing file**, ``journal/timing/date=<D>.jsonl``, is dated by its own name and
+       is not a segment. It is the one dated file under ``journal/`` that outlives the seal.
+    2. **Any other path** is dated by its first component that parses as ``date=YYYY-MM-DD``.
+       ``parse_date_dir`` is the one date rule and it is strict, because ``date.fromisoformat``
+       alone accepts ``20260824`` and ``2026-W35-1``. The last component has ``.parquet``
+       stripped first, which is what ``parse_partition_rel`` does before handing it the same
+       parser, "so a partition file name and a journal date directory are read by one rule
+       rather than two". A dated path under ``journal/`` is a segment.
+
+    ``parse_partition_rel`` itself is not the rule here. It returns ``None`` for ``bars``, whose
+    path carries a ``freq=`` level and so has four components rather than three, and the walk
+    has to attribute those bytes too.
     """
+    if len(parts) == 3 and parts[0] == JOURNAL_DIR and parts[1] == TIMING_DIR:
+        name = parts[-1]
+        if not name.endswith(JSONL_SUFFIX):
+            return None, False
+        return parse_date_dir(name[: -len(JSONL_SUFFIX)]), False
     for index, part in enumerate(parts):
         if index == len(parts) - 1 and part.endswith(PARQUET_SUFFIX):
             part = part[: -len(PARQUET_SUFFIX)]
         day = parse_date_dir(part)
         if day is not None:
-            return day
-    return None
-
-
-def _is_timing_file(parts: Sequence[str]) -> bool:
-    """Whether a lake-relative path is a request timing file, ``journal/timing/<file>``."""
-    return len(parts) == 3 and parts[0] == JOURNAL_DIR and parts[1] == TIMING_DIR
-
-
-def _timing_day(parts: Sequence[str]) -> date | None:
-    """The day a timing file's name carries, as in ``date=2026-09-24.jsonl``."""
-    name = parts[-1]
-    if not name.endswith(JSONL_SUFFIX):
-        return None
-    return parse_date_dir(name[: -len(JSONL_SUFFIX)])
+            return day, parts[0] == JOURNAL_DIR
+    return None, False
 
 
 def walk(lake_root: Path | str) -> Usage:
@@ -466,14 +472,13 @@ def walk(lake_root: Path | str) -> Usage:
             entry = parts[0]
             entry_bytes[entry] = entry_bytes.get(entry, 0) + size
             entry_files[entry] = entry_files.get(entry, 0) + 1
-            timing = _is_timing_file(parts)
-            day = _timing_day(parts) if timing else _day_of(parts)
+            day, segment = path_day(parts)
             if day is None:
                 undated += size
             else:
                 dated += size
                 day_bytes[day] = day_bytes.get(day, 0) + size
-                if entry == JOURNAL_DIR and not timing:
+                if segment:
                     unsealed.add(day)
                     journal_bytes[day] = journal_bytes.get(day, 0) + size
 
@@ -540,15 +545,101 @@ def busiest_sealed_day(usage: Usage, *, today: date, window_days: int = GROWTH_W
     ``JOURNAL_RESERVE_SESSIONS`` times over, so each day counts its sealed bytes only. A
     window with no dated bytes answers 0.
 
-    :func:`assess` reads it for the Lake panel and the evening sweep, and the range restore in
-    :mod:`lake.bucket` reads it for :func:`reserve_shortfall`. One computation keeps the panel
-    and the refusal from disagreeing about the reserve.
+    :func:`assess` reads it for the Lake panel and the evening sweep. Both restores in
+    :mod:`lake.bucket` read it for :func:`reserve_shortfall`, the ``restore`` command through
+    :func:`listing_busiest_sealed_day`. One computation keeps the panel and the refusals from
+    disagreeing about the reserve.
     """
     start = today - timedelta(days=window_days - 1)
     return max(
         (usage.sealed_bytes(day) for day in usage.day_bytes if start <= day <= today),
         default=0,
     )
+
+
+def listing_usage(listing: Mapping[str, int]) -> Usage:
+    """What a bucket listing holds, as the :class:`Usage` :func:`walk` gives for a lake on disk.
+
+    ``listing`` maps each lake-relative key to its size, the shape ``lake.bucket.list_bucket``
+    returns. Each key is split on ``/`` and sorted by :func:`path_day`, the rule the walk uses.
+    Two kinds of key are skipped, as the walk and the restore skip them. A zero-byte key ending
+    in ``/`` is the folder marker the S3 console writes, which names no file. A key under a root
+    ``lost+found`` names the filesystem's directory rather than the lake.
+
+    Every field is filled. ``refused`` is 0 and ``refusals`` is empty, because a listing arrives
+    whole or ``list_bucket`` raises, so nothing in it is a path that would not read. Sizes are the
+    objects' logical bytes, while the walk counts allocated blocks. The two differ by under 0.1%
+    of a day. It never raises, as nothing in this module does.
+    """
+    entry_bytes: dict[str, int] = {}
+    entry_files: dict[str, int] = {}
+    day_bytes: dict[date, int] = {}
+    unsealed: set[date] = set()
+    journal_bytes: dict[date, int] = {}
+    dated = undated = files = 0
+    for key, size in listing.items():
+        if key.endswith("/") and size == 0:
+            continue
+        parts = key.split("/")
+        if parts[0] == LOST_AND_FOUND:
+            continue
+        files += 1
+        entry = parts[0]
+        entry_bytes[entry] = entry_bytes.get(entry, 0) + size
+        entry_files[entry] = entry_files.get(entry, 0) + 1
+        day, segment = path_day(parts)
+        if day is None:
+            undated += size
+            continue
+        dated += size
+        day_bytes[day] = day_bytes.get(day, 0) + size
+        if segment:
+            unsealed.add(day)
+            journal_bytes[day] = journal_bytes.get(day, 0) + size
+    return Usage(
+        entries=tuple(
+            Entry(name=name, bytes=entry_bytes[name], files=entry_files[name])
+            for name in sorted(entry_bytes)
+        ),
+        day_bytes=dict(sorted(day_bytes.items())),
+        unsealed=frozenset(unsealed),
+        journal_bytes=dict(sorted(journal_bytes.items())),
+        dated=dated,
+        undated=undated,
+        files=files,
+        refusals=(),
+        refused=0,
+    )
+
+
+def listing_busiest_sealed_day(
+    listing: Mapping[str, int], *, window_days: int = GROWTH_WINDOW_DAYS
+) -> int:
+    """The busiest sealed day in a bucket listing's window, the journal reserve's basis there.
+
+    The restore in ``lake.bucket`` fills an empty directory, which holds no sealed day to read,
+    so it reads the lake's busiest sealed day off the bucket's listing instead. This is
+    :func:`busiest_sealed_day` over :func:`listing_usage`, with the window anchored on the
+    listing itself rather than on a clock, so the restore needs none.
+
+    **The window ends at the newest day whose sealed bytes are above 0.** Three other anchors
+    each fail on a lake a restore meets.
+
+    1. Today would leave the window empty for a host dead 30 days, the reserve at 0, and the
+       check passing on nothing, on the recovery path.
+    2. The newest day outside ``Usage.unsealed`` would let one leftover segment pull the end
+       back. The bucket keeps every segment it ever uploaded, and a day that sealed most tickers
+       while compaction refused one is both unsealed and possibly the busiest.
+    3. The oldest day would measure the lake's first month rather than its latest.
+
+    The price is that a key dated in the future would move the window, and nothing in the lake
+    writes one. A listing with no sealed bytes on any day answers 0.
+    """
+    usage = listing_usage(listing)
+    newest = max((day for day in usage.day_bytes if usage.sealed_bytes(day) > 0), default=None)
+    if newest is None:
+        return 0
+    return busiest_sealed_day(usage, today=newest, window_days=window_days)
 
 
 def reserve_shortfall(*, free: int, planned: int, busiest_sealed_day: int) -> int:
@@ -562,8 +653,9 @@ def reserve_shortfall(*, free: int, planned: int, busiest_sealed_day: int) -> in
 
     The busiest sealed day is an argument rather than read from the disk here, because the two
     callers find it differently. The range restore in :mod:`lake.bucket` adds partitions to a
-    live lake and reads it with :func:`busiest_sealed_day`. Marketlake #785 rebuilds an empty
-    volume, which holds no sealed day to read, and derives it from the bucket's listing.
+    live lake and reads it with :func:`busiest_sealed_day`. The ``restore`` command fills an
+    empty directory, which holds no sealed day to read, so it reads it off the bucket's listing
+    with :func:`listing_busiest_sealed_day`.
     """
     reserve = JOURNAL_RESERVE_SESSIONS * busiest_sealed_day
     return max(0, reserve - (free - planned))

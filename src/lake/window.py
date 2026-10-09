@@ -2,9 +2,14 @@
 
 Marketlake #755 keeps only a window of recent sessions on the hosted VM's lake volume and
 leaves older partitions in the backup bucket. One config key, ``lake_window_sessions``, is
-both the window and the opt-in. A host without it never trims and writes no split
-checkpoint, which is the laptop today. Marketlake #786 adds the key and its first reader,
-the 18:30 sweep's split checkpoint, and marketlake #787's trim is its second reader.
+both the window and the opt-in. A host without it never trims, writes no split checkpoint,
+and restores the whole lake from the bucket, which is the laptop today. Three jobs read it.
+
+1. The 18:30 sweep writes the split checkpoint, which marketlake #786 added with the key.
+2. Marketlake #787's trim removes what falls outside the window.
+3. ``lake.bucket``'s restore rebuilds the trimmed lake rather than the whole one, leaving out
+   each partition the bucket's ``trimmed.jsonl`` says was removed on purpose (marketlake
+   #785).
 
 The key is named for the lake rather than for chains. The owner decided on 2026-10-07
 (decision 9 on #755) that every dated surface is trimmed at one snapshot cutoff, so
@@ -14,8 +19,8 @@ chains readers' until #794 adds the quotes readers'.
 **Loading never judges the value.** ``config.load_config`` runs every capture cycle, so a
 refusal there would stop capture on a typo. Loading stores an integer as read and any other
 value as its ``repr``, the way ``role`` is stored, and each job judges it here: the render
-in ``lake.vm_config`` refuses a bad value before it reaches the VM, and the sweep and the
-trim check it again as a backstop.
+in ``lake.vm_config`` refuses a bad value before it reaches the VM, and the sweep, the trim
+and the restore check it again as a backstop.
 
 **The floor is derived, never written down.** Every job that reads sealed chains on a host
 sets a minimum on the window, and marketlake #786's body carries the table. Three set it:
@@ -42,8 +47,8 @@ from lake.calendar import Calendar
 from lake.config import LAKE_WINDOW_SESSIONS_KEY, GuardConstants
 from lake.runway import GROWTH_WINDOW_DAYS
 
-# The key, spelled once in ``lake.config`` beside the other keys. ``lake.vm_config``, the sweep
-# and marketlake #787's trim read it.
+# The key, spelled once in ``lake.config`` beside the other keys. ``lake.vm_config``, the sweep,
+# marketlake #787's trim and ``lake.bucket``'s restore read it.
 WINDOW_KEY = LAKE_WINDOW_SESSIONS_KEY
 
 # How far back the edge is looked for before it gives up, at the least. A calendar that answers
