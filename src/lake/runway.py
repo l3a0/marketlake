@@ -28,7 +28,9 @@ Five decisions are worth reading before the code.
    ``reports/`` tree is 6,275 bytes of content in 155,648 bytes of blocks across 38
    files. It is also the tree with no pruning step, since a held finding files again
    every night it survives, so the divergence grows. ``st_blocks`` is in 512-byte units
-   by POSIX convention whatever the filesystem's own block size is.
+   by POSIX convention whatever the filesystem's own block size is. A bucket listing is
+   the one exception. S3 reports each object's logical size and no blocks, so
+   :func:`listing_usage` counts sizes, which differ from blocks by under 0.1% of a day.
 2. **The growth rate is the busiest day's permanent growth in the window, not the mean.**
    Measured over the live lake, the same bytes give a runway from 2,059 days to 20,647
    depending only on what the rate is divided by, because capture began partway through
@@ -562,14 +564,18 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
 
     ``listing`` maps each lake-relative key to its size, the shape ``lake.bucket.list_bucket``
     returns. Each key is split on ``/`` and sorted by :func:`path_day`, the rule the walk uses.
-    Two kinds of key are skipped, as the walk and the restore skip them. A zero-byte key ending
-    in ``/`` is the folder marker the S3 console writes, which names no file. A key under a root
-    ``lost+found`` names the filesystem's directory rather than the lake.
+    Two kinds of key are skipped.
+
+    1. A zero-byte key ending in ``/`` is the folder marker the S3 console writes, which names
+       no file. The restore skips it too.
+    2. A key under a root ``lost+found`` names the filesystem's directory rather than the lake,
+       and the walk skips that directory on disk. The restore writes no such key either. It
+       fails the run on one as a path it must not write.
 
     Every field is filled. ``refused`` is 0 and ``refusals`` is empty, because a listing arrives
     whole or ``list_bucket`` raises, so nothing in it is a path that would not read. Sizes are the
     objects' logical bytes, while the walk counts allocated blocks. The two differ by under 0.1%
-    of a day. It never raises, as nothing in this module does.
+    of a day.
     """
     entry_bytes: dict[str, int] = {}
     entry_files: dict[str, int] = {}

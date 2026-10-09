@@ -1583,9 +1583,16 @@ restore onto the VM.
    `config.yaml`, so the VM's restore rebuilds its trimmed lake
    ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out each partition
    the bucket's `trimmed.jsonl` says the VM removed on purpose, and the rest fits the
-   volume once trimming runs. A failed render leaves no `config.yaml`, and the restore then
-   exits 2 rather than falling back to a whole-lake restore. The README's restore command
-   says how a refusal over the bucket's `trimmed.jsonl` is repaired.
+   volume once trimming runs. A failed render writes nothing. On a new instance that
+   leaves no `config.yaml`, and the restore exits 2 on the missing file rather than
+   falling back to a whole-lake restore. On a kept instance the restore reads the file the
+   last good render wrote, which sets the key too. The "When the lake is gone" steps in
+   [README.md](../README.md) say how to repair a refusal over the bucket's
+   `trimmed.jsonl`. A one-off whole-lake restore passes `--config` naming a copy of
+   `config.yaml` with the `lake_window_sessions` line deleted, not blanked, since a blank
+   value refuses, and passes `--target` naming the bucket. The VM reaches the bucket
+   through its instance profile, so the copy can hold placeholder values for the four
+   secrets and no secret is copied.
 4. The restore refuses, with exit 2 and before any download, when the volume would be left
    with less free space than the journal reserve, 13 times the busiest sealed day in the
    bucket. Grow the lake volume first, as item 3 under

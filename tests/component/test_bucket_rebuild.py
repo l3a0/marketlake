@@ -437,33 +437,61 @@ def test_the_window_key_decides_the_mode_through_main(tmp_path, monkeypatch, cap
     assert _files(whole) == {**lake.uploaded, SPY_1: lake.spy_1}
 
 
+def _never_built(cfg):
+    pytest.fail("main built a client before it judged lake_window_sessions")
+
+
 @pytest.mark.parametrize("value", ["many", "3"], ids=["not-a-number", "under-the-floor"])
 def test_a_bad_window_key_refuses_with_one_line_before_any_request(
     tmp_path, monkeypatch, capsys, value
 ):
+    # Building the client fails the test, so the key has to be judged before ``connect``,
+    # which fetches the instance profile's credentials on the VM.
     lake = _trimmed_bucket(tmp_path)
-    lake.client.calls.clear()
+    monkeypatch.setattr(bucket, "client_from_config", _never_built)
+    config = _config(tmp_path, lake.root, window=value)
+    argv = ["restore", str(tmp_path / "restored"), "--config", str(config)]
+    argv += ["--target", "s3://lake-backup/lake"]
 
     with pytest.raises(SystemExit) as exc:
-        _main(
-            _config(tmp_path, lake.root, window=value),
-            lake.client,
-            monkeypatch,
-            tmp_path / "restored",
-        )
+        bucket.main(argv, clock=ManualClock(MONDAY_19), calendar=CALENDAR)
 
     line = _refused(capsys, exc)
     assert "lake_window_sessions" in line
-    assert lake.client.calls == []
     assert not (tmp_path / "restored").exists()
+
+
+@pytest.mark.parametrize("command", ["first-upload", "live-check"])
+def test_a_bad_window_key_breaks_no_command_but_the_restore(tmp_path, monkeypatch, capsys, command):
+    root = FixtureLake(tmp_path / "lake").with_chains("SPY", D1).build()
+    client = FakeS3()
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    config = _config(tmp_path, root, window="many")
+    target = "s3://lake-backup/lake" if command == "first-upload" else "s3://lake-backup/probe"
+    argv = [command, "--config", str(config), "--target", target]
+
+    assert bucket.main(argv, clock=ManualClock(MONDAY_19), calendar=CALENDAR) == 0
+
+    assert "lake_window_sessions" not in capsys.readouterr().err
+    assert client.calls != []
 
 
 def test_a_keyless_host_never_reads_the_ledger_and_fails_on_a_mismatch_with_exit_1(
     tmp_path, monkeypatch, capsys
 ):
-    # The whole-lake restore downloads trimmed.jsonl like any manifested file and fails it in
-    # the download loop. That exit 1 is marketlake #838's gap, and #838's fix rewrites this.
-    lake, _never = _mismatched(tmp_path)
+    # A nightly upload stopped between the ledger's PUT and the manifest's leaves the bucket's
+    # current trimmed.jsonl newer than the manifest's entry, while the version the entry names
+    # is still in the bucket. The whole-lake restore downloads the current version like any
+    # manifested file and fails it in the download loop. That exit 1 is marketlake #838's gap,
+    # and #838's fix, which falls back to the matching version, rewrites this assertion.
+    lake = _trimmed_bucket(tmp_path)
+    recorded = lake.client.body(f"lake/{LEDGER}")
+    assert _sha(recorded) == _bucket_latest(lake.client)[LEDGER]["sha256"]
+    extra = restore_line(SPY_3, sha256=_sha((lake.root / SPY_3).read_bytes()), restored_at=STAMP)
+    lake.client.store(
+        f"lake/{LEDGER}", recorded + (json.dumps(extra, sort_keys=True) + "\n").encode()
+    )
+    assert [version.body for version in lake.client.versions(f"lake/{LEDGER}")][-2] == recorded
 
     code = _main(_config(tmp_path, lake.root), lake.client, monkeypatch, tmp_path / "restored")
 
@@ -491,8 +519,8 @@ def test_a_designed_absence_the_bucket_lost_is_named_and_fails_nothing(
     assert captured.err == ""
     lines = captured.out.splitlines()
     assert lines[0] == (
-        "restore: trimmed on purpose and missing from the bucket, so it was left out and no "
-        f"copy of it is left: {SPY_1}"
+        "restore: trimmed on purpose and missing from the bucket, so it was left out. The "
+        f"bucket holds no current version of it: {SPY_1}"
     )
     assert "1 partition(s) trimmed on purpose and missing from the bucket, " in lines[1]
     assert lines[1].endswith("0 compacted journal segment(s) left out")

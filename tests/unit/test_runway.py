@@ -1375,7 +1375,7 @@ def test_assess_reads_the_busiest_sealed_day_over_its_own_window(
 
 # -- the busiest sealed day of a bucket listing (marketlake #785) ---------------------
 #
-# The whole-lake restore fills an empty directory, which holds no sealed day, so it reads the
+# The ``restore`` command fills an empty directory, which holds no sealed day, so it reads the
 # reserve's basis off the bucket's listing: lake-relative key to size, as ``list_bucket`` returns
 # it. These tests reach every rule through the two public listing functions.
 

@@ -257,44 +257,47 @@ The restore, command 3, runs on either.
    upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
    downloads the current version of every object into `<dest>`, less what the next
-   sentences leave out. `<dest>` must be empty or not exist yet, and each file is verified
-   before `<dest>` is filled. A file the manifest records must match its latest entry, and
-   any other file must match the SHA-256 S3 stored when it was uploaded. A journal segment
-   whose day the manifest records as compacted stays out, so on a host whose config sets
-   no `lake_window_sessions`, such as the laptop, the restored lake holds what the lake it
-   came from holds. On a host whose config sets the key, which is the hosted VM, the
-   restore rebuilds that host's trimmed lake
-   ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out each partition
-   the bucket's `trimmed.jsonl` says was removed on purpose, so the restored lake holds
-   what the bucket holds, less those. A partition trimmed after the ledger last
-   uploaded comes back, and the next trim removes it again. A removed partition the bucket
-   no longer holds is named on its own line and fails nothing. A malformed window key
+   sentences leave out. `<dest>` must be empty or not exist yet, and the restore verifies
+   each file before it fills `<dest>`. A file the manifest records must match its latest
+   entry, and any other file must match the SHA-256 S3 stored when it was uploaded. A
+   journal segment whose day the manifest records as compacted stays out, so the restore
+   brings back no segment the lake already compacted. On a host whose config sets no
+   `lake_window_sessions`, such as the laptop, the restored lake holds every file the
+   bucket's manifest records, including any partition the hosted VM trimmed. On a host
+   whose config sets the key, which is the hosted VM, the restore rebuilds that host's
+   trimmed lake ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out
+   each partition the bucket's `trimmed.jsonl` says was removed on purpose, so the
+   restored lake holds what the bucket holds, less those. A partition trimmed after the
+   ledger last uploaded comes back, and the next trim removes it again. A removed
+   partition the bucket no longer holds is named on its own line and fails nothing. A
+   malformed window key, or one under the smallest window the lake's own readers need,
    refuses with exit 2 before any request. For a one-off whole-lake restore on such a
    host, pass `--config` naming a copy of `config.yaml` with the `lake_window_sessions`
-   line deleted, not blanked, since a blank value refuses. The restore reads none of the
-   config's secrets, so placeholder values serve in that copy. The download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
-   files are moved up into `<dest>` only once every file has verified, with
-   `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
-   no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working
-   directory and downloads only what is not already there and correct, and a run killed
-   while moving files in finishes the move. Before moving anything it checks that each
-   verified file is still there at its recorded size, and refuses when `<dest>` has
-   gained a `manifest.jsonl` or a name it is about to move in, which is what a daemon
-   started on that root looks like. It refuses with exit 2 when `<dest>` holds
-   anything but `lost+found` and the working directory, which keeps it off a live lake,
-   when `<dest>` is a symbolic link, and when its filesystem is too small. Too small means
-   short of the download, or short of the download plus the journal reserve, 13 times the
-   busiest sealed day in the bucket, which the next session's journal needs on the same
-   volume. The reserve line says how much to free. On the hosted VM it also names the
-   fix: raise `lake_volume_gib`, apply, and rerun the bootstrap, as
-   [infra/README.md](infra/README.md) says. On a host that keeps a window, the restore also
-   refuses with exit 2 when the bucket's `trimmed.jsonl` is missing, damaged or does not
-   match the bucket's manifest, before any data file downloads. Two keys that
-   differ only by case are named as failures, because on macOS one would overwrite the
-   other. A year-end lake
-   is about 154 GB. `<dest>` may be a volume's mount point, which is how a new host's
-   empty `lake_root` is seeded. This restore uploads nothing and takes no lock, which is why
-   a shadow host may run it.
+   line deleted, not blanked, since a blank value refuses. The VM's restore reaches the
+   bucket through its instance profile and uses none of the four secrets every config
+   holds, so placeholder values serve for those in that copy. The download lands in a
+   hidden working directory, `<dest>/.marketlake-restoring`, and its files are moved up
+   into `<dest>` only once every file has verified, with `manifest.jsonl` moved last. A
+   file that fails is named on its own line, `<dest>` gets no `manifest.jsonl`, and the
+   command exits 1. Running it again resumes in the working directory and downloads only
+   what is not already there and correct, and a run killed while moving files in finishes
+   the move. Before moving anything it checks that each verified file is still there at
+   its recorded size, and refuses when `<dest>` has gained a `manifest.jsonl` or a name it
+   is about to move in, which is what a daemon started on that root looks like. It refuses
+   with exit 2 when `<dest>` holds anything but `lost+found` and the working directory,
+   which keeps it off a live lake, when `<dest>` is a symbolic link, and when its
+   filesystem is too small. Too small means short of the download, or short of the
+   download plus the journal reserve, 13 times the busiest sealed day in the bucket, which
+   the next session's journal needs on the same volume. The reserve line says how much to
+   free. On the hosted VM it also names the fix: raise `lake_volume_gib`, apply, and rerun
+   the bootstrap, as [infra/README.md](infra/README.md) says. On a host that keeps a
+   window, the restore also refuses with exit 2, before any data file downloads, when the
+   bucket's manifest records a `trimmed.jsonl` the bucket lacks, or one that is damaged or
+   does not match the manifest's entry. A bucket whose manifest records no `trimmed.jsonl`
+   does not refuse. Two keys that differ only by case are named as failures, because on
+   macOS one would overwrite the other. A year-end lake is about 154 GB. `<dest>` may be a
+   volume's mount point, which is how a new host's empty `lake_root` is seeded. This
+   restore uploads nothing and takes no lock, which is why a shadow host may run it.
 4. `uv run python -m lake.bucket restore-range --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30`
    puts chosen chains or quotes partitions back into the live lake at `lake_root`, for a
    partition lost by accident or a rollback of trimming. Leave out `--ticker` to take every

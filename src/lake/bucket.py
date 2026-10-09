@@ -159,7 +159,7 @@ from lake.paths import (
 )
 from lake.runner import BACKUP_EXCLUSIONS
 from lake.session import SessionClock
-from lake.trimmed import is_designed_absence, latest_by_partition, parse_trimmed
+from lake.trimmed import is_designed_absence, latest_by_partition, latest_trimmed, parse_trimmed
 from lake.window import WindowRefused, window_sessions
 
 # The storage class every PUT sets. Standard-IA bills each version for at least 30 days
@@ -1004,8 +1004,6 @@ def first_upload_files(
     absence among the nightly upload's pending entries cannot happen and the raise guards
     exactly that.
     """
-    from lake.trimmed import is_designed_absence, latest_trimmed
-
     trimmed: Mapping[str, dict] | None = None
     for rel in sorted(rels):
         if rsync_excluded(rel, is_dir=False):
@@ -1771,7 +1769,7 @@ def _download_to(read: Callable[[str], Iterator[bytes]], rel: str, part: Path) -
     """Stream ``rel`` into the in-flight file ``part``, and return its hex SHA-256 and its size.
 
     The caller names the in-flight file, because its two callers name it differently. The
-    whole-lake restore writes ``<name>.part`` inside its own working directory. The range
+    ``restore`` command writes ``<name>.part`` inside its own working directory. The range
     restore writes into the live lake, where ``.part`` sits in neither the backup's nor the
     scrub's exclusions, so it writes ``paths.temp_write_path``'s name, which the backup leaves
     out. ``part``'s directory is created when it is missing, which brings back a ticker
@@ -1952,6 +1950,11 @@ def _restore_trimmed(
     except BucketLedgerMismatch as exc:
         try:
             _prepare_work(dest, work)
+        except OSError as failed:
+            raise RestoreRefused(
+                _local(f"creating {work}", failed) + ", so nothing was restored"
+            ) from None
+        try:
             (work / MANIFEST_FILE).write_bytes(manifest_raw)
         except OSError as failed:
             raise RestoreRefused(
@@ -2013,8 +2016,8 @@ def restore_lake(
     lake is restored. Set, the restore rebuilds a lake that keeps only a window of sessions,
     leaving out each partition the bucket's ``trimmed.jsonl`` says that lake removed on
     purpose (marketlake #785). ``main`` sets it on a host whose config sets
-    ``lake_window_sessions``, and every other caller states it rather than inheriting it from
-    a config.
+    ``lake_window_sessions``. Every other caller passes it or takes the whole-lake default,
+    and none reads a config.
 
     The steps, in order.
 
@@ -2243,7 +2246,7 @@ def restore_lake(
 #
 # ``python -m lake.bucket restore-range`` puts chosen chains or quotes partitions back into the
 # live lake: a partition lost by accident, or every partition trimmed on purpose when the lake
-# rolls back to keeping everything (marketlake #784, #755). The whole-lake restore above stays
+# rolls back to keeping everything (marketlake #784, #755). The ``restore`` command above stays
 # off a live lake on purpose. This one writes into it, so it keeps the rules every lake writer
 # keeps, and the design's Backup section carries the reasoning.
 
@@ -2382,7 +2385,6 @@ def restore_range(
     after some partitions were committed says how many, since each stands on its own and a
     re-run picks up the rest.
     """
-    from lake import runway
     from lake.trimmed import (
         KIND_FIELD,
         TRIM_KIND,
@@ -2874,8 +2876,8 @@ def _restore_command(
         )
     for rel in summary.trimmed_lost:
         print(
-            "restore: trimmed on purpose and missing from the bucket, so it was left out and "
-            f"no copy of it is left: {rel}"
+            "restore: trimmed on purpose and missing from the bucket, so it was left out. "
+            f"The bucket holds no current version of it: {rel}"
         )
     if not summary.restored:
         for rel, why in summary.failures:
