@@ -1371,3 +1371,157 @@ def test_assess_reads_the_busiest_sealed_day_over_its_own_window(
     reading = assess(tmp_path, today=today, calendar=_weekday_calendar(today, 60), window_days=7)
 
     assert reading.reserve == 13 * sealed
+
+
+# -- the busiest sealed day of a bucket listing (marketlake #785) ---------------------
+#
+# The ``restore`` command fills an empty directory, which holds no sealed day, so it reads the
+# reserve's basis off the bucket's listing: lake-relative key to size, as ``list_bucket`` returns
+# it. These tests reach every rule through the two public listing functions.
+
+_SEGMENT = "journal/date={day}/surface=chains/ticker={ticker}/seg-20260101T133000Z-1.arrows"
+
+
+def _chains(day: str, ticker: str = "SPY") -> str:
+    return f"chains/ticker={ticker}/date={day}.parquet"
+
+
+def test_a_refused_days_journal_segment_never_counts_toward_the_busiest_day():
+    """Mutation this catches: counting ``journal/date=*`` segments as sealed bytes."""
+    listing = {
+        _chains("2026-09-01"): 100,
+        _chains("2026-09-02"): 300,
+        # A day compaction refused: one gigabyte of segment and nothing sealed.
+        _SEGMENT.format(day="2026-09-03", ticker="SPY"): 10**9,
+        "manifest.jsonl": 50,
+    }
+
+    assert runway.listing_busiest_sealed_day(listing) == 300
+
+
+def test_a_listing_and_a_walk_of_the_same_tree_agree_day_by_day(tmp_path: Path):
+    """The listing reads the walk's path rule, so the two agree on every day's sealed bytes.
+
+    The listing is fed the tree's allocated sizes, the walk's own unit, so any disagreement is a
+    difference in the rule rather than in the bytes. It also carries the two keys a listing has
+    and a walk skips: the S3 console's folder marker, and a file under a root ``lost+found``.
+    """
+    for rel, size in (
+        ("chains/ticker=SPY/date=2026-09-14.parquet", 5000),
+        ("quotes/ticker=SPY/date=2026-09-14.parquet", 300),
+        ("bars/ticker=SPY/freq=1d/date=2026-09-15.parquet", 200),
+        ("journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 9000),
+        ("journal/timing/date=2026-09-15.jsonl", 100),
+        ("reports/close_guard/date=2026-09-16/run.json", 10),
+        ("manifest.jsonl", 700),
+        ("reference/security_master.parquet", 400),
+        ("lost+found/orphan", 600),
+    ):
+        _write(tmp_path, rel, size)
+    usage = walk(tmp_path)
+    listing = {
+        path.relative_to(tmp_path).as_posix(): path.stat().st_blocks * runway.BLOCK_BYTES
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    listing["journal/"] = 0
+
+    read = runway.listing_usage(listing)
+
+    assert set(read.day_bytes) == set(usage.day_bytes)
+    assert set(usage.day_bytes) == {date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)}
+    for day in usage.day_bytes:
+        assert read.sealed_bytes(day) == usage.sealed_bytes(day)
+    assert read.day_bytes == usage.day_bytes
+    assert read.journal_bytes == usage.journal_bytes
+    assert read.unsealed == usage.unsealed == frozenset({date(2026, 9, 15)})
+    assert (read.dated, read.undated, read.files) == (usage.dated, usage.undated, usage.files)
+    assert read.entries == usage.entries
+    assert (read.refused, read.refusals) == (0, ())
+
+
+def test_a_listing_whose_newest_day_is_forty_days_old_still_has_a_busiest_day():
+    """The window is anchored on the listing, never on a clock.
+
+    A host dead for forty days is the recovery case. Anchored on today, its window would hold
+    no day, the reserve would read 0, and the check would pass on nothing.
+    """
+    listing = {_chains("2026-07-01"): 400, _chains("2026-07-02"): 900, _chains("2026-07-03"): 200}
+
+    assert runway.listing_busiest_sealed_day(listing) == 900
+
+
+def test_a_larger_day_more_than_thirty_days_before_the_newest_sealed_day_is_left_out():
+    """Mutations this catches: dropping the window, and anchoring it at the oldest day.
+
+    The newest sealed day is 2026-09-30, so the window starts on 2026-09-01. The oldest day is
+    2026-08-31, one day outside it, and the largest day in the listing.
+    """
+    listing = {
+        _chains("2026-08-31"): 5000,
+        _chains("2026-09-01"): 300,
+        _chains("2026-09-30"): 200,
+    }
+
+    assert runway.listing_busiest_sealed_day(listing) == 300
+
+
+def test_the_newest_day_anchors_the_window_even_with_a_refused_tickers_segment():
+    """Mutation this catches: anchoring the window at the newest day outside ``unsealed``.
+
+    The newest day sealed SPY and compaction refused QQQ, so the day is both unsealed and the
+    busiest. The bucket keeps every segment it ever uploaded, so a rebuild meets this day.
+    Anchored at the day before, the window would leave it out and answer 100.
+    """
+    listing = {
+        _chains("2026-09-29"): 100,
+        _chains("2026-09-30"): 900,
+        _SEGMENT.format(day="2026-09-30", ticker="QQQ"): 100,
+    }
+
+    assert runway.listing_busiest_sealed_day(listing) == 900
+
+
+def test_a_listing_with_no_sealed_day_answers_zero():
+    segment = _SEGMENT.format(day="2026-09-30", ticker="SPY")
+
+    assert runway.listing_busiest_sealed_day({}) == 0
+    assert runway.listing_busiest_sealed_day({"manifest.jsonl": 10}) == 0
+    assert runway.listing_busiest_sealed_day({segment: 9}) == 0
+
+
+def test_the_listing_reading_never_raises_on_keys_no_lake_writes():
+    """Nothing in ``runway`` raises, so a strange key the bucket holds reads as undated."""
+    listing = {"": 5, "a//b": 6, "date=2026-13-45.parquet": 7, "/": 0}
+
+    read = runway.listing_usage(listing)
+
+    assert read.dated == 0
+    assert read.undated == 5 + 6 + 7
+    assert read.files == 3
+
+
+@pytest.mark.parametrize(
+    ("newer", "size"),
+    [
+        pytest.param(_SEGMENT.format(day="2026-09-15", ticker="SPY"), 10, id="segment"),
+        pytest.param("reports/close_guard/date=2026-09-15/run.json", 0, id="empty-report"),
+    ],
+)
+def test_a_newer_day_with_no_sealed_bytes_does_not_anchor_the_window(newer, size):
+    """Mutations this catches: anchoring at a day with 0 sealed bytes, or at any dated day.
+
+    2026-09-15 is 45 days after 2026-08-01, so a window ending there leaves the only sealed day
+    out and answers 0.
+    """
+    listing = {_chains("2026-08-01"): 300, newer: size}
+
+    assert runway.listing_busiest_sealed_day(listing) == 300
+
+
+def test_a_listing_counts_a_lost_and_found_below_the_root():
+    """Only the filesystem's own ``lost+found``, at the root, is skipped, as the walk does."""
+    read = runway.listing_usage({"reports/lost+found/orphan": 7})
+
+    assert read.files == 1
+    assert read.undated == 7

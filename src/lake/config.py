@@ -85,8 +85,9 @@ re-auth checks them, for the same reason.
 
 A fourth is ``lake_window_sessions``, the number of recent sessions a host keeps on its lake
 volume, marketlake #786. An integer is stored as read and any other value as its ``repr``,
-and an absent key is ``None``, which means never trim. ``lake.window`` judges it in each job
-that reads it, for the same reason.
+and an absent key is ``None``. A host without the key never trims, and its
+``lake.bucket restore`` brings back the whole lake rather than rebuilding a trimmed one,
+marketlake #785. ``lake.window`` judges it in each job that reads it, for the same reason.
 
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the

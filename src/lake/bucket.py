@@ -20,7 +20,10 @@ Five jobs live here.
    test then downloads the week's share of what it matched through ``bucket_reader``.
 4. **The restore**, ``python -m lake.bucket restore <dest>``, is run by hand. It
    downloads the bucket's current versions into an empty directory and verifies every
-   file before the directory is filled. ``bucket_reader`` is its download too.
+   file before the directory is filled. ``bucket_reader`` is its download too. On a host
+   whose config sets ``lake_window_sessions`` it rebuilds that host's trimmed lake, and
+   leaves out each partition the bucket's ``trimmed.jsonl`` says was removed on purpose
+   (marketlake #785). Elsewhere it restores the whole lake.
 5. **The range restore**, ``python -m lake.bucket restore-range``, is run by hand. It puts
    chosen chains or quotes partitions back into the live lake, verified against the lake's
    own manifest, for a partition lost by accident or a rollback of trimming (marketlake
@@ -96,7 +99,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from lake import outbox
+from lake import outbox, runway
 from lake.aws_session import (
     _UNAVAILABLE_CODES,
     _AssumeRoleFailed,
@@ -149,12 +152,15 @@ from lake.paths import (
     LOST_AND_FOUND,
     MANIFEST_FILE,
     TEMP_MARKER,
+    TRIMMED_FILE,
     parse_date_dir,
     parse_partition_rel,
     temp_write_path,
 )
 from lake.runner import BACKUP_EXCLUSIONS
 from lake.session import SessionClock
+from lake.trimmed import is_designed_absence, latest_by_partition, latest_trimmed, parse_trimmed
+from lake.window import WindowRefused, window_sessions
 
 # The storage class every PUT sets. Standard-IA bills each version for at least 30 days
 # and each object at no less than 128 KB, which marketlake #630 measured and accepted.
@@ -334,6 +340,34 @@ class TrimmedNotInBucket(BucketRefusal):
     upload is the one job that re-baselines the bucket, so it checks that claim rather than
     trusting it, and a bucket without the partition means the only copy is gone.
     """
+
+
+class BucketLedgerRefused(BucketRefusal):
+    """The bucket's copy of ``trimmed.jsonl`` is missing or will not parse.
+
+    Without it, no partition the bucket's manifest records can be told apart as removed on
+    purpose rather than lost. :func:`read_bucket_trimmed` raises it. It is a plain
+    ``BucketRefusal`` rather than a ``RestoreRefused``, because the restore and marketlake #832's
+    resync both read the bucket's ledger through that helper, and each re-raises this as its
+    own refusal with its own repair.
+    """
+
+
+class BucketLedgerMissing(BucketLedgerRefused):
+    """The bucket holds no current ``trimmed.jsonl``, though its manifest records one."""
+
+
+class BucketLedgerMismatch(BucketLedgerRefused):
+    """The bucket's current ``trimmed.jsonl`` does not hash to its bucket manifest entry.
+
+    ``sha256`` is the entry's SHA-256, the hash a copy has to match. A caller that can take a
+    matching copy from somewhere else catches this subclass, and a caller that cannot catches
+    :class:`BucketLedgerRefused`.
+    """
+
+    def __init__(self, message: str, sha256: str) -> None:
+        super().__init__(message)
+        self.sha256 = sha256
 
 
 class ObjectTooLarge(BucketRefusal):
@@ -970,8 +1004,6 @@ def first_upload_files(
     absence among the nightly upload's pending entries cannot happen and the raise guards
     exactly that.
     """
-    from lake.trimmed import is_designed_absence, latest_trimmed
-
     trimmed: Mapping[str, dict] | None = None
     for rel in sorted(rels):
         if rsync_excluded(rel, is_dir=False):
@@ -1451,6 +1483,65 @@ def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator
     return read
 
 
+def read_bucket_trimmed(
+    client: Any, target: BucketTarget, bucket_latest: Mapping[str, Mapping]
+) -> Mapping[str, dict]:
+    """The bucket's ``trimmed.jsonl``, verified and resolved to each partition's latest line.
+
+    ``bucket_latest`` is the latest entry per partition of the bucket's own ``manifest.jsonl``,
+    and its entry for ``trimmed.jsonl`` decides everything here. With no entry, the bucket's
+    manifest records no trim, so every trimmed partition is still in the bucket, and the answer
+    is an empty mapping with no request sent. Otherwise the current version is downloaded, its
+    SHA-256 must equal the entry's, and it is parsed by ``trimmed.parse_trimmed`` and resolved by
+    ``trimmed.latest_by_partition``, the reader the lake's own copy goes through. A copy whose
+    hash matches carries no torn tail, because ``trimmed`` never records an entry over one.
+
+    Three things refuse, each with :class:`BucketLedgerRefused`.
+
+    1. A key S3 answers as absent, as :class:`BucketLedgerMissing`.
+    2. Bytes that do not hash to the entry, as :class:`BucketLedgerMismatch` carrying the
+       entry's SHA-256.
+    3. Bytes that match and do not parse, naming the damage.
+
+    Every other bucket failure, such as a refused role, a 403 or a 5xx, raises as itself, so the
+    command names it as it names every transport failure rather than as a damaged ledger. The
+    download is joined inside the ``try``, because ``bucket_reader`` sends the request on the
+    first iteration rather than when it is called.
+
+    The restore and marketlake #832's resync both call this, so the bucket's ledger is judged
+    one way wherever a designed absence is decided against it.
+    """
+    entry = bucket_latest.get(TRIMMED_FILE)
+    if entry is None:
+        return {}
+    expected = str(entry.get("sha256"))
+    read = bucket_reader(client, target)
+    try:
+        raw = b"".join(read(TRIMMED_FILE))
+    except BucketReadError as exc:
+        if not exc.absent:
+            raise
+        raise BucketLedgerMissing(
+            f"the bucket holds no current {TRIMMED_FILE}, which its manifest.jsonl records with "
+            f"SHA-256 {expected}, so no partition trimmed on purpose can be told from one lost: "
+            f"{target}"
+        ) from None
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise BucketLedgerMismatch(
+            f"the bucket's current {TRIMMED_FILE} does not match the SHA-256 its manifest.jsonl "
+            f"records, {expected}, so no partition trimmed on purpose can be told from one lost: "
+            f"{target}",
+            expected,
+        )
+    try:
+        return latest_by_partition(parse_trimmed(raw, TRIMMED_FILE), TRIMMED_FILE)
+    except ManifestError as exc:
+        raise BucketLedgerRefused(
+            f"the bucket's {TRIMMED_FILE} matches its manifest entry and cannot be read ({exc}), "
+            f"so no partition trimmed on purpose can be told from one lost: {target}"
+        ) from None
+
+
 # -- the restore command ------------------------------------------------------
 #
 # ``python -m lake.bucket restore <dest>`` rebuilds a lake from the bucket into an empty
@@ -1514,6 +1605,12 @@ class RestoreSummary:
     does not record, outside the scrub's exclusion set. A torn last manifest line
     leaves one behind. Each was verified against the checksum S3 stored at upload, so it
     is named rather than failed.
+
+    Two fields count what a restore that skips designed absences left out, and stay empty in a
+    whole-lake restore. ``trimmed_left_out`` counts the listed keys left out because the
+    bucket's ``trimmed.jsonl`` says the lake removed them on purpose. ``trimmed_lost`` names each
+    designed absence the bucket no longer holds. The rebuilt lake never needed that file, so it
+    is named rather than failed, and the Sunday bucket scrub reports the loss every week.
     """
 
     target: str
@@ -1524,6 +1621,8 @@ class RestoreSummary:
     downloaded_bytes: int = 0
     resumed: int = 0
     segments_left_out: int = 0
+    trimmed_left_out: int = 0
+    trimmed_lost: list[str] = field(default_factory=list)
     unrecorded: list[str] = field(default_factory=list)
     failures: list[tuple[str, str]] = field(default_factory=list)
     restored: bool = False
@@ -1536,10 +1635,21 @@ class RestoreSummary:
                 f"finished moving a restore that had already verified every file into {self.dest}"
             )
         megabytes = self.downloaded_bytes / 1_000_000
+        # The counts of designed absences show only when nonzero, so a whole-lake restore's
+        # line reads exactly as it did before they existed.
+        trimmed = ""
+        if self.trimmed_left_out:
+            trimmed += f"{self.trimmed_left_out} partition(s) trimmed on purpose left out, "
+        if self.trimmed_lost:
+            trimmed += (
+                f"{len(self.trimmed_lost)} partition(s) trimmed on purpose and missing from "
+                "the bucket, "
+            )
         return (
             f"restored {self.files} file(s) from {self.target} into {self.dest}: downloaded "
             f"{self.downloaded} ({megabytes:.1f} MB), {self.resumed} already verified in the "
-            f"working directory, {self.segments_left_out} compacted journal segment(s) left out"
+            f"working directory, {trimmed}{self.segments_left_out} compacted journal segment(s) "
+            "left out"
         )
 
 
@@ -1659,7 +1769,7 @@ def _download_to(read: Callable[[str], Iterator[bytes]], rel: str, part: Path) -
     """Stream ``rel`` into the in-flight file ``part``, and return its hex SHA-256 and its size.
 
     The caller names the in-flight file, because its two callers name it differently. The
-    whole-lake restore writes ``<name>.part`` inside its own working directory. The range
+    ``restore`` command writes ``<name>.part`` inside its own working directory. The range
     restore writes into the live lake, where ``.part`` sits in neither the backup's nor the
     scrub's exclusions, so it writes ``paths.temp_write_path``'s name, which the backup leaves
     out. ``part``'s directory is created when it is missing, which brings back a ticker
@@ -1795,14 +1905,119 @@ def _finish_or_refuse(work: Path, dest: Path) -> None:
         ) from None
 
 
+def _restore_trimmed(
+    client: Any,
+    target: BucketTarget,
+    latest: Mapping[str, Mapping],
+    manifest_raw: bytes,
+    dest: Path,
+    work: Path,
+) -> Mapping[str, dict]:
+    """The bucket's trimmed ledger for a restore that skips designed absences.
+
+    A ``trimmed.jsonl`` already in the working directory whose hash matches the bucket
+    manifest's entry is parsed in place of the bucket's, and no request is sent, as a matching
+    working file is resumed for every other download. That is the repair for a bucket whose
+    current ledger is newer than its manifest's entry, which a nightly upload stopped between
+    the two leaves. A working copy that does not match is ignored.
+
+    Otherwise :func:`read_bucket_trimmed` reads the bucket's, and each of its refusals becomes a
+    ``RestoreRefused`` naming the repair. A mismatch first creates the marked working directory
+    and writes the bucket's ``manifest.jsonl`` into it, so the operator has the entry to check
+    a download against and the next run finds a working directory a restore made. The call
+    sits outside the download loop's ``except OSError``, which would read a ``BucketReadError``
+    as the local disk's.
+    """
+    entry = latest.get(TRIMMED_FILE)
+    working = work / TRIMMED_FILE
+    if entry is not None:
+        try:
+            held = working.read_bytes() if working.is_file() else None
+        except OSError as exc:
+            raise RestoreRefused(
+                _local(f"reading {TRIMMED_FILE} in {work}", exc) + ", so nothing was restored"
+            ) from None
+        if held is not None and hashlib.sha256(held).hexdigest() == str(entry.get("sha256")):
+            try:
+                return latest_by_partition(parse_trimmed(held, working), working)
+            except ManifestError as exc:
+                raise RestoreRefused(
+                    f"{exc} It matches the bucket manifest's entry, so every copy of that "
+                    "version is damaged the same way, and nothing was restored"
+                ) from None
+    try:
+        return read_bucket_trimmed(client, target, latest)
+    except BucketLedgerMismatch as exc:
+        try:
+            _prepare_work(dest, work)
+        except OSError as failed:
+            raise RestoreRefused(
+                _local(f"creating {work}", failed) + ", so nothing was restored"
+            ) from None
+        try:
+            (work / MANIFEST_FILE).write_bytes(manifest_raw)
+        except OSError as failed:
+            raise RestoreRefused(
+                _local(f"writing manifest.jsonl into {work}", failed) + ", so nothing was restored"
+            ) from None
+        raise RestoreRefused(
+            f"{exc}. Nothing was restored. Download the version of {TRIMMED_FILE} whose SHA-256 "
+            f"is {exc.sha256} from the console, put it at {working}, and run the restore again, "
+            'as the README\'s "When the lake is gone" steps describe'
+        ) from None
+    except BucketLedgerMissing as exc:
+        raise RestoreRefused(
+            f"{exc}. Nothing was restored. Put back the version whose SHA-256 matches that entry "
+            "as the current one, as the README's \"Putting a version back for the range "
+            'restore" steps describe, and run the restore again'
+        ) from None
+    except BucketLedgerRefused as exc:
+        raise RestoreRefused(f"{exc}. Nothing was restored") from None
+
+
+def _reserve_refusal(
+    dest: Path, *, needed: int, busiest: int, free: int, short: int, windowed: bool
+) -> str:
+    """The line a restore refuses with when it would leave less than the journal reserve free.
+
+    It names the plan, the reserve, the free space and the shortfall. A restore that skips
+    designed absences runs on a host that keeps a window, which is the hosted VM, so its line
+    also names the VM's fix.
+    """
+    reserve = runway.JOURNAL_RESERVE_SESSIONS * busiest
+    line = (
+        f"the restore needs {needed / 1_000_000:.1f} MB, and the next session's journal needs "
+        f"a reserve of {reserve / 1_000_000:.1f} MB beside it, "
+        f"{runway.JOURNAL_RESERVE_SESSIONS} times the busiest sealed day in the bucket "
+        f"({busiest / 1_000_000:.1f} MB). The filesystem holding {dest} has "
+        f"{free / 1_000_000:.1f} MB free, {short / 1_000_000:.1f} MB short of the reserve, so "
+        "nothing was restored. Free that much or use a larger filesystem"
+    )
+    if windowed:
+        line += (
+            ". On the hosted VM, raise lake_volume_gib, apply the infrastructure, and rerun the "
+            "bootstrap so resize2fs grows the filesystem. A whole-lake restore needs more room, "
+            "not less"
+        )
+    return line
+
+
 def restore_lake(
     dest: Path | str,
     target: BucketTarget,
     *,
     client: Any,
     free_space: Callable[[Path], int] = _free_bytes,
+    skip_designed_absences: bool = False,
 ) -> RestoreSummary:
     """Restore the bucket's current versions into the empty directory ``dest``.
+
+    ``skip_designed_absences`` chooses what comes back. Left false, the default, the whole
+    lake is restored. Set, the restore rebuilds a lake that keeps only a window of sessions,
+    leaving out each partition the bucket's ``trimmed.jsonl`` says that lake removed on
+    purpose (marketlake #785). ``main`` sets it on a host whose config sets
+    ``lake_window_sessions``. Every other caller passes it or takes the whole-lake default,
+    and none reads a config.
 
     The steps, in order.
 
@@ -1811,17 +2026,28 @@ def restore_lake(
        request is sent. A working directory whose files already verified skips to step 7.
     2. The bucket's ``manifest.jsonl`` is downloaded into memory and checked against the
        SHA-256 S3 stored for it. The latest entry per partition is read from it, with a
-       torn last line discarded the way every reader discards one.
+       torn last line discarded the way every reader discards one. When skipping designed
+       absences, the bucket's ``trimmed.jsonl`` is read too, by :func:`read_bucket_trimmed`,
+       unless a copy matching its manifest entry already waits in the working directory.
+       A missing, damaged or mismatched ledger refuses before any data file. A mismatch
+       first leaves a marked working directory holding the bucket's ``manifest.jsonl``, and
+       its refusal names the SHA-256 a copy put there by hand has to match.
     3. The plan is every object under the target, less each journal segment whose
        compacted partition the manifest records, and less S3's zero-byte folder
        markers. The bucket never deletes, so it can hold the segments of a day
        compacted after they uploaded, and the restore leaves them out by the scrub's own
-       rule, ``_compacted_partition_for_segment``. A key whose path would land outside
-       the working directory is never written and is named as a failure. A manifested
-       file the bucket does not hold is a failure named missing.
+       rule, ``_compacted_partition_for_segment``. When skipping designed absences, each key
+       that ``trimmed.is_designed_absence`` calls designed against the bucket's two ledgers
+       is left out too. A key whose path would land outside the working directory is never
+       written and is named as a failure. A manifested file the bucket does not hold is a
+       failure named missing, unless it is a designed absence being skipped. That one is
+       named in ``trimmed_lost`` and fails nothing, since the rebuilt lake never needed it.
     4. The free space on the destination's filesystem must cover every planned byte not
        already verified in the working directory, or the command refuses before the
-       first data file.
+       first data file. What is left after those bytes must then cover the journal
+       reserve, by ``runway.reserve_shortfall`` with the busiest sealed day in the bucket's
+       listing, or the command refuses the same way. The next session's journal lands on
+       this filesystem, and a lake that cannot seal its next close loses captured minutes.
     5. Each planned file streams into ``<dest>/.marketlake-restoring`` and is hashed as
        it arrives. A manifested file must match its latest entry. Any other file must
        match the SHA-256 S3 stored at upload, since the manifest has no entry for it. A
@@ -1870,10 +2096,16 @@ def restore_lake(
         )
     except ManifestError as exc:
         raise RestoreRefused(f"the bucket's {exc}, so nothing was restored") from None
+    trimmed_latest: Mapping[str, Mapping] = (
+        _restore_trimmed(client, target, latest, raw, dest, work) if skip_designed_absences else {}
+    )
 
     def superseded(rel: str) -> bool:
         compacted = _compacted_partition_for_segment(rel)
         return compacted is not None and compacted in latest
+
+    def designed(rel: str) -> bool:
+        return skip_designed_absences and is_designed_absence(rel, latest, trimmed_latest)
 
     plan: dict[str, str | None] = {}
     for rel in sorted(listing):
@@ -1886,6 +2118,9 @@ def restore_lake(
             continue
         if superseded(rel):
             summary.segments_left_out += 1
+            continue
+        if designed(rel):
+            summary.trimmed_left_out += 1
             continue
         plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
     by_case: dict[str, list[str]] = {}
@@ -1902,6 +2137,9 @@ def restore_lake(
             )
     for rel in sorted(latest):
         if rel not in listing and not superseded(rel):
+            if designed(rel):
+                summary.trimmed_lost.append(rel)
+                continue
             summary.failures.append((rel, "missing from the bucket"))
 
     needed = len(raw) + sum(
@@ -1914,6 +2152,19 @@ def restore_lake(
         raise RestoreRefused(
             f"the restore needs {needed / 1_000_000:.1f} MB and the filesystem holding "
             f"{dest} has {free / 1_000_000:.1f} MB free, so nothing was restored"
+        )
+    busiest = runway.listing_busiest_sealed_day(listing)
+    short = runway.reserve_shortfall(free=free, planned=needed, busiest_sealed_day=busiest)
+    if short:
+        raise RestoreRefused(
+            _reserve_refusal(
+                dest,
+                needed=needed,
+                busiest=busiest,
+                free=free,
+                short=short,
+                windowed=skip_designed_absences,
+            )
         )
 
     try:
@@ -1995,7 +2246,7 @@ def restore_lake(
 #
 # ``python -m lake.bucket restore-range`` puts chosen chains or quotes partitions back into the
 # live lake: a partition lost by accident, or every partition trimmed on purpose when the lake
-# rolls back to keeping everything (marketlake #784, #755). The whole-lake restore above stays
+# rolls back to keeping everything (marketlake #784, #755). The ``restore`` command above stays
 # off a live lake on purpose. This one writes into it, so it keeps the rules every lake writer
 # keeps, and the design's Backup section carries the reasoning.
 
@@ -2134,7 +2385,6 @@ def restore_range(
     after some partitions were committed says how many, since each stands on its own and a
     re-run picks up the rest.
     """
-    from lake import runway
     from lake.trimmed import (
         KIND_FIELD,
         TRIM_KIND,
@@ -2608,13 +2858,26 @@ def live_check(
 # -- the command-line entry ---------------------------------------------------
 
 
-def _restore_command(dest: str, target: BucketTarget, client: Any) -> int:
-    """Run the restore and print its lines. A refusal raises, for ``main`` to print."""
-    summary = restore_lake(dest, target, client=client)
+def _restore_command(
+    dest: str, target: BucketTarget, client: Any, *, skip_designed_absences: bool
+) -> int:
+    """Run the restore and print its lines. A refusal raises, for ``main`` to print.
+
+    A designed absence the bucket no longer holds gets its own line on stdout, because the run
+    still exits 0 without it.
+    """
+    summary = restore_lake(
+        dest, target, client=client, skip_designed_absences=skip_designed_absences
+    )
     for rel in summary.unrecorded:
         print(
             f"restore: restored with no manifest entry, verified against the bucket's "
             f"stored SHA-256: {rel}"
+        )
+    for rel in summary.trimmed_lost:
+        print(
+            "restore: trimmed on purpose and missing from the bucket, so it was left out. "
+            f"The bucket holds no current version of it: {rel}"
         )
     if not summary.restored:
         for rel, why in summary.failures:
@@ -2661,7 +2924,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     restore = sub.add_parser(
         "restore",
-        help="Download the bucket's current versions into an empty directory and verify them.",
+        help=(
+            "Download the bucket's current versions into an empty directory and verify them. "
+            "On a host whose config sets lake_window_sessions, leave out each partition the "
+            "bucket's trimmed.jsonl says was removed on purpose."
+        ),
     )
     restore.add_argument(
         "dest", help="The empty directory to restore into. It may also not exist yet."
@@ -2762,6 +3029,13 @@ def main(
     directory, which may be a fresh volume's mount point holding only ``lost+found``.
     That is how a new host is seeded.
 
+    ``restore`` reads ``lake_window_sessions`` through ``window.window_sessions`` before the
+    client is built, so a bad value refuses before any request. A host that sets the key
+    keeps a window, and its restore leaves out the designed absences the bucket's
+    ``trimmed.jsonl`` records. A host without it restores the whole lake. A malformed value, or
+    one under the floor, refuses with one line and exit 2. No other command reads the key, so
+    a bad one breaks nothing else.
+
     ``restore`` exits 0 when the destination was filled, 1 when a file failed
     verification, with one line per failing file, and 2 on a refusal, with one line.
     ``restore-range`` exits 0 when every selected partition is in the lake, and 2 on a
@@ -2769,7 +3043,7 @@ def main(
     """
     args = build_parser().parse_args(argv)
     label = args.command
-    with input_errors_exit(label, BucketRefusal):
+    with input_errors_exit(label, BucketRefusal, WindowRefused):
         config = load_config(args.config)
         role, warning = outbox.role_of(config)
         if warning is not None:
@@ -2780,6 +3054,11 @@ def main(
         if role != outbox.PRIMARY and args.command != "restore":
             print(f"{label}: {BUCKET_SHADOW}", file=sys.stderr)
             return 2
+        windowed = False
+        if args.command == "restore":
+            # Judged before ``connect``, which already fetches credentials on the instance
+            # profile path, so a bad key refuses before any request.
+            windowed = window_sessions(config.lake_window_sessions, config.guards) is not None
         target, client = connect(config, _target(config, args.target))
         if clock is None:
             from lake.clock import SystemClock
@@ -2787,7 +3066,7 @@ def main(
             clock = SystemClock()
         try:
             if args.command == "restore":
-                return _restore_command(args.dest, target, client)
+                return _restore_command(args.dest, target, client, skip_designed_absences=windowed)
             if args.command == "restore-range":
                 if calendar is None:
                     from lake.calendar import ExchangeCalendar
@@ -2859,6 +3138,9 @@ __all__ = [
     "RESTORE_WORK_DIR",
     "VERIFIED_MARKER",
     "BucketBackup",
+    "BucketLedgerMismatch",
+    "BucketLedgerMissing",
+    "BucketLedgerRefused",
     "BucketReadError",
     "BucketRefusal",
     "BucketSettingsInvalid",
@@ -2895,6 +3177,7 @@ __all__ = [
     "main",
     "manifested_files",
     "nightly_upload",
+    "read_bucket_trimmed",
     "read_copy_state",
     "read_ledger",
     "restore_lake",
