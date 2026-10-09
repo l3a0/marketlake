@@ -601,6 +601,20 @@ def test_a_stopped_line_names_its_path_relative_to_the_lake_root(lake_root, monk
     assert first in result.stopped
 
 
+def test_describe_strips_a_root_whose_resolved_spelling_contains_the_given_one(tmp_path):
+    """Mutation this catches: stripping the shorter spelling first, which on macOS turns
+    ``/private/tmp/x/a`` into ``/privatea`` when the root was given as ``/tmp/x``."""
+    given = tmp_path / "lake"
+    # The resolved directory's path ends with the given path's, as /private/tmp/x does /tmp/x.
+    real = Path(f"{tmp_path}/real{given}")
+    real.mkdir(parents=True)
+    given.symlink_to(real)
+    exc = OSError(errno.EIO, "Input/output error", f"{real}/chains/ticker=SPY/a.parquet")
+    text = trim_module.describe(given, exc)
+    assert text.endswith("'chains/ticker=SPY/a.parquet'")
+    assert str(tmp_path) not in text
+
+
 def test_an_unlink_of_a_file_already_gone_counts_as_done(lake_root, monkeypatch):
     client = _build(lake_root)
     first = _expected()[0]
