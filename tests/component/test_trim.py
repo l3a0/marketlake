@@ -308,9 +308,13 @@ def test_a_ticker_day_with_journal_segments_is_kept(lake_root):
     other.mkdir(parents=True)
     (other / "notes.txt").write_text("not a segment")
     result = _trim(lake_root, client)
-    assert _rel("SPY", day) not in result.trimmed
-    assert (lake_root / _rel("SPY", day)).exists()
+    held = _rel("SPY", day)
+    assert held not in result.trimmed
+    assert (lake_root / held).exists()
     assert _rel("QQQ", day) in result.trimmed
+    # A partition never trimmed has no trim line to supersede, so it gets no line at all.
+    assert held not in result.restored
+    assert held not in [line["partition"] for line in _lines(lake_root)]
 
 
 def test_a_journal_directory_that_cannot_be_listed_counts_as_holding_segments(lake_root):
@@ -323,8 +327,11 @@ def test_a_journal_directory_that_cannot_be_listed_counts_as_holding_segments(la
         result = _trim(lake_root, client)
     finally:
         segment_dir.chmod(0o755)
-    assert _rel("SPY", day) not in result.trimmed
-    assert (lake_root / _rel("SPY", day)).exists()
+    held = _rel("SPY", day)
+    assert held not in result.trimmed
+    assert (lake_root / held).exists()
+    assert held not in result.restored
+    assert held not in [line["partition"] for line in _lines(lake_root)]
 
 
 def test_the_segment_glob_is_the_one_compaction_reads():

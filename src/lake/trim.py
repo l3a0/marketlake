@@ -529,8 +529,10 @@ def _one(
     if kept_by is None and segments_remain(selection.paths, candidate.ref):
         kept_by = "its journal still holds segments"
     if kept_by is not None:
-        # Only a recovery reaches here with a clause against it, and it gets a restore line.
-        run.restore(rel, candidate.sha256)
+        # A recovery supersedes its trim line with a restore line. Any other candidate has no
+        # trim line to supersede, so the file stays and nothing is written for it.
+        if candidate.recovering:
+            run.restore(rel, candidate.sha256)
         return
     try:
         found = current_digest(client, target, rel)
