@@ -408,8 +408,11 @@ either.
    can run it. `<dir>` must be empty or not exist yet, and the command refuses with exit 2
    when `<dir>` is `lake_root` or sits inside it. A finished directory is no longer empty,
    so a second range goes to a new directory. Put `<dir>` on a disk, not on a `tmpfs`, which
-   holds its files in memory and may be what `/tmp` is on the VM. The journal reserve applies
-   only when `<dir>` is on `lake_root`'s filesystem, which on the laptop every directory is.
+   holds its files in memory and may be what `/tmp` is on the VM. The command refuses with
+   exit 2 a read that would leave its filesystem short of free space. On `lake_root`'s
+   filesystem, which on the laptop every directory is, it must leave the journal reserve
+   free. On any other filesystem it must leave 1 GB free, so a read on the VM's root volume
+   keeps room for `token.json` and the other files a session writes there.
    A file that fails is named with what it is to the range, `<dir>` holds no reading set, and
    the command exits 1. A file that does not match its SHA-256 means either an upload is
    running or stopped part-way, so run it again after the next complete nightly upload, or

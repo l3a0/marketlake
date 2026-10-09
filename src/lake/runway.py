@@ -171,6 +171,16 @@ PAGE_FLOOR_WEEKS = 2
 # because a past day's stuck journal raises the rate and must not raise this thirteen-fold.
 JOURNAL_RESERVE_SESSIONS = 13
 
+# The bytes a reading restore must leave free after its plan on a filesystem other than
+# ``lake_root``'s, 1 GB in the decimal megabytes every refusal line prints. No journal lands
+# there, so ``JOURNAL_RESERVE_SESSIONS`` protects nothing, but a host still writes files on
+# that filesystem during a session. On the hosted VM it is the 16 GiB root volume, which holds
+# ``token.json``, written to a temporary file and renamed on each 30-minute token refresh,
+# ``config.yaml``, and the systemd journal. A read that left nothing free could fail the next
+# token write. On ``lake_root``'s own filesystem the journal reserve applies instead, and this
+# floor does not.
+OFF_LAKE_FREE_FLOOR_BYTES = 1_000_000_000
+
 # ``st_blocks`` is counted in 512-byte units by POSIX, whatever the filesystem's own
 # block size is. It is spelled once.
 BLOCK_BYTES = 512
@@ -728,6 +738,9 @@ def reserve_shortfall(*, free: int, planned: int, busiest_sealed_day: int) -> in
        listing with :func:`listing_busiest_sealed_day`. The two restores fill an empty
        directory, which holds no sealed day to read, and the resync brings the lake level with
        the bucket.
+
+    The reading restore asks only when its directory is on ``lake_root``'s filesystem. Off it,
+    the caller keeps ``OFF_LAKE_FREE_FLOOR_BYTES`` free after the write instead.
     """
     reserve = JOURNAL_RESERVE_SESSIONS * busiest_sealed_day
     return max(0, reserve - (free - planned))

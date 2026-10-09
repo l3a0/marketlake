@@ -2852,6 +2852,25 @@ def _short_of_plan(dest: Path, *, needed: int, free: int) -> str:
     )
 
 
+def _floor_refusal(dest: Path, lake_root: Path, *, needed: int, free: int) -> str:
+    """The line a reading restore refuses with when it would leave less than the floor free.
+
+    Only a directory on a filesystem other than ``lake_root``'s meets it. The floor is
+    ``runway.OFF_LAKE_FREE_FLOOR_BYTES``, which keeps room for the files a host writes there
+    during a session. The line names the plan, the floor, the free space and the shortfall,
+    in the decimal megabytes the reserve's line uses.
+    """
+    floor = runway.OFF_LAKE_FREE_FLOOR_BYTES
+    short = floor - (free - needed)
+    return (
+        f"the restore needs {needed / 1_000_000:.1f} MB, and a filesystem lake_root "
+        f"{lake_root} does not use must keep {floor / 1_000_000:.1f} MB free beside it for the "
+        "files a host writes during a session, such as token.json. The filesystem holding "
+        f"{dest} has {free / 1_000_000:.1f} MB free, {short / 1_000_000:.1f} MB short of that "
+        "floor, so nothing was restored. Free that much or use a larger filesystem"
+    )
+
+
 def _needed_bytes(work: Path, raw: bytes, plan: Iterable[str], listing: Mapping[str, int]) -> int:
     """The bytes a restore still has to download: the manifest and each file not yet verified."""
     return len(raw) + sum(
@@ -3505,8 +3524,10 @@ def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
 def _shares_lake_filesystem(probe: Path, lake_root: Path, device_of: Callable[[Path], int]) -> bool:
     """Whether ``probe`` sits on the filesystem holding ``lake_root``, by device number.
 
-    A ``lake_root`` that cannot be statted answers yes, so the journal reserve applies whenever
-    nothing proves the two filesystems apart. A failure to stat ``probe`` is one line.
+    Yes means the journal reserve applies, and no means ``runway.OFF_LAKE_FREE_FLOOR_BYTES``
+    applies in its place. A ``lake_root`` that cannot be statted answers yes, so the reserve
+    applies whenever nothing proves the two filesystems apart. A failure to stat ``probe`` is
+    one line.
     """
     try:
         here = device_of(probe)
@@ -3624,7 +3645,9 @@ def restore_for_reading(
        verified in the working directory. When that filesystem is ``lake_root``'s, by
        ``device_of``, what is left must also cover the journal reserve, as in
        :func:`restore_lake`, since the next session's journal lands there. Elsewhere the
-       reserve protects nothing and is not checked.
+       reserve protects nothing and is not checked, and what is left must instead be at least
+       ``runway.OFF_LAKE_FREE_FLOOR_BYTES``, for the files a host writes there during a
+       session. Exactly the floor passes.
     6. The download, the verification and the move are :func:`restore_lake`'s own: every file
        must hash to its latest manifest entry, ``manifest.jsonl`` to the SHA-256 S3 stored
        for it, and the working directory moves in only once every file verified,
@@ -3686,6 +3709,7 @@ def restore_for_reading(
         ) from None
     if free < needed:
         raise RestoreRefused(_short_of_plan(dest, needed=needed, free=free))
+    floor = runway.OFF_LAKE_FREE_FLOOR_BYTES
     if _shares_lake_filesystem(probe, root, device_of):
         busiest = runway.listing_busiest_sealed_day(listing)
         short = runway.reserve_shortfall(free=free, planned=needed, busiest_sealed_day=busiest)
@@ -3694,8 +3718,11 @@ def restore_for_reading(
                 _reserve_refusal(
                     dest, needed=needed, busiest=busiest, free=free, short=short, windowed=False
                 )
-                + f". A directory on a filesystem other than lake_root {root}'s needs no reserve"
+                + f". A directory on a filesystem other than lake_root {root}'s needs no "
+                f"reserve, only {floor / 1_000_000:.1f} MB free beside the plan"
             )
+    elif free - needed < floor:
+        raise RestoreRefused(_floor_refusal(dest, root, needed=needed, free=free))
 
     _download_plan(client, target, read, plan, raw, dest, work, summary)
     if summary.failures:

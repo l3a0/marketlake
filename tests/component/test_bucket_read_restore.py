@@ -10,7 +10,8 @@ Verification list.
    range.
 2. A bad key outside the plan fails nothing, and the same key inside it fails the run.
 3. A destination that is not empty, or sits inside ``lake_root``, refuses and writes nothing.
-4. The journal reserve applies only when the destination shares ``lake_root``'s filesystem.
+4. The journal reserve applies only when the destination shares ``lake_root``'s filesystem,
+   and on any other filesystem the read must leave a 1 GB floor free instead.
 5. The verified marker records the mode and the range, so a waiting directory moves in only
    for the run that made it. Refusals on the arguments and on an empty range come first.
 6. The command runs on a shadow host.
@@ -34,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import bucket
+from lake import bucket, runway
 from lake.bucket import RestoreRefused, first_upload, nightly_upload, restore_for_reading
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import CaptureSpans
@@ -74,6 +75,7 @@ MONDAY_19 = datetime(2026, 8, 31, 19, 0, tzinfo=MARKET_TZ)
 CALENDAR = weekday_sessions(date(2026, 8, 24), date(2026, 8, 31))
 PLENTY = 10**12
 RESERVE_SESSIONS = 13
+FLOOR = 1_000_000_000
 LABEL = "restore-for-reading"
 
 
@@ -1007,6 +1009,31 @@ def _reserve(client: FakeS3) -> int:
     return RESERVE_SESSIONS * max(sum(sizes[rel] for rel in rels) for rels in days.values())
 
 
+def _huge_reserve(client: FakeS3, monkeypatch) -> int:
+    """Raise the reserve past the floor, which the simple bucket's few KB never reach.
+
+    The sessions are a literal chosen here so the reserve is at least twice the floor, and the
+    reserve returned is that literal times the busiest sealed day, written out by ``_reserve``.
+    """
+    busiest = _reserve(client) // RESERVE_SESSIONS
+    sessions = 2 * FLOOR // busiest + 1
+    monkeypatch.setattr(runway, "JOURNAL_RESERVE_SESSIONS", sessions)
+    reserve = sessions * busiest
+    assert reserve > 2 * FLOOR
+    return reserve
+
+
+def _floor_line(dest: Path, root: Path, *, needed: int, free: int) -> str:
+    """The floor refusal, written out here with the floor as a literal."""
+    return (
+        f"the restore needs {needed / 1_000_000:.1f} MB, and a filesystem lake_root {root} does "
+        "not use must keep 1000.0 MB free beside it for the files a host writes during a "
+        f"session, such as token.json. The filesystem holding {dest} has "
+        f"{free / 1_000_000:.1f} MB free, {(FLOOR - (free - needed)) / 1_000_000:.1f} MB short "
+        "of that floor, so nothing was restored. Free that much or use a larger filesystem"
+    )
+
+
 def _devices(lake_root: Path, *, same: bool):
     """A device check that puts every path on lake_root's device, or every other path off it."""
 
@@ -1019,7 +1046,9 @@ def _devices(lake_root: Path, *, same: bool):
 def test_the_reserve_applies_on_lake_root_s_filesystem(tmp_path):
     """Room for the plan and not the reserve refuses there, and the reserve's room restores.
 
-    Catches dropping the device comparison so the reserve never applies.
+    Catches dropping the device comparison so the reserve never applies. The simple bucket's
+    reserve is a few KB, far under the floor, so the restore also catches the floor applying
+    on lake_root's filesystem beside the reserve.
     """
     root, client = _simple(tmp_path)
     needed, reserve = _needed(client), _reserve(client)
@@ -1044,25 +1073,76 @@ def test_the_reserve_applies_on_lake_root_s_filesystem(tmp_path):
     message = str(refused.value)
     assert "short of the reserve" in message
     assert message.endswith(
-        f"A directory on a filesystem other than lake_root {root}'s needs no reserve"
+        f"A directory on a filesystem other than lake_root {root}'s needs no reserve, only "
+        "1000.0 MB free beside the plan"
     )
     assert "lake_volume_gib" not in message
     assert not (tmp_path / "short").exists()
     assert summary.restored is True
 
 
-def test_the_reserve_does_not_apply_on_another_filesystem(tmp_path):
-    """Exactly the plan's bytes free restores on a filesystem that is not lake_root's.
+def test_on_lake_root_s_filesystem_the_floor_does_not_stand_in_for_the_reserve(
+    tmp_path, monkeypatch
+):
+    """With a reserve larger than the floor, clearing the floor alone still refuses there.
+
+    The previous test's reserve is a few KB, under the floor, so its restore catches the floor
+    applying on lake_root's filesystem too. This one catches the reverse: the floor in place
+    of the reserve there, or the device comparison dropped so the floor applies everywhere.
+    """
+    root, client = _simple(tmp_path)
+    needed, reserve = _needed(client), _huge_reserve(client, monkeypatch)
+    same = _devices(root, same=True)
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, tmp_path / "short", root, free=needed + FLOOR, device_of=same)
+    summary = _read(client, tmp_path / "enough", root, free=needed + reserve, device_of=same)
+
+    assert "short of the reserve" in str(refused.value)
+    assert not (tmp_path / "short").exists()
+    assert summary.restored is True
+
+
+def test_the_reserve_does_not_apply_on_another_filesystem(tmp_path, monkeypatch):
+    """The plan and exactly the floor free restores elsewhere, under a reserve twice the floor.
 
     Catches dropping the device comparison so the reserve always applies.
     """
     root, client = _simple(tmp_path)
     needed = _needed(client)
+    _huge_reserve(client, monkeypatch)
 
     summary = _read(
-        client, tmp_path / "reading", root, free=needed, device_of=_devices(root, same=False)
+        client,
+        tmp_path / "reading",
+        root,
+        free=needed + FLOOR,
+        device_of=_devices(root, same=False),
     )
 
+    assert summary.restored is True
+
+
+def test_another_filesystem_keeps_the_floor_free_after_the_plan(tmp_path):
+    """One byte under the plan and the floor refuses with the floor's line, and exactly it restores.
+
+    Catches a floor of 0 or off by one either way, a ``<=`` for the ``<``, and a floor check
+    dropped so a read off the lake's filesystem only has to hold its plan.
+    """
+    root, client = _simple(tmp_path)
+    needed = _needed(client)
+    elsewhere = _devices(root, same=False)
+    short = tmp_path / "short"
+    client.calls.clear()
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, short, root, free=needed + FLOOR - 1, device_of=elsewhere)
+    gets = _gets(client)
+    summary = _read(client, tmp_path / "exact", root, free=needed + FLOOR, device_of=elsewhere)
+
+    assert str(refused.value) == _floor_line(short, root, needed=needed, free=needed + FLOOR - 1)
+    assert not short.exists()
+    assert gets == ["lake/manifest.jsonl"]
     assert summary.restored is True
 
 
@@ -1194,10 +1274,10 @@ def test_a_working_file_larger_than_its_listed_size_counts_toward_the_space_need
     needed = len(client.body("lake/manifest.jsonl")) + len(good) + listed
     elsewhere = _devices(root, same=False)
 
-    with pytest.raises(RestoreRefused, match="MB free, so nothing was restored"):
-        _read(client, dest, root, free=needed - 1, device_of=elsewhere)
+    with pytest.raises(RestoreRefused, match="MB short of that floor"):
+        _read(client, dest, root, free=needed + FLOOR - 1, device_of=elsewhere)
 
-    assert _read(client, dest, root, free=needed, device_of=elsewhere).restored is True
+    assert _read(client, dest, root, free=needed + FLOOR, device_of=elsewhere).restored is True
 
 
 # -- 5. the marker, and refusals before the work ------------------------------------------
@@ -1580,6 +1660,74 @@ def test_main_refuses_a_destination_inside_the_configured_lake_root(tmp_path, mo
     )
     assert not dest.exists()
     assert client.calls == []
+
+
+def _main_with_space(tmp_path, root, client, monkeypatch, dest: Path, *, free: int, same: bool):
+    """``_main`` with the reading restore's free space and device check injected.
+
+    ``main`` passes neither, so the wrapper hands them to the real ``restore_for_reading``,
+    the one this module imported, never one an earlier call patched in.
+    """
+
+    def injected(*args, **kwargs):
+        return restore_for_reading(
+            *args, **kwargs, free_space=lambda path: free, device_of=_devices(root, same=same)
+        )
+
+    monkeypatch.setattr(bucket, "restore_for_reading", injected)
+    return _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
+
+
+def test_main_refuses_a_read_that_would_leave_less_than_the_floor_elsewhere(
+    tmp_path, monkeypatch, capsys
+):
+    """Through ``main``, one byte under the floor exits 2 with its line, and the floor exits 0.
+
+    Catches the floor dropped, off by one, or compared with ``<=``, on the command's own path.
+    """
+    root, client = _simple(tmp_path)
+    needed = _needed(client)
+    short = tmp_path / "short"
+
+    with pytest.raises(SystemExit) as exc:
+        _main_with_space(
+            tmp_path, root, client, monkeypatch, short, free=needed + FLOOR - 1, same=False
+        )
+    err = capsys.readouterr().err
+    code = _main_with_space(
+        tmp_path, root, client, monkeypatch, tmp_path / "exact", free=needed + FLOOR, same=False
+    )
+
+    assert exc.value.code == 2
+    assert err == f"{LABEL}: {_floor_line(short, root, needed=needed, free=needed + FLOOR - 1)}\n"
+    assert not short.exists()
+    assert code == 0
+
+
+def test_main_keeps_the_reserve_rather_than_the_floor_on_lake_root_s_filesystem(
+    tmp_path, monkeypatch, capsys
+):
+    """Through ``main``, the floor alone refuses on lake_root's filesystem, and the reserve passes.
+
+    Catches the floor in place of the reserve on the command's own path.
+    """
+    root, client = _simple(tmp_path)
+    needed, reserve = _needed(client), _huge_reserve(client, monkeypatch)
+    short = tmp_path / "short"
+
+    with pytest.raises(SystemExit) as exc:
+        _main_with_space(tmp_path, root, client, monkeypatch, short, free=needed + FLOOR, same=True)
+    err = capsys.readouterr().err
+    code = _main_with_space(
+        tmp_path, root, client, monkeypatch, tmp_path / "enough", free=needed + reserve, same=True
+    )
+
+    assert exc.value.code == 2
+    assert err.startswith(f"{LABEL}: the restore needs {needed / 1_000_000:.1f} MB")
+    assert "short of the reserve" in err
+    assert "short of that floor" not in err
+    assert not short.exists()
+    assert code == 0
 
 
 def test_main_without_a_ticker_takes_every_ticker(tmp_path, monkeypatch, capsys):
