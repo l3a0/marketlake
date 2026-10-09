@@ -23,9 +23,9 @@ roles it assumes ([#737](https://github.com/l3a0/marketlake/issues/737)), and th
 itself ([#686](https://github.com/l3a0/marketlake/issues/686)). The role
 `marketlake-backup` reaches the bucket, and the role `marketlake-token-writer` writes the
 Schwab token to the VM's config parameters. cloud-init takes a new VM from nothing to a
-running daemon with no login, through `deploy/vm-bootstrap.sh`, and the VM runs as a
-shadow beside the laptop until the cutover in
-[#638](https://github.com/l3a0/marketlake/issues/638).
+running daemon with no login, through `deploy/vm-bootstrap.sh`. The VM ran as a shadow
+beside the laptop until the cutover in
+[#638](https://github.com/l3a0/marketlake/issues/638) made it the primary capture host.
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.

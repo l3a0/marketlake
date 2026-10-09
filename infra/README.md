@@ -1302,8 +1302,8 @@ resource.
 | `aws_volume_attachment.lake` | create |
 
 The read half of the instance role's S3 policy is the one IAM change. The write half,
-`s3:PutObject` alone, stays off until
-[#638](https://github.com/l3a0/marketlake/issues/638)'s cutover turns it on.
+`s3:PutObject` alone, stayed off until
+[#638](https://github.com/l3a0/marketlake/issues/638)'s cutover turned it on on 2026-10-08.
 
 At first boot, cloud-init runs the shim that `infra/live/user-data.sh.tftpl` renders. A
 shim here is a short script whose only job is to hand over to the tracked bootstrap. It
@@ -1333,8 +1333,10 @@ describe the instance can read it. The boot takes two steps.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
-and the journal, not in healthchecks. The VM runs as `role: shadow`, and a shadow's pings
-go to its own `journal/outbox/` rather than to healthchecks.
+and the journal, not in healthchecks. A VM runs as the `role` that `config/vm.yaml` names.
+As `primary`, which it has been since [#638](https://github.com/l3a0/marketlake/issues/638)'s
+cutover, its pings reach healthchecks. As `shadow`, they go to its own `journal/outbox/`
+instead.
 
 Read the first boot on the apply's evening. Find the address as in
 [Find the VM's address](#find-the-vms-address), then open a session from the laptop.
@@ -1370,8 +1372,15 @@ bootstrap's closing line.
 sed -n '/^vm-bootstrap: installing and starting the units/,$p' /var/log/cloud-init-output.log
 ```
 
-The daemon prints its role at every start, so its journal should hold
-`daemon: role=shadow`.
+These reads assume `config/vm.yaml` says `role: shadow`, as it did for the first boots in
+[#686](https://github.com/l3a0/marketlake/issues/686). Since
+[#638](https://github.com/l3a0/marketlake/issues/638)'s cutover it says `primary`. A primary
+on an empty lake refuses its roster, and its daemon exits 2 at start, so a VM built from
+scratch as primary needs [Restore the lake](#restore-the-lake) before these reads mean
+anything.
+
+The daemon prints its role at every start, so its journal should hold `daemon: role=` and
+the role `config/vm.yaml` names.
 
 ```bash
 TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'role='
@@ -1395,8 +1404,9 @@ df -h /
 du -sh ~/.cache/uv ~/marketlake/.venv
 ```
 
-At the next open, data segments appear under `/srv/marketlake`, and the outbox under
-`/srv/marketlake/journal/outbox/` gains ping lines. The build plan lists both reads as a
+At the next open, data segments appear under `/srv/marketlake`. A shadow's pings land as
+lines in the outbox under `/srv/marketlake/journal/outbox/`, and a primary's reach
+healthchecks instead. The build plan lists both reads as a
 live check, beside the replacement in
 [Replace the instance](#replace-the-instance-and-the-approval-window), which runs on the
 same evening as the first boot.
@@ -1558,8 +1568,9 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
 ### Restore the lake
 
 A restore is not part of the first boot. The shadow day captures beside the laptop and
-needs no history, and how the cutover fills the VM's lake is
-[#638](https://github.com/l3a0/marketlake/issues/638)'s question. Two facts hold for any
+needs no history. [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover filled the
+VM's lake by emptying the shadow lake with `deploy/vm-empty-shadow-lake.sh` and then
+restoring from the bucket. Two facts hold for any
 restore onto the VM.
 
 1. The instance role reads the bucket from the first boot, so `bucket restore` runs on
