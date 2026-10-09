@@ -1464,7 +1464,7 @@ def _trim_step(
     4. The trimmed ledger's entry has to have been repaired or found in step, because the
        trim writes to that ledger.
     """
-    from lake.trim import TrimResult, trim
+    from lake.trim import TrimResult, describe, trim
 
     try:
         try:
@@ -1509,7 +1509,7 @@ def _trim_step(
         )
     except Exception as exc:
         return TrimResult(
-            stopped=f"an unforeseen {type(exc).__name__} before the trim: {exc}. The next "
+            stopped=f"an unforeseen error before the trim, {describe(root, exc)}. The next "
             "close+15 tries again"
         )
 

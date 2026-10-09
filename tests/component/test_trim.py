@@ -569,6 +569,38 @@ def test_an_unlink_refused_by_permission_stops_only_its_ticker(lake_root, monkey
     assert "chown" in held
 
 
+def test_a_ticker_directory_that_cannot_be_searched_holds_only_its_ticker(lake_root):
+    """Mutations this catches: letting the ``lstat`` error stop the run, and naming the
+    directory by its absolute path."""
+    client = _build(lake_root)
+    ticker_dir = lake_root / "chains" / "ticker=QQQ"
+    ticker_dir.chmod(0o600)
+    try:
+        result = _trim(lake_root, client)
+    finally:
+        ticker_dir.chmod(0o755)
+    assert result.stopped is None and result.refused is None
+    assert [rel for rel in _gets(client) if "QQQ" in rel] == []
+    assert list(result.trimmed) == [rel for rel in _expected() if "SPY" in rel]
+    assert all((lake_root / rel).exists() for rel in _expected() if "QQQ" in rel)
+    (held,) = result.held
+    assert held.startswith("chains/ticker=QQQ/: ")
+    assert "chown" in held and "chmod" in held
+    assert str(lake_root) not in "\n".join(result.render())
+
+
+def test_a_stopped_line_names_its_path_relative_to_the_lake_root(lake_root, monkeypatch):
+    """Mutation this catches: printing the ``OSError`` with its absolute filename."""
+    client = _build(lake_root)
+    first = _expected()[0]
+    _failing_unlink(monkeypatch, first, errno.EIO)
+    result = _trim(lake_root, client)
+    assert result.stopped is not None
+    assert str(lake_root) not in result.stopped
+    assert str(lake_root.resolve()) not in result.stopped
+    assert first in result.stopped
+
+
 def test_an_unlink_of_a_file_already_gone_counts_as_done(lake_root, monkeypatch):
     client = _build(lake_root)
     first = _expected()[0]

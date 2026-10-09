@@ -45,7 +45,10 @@ line that supersedes the trim line.
 **Failures.** One that would repeat on every partition stops the run: a bucket that refuses or
 cannot be reached, a ``GetObject`` with no usable ``VersionId``, any exception from the ledger
 step, and an unlink error other than a missing file or a permission refusal. A permission
-refusal on the unlink stops only that ticker, because the fault is the ticker's directory. A
+refusal on the unlink stops only that ticker, because the fault is the ticker's directory. So
+does a partition whose presence cannot be checked, which an unsearchable ticker directory
+causes. Each of those lines names the directory relative to the lake root and the ``chown``
+and ``chmod`` that repair it, and no line the trim prints names an absolute path. A
 hash mismatch is rot: the partition is kept, the lake's own copy is hashed so the page can say
 which copy is good, and nothing is ever written to the bucket. Anything else skips only its
 partition. The deadline the upload ran under is checked between partitions.
@@ -64,7 +67,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from fnmatch import fnmatchcase
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from lake import trimmed
@@ -272,6 +275,33 @@ def _present(path: Path) -> bool:
     return True
 
 
+def describe(root: Path, exc: BaseException) -> str:
+    """An exception as ``Class: message``, with each path under the lake root made relative.
+
+    The compaction log is read beside other hosts' output, and ``runway.walk`` already names a
+    refused path relative to the lake root rather than absolutely. An ``OSError`` prints its
+    absolute filename, so the root's own spellings are stripped from the text, the longest
+    first, because a resolved ``/private/tmp/x`` contains the unresolved ``/tmp/x``.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    bases = {str(root)}
+    try:
+        bases.add(str(root.resolve()))
+    except OSError:
+        pass
+    for base in sorted(bases, key=len, reverse=True):
+        text = text.replace(base + os.sep, "").replace(base, "the lake root")
+    return text
+
+
+def _ticker_repair(ticker_dir: str) -> str:
+    """The hand repair for a ticker directory the trim cannot search or write."""
+    return (
+        f"Give the directory back to the lake's owner, as in chown <lake owner> "
+        f"<lake_root>/{ticker_dir} and chmod u+rwx <lake_root>/{ticker_dir}"
+    )
+
+
 # -- the run -----------------------------------------------------------------------
 
 
@@ -314,9 +344,14 @@ class _Run:
         except Exception as exc:
             raise _Stop(
                 f"the trimmed ledger refused a line for {line.get(trimmed.PARTITION_FIELD)} "
-                f"({type(exc).__name__}: {exc}). Nothing more is trimmed until the ledger is "
+                f"({describe(self.root, exc)}). Nothing more is trimmed until the ledger is "
                 "repaired by hand under the lock, then the next close+15 carries on"
             ) from exc
+
+    def hold(self, ticker: str, line: str) -> None:
+        """Hold the rest of ``ticker`` for this run, naming why and the repair."""
+        self.held_tickers.add(ticker)
+        self.held.append(line)
 
     def restore(self, rel: str, sha256: str) -> None:
         """Supersede a trim line beside a present file that a clause now keeps."""
@@ -372,6 +407,8 @@ def trim(
         if isinstance(selection, str):
             return TrimResult(window=window, refused=selection)
         edge = selection.edge
+        for ticker, line in selection.held:
+            run.hold(ticker, line)
         for candidate in selection.candidates:
             if clock.now() >= upload.deadline:
                 return result(
@@ -384,9 +421,7 @@ def trim(
     except _Stop as stop:
         return result(stopped=str(stop))
     except Exception as exc:
-        return result(
-            stopped=f"an unforeseen {type(exc).__name__}: {exc}. The next close+15 tries again"
-        )
+        return result(stopped=f"an unforeseen {describe(root, exc)}. The next close+15 tries again")
     return result()
 
 
@@ -408,6 +443,8 @@ class _Selection:
     edge: date
     candidates: tuple[_Candidate, ...]
     paths: LakePaths
+    # Each ticker whose directory could not be checked, with the line that names its repair.
+    held: tuple[tuple[str, str], ...] = ()
 
 
 def _select(
@@ -422,11 +459,14 @@ def _select(
         latest = latest_entries(root)
         ledger = read_ledger(root)
     except Exception as exc:
-        return f"the manifest could not be read ({type(exc).__name__}: {exc}). Repair it by hand"
+        return f"the manifest could not be read ({describe(root, exc)}). Repair it by hand"
     try:
         checkpoint = read_checkpoint(root)
     except CheckpointUnreadable as exc:
-        return f"{exc}. The 18:30 sweep rewrites it, and the trim waits for that"
+        return (
+            f"the split checkpoint at {CHECKPOINT_PARTITION} {exc.reason}. The 18:30 sweep "
+            "rewrites it, and the trim waits for that"
+        )
     if checkpoint is None:
         return "no split checkpoint exists yet. The 18:30 sweep writes one, and the trim waits"
     refusal = _checkpoint_refusal(root, checkpoint, latest, today)
@@ -441,17 +481,25 @@ def _select(
         quarantine = latest_quarantine(root)
     except Exception as exc:
         return (
-            f"a ledger could not be read ({type(exc).__name__}: {exc}). Repair it by hand, "
+            f"a ledger could not be read ({describe(root, exc)}). Repair it by hand, "
             "and the next close+15 trims"
         )
     paths = LakePaths(root)
     cutoffs = checkpoint.cutoffs()
     candidates: list[_Candidate] = []
+    held: dict[str, str] = {}
     for rel, entry in latest.items():
         ref = parse_partition_rel(rel)
-        if ref is None or ref.surface != CHAINS:
+        if ref is None or ref.surface != CHAINS or ref.ticker in held:
             continue
-        if not _present(root / rel):
+        try:
+            present = _present(root / rel)
+        except OSError as exc:
+            # The fault is the ticker's directory, so it holds that ticker and no other, the
+            # way a refused unlink does.
+            held[ref.ticker] = _unsearchable(rel, ref, exc)
+            continue
+        if not present:
             continue
         line = trimmed_latest.get(rel)
         kind = None if line is None else line.get(trimmed.KIND_FIELD)
@@ -483,8 +531,22 @@ def _select(
                 kept_by=kept_by,
             )
         )
+    candidates = [item for item in candidates if item.ref.ticker not in held]
     candidates.sort(key=lambda item: (item.ref.day, item.ref.ticker))
-    return _Selection(edge=edge, candidates=tuple(candidates), paths=paths)
+    return _Selection(
+        edge=edge, candidates=tuple(candidates), paths=paths, held=tuple(held.items())
+    )
+
+
+def _unsearchable(rel: str, ref: PartitionRef, exc: OSError) -> str:
+    """The held line for a ticker whose partition could not be checked for presence."""
+    ticker_dir = PurePosixPath(rel).parent.as_posix()
+    code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+    if exc.errno in _TICKER_ERRNOS:
+        repair = _ticker_repair(ticker_dir)
+    else:
+        repair = "Check the volume, and the next close+15 carries on"
+    return f"{ticker_dir}/: {rel} could not be checked ({code}), so {ref.ticker} waits. {repair}"
 
 
 def _checkpoint_refusal(
@@ -595,16 +657,15 @@ def _one(
         run.lined.append(rel)
         ticker_dir = (run.root / rel).parent.relative_to(run.root).as_posix()
         if exc.errno in _TICKER_ERRNOS:
-            run.held_tickers.add(candidate.ref.ticker)
             code = errno.errorcode.get(exc.errno, str(exc.errno))
-            run.held.append(
+            run.hold(
+                candidate.ref.ticker,
                 f"{ticker_dir}/: the unlink of {rel} was refused ({code}), "
-                f"so the rest of {candidate.ref.ticker} waits. Give the directory back to the "
-                f"lake's owner, as in chown <lake owner> <lake_root>/{ticker_dir}"
+                f"so the rest of {candidate.ref.ticker} waits. {_ticker_repair(ticker_dir)}",
             )
             return
         raise _Stop(
-            f"the unlink of {rel} failed ({type(exc).__name__}: {exc}), so the file stays "
+            f"the unlink of {rel} failed ({describe(run.root, exc)}), so the file stays "
             "beside its trim line and reads as present. Repair the volume, and the next "
             "close+15 carries on"
         ) from exc
@@ -618,6 +679,7 @@ __all__ = [
     "TRIM_SOURCE",
     "RotFinding",
     "TrimResult",
+    "describe",
     "rot_page_body",
     "segments_remain",
     "tonight_refusal",
