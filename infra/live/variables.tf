@@ -11,17 +11,6 @@ variable "backup_bucket" {
   }
 }
 
-variable "backup_policy_name" {
-  description = "Unused since marketlake-backup became a role (#737). Any valid policy name passes until #741 removes it. CI reads it from the BACKUP_POLICY_NAME variable."
-  type        = string
-  nullable    = false
-
-  validation {
-    condition     = can(regex("^[A-Za-z0-9+=,.@_-]{1,128}$", var.backup_policy_name))
-    error_message = "backup_policy_name must be an IAM policy name."
-  }
-}
-
 variable "adopt_existing" {
   description = "Import the existing bucket and its settings. The tests set it to false, because an import crashes tofu test."
   type        = bool
