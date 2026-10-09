@@ -3497,8 +3497,25 @@ def _plan_resync(
         )
     try:
         trimmed_latest = read_bucket_trimmed(client, target, bucket_latest)
+    except BucketLedgerMismatch:
+        # The cause step 7 names for a newer data file, reached here first because the
+        # ledger is read before the plan. marketlake #838 is the upload's half.
+        raise refuse(
+            f"the bucket's current {TRIMMED_FILE} is not the version its manifest.jsonl names. "
+            "The other host's last nightly upload stopped before its manifest.jsonl PUT, or is "
+            "still running, or the object rotted, so the resync changed nothing. Let that "
+            "upload finish, or run it again on the other host, then run the resync again: "
+            f"{target}"
+        ) from None
     except BucketLedgerRefused as exc:
         raise refuse(f"{exc}. The resync changed nothing") from None
+    try:
+        own_trimmed = latest_trimmed(root)
+    except (ManifestError, OSError) as exc:
+        raise refuse(
+            f"this lake's {TRIMMED_FILE} could not be read ({exc}), so the resync changed "
+            "nothing. Repair it by hand, then run the resync again"
+        ) from None
 
     def held(rel: str) -> str | None:
         path = root / rel
@@ -3520,16 +3537,40 @@ def _plan_resync(
         compacted = _compacted_partition_for_segment(rel)
         if compacted is not None and compacted in bucket_latest:
             continue
+        sha = str(entry.get("sha256"))
         if is_designed_absence(rel, bucket_latest, trimmed_latest):
             # The bucket's manifest still names the path, and its trimmed ledger says the
-            # file is gone on purpose. A file left here would sit under an entry for other
-            # bytes, which the scrub reads as a mismatch.
-            if (root / rel).exists():
+            # file is gone on purpose. A file with other bytes left here would sit under that
+            # entry, which the scrub reads as a mismatch. A file with the entry's own bytes
+            # reads as present beside its trim line, which is what a crash between a trim
+            # line and its unlink leaves, and it stays.
+            if os.path.lexists(root / rel) and held(rel) != sha:
                 trimmed_here.append(rel)
             continue
-        sha = str(entry.get("sha256"))
         if held(rel) != sha:
             downloads[rel] = sha
+
+    # This host's own trims since its last upload. The close+15 uploads before it trims, so
+    # the trim lines of the last night this host was primary never reached the bucket, and
+    # the bucket's ledger does not explain those absences. Each such partition the bucket
+    # still names, and does not itself call trimmed, is downloaded back, so the lake can take
+    # the bucket's ledger, or drop its own when the bucket names none.
+    lake_full = {entry["partition"]: entry for entry in shared + lake_tail}
+    for rel in sorted(own_trimmed):
+        if (
+            rel not in downloads
+            and rel in bucket_latest
+            and is_designed_absence(rel, lake_full, own_trimmed)
+            and not is_designed_absence(rel, bucket_latest, trimmed_latest)
+            and not os.path.lexists(root / rel)
+        ):
+            if _unsafe(rel) or not _inside(root, rel):
+                raise refuse(
+                    f"this lake's {TRIMMED_FILE} names {rel!r}, which would land outside the "
+                    f"lake or on a name the resync keeps for itself, so the resync changed "
+                    f"nothing: {target}"
+                )
+            downloads[rel] = str(bucket_latest[rel].get("sha256"))
     # A directory, or anything else that is not a regular file, where a download lands would
     # fail the rename at the commit, after the renames before it had landed, and every run
     # after would fail there too.
@@ -3574,6 +3615,10 @@ def _plan_resync(
             summary.deletions.append((rel, f"covered by {compacted}"))
         elif rel.split("/", 1)[0] == BARS:
             summary.deletions.append((rel, "the next sweep regenerates it"))
+        elif rel == TRIMMED_FILE:
+            summary.deletions.append(
+                (rel, "the bucket names no trimmed ledger, and each trim it records is undone")
+            )
         elif parse_partition_rel(rel) is not None or (
             ref is not None and (ref.surface, ref.ticker, ref.day) not in bucket_days
         ):
@@ -3947,7 +3992,12 @@ def resync(
                     f"host may be uploading now and the resync changed nothing: {target}"
                 )
             try:
-                for rel, temp in zip(plan.downloads, temps, strict=True):
+                # The trimmed ledger is replaced or deleted after every other file, so a crash
+                # part-way still leaves this lake's own trim lines for the next run to read.
+                renames = list(zip(plan.downloads, temps, strict=True))
+                for rel, temp in renames:
+                    if rel == TRIMMED_FILE:
+                        continue
                     os.replace(temp, root / rel)
                     _fsync_path((root / rel).parent)
                 # A directory a download created is an entry in its parent, which a crash
@@ -3955,8 +4005,17 @@ def resync(
                 for parent in sorted({directory.parent for directory in created}):
                     _fsync_path(parent)
                 for rel, _why in summary.deletions:
+                    if rel == TRIMMED_FILE:
+                        continue
                     (root / rel).unlink(missing_ok=True)
                     _fsync_path((root / rel).parent)
+                for rel, temp in renames:
+                    if rel == TRIMMED_FILE:
+                        os.replace(temp, root / rel)
+                        _fsync_path(root)
+                if any(rel == TRIMMED_FILE for rel, _why in summary.deletions):
+                    (root / TRIMMED_FILE).unlink(missing_ok=True)
+                    _fsync_path(root)
                 _rewrite_manifest(root, plan.keep, plan.bucket_raw[plan.keep :], plan.bucket_raw)
             except OSError as exc:
                 raise refuse(

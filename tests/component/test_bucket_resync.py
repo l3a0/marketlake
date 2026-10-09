@@ -1529,6 +1529,204 @@ def test_a_switch_back_and_a_return_each_resume_the_nightly_upload(tmp_path, mon
     assert client.body(TARGET.key(SPY_3)) == b"laptop chains 2026-08-26"
 
 
+# -- 10. a trimmed lake on the way back ---------------------------------------------------
+#
+# The close+15 uploads before it trims, so the trim lines of the last night a host was primary
+# never reach the bucket. These run the real ``lake.trim`` on the VM after its last upload.
+
+TRIMMED = "trimmed.jsonl"
+THURSDAY_20 = datetime(2026, 8, 27, 20, 0, tzinfo=MARKET_TZ)
+
+
+def _checkpoint(root: Path, day: date) -> None:
+    """A split-walk checkpoint through ``day``, which the trim needs before it drops a day."""
+    from dataclasses import replace
+
+    from lake.split_checkpoint import Checkpoint, CheckpointEntry, starting_state, write_checkpoint
+
+    state = replace(starting_state("SPY"), cutoff=day, last_day=day)
+    write_checkpoint(
+        root,
+        Checkpoint(session_day=day, entries=(CheckpointEntry(state=state, mappings=()),)),
+        recorded_at=datetime(day.year, day.month, day.day, 18, 30, tzinfo=MARKET_TZ),
+    )
+
+
+def _close15(root: Path, client: FakeS3, when: datetime):
+    """The close+15 on a host keeping one session: the nightly upload, then the trim."""
+    from lake.lock import lake_lock
+    from lake.trim import trim
+
+    summary = nightly_upload(
+        root, TARGET, client=client, clock=ManualClock(when), calendar=CALENDAR
+    )
+    with lake_lock(root):
+        return trim(
+            root,
+            window=1,
+            client=client,
+            target=TARGET,
+            upload=summary,
+            clock=ManualClock(when),
+            calendar=CALENDAR,
+        )
+
+
+def test_a_trim_after_the_vms_last_upload_comes_back_when_the_bucket_names_no_ledger(tmp_path):
+    from lake.manifest import scrub
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _checkpoint(vm, D1)
+    _record(vm, SPY_2, b"vm chains 2026-08-25")
+    # The VM's last night as primary: it uploads, then trims SPY_1, so the bucket names no
+    # trimmed ledger.
+    assert SPY_1 in _close15(vm, client, datetime(2026, 8, 25, 16, 30, tzinfo=MARKET_TZ)).trimmed
+    assert not (vm / SPY_1).exists()
+    assert TRIMMED.encode() not in client.body(MANIFEST_KEY)
+    # The laptop resyncs, becomes primary, and uploads a session.
+    assert _resync(laptop, client, apply=True).applied
+    _record(laptop, SPY_3, b"laptop chains 2026-08-26")
+    _upload(laptop, client, WEDNESDAY_19)
+    sha = hashlib.sha256((laptop / SPY_1).read_bytes()).hexdigest()
+
+    summary = _resync(vm, client, now=WEDNESDAY_20, apply=True)
+
+    assert SPY_1 in dict(summary.downloads)
+    assert (TRIMMED, "the bucket names no trimmed ledger, and each trim it records is undone") in (
+        summary.deletions
+    )
+    assert hashlib.sha256((vm / SPY_1).read_bytes()).hexdigest() == sha
+    assert not (vm / TRIMMED).exists()
+    assert manifest_path(vm).read_bytes() == client.body(MANIFEST_KEY)
+    assert scrub(vm).ok
+
+
+def test_a_trim_after_the_vms_last_upload_comes_back_when_the_bucket_names_an_older_ledger(
+    tmp_path,
+):
+    from lake.manifest import scrub
+    from lake.trimmed import latest_trimmed
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _checkpoint(vm, D1)
+    _record(vm, SPY_2, b"vm chains 2026-08-25")
+    assert SPY_1 in _close15(vm, client, datetime(2026, 8, 25, 16, 30, tzinfo=MARKET_TZ)).trimmed
+    # Wednesday's close+15 uploads Tuesday's trim line, then trims SPY_2 after the upload.
+    _checkpoint(vm, D2)
+    _record(vm, SPY_3, b"vm chains 2026-08-26")
+    assert SPY_2 in _close15(vm, client, datetime(2026, 8, 26, 16, 30, tzinfo=MARKET_TZ)).trimmed
+    assert SPY_2 not in latest_trimmed_of_bucket(client)
+    assert _resync(laptop, client, now=WEDNESDAY_20, apply=True).applied
+    _record(laptop, SPY_4, b"laptop chains 2026-08-27")
+    _upload(laptop, client, THURSDAY_19)
+
+    summary = _resync(vm, client, now=THURSDAY_20, apply=True)
+
+    planned = dict(summary.downloads)
+    assert SPY_2 in planned
+    assert SPY_1 not in planned
+    assert TRIMMED in planned
+    assert (vm / SPY_2).read_bytes() == b"vm chains 2026-08-25"
+    assert not (vm / SPY_1).exists()
+    assert (vm / TRIMMED).read_bytes() == client.body(TARGET.key(TRIMMED))
+    assert SPY_2 not in latest_trimmed(vm)
+    assert scrub(vm).ok
+
+
+def latest_trimmed_of_bucket(client: FakeS3) -> dict:
+    from lake.trimmed import latest_by_partition, parse_trimmed
+
+    return latest_by_partition(parse_trimmed(client.body(TARGET.key(TRIMMED)), TRIMMED))
+
+
+def test_a_crash_before_the_ledger_moves_leaves_this_lakes_trim_lines(tmp_path, monkeypatch):
+    from lake.trimmed import latest_trimmed
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    _checkpoint(vm, D1)
+    _record(vm, SPY_2, b"vm chains 2026-08-25")
+    _close15(vm, client, datetime(2026, 8, 25, 16, 30, tzinfo=MARKET_TZ))
+    _resync(laptop, client, apply=True)
+    _record(laptop, SPY_3, b"laptop chains 2026-08-26")
+    _upload(laptop, client, WEDNESDAY_19)
+    lines = (vm / TRIMMED).read_bytes()
+    with monkeypatch.context() as patched:
+        patched.setattr(bucket, "_rewrite_manifest", _crash)
+        real_unlink = Path.unlink
+
+        def unlink(self: Path, missing_ok: bool = False) -> None:
+            if self.name == TRIMMED:
+                raise Crash
+            real_unlink(self, missing_ok=missing_ok)
+
+        patched.setattr(Path, "unlink", unlink)
+        with pytest.raises(Crash):
+            _resync(vm, client, now=WEDNESDAY_20, apply=True)
+    # SPY_1 came back before the ledger was touched, and the ledger still holds its line.
+    assert (vm / SPY_1).exists()
+    assert (vm / TRIMMED).read_bytes() == lines
+    assert SPY_1 in latest_trimmed(vm)
+
+    assert _resync(vm, client, now=WEDNESDAY_20, apply=True).applied
+    assert not (vm / TRIMMED).exists()
+
+
+def test_a_designed_absence_held_with_the_trimmed_bytes_applies_and_scrubs_clean(tmp_path):
+    from lake.manifest import scrub
+    from lake.trimmed import append_trimmed, trim_line
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    data = b"vm chains 2026-08-25"
+    sha = _record(vm, SPY_2, data)
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
+    line = trim_line(SPY_2, sha256=sha, version_id="v1", verified_at="s", trimmed_at="s")
+    append_trimmed(vm, line, source="test-trim", fetched_at=None)
+    (vm / SPY_2).unlink()
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
+    # The laptop holds the very bytes the bucket trimmed, under an entry of its own.
+    (laptop / SPY_2).parent.mkdir(parents=True, exist_ok=True)
+    (laptop / SPY_2).write_bytes(data)
+    append_manifest(
+        laptop,
+        partition=SPY_2,
+        source="compaction",
+        sha256=sha,
+        rows=100,
+        fetched_at="2026-08-25T16:30:00-04:00",
+    )
+
+    assert _resync(laptop, client, apply=True).applied
+
+    assert (laptop / SPY_2).read_bytes() == data
+    assert scrub(laptop).ok
+
+
+def test_a_buckets_ledger_newer_than_its_manifest_names_the_unfinished_upload(tmp_path):
+    from lake.trimmed import append_trimmed, trim_line
+
+    laptop, client = _laptop(tmp_path)
+    vm = _vm(tmp_path, client)
+    sha = _record(vm, SPY_2, b"vm chains 2026-08-25")
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
+    line = trim_line(SPY_2, sha256=sha, version_id="v1", verified_at="s", trimmed_at="s")
+    append_trimmed(vm, line, source="test-trim", fetched_at=None)
+    (vm / SPY_2).unlink()
+    nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
+    # A later upload PUT a rewritten ledger and stopped before its manifest.jsonl PUT.
+    newer = client.body(TARGET.key(TRIMMED)) + b'{"kind": "trim", "partition": "q"}\n'
+    client.store(TARGET.key(TRIMMED), newer)
+
+    message = _refused(laptop, client)
+
+    assert "stopped before its manifest.jsonl PUT, or is still running" in message
+    assert "rotted" in message
+    assert message.endswith(str(TARGET))
+
+
 # -- 9. the mutation lens's additions (PR #847) -------------------------------------------
 
 
