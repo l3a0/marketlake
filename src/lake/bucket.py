@@ -815,10 +815,10 @@ def _checksum_refusal(rel: str) -> str:
     """The one line ``ChecksumRefused`` carries for ``rel``.
 
     Every file names rot and the two benign races. The trimmed ledger names a fourth cause,
-    because a trim or restore line can land without its manifest entry being refreshed, and
-    compaction's ledger repair is what re-records that entry before the upload. A refusal of
-    ``trimmed.jsonl`` therefore means the repair did not run or refused, and the line sends
-    the operator to the repair rather than to the bucket.
+    because a trim or restore line can land without its manifest entry being refreshed. The
+    nightly upload and the first upload share this line, and only the nightly one runs after
+    compaction's ledger repair, so the line says the repair runs on a nightly compaction and
+    gives the hand repair that holds for both callers.
     """
     message = (
         f"S3 refused {rel}: its bytes no longer match its manifest entry's SHA-256. Rot does "
@@ -828,9 +828,9 @@ def _checksum_refusal(rel: str) -> str:
     if rel == TRIMMED_FILE:
         message += (
             ". A fourth cause is a trim or restore line that landed without its manifest "
-            "entry, which compaction's ledger repair re-records before the upload unless it "
-            "refused. Read the compaction_trimmed_ledger page or run "
-            "lake.trimmed.repair_trimmed_entry by hand under the lock"
+            "entry. On a nightly compaction, the ledger repair re-records it before the upload "
+            "unless it refused, which pages compaction_trimmed_ledger. Either way, "
+            "lake.trimmed.repair_trimmed_entry run by hand under the lock re-records it"
         )
     return message + ". Run the job again, and treat a repeat as rot"
 

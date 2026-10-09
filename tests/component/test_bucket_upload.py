@@ -961,6 +961,38 @@ def test_a_trimmed_ledger_refused_at_upload_names_the_ledger_repair(tmp_path):
     assert "\n" not in message
 
 
+def test_a_trimmed_ledger_refused_at_a_first_upload_makes_the_repair_a_nightly_one(tmp_path):
+    """Mutation this catches: a cause that says compaction's repair ran before every upload.
+
+    A first upload runs no compaction, so the line can say only that a nightly compaction
+    repairs the entry, and it names the hand repair for both callers.
+    """
+    from lake.trimmed import append_trimmed, trim_line, trimmed_path
+
+    lake = _lake(tmp_path / "lake")
+    rel = _seal_another_day(lake)
+    line = trim_line(
+        rel,
+        sha256=sha256_file(lake / rel),
+        version_id="v1",
+        verified_at="2026-08-25T16:40:00-04:00",
+        trimmed_at="2026-08-25T16:41:00-04:00",
+    )
+    with lake_lock(lake):
+        append_trimmed(lake, line, source="test-trim", fetched_at=None)
+    with trimmed_path(lake).open("a") as ledger:
+        ledger.write('{"kind": "restore", "partition": "x", "sha256": "y", "restored_at": "z"}\n')
+
+    with pytest.raises(ChecksumRefused) as refused:
+        first_upload(lake, TARGET, client=FakeS3(), clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert message.startswith("S3 refused trimmed.jsonl: ")
+    assert "On a nightly compaction, the ledger repair re-records it" in message
+    assert "Either way, lake.trimmed.repair_trimmed_entry run by hand" in message
+    assert "compaction's ledger repair re-records" not in message
+
+
 def test_a_partition_refused_at_upload_names_no_ledger_repair(tmp_path):
     lake = _lake(tmp_path / "lake")
     client = FakeS3()
