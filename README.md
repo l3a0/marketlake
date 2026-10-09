@@ -219,7 +219,8 @@ two steps change as follows.
    Run `first-upload` only on the host whose lake the bucket should hold, because it
    replaces the bucket's `manifest.jsonl`. It refuses when the bucket's copy holds entries
    this lake never recorded, such as the other host's sessions after a switch, since
-   replacing the copy would drop them from the bucket's record. Run `live-check` in the
+   replacing the copy would drop them from the bucket's record. After a switch, `resync`,
+   command 5 below, brings the lake level instead. Run `live-check` in the
    same order, after the IAM role's write half is turned on, since the check writes probe
    objects.
 
@@ -232,9 +233,9 @@ credentials, such as a VM with no instance profile or a laptop that carries the 
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: assume_role` in `config.yaml`.
 
-Five commands go with the bucket. The first two and the range restore refuse with exit 2 on a
+Six commands go with the bucket. The first two and the range restore refuse with exit 2 on a
 shadow host, which is any host whose config sets `role` to something other than `primary`.
-The restore, command 3, runs on either.
+The restore, command 3, and the resync, command 5, run on either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -258,9 +259,9 @@ The restore, command 3, runs on either.
    human repaired, which the nightly upload refuses with a line naming it. When the copy
    stopped being a prefix because it holds entries this lake never recorded, another
    host's sessions or a lake restored from an older copy, the nightly upload's line says
-   not to run `first-upload`, and `first-upload` refuses too.
-   [#832](https://github.com/l3a0/marketlake/issues/832) adds the resync that brings the
-   lake level. `networkQuality -s`, built into macOS, measures upload capacity beforehand.
+   not to run `first-upload`, and `first-upload` refuses too. The resync, command 5,
+   brings the lake level instead. `networkQuality -s`, built into macOS, measures upload
+   capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
    downloads the current version of every object into `<dest>`, less what the next
    sentences leave out. `<dest>` must be empty or not exist yet, and the restore verifies
@@ -324,7 +325,28 @@ The restore, command 3, runs on either.
    copy. A version that does not match is repaired by "Putting a version back for the range
    restore" below, and a refusal for a trimmed partition names the version its trim line
    recorded.
-5. The nightly upload needs no command. Once `backup_target` names the bucket, the
+5. `uv run python -m lake.bucket resync --target s3://example-lake-backup/lake` brings
+   this lake level with the bucket on a host about to become primary again, after the other
+   host was primary ([#832](https://github.com/l3a0/marketlake/issues/832)). It reads the
+   bucket's `manifest.jsonl` and finds the entries both copies share. Past them, the
+   bucket's copy holds the other host's sessions, and this lake holds what its own sweep and
+   battery wrote while it was the shadow. It plans to download each file the bucket's
+   entries name that this lake lacks or holds with other bytes, and to drop this lake's own
+   entries. It prints one line per download and per deletion, then a last line counting
+   them and naming the time the run must stop by. It sends no write to the bucket, so it
+   runs under either role. It refuses with exit 2 when this lake's own `manifest.jsonl` is
+   empty or missing, which is what a wrong `lake_root` looks like, when the bucket holds no
+   `manifest.jsonl`, when run as root, on Sunday from 19:55 to 23:30, and inside a session
+   or within 30 minutes of its open. It also refuses when the two copies differ only by a
+   hand repair, which `first-upload` is for, and when the bucket's current version of a
+   file is newer than its `manifest.jsonl` names, which the other host's unfinished upload
+   leaves. It refuses, too, when this lake's own entries hold something the bucket's copy
+   would lose: a chains or quotes partition or a journal segment the bucket does not hold,
+   an `onboard`, `retire` or `seed_spans` change to the capture spans, a quarantine
+   sign-off, or any other file the bucket does not record. Move such a file out of the
+   lake by hand, or redo the decision on the new primary after the switch, then run it
+   again.
+6. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
