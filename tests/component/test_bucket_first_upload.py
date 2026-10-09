@@ -646,9 +646,7 @@ def test_exactly_three_foreign_entries_are_counted_alone_and_named_with_no_more(
     assert "more" not in line
 
 
-def test_the_check_under_the_lock_reads_the_ledger_as_it_stands_then(
-    tmp_path, monkeypatch, capsys
-):
+def test_the_check_under_the_lock_reads_the_ledger_as_it_stands_then(tmp_path, monkeypatch, capsys):
     # After the unlocked guard, the lake records a new partition and the bucket's copy is
     # hand repaired to the lake's new manifest with its first byte damaged. Every entry in
     # it is in the lake under the lock, so the run re-baselines rather than refuse.
