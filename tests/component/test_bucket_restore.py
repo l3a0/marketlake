@@ -130,6 +130,17 @@ def _uploaded(tmp_path: Path) -> tuple[Path, FakeS3]:
     return root, client
 
 
+def _reserve(lake: Path) -> int:
+    """The journal reserve the restore keeps free: 13 times the fixture's busiest sealed day.
+
+    The day sizes are the byte lengths ``_files`` reads, which equal the listing's sizes. The
+    journal segment is no sealed byte, and the report's name ends in ``.md`` rather than naming
+    a ``date=`` directory, so the lake's path rule dates it to no day.
+    """
+    files = _files(lake)
+    return 13 * max(len(files[CHAINS]) + len(files[QUOTES]), len(files[SEALED]))
+
+
 def _gets(client: FakeS3) -> list[str]:
     return [kwargs["Key"] for name, kwargs in client.calls if name == "get_object"]
 
@@ -476,7 +487,7 @@ def test_free_space_is_measured_on_the_destination_s_own_filesystem(tmp_path):
 
 def test_exactly_enough_free_space_is_enough(tmp_path):
     lake, client = _uploaded(tmp_path)
-    needed = sum(len(data) for data in _files(lake).values())
+    needed = sum(len(data) for data in _files(lake).values()) + _reserve(lake)
 
     summary = restore_lake(
         tmp_path / "restored", TARGET, client=client, free_space=lambda p: needed
@@ -946,7 +957,7 @@ def test_a_resumed_run_needs_space_only_for_what_is_left(tmp_path):
     dest = tmp_path / "restored"
     assert restore_lake(dest, TARGET, client=client).restored is False
     client.store(f"lake/{QUOTES}", good.body, checksum=good.checksum)
-    needed = len((lake / "manifest.jsonl").read_bytes()) + len(good.body)
+    needed = len((lake / "manifest.jsonl").read_bytes()) + len(good.body) + _reserve(lake)
 
     summary = restore_lake(dest, TARGET, client=client, free_space=lambda p: needed)
 

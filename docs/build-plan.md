@@ -610,7 +610,10 @@ weekly test downloads through `bucket.bucket_reader`, and
 whose bytes rotted under a matching stored checksum. Its restore command,
 `python -m lake.bucket restore`, is driven by `tests/component/test_bucket_restore.py`,
 which uploads a lake with the real upload code, restores it into an empty directory, and
-compares every file byte for byte.
+compares every file byte for byte. The same command's rebuild of a trimmed lake, on a host
+that keeps a window, is driven by `tests/component/test_bucket_rebuild.py`, which trims the
+lake between the real first and nightly uploads
+([#785](https://github.com/l3a0/marketlake/issues/785)).
 
 ## The 10 live checks
 
