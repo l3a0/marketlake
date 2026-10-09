@@ -94,11 +94,9 @@ variable "root_volume_gib" {
 }
 
 variable "lake_volume_gib" {
-  # The whole lake outgrows 30 GiB, so the VM's trim window bounds what the volume holds,
-  # beside a journal reserve of runway.JOURNAL_RESERVE_SESSIONS times the busiest sealed day.
-  # docs/design.md's paragraph "The lake lives on its own EBS volume" says what has to fit. A
-  # larger size modifies the volume in place, and the bootstrap's resize2fs grows the
-  # filesystem to match.
+  # docs/design.md's paragraph "The lake lives on its own EBS volume" says what this volume
+  # has to fit. A larger size modifies the volume in place, and the bootstrap's resize2fs
+  # grows the filesystem to match.
   description = "The lake volume's size, in GiB."
   type        = number
   default     = 30
