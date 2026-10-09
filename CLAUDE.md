@@ -74,6 +74,10 @@ Two places keep the bare form.
 1. **GitHub's own text.** In an issue body, a comment, a pull request body or a commit message, GitHub links a bare `#NN` on its own, and a closing keyword needs the number right after it.
 2. **Code and quotations.** A command, a code span, a file name or a quoted commit subject stays exactly as written, because a link inside it breaks it.
 
+**Link every workflow run, job, deployment and environment too (owner directive, 2026-10-09).** A workflow run, a job or a deployment waiting on approval gets a Markdown link wherever it is named by its id. An environment gets one wherever the text sends the reader to it, such as to approve a waiting run or to read its deployment history. A sentence that only mentions an environment by name, such as "the apply runs in the `infra` environment", needs none. Write `[run 37978234958](https://github.com/l3a0/marketlake/actions/runs/37978234958)` for a run, `[job 123](https://github.com/l3a0/marketlake/actions/runs/<run>/job/123)` for a job, and `[the infra environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)` for an environment's deployment history. That is the `html_url` that `gh api repos/l3a0/marketlake/environments` returns, and the shorter `deployments/<name>` form is not one GitHub recognizes. A run waiting on approval matters most, because the owner's next step is to open it and act, per "Deployment approvals" below, and a bare id sends them searching the Actions tab for it. On 2026-10-09 a report named "run 37978234958" as waiting on approval, and the owner had to copy the number back to ask for it.
+
+GitHub links none of these on its own, unlike `#NN`. So this rule also holds in an issue body, a comment, a pull request body and a commit message. Only code and quotations keep the bare form, as in the issue and pull request rule above. A command such as `gh run view 37978234958` stays exactly as written.
+
 ## The design doc is review-hardened
 
 The doc survived three adversarial review batteries. That was 89+ agents and 58 verified findings, with zero findings refuted. It also survived the owner's own Socratic passes. Respect two conventions it carries:
@@ -172,7 +176,7 @@ Branch before the first edit, not just before the commit. The moment a task will
 3. The GitHub web UI, driven through a browser tool.
 4. Any MCP tool.
 
-When a deployment waits on approval, the session tells the owner which run is waiting and leaves it waiting. `gh run view <id>` shows the waiting job without touching the approval.
+When a deployment waits on approval, the session tells the owner which run is waiting, as a link to the run per the writing-style rule above, and leaves it waiting. `gh run view <id>` shows the waiting job without touching the approval.
 
 Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. The approval is the human check on what a session wrote, and a session that approves its own change removes that check.
 
