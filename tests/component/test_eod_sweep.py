@@ -3879,6 +3879,8 @@ def test_a_refusal_named_by_its_class_alone_is_filed_as_it_is(
 BEFORE_COMPACTION = datetime.fromisoformat("2026-09-14T16:20:00-04:00")
 # A Saturday catch-up, the weekend run a VM down across Friday 18:30 makes once it is back.
 SATURDAY_CATCH_UP = datetime.fromisoformat("2026-09-19T10:00:00-04:00")
+# A Sunday evening run at the sweep's own hour, the other day the weekday rule must stop.
+SUNDAY_EVENING = datetime.fromisoformat("2026-09-20T18:30:00-04:00")
 
 
 class _UnreachablePinger:
@@ -3912,14 +3914,18 @@ def test_a_catch_up_inside_capture_does_not_hand_off(fixture_lake: FixtureLake):
     assert outcome.held_back == "the day's compaction moment has not passed"
 
 
-def test_a_weekend_catch_up_does_not_hand_off(fixture_lake: FixtureLake):
-    """A Saturday is no session, so it pings like a holiday, and the weekday rule stops it."""
+@pytest.mark.parametrize("now", [SATURDAY_CATCH_UP, SUNDAY_EVENING], ids=["saturday", "sunday"])
+def test_a_weekend_catch_up_does_not_hand_off(fixture_lake: FixtureLake, now: datetime):
+    """A weekend day is no session, so it pings like a holiday, and the weekday rule stops it.
+
+    Saturday and Sunday both run, because a rule that let either day through would upload on it.
+    """
     root = _lake(fixture_lake)
-    outcome, pinger, _ = _run(root, now=SATURDAY_CATCH_UP)
+    outcome, pinger, _ = _run(root, now=now)
     assert outcome.nightly.session is False
     assert pinger.urls == [PING_URL]
     assert outcome.hand_off is False
-    assert outcome.held_back == "2026-09-19 is a weekend"
+    assert outcome.held_back == f"{now.date().isoformat()} is a weekend"
 
 
 def test_a_weekday_holiday_hands_off(fixture_lake: FixtureLake):

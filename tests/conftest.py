@@ -1,20 +1,20 @@
 """Shared fixtures that expose the four seams, the fixture-lake builder and a loopback STS.
 
-It also carries four guards, one redirect, one deletion, one host pin, and one check on
-the outcome. The network guard fails any test that reaches another machine from inside
-this process. The subprocess guard fails any test that shells out to rsync, launchctl,
-pmset, tmutil, systemctl, or timedatectl. The exec guard fails any test that would
-replace this process through ``os.execv`` or ``os.execve``. The config-directory guard
-fails any test that writes under the machine's real ``~/.config/marketlake/``, and its
-other half, the predicate deciding what counts as that directory, sits in
-``tests/support/config_guard.py`` so a child can ask without importing this file. The
-redirect points this process, and every child that inherits its environment, at a
-throwaway config directory, which is what covers the children the four guards cannot
+It also carries four guards, one redirect, one deletion, one host pin, and one check on the
+outcome. The network guard fails any test that reaches another machine from inside this
+process. The subprocess guard fails any test that shells out to rsync, launchctl, pmset,
+tmutil, systemctl, or timedatectl. The exec guard fails any test that calls ``os.execv`` or
+``os.execve`` through the ``os`` module, which is how ``lake.sweep`` reaches its ``exec``.
+The config-directory guard fails any test that writes under the machine's real
+``~/.config/marketlake/``, and its other half, the predicate deciding what counts as that
+directory, sits in ``tests/support/config_guard.py`` so a child can ask without importing
+this file. The redirect points this process, and every child that inherits its environment,
+at a throwaway config directory, which is what covers the children the four guards cannot
 reach. The deletion drops an inherited ``MARKETLAKE_CONFIG``, which names a config file
-rather than a directory and so is not moved by that redirect. The host pin makes every
-test run as macOS unless it asks for Linux, so CI's Linux runner takes the same branch as
-the laptop. The check on the outcome lists the real config directory when this file is
-imported and again when the session ends, and fails the run when it changed.
+rather than a directory and so is not moved by that redirect. The host pin makes every test
+run as macOS unless it asks for Linux, so CI's Linux runner takes the same branch as the
+laptop. The check on the outcome lists the real config directory when this file is imported
+and again when the session ends, and fails the run when it changed.
 """
 
 from __future__ import annotations

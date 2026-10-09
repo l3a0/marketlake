@@ -5,23 +5,32 @@ hand-off without patching it fails, rather than replacing the pytest process wit
 ``python -m lake.compact``. It is autouse, so every test depends on it and no test asserts
 it. These do.
 
-Three properties carry the guard.
+Four properties carry the guard.
 
 1. ``os.execv`` and ``os.execve`` are both refused, and the refusal names the program.
 2. The refusal is neither an ``OSError`` nor an ``Exception``. ``sweep.main`` catches
    ``OSError`` around its ``exec`` and returns 1, so a guard of that kind would turn into an
    exit code that four of the tests reaching the hand-off do not assert.
 3. A recorder a test patches onto ``os.execv`` replaces the guard for that test only.
+4. ``lake.sweep`` reaches its ``exec`` through the ``os`` module. The guard patches the
+   attribute on ``os``, so a ``from os import execv`` in ``lake.sweep`` would bind the real
+   function when the module is imported, and the patch would never reach it.
 """
 
 from __future__ import annotations
 
 import os
+import posix
 import sys
 
 import pytest
 
+import lake.sweep
 from tests.conftest import ExecInTest
+
+# The real exec functions, read when this file is collected and so before any test's guard.
+# ``posix`` is never patched, so its two are the real ones however this file is reached.
+_REAL_EXECS = (os.execv, os.execve, posix.execv, posix.execve)
 
 
 def test_execv_is_refused_and_names_the_program():
@@ -58,3 +67,15 @@ def test_a_recorder_patched_on_top_replaces_the_guard_for_its_test(monkeypatch):
     # Undoing the test's own patch puts the guard back, not the real exec.
     with pytest.raises(ExecInTest):
         os.execv(sys.executable, ["python"])
+
+
+def test_lake_sweep_binds_no_exec_function_by_name():
+    # Every name in the module is checked, since an alias such as ``from os import execv as
+    # run`` hides from a search for the word.
+    bound = [
+        name
+        for name, value in vars(lake.sweep).items()
+        if any(value is real for real in _REAL_EXECS)
+    ]
+    assert bound == []
+    assert lake.sweep.os is os
