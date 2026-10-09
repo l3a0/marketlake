@@ -18,10 +18,11 @@ Post-crash states are built by hand rather than by injecting a crash.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ from lake.split_checkpoint import (
     write_checkpoint,
 )
 from lake.trim import LOCAL_GOOD, LOCAL_ROTTED, TrimResult, rot_page_body, trim
-from tests.component.test_compaction import _chains, _snap
+from tests.component.test_compaction import _chains, _quotes, _snap
 from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
@@ -228,7 +229,73 @@ def test_a_first_night_backlog_is_trimmed_to_the_window_inside_the_deadline(lake
     assert remaining == [f"date={day.isoformat()}.parquet" for day in SESSIONS if day > EDGE]
 
 
+def test_a_utc_clock_still_stamps_the_line_in_eastern_time(lake_root):
+    """Mutation this catches: stamping the clock's own zone. Every other test's clock is
+    Eastern already, so only a clock in another zone tells the two apart."""
+    client = _build(lake_root)
+    _trim(lake_root, client, clock=ManualClock(_et(TONIGHT, 16, 30).astimezone(UTC)))
+    lines = _lines(lake_root)
+    assert lines
+    eastern = _et(TONIGHT, 16, 30).isoformat()
+    assert eastern.endswith("-04:00")
+    for line in lines:
+        assert line["verified_at"] == line["trimmed_at"] == eastern
+
+
+def test_the_oldest_partitions_go_first_whatever_order_the_manifest_holds(lake_root):
+    """Mutations this catches: dropping the sort, and sorting by day alone. The manifest
+    lists the days newest first and SPY before QQQ, so neither order matches by accident."""
+    client = _build(lake_root, days=list(reversed(SESSIONS)), tickers=("SPY", "QQQ"))
+    result = _trim(lake_root, client)
+    assert list(result.trimmed) == _expected()
+    assert [line["partition"] for line in _lines(lake_root)] == _expected()
+
+
 # -- clause 1: present on disk ------------------------------------------------------------
+
+
+def test_a_quotes_partition_is_never_trimmed(lake_root):
+    """Mutation this catches: selecting a partition of any surface. These quotes partitions
+    are manifested, in the bucket and past the window, so only the surface keeps them."""
+    lake = FixtureLake(lake_root)
+    for day in SESSIONS:
+        for ticker in TICKERS:
+            lake.with_partition(
+                "chains", ticker, day, _chains(1, snap_ts=_snap(day, 0), ticker=ticker)
+            )
+    quotes = [f"quotes/ticker=SPY/date={day.isoformat()}.parquet" for day in SESSIONS[:2]]
+    for day in SESSIONS[:2]:
+        lake.with_partition("quotes", "SPY", day, _quotes(1, snap_ts=_snap(day, 0)))
+    lake.build()
+    _checkpoint(lake_root, YESTERDAY, dict.fromkeys(TICKERS, EDGE))
+    client = FakeS3()
+    for rel in [*quotes, *(_rel(t, d) for d in SESSIONS for t in TICKERS)]:
+        client.store(TARGET.key(rel), (lake_root / rel).read_bytes())
+    result = _trim(lake_root, client)
+    assert list(result.trimmed) == _expected()
+    assert all(rel.startswith("chains/") for rel in result.trimmed)
+    assert all((lake_root / rel).exists() for rel in quotes)
+    assert not any(rel in _gets(client) for rel in quotes)
+
+
+# -- refusals before any partition -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("reader", ["latest_trimmed", "latest_quarantine"])
+def test_a_ledger_that_cannot_be_read_refuses_rather_than_stops(lake_root, monkeypatch, reader):
+    """Mutation this catches: letting the ledger read raise, which the outer handler would
+    report as an unforeseen stop rather than a refusal naming the repair."""
+    client = _build(lake_root)
+
+    def torn(root):
+        raise OSError(errno.EIO, "torn")
+
+    owner = trimmed if reader == "latest_trimmed" else trim_module
+    monkeypatch.setattr(owner, reader, torn)
+    result = _trim(lake_root, client)
+    assert result.stopped is None
+    assert result.refused is not None and "a ledger could not be read" in result.refused
+    assert result.trimmed == () and _gets(client) == []
 
 
 def test_an_absent_partition_sends_no_read_and_writes_nothing(lake_root):
@@ -358,6 +425,8 @@ def test_a_rotted_bucket_copy_is_kept_and_named_with_its_good_lake_copy(lake_roo
     assert finding.local == LOCAL_GOOD
     assert finding.version_id == client.versions(TARGET.key(rel))[-1].version_id
     assert finding.manifest_sha256 == latest_entries(lake_root)[rel]["sha256"]
+    # The bucket's own bytes, so the page can tell the two copies apart.
+    assert finding.bucket_sha256 == hashlib.sha256(b"rotted bytes").hexdigest()
     assert client.puts() == []
     # The rest of the run went on.
     assert len(result.trimmed) == len(_expected()) - 1
@@ -377,6 +446,9 @@ def test_two_rotted_copies_fold_into_one_page_body(lake_root):
     assert body.startswith("2 chains partition(s)")
     for finding in result.rot:
         assert f"version {finding.version_id}" in body
+    # The night's printed result names each finding too, not only the page.
+    rot_lines = [line for line in result.render() if line.startswith("  trim     rot ")]
+    assert [line.split()[2] for line in rot_lines] == [f"{first}:", f"{second}:"]
 
 
 def test_the_rot_page_caps_its_list():
@@ -388,6 +460,11 @@ def test_the_rot_page_caps_its_list():
     assert "and 2 more" in body
     assert "T4" not in body
     assert len(body.encode()) < 1000
+    # Exactly the cap names every finding and counts no remainder.
+    capped = findings[: trim_module.ROT_PAGE_CAP]
+    at_cap = rot_page_body(capped)
+    assert " more" not in at_cap
+    assert all(finding.partition in at_cap for finding in capped)
 
 
 def test_a_local_copy_that_rotted_beside_a_good_bucket_copy_is_trimmed(lake_root):
@@ -833,24 +910,36 @@ def _restore(root: Path, rel: str, restored_at: object) -> None:
     ids=["before", "on-the-day", "utc-before", "no-offset", "unparseable", "not-text", "missing"],
 )
 def test_a_restore_waits_for_a_checkpoint_written_after_it(lake_root, restored_at, kept):
-    """Mutations this catches: ``<`` turned to ``<=``, and dropping the restore-line rule."""
+    """Mutations this catches: ``<`` turned to ``<=``, dropping the restore-line rule, and
+    dropping the stamp's text check or narrowing its parse failure. Either of the last two
+    turns a bad stamp into an error that stops the whole run."""
     client = _build(lake_root)
     rel = _rel("SPY", SESSIONS[0])
     _restore(lake_root, rel, restored_at)
     result = _trim(lake_root, client)
     assert (rel in result.trimmed) is not kept
     assert (lake_root / rel).exists() is kept
+    # A bad stamp keeps its own partition and nothing else.
+    assert result.stopped is None
+    assert list(result.trimmed) == [other for other in _expected() if not (kept and other == rel)]
 
 
-def test_a_line_of_an_unknown_kind_keeps_its_partition(lake_root):
+@pytest.mark.parametrize(
+    "stamp", [None, "2026-08-20T19:00:00-04:00"], ids=["no-stamp", "old-restore-stamp"]
+)
+def test_a_line_of_an_unknown_kind_keeps_its_partition(lake_root, stamp):
+    """Mutation this catches: judging every line that is not a trim line as a restore line.
+    A restore stamp from before the checkpoint's session would then release the partition."""
     client = _build(lake_root)
     rel = _rel("SPY", SESSIONS[0])
+    line = {"kind": "hold", "partition": rel}
+    if stamp is not None:
+        line[trimmed.RESTORED_AT_FIELD] = stamp
     with lake_lock(lake_root):
-        trimmed.append_trimmed(
-            lake_root, {"kind": "hold", "partition": rel}, source="test", fetched_at=None
-        )
+        trimmed.append_trimmed(lake_root, line, source="test", fetched_at=None)
     result = _trim(lake_root, client)
     assert rel not in result.trimmed
+    assert (lake_root / rel).exists()
 
 
 # -- clause 7: the quarantine -----------------------------------------------------------

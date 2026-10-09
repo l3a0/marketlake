@@ -326,6 +326,45 @@ def test_a_gate_that_refuses_keeps_every_partition(lake_root, kwargs, words):
     assert f"  trim     refused: {result.trim.refused}" in result.render()
 
 
+def test_a_runner_that_is_not_a_bucket_refuses_even_with_a_bucket_target(lake_root):
+    """Mutation this catches: judging the target's form alone. A runner that is not a bucket
+    backup carries no upload summary to trim by."""
+    client = _lake(lake_root)
+    events: list[str] = []
+    result = _job(lake_root, client, events, backup=FakeBackup([]), backup_target=TARGET)
+    assert result.trim is not None and result.trim.stopped is None
+    assert result.trim.refused is not None and "not a bucket" in result.trim.refused
+    assert not any(event.startswith("get ") for event in events)
+    assert all((lake_root / _rel("SPY", day)).exists() for day in OLD)
+
+
+def test_main_on_a_shadow_refuses_the_trim_by_its_role(lake_root, tmp_path, monkeypatch, capsys):
+    """Mutation this catches: ``main`` passing a fixed role. A shadow builds no backup, so a
+    fixed primary role would still refuse, but by the backup, not by the role."""
+    client = _lake(lake_root)
+    config = write_config(tmp_path, lake_root, role="shadow")
+    text = config.read_text().replace(
+        f"backup_target: {tmp_path / 'ssd'}", f"backup_target: {TARGET}"
+    )
+    config.write_text(
+        text
+        + "bucket_access_key_id: AKIDCONFIG\n"
+        + "bucket_secret_access_key: secret-bucket-key\n"
+        + "bucket_region: us-east-2\n"
+        + f"lake_window_sessions: {WINDOW}\n"
+    )
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
+    compact_module.main(
+        ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+        clock=ManualClock(_et(TONIGHT, 16, 30)),
+        calendar=CALENDAR,
+    )
+    out = capsys.readouterr().out
+    assert "  trim     refused: the role is 'shadow'" in out, out
+    assert all((lake_root / _rel("SPY", day)).exists() for day in OLD)
+
+
 def test_a_path_backup_target_refuses_even_with_a_runner(lake_root):
     """Mutation this catches: gating on ``backup is not None`` alone."""
     client = _lake(lake_root)
@@ -477,6 +516,52 @@ def test_a_host_with_no_ledger_keeps_an_empty_directory(lake_root):
     assert left.is_dir()
     assert result.pruned == ()
     assert not trimmed_path(lake_root).exists()
+
+
+def test_a_run_whose_only_change_is_a_pruned_directory_reports_a_change(lake_root):
+    """Mutation this catches: ``changed`` ignoring the pass. The first run seals and writes
+    the plan, so only the second run's removal is left to count."""
+    _lake(lake_root, seed=False, tonight=False)
+    _ledger(lake_root)
+
+    def run():
+        return compact(
+            lake_root,
+            clock=ManualClock(_et(TONIGHT, 16, 30)),
+            calendar=CALENDAR,
+            backup=FakeBackup([]),
+            backup_target=lake_root.parent / "ssd",
+            plan_path=lake_root.parent / "chain_plan.json",
+        )
+
+    run()
+    assert not run().changed
+    left = _empty_ticker(lake_root)
+    result = run()
+    assert result.pruned == ("chains/ticker=IWM",) and not left.exists()
+    assert result.trim is None and result.sealed == ()
+    assert result.changed
+
+
+def test_the_pass_keeps_an_empty_directory_that_is_not_a_ticker(lake_root):
+    """Mutation this catches: removing every empty directory under ``chains/``. Only a
+    ``ticker=`` directory is the trim's to remove."""
+    _lake(lake_root, seed=False)
+    _ledger(lake_root)
+    other = lake_root / "chains" / "notaticker"
+    other.mkdir()
+    left = _empty_ticker(lake_root)
+    result = compact(
+        lake_root,
+        clock=ManualClock(_et(TONIGHT, 16, 30)),
+        calendar=CALENDAR,
+        backup=FakeBackup([]),
+        backup_target=lake_root.parent / "ssd",
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+    assert other.is_dir()
+    assert not left.exists()
+    assert result.pruned == ("chains/ticker=IWM",)
 
 
 def test_the_pass_keeps_a_directory_holding_anything(lake_root):

@@ -234,6 +234,28 @@ def test_a_plain_get_of_old_bytes_fails_grant_seven():
     ) in lines
 
 
+class _ServesFirstBytesAsCurrent(FakeS3):
+    """A plain ``GetObject`` that names the current version and serves the first one's bytes."""
+
+    def get_object(self, **kwargs):
+        if "VersionId" in kwargs:
+            return super().get_object(**kwargs)
+        versions = self.objects[kwargs["Key"]]
+        response = super().get_object(**kwargs, VersionId=versions[0].version_id)
+        response["VersionId"] = versions[-1].version_id
+        return response
+
+
+def test_a_plain_get_of_old_bytes_under_the_current_id_fails_grant_seven():
+    """Mutation this catches: grant seven judging the id alone. The id here is right, so only
+    the bytes fail it."""
+    passed, lines = _run(_ServesFirstBytesAsCurrent())
+    assert not passed
+    assert (
+        "live-check: FAIL 7 GetObject of the probe returned other bytes with VersionId v2"
+    ) in lines
+
+
 class _NamesNoVersion(FakeS3):
     """A plain ``GetObject`` that serves the current bytes and names no version."""
 

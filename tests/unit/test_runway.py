@@ -165,6 +165,29 @@ def test_a_timing_file_beside_a_live_segment_leaves_that_day_unsealed(tmp_path: 
     assert usage.unsealed == frozenset({date(2026, 9, 16)})
 
 
+@pytest.mark.parametrize("reverse", [False, True], ids=["sorted", "reversed"])
+def test_an_older_chains_day_replaces_the_tickers_of_a_newer_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse: bool
+):
+    """Mutation this catches: adding a ticker to the set when an older day replaces the day.
+    The walk meets AAA's or ZZZ's newer day before MMM's older one in either order, so the
+    newer day's ticker would stay in the answer."""
+    real = os.walk
+
+    def ordered(top, **kwargs):
+        for parent, dirs, names in real(top, **kwargs):
+            dirs.sort(reverse=reverse)
+            yield parent, dirs, sorted(names, reverse=reverse)
+
+    monkeypatch.setattr(runway.os, "walk", ordered)
+    _write(tmp_path, "chains/ticker=AAA/date=2026-09-15.parquet", 10)
+    _write(tmp_path, "chains/ticker=MMM/date=2026-09-14.parquet", 10)
+    _write(tmp_path, "chains/ticker=ZZZ/date=2026-09-15.parquet", 10)
+    oldest = walk(tmp_path).oldest_chains
+    assert oldest is not None
+    assert (oldest.day, oldest.tickers) == (date(2026, 9, 14), ("MMM",))
+
+
 # -- what the walk refuses ---------------------------------------------------
 
 
