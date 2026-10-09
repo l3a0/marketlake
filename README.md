@@ -28,6 +28,9 @@ beside the laptop until the cutover in
 [#638](https://github.com/l3a0/marketlake/issues/638) made it the primary capture host.
 Its lake volume holds a window of recent chains sessions, and the close+15 compaction trims
 older chains partitions once each is verified in the bucket ([#787](https://github.com/l3a0/marketlake/issues/787)).
+A merge to `main` reaches the VM through `.github/workflows/deploy.yml`, which asks the VM
+to deploy the commit once the owner approves the run
+([#676](https://github.com/l3a0/marketlake/issues/676)).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -82,13 +85,15 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
-  that holds the infrastructure's state, GitHub's OIDC provider, and the plan and apply
-  roles. The owner applies it from the laptop.
+  that holds the infrastructure's state, GitHub's OIDC provider, and the plan, apply and
+  deploy roles. The owner applies it from the laptop.
 - `infra/live` is the configuration CI applies: the backup bucket, the instance role,
   the laptop's IAM user `marketlake-command` with the two roles it assumes, one for the
   bucket and one that writes the Schwab token, and the hosted VM. `infra/live/vm.tf`
   holds the VM, its security group, key pair and lake volume, and
   `infra/live/user-data.sh.tftpl` is the first-boot script it hands to cloud-init.
+  `infra/live/deploy.tf` holds the SSM document that deploys `main` to the VM, and
+  `infra/live/deploy-step.sh` is the one shell step it runs there.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
@@ -99,6 +104,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   the lake volume, installs `uv`, syncs the environment, renders `config.yaml`, pulls
   the token, applies the roster, and only then installs and starts the units. It is safe
   to run again over SSH.
+- `deploy/send-deploy.sh` runs on a GitHub runner for `.github/workflows/deploy.yml`. It
+  sends the VM the deploy document for one commit, waits for the result, and prints only a
+  summary, because the repository's logs are public.
 - `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
   It refuses unless the lake volume is mounted, `role` is `shadow`, every unit is
   stopped and nothing is mounted below the lake root.
@@ -736,8 +744,8 @@ how many open spans it checked. On a host whose `role` is exactly `shadow`, a mi
 security master or capture spans file skips the check, and the skip says so.
 
 On the VM, `deploy/vm-bootstrap.sh` runs it at first boot and on every rerun
-([#686](https://github.com/l3a0/marketlake/issues/686)), and the post-close deploy
-([#676](https://github.com/l3a0/marketlake/issues/676)) will run it once it is built.
+([#686](https://github.com/l3a0/marketlake/issues/686)), and every deploy
+([#676](https://github.com/l3a0/marketlake/issues/676)) runs it again through the bootstrap.
 
 On the laptop, run it from the main checkout after a `git pull`. Call the checkout's own
 venv interpreter, the way the rendered `reauth.sh` does. `uv run` would sync the venv
@@ -777,8 +785,10 @@ steps, and the order matters.
 The hosted deployment's AWS resources are code under `infra/`, in two OpenTofu
 configurations. The owner applies `infra/bootstrap/` from the laptop, and
 `.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the owner
-approves the run. [infra/README.md](infra/README.md) is the runbook, from the first
-bootstrap through recovery, and lists the secrets and the variables the workflow reads.
+approves the run. `.github/workflows/deploy.yml` deploys `main` to the VM after each merge,
+once the owner approves that run too. [infra/README.md](infra/README.md) is the runbook,
+from the first bootstrap through recovery, and lists the secrets and the variables both
+workflows read.
 
 ## Develop
 
@@ -824,7 +834,7 @@ tofu -chdir=infra/live validate
 tofu -chdir=infra/live test
 ```
 
-Six things those checks cannot see are covered by `uv run pytest` instead.
+Seven things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups, captured minutes or
    the infrastructure's state, and on the laptop's user, its two roles and their
@@ -838,6 +848,9 @@ Six things those checks cannot see are covered by `uv run pytest` instead.
    owner and the volume id.
 6. Every variable `infra/live/` requires reaching both plans in `infra.yml`, and the
    `replace_instance` input naming only the instance.
+7. The deploy: the document's shell step run under dash, `deploy/send-deploy.sh` run
+   against a fake `aws`, the guards in `deploy.yml`, and the document name, tag and
+   timeouts that `deploy.yml` shares with both configurations.
 
 ### Keep development runs off the real config directory
 

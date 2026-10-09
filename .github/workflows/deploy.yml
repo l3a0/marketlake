@@ -1,0 +1,110 @@
+# Deploys main to the hosted VM after each merge, with no login and no stored key (#676).
+#
+# The job waits for the owner's approval in the `deploy` environment, assumes the deploy
+# role through OIDC, and runs deploy/send-deploy.sh, which asks the VM to run
+# deploy/vm-deploy.sh through the SSM document marketlake-deploy. The host decides
+# whether this moment is safe, so an approval during the refused hours fails the run
+# with the time a deploy may start, and a re-run after that time deploys.
+#
+# No job here is named `test`, because the ruleset on main requires a check by that
+# name and ci.yml provides it.
+#
+# A public repository's logs are readable by anyone, so send-deploy.sh prints only its
+# summary, never the host's output or an AWS reply. Event values reach a `run:` script
+# only through `env:`, never by interpolation.
+#
+# Every action is pinned to a commit. Any step in a job with `id-token: write` can mint
+# the job's OIDC token, so a re-pointed tag would get the AWS role.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # An explicit bash adds pipefail.
+    shell: bash
+
+# The document's name and the VM's tag live here once, and reach send-deploy.sh as
+# environment variables. tests/component/test_deploy_workflow.py checks them against
+# infra/live and infra/bootstrap.
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_DOCUMENT: marketlake-deploy
+  DEPLOY_TAG_KEY: "marketlake:host"
+  DEPLOY_TAG_VALUE: capture
+
+jobs:
+  deploy:
+    name: deploy main to the VM
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # 10 minutes for delivery, the document's 220-minute timeout, and 10 for setup and
+    # polling.
+    timeout-minutes: 240
+    # Needs the owner's approval, and holds the deploy role's ARN.
+    environment: deploy
+    # One deploy at a time. Cancelling a running job would stop only the host's wrapper,
+    # and leave its outcome unread.
+    concurrency:
+      group: deploy-vm
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The secret is an environment secret, so a run in an environment nobody protected
+      # stops here.
+      - name: Refuse an empty secret
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_DEPLOY_ROLE_ARN" ]; then
+            echo "::error::AWS_DEPLOY_ROLE_ARN is empty. infra/README.md says where to set it."
+            exit 1
+          fi
+
+      # Every push to main starts its own deploy run, so a run whose commit main has moved
+      # past skips, and the newer commit's run deploys. Approving two waiting runs out of
+      # order would otherwise deploy the older commit last. A failed read fails the step,
+      # because the assignment fails under bash's -e.
+      - name: Check that main still points at this commit
+        id: head
+        run: |
+          remote="$(git ls-remote --exit-code origin refs/heads/main)"
+          head="${remote%%[[:space:]]*}"
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git ls-remote returned no commit for main."
+            exit 1
+          fi
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "state=fresh" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=stale" >> "$GITHUB_OUTPUT"
+            echo "Skipped: main has moved past $GITHUB_SHA, and the newer commit's own run deploys it." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.head.outputs.state == 'fresh'
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+          # The deploy role allows 18,000 seconds, longer than this job's 240 minutes.
+          role-duration-seconds: 18000
+
+      - name: Ask the VM to deploy this commit
+        if: steps.head.outputs.state == 'fresh'
+        run: deploy/send-deploy.sh

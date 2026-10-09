@@ -152,10 +152,12 @@ resource "aws_instance" "vm" {
     lake_volume_id = aws_ebs_volume.lake.id
   })
 
-  # #676 conditions ssm:SendCommand on the marketlake:host tag. The config render reads
-  # marketlake:backup-target through instance metadata, by the owner's decision of
-  # 2026-10-07, so the bucket reaches the VM from the variable OpenTofu already holds
-  # rather than from a parameter put by hand. A bucket change updates the tag in place.
+  # The deploy role in infra/bootstrap/roles.tf may send the deploy document only to an
+  # instance whose marketlake:host tag is capture (#676), and deploy/send-deploy.sh finds
+  # the VM by the same tag. The config render reads marketlake:backup-target through
+  # instance metadata, by the owner's decision of 2026-10-07, so the bucket reaches the
+  # VM from the variable OpenTofu already holds rather than from a parameter put by hand.
+  # A bucket change updates the tag in place.
   #
   # With instance_metadata_tags enabled, EC2 refuses a tag key holding a / or a space,
   # because the metadata service serves each key as a path. Every key here complies, and

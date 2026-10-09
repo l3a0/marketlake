@@ -692,6 +692,80 @@ run "shim_carries_only_the_owner_and_the_volume_id" {
   }
 }
 
+# The deploy role may send this document and no other (#676), so the document's patterns
+# and its one command are all that stand between a deploy job and root on the VM.
+# tests/component/test_deploy_document.py runs the step itself under dash.
+run "deploy_document_runs_only_vm_deploy" {
+  command = plan
+
+  assert {
+    condition = [
+      aws_ssm_document.deploy.name,
+      aws_ssm_document.deploy.document_type,
+      jsondecode(aws_ssm_document.deploy.content).schemaVersion,
+    ] == ["marketlake-deploy", "Command", "2.2"]
+    error_message = "The deploy document is not the schema 2.2 Command document marketlake-deploy."
+  }
+
+  # SSM checks both patterns at the API and on the agent before it substitutes a value
+  # into the step, so a looser pattern lets a parameter carry a command.
+  assert {
+    condition = jsondecode(aws_ssm_document.deploy.content).parameters == {
+      sha = {
+        type           = "String"
+        description    = "The commit to deploy, 40 hex digits."
+        allowedPattern = "^[0-9a-f]{40}$"
+      }
+      notAfter = {
+        type           = "String"
+        description    = "The epoch second after which the host refuses to start."
+        allowedPattern = "^[0-9]{10}$"
+      }
+    }
+    error_message = "The deploy document's parameters are not exactly sha and notAfter with their anchored patterns."
+  }
+
+  assert {
+    condition = [
+      for step in jsondecode(aws_ssm_document.deploy.content).mainSteps :
+      [step.action, step.name, step.inputs.timeoutSeconds, length(step.inputs.runCommand), join(",", sort(keys(step.inputs)))]
+      ] == [
+      ["aws:runShellScript", "deploy", 13200, 1, "runCommand,timeoutSeconds"],
+    ]
+    error_message = "The deploy document is not one aws:runShellScript step with a 13,200-second timeout and one command."
+  }
+
+  # The step's lines, without comments and blank lines, start by setting PATH and the
+  # directory, because the agent starts a step in its own directory with its own PATH.
+  assert {
+    condition = slice([
+      for line in split("\n", jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0]) :
+      line if trimspace(line) != "" && !startswith(trimspace(line), "#")
+      ], 0, 3) == [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "export PATH",
+      "cd / || exit 2",
+    ]
+    error_message = "The deploy step does not set its PATH and change to / before anything else."
+  }
+
+  # The one command the step runs, with the two parameters and nothing else substituted.
+  assert {
+    condition = [
+      for line in split("\n", jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0]) :
+      line if strcontains(line, "{{")
+      ] == [
+      "exec \"$home/marketlake/deploy/vm-deploy.sh\" --sha {{ sha }} --not-after {{ notAfter }}",
+    ]
+    error_message = "The deploy step does not run exactly deploy/vm-deploy.sh with --sha and --not-after."
+  }
+
+  assert {
+    condition     = strcontains(jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0], "conf=/etc/marketlake/bootstrap.conf\n")
+    error_message = "The deploy step does not read the owner from bootstrap.conf."
+  }
+}
+
 # The validations refuse a malformed input with a message that names no value. The
 # provider refuses some of these too, but its error prints the address.
 run "a_bare_address_and_an_empty_key_fail_validation" {

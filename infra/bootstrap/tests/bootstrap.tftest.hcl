@@ -50,6 +50,34 @@ run "trust_policies_match_the_oidc_subjects" {
     }]
     error_message = "The apply role's trust is not exactly the infra environment subject on main with the sts audience."
   }
+
+  assert {
+    condition = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement == [{
+      Effect    = "Allow"
+      Principal = { Federated = "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com" }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:l3a0@5200900/marketlake@1346754080:environment:deploy"
+          "token.actions.githubusercontent.com:ref" = "refs/heads/main"
+        }
+      }
+    }]
+    error_message = "The deploy role's trust is not exactly the deploy environment subject on main with the sts audience."
+  }
+
+  # deploy.yml asks for an 18,000-second session, and AWS refuses a request longer than
+  # the role allows.
+  assert {
+    condition     = aws_iam_role.deploy.max_session_duration == 18000
+    error_message = "The deploy role's session limit is not 18,000 seconds, so the deploy job cannot assume it for its 240 minutes."
+  }
+
+  assert {
+    condition     = aws_iam_role.deploy.name == "marketlake-deploy"
+    error_message = "The deploy role is not named marketlake-deploy."
+  }
 }
 
 run "every_deny_is_present" {
@@ -127,15 +155,40 @@ run "no_allow_grants_a_forbidden_action" {
       for s in concat(
         jsondecode(aws_iam_role_policy.plan.policy).Statement,
         jsondecode(aws_iam_role_policy.apply.policy).Statement,
+        jsondecode(aws_iam_role_policy.deploy.policy).Statement,
         ) : s.Effect == "Allow" && (
         can(s.NotAction)
         || length(setintersection(toset(flatten([s.Action])), toset([
           "s3:PutBucketVersioning", "iam:DeleteUser", "iam:DeleteUserPolicy", "iam:*", "s3:*", "*",
+          "ssm:ModifyDocumentPermission", "ssm:CancelCommand", "ssm:*",
         ]))) > 0
         || anytrue([for a in flatten([s.Action]) : strcontains(a, "*") && a != "ec2:*"])
       )
     ])
     error_message = "A role allows an action the issue forbids, or a wildcard other than ec2:*."
+  }
+
+  # The deploy role reaches the VM through one document. A send grant on any other
+  # document, AWS-RunShellScript among them, would let any step in the deploy job run
+  # any command as root on the VM.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.deploy.policy).Statement : alltrue([
+        for r in flatten([s.Resource]) :
+        r == "arn:aws:ssm:us-east-1:000000000000:document/marketlake-deploy*"
+        || (r == "arn:aws:ec2:us-east-1:000000000000:instance/*"
+        && try(s.Condition, null) == { StringEquals = { "ssm:resourceTag/marketlake:host" = "capture" } })
+      ])
+      if contains(flatten([s.Action]), "ssm:SendCommand")
+    ])
+    error_message = "The deploy role may send a command to a document other than marketlake-deploy, or to an instance not tagged marketlake:host = capture."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.deploy.policy).Statement : s.Effect == "Allow"
+    ])
+    error_message = "The deploy role's inline policy holds a Deny, which the reviewed policy does not."
   }
 
   assert {
@@ -349,9 +402,61 @@ run "policies_are_exactly_the_reviewed_statements" {
             StringEquals = { "aws:RequestedRegion" = "us-east-1" }
           }
         },
+        {
+          Sid    = "DeployDocumentWrite"
+          Effect = "Allow"
+          Action = [
+            "ssm:CreateDocument",
+            "ssm:UpdateDocument",
+            "ssm:UpdateDocumentDefaultVersion",
+            "ssm:DeleteDocument",
+          ]
+          Resource = ["arn:aws:ssm:us-east-1:000000000000:document/marketlake-deploy*"]
+        },
       ]
     }
     error_message = "The apply role's inline policy is not exactly the reviewed Denies and Allows."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.deploy.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "FindTheVm"
+          Effect   = "Allow"
+          Action   = ["ec2:DescribeInstances"]
+          Resource = ["*"]
+        },
+        {
+          Sid      = "SendToTheCaptureHost"
+          Effect   = "Allow"
+          Action   = ["ssm:SendCommand"]
+          Resource = ["arn:aws:ec2:us-east-1:000000000000:instance/*"]
+          Condition = {
+            StringEquals = { "ssm:resourceTag/marketlake:host" = "capture" }
+          }
+        },
+        {
+          Sid      = "SendTheDeployDocument"
+          Effect   = "Allow"
+          Action   = ["ssm:SendCommand"]
+          Resource = ["arn:aws:ssm:us-east-1:000000000000:document/marketlake-deploy*"]
+        },
+        {
+          Sid      = "ReadTheDeployResult"
+          Effect   = "Allow"
+          Action   = ["ssm:GetCommandInvocation"]
+          Resource = ["*"]
+        },
+      ]
+    }
+    error_message = "The deploy role's inline policy is not exactly the reviewed four Allows."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.deploy.role == aws_iam_role.deploy.name
+    error_message = "The deploy policy is not on marketlake-deploy."
   }
 }
 
@@ -435,5 +540,29 @@ run "config_denies_follow_the_callers_account" {
       ]]
     ])
     error_message = "A config-parameter Deny does not name the caller's account."
+  }
+
+  # A grant naming a hard-coded account id is a grant on nobody's VM or document.
+  assert {
+    condition = [for s in jsondecode(aws_iam_role_policy.deploy.policy).Statement : s.Resource] == [
+      ["*"],
+      ["arn:aws:ec2:us-east-1:111111111111:instance/*"],
+      ["arn:aws:ssm:us-east-1:111111111111:document/marketlake-deploy*"],
+      ["*"],
+    ]
+    error_message = "A deploy-role grant does not name the caller's account."
+  }
+
+  assert {
+    condition = [
+      for s in jsondecode(aws_iam_role_policy.apply.policy).Statement : s.Resource
+      if try(s.Sid, "") == "DeployDocumentWrite"
+    ] == [["arn:aws:ssm:us-east-1:111111111111:document/marketlake-deploy*"]]
+    error_message = "The apply role's document grant does not name the caller's account."
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Principal.Federated == "arn:aws:iam::111111111111:oidc-provider/token.actions.githubusercontent.com"
+    error_message = "The deploy role's trust does not name the caller's OIDC provider."
   }
 }
