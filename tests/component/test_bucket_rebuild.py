@@ -233,6 +233,23 @@ def test_the_exclusion_restores_everything_but_the_designed_absences(tmp_path):
     )
 
 
+def test_the_summary_line_names_the_left_out_count_before_the_lost_one():
+    summary = bucket.RestoreSummary(
+        target="s3://lake-backup/lake",
+        dest=Path("/restored"),
+        work=Path("/restored") / WORK,
+        trimmed_left_out=2,
+        trimmed_lost=["a"],
+    )
+
+    assert summary.render() == (
+        "restored 0 file(s) from s3://lake-backup/lake into /restored: downloaded 0 (0.0 MB), "
+        "0 already verified in the working directory, 2 partition(s) trimmed on purpose left "
+        "out, 1 partition(s) trimmed on purpose and missing from the bucket, 0 compacted "
+        "journal segment(s) left out"
+    )
+
+
 def test_a_whole_lake_restore_of_the_same_bucket_brings_the_trimmed_partition_back(tmp_path):
     lake = _trimmed_bucket(tmp_path)
     dest = tmp_path / "restored"
@@ -340,23 +357,160 @@ def test_a_ledger_the_bucket_lacks_refuses_before_any_download(tmp_path):
     assert not dest.exists()
 
 
-def test_a_ledger_whose_matching_bytes_do_not_parse_refuses_naming_the_damage(tmp_path):
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(lambda ledger: b"\xff\n", id="bad-utf8"),
+        pytest.param(lambda ledger: b"\xef\xbb\xbf" + ledger, id="byte-order-mark"),
+        pytest.param(lambda ledger: b'{"kind": "tr\n' + ledger, id="hidden-tear"),
+        pytest.param(lambda ledger: ledger + b'{"kind": "trim"}\n', id="no-partition"),
+    ],
+)
+def test_a_ledger_whose_matching_bytes_do_not_parse_refuses_naming_the_damage(
+    tmp_path, monkeypatch, capsys, damage
+):
+    # Each kind of damage the parse and the resolve refuse is a different ``ManifestError``, so
+    # a catch narrowed to one of them lets the others out of ``main`` as a traceback.
     lake = _trimmed_bucket(tmp_path)
-    damaged = b"\xff\n"
+    damaged = damage(lake.client.body(f"lake/{LEDGER}"))
     lake.client.store(f"lake/{LEDGER}", damaged)
     _record_in_bucket(lake.client, LEDGER, damaged)
+    config = _config(tmp_path, lake.root, window="22")
     lake.client.calls.clear()
     dest = tmp_path / "restored"
+
+    with pytest.raises(SystemExit) as exc:
+        _main(config, lake.client, monkeypatch, dest)
+
+    line = _refused(capsys, exc)
+    assert "matches its manifest entry and cannot be read" in line
+    assert "trimmed on purpose" in line
+    assert "Putting a version back" not in line
+    assert _gets(lake.client) == ["lake/manifest.jsonl", f"lake/{LEDGER}"]
+    assert not dest.exists()
+
+
+def test_a_matching_working_ledger_that_does_not_parse_refuses_as_damaged_everywhere(tmp_path):
+    # The manifest's entry is for damaged bytes the bucket's current ledger is not, so the first
+    # run refuses on the mismatch and leaves the working directory. A copy of the recorded bytes
+    # put there matches the entry and still cannot be read, so no copy anywhere can be.
+    lake = _trimmed_bucket(tmp_path)
+    damaged = b"\xff\n"
+    _record_in_bucket(lake.client, LEDGER, damaged)
+    dest = tmp_path / "restored"
+    with pytest.raises(RestoreRefused, match=_sha(damaged)):
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+    (dest / WORK / LEDGER).write_bytes(damaged)
+    lake.client.calls.clear()
 
     with pytest.raises(RestoreRefused) as refused:
         restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
 
     message = str(refused.value)
-    assert "matches its manifest entry and cannot be read" in message
-    assert "trimmed on purpose" in message
-    assert "Putting a version back" not in message
-    assert _gets(lake.client) == ["lake/manifest.jsonl", f"lake/{LEDGER}"]
+    assert str(dest / WORK / LEDGER) in message
+    assert "every copy of that version is damaged the same way" in message
+    assert f"lake/{LEDGER}" not in _gets(lake.client)
+    assert sorted(os.listdir(dest)) == [WORK]
+
+
+@pytest.fixture
+def restore_chmod():
+    """Paths whose mode a test changed, put back to writable after it, pass or fail."""
+    changed: list[Path] = []
+    yield changed
+    for path in changed:
+        path.chmod(0o755 if path.is_dir() else 0o644)
+
+
+def _skip_as_root() -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes, so chmod cannot make the local failure")
+
+
+def test_a_working_ledger_that_will_not_read_is_one_local_line(tmp_path, restore_chmod):
+    _skip_as_root()
+    lake, _never = _mismatched(tmp_path)
+    dest = tmp_path / "restored"
+    with pytest.raises(RestoreRefused):
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+    working = dest / WORK / LEDGER
+    working.write_bytes(lake.client.body(f"lake/{LEDGER}"))
+    working.chmod(0)
+    restore_chmod.append(working)
+
+    with pytest.raises(RestoreRefused) as refused:
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    message = str(refused.value)
+    assert message.startswith(f"reading {LEDGER} in {dest / WORK} failed (PermissionError: ")
+    assert message.endswith(", so nothing was restored")
+
+
+def test_a_mismatch_that_cannot_create_the_working_directory_is_one_local_line(
+    tmp_path, restore_chmod
+):
+    _skip_as_root()
+    lake, _never = _mismatched(tmp_path)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    parent.chmod(0o555)
+    restore_chmod.append(parent)
+    dest = parent / "restored"
+
+    with pytest.raises(RestoreRefused) as refused:
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    message = str(refused.value)
+    assert message.startswith(f"creating {dest / WORK} failed (PermissionError: ")
+    assert message.endswith(", so nothing was restored")
     assert not dest.exists()
+
+
+def test_a_mismatch_that_cannot_write_the_manifest_is_one_local_line(tmp_path, restore_chmod):
+    _skip_as_root()
+    lake, _never = _mismatched(tmp_path)
+    dest = tmp_path / "restored"
+    with pytest.raises(RestoreRefused):
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+    manifest = dest / WORK / "manifest.jsonl"
+    manifest.chmod(0o444)
+    restore_chmod.append(manifest)
+
+    with pytest.raises(RestoreRefused) as refused:
+        restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"writing manifest.jsonl into {dest / WORK} failed (PermissionError: "
+    )
+    assert message.endswith(", so nothing was restored")
+
+
+def test_a_resumed_restore_with_an_unrecorded_ledger_in_the_working_directory(tmp_path):
+    # The bucket's manifest records no trimmed.jsonl, while the bucket holds one, so the first
+    # windowed run downloads it as an unrecorded file into the working directory. A failed file
+    # stops that run, and the next run resumes beside the ledger it left.
+    root = FixtureLake(tmp_path / "lake").with_chains("SPY", D1).with_quotes("SPY", D1).build()
+    client = FakeS3()
+    first_upload(root, TARGET, client=client, clock=ManualClock(FRIDAY_19), calendar=CALENDAR)
+    assert LEDGER not in _bucket_latest(client)
+    client.store(f"lake/{LEDGER}", b"a ledger the manifest does not record\n")
+    good = client.body(f"lake/{SPY_1}")
+    client.store(f"lake/{SPY_1}", good + b"rot")
+    dest = tmp_path / "restored"
+
+    first = restore_lake(dest, TARGET, client=client, skip_designed_absences=True)
+    assert first.restored is False
+    assert first.failures == [(SPY_1, "does not match its SHA-256")]
+    assert (dest / WORK / LEDGER).is_file()
+    client.store(f"lake/{SPY_1}", good)
+
+    second = restore_lake(dest, TARGET, client=client, skip_designed_absences=True)
+
+    assert second.restored is True
+    assert second.failures == []
+    assert (dest / LEDGER).read_bytes() == b"a ledger the manifest does not record\n"
+    assert (dest / SPY_1).read_bytes() == good
 
 
 @pytest.mark.parametrize(
@@ -664,3 +818,81 @@ def test_a_destination_short_of_the_plan_gets_the_free_space_line(tmp_path, wind
     message = str(refused.value)
     assert "MB free, so nothing was restored" in message
     assert "reserve" not in message
+
+
+def test_free_space_equal_to_the_plan_is_judged_by_the_reserve(tmp_path):
+    # At exactly the planned bytes free the plan fits, so what refuses is the reserve, which
+    # this bucket's busiest sealed day makes nonzero.
+    lake = _trimmed_bucket(tmp_path)
+    needed = _needed(lake.client, left_out=(SPY_1,))
+    assert _reserve(lake.client) > 0
+
+    with pytest.raises(RestoreRefused) as refused:
+        restore_lake(
+            tmp_path / "exact",
+            TARGET,
+            client=lake.client,
+            skip_designed_absences=True,
+            free_space=lambda path: needed,
+        )
+
+    message = str(refused.value)
+    assert "short of the reserve" in message
+    assert "MB free, so nothing was restored" not in message
+
+
+def test_free_space_equal_to_the_plan_restores_a_bucket_with_no_sealed_day(tmp_path):
+    # The lake holds only a refused day's journal segment, which is no sealed byte, so the
+    # reserve is 0 and exactly the plan's bytes free is enough.
+    lake = FixtureLake(tmp_path / "lake")
+    lake.with_journal_segment(
+        "chains", "SPY", "2026-08-27", sample_chains_table(), start_ts="20260827T133000Z", pid=4242
+    )
+    root = lake.build()
+    _record(root, SEGMENT, "capture")
+    client = FakeS3()
+    first_upload(root, TARGET, client=client, clock=ManualClock(FRIDAY_19), calendar=CALENDAR)
+    assert sorted(_sizes(client)) == [SEGMENT, "manifest.jsonl"]
+    needed = _needed(client, left_out=())
+
+    with pytest.raises(RestoreRefused, match="MB free, so nothing was restored"):
+        restore_lake(tmp_path / "short", TARGET, client=client, free_space=lambda path: needed - 1)
+    summary = restore_lake(
+        tmp_path / "exact", TARGET, client=client, free_space=lambda path: needed
+    )
+
+    assert summary.restored is True
+    assert _files(tmp_path / "exact") == _files(root)
+
+
+@pytest.mark.parametrize(
+    ("windowed", "tail"),
+    [
+        pytest.param(False, "", id="whole-lake"),
+        pytest.param(
+            True,
+            ". On the hosted VM, raise lake_volume_gib, apply the infrastructure, and rerun the "
+            "bootstrap so resize2fs grows the filesystem. A whole-lake restore needs more room, "
+            "not less",
+            id="exclusion",
+        ),
+    ],
+)
+def test_the_reserve_line_puts_each_figure_in_its_own_place(windowed, tail):
+    # Each figure is a different whole number of megabytes, so a figure printed in another's
+    # place shows. The fixture bucket's sizes all round to 0.0 MB and cannot tell them apart.
+    line = bucket._reserve_refusal(
+        Path("/lake"),
+        needed=5_000_000,
+        busiest=1_000_000,
+        free=10_000_000,
+        short=8_000_000,
+        windowed=windowed,
+    )
+
+    assert line == (
+        "the restore needs 5.0 MB, and the next session's journal needs a reserve of 13.0 MB "
+        "beside it, 13 times the busiest sealed day in the bucket (1.0 MB). The filesystem "
+        "holding /lake has 10.0 MB free, 8.0 MB short of the reserve, so nothing was restored. "
+        "Free that much or use a larger filesystem" + tail
+    )

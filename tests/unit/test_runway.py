@@ -1499,3 +1499,29 @@ def test_the_listing_reading_never_raises_on_keys_no_lake_writes():
     assert read.dated == 0
     assert read.undated == 5 + 6 + 7
     assert read.files == 3
+
+
+@pytest.mark.parametrize(
+    ("newer", "size"),
+    [
+        pytest.param(_SEGMENT.format(day="2026-09-15", ticker="SPY"), 10, id="segment"),
+        pytest.param("reports/close_guard/date=2026-09-15/run.json", 0, id="empty-report"),
+    ],
+)
+def test_a_newer_day_with_no_sealed_bytes_does_not_anchor_the_window(newer, size):
+    """Mutations this catches: anchoring at a day with 0 sealed bytes, or at any dated day.
+
+    2026-09-15 is 45 days after 2026-08-01, so a window ending there leaves the only sealed day
+    out and answers 0.
+    """
+    listing = {_chains("2026-08-01"): 300, newer: size}
+
+    assert runway.listing_busiest_sealed_day(listing) == 300
+
+
+def test_a_listing_counts_a_lost_and_found_below_the_root():
+    """Only the filesystem's own ``lost+found``, at the root, is skipped, as the walk does."""
+    read = runway.listing_usage({"reports/lost+found/orphan": 7})
+
+    assert read.files == 1
+    assert read.undated == 7

@@ -240,3 +240,39 @@ def test_read_trimmed_parses_through_parse_trimmed(tmp_path, monkeypatch):
 
     assert trimmed_module.read_trimmed(tmp_path) is answer
     assert calls == [(raw, tmp_path / "trimmed.jsonl")]
+
+
+@pytest.mark.parametrize(
+    ("raw", "refusal", "consequence"),
+    [
+        pytest.param(
+            b"\xff\n",
+            LedgerNotUtf8,
+            "Every line in this file is unreadable until that byte is repaired",
+            id="bad-utf8",
+        ),
+        pytest.param(
+            b"\xef\xbb\xbf" + _ledger(_trim()),
+            LedgerHasByteOrderMark,
+            "Read past it, a line is either discarded or filed under a name no reader asks about",
+            id="bom",
+        ),
+        pytest.param(
+            _ledger(_trim()) + b'{"kind": "tr\n' + _ledger(_restore()),
+            TornLedger,
+            "Every line behind that line is invisible",
+            id="hidden-tear",
+        ),
+    ],
+)
+def test_parse_trimmed_names_the_path_it_was_handed_and_the_damage_s_own_cost(
+    raw, refusal, consequence
+):
+    """Mutations this catches: naming a fixed file rather than ``path``, and swapping two
+    consequence sentences. Each sentence is written out here rather than imported."""
+    with pytest.raises(refusal) as refused:
+        parse_trimmed(raw, "/some/where/trimmed.jsonl")
+
+    message = str(refused.value)
+    assert "/some/where/trimmed.jsonl" in message
+    assert consequence in message
