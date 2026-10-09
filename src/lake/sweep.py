@@ -97,11 +97,11 @@ still pings, and the Friday branch still sets the wake, which the design's pmset
 directly. One side effect is worth naming: a holiday never builds the vendor, so it never
 reads the token.
 
-**Why the run hands off to compaction, and when it does not.** The close+15 compaction is
-the only upload, and it runs two hours before this job writes its bars partitions, its
-actions ledger lines and its reference-table updates. Without a second upload that output
-reaches the bucket about 22 hours later, and a restore made in between is a day behind on
-bars and actions. So ``main`` ends a run with ``os.execv`` on ``python -m lake.compact
+**Why the run hands off to compaction, and when it does not.** Without this hand-off the
+close+15 compaction would be the only upload, and it runs two hours before this job writes
+its bars partitions, its actions ledger lines and its reference-table updates. That output
+would then reach the bucket about 22 hours later, and a restore made in between would be a
+day behind on bars and actions. So ``main`` ends a run with ``os.execv`` on ``python -m lake.compact
 --after-vendor-sweep``. An ``exec`` replaces this program with compaction's inside the same
 process. That hands back all of this run's memory first, and it leaves compaction as the
 job's own main process, so launchd and systemd track it with no change to the plist or the

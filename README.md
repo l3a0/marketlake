@@ -256,9 +256,11 @@ The restore, command 3, runs on either.
    still a path.
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
-   an evening after the 18:30 sweep. It does not run on Sunday from 19:55 to 23:30,
-   while the Sunday job may be scrubbing the bucket, and a run begun just before 19:55
-   stops when the window opens. Its last step holds the lake-root lock, and that step
+   an evening after the 18:30 sweep, once the evening upload that follows it has
+   finished, since that upload holds the lake-root lock. On the VM,
+   `systemctl is-active com.marketlake.eod-sweep.service` prints `inactive` once it
+   has. It does not run on Sunday from 19:55 to 23:30, while the Sunday job may be
+   scrubbing the bucket, and a run begun just before 19:55 stops when the window opens. Its last step holds the lake-root lock, and that step
    stops 30 minutes before the next session opens, so start it with the evening ahead of
    it. It refuses when the lake's own `manifest.jsonl` is empty or missing while the
    bucket's is not, which is what a wrong `lake_root` looks like. Each stop leaves the
@@ -464,7 +466,7 @@ deploy therefore waits for the session's close before it updates the checkout or
 not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
 On a weekday evening it also waits for the upload after the vendor sweep, which runs in the
 eod-sweep unit from about 18:32 ET and can run past 20:00 on a night it retries a failed
-seal ([#833](https://github.com/l3a0/marketlake/issues/833)). Once it has finished,
+seal or upload ([#833](https://github.com/l3a0/marketlake/issues/833)). Once it has finished,
 `systemctl is-active com.marketlake.eod-sweep.service` prints `inactive`.
 
 Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern

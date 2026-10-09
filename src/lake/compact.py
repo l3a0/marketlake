@@ -12,7 +12,7 @@ trims chains partitions older than the window, which ``lake.trim`` decides.
 
 The same job runs a second time on a weekday evening. The 18:30 vendor sweep writes bars,
 the actions ledger and reference-table updates into the lake after close+15 has uploaded
-it, so the sweep replaces its own process with ``python -m lake.compact
+it, so the vendor sweep replaces its own process with ``python -m lake.compact
 --after-vendor-sweep``. With nothing left to seal, that run only uploads, and it pings the
 ``evening-upload`` check instead of ``compaction``. On a night the close+15 run failed to
 seal, it seals what that run left, so it doubles as its retry.
@@ -1371,7 +1371,8 @@ def _page_damage(
 
     One page rather than one per ticker-day, for the reason ``_page_drift`` gives: a disk
     going bad damages many segments at once, and a page per finding would spend the
-    publisher's forty-a-day cap on one fact. It repeats every night the damage survives,
+    publisher's forty-a-day cap on one fact. It repeats on every run while the damage
+    survives, which is twice a weekday evening, at close+15 and after the vendor sweep,
     because nothing repairs it yet and the run that would clear it is the run that finds
     it again.
     """
@@ -2612,7 +2613,7 @@ def recompact_ticker_day(
 
 # The flag the vendor sweep passes when it hands off to this job. ``lake.sweep`` spells the
 # argv it execs itself rather than importing this module, which would load the compaction
-# engine into the sweep for one string. ``tests/unit/test_unattended_entries.py`` runs that
+# engine into the vendor sweep for one string. ``tests/unit/test_unattended_entries.py`` runs that
 # argv through this parser, so the two spellings cannot part without a failure.
 AFTER_VENDOR_SWEEP_FLAG = "--after-vendor-sweep"
 
@@ -2687,7 +2688,7 @@ def main(
 
     The daemon dispatches this job itself at close+15, and it spawns this entry to do it.
     This entry also serves the hand run, a catch-up after a machine was off for a day or a
-    run under the operator's eye, and the run after the 18:30 vendor sweep. That sweep
+    run under the operator's eye, and the run after the 18:30 vendor sweep. The vendor sweep
     replaces its own process with this entry under ``--after-vendor-sweep``, which uploads
     the evening's bars and actions and pings ``evening-upload`` rather than ``compaction``.
     Every one of them reaches the same ``compact`` below, and its lake-root lock is what
@@ -2776,7 +2777,8 @@ def main(
         # The nightly throughput, the same line the first upload prints. The close+15 run is
         # the daemon's child and shares its stdout, so this lands in the daemon's log, which
         # is where the night's rate is read. The run after the vendor sweep replaced the
-        # sweep's process, so its line lands in the eod-sweep job's log after the sweep's.
+        # vendor sweep's process, so its line lands in the eod-sweep job's log after the
+        # vendor sweep's own lines.
         print(f"compact: {backup.last.render()}")
     return 0
 

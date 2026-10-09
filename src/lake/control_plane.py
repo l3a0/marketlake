@@ -290,12 +290,14 @@ SUNDAY_SLUG = "sunday"
 # for a job that no longer runs, so deleting it is an operator step.
 CAPTURE_SLUG = "capture"
 
-# The slug of the check the nightly compaction-plus-backup run pings. It sits here for
-# the reason above rather than in ``lake.compact``, because the install renderer names
-# it too. Reaching into ``lake.compact`` from here would make every process that imports
-# this module load the compaction engine, the daemon included, and the daemon spawns
-# compaction as a separate process on purpose. ``lake.compact`` imports it back and
-# re-exports it, so every consumer still reads it from there.
+# The slug of the check the close+15 compaction-plus-backup run pings. A weekday evening
+# runs compaction twice, and the run after the vendor sweep pings ``EVENING_UPLOAD_SLUG``
+# below instead. This slug sits here for the reason above rather than in ``lake.compact``,
+# because the install renderer names it too. Reaching into ``lake.compact`` from here would
+# make every process that imports this module load the compaction engine, the daemon
+# included, and the daemon spawns compaction as a separate process on purpose.
+# ``lake.compact`` imports it back and re-exports it, so every consumer still reads it
+# from there.
 COMPACTION_SLUG = "compaction"
 
 # The slug of the check the 18:30 vendor sweep pings. It sits here for the reason its two

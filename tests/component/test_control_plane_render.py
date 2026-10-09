@@ -1907,8 +1907,8 @@ def test_the_step_reads_every_slug_rather_than_spelling_it(tmp_path, capsys):
     test is what separates them, and it is the rename that would otherwise ship an
     install pointing the operator at a row that no longer exists.
 
-    Every one of the six is renamed, one at a time, because a block that reads one slug
-    and spells the other five is the half-fix this section exists to stop. That is also
+    Every one of the seven is renamed, one at a time, because a block that reads one slug
+    and spells the other six is the half-fix this section exists to stop. That is also
     why the renderer reads ``live_check_slugs()`` on each call rather than a tuple bound
     at import: a frozen roster would leave this check unable to fail. The original
     has to be gone from the block afterwards, so a renderer that read the constant and
@@ -2010,8 +2010,8 @@ def test_the_arming_step_asks_for_a_press_on_every_check_and_on_no_other(tmp_pat
     Read off the instruction rather than off the block, and compared as a set rather than
     as a search. Presence alone would pass an install that named ``capture`` to press and
     said the rest arm themselves, and a one-way search would pass one that sent the
-    operator hunting for a sixth row no job pings. The quantifier is asserted for the same
-    reason: an instruction to press one of six is not an instruction to press six.
+    operator hunting for an eighth row no job pings. The quantifier is asserted for the same
+    reason: an instruction to press one of seven is not an instruction to press seven.
 
     The slugs are also all the step may carry, because a ping URL is a secret and the
     renderer's output is tracked.

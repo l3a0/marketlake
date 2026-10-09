@@ -264,10 +264,11 @@ ASSUME_ROLE = "AssumeRole"
 # budget runs to the sweep instead.
 #
 # The run the vendor sweep hands off to, near 18:32, takes the same budget (marketlake
-# #833). No job follows it before the next session, so the budget and the session bound
-# below are what limit it. Its check, ``evening-upload``, expects the ping by about 20:15,
-# the hand-off plus a seal plus this budget and ``IN_FLIGHT_ALLOWANCE``, so a run inside
-# its own deadline never pages.
+# #833). No job that takes the lake-root lock follows it before the next session, so the
+# budget and the session bound below are what limit it. The hand-off plus
+# ``SEAL_ALLOWANCE``, this budget and ``IN_FLIGHT_ALLOWANCE`` reaches about 20:17. Its
+# check, ``evening-upload``, expects the ping by about 20:30, so a run inside its own
+# deadline never pages.
 #
 # **The session bounds it too.** A compaction run by hand, the catch-up ``compact.main``
 # describes, can start at any hour. One started during a session would hold the lock

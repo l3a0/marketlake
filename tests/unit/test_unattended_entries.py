@@ -14,12 +14,11 @@ with the argv ``daemon.compaction_command`` builds, the token pull the daemon sp
 auth death with the argv ``daemon.token_pull_command`` builds, and the evening upload the
 vendor sweep execs with the argv ``sweep.evening_upload_command`` builds. Each entry runs
 in process under ``runpy`` with the entry's own arguments, and stops at the config load,
-because the suite's
-config directory is an empty throwaway. That exit is the first stop between the entry and
-live work. The conftest's network and subprocess guards catch some of what lies past it,
-but not a server bound to a local port or a loop that never calls out. So the precondition
-is asserted first, and a deadline turns an entry that runs past it into a failure rather
-than a hung suite.
+because the suite's config directory is an empty throwaway. That exit is the first stop
+between the entry and live work. The conftest's network and subprocess guards catch some
+of what lies past it, but not a server bound to a local port or a loop that never calls
+out. So the precondition is asserted first, and a deadline turns an entry that runs past
+it into a failure rather than a hung suite.
 """
 
 from __future__ import annotations

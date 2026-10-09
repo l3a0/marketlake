@@ -50,7 +50,7 @@ from tests.support.transport import FakeTransport
 
 NOW = datetime(2026, 9, 14, 16, 30, tzinfo=MARKET_TZ)
 
-# The six checks a live job feeds. The retired slice-1 slug is deliberately absent, and
+# The seven checks a live job feeds. The retired slice-1 slug is deliberately absent, and
 # the test at the bottom of this file is what keeps it absent.
 LIVE_SLUGS = (
     COMPACTION_SLUG,
