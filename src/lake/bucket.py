@@ -1,4 +1,4 @@
-"""The bucket backup: the nightly upload, the first upload, the Sunday scrub, and the restores.
+"""The bucket backup: the nightly and first uploads, the Sunday scrub, the restores, the resync.
 
 ``backup_target`` takes a bucket URL as well as a path, and this module is what a bucket
 target runs. The path form, ``rsync`` to a mounted directory, is unchanged and stays the
@@ -56,8 +56,8 @@ downloading it, the same byte-prefix rule ``manifest.backup_scrub`` applies to a
 copy. The number of entries in that prefix is the watermark. The nightly upload downloads
 the copy only when it is present and not a prefix, so ``bucket_divergence`` can tell
 another host's entries from a hand repair, and the refusal can say which. The first upload
-and the bucket scrub download it under the same condition. The restore downloads it every
-time, because the copy is what it restores the lake's manifest from.
+and the bucket scrub download it under the same condition. The restore and the resync
+download it every time, because the copy is what each makes the lake's manifest from.
 
 **What stays on the machine.** ``runner.BACKUP_EXCLUSIONS`` decides it, with ``rsync``'s
 own matching rules, because the uploader walks the tree itself and ``rsync`` is not
@@ -3157,7 +3157,8 @@ def restore_range(
 # ``python -m lake.bucket resync`` brings a host that is about to become primary again level
 # with the bucket, after the other host was primary meanwhile (marketlake #832). The bucket's
 # ``manifest.jsonl`` then holds the other host's sessions past the entries both hosts share,
-# and this lake holds a tail of its own from the sweep and the battery a shadow still runs.
+# and this lake holds a tail of its own, because a shadow still captures, compacts, and runs
+# the sweep and the battery.
 # The nightly upload refuses that pair, since the bucket's copy is not a prefix of the lake's.
 # The resync drops this lake's own tail, downloads what the bucket's tail names, and leaves
 # the lake's ``manifest.jsonl`` equal to the bucket's bytes, so the next nightly upload finds

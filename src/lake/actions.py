@@ -27,7 +27,10 @@ writing beside a nightly job.
 corrected in August silently rewrites June's factor, and nothing could then say what the
 lake knew on 2026-06-20. Every backtest would read today's corrected history as though it
 had always been available. Appending turns that into a filter, ``recorded_at <= D``, which
-is what :func:`as_of` reads.
+is what :func:`as_of` reads. One writer does replace the file whole.
+``python -m lake.bucket resync`` (marketlake #832), on a host about to become primary
+again, puts the bucket's copy in place, which drops whatever this host appended while
+it was the shadow.
 
 **Order is a property of the file rather than a rule a writer remembers.** Marketlake #242
 settled that Parquet row order is incidental, proving it against a fixture written in

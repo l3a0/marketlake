@@ -15,10 +15,10 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    write leaves no terminating newline, so the next entry fuses onto the fragment and
    the entries behind that line are unreachable. Marketlake #447 carries what that
    costs the manifest and the corporate-actions ledgers, which still read short. Entries
-   are only ever appended, with one exception, the repair step this docstring names last.
-   ``python -m lake.bucket resync`` (marketlake #832), run by hand under the lake-root lock,
-   cuts the manifest back to the entries it shares with the bucket's copy and appends that
-   copy's tail in place, so the file ends equal to the bucket's.
+   are only ever appended, with one exception, the resync. ``python -m lake.bucket
+   resync`` (marketlake #832), run by hand under the lake-root lock, cuts the manifest
+   back to the entries it shares with the bucket's copy and appends that copy's tail in
+   place, so the file ends equal to the bucket's.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
 3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha,
@@ -31,7 +31,9 @@ The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolve
 partition and each keeps its own current verdict. :func:`latest_quarantine_by_check` is that
 resolution and marketlake #426 is why it is not the path alone. It records
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
-deletion. This module gives it the same append helper and its own reader.
+deletion. This module gives it the same append helper and its own reader. The resync is
+the one writer that does not append to it: it replaces the file whole with the bucket's
+copy, as it does the corporate-actions and trimmed ledgers below.
 
 The read is where it parts from rule 1, and marketlake #469 is why. Its entries are a guard,
 so a read that stopped with whole lines behind it would resolve to a ledger missing its own
@@ -1528,8 +1530,9 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     list written, so the two scrubs skip the same files and a decision about that list is made
     once. The price is named rather than hidden: that list skips ``journal/``, ``reports/`` and
     ``lost+found/``, so a killed sync's temp file under any of them is not seen. Scanning the
-    journal instead would name every segment in it, because segments carry no manifest entry by
-    rule.
+    journal instead would name files that never get an entry: the metadata stamp, the
+    request timing files and a shadow host's outbox files. Capture records each segment it
+    writes, and the list still skips ``journal/`` as a whole tree for those files.
 
     ``BACKUP_EXCLUSIONS`` is deliberately not consulted. Its two patterns name a temp
     file, which is renamed away before any entry is appended and so can never be

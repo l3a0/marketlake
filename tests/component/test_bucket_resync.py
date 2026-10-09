@@ -2,7 +2,8 @@
 
 Marketlake #832. A host that is about to become primary again finds the bucket's
 ``manifest.jsonl`` holding the other host's sessions past the entries both share, and its own
-lake holding a tail the shadow's sweep wrote. The resync drops that tail, downloads what the
+lake holding a tail the shadow wrote, since a shadow still captures, compacts, and runs the
+sweep and the battery. The resync drops that tail, downloads what the
 bucket's tail names, and leaves the lake's manifest equal to the bucket's bytes. Each test
 builds the two lakes the way the hosts would: the laptop uploads, the VM is restored from the
 bucket and uploads a session of its own, and the laptop's sweep grows a tail.
