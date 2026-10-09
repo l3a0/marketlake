@@ -583,6 +583,27 @@ def test_a_download_and_a_deletion_that_differ_only_by_case_refuse(tmp_path):
     assert repr(other) in message
 
 
+def test_a_deletion_of_a_file_the_bucket_names_in_another_case_refuses(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    # The bucket names the laptop's bars file in another case, with the same bytes, so
+    # nothing downloads. On a filesystem that ignores case, deleting BARS_2 would then delete
+    # the file the bucket's entry names.
+    other = BARS_2.replace("ticker=SPY", "ticker=spy")
+    data = (laptop / BARS_2).read_bytes()
+    client.store(TARGET.key(other), data)
+    client.store(
+        MANIFEST_KEY,
+        client.body(MANIFEST_KEY) + _entry(other, hashlib.sha256(data).hexdigest()),
+    )
+    (laptop / other).parent.mkdir(parents=True, exist_ok=True)
+    (laptop / other).write_bytes(data)
+
+    message = _refused(laptop, client)
+
+    assert "differs only by case" in message
+    assert repr(BARS_2) in message
+
+
 def test_a_download_beside_a_path_this_lakes_tail_names_in_another_case_refuses(tmp_path):
     laptop, _vm_root, client, _files = _switched(tmp_path)
     mine = "reference/other_table.parquet"
@@ -1123,12 +1144,15 @@ def test_apply_flushes_the_manifest_and_each_download_past_the_drive_cache(tmp_p
     import types
 
     laptop, _vm_root, client, files = _switched(tmp_path)
+    bucket_raw = client.body(MANIFEST_KEY)
+    shared = len(b"".join(bucket_raw.splitlines(keepends=True)[:-2]))
     full = object()
-    flushed: set[int] = set()
+    flushed: set[tuple[int, int]] = set()
 
     def fcntl(fd, command, *args):
         assert command is full
-        flushed.add(os.fstat(fd).st_ino)
+        stat = os.fstat(fd)
+        flushed.add((stat.st_ino, stat.st_size))
         return 0
 
     monkeypatch.setattr(bucket, "F_FULLFSYNC", full)
@@ -1136,8 +1160,13 @@ def test_apply_flushes_the_manifest_and_each_download_past_the_drive_cache(tmp_p
 
     assert _resync(laptop, client, apply=True).applied
 
-    expected = {manifest_path(laptop).stat().st_ino, (laptop / QUARANTINE).stat().st_ino}
-    expected |= {(laptop / rel).stat().st_ino for rel in files}
+    # The manifest is flushed once cut back to the shared bytes and once with the bucket's
+    # tail appended, and each download once at its full size.
+    manifest = manifest_path(laptop).stat().st_ino
+    expected = {(manifest, shared), (manifest, len(bucket_raw))}
+    for rel in (QUARANTINE, *files):
+        stat = (laptop / rel).stat()
+        expected.add((stat.st_ino, stat.st_size))
     assert expected <= flushed
 
 
