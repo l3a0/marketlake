@@ -4090,3 +4090,30 @@ def test_a_piped_hand_off_keeps_the_sweeps_block_ahead_of_the_upload(tmp_path):
     target = shlex.join(["-c", "print('the upload ran')"])
     hand_off = lines.index(f"sweep: handing off to python {target}")
     assert lines[hand_off + 1 :] == ["the upload ran"], finished.stdout
+
+
+def test_an_unpatched_hand_off_reaches_the_suites_exec_guard(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """The catch around the ``exec`` is ``OSError`` alone, so the guard escapes ``main``.
+
+    A wider catch would turn the guard into exit 1, and four of the command tests that reach
+    the hand-off do not assert their exit code, so they would stay green with nothing
+    recorded. This case reaches the hand-off with no recorder and expects the guard itself.
+    """
+    from tests.conftest import ExecInTest
+
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+    # The precondition, asserted before the run: with the guard gone this case would really
+    # replace the test process with compaction.
+    assert os.execv.__qualname__ == "_no_exec.<locals>.refuse", os.execv
+
+    with pytest.raises(ExecInTest):
+        sweep.main(
+            ["--config", str(config), "--tickers", str(tickers)],
+            clock=ManualClock(EVENING),
+            vendor_source=_CountingVendorSource(),
+            schedule_setter=_RecordingSetter(),
+            schedule_reader=lambda: _schedule_text(),
+        )
+    capsys.readouterr()
