@@ -5,8 +5,10 @@ when the copy is not a prefix. A bucket entry is foreign when its partition and 
 pair appears in no entry anywhere in the lake's manifest. Marketlake #832 carries the
 reasoning. Each decision it makes has a test here.
 
-1. Every line is parsed on its own, on both sides, so a fused line hides nothing.
-2. A line that is not an entry, or holds a byte that is not UTF-8, raises nothing.
+1. Every line is parsed on its own, on both sides, so a fused line hides nothing, and a
+   line that does not parse gives up the whole entry at its end.
+2. A line that is not an entry, holds a byte that is not UTF-8, or nests past the
+   recursion limit raises nothing.
 3. A pair the lake recorded and later superseded is not foreign.
 4. A rewrite of a recorded path under a new sha is foreign.
 5. Only the latest entry for each partition in the bucket's tail counts.
@@ -36,6 +38,12 @@ def _fused(first: bytes, second: bytes) -> bytes:
     return first[:-1] + second
 
 
+def _torn(line: bytes) -> bytes:
+    """The first 30 bytes of a line, as a short write leaves them, with no newline."""
+    assert b"{" not in line[1:30]
+    return line[:30]
+
+
 def _foreign(split: Divergence) -> list[tuple[str, str]]:
     return [(entry["partition"], entry["sha256"]) for entry in split.foreign]
 
@@ -51,16 +59,70 @@ LAPTOP = "bars/ticker=SPY/date=2026-10-09.parquet"
 # -- 1. each line on its own --------------------------------------------------------
 
 
-def test_a_foreign_entry_behind_a_fused_line_reads_as_foreign():
+def test_the_entries_at_the_end_of_and_behind_a_fused_line_read_as_foreign():
     lake = A + B + _line(LAPTOP)
     bucket = A + B + _fused(C, D) + _line(VM, "f" * 64)
 
     split = bucket_divergence(bucket, lake)
 
+    # C's bytes are fused into D's line and lost, while D, whole at the line's end, counts.
+    assert _foreign(split) == [
+        (json.loads(D)["partition"], json.loads(D)["sha256"]),
+        (VM, "f" * 64),
+    ]
+    assert split.bucket_tail == 2
+    assert split.bucket_first == json.loads(D)["partition"]
+
+
+def test_another_hosts_entry_fused_onto_a_torn_fragment_reads_as_foreign():
+    # A short write on the other host left 30 bytes of an entry, and its next entry landed
+    # on the same line. Skipping the line would read the copy as a hand repair, and the
+    # first upload it then advises would drop the entry from the bucket's record.
+    shared = A + B
+    bucket = shared + _torn(_line("quotes/q", "qq")) + _line(VM, "f" * 64)
+
+    split = bucket_divergence(bucket, shared + _line(LAPTOP))
+
     assert _foreign(split) == [(VM, "f" * 64)]
-    # The fused line names no entry, so the tail counts the one entry after it.
-    assert split.bucket_tail == 1
-    assert split.bucket_first == VM
+    assert (split.bucket_tail, split.bucket_first) == (1, VM)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [b'{"fetched_at": {"nested": 1}, "parti', b'{"fetched_at": {'],
+    ids=["nested-object", "torn-after-a-brace"],
+)
+def test_a_fragment_holding_a_brace_of_its_own_still_gives_up_the_entry_after_it(fragment):
+    # The first brace after the fragment's start is the fragment's own, and its suffix does
+    # not parse, so the entry is found only by trying every brace after it. In the second
+    # case the entry's brace is the very next byte.
+    split = bucket_divergence(A + fragment + _line(VM, "f" * 64), A + _line(LAPTOP))
+
+    assert _foreign(split) == [(VM, "f" * 64)]
+
+
+def test_a_fused_bucket_line_whose_entries_the_lake_holds_split_is_not_foreign():
+    # A human split the lake's fused line in two. The bucket's copy still holds it fused.
+    bucket = A + _fused(B, C) + D
+    lake = A + B + C + D
+
+    split = bucket_divergence(bucket, lake)
+
+    assert split.foreign == ()
+    assert (split.shared_bytes, split.bucket_tail, split.lake_tail) == (len(A), 2, 3)
+
+
+def test_a_fused_lake_line_still_records_the_entry_at_its_end():
+    # The lake's own manifest holds a torn fragment fused onto C, and a human dropped the
+    # fragment from the bucket's copy. C is whole at the end of the lake's line, so the
+    # bucket's C is recorded rather than another host's.
+    lake = A + _torn(B) + C + D
+    bucket = A + C + D
+
+    split = bucket_divergence(bucket, lake)
+
+    assert split.foreign == ()
+    assert split.lake_tail == 2
 
 
 def test_a_damaged_line_early_in_the_lake_still_leaves_its_later_pairs_recorded():
@@ -103,6 +165,24 @@ def test_a_line_holding_a_byte_that_is_not_utf8_raises_nothing_and_reads_as_fore
     split = bucket_divergence(bucket, lake)
 
     assert [entry["partition"] for entry in split.foreign] == [json.loads(B)["partition"]]
+
+
+@pytest.mark.parametrize(
+    ("deep", "parsed"),
+    [(b"[" * 50000, b"[" * 50000), (b'x{"a": ' + b"[" * 50000, b'{"a": ' + b"[" * 50000)],
+    ids=["whole-line", "fused-tail"],
+)
+def test_a_line_nested_past_the_recursion_limit_raises_nothing(deep, parsed):
+    # json.loads raises RecursionError, not ValueError, on the bytes each line gets parsed
+    # as: the whole line in the first case, and the suffix after its fragment in the second.
+    with pytest.raises(RecursionError):
+        json.loads(parsed)
+    deep += b"\n"
+
+    split = bucket_divergence(A + deep + _line(VM, "f" * 64), A + _line(LAPTOP) + deep)
+
+    assert _foreign(split) == [(VM, "f" * 64)]
+    assert (split.shared, split.bucket_tail, split.lake_tail) == (1, 1, 1)
 
 
 def test_a_byte_that_is_not_utf8_on_the_lake_side_raises_nothing():
@@ -230,7 +310,38 @@ def test_a_fused_line_inside_the_shared_bytes_does_not_stop_the_count():
     split = bucket_divergence(shared + _line(VM, "f" * 64), shared + _line(LAPTOP))
 
     assert split.shared_bytes == len(shared)
-    # parse_jsonl would stop at the fused line and count 1. Each line on its own counts 2.
-    assert split.shared == 2
+    # parse_jsonl would stop at the fused line and count 1. Each line on its own counts A
+    # and D, and the fused line gives up C, whole at its end, so the count is 3.
+    assert split.shared == 3
     assert _foreign(split) == [(VM, "f" * 64)]
     assert (split.bucket_first, split.lake_first) == (VM, LAPTOP)
+
+
+# -- added by the mutation lens on PR #840 ---------------------------------------------
+
+
+def test_a_copy_saved_with_crlf_endings_shares_nothing():
+    # A hand repair saved by an editor that writes CRLF differs from the lake on A's own
+    # newline byte, so no whole line is shared.
+    split = bucket_divergence((A + B).replace(b"\n", b"\r\n"), A + B)
+
+    assert (split.shared_bytes, split.shared) == (0, 0)
+    assert (split.bucket_tail, split.lake_tail) == (2, 2)
+    assert split.bucket_first == json.loads(A)["partition"]
+    assert split.foreign == ()
+
+
+def test_a_tail_entry_the_lake_recorded_inside_the_shared_bytes_is_not_foreign():
+    # The bucket's tail repeats a pair the lake recorded before the two parted.
+    split = bucket_divergence(A + B + A, A + B + C)
+
+    assert split.shared_bytes == len(A + B)
+    assert split.bucket_tail == 1
+    assert split.foreign == ()
+
+
+def test_two_different_non_string_shas_on_one_path_both_read_as_none():
+    path = json.loads(C)["partition"]
+    split = bucket_divergence(A + _line(path, ["rotted"]), A + _line(path, 7))
+
+    assert split.foreign == ()
