@@ -6,7 +6,10 @@ that can fail has a test here.
 
 1. What is new: every manifested file past the watermark, and every file with no
    manifest entry whose size differs from the bucket's.
-2. No usable watermark refuses with one line naming the first-upload command.
+2. No usable watermark refuses with one line. An empty bucket, a copy with no whole
+   entry, and a hand repair name the first-upload command. A copy holding entries this
+   lake never recorded, and one that could not be read to tell, say not to run it, since
+   it would drop another host's entries from the bucket's record (marketlake #832).
 3. Segments upload unless their compacted partition is manifested, and any other
    manifested file missing from disk refuses.
 4. Every PUT carries the manifest's digest as base64, sets Standard-IA, and is never a
@@ -25,6 +28,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import json
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -52,7 +56,7 @@ from lake.control_plane import COMPACTION_RUN, VENDOR_SWEEP
 from lake.lock import lake_lock
 from lake.manifest import append_manifest, manifest_path, sha256_file
 from lake.paths import LakePaths
-from tests.support.bucket import FakeS3
+from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake, sample_chains_table, sample_quotes_table
@@ -141,8 +145,10 @@ def test_a_copy_that_is_not_a_prefix_refuses_and_puts_nothing(tmp_path):
     # A hand repair: the bucket's copy now differs in its first byte.
     raw = manifest_path(lake).read_bytes()
     client.store(_key("manifest.jsonl"), b"X" + raw[1:])
-    with pytest.raises(WatermarkMissing, match="not a prefix"):
+    with pytest.raises(WatermarkMissing, match="not a prefix") as refused:
         nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    message = str(refused.value)
+    assert FIRST_UPLOAD_COMMAND in message and "\n" not in message
     assert client.puts() == []
 
 
@@ -151,8 +157,10 @@ def test_a_copy_longer_than_the_lake_is_not_a_prefix(tmp_path):
     client = FakeS3()
     _seed(lake, client)
     client.store(_key("manifest.jsonl"), manifest_path(lake).read_bytes() + b'{"x": 1}\n')
-    with pytest.raises(WatermarkMissing):
+    with pytest.raises(WatermarkMissing, match="not a prefix") as refused:
         nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    # The extra line names no partition, so it is a hand repair and not another host's.
+    assert FIRST_UPLOAD_COMMAND in str(refused.value)
 
 
 def test_a_copy_stored_without_a_checksum_proves_no_prefix(tmp_path):
@@ -162,8 +170,29 @@ def test_a_copy_stored_without_a_checksum_proves_no_prefix(tmp_path):
     client = FakeS3()
     _seed(lake, client)
     client.store(_key("manifest.jsonl"), manifest_path(lake).read_bytes(), checksum=None)
-    with pytest.raises(WatermarkMissing):
+    with pytest.raises(WatermarkMissing) as refused:
         nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    message = str(refused.value)
+    assert FIRST_UPLOAD_COMMAND in message and "\n" not in message
+    # The lake starts with the copy's bytes, so "not a prefix" would be false. What is
+    # missing is the stored SHA-256 that would prove it.
+    assert "no stored SHA-256" in message
+    assert "not a prefix" not in message
+
+
+def test_a_hand_repaired_copy_with_no_checksum_still_says_not_a_prefix(tmp_path):
+    # With no stored SHA-256 and bytes the lake does not start with, the copy really is not
+    # a prefix, so the line says so rather than blaming the missing checksum.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    raw = manifest_path(lake).read_bytes()
+    client.store(_key("manifest.jsonl"), b"X" + raw[1:], checksum=None)
+    with pytest.raises(WatermarkMissing, match="not a prefix") as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    message = str(refused.value)
+    assert FIRST_UPLOAD_COMMAND in message
+    assert "no stored SHA-256" not in message
 
 
 @pytest.mark.parametrize("length", [0, 1, 40])
@@ -184,6 +213,237 @@ def test_a_copy_with_no_whole_entry_refuses_rather_than_upload_the_whole_lake(tm
     assert FIRST_UPLOAD_COMMAND in message and "no whole entry" in message
     assert "\n" not in message
     assert client.puts() == []
+
+
+# -- 2. a copy that is not a prefix: another host's entries or a hand repair --------
+#
+# Marketlake #832. Only a copy that is present and not a prefix is downloaded, and
+# ``bucket_divergence`` says whether it holds entries this lake never recorded.
+
+VM_PARTITION = "chains/ticker=SPY/date=2026-10-09.parquet"
+# Another host's first partition, holding a newline, as a rotted or hostile copy could.
+ODD_PARTITION = "chains/ticker=SPY/\ndate=2026-10-09"
+
+
+def _vm_line(partition: str = VM_PARTITION) -> bytes:
+    """An entry another host appended, for a path and sha this lake never recorded."""
+    entry = {
+        "fetched_at": None,
+        "partition": partition,
+        "rows": 1,
+        "sha256": "f" * 64,
+        "source": "compaction",
+    }
+    return (json.dumps(entry, sort_keys=True) + "\n").encode()
+
+
+class _ManifestS3(FakeS3):
+    """A fake bucket that can change its copy of ``manifest.jsonl`` between HEAD and GET.
+
+    ``after_head`` runs after every ``HeadObject`` of the manifest key, and ``get_error``
+    is raised by every ``GetObject``.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.after_head = None
+        self.get_error: BaseException | None = None
+
+    def head_object(self, **kwargs) -> dict:
+        response = super().head_object(**kwargs)
+        if kwargs["Key"] == _key("manifest.jsonl") and self.after_head is not None:
+            self.after_head()
+        return response
+
+    def get_object(self, **kwargs) -> dict:
+        if self.get_error is not None:
+            self.calls.append(("get_object", dict(kwargs)))
+            raise self.get_error
+        return super().get_object(**kwargs)
+
+
+def _gets(client: FakeS3) -> list[dict]:
+    return [kwargs for name, kwargs in client.calls if name == "get_object"]
+
+
+def _foreign_lake(tmp_path: Path, client: FakeS3, *, own_tail: bool = True) -> tuple[Path, bytes]:
+    """A seeded lake, a bucket copy with another host's entries after it, and that copy.
+
+    With ``own_tail`` the lake also seals a day of its own, the way the 18:30 sweep on a
+    shadow host appends.
+    """
+    lake = _lake(tmp_path / "lake")
+    _seed(lake, client)
+    copy = manifest_path(lake).read_bytes() + _vm_line(ODD_PARTITION) + _vm_line()
+    client.store(_key("manifest.jsonl"), copy)
+    if own_tail:
+        _seal_another_day(lake)
+    client.calls.clear()
+    return lake, copy
+
+
+def test_a_foreign_tail_says_not_to_run_first_upload_and_names_832(tmp_path):
+    client = FakeS3()
+    lake, copy = _foreign_lake(tmp_path, client)
+    shared = len(copy.splitlines()) - 2
+    own = LakePaths(lake).quotes_partition_path("SPY", NEXT).relative_to(lake).as_posix()
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "\n" not in message
+    assert FIRST_UPLOAD_COMMAND not in message
+    assert "do not run first-upload" in message
+    assert "marketlake #832" in message
+    assert "never recorded" in message
+    assert f"shares {shared} entries" in message
+    # The bucket's first partition holds a newline, and it renders escaped on the line.
+    assert f"holds 2 entries from {ODD_PARTITION!r}," in message
+    assert f"this lake holds 1 entries from {own!r} of its own" in message
+    assert "2 of the bucket's" in message
+    assert client.puts() == []
+    assert len(_gets(client)) == 1
+
+
+def test_a_lake_that_is_a_strict_prefix_of_a_foreign_copy_names_an_empty_tail(tmp_path):
+    client = FakeS3()
+    lake, copy = _foreign_lake(tmp_path, client, own_tail=False)
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert f"shares {len(copy.splitlines()) - 2} entries" in message
+    assert "this lake holds 0 entries of its own" in message
+    assert FIRST_UPLOAD_COMMAND not in message
+    assert client.puts() == []
+
+
+@pytest.mark.parametrize("behind", [False, True], ids=["level", "behind"])
+def test_a_prefix_copy_is_never_downloaded(tmp_path, behind):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    if behind:
+        _seal_another_day(lake)
+
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _gets(client) == []
+
+
+def _neutral(message: str) -> None:
+    """The line for a copy that could not be read to tell another host from a repair."""
+    assert "\n" not in message
+    assert "could not be read to tell another host's entries from a hand repair" in message
+    assert "Do not run first-upload" in message
+    assert FIRST_UPLOAD_COMMAND not in message
+
+
+def test_a_head_that_crosses_the_deadline_gives_the_neutral_line_and_no_get(tmp_path):
+    client = _ManifestS3()
+    lake, _ = _foreign_lake(tmp_path, client)
+    clock = _clock()
+    client.after_head = lambda: clock.advance(NIGHTLY_UPLOAD_BUDGET.total_seconds())
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    message = str(refused.value)
+    _neutral(message)
+    assert "deadline" in message
+    # UploadDeadline's "the next night carries on" would be false here.
+    assert "next night" not in message
+    assert _gets(client) == []
+
+
+@pytest.mark.parametrize(
+    ("error", "named"),
+    [
+        (client_error("AccessDenied", "GetObject", 403), "refused the read (AccessDenied)"),
+        (unreachable(), "could not be reached or was unavailable (EndpointConnectionError)"),
+        (client_error("NoSuchKey", "GetObject", 404), "answered the read with an error"),
+    ],
+    ids=["refused", "unreachable", "absent"],
+)
+def test_a_failed_get_gives_the_neutral_line(tmp_path, error, named):
+    client = _ManifestS3()
+    lake, _ = _foreign_lake(tmp_path, client)
+    client.get_error = error
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    _neutral(message)
+    assert named in message
+    assert client.puts() == []
+
+
+def _repaired(copy: bytes, length: int) -> bytes:
+    """Bytes that read alone as a hand repair, ``length`` long: a lake line, then padding."""
+    head = copy[: copy.index(b"\n") + 1]
+    pad = length - len(head) - len(b'{"x": ""}\n')
+    assert pad >= 0
+    return head + b'{"x": "' + b"y" * pad + b'"}\n'
+
+
+def test_a_copy_replaced_by_other_bytes_of_the_same_length_gives_the_neutral_line(tmp_path):
+    # The HEAD stored one SHA-256 and the GET returned other bytes of the same length, so
+    # the copy changed between the two. Read alone, the new bytes are a hand repair, whose
+    # line would name the first upload while another host may be uploading now.
+    client = _ManifestS3()
+    lake, copy = _foreign_lake(tmp_path, client)
+    other = _repaired(copy, len(copy))
+    assert len(other) == len(copy) and other != copy
+    client.after_head = lambda: client.store(_key("manifest.jsonl"), other)
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    _neutral(message)
+    assert "changed between its HEAD and its GET" in message
+    assert len(_gets(client)) == 1
+
+
+def test_a_copy_with_no_checksum_whose_get_length_differs_gives_the_neutral_line(tmp_path):
+    client = _ManifestS3()
+    lake, copy = _foreign_lake(tmp_path, client)
+    client.store(_key("manifest.jsonl"), copy, checksum=None)
+    other = _repaired(copy, len(copy) + 10)
+    client.after_head = lambda: client.store(_key("manifest.jsonl"), other, checksum=None)
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    _neutral(message)
+    assert "changed between its HEAD and its GET" in message
+
+
+def test_a_copy_with_no_checksum_is_still_classified_after_its_length_checks(tmp_path):
+    # A hand ``aws s3 cp`` stores no full-object SHA-256. Its length matches the HEAD's,
+    # so it is classified, and another host's entries in it are still named.
+    client = FakeS3()
+    lake, copy = _foreign_lake(tmp_path, client)
+    client.store(_key("manifest.jsonl"), copy, checksum=None)
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "never recorded" in message and FIRST_UPLOAD_COMMAND not in message
+
+
+def test_a_non_bucket_error_from_the_get_re_raises(tmp_path):
+    client = _ManifestS3()
+    lake, _ = _foreign_lake(tmp_path, client)
+    client.get_error = ZeroDivisionError("a real bug")
+
+    with pytest.raises(ZeroDivisionError):
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
 
 
 # -- 1, 5, 6. what goes up, in what order, and only once -------------------------

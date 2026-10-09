@@ -216,8 +216,11 @@ two steps change as follows.
    rest of step 2, the first upload and the restore, follows the cutover order on
    [#638](https://github.com/l3a0/marketlake/issues/638).
    Run `first-upload` only on the host whose lake the bucket should hold, because it
-   replaces the bucket's `manifest.jsonl`. Run `live-check` in the same order, after the
-   IAM role's write half is turned on, since the check writes probe objects.
+   replaces the bucket's `manifest.jsonl`. It refuses when the bucket's copy holds entries
+   this lake never recorded, such as the other host's sessions after a switch, since
+   replacing the copy would drop them from the bucket's record. Run `live-check` in the
+   same order, after the IAM role's write half is turned on, since the check writes probe
+   objects.
 
 The client asks the instance metadata service for credentials only when `config.yaml`
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
@@ -250,10 +253,13 @@ The whole-lake restore runs on either.
    it. It refuses when the lake's own `manifest.jsonl` is empty or missing while the
    bucket's is not, which is what a wrong `lake_root` looks like. Each stop leaves the
    bucket's `manifest.jsonl` as it was, and running the command again picks up where it
-   left off. The same command re-baselines a bucket whose
-   copy of `manifest.jsonl` stopped being a prefix of the lake's, which the nightly
-   upload refuses with a line naming it. `networkQuality -s`, built into macOS, measures
-   upload capacity beforehand.
+   left off. The same command re-baselines a bucket whose copy of `manifest.jsonl` a
+   human repaired, which the nightly upload refuses with a line naming it. When the copy
+   stopped being a prefix because it holds entries this lake never recorded, another
+   host's sessions or a lake restored from an older copy, the nightly upload's line says
+   not to run `first-upload`, and `first-upload` refuses too.
+   [#832](https://github.com/l3a0/marketlake/issues/832) adds the resync that brings the
+   lake level. `networkQuality -s`, built into macOS, measures upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
    downloads the current version of every object into `<dest>`, which must be empty or
    not exist yet, and verifies each file before `<dest>` is filled. A file the manifest
