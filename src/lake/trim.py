@@ -8,8 +8,8 @@ compaction, after the upload and the ping, under the lock hold the ping sits in,
 no lock of its own. ``lake.compact`` decides whether it runs at all and hands it an integer
 window. This module decides which partitions go.
 
-It lives outside ``lake.bucket`` because that module's rule is that only the range restore
-writes under the lake root. The bucket read it makes, ``bucket.current_digest``, writes
+It lives outside ``lake.bucket`` because that module's rule is that only its range restore
+writes into a live lake. The bucket read it makes, ``bucket.current_digest``, writes
 nothing.
 
 **A partition is dropped only when all seven clauses hold.**

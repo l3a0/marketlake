@@ -284,15 +284,18 @@ The restore, command 3, runs on either.
    host, pass `--config` naming a copy of `config.yaml` with the `lake_window_sessions`
    line deleted, not blanked, since a blank value refuses. The VM's restore reaches the
    bucket through its instance profile and uses none of the four secrets every config
-   holds, so placeholder values serve for those in that copy. The download lands in a
-   hidden working directory, `<dest>/.marketlake-restoring`, and its files are moved up
-   into `<dest>` only once every file has verified, with `manifest.jsonl` moved last. A
-   file that fails is named on its own line, `<dest>` gets no `manifest.jsonl`, and the
-   command exits 1. Running it again resumes in the working directory and downloads only
-   what is not already there and correct, and a run killed while moving files in finishes
-   the move. Before moving anything it checks that each verified file is still there at
-   its recorded size, and refuses when `<dest>` has gained a `manifest.jsonl` or a name it
-   is about to move in, which is what a daemon started on that root looks like. It refuses
+   holds, so placeholder values serve for those in that copy. A whole lake restored into
+   the VM's own `lake_root` lasts only until the trim runs again. Each partition it brings
+   back beside a trim line takes the trim's recovery path and is trimmed again. The
+   download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
+   files are moved up into `<dest>` only once every file has verified, with
+   `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
+   no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working
+   directory and downloads only what is not already there and correct, and a run killed
+   while moving files in finishes the move. Before moving anything it checks that each
+   verified file is still there at its recorded size, and refuses when `<dest>` has gained
+   a `manifest.jsonl` or a name it is about to move in, which is what a daemon started on
+   that root looks like. It refuses
    with exit 2 when `<dest>` holds anything but `lost+found` and the working directory,
    which keeps it off a live lake, when `<dest>` is a symbolic link, and when its
    filesystem is too small. Too small means short of the download, or short of the
@@ -309,12 +312,16 @@ The restore, command 3, runs on either.
    restore uploads nothing and takes no lock, which is why a shadow host may run it.
 4. `uv run python -m lake.bucket restore-range --surface chains --ticker SPY --from 2026-09-01 --to 2026-09-30`
    puts chosen chains or quotes partitions back into the live lake at `lake_root`, for a
-   partition lost by accident or a rollback of trimming. Leave out `--ticker` to take every
-   ticker. It restores only partitions the lake's manifest records, verifies each download
-   against the manifest's sha before it moves the file into place, and leaves a partition
-   already on disk with that sha as it is. A partition trimmed on purpose gets a restore line
-   in `trimmed.jsonl`, which a lost one does not. It hashes and downloads with the lake-root
-   lock released, and takes the lock only for short steps: listing the targets' directories,
+   partition lost by accident or a rollback of trimming. While the host's config sets
+   `lake_window_sessions`, a rollback lasts only until the trim runs with a split
+   checkpoint from a session after the restore's day, which drops each restored partition
+   outside the window again. A lasting rollback also removes the key. Leave out `--ticker`
+   to take every ticker. It restores only partitions the lake's manifest records, verifies
+   each download against the manifest's sha before it moves the file into place, and
+   leaves a partition already on disk with that sha as it is. A partition trimmed on
+   purpose gets a restore line in `trimmed.jsonl`, which a lost one does not. It hashes and
+   downloads with the lake-root lock released, and takes the lock only for short steps:
+   listing the targets' directories,
    reading the ledgers, each partition's rename, and each ledger line. So it blocks capture
    for no more than a moment. It removes a
    temp file a crashed run left beside a target, and finishes what a crashed run left
@@ -338,9 +345,11 @@ The restore, command 3, runs on either.
 then drops each chains partition older than that many sessions once its bucket copy hashes
 to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)). The trim's lines, then any
 pruned ticker directories, end the compaction log.
-The laptop's `config.yaml` must never set `lake_window_sessions`. The laptop's role and its
-`s3://` target pass the trim's other two gates, so the key's absence is the only thing that
-keeps the laptop's own compaction from trimming. Once the resync [#832](https://github.com/l3a0/marketlake/issues/832) plans
+The laptop's `config.yaml` must never set `lake_window_sessions`. Since the cutover
+([#638](https://github.com/l3a0/marketlake/issues/638)) the laptop runs `role: shadow`,
+which the trim's role gate refuses. A switch back to `primary` would pass that gate, and
+the laptop's `s3://` target passes the bucket gate, so the key's absence would then be the
+only thing that keeps the laptop's own compaction from trimming. Once the resync [#832](https://github.com/l3a0/marketlake/issues/832) plans
 lands, a laptop that resyncs from the bucket after a trim will hold a trimmed lake without
 the key, because that resync will skip the partitions the bucket's trimmed ledger says
 were removed on purpose.

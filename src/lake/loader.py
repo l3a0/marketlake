@@ -1504,9 +1504,10 @@ def load_contract_life(
 
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed drops out of a range
     with no error, because the read lists sessions from disk. Nothing nightly calls this door.
-    A reader of trimmed sessions restores the range into an empty directory first and reads
-    there. A partition removed between the directory check and its listing raises
-    ``FileNotFoundError`` rather than this door's own refusal.
+    Reading a trimmed session means restoring it into a directory outside the live lake, and
+    the tool that restores a range there is marketlake #837, deferred. A partition removed
+    between the directory check and its listing raises ``FileNotFoundError`` rather than this
+    door's own refusal.
     """
     root = resolve_lake_root(lake_root)
     thread = _thread(root, occ_symbol)

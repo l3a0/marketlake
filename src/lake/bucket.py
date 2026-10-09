@@ -27,7 +27,9 @@ Five jobs live here.
 5. **The range restore**, ``python -m lake.bucket restore-range``, is run by hand. It puts
    chosen chains or quotes partitions back into the live lake, verified against the lake's
    own manifest, for a partition lost by accident or a rollback of trimming (marketlake
-   #784).
+   #784). While the host's config sets ``lake_window_sessions``, a rollback lasts only until
+   the trim runs with a split checkpoint from a session after the restore's day, which drops
+   each restored partition outside the window again. A lasting rollback also removes the key.
 
 **The manifest's digest travels with every upload.** ``manifest.jsonl`` records each
 file's SHA-256 as 64 hex characters. S3 takes a SHA-256 as ``ChecksumSHA256``, the
@@ -47,10 +49,12 @@ copy. The number of entries in that prefix is the watermark.
 
 **What stays on the machine.** ``runner.BACKUP_EXCLUSIONS`` decides it, with ``rsync``'s
 own matching rules, because the uploader walks the tree itself and ``rsync`` is not
-there to apply them. Nothing but the range restore writes under the lake root. It writes
-only partitions the lake's own manifest already records, a restore line in the trimmed
-ledger, and that ledger's manifest entry, which are what any lake writer leaves, so
-switching back to a path stays free. The trim that deletes old chains partitions lives in
+there to apply them. Of this module's jobs, only the range restore writes into a live
+lake. The restore writes only into an empty destination, which on the VM is ``lake_root``
+before any lake is there. The range restore writes only partitions the lake's own
+manifest already records, a restore line in the trimmed ledger, and that ledger's
+manifest entry, which are what any lake writer leaves, so switching back to a path stays
+free. The trim that deletes old chains partitions lives in
 ``lake.trim`` for that reason (marketlake #787), and ``current_digest``, the read it checks
 a partition's bucket copy with, writes nothing.
 
@@ -349,9 +353,9 @@ class BucketLedgerRefused(BucketRefusal):
 
     Without it, no partition the bucket's manifest records can be told apart as removed on
     purpose rather than lost. :func:`read_bucket_trimmed` raises it. It is a plain
-    ``BucketRefusal`` rather than a ``RestoreRefused``, because the restore and marketlake #832's
-    resync both read the bucket's ledger through that helper, and each re-raises this as its
-    own refusal with its own repair.
+    ``BucketRefusal`` rather than a ``RestoreRefused``, because the restore reads the bucket's
+    ledger through that helper, and marketlake #832's resync, still open, is to read it the
+    same way. Each re-raises this as its own refusal with its own repair.
     """
 
 
@@ -1554,7 +1558,7 @@ def current_digest(client: Any, target: BucketTarget, rel: str) -> CurrentDigest
     lake's copy. The body streams in ``_READ_CHUNK`` pieces into one SHA-256, so a partition of
     a few hundred megabytes is never held in memory whole, and it is closed when the read ends.
     Nothing is written anywhere, which keeps this module's rule that only the range restore
-    writes under the lake root. A bucket failure on the request or partway through the body
+    writes into a live lake. A bucket failure on the request or partway through the body
     raises ``BucketReadError`` the way :func:`bucket_reader` maps it, so a missing key reads as
     ``absent`` and a lost grant as ``refused``. Anything that is not a bucket failure is a bug
     and raises as itself.
@@ -1607,8 +1611,8 @@ def read_bucket_trimmed(
     download is joined inside the ``try``, because ``bucket_reader`` sends the request on the
     first iteration rather than when it is called.
 
-    The restore and marketlake #832's resync both call this, so the bucket's ledger is judged
-    one way wherever a designed absence is decided against it.
+    The restore calls this, and marketlake #832's resync, still open, is to call it too, so the
+    bucket's ledger is judged one way wherever a designed absence is decided against it.
     """
     entry = bucket_latest.get(TRIMMED_FILE)
     if entry is None:

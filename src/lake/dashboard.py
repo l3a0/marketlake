@@ -1757,8 +1757,9 @@ def query_today(
 
     **On a trimmed lake** (marketlake #787) a chosen date the VM's trim removed raises
     nothing. Every slot renders ``STATUS_MISSING``, which looks the same as a capture outage.
-    The panel reads only the lake it is pointed at, so a trimmed day is read by pointing a
-    dashboard at a range restored into an empty directory.
+    The panel reads only the lake it is pointed at, so reading a trimmed day means pointing a
+    dashboard at a directory outside the live lake that holds it. The tool that restores a
+    range there is marketlake #837, deferred.
     """
     session_day = day if day is not None else ctx.session.session_date()
     payload: dict[str, object] = {
