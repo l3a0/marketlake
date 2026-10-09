@@ -3,8 +3,9 @@
 The owner runs it by hand to seed the bucket, and again to re-baseline a bucket whose
 copy of ``manifest.jsonl`` a human repaired. It compares every object rather than trusting
 a watermark, prints its throughput, and refuses with one printed line and exit 2 rather
-than a traceback. It refuses a copy holding entries this lake never recorded, because
-replacing that copy would drop another host's sessions from the bucket's record
+than a traceback. It refuses a copy where some path's latest entry is one this lake never
+recorded, because replacing that copy would drop another host's sessions from the bucket's
+record
 (marketlake #832). ``main`` builds the client from the config, so a test replaces
 ``bucket.client_from_config`` and drives the rest of the wiring unchanged.
 """
@@ -435,8 +436,9 @@ def test_a_missing_file_whose_entry_has_no_sha_refuses_as_missing_as_before(
 # -- a copy holding another host's entries -------------------------------------------
 
 # Marketlake #832. The first upload replaces the bucket's manifest.jsonl outright, so a copy
-# holding entries this lake never recorded refuses, before the listing and again under the
-# lock before the manifest PUT. The check reads only a copy that is present and not a prefix.
+# where some path's latest entry is one this lake never recorded refuses, before the listing
+# and again under the lock before the manifest PUT. The check reads only a copy that is
+# present and not a prefix.
 
 MANIFEST_KEY = "lake/manifest.jsonl"
 
@@ -453,6 +455,12 @@ FOREIGN = (
     "quotes/ticker=SPY/date=2026-10-09.parquet",
     "bars/ticker=SPY/date=2026-10-09.parquet",
     "chains/ticker=QQQ/date=2026-10-09.parquet",
+)
+
+
+# How the refusal counts them: the paths whose latest entry in the copy's tail is foreign.
+NEVER = (
+    "the latest entry in the tail of the bucket's manifest.jsonl is one this lake never recorded"
 )
 
 
@@ -503,7 +511,7 @@ def test_a_foreign_copy_refuses_with_exit_2_and_no_put(tmp_path, monkeypatch, ca
         _main(config, client, monkeypatch)
 
     line = _refused(capsys, exited)
-    assert "4 entries this lake never recorded" in line
+    assert f"on 4 path(s) {NEVER}" in line
     named = ", ".join(repr(rel) for rel in FOREIGN[:3])
     assert f"({named} and 1 more)" in line
     assert FOREIGN[3] not in line
@@ -544,7 +552,7 @@ def test_a_copy_that_turns_foreign_mid_run_refuses_before_the_manifest_put(
         _main(config, client, monkeypatch)
 
     line = _refused(capsys, exited)
-    assert "1 entries this lake never recorded" in line and repr(FOREIGN[1]) in line
+    assert f"on 1 path(s) {NEVER}" in line and repr(FOREIGN[1]) in line
     assert "after 1 PUT(s)" in line
     assert client.put_keys() == [f"lake/{rel}"]
     assert client.body(MANIFEST_KEY) == seeded + _entry(FOREIGN[1])
@@ -642,8 +650,49 @@ def test_exactly_three_foreign_entries_are_counted_alone_and_named_with_no_more(
 
     line = _refused(capsys, exited)
     named = ", ".join(repr(rel) for rel in FOREIGN[:3])
-    assert f"holds 3 entries this lake never recorded ({named})," in line
+    assert f"on 3 path(s) {NEVER} ({named})," in line
     assert "more" not in line
+
+
+def test_two_unrecorded_entries_on_one_path_name_the_path_once(tmp_path, monkeypatch, capsys):
+    _, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    tail = _entry(FOREIGN[1], "1" * 64) + _entry(FOREIGN[1], "2" * 64) + _entry(FOREIGN[2])
+    client.store(MANIFEST_KEY, seeded + tail)
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 2 path(s) {NEVER} ({FOREIGN[1]!r}, {FOREIGN[2]!r})," in line
+    assert client.puts() == []
+
+
+def test_another_hosts_entry_fused_onto_a_torn_fragment_refuses_with_no_manifest_put(
+    tmp_path, monkeypatch, capsys
+):
+    # Read as a hand repair, the copy would be replaced, dropping the fused entry from the
+    # bucket's record.
+    _, config = _setup(tmp_path)
+    client = FakeS3()
+    assert _main(config, client, monkeypatch) == 0
+    seeded = client.body(MANIFEST_KEY)
+    copy = seeded + _entry("quotes/q", "q" * 64)[:30] + _entry(FOREIGN[1])
+    client.store(MANIFEST_KEY, copy)
+    client.calls.clear()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exited:
+        _main(config, client, monkeypatch)
+
+    line = _refused(capsys, exited)
+    assert f"on 1 path(s) {NEVER} ({FOREIGN[1]!r})," in line
+    assert MANIFEST_KEY not in client.put_keys()
+    assert client.body(MANIFEST_KEY) == copy
 
 
 def test_the_check_under_the_lock_reads_the_ledger_as_it_stands_then(tmp_path, monkeypatch, capsys):

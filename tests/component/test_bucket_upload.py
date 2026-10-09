@@ -7,9 +7,10 @@ that can fail has a test here.
 1. What is new: every manifested file past the watermark, and every file with no
    manifest entry whose size differs from the bucket's.
 2. No usable watermark refuses with one line. An empty bucket, a copy with no whole
-   entry, and a hand repair name the first-upload command. A copy holding entries this
-   lake never recorded, and one that could not be read to tell, say not to run it, since
-   it would drop another host's entries from the bucket's record (marketlake #832).
+   entry, a copy stored with no SHA-256, and a hand repair name the first-upload command.
+   A copy where some path's latest entry is one this lake never recorded, and one that
+   could not be read to tell, say not to run it, since it would drop another host's
+   entries from the bucket's record (marketlake #832).
 3. Segments upload unless their compacted partition is manifested, and any other
    manifested file missing from disk refuses.
 4. Every PUT carries the manifest's digest as base64, sets Standard-IA, and is never a
@@ -217,21 +218,22 @@ def test_a_copy_with_no_whole_entry_refuses_rather_than_upload_the_whole_lake(tm
 
 # -- 2. a copy that is not a prefix: another host's entries or a hand repair --------
 #
-# Marketlake #832. Only a copy that is present and not a prefix is downloaded, and
-# ``bucket_divergence`` says whether it holds entries this lake never recorded.
+# Marketlake #832. The nightly upload downloads only a copy that is present and not a
+# prefix, and ``bucket_divergence`` says on which paths its latest entry is one this lake
+# never recorded.
 
 VM_PARTITION = "chains/ticker=SPY/date=2026-10-09.parquet"
 # Another host's first partition, holding a newline, as a rotted or hostile copy could.
 ODD_PARTITION = "chains/ticker=SPY/\ndate=2026-10-09"
 
 
-def _vm_line(partition: str = VM_PARTITION) -> bytes:
+def _vm_line(partition: str = VM_PARTITION, sha: str = "f" * 64) -> bytes:
     """An entry another host appended, for a path and sha this lake never recorded."""
     entry = {
         "fetched_at": None,
         "partition": partition,
         "rows": 1,
-        "sha256": "f" * 64,
+        "sha256": sha,
         "source": "compaction",
     }
     return (json.dumps(entry, sort_keys=True) + "\n").encode()
@@ -301,7 +303,7 @@ def test_a_foreign_tail_says_not_to_run_first_upload_and_names_832(tmp_path):
     # The bucket's first partition holds a newline, and it renders escaped on the line.
     assert f"holds 2 entries from {ODD_PARTITION!r}," in message
     assert f"this lake holds 1 entries from {own!r} of its own" in message
-    assert "2 of the bucket's" in message
+    assert "On 2 path(s) the latest entry in the bucket's tail is one" in message
     assert client.puts() == []
     assert len(_gets(client)) == 1
 
@@ -473,7 +475,65 @@ def test_the_foreign_count_leaves_out_tail_entries_the_lake_recorded(tmp_path):
 
     message = str(refused.value)
     assert "then holds 2 entries from" in message
-    assert "1 of the bucket's are entries this lake never recorded" in message
+    assert "On 1 path(s) the latest entry in the bucket's tail is one this lake never" in message
+
+
+def test_two_unrecorded_entries_on_one_path_count_as_one_path(tmp_path):
+    client = FakeS3()
+    lake = _lake(tmp_path / "lake")
+    _seed(lake, client)
+    raw = manifest_path(lake).read_bytes()
+    tail = _vm_line("quarantine.jsonl", "1" * 64) + _vm_line("quarantine.jsonl", "2" * 64)
+    client.store(_key("manifest.jsonl"), raw + tail + _vm_line())
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "\n" not in message
+    # The tail counts 3 entries, and the ones this lake never recorded sit on 2 paths.
+    assert "then holds 3 entries from 'quarantine.jsonl'" in message
+    assert "On 2 path(s) the latest entry in the bucket's tail is one" in message
+
+
+def test_another_hosts_entry_fused_onto_a_torn_fragment_refuses_and_puts_nothing(tmp_path):
+    # A short write on the other host left a fragment, and its next entry fused onto it.
+    # Read as a hand repair, the line would advise the first upload, which drops the entry.
+    client = FakeS3()
+    lake = _lake(tmp_path / "lake")
+    _seed(lake, client)
+    raw = manifest_path(lake).read_bytes()
+    client.store(_key("manifest.jsonl"), raw + _vm_line("quotes/q", "q" * 64)[:30] + _vm_line())
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "\n" not in message
+    assert FIRST_UPLOAD_COMMAND not in message
+    assert f"then holds 1 entries from {VM_PARTITION!r}" in message
+    assert "On 1 path(s)" in message
+    assert client.puts() == []
+
+
+@pytest.mark.parametrize(
+    "deep", [b"[" * 50000, b'x{"a": ' + b"[" * 50000], ids=["whole-line", "fused-tail"]
+)
+def test_a_line_nested_past_the_recursion_limit_still_refuses_with_one_line(tmp_path, deep):
+    # json.loads raises RecursionError on it, which compact.main would not catch.
+    client = FakeS3()
+    lake = _lake(tmp_path / "lake")
+    _seed(lake, client)
+    raw = manifest_path(lake).read_bytes()
+    client.store(_key("manifest.jsonl"), raw + deep + b"\n" + _vm_line())
+
+    with pytest.raises(WatermarkMissing) as refused:
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    message = str(refused.value)
+    assert "\n" not in message
+    assert "On 1 path(s)" in message
+    assert client.puts() == []
 
 
 def test_a_copy_larger_than_one_read_chunk_is_read_whole(tmp_path, monkeypatch):

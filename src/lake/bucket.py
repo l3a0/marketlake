@@ -14,8 +14,8 @@ Five jobs live here.
 2. **The first upload**, ``python -m lake.bucket first-upload``, is run by hand. It
    compares every object rather than trusting the bucket's copy of the manifest, so it
    both seeds an empty bucket and re-baselines one whose copy a human repaired. It refuses
-   a copy that holds entries this lake never recorded, since replacing that copy would drop
-   another host's sessions from the bucket's record.
+   a copy where some path's latest entry is one this lake never recorded, since replacing
+   that copy would drop another host's sessions from the bucket's record.
 3. **The bucket scrub**, ``bucket_scrub``, is the Sunday job's check of the bucket. It
    returns the same ``BackupScrubResult`` the path scrub returns, with the same
    findings and the same rule about which of them withhold the ping. The Sunday restore
@@ -45,9 +45,11 @@ rather than falling back to parts.
 got. A ``HeadObject`` returns its length and its stored SHA-256. Hashing that many
 leading bytes of the lake's manifest and comparing proves the copy is a prefix without
 downloading it, the same byte-prefix rule ``manifest.backup_scrub`` applies to a path
-copy. The number of entries in that prefix is the watermark. Only a copy that is present
-and not a prefix is downloaded, so ``bucket_divergence`` can tell another host's entries
-from a hand repair, and the refusal can say which.
+copy. The number of entries in that prefix is the watermark. The nightly upload downloads
+the copy only when it is present and not a prefix, so ``bucket_divergence`` can tell
+another host's entries from a hand repair, and the refusal can say which. The first upload
+and the bucket scrub download it under the same condition. The restore downloads it every
+time, because the copy is what it restores the lake's manifest from.
 
 **What stays on the machine.** ``runner.BACKUP_EXCLUSIONS`` decides it, with ``rsync``'s
 own matching rules, because the uploader walks the tree itself and ``rsync`` is not
@@ -328,15 +330,24 @@ class WatermarkMissing(BucketRefusal):
     """The bucket holds no usable copy of ``manifest.jsonl``, so the nightly run cannot start.
 
     An empty bucket would otherwise start a whole-lake upload inside compaction's lock, and
-    the first-upload command is its repair. A copy that is not a prefix has three causes.
+    the first-upload command is its repair. A copy that is not a prefix has four causes,
+    the same four ``bucket_divergence`` tells apart.
 
     1. Another host appended its own sessions to the bucket's copy.
     2. This lake was restored from an older copy, so the bucket holds entries it lost.
-    3. A human repaired the lake's manifest or the bucket's copy.
+    3. A human repaired a line in the lake's manifest or the bucket's copy.
+    4. A line that still parses was damaged on either side.
 
     The first two leave entries this lake never recorded, and the first-upload command
-    would drop them from the bucket's record, so the refusal says not to run it. Only the
-    third keeps the first-upload command as its repair.
+    would drop them from the bucket's record, so the refusal says not to run it. The fourth
+    reads the same way, because its bytes cannot be told from the first two, and refusing
+    is the safe side. So damage to the lake's own manifest refuses and blames another
+    host, while the real repair is fixing the lake's line. Only the third keeps the
+    first-upload command as its repair.
+
+    A copy stored with no SHA-256 is a separate case. When the lake's manifest starts with
+    its bytes, nothing is wrong with it except that it cannot be proved a prefix, and its
+    line names the first-upload command too.
     """
 
 
@@ -807,8 +818,11 @@ class Divergence:
     ``shared_bytes`` is the length of the bytes both share, cut back to a line boundary, and
     ``shared`` is how many entries those bytes hold. ``bucket_tail`` and ``lake_tail`` count
     the entries each side holds past them, and ``bucket_first`` and ``lake_first`` name the
-    first partition of each, or ``None`` when that side holds none. ``foreign`` holds the
-    bucket's entries this lake never recorded, in the bucket's order.
+    first partition of each, or ``None`` when that side holds none. ``shared``,
+    ``bucket_tail`` and ``lake_tail`` read lines the way :func:`_entries` reads them, so a
+    fused line counts the whole entry at its end. ``foreign`` holds the latest entry in the
+    bucket's tail for each path where that entry is one this lake never recorded, in the
+    bucket's order.
     """
 
     shared_bytes: int
@@ -820,16 +834,41 @@ class Divergence:
     foreign: tuple[dict, ...]
 
 
-def _entries(raw: bytes) -> list[dict]:
-    """Every line of ``raw`` that parses alone as an entry naming a string ``partition``.
+def _is_entry(value: object) -> bool:
+    """Whether a parsed line is an object naming a string ``partition``."""
+    return isinstance(value, dict) and isinstance(value.get("partition"), str)
 
-    Each line is decoded and parsed on its own, so one damaged line hides nothing behind it.
+
+def _fused_tail(text: str) -> object:
+    """The whole object at the end of a line that does not parse, or ``None``.
+
+    A short write leaves a fragment with no newline, and the next append lands on the same
+    line, as ``manifest.append_line`` says. The fragment is lost, but the entry after it is
+    whole, and it may be the only record of another host's session. Each ``{`` after the
+    line's first character is tried from the left, and the first suffix that parses is
+    returned. :func:`_entries` keeps it only when it names a string ``partition``.
+    """
+    start = text.find("{", 1)
+    while start != -1:
+        try:
+            return json.loads(text[start:])
+        except (ValueError, RecursionError):
+            start = text.find("{", start + 1)
+    return None
+
+
+def _entries(raw: bytes) -> list[dict]:
+    """Every entry naming a string ``partition`` in ``raw``, each line parsed on its own.
+
     ``parse_jsonl`` stops at the first line that does not parse, which is the right rule
     for a torn tail and the wrong one here: a fused line would hide a foreign entry after
-    it. Each line decodes with a replacement, as :func:`read_ledger` decodes, because
-    ``json.loads`` on bytes raises ``UnicodeDecodeError``, which is not a
-    ``JSONDecodeError``. A line that is not an object with a string ``partition`` is
-    skipped.
+    it. So each line is parsed alone, and a line that does not parse gives up the whole
+    entry at its end, by :func:`_fused_tail`. Each line decodes with a replacement, as
+    :func:`read_ledger` decodes, because ``json.loads`` on bytes raises
+    ``UnicodeDecodeError``, which is not a ``JSONDecodeError``. A line nested deeper than
+    the interpreter's recursion limit, such as ``[`` repeated 50,000 times, raises
+    ``RecursionError`` rather than ``ValueError``, so both parses catch both. A line that
+    parses to something other than an object with a string ``partition`` is skipped.
     """
     entries: list[dict] = []
     for line in raw.split(b"\n"):
@@ -837,11 +876,11 @@ def _entries(raw: bytes) -> list[dict]:
         if not text:
             continue
         try:
-            entry = json.loads(text)
-        except ValueError:
-            continue
-        if isinstance(entry, dict) and isinstance(entry.get("partition"), str):
-            entries.append(entry)
+            value = json.loads(text)
+        except (ValueError, RecursionError):
+            value = _fused_tail(text)
+        if _is_entry(value):
+            entries.append(value)
     return entries
 
 
@@ -857,21 +896,28 @@ def _pair(entry: Mapping[str, Any]) -> tuple[str, str | None]:
 def bucket_divergence(bucket_raw: bytes, lake_raw: bytes) -> Divergence:
     """Tell where the bucket's ``manifest.jsonl`` leaves the lake's, and what it holds after.
 
-    A copy that is not a prefix of the lake's has three causes, and this tells them apart.
+    A copy that is not a prefix of the lake's has four causes, and this tells them apart as
+    far as the bytes allow.
 
-    1. Another host appended, or the lake was restored from an older copy. The bucket then
-       holds entries this lake never recorded, which ``foreign`` returns.
-    2. A human repaired a fused line, a byte-order mark or a line with no partition. The
-       damaged line no longer parses or names no partition, and every entry kept is
-       somewhere in the lake, so ``foreign`` is empty.
-    3. Rot inside a recorded partition or sha that still parses. It reads as foreign, which
-       is the safe side, and the refusal names its partition.
+    1. Another host appended its own sessions. The bucket then holds entries this lake
+       never recorded, which ``foreign`` returns.
+    2. The lake was restored from an older copy, so the bucket holds entries the lake lost.
+       They read as foreign the same way.
+    3. A human repaired a line on either side, such as a fused line, a byte-order mark or a
+       line with no partition. Every entry the copy still holds is somewhere in the lake,
+       so ``foreign`` is empty.
+    4. A line that still parses was damaged on either side. It reads as foreign, which is
+       the safe side. So damage to the lake's own manifest, such as a rotted sha or a
+       deleted line that was a path's latest entry, refuses and blames another host, while
+       the real repair is fixing the lake's line.
 
     A bucket entry is foreign when its partition and sha256 pair appears in no entry
     anywhere in the lake's manifest. Anywhere rather than in the lake's latest, so the
     18:30 sweep's later entries on the same paths change nothing. Only the latest entry for
     each partition in the bucket's tail counts, so an earlier entry its own host superseded
-    loses nothing current, and a hand repair that deleted a parseable line is not refused.
+    loses nothing current. For the same reason, a hand repair that deleted a line from the
+    lake's manifest is not refused when a later entry for the same path in the bucket's tail
+    replaced that line. Deleting a path's latest or only entry is refused, as cause 4 says.
 
     The shared bytes are cut where the two first differ, then back to the last newline
     before that, or to 0 when there is none.
@@ -951,15 +997,20 @@ def _diverged_copy(
     """The nightly upload's refusal for a copy that is present and not a prefix.
 
     The copy is downloaded only here, so the nightly path that finds a prefix sends no new
-    request. Three refusals come out of it, each one line.
+    request. Four refusals come out of it, each one line.
 
-    1. The copy holds entries this lake never recorded. Running the first upload would drop
-       them from the bucket's record, so the line says not to and does not name the command.
-    2. It holds none, which is a hand repair, and the line names the first upload as before.
-    3. The copy could not be read to tell the two apart: the deadline passed, the GET
-       failed, or the body is not the copy the HEAD described. The line says not to run the
-       first upload, since it cannot rule out another host. ``UploadDeadline`` is not raised,
-       because its "the next night carries on" would be false here.
+    1. On some path the latest entry in the copy's tail is one this lake never recorded.
+       Running the first upload would drop it from the bucket's record, so the line says
+       not to and does not name the command. The line counts entries for the tails and
+       paths for the ones this lake never recorded, and says which is which.
+    2. The copy carries no stored SHA-256 and the lake's manifest starts with its bytes. It
+       cannot be proved a prefix, and the line names the first upload.
+    3. No path's latest entry is one this lake never recorded, which is a hand repair, and
+       the line names the first upload as before.
+    4. The copy could not be read to tell the first from the third: the deadline passed,
+       the GET failed, or the body is not the copy the HEAD described. The line says not to
+       run the first upload, since it cannot rule out another host. ``UploadDeadline`` is
+       not raised, because its "the next night carries on" would be false here.
     """
 
     def unread(why: str) -> WatermarkMissing:
@@ -987,10 +1038,11 @@ def _diverged_copy(
         return WatermarkMissing(
             f"the bucket's manifest.jsonl shares {split.shared} entries with the lake's, then "
             f"holds {_tail(split.bucket_tail, split.bucket_first)}, while this lake holds "
-            f"{_tail(split.lake_tail, split.lake_first)} of its own. {len(split.foreign)} of "
-            "the bucket's are entries this lake never recorded (another host's sessions, or a "
-            "lake restored from an older copy), so do not run first-upload, which would drop "
-            f"them from the bucket's record, and {_RESYNC_POINTER}: {target}"
+            f"{_tail(split.lake_tail, split.lake_first)} of its own. On {len(split.foreign)} "
+            "path(s) the latest entry in the bucket's tail is one this lake never recorded "
+            "(another host's sessions, or a lake restored from an older copy), so do not run "
+            "first-upload, which would drop those entries from the bucket's record, and "
+            f"{_RESYNC_POINTER}: {target}"
         )
     if copy.stored is None and lake_raw.startswith(body):
         return WatermarkMissing(
@@ -999,9 +1051,9 @@ def _diverged_copy(
             f"{FIRST_UPLOAD_COMMAND} by hand: {target}"
         )
     return WatermarkMissing(
-        "the bucket holds a manifest.jsonl that is not a prefix of the lake's and holds no "
-        "entry this lake never recorded, so the nightly upload has no watermark. Run "
-        f"{FIRST_UPLOAD_COMMAND} by hand: {target}"
+        "the bucket holds a manifest.jsonl that is not a prefix of the lake's, and no path's "
+        "latest entry in its tail is one this lake never recorded, so the nightly upload has "
+        f"no watermark. Run {FIRST_UPLOAD_COMMAND} by hand: {target}"
     )
 
 
@@ -1012,7 +1064,7 @@ def _refuse_foreign(
     lake_raw: bytes,
     uploader: _Uploader,
 ) -> None:
-    """The first upload's guard: refuse when the bucket's copy holds another host's entries.
+    """The first upload's guard: refuse when the bucket's copy may hold another host's entries.
 
     It reads only a copy that is present and not a prefix, and runs the upload's guards
     first, so the Sunday window holds before the GET. A failed read raises
@@ -1032,11 +1084,12 @@ def _refuse_foreign(
     foreign = bucket_divergence(body, lake_raw).foreign
     if foreign:
         raise FirstUploadRefused(
-            f"the bucket's manifest.jsonl holds {len(foreign)} entries this lake never "
-            f"recorded ({_quoted([entry['partition'] for entry in foreign])}), from another "
-            "host's sessions or a lake restored from an older copy, and replacing it would "
-            f"drop them from the bucket's record. The first upload stopped after {puts} PUT(s) "
-            f"with no manifest.jsonl uploaded, and {_RESYNC_POINTER}: {target}"
+            f"on {len(foreign)} path(s) the latest entry in the tail of the bucket's "
+            "manifest.jsonl is one this lake never recorded "
+            f"({_quoted([entry['partition'] for entry in foreign])}), from another host's "
+            "sessions or a lake restored from an older copy, and replacing the copy would drop "
+            f"those entries from the bucket's record. The first upload stopped after {puts} "
+            f"PUT(s) with no manifest.jsonl uploaded, and {_RESYNC_POINTER}: {target}"
         )
 
 
@@ -1316,8 +1369,9 @@ def nightly_upload(
 
     1. The bucket's manifest copy must be a prefix of the lake's that carries at least
        one whole entry when the lake has any, or this refuses with one line and uploads
-       nothing. An absent copy, one with no whole entry, and a hand repair name the
-       first-upload command. A copy holding entries this lake never recorded, and one that
+       nothing. An absent copy, one with no whole entry, one stored with no SHA-256 that
+       the lake's manifest starts with, and a hand repair name the first-upload command. A
+       copy where some path's latest entry is one this lake never recorded, and one that
        could not be read to tell, say not to run it.
     2. Every manifested file whose latest entry sits past the watermark is pending and
        uploads under the manifest's digest, segments by the segment rule.
@@ -1455,13 +1509,13 @@ def first_upload(
        wrong ``lake_root`` reads that way, and the run would replace the bucket's
        manifest with an empty one. This is checked before the lock, because taking the
        lock creates ``manifest.jsonl`` under the root it is handed.
-    4. A bucket copy that is present and not a prefix, and holds entries this lake never
-       recorded by ``bucket_divergence``. Replacing it would drop another host's sessions
-       from the bucket's record. It is checked before ``list_bucket`` and again under the
-       lock before the manifest PUT. The second check limits damage rather than preventing
-       it, since the unlocked pass has already sent any shared path whose sha differs. A
-       copy that changed between its HEAD and its GET refuses too, and a failed read
-       raises ``BucketReadError``.
+    4. A bucket copy that is present and not a prefix, where ``bucket_divergence`` finds a
+       path whose latest entry is one this lake never recorded. Replacing it would drop
+       another host's sessions from the bucket's record. It is checked before
+       ``list_bucket`` and again under the lock before the manifest PUT. The second check
+       limits damage rather than preventing it, since the unlocked pass has already sent
+       any shared path whose sha differs. A copy that changed between its HEAD and its GET
+       refuses too, and a failed read raises ``BucketReadError``.
     """
     root = Path(lake_root)
     started = clock.monotonic()
