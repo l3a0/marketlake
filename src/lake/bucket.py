@@ -3840,9 +3840,14 @@ def resync(
        with that sha is skipped, and one that differs or is absent is downloaded. A segment
        whose compacted partition B records is skipped, and so is a designed absence judged
        against B's own ``trimmed.jsonl``, read by :func:`read_bucket_trimmed`. A designed
-       absence this lake holds a file for refuses, and so does a download whose path holds
-       something that is not a regular file, such as a directory. A path only this lake's
-       tail names is judged in step 5. Every path passes the restore's safety checks first.
+       absence this lake holds with bytes other than B's entry refuses, and so does a
+       download whose path holds something that is not a regular file, such as a directory.
+       A partition this lake's own ``trimmed.jsonl`` calls trimmed, absent on disk, named
+       by B and not trimmed by B's ledger is downloaded at B's sha, because the close+15
+       uploads before it trims and B lacks the last night's trim lines. A B ledger newer
+       than B's entry refuses with the cause step 7 names for a newer object. A path only
+       this lake's tail names is judged in step 5. Every path passes the restore's safety
+       checks first.
     5. Refusals on this lake's tail. A file only this lake's tail names, on disk and outside
        step 6's list, refuses whatever its bytes: a chains or quotes partition B does not
        name, or a journal segment no compacted partition and no segment of B covers, may be
@@ -3853,8 +3858,8 @@ def resync(
        is a warning instead. Last, a download or a deletion whose path differs only by case
        from another path B names or this lake's tail names refuses.
     6. Deletions: a file only this lake's tail names, on disk, goes when it is a journal
-       segment whose compacted partition B records, or a ``bars/`` partition, whatever its
-       bytes.
+       segment whose compacted partition B records, a ``bars/`` partition, or a
+       ``trimmed.jsonl`` B names none of, whatever its bytes.
     7. Checks: every download is in the listing, its stored SHA-256 equals B's entry, and the
        free space left covers the journal reserve. A stored SHA-256 that differs means the
        other host's last upload stopped before its ``manifest.jsonl`` or is still running.
@@ -3865,8 +3870,9 @@ def resync(
     8. Commit, under ``lake_lock``: the guards run again, L must read as it did and B's HEAD
        must answer as it did. Each download is renamed into place and flushed with its
        directory and the parent of each directory a download created, step 6's files are
-       deleted, and :func:`_rewrite_manifest` cuts the manifest back to the shared bytes and
-       appends B's tail in place.
+       deleted, ``trimmed.jsonl`` is moved or deleted after every other file, and
+       :func:`_rewrite_manifest` cuts the manifest back to the shared bytes and appends B's
+       tail in place.
 
     A refusal or any other stop removes this run's temp files, so a run that stops at its
     deadline discards its downloads and the next one fetches them again. Every refusal
