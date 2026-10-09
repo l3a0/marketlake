@@ -1508,9 +1508,8 @@ def load_contract_life(
     ``python -m lake.bucket restore-for-reading`` does (marketlake #837). Call this with
     ``lake_root`` at that directory and ``end`` at the range's last day, because the restore
     also brings the next chains partition after the range and an open end would read it. A
-    partition removed
-    between the directory check and its listing raises ``FileNotFoundError`` rather than this
-    door's own refusal.
+    partition removed between the directory check and its listing raises ``FileNotFoundError``
+    rather than this door's own refusal.
     """
     root = resolve_lake_root(lake_root)
     thread = _thread(root, occ_symbol)

@@ -28,8 +28,8 @@ beside the laptop until the cutover in
 [#638](https://github.com/l3a0/marketlake/issues/638) made it the primary capture host.
 Its lake volume holds a window of recent chains sessions, and the close+15 compaction trims
 older chains partitions once each is verified in the bucket ([#787](https://github.com/l3a0/marketlake/issues/787)).
-A trimmed range is read by restoring it from the bucket into a directory outside the live
-lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
+To read a trimmed range, the reading restore brings it from the bucket into a directory
+outside the live lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -311,10 +311,11 @@ either.
    a `manifest.jsonl` or a name it is about to move in, which is what a daemon started on
    that root looks like. It refuses
    with exit 2 when `<dest>` holds anything but `lost+found` and the working directory,
-   which keeps it off a live lake, when `<dest>` is a symbolic link, and when its
-   filesystem is too small. Too small means short of the download, or short of the
-   download plus the journal reserve, 13 times the busiest sealed day in the bucket, which
-   the next session's journal needs on the same volume. The reserve line says how much to
+   which keeps it off a live lake, when `<dest>` or its working directory is a symbolic
+   link, when `<dest>` cannot be read, and when its filesystem is too small. Too small
+   means short of the download, or short of the download plus the journal reserve, 13
+   times the busiest sealed day in the bucket, which the next session's journal needs on
+   the same volume. The reserve line says how much to
    free. On the hosted VM it also names the fix: raise `lake_volume_gib`, apply, and rerun
    the bootstrap, as [infra/README.md](infra/README.md) says. On a host that keeps a
    window, the restore also refuses with exit 2, before any data file downloads, when the
@@ -412,12 +413,19 @@ either.
    A file that fails is named with what it is to the range, `<dir>` holds no reading set, and
    the command exits 1. A file that does not match its SHA-256 means either an upload is
    running or stopped part-way, so run it again after the next complete nightly upload, or
-   the bucket's current version is damaged, which the "When the lake is gone" steps below
-   repair into `<dir>/.marketlake-restoring` with no write to the bucket. The directory is for
-   reading only. Its `manifest.jsonl` names partitions it does not hold, so never make it a
-   daemon's or a job's `lake_root`. Pass `lake_root=` to every read, since a call without it
-   reads the configured live lake, and pass `end` at the range's last day to
-   `continuity_view` and `load_contract_life`, which otherwise read the next partition too.
+   the bucket's current version is damaged. When the bucket holds an earlier good version,
+   the "When the lake is gone" steps below put it into `<dir>/.marketlake-restoring` with no
+   write to the bucket. A partition the trim removed usually has a single bucket version,
+   so it has none to recover.
+   A reading set is as current as the last complete nightly upload, so a quarantine verdict
+   written after that upload does not reach `<dir>`. The directory is for reading only. Its
+   `manifest.jsonl` names partitions it does not hold, so never make it a daemon's or a
+   job's `lake_root`. Pass `lake_root=` to every read, since a call without it reads the
+   configured live lake. Read only the range's own days. The next chains partition is there
+   so the range's last day reads as on the full lake, and `oi_view` on that partition's own
+   day answers `pending` where the full lake answers `settled`, since the session after it
+   was not restored. Pass `end` at the range's last day to `continuity_view` and
+   `load_contract_life`, which otherwise read the next partition too.
    `uv run python -m lake.dashboard --lake-root <dir> --port <free port>` shows it, on a port
    other than the resident dashboard's 8765.
 7. The nightly upload needs no command. Once `backup_target` names the bucket, the

@@ -426,9 +426,8 @@ def continuity_view(
     ``python -m lake.bucket restore-for-reading`` does (marketlake #837). Call this with
     ``lake_root`` at that directory and ``end`` at the range's last day, because the restore
     also brings the next chains partition after the range, without its bars, and an open end
-    would read it. A partition removed
-    between the directory check and its listing raises ``FileNotFoundError`` rather than this
-    door's own refusal.
+    would read it. A partition removed between the directory check and its listing raises
+    ``FileNotFoundError`` rather than this door's own refusal.
     """
     root = resolve_lake_root(lake_root)
     first, last = _session(start), _session(end)

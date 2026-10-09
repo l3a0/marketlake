@@ -605,10 +605,11 @@ def busiest_sealed_day(usage: Usage, *, today: date, window_days: int = GROWTH_W
     ``JOURNAL_RESERVE_SESSIONS`` times over, so each day counts its sealed bytes only. A
     window with no dated bytes answers 0.
 
-    :func:`assess` reads it for the Lake panel and the evening sweep. Both restores in
-    :mod:`lake.bucket` read it for :func:`reserve_shortfall`, the ``restore`` command through
-    :func:`listing_busiest_sealed_day`. One computation keeps the panel and the refusals from
-    disagreeing about the reserve.
+    :func:`assess` reads it for the Lake panel and the evening sweep. Four jobs in
+    :mod:`lake.bucket` read it for :func:`reserve_shortfall`. The range restore reads it from
+    the lake. The ``restore`` command, the reading restore and the resync read it off the
+    bucket's listing through :func:`listing_busiest_sealed_day`. One computation keeps the
+    panel and the refusals from disagreeing about the reserve.
     """
     start = today - timedelta(days=window_days - 1)
     return max(
@@ -718,11 +719,15 @@ def reserve_shortfall(*, free: int, planned: int, busiest_sealed_day: int) -> in
     reserve exactly or with room to spare, and otherwise the bytes missing. It never raises, as
     nothing in this module does, so the caller words the refusal.
 
-    The busiest sealed day is an argument rather than read from the disk here, because the two
-    callers find it differently. The range restore in :mod:`lake.bucket` adds partitions to a
-    live lake and reads it with :func:`busiest_sealed_day`. The ``restore`` command fills an
-    empty directory, which holds no sealed day to read, so it reads it off the bucket's listing
-    with :func:`listing_busiest_sealed_day`.
+    The busiest sealed day is an argument rather than read from the disk here, because the
+    callers in :mod:`lake.bucket` find it in one of two ways.
+
+    1. The range restore adds partitions to a live lake, so it reads the lake with
+       :func:`busiest_sealed_day`, each planned partition's size added to its day.
+    2. The ``restore`` command, the reading restore and the resync read it off the bucket's
+       listing with :func:`listing_busiest_sealed_day`. The two restores fill an empty
+       directory, which holds no sealed day to read, and the resync brings the lake level with
+       the bucket.
     """
     reserve = JOURNAL_RESERVE_SESSIONS * busiest_sealed_day
     return max(0, reserve - (free - planned))

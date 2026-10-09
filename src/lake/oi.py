@@ -322,6 +322,9 @@ def oi_view(
     restoring it into a directory outside the live lake, which ``python -m lake.bucket
     restore-for-reading`` does (marketlake #837). It also brings each ticker's next chains
     partition after the range, so the range's last day reads there as it does on the full lake.
+    That partition is there only for the range's last day, so read only the range's own days.
+    On the next partition's own day this answers ``pending`` where the full lake answers
+    ``settled``, since the session after it was not restored.
     """
     session_text = day.isoformat() if isinstance(day, date) else str(day)
     session = date.fromisoformat(session_text)
