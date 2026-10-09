@@ -416,6 +416,44 @@ def test_a_damaged_first_line_in_the_buckets_copy_names_that_line(tmp_path):
     assert "carries no whole entry" not in message
 
 
+def test_a_fused_line_both_copies_share_does_not_stop_a_rewind(tmp_path):
+    laptop, _vm_root, client, files = _switched(tmp_path)
+    # A torn write fused with the next append long ago, before the switch, so both copies
+    # carry the same fused line among the entries they share. Only first-upload could repair
+    # the bucket's copy, and it refuses while the bucket holds the VM's entries.
+    bucket_raw = client.body(MANIFEST_KEY)
+    lake_raw = manifest_path(laptop).read_bytes()
+    shared = b"".join(bucket_raw.splitlines(keepends=True)[:-2])
+    assert lake_raw.startswith(shared)
+    first, rest = shared.split(b"\n", 1)
+    fused = first + b"\n" + _torn("chains/ticker=ZZZ/date=2026-08-21.parquet") + rest
+    client.store(MANIFEST_KEY, fused + bucket_raw[len(shared) :])
+    manifest_path(laptop).write_bytes(fused + lake_raw[len(shared) :])
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    # The fused line still gives up the whole entry at its end, so no shared entry is lost.
+    assert summary.shared == len(shared.splitlines())
+    assert manifest_path(laptop).read_bytes() == client.body(MANIFEST_KEY)
+    for rel, data in files.items():
+        assert (laptop / rel).read_bytes() == data
+
+
+def test_a_directory_where_a_download_lands_refuses_before_any_download(tmp_path):
+    laptop, _vm_root, client, _files = _switched(tmp_path)
+    (laptop / QUOTES_2).mkdir(parents=True)
+    before = _snapshot(laptop)
+
+    message = _refused(laptop, client, apply=True)
+
+    assert repr(QUOTES_2) in message
+    assert "not a regular file" in message
+    assert _gets(client) == [MANIFEST_KEY]
+    assert _snapshot(laptop) == before
+    assert (laptop / QUOTES_2).is_dir()
+
+
 class _ChangingS3(FakeS3):
     """A fake bucket whose ``manifest.jsonl`` gains a line between its HEAD and its GET."""
 

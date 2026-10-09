@@ -945,39 +945,40 @@ def bucket_divergence(bucket_raw: bytes, lake_raw: bytes) -> Divergence:
     The shared bytes are cut where the two first differ, then back to the last newline
     before that, or to 0 when there is none.
     """
-    return _divergence(bucket_raw, lake_raw, _entries)
-
-
-def _divergence(
-    bucket_raw: bytes, lake_raw: bytes, entries: Callable[[bytes], list[dict]]
-) -> Divergence:
-    """:func:`bucket_divergence`, with the lines of each side read by ``entries``.
-
-    The nightly upload and the first upload read with :func:`_entries`, which steps over a
-    damaged line. The resync reads with :func:`_whole_entries`, which refuses one, so every
-    count and view it prints comes from the one parse it checked.
-    """
-    cut = _first_difference(lake_raw, bucket_raw)
-    shared_bytes = lake_raw.rfind(b"\n", 0, cut) + 1
-    bucket_tail = entries(bucket_raw[shared_bytes:])
-    lake_tail = entries(lake_raw[shared_bytes:])
-    recorded = {_pair(entry) for entry in entries(lake_raw)}
-    latest: dict[str, tuple[int, dict]] = {}
-    for index, entry in enumerate(bucket_tail):
-        latest[entry["partition"]] = (index, entry)
-    foreign = tuple(
-        entry
-        for _, entry in sorted(latest.values(), key=lambda item: item[0])
-        if _pair(entry) not in recorded
-    )
+    shared_bytes = _shared_bytes(bucket_raw, lake_raw)
+    bucket_tail = _entries(bucket_raw[shared_bytes:])
+    lake_tail = _entries(lake_raw[shared_bytes:])
     return Divergence(
         shared_bytes=shared_bytes,
-        shared=len(entries(lake_raw[:shared_bytes])),
+        shared=len(_entries(lake_raw[:shared_bytes])),
         bucket_tail=len(bucket_tail),
         bucket_first=bucket_tail[0]["partition"] if bucket_tail else None,
         lake_tail=len(lake_tail),
         lake_first=lake_tail[0]["partition"] if lake_tail else None,
-        foreign=foreign,
+        foreign=_foreign(bucket_tail, _entries(lake_raw)),
+    )
+
+
+def _shared_bytes(bucket_raw: bytes, lake_raw: bytes) -> int:
+    """How many leading bytes both manifests share, cut back to a line boundary."""
+    cut = _first_difference(lake_raw, bucket_raw)
+    return lake_raw.rfind(b"\n", 0, cut) + 1
+
+
+def _foreign(bucket_tail: Sequence[dict], recorded: Iterable[dict]) -> tuple[dict, ...]:
+    """The latest entry per path in ``bucket_tail`` whose pair no entry in ``recorded`` holds.
+
+    :func:`bucket_divergence` and the resync both decide "entries this lake never recorded"
+    here, each from its own parse of the lines, so the rule itself has one copy.
+    """
+    pairs = {_pair(entry) for entry in recorded}
+    latest: dict[str, tuple[int, dict]] = {}
+    for index, entry in enumerate(bucket_tail):
+        latest[entry["partition"]] = (index, entry)
+    return tuple(
+        entry
+        for _, entry in sorted(latest.values(), key=lambda item: item[0])
+        if _pair(entry) not in pairs
     )
 
 
@@ -3272,18 +3273,23 @@ class _DamagedLine(Exception):
 def _whole_entries(raw: bytes) -> list[dict]:
     """Every entry in ``raw``, raising :class:`_DamagedLine` on a line that is not one.
 
-    This is the resync's one parse of both manifests, so the latest entry for each path, both
-    tails and every count come from the same lines. A blank line is skipped. The last line,
-    when no newline ends it and it does not parse, is a write that did not finish, and it is
-    dropped, the rule ``manifest.parse_jsonl`` applies to a torn tail. Any other line must be
-    a JSON object naming a string ``partition``.
+    The resync reads each side's tail, the lines past the bytes both manifests share, with
+    this, so the tails and every view built on them come from one parse. A blank line is
+    skipped. The last line, when no newline ends it and it does not parse, is a write that did
+    not finish, and it is dropped, the rule ``manifest.parse_jsonl`` applies to a torn tail.
+    Any other line must be a JSON object naming a string ``partition``.
 
     The nightly upload's :func:`_entries` steps over such a line instead, which suits a
     classifier and not a command that rewrites the lake. ``parse_jsonl`` stops at it, and
-    either rule on one side of the resync would leave an entry counted in one view and missing
-    from another. A fused line would hide the entry torn into it, or the entries after it,
-    and a partition that is a number or ``null`` would reach a string method as a traceback.
-    So the resync refuses and names the line, and the repair is fixing it by hand.
+    either rule in a tail would leave an entry counted in one view and missing from another.
+    A fused line would hide the entry torn into it, or the entries after it, and a partition
+    that is a number or ``null`` would reach a string method as a traceback. So the resync
+    refuses and names the line, and the repair is fixing it by hand.
+
+    The shared bytes are read by :func:`_entries` instead. They are the same on both sides, so
+    a damaged line there hides the same entries from both hosts. Refusing on one would block
+    every resync, since only ``first-upload`` can repair the bucket's copy, and it refuses
+    while the bucket holds entries this lake never recorded.
     """
     entries: list[dict] = []
     lines = raw.split(b"\n")
@@ -3368,6 +3374,7 @@ class _ResyncPlan:
     keep: int
     downloads: Mapping[str, str]
     summary: ResyncSummary
+    entries: int = 0
 
 
 def _plan_resync(
@@ -3411,25 +3418,16 @@ def _plan_resync(
             f"may be uploading now. Run the resync again once that upload ends: {target}"
         )
 
-    # Both manifests are read once, by one rule, and every view below comes from that read.
-    def parsed(raw: bytes, where: str, suffix: str) -> list[dict]:
-        try:
-            return _whole_entries(raw)
-        except _DamagedLine as damaged:
-            raise refuse(
-                f"line {damaged.number} of {where} is not a whole entry naming a partition, so "
-                "the two manifests cannot be compared and the resync changed nothing. Repair "
-                f"that line by hand, then run the resync again{suffix}"
-            ) from None
-
-    bucket_entries = parsed(bucket_raw, "the bucket's manifest.jsonl", f": {target}")
-    parsed(lake_raw, str(manifest_path(root)), "")
-    if not bucket_entries:
+    # The bytes both manifests share are the same on both sides, so damage there hides the same
+    # entries from both hosts, and they are read leniently by ``_entries``. A refusal there
+    # would block every resync, since only ``first-upload`` can repair the bucket's copy and
+    # it refuses while the bucket holds entries this lake never recorded. Each side's tail is
+    # read strictly by ``_whole_entries``, so every view of the tails comes from one parse.
+    if not _entries(bucket_raw):
         raise refuse(
             f"the bucket's manifest.jsonl of {len(bucket_raw)} byte(s) carries no whole entry, "
             f"so --target may name the wrong bucket or prefix: {target}"
         )
-    bucket_latest = {entry["partition"]: entry for entry in bucket_entries}
 
     # Step 3, the classification.
     if lake_raw.startswith(bucket_raw):
@@ -3441,14 +3439,28 @@ def _plan_resync(
         # resync only appends, and a torn last line of the lake's is cut back first.
         keep = lake_raw.rfind(b"\n") + 1
     else:
-        split = _divergence(bucket_raw, lake_raw, _whole_entries)
-        if not split.foreign:
+        keep = _shared_bytes(bucket_raw, lake_raw)
+
+    def tail(raw: bytes, where: str, suffix: str) -> list[dict]:
+        try:
+            return _whole_entries(raw[keep:])
+        except _DamagedLine as damaged:
+            number = raw.count(b"\n", 0, keep) + damaged.number
             raise refuse(
-                "the bucket's manifest.jsonl is not a prefix of the lake's and holds no entry "
-                "this lake never recorded, which is a hand repair, and a resync would revert "
-                f"it, so the resync changed nothing. Run {FIRST_UPLOAD_COMMAND} by hand: {target}"
-            )
-        keep = split.shared_bytes
+                f"line {number} of {where} is not a whole entry naming a partition, so the "
+                "two manifests cannot be compared and the resync changed nothing. Repair that "
+                f"line by hand, then run the resync again{suffix}"
+            ) from None
+
+    bucket_tail = tail(bucket_raw, "the bucket's manifest.jsonl", f": {target}")
+    lake_tail = tail(lake_raw, str(manifest_path(root)), "")
+    shared = _entries(lake_raw[:keep])
+    if not bucket_raw.startswith(lake_raw) and not _foreign(bucket_tail, shared + lake_tail):
+        raise refuse(
+            "the bucket's manifest.jsonl is not a prefix of the lake's and holds no entry "
+            "this lake never recorded, which is a hand repair, and a resync would revert "
+            f"it, so the resync changed nothing. Run {FIRST_UPLOAD_COMMAND} by hand: {target}"
+        )
     if keep == 0:
         # The commit cuts the manifest back to the shared bytes before it appends the
         # bucket's tail. With none shared, a crash between the two would leave an empty
@@ -3459,9 +3471,11 @@ def _plan_resync(
             "would leave a manifest no run accepts. The resync changed nothing. Repair the "
             f"damaged first line by hand, then run the resync again: {target}"
         )
-    bucket_tail = _whole_entries(bucket_raw[keep:])
-    lake_tail = _whole_entries(lake_raw[keep:])
-    summary.shared = len(_whole_entries(lake_raw[:keep]))
+    # A path's latest entry in the bucket's copy is its latest in the bucket's tail, else its
+    # latest in the shared bytes.
+    bucket_entries = shared + bucket_tail
+    bucket_latest = {entry["partition"]: entry for entry in bucket_entries}
+    summary.shared = len(shared)
     summary.bucket_tail = len(bucket_tail)
     summary.bucket_first = bucket_tail[0]["partition"] if bucket_tail else None
     summary.lake_tail = len(lake_tail)
@@ -3516,6 +3530,18 @@ def _plan_resync(
         sha = str(entry.get("sha256"))
         if held(rel) != sha:
             downloads[rel] = sha
+    # A directory, or anything else that is not a regular file, where a download lands would
+    # fail the rename at the commit, after the renames before it had landed, and every run
+    # after would fail there too.
+    blocked = [
+        rel for rel in downloads if os.path.lexists(root / rel) and not (root / rel).is_file()
+    ]
+    if blocked:
+        raise refuse(
+            f"the resync would download {_quoted(blocked)} where this lake holds something "
+            "that is not a regular file, such as a directory, so the resync changed nothing. "
+            "Move it out of the lake by hand, then run the resync again"
+        )
     if trimmed_here:
         raise refuse(
             f"the bucket's {TRIMMED_FILE} says {_quoted(trimmed_here)} was removed on purpose, "
@@ -3663,7 +3689,9 @@ def _plan_resync(
             continue
         if size != listing[rel]:
             summary.unrecorded.append(rel)
-    return _ResyncPlan(lake_raw, copy, bucket_raw, keep, downloads, summary)
+    return _ResyncPlan(
+        lake_raw, copy, bucket_raw, keep, downloads, summary, entries=len(bucket_entries)
+    )
 
 
 # Whether a scheduled job's process is executing, by its label. ``control_plane`` holds the
@@ -3751,9 +3779,11 @@ def resync(
        probe, since it writes nothing and takes no lock, so a classification can be read while
        the daemon is up. The Sunday scrub window, and ``session_bound``.
     2. Read: the bucket's copy B, with the HEAD-then-GET read :func:`_read_bucket_manifest`
-       makes, and the lake's L. Both are parsed once by :func:`_whole_entries`, and a line in
-       either that is not a whole entry, other than a torn last line, refuses and names its
-       line number and its manifest.
+       makes, and the lake's L. The lines both share are read by :func:`_entries`, which
+       steps over a damaged line. Each side's tail is read by :func:`_whole_entries`, and a
+       line there that is not a whole entry, other than a torn last line, refuses and names
+       its line number and its manifest. A path's latest entry in B is its latest in B's
+       tail, else its latest in the shared lines.
     3. Classify: an absent B, or one with no whole entry, refuses and names the target. B
        equal to L, or a prefix of it, is level and has nothing to do. L a byte prefix of B
        only appends. Otherwise the test :func:`bucket_divergence` applies decides: entries
@@ -3765,8 +3795,9 @@ def resync(
        with that sha is skipped, and one that differs or is absent is downloaded. A segment
        whose compacted partition B records is skipped, and so is a designed absence judged
        against B's own ``trimmed.jsonl``, read by :func:`read_bucket_trimmed`. A designed
-       absence this lake holds a file for refuses. A path only this lake's tail names is
-       judged in step 5. Every path passes the restore's safety checks first.
+       absence this lake holds a file for refuses, and so does a download whose path holds
+       something that is not a regular file, such as a directory. A path only this lake's
+       tail names is judged in step 5. Every path passes the restore's safety checks first.
     5. Refusals on this lake's tail. A file only this lake's tail names, on disk and outside
        step 6's list, refuses whatever its bytes: a chains or quotes partition B does not
        name, or a journal segment no compacted partition and no segment of B covers, may be
@@ -3941,7 +3972,7 @@ def resync(
                 # refusal is the one line the operator needs.
                 pass
     summary.applied = True
-    summary.entries = len(_whole_entries(plan.bucket_raw))
+    summary.entries = plan.entries
     return summary
 
 
