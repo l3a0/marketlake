@@ -214,8 +214,8 @@ def test_each_command_prints_one_line_for_a_refused_assume(tmp_path, monkeypatch
 
 
 def test_the_sunday_job_reports_a_refused_assume_and_runs_on(tmp_path, capsys, monkeypatch):
-    # Without the branch in ``_failure`` the scrub would re-raise, and the job would stop
-    # before the canary.
+    # Without the branch in ``_failure`` the scrub would re-raise, and the Sunday job's guard
+    # would print a traceback and name a scrub that raised rather than the refused role.
     lake, client = _uploaded(tmp_path / "lake")
     client.fail_with = REFUSED
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)

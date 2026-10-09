@@ -1533,10 +1533,10 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     try:
         return _backup_scrub(Path(lake_root), target)
     except OSError as exc:
-        # The one disk in this system built to fail, on a cable a person can pull. Every
-        # other Sunday check runs after this call, so a raise here would cost the run its
-        # canary, its coverage assertion and its re-auth reminder, and report a traceback
-        # instead of the disk. A read that fails is a named finding instead.
+        # The one disk in this system built to fail, on a cable a person can pull. A raise
+        # here would reach the Sunday job's guard, whose line says the backup scrub raised
+        # and sends the operator looking for a bug. A read that fails is a named finding
+        # instead, so the line names the disk and its error, which is where the repair is.
         return BackupScrubResult(target=str(target), unreadable=f"{type(exc).__name__}: {exc}")
 
 

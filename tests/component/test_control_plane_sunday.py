@@ -1596,11 +1596,12 @@ def test_a_torn_trimmed_ledger_is_two_problem_lines_and_never_a_raise(fixture_la
 
 # -- a lake path the scrub cannot read -----------------------------------------------
 
-# Marketlake #441. A path the scrub cannot read is a named finding rather than a raise, because
-# every other Sunday check runs after the scrub. Each finding withholds the ping, is named in
-# ``report`` by its path, and leaves the canary and the coverage assertion running. The cases
-# that come back clean or ``missing`` sit with the scrub's own tests in
-# ``tests/component/test_manifest.py``.
+# Marketlake #441. A path the scrub cannot read is a named finding rather than a raise. A raise
+# would reach the Sunday job's guard, whose line says only that the scrub could not run, while
+# the finding names the path and leaves every other path's answer standing. Each finding
+# withholds the ping, is named in ``report`` by its path, and leaves the canary and the coverage
+# assertion running. The cases that come back clean or ``missing`` sit with the scrub's own
+# tests in ``tests/component/test_manifest.py``.
 
 _no_root_chmod = pytest.mark.skipif(
     os.geteuid() == 0, reason="root reads and lists past every permission bit"
@@ -2037,6 +2038,46 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_path_target(
     assert cp.BACKUP_SCRUB_SKIPPED not in outcome.report
     # Each guard that fired kept the stack trace, so a bug in a scrub is not lost to the line.
     assert _tracebacks_printed(capsys.readouterr().err) == 1 + len(backup_lines)
+    _withheld_and_still_ran(outcome, pinger)
+
+
+class _ScrubBug(Exception):
+    """A bug of a class no named exception tuple covers, so only ``except Exception`` catches it."""
+
+
+def test_a_bug_in_either_scrub_is_a_problem_line_with_its_trace(fixture_lake, monkeypatch, capsys):
+    """The lake and path backup guards catch ``Exception``, not only a damaged manifest's raise.
+
+    ``_ScrubBug`` is a plain bug of a class no tuple names. With either guard narrowed to any
+    tuple of named classes, even one that adds ``AttributeError`` to the ``KeyError`` and
+    ``ManifestError`` the guard comment names, it leaves the Sunday job, and this fails.
+    ``_backup_scrub_raised`` writing an empty ``target`` fails it too, and so does a guard
+    that prints a bare traceback header without the trace below it.
+    """
+    root = _clean_lake(fixture_lake)
+
+    def bug(*args, **kwargs):
+        raise _ScrubBug("a bug in the scrub")
+
+    monkeypatch.setattr(cp, "scrub", bug)
+    monkeypatch.setattr(cp, "backup_scrub", bug)
+
+    outcome, pinger = _run(root)
+
+    assert outcome.scrub is None
+    assert outcome.problems == (
+        "lake scrub could not run: _ScrubBug: a bug in the scrub",
+        "backup could not be read: the backup scrub raised _ScrubBug: a bug in the scrub",
+    )
+    assert outcome.backup.target == str(_backup_of(root))
+    assert outcome.restore is None
+    err = capsys.readouterr().err
+    assert _tracebacks_printed(err) == 2
+    # Each guard printed its own whole trace: one names the lake scrub's call, the other the
+    # backup scrub's, and both reach the line that raised.
+    assert err.count("result = scrub(root)") == 1
+    assert err.count("backup = backup_scrub(root, Path(backup_target))") == 1
+    assert err.count('raise _ScrubBug("a bug in the scrub")') == 2
     _withheld_and_still_ran(outcome, pinger)
 
 

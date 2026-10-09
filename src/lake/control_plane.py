@@ -2355,22 +2355,24 @@ class SundayOutcome:
     ping's failure is different in kind. It is recorded after the others have all
     passed, and it names why the ping did not land rather than why it was not attempted.
 
-    ``report`` carries the report-tier findings, in this order. The first is pmset
-    alarm drift, which the design pins to the nightly report because the pre-open
-    self-check already catches a missed wake an hour before the bell. The second is the
-    path of every file the lake scrub found missing, wrong, unrecorded or unreadable,
-    capped per kind, because its problem line carries counts alone. The third is
-    everything the backup scrub names rather than pages for, or ``BACKUP_SCRUB_SKIPPED``
-    on a shadow host. That covers the path of
-    every file it found wrong, because a count decides whether to ping and only a path
-    says where to look. It also covers an extra file on the copy and a copy behind its
-    lake, neither of which can be lake data going missing. How far behind reads by eye
-    from the partition count, and one run carries no history of the last one. The
-    restore test's own findings ride it the same way, each file it read back wrong and
-    the repair for it. After those come the Time Machine exclusion lines and, last, the
-    title of a daemon page this attempt found owed. The first four are not the order the
-    steps run. They are the order a reader wants: the cheap alarm lines first, then the
-    lake, then its copy.
+    ``report`` carries the report-tier findings, in this order.
+
+    1. pmset alarm drift, which the design pins to the nightly report because the pre-open
+       self-check already catches a missed wake an hour before the bell.
+    2. The path of every file the lake scrub found missing, wrong, unrecorded or
+       unreadable, capped per kind, because its problem line carries counts alone.
+    3. Everything the backup scrub names rather than pages for, or
+       ``BACKUP_SCRUB_SKIPPED`` on a shadow host. That covers the path of every file it
+       found wrong, because a count decides whether to ping and only a path says where to
+       look. It also covers an extra file on the copy and a copy behind its lake, neither
+       of which can be lake data going missing. How far behind reads by eye from the
+       partition count, and one run carries no history of the last one.
+    4. The restore test's own findings, each file it read back wrong and the repair for it.
+    5. The Time Machine exclusion lines.
+    6. The title of a daemon page this attempt found owed.
+
+    The first four are in reader order, not run order. A reader wants the cheap alarm
+    lines first, then the lake, then its copy.
 
     ``scrub`` is the lake scrub's result. It is ``None`` when the scrub did not run,
     because the lake root is missing or because the scrub raised, and a problem line says
@@ -2434,8 +2436,12 @@ def restore_week(now: datetime) -> int:
 def _backup_scrub_raised(target: Path | BucketTarget, exc: Exception) -> BackupScrubResult:
     """The finding for a backup scrub that raised, with its stack trace printed to stderr.
 
-    The words say the scrub raised rather than that the disk failed, because a raise that got
-    past the scrub's own ``except OSError`` is a damaged lake manifest or a bug, never the copy.
+    The line opens with ``BackupScrubResult.problem``'s ``backup could not be read:`` prefix,
+    and the text after it says the backup scrub raised rather than that the disk failed. A
+    raise that got past the path scrub's own ``except OSError`` is a damaged lake manifest or
+    a bug, never the copy. On a bucket target it can also be a fault reading the bucket's
+    copy: a ``urllib3`` error while ``_bucket_scrub`` reads a diverged manifest copy is
+    sorted by ``_failure``, which does not know it, so it arrives here (marketlake #830).
     """
     print(traceback.format_exc(), file=sys.stderr, end="")
     return BackupScrubResult(

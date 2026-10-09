@@ -1,7 +1,8 @@
 """The Sunday scrub of a bucket target, against the fake S3 client.
 
-``bucket.bucket_scrub`` gives the path scrub's findings and its ping rules. The cases
-follow the issue's list, marketlake #639.
+``bucket.bucket_scrub`` gives the path scrub's ping rules, and its findings except
+``not_regular`` and ``target_missing``, which a bucket cannot have. The cases follow the
+issue's list, marketlake #639.
 
 1. The prefix check, which also names where a copy diverged.
 2. The forward pass, by ``HeadObject`` in checksum mode, inside the watermark.
@@ -314,6 +315,22 @@ def test_reports_and_the_journal_are_skipped_by_the_reverse_pass(tmp_path):
     assert bucket_scrub(lake, TARGET, client).orphans == ()
 
 
+def test_lost_and_found_in_the_bucket_is_not_an_orphan(tmp_path):
+    """The reverse pass skips ``SCRUB_EXCLUSIONS``, which includes ``lost+found/``.
+
+    The test above covers only the older entries. Reverting ``SCRUB_EXCLUSIONS`` to its
+    three entries before marketlake #441 names the object under ``lost+found/`` as an
+    orphan, and this fails.
+    """
+    lake, client = _uploaded(tmp_path / "lake")
+    client.store(_key("lost+found/#12345"), b"recovered")
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.orphans == ()
+    assert result.ok and result.notes == ()
+
+
 def test_objects_outside_the_prefix_are_not_the_lakes(tmp_path):
     lake, client = _uploaded(tmp_path / "lake")
     client.store("live-check-20261005T000000Z/probe", b"probe")
@@ -621,6 +638,42 @@ def test_a_damaged_lake_manifest_is_a_problem_line_on_a_bucket_target(
     # The lake guard always fired here, and the bucket guard when the bucket scrub raised.
     # Each kept the stack trace, so a bug in a scrub is not lost to the line.
     assert _tracebacks_printed(capsys.readouterr().err) == 1 + raised
+    assert pinger.urls == []
+    assert outcome.canary_passed and outcome.covered is True
+
+
+class _ScrubBug(Exception):
+    """A bug of a class no named exception tuple covers, so only ``except Exception`` catches it."""
+
+
+def test_a_bug_in_the_bucket_scrub_is_a_problem_line_with_its_trace(tmp_path, monkeypatch, capsys):
+    """The bucket guard catches ``Exception``, not only what a damaged manifest raises.
+
+    ``_ScrubBug`` is a plain bug of a class no tuple names. With the guard narrowed to any
+    tuple of named classes, even one that adds ``AttributeError`` to ``ManifestError``, it
+    leaves the Sunday job, and this fails. So does a guard that prints a bare traceback
+    header without the trace below it.
+    """
+    lake, client = _uploaded(tmp_path / "lake")
+
+    def bug(*args, **kwargs):
+        raise _ScrubBug("a bug in the scrub")
+
+    monkeypatch.setattr(bucket, "bucket_scrub", bug)
+    capsys.readouterr()
+
+    outcome, pinger = _sunday(lake, client)
+
+    assert outcome.problems == (
+        "backup could not be read: the backup scrub raised _ScrubBug: a bug in the scrub",
+    )
+    assert outcome.backup.target == str(TARGET)
+    assert outcome.restore is None
+    err = capsys.readouterr().err
+    assert _tracebacks_printed(err) == 1
+    # The whole trace, from the guarded call down to the line that raised.
+    assert err.count("backup = bucket_scrub(root, backup_target, bucket_client)") == 1
+    assert err.count('raise _ScrubBug("a bug in the scrub")') == 1
     assert pinger.urls == []
     assert outcome.canary_passed and outcome.covered is True
 

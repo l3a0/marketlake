@@ -478,8 +478,13 @@ def _failure(exc: BaseException) -> tuple[str, str] | None:
     the role's credentials first. ``_AssumeRoleFailed`` is STS turning that down, so it
     is *refused* or *unreachable* as ``lake.aws_session`` sorted it where it was caught,
     with the detail ``AssumeRole <code>``. Without this branch every caller would re-raise
-    it, and the Sunday job's guard would name it only as a scrub that raised, rather than as
-    the refusal or the outage it is. The guard still withholds the ping either way.
+    it, with two results on the Sunday job.
+
+    1. The guard on the bucket scrub would name it only as a scrub that raised, rather than
+       as the refusal or the outage it is. That guard still withholds the ping.
+    2. The same refusal during the restore read through ``bucket_reader`` would raise out
+       of the Sunday job before its canary. That read's only catch is ``restore_check``'s
+       ``except OSError``, and ``_AssumeRoleFailed`` is not an ``OSError``.
     """
     from botocore.exceptions import BotoCoreError, ClientError
 
@@ -1238,7 +1243,11 @@ def first_upload(
 def bucket_scrub(lake_root: Path, target: BucketTarget, client: Any) -> BackupScrubResult:
     """Scrub the bucket against the lake's manifest. Read-only on both sides.
 
-    The same findings and the same ping rules as ``manifest.backup_scrub``.
+    The same ping rules as ``manifest.backup_scrub``, and its findings with two exceptions.
+
+    1. ``not_regular`` is never set, because an object is never a FIFO or a directory.
+    2. ``target_missing`` is never set. A bucket that refuses or cannot be reached plays
+       that part, as item 4 below says.
 
     1. The prefix check is :func:`read_copy_state`. A copy that is not a prefix is
        downloaded once, only then, to name the byte where it diverged.

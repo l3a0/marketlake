@@ -1274,7 +1274,7 @@ def test_the_backup_canary_still_answers_on_a_manifest_every_other_reader_refuse
 
     ``backup_scrub`` is the Sunday check on the removable disk, and it reads the manifest's bytes
     itself and decodes them with a replacement rather than through ``_read_jsonl``. A refusal
-    reaching it would cost the run its canary over the damage the canary exists to report.
+    reaching it would cost the run its backup scrub over the damage that scrub exists to report.
 
     This is what makes routing ``_backup_scrub`` through the refusal a decision rather than a
     tidy-up somebody does on the way past.
