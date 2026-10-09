@@ -1428,10 +1428,15 @@ def test_a_listing_and_a_walk_of_the_same_tree_agree_day_by_day(tmp_path: Path):
     The listing is fed the tree's allocated sizes, the walk's own unit, so any disagreement is a
     difference in the rule rather than in the bytes. It also carries the two keys a listing has
     and a walk skips: the S3 console's folder marker, and a file under a root ``lost+found``.
+    The two also agree on the oldest chains session. Mutation this catches: ``listing_usage``
+    leaving ``oldest_chains`` at its default, which reads as a bucket with no chains partition.
     """
     for rel, size in (
         ("chains/ticker=SPY/date=2026-09-14.parquet", 5000),
+        ("chains/ticker=SPY/date=2026-09-15.parquet", 5000),
+        ("chains/ticker=QQQ/date=2026-09-15.parquet", 5000),
         ("quotes/ticker=SPY/date=2026-09-14.parquet", 300),
+        ("quotes/ticker=QQQ/date=2026-09-13.parquet", 300),
         ("bars/ticker=SPY/freq=1d/date=2026-09-15.parquet", 200),
         ("journal/date=2026-09-15/surface=chains/ticker=QQQ/seg-a.arrows", 9000),
         ("journal/timing/date=2026-09-15.jsonl", 100),
@@ -1452,7 +1457,12 @@ def test_a_listing_and_a_walk_of_the_same_tree_agree_day_by_day(tmp_path: Path):
     read = runway.listing_usage(listing)
 
     assert set(read.day_bytes) == set(usage.day_bytes)
-    assert set(usage.day_bytes) == {date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16)}
+    assert set(usage.day_bytes) == {
+        date(2026, 9, 13),
+        date(2026, 9, 14),
+        date(2026, 9, 15),
+        date(2026, 9, 16),
+    }
     for day in usage.day_bytes:
         assert read.sealed_bytes(day) == usage.sealed_bytes(day)
     assert read.day_bytes == usage.day_bytes
@@ -1461,6 +1471,9 @@ def test_a_listing_and_a_walk_of_the_same_tree_agree_day_by_day(tmp_path: Path):
     assert (read.dated, read.undated, read.files) == (usage.dated, usage.undated, usage.files)
     assert read.entries == usage.entries
     assert (read.refused, read.refusals) == (0, ())
+    # A quotes day older than every chains day, so the answer cannot come from ``day_bytes``.
+    assert read.oldest_chains == usage.oldest_chains
+    assert usage.oldest_chains == runway.OldestChains(day=date(2026, 9, 14), tickers=("SPY",))
 
 
 def test_a_listing_whose_newest_day_is_forty_days_old_still_has_a_busiest_day():

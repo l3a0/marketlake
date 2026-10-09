@@ -15,6 +15,7 @@ partitions of 2026-07-20 and 2026-07-21 are past it.
 from __future__ import annotations
 
 import errno
+import hashlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -23,11 +24,12 @@ import pytest
 from lake import bucket
 from lake import compact as compact_module
 from lake.alert import Publisher
-from lake.bucket import BucketBackup, first_upload
+from lake.bucket import BucketBackup, first_upload, nightly_upload, restore_lake
 from lake.calendar import MARKET_TZ
 from lake.compact import TRIM_ROT_EVENT, TRIM_ROT_TITLE, compact
 from lake.config import BucketTarget
 from lake.lock import lake_lock
+from lake.manifest import latest_entries
 from lake.trimmed import append_trimmed, restore_line, trimmed_path
 from tests.component.test_compaction import _chains, _segment, _snap
 from tests.component.test_trim import _checkpoint
@@ -596,3 +598,54 @@ def test_an_unlink_refusal_on_one_ticker_leaves_the_other_trimmed(lake_root, mon
     assert list(result.trim.trimmed) == [_rel("SPY", day) for day in OLD]
     assert result.trim.held and result.trim.held[0].startswith("chains/ticker=QQQ/")
     assert (lake_root / target).exists()
+
+
+# -- the trim feeds the rebuild ---------------------------------------------------------
+
+
+def _chains_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted((root / "chains").rglob("*.parquet"))
+    }
+
+
+def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake_root, tmp_path):
+    """The trim's own ledger lines, uploaded the next night, drive marketlake #785's rebuild.
+
+    The rebuild tests in ``tests/component/test_bucket_rebuild.py`` trim with a stand-in, so
+    this is the one run of the real trim into the real restore. Mutation this catches: a trim
+    line the rebuild's exclusion does not read as a designed absence, such as one recording the
+    wrong sha or the wrong partition, which would bring every trimmed partition back.
+    """
+    tickers = ("QQQ", "SPY")
+    client = _lake(lake_root, tickers=tickers)
+    result = _job(lake_root, client, [])
+    assert result.trim is not None
+    gone = {_rel(ticker, day) for ticker in tickers for day in OLD}
+    assert set(result.trim.trimmed) == gone
+    with lake_lock(lake_root):
+        nightly_upload(
+            lake_root,
+            TARGET,
+            client=client,
+            clock=ManualClock(_et(TONIGHT, 19, 0)),
+            calendar=CALENDAR,
+        )
+    kept = _chains_files(lake_root)
+    assert kept and not gone & set(kept)
+
+    windowed = restore_lake(
+        tmp_path / "windowed", TARGET, client=client, skip_designed_absences=True
+    )
+    whole = restore_lake(tmp_path / "whole", TARGET, client=client)
+
+    assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
+    assert windowed.trimmed_left_out == len(gone)
+    assert _chains_files(tmp_path / "windowed") == kept
+    assert (whole.restored, whole.failures) == (True, [])
+    restored = _chains_files(tmp_path / "whole")
+    assert set(restored) == set(kept) | gone
+    entries = latest_entries(lake_root)
+    for rel in gone:
+        assert hashlib.sha256(restored[rel]).hexdigest() == entries[rel]["sha256"]

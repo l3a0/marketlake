@@ -1,6 +1,6 @@
 """The disk runway: what the lake holds, how fast it grows, and how long the disk lasts.
 
-Four consumers read this module and it is deliberately a leaf, importing only the standard
+Five consumers read this module and it is deliberately a leaf, importing only the standard
 library, :mod:`lake.calendar` and :mod:`lake.paths`.
 
 1. The dashboard's Lake panel renders what it returns.
@@ -12,6 +12,9 @@ library, :mod:`lake.calendar` and :mod:`lake.paths`.
 4. The ``restore`` command in :mod:`lake.bucket` refuses the same way on the directory it
    fills, with the busiest sealed day read off the bucket's listing by
    :func:`listing_busiest_sealed_day` (marketlake #785).
+5. :mod:`lake.window` reads :data:`GROWTH_WINDOW_DAYS` to derive the smallest window a host
+   may keep, because :func:`assess` reads the busiest day over that many calendar days
+   (marketlake #786).
 
 One computation with several consumers is the point: independent ones would drift, and a
 panel and an alarm disagreeing about how long the disk lasts is worse than either being
@@ -226,6 +229,32 @@ class OldestChains:
     tickers: tuple[str, ...]
 
 
+class _OldestChainsSeen:
+    """The oldest chains session among the paths seen so far, for :func:`walk` and
+    :func:`listing_usage` alike, so the two read it by one rule.
+
+    Each path is read with ``paths.parse_partition_rel``, and only a chains partition counts.
+    """
+
+    def __init__(self) -> None:
+        self.day: date | None = None
+        self.tickers: set[str] = set()
+
+    def see(self, parts: Sequence[str]) -> None:
+        ref = parse_partition_rel("/".join(parts)) if parts[0] == CHAINS else None
+        if ref is None or ref.surface != CHAINS:
+            return
+        if self.day is None or ref.day < self.day:
+            self.day, self.tickers = ref.day, {ref.ticker}
+        elif ref.day == self.day:
+            self.tickers.add(ref.ticker)
+
+    def result(self) -> OldestChains | None:
+        if self.day is None:
+            return None
+        return OldestChains(day=self.day, tickers=tuple(sorted(self.tickers)))
+
+
 @dataclass(frozen=True)
 class Usage:
     """One read of the lake tree: what it holds, when it arrived, and what refused.
@@ -434,8 +463,7 @@ def walk(lake_root: Path | str) -> Usage:
     journal_bytes: dict[date, int] = {}
     dated = undated = files = refused = 0
     refusals: list[str] = []
-    oldest_day: date | None = None
-    oldest_tickers: set[str] = set()
+    oldest = _OldestChainsSeen()
 
     def refuse(where: object, exc: OSError) -> None:
         """Name a refused path relative to the lake root, never absolutely.
@@ -502,12 +530,7 @@ def walk(lake_root: Path | str) -> Usage:
             entry = parts[0]
             entry_bytes[entry] = entry_bytes.get(entry, 0) + size
             entry_files[entry] = entry_files.get(entry, 0) + 1
-            ref = parse_partition_rel("/".join(parts)) if entry == CHAINS else None
-            if ref is not None and ref.surface == CHAINS:
-                if oldest_day is None or ref.day < oldest_day:
-                    oldest_day, oldest_tickers = ref.day, {ref.ticker}
-                elif ref.day == oldest_day:
-                    oldest_tickers.add(ref.ticker)
+            oldest.see(parts)
             day, segment = path_day(parts)
             if day is None:
                 undated += size
@@ -532,11 +555,7 @@ def walk(lake_root: Path | str) -> Usage:
         files=files,
         refusals=tuple(refusals),
         refused=refused,
-        oldest_chains=(
-            None
-            if oldest_day is None
-            else OldestChains(day=oldest_day, tickers=tuple(sorted(oldest_tickers)))
-        ),
+        oldest_chains=oldest.result(),
     )
 
 
@@ -622,6 +641,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
     unsealed: set[date] = set()
     journal_bytes: dict[date, int] = {}
     dated = undated = files = 0
+    oldest = _OldestChainsSeen()
     for key, size in listing.items():
         if key.endswith("/") and size == 0:
             continue
@@ -632,6 +652,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
         entry = parts[0]
         entry_bytes[entry] = entry_bytes.get(entry, 0) + size
         entry_files[entry] = entry_files.get(entry, 0) + 1
+        oldest.see(parts)
         day, segment = path_day(parts)
         if day is None:
             undated += size
@@ -654,6 +675,7 @@ def listing_usage(listing: Mapping[str, int]) -> Usage:
         files=files,
         refusals=(),
         refused=0,
+        oldest_chains=oldest.result(),
     )
 
 

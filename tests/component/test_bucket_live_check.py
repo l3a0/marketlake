@@ -91,6 +91,38 @@ def test_a_bucket_without_versions_fails_behavior_three():
     assert any(line.startswith("live-check: FAIL 3 ") for line in lines)
 
 
+class _FirstPutUnversioned(FakeS3):
+    """A bucket whose first PUT to a key names no version and whose later PUTs name one.
+
+    That is what a bucket that turned versioning on between the two PUTs answers. The two ids
+    differ, so only ``usable_version_id`` tells the first one names nothing.
+    """
+
+    def __init__(self, first: str | None):
+        super().__init__()
+        self.first = first
+        self.seen: set[str] = set()
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        if kwargs["Key"] in self.seen:
+            return response
+        self.seen.add(kwargs["Key"])
+        response = {key: value for key, value in response.items() if key != "VersionId"}
+        if self.first is not None:
+            response["VersionId"] = self.first
+        return response
+
+
+@pytest.mark.parametrize("first", ["null", "NULL", "", None], ids=["null", "NULL", "empty", "none"])
+def test_two_puts_whose_first_id_names_no_version_fail_behavior_three(first):
+    """Mutation this catches: behavior three judging two ids distinct by ``!=`` alone rather
+    than through ``bucket.usable_version_id``, which the trim judges a version by too."""
+    passed, lines = _run(_FirstPutUnversioned(first))
+    assert not passed
+    assert any(line.startswith("live-check: FAIL 3 two PUTs to one key") for line in lines)
+
+
 class _DeniesMismatch(FakeS3):
     """A key whose policy turns away the probe that sends a mismatched checksum."""
 
@@ -317,6 +349,35 @@ def test_an_id_that_names_no_version_fails_grant_seven_even_when_the_put_named_i
     passed, lines = _run(_NamesOneId(version))
     assert not passed
     assert any(line.startswith("live-check: FAIL 7 GetObject") for line in lines)
+
+
+class _NamesNoSecondVersion(FakeS3):
+    """The second PUT to a key answers an id that names no version, unlike the first."""
+
+    def __init__(self, version_id: str) -> None:
+        super().__init__()
+        self.fixed = version_id
+        self.puts: dict[str, int] = {}
+
+    def put_object(self, **kwargs):
+        response = super().put_object(**kwargs)
+        count = self.puts[kwargs["Key"]] = self.puts.get(kwargs["Key"], 0) + 1
+        if count > 1:
+            response["VersionId"] = self.fixed
+        return response
+
+
+@pytest.mark.parametrize("version", ["NULL", "Null", "  "])
+def test_a_second_put_naming_no_version_fails_behavior_three(version):
+    """Mutation this catches: behavior three judging the ids by anything but
+    ``bucket.usable_version_id``. The earlier check, ``old_id != "null"`` on the first id alone,
+    passed a first id of ``v1`` and a second of ``NULL``."""
+    passed, lines = _run(_NamesNoSecondVersion(version))
+    assert not passed
+    assert any(
+        line.startswith("live-check: FAIL 3 two PUTs to one key returned versions v1 and")
+        for line in lines
+    )
 
 
 @pytest.mark.parametrize(
