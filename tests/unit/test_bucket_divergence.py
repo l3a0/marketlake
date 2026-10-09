@@ -87,11 +87,15 @@ def test_another_hosts_entry_fused_onto_a_torn_fragment_reads_as_foreign():
     assert (split.bucket_tail, split.bucket_first) == (1, VM)
 
 
-def test_a_fragment_holding_an_object_of_its_own_still_gives_up_the_entry_after_it():
-    # The first brace after the fragment's start opens its own nested object, whose suffix
-    # does not parse, so the entry is found only by trying the braces after it.
-    fragment = b'{"fetched_at": {"nested": 1}, "parti'
-
+@pytest.mark.parametrize(
+    "fragment",
+    [b'{"fetched_at": {"nested": 1}, "parti', b'{"fetched_at": {'],
+    ids=["nested-object", "torn-after-a-brace"],
+)
+def test_a_fragment_holding_a_brace_of_its_own_still_gives_up_the_entry_after_it(fragment):
+    # The first brace after the fragment's start is the fragment's own, and its suffix does
+    # not parse, so the entry is found only by trying every brace after it. In the second
+    # case the entry's brace is the very next byte.
     split = bucket_divergence(A + fragment + _line(VM, "f" * 64), A + _line(LAPTOP))
 
     assert _foreign(split) == [(VM, "f" * 64)]
