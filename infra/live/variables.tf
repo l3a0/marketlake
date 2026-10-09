@@ -94,9 +94,9 @@ variable "root_volume_gib" {
 }
 
 variable "lake_volume_gib" {
-  # From a 7.9 GB lake growing 0.58 GB a night, 30 GiB holds roughly 40 more sessions,
-  # derived rather than measured. A larger size modifies the volume in place, and the
-  # bootstrap's resize2fs grows the filesystem to match.
+  # docs/design.md's paragraph "The lake lives on its own EBS volume" says what this volume
+  # has to fit. A larger size modifies the volume in place, and the bootstrap's resize2fs
+  # grows the filesystem to match.
   description = "The lake volume's size, in GiB."
   type        = number
   default     = 30
