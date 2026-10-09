@@ -36,13 +36,14 @@ variables {
   ssh_public_key     = "ssh-ed25519 AAAAexamplenotakey"
 }
 
-run "instance_s3_write_half_is_off_by_default" {
+run "instance_s3_write_half_is_on_by_default" {
   command = plan
 
-  # #638's cutover pull request flips the default and inverts this assert.
+  # #638's cutover flipped the default, because the VM is now the primary. The way back
+  # turns it off again, and inverts this assert.
   assert {
-    condition     = length(aws_iam_role_policy.instance_s3) == 0
-    error_message = "marketlake-instance has S3 write access by default. It would be a write credential on a shadow host."
+    condition     = length(aws_iam_role_policy.instance_s3) == 1
+    error_message = "marketlake-instance has no S3 write access by default, so the primary VM's nightly upload would be refused."
   }
 
   # The read half is compared whole, so a write action moved into it fails here even
@@ -226,9 +227,9 @@ run "backup_role_gets_the_four_actions" {
   }
 }
 
-# No variable is set, so instance_s3_enabled keeps its default of false. The VM reads
-# its config on the shadow day, before the cutover turns the S3 write half on, and a
-# count on this policy would make the unindexed references below fail.
+# No variable is set, so instance_s3_enabled keeps its default. The config read is
+# always on, whatever the write half's setting, and a count on this policy would make the
+# unindexed references below fail.
 run "instance_reads_exactly_the_config_parameters" {
   command = plan
 

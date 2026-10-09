@@ -2,8 +2,9 @@
 # marketlake-backup role in command.tf, which are the ones src/lake/bucket.py calls:
 # PutObject, GetObject (which also authorises HEAD), ListBucket and GetBucketVersioning.
 # They are split across two policies, a read half that is always on and a write half,
-# PutObject alone, that stays off until #638's cutover. Nothing deletes a version or
-# reads an old one. The instance role also reads the config parameters.
+# PutObject alone, that is on while the VM is the primary, since #638's cutover, and off
+# while it is a shadow. Nothing deletes a version or reads an old one. The instance role
+# also reads the config parameters.
 
 # -- the instance role --------------------------------------------------------------
 
@@ -34,9 +35,9 @@ resource "aws_iam_role_policy_attachment" "instance_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# The write half, off until #638's cutover. On a shadow host, a role with s3:PutObject
-# would be a write credential to the primary's bucket that only the code's
-# `role: shadow` refusal declines to use. It keeps the address and the policy name it
+# The write half, on since #638's cutover made the VM the primary. On a shadow host, a
+# role with s3:PutObject would be a write credential to the primary's bucket that only
+# the code's `role: shadow` refusal declines to use, so the way back turns it off. It keeps the address and the policy name it
 # had before the split (#686).
 resource "aws_iam_role_policy" "instance_s3" {
   count = var.instance_s3_enabled ? 1 : 0
@@ -87,7 +88,7 @@ resource "aws_iam_instance_profile" "instance" {
 
 # The VM's config.yaml secrets and the Schwab token, as SecureString parameters (#699).
 # This is not a statement in either S3 half, for two reasons. The write half is off
-# until the cutover, and the VM needs its config on the shadow day. And each half is
+# whenever the VM is a shadow, and the VM needs its config then too. And each half is
 # tested as exactly its own S3 actions. AmazonSSMManagedInstanceCore, which #695
 # attaches to the same role, allows both actions on every parameter, so it sets the
 # role's real read scope. This grant keeps the read from depending on that managed
