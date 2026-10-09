@@ -258,11 +258,58 @@ in progress that nothing else announces, such as the worktree above.
 
 ## 3. Update the build board
 
-The board is the artifact at
-`https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw`. It cannot read the disk or
-poll GitHub, so every figure on it was measured by a session and written by
-hand. A round that changes what the board should show and leaves without
-writing has made it wrong, and nothing else notices.
+The board is a claude.ai artifact. Its URL lives in a file on this machine
+rather than in the repository, so switching to another board needs no commit.
+Read it before anything else in this step.
+
+```bash
+d="${MARKETLAKE_CONFIG_DIR:-$HOME/.config/marketlake}"; d="${d/#\~/$HOME}"
+tr -d '\r' < "$d/board-url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'
+```
+
+The first line names the config directory the way `lake.paths.config_dir`
+resolves it. That is `MARKETLAKE_CONFIG_DIR` when it is set and not empty, with
+a leading `~` read as this user's home, and `~/.config/marketlake` otherwise.
+The same lines work in bash and zsh. The second line drops carriage returns,
+spaces around the URL, and blank lines, so a file saved by any editor reads the
+same.
+
+The file is usable when the second line prints exactly one line. Every
+`<board url>` below stands for that line. The round only reads this file. Like
+everything else in that directory, it is the owner's to write, per
+`CLAUDE.md`.
+
+When the file is missing, prints nothing, or prints more than one line, skip
+this step. Do not guess a URL, do not pick one of several, and do not reuse one
+from an earlier report or round. Tell the owner that the board was not updated,
+and that the fix is that file holding the board's URL on one line. Steps 1, 2
+and 4 still run. Step 4 then reads the open pull requests, their checks and
+their review markers straight from GitHub, as "The document's shape" describes
+for `prs`, and ranks from `CLAUDE.md`'s directive. It reports that it had no
+`working` or `planned` entries to read.
+
+The board cannot read the disk or poll GitHub, so every figure on it was
+measured by a session and written by hand. A round that changes what the board
+should show and leaves without writing has made it wrong, and nothing else
+notices.
+
+### Switching to another board
+
+To move the round to another board, the owner writes the new board's URL into
+that file in place of the old one. A board belongs to one claude.ai account,
+and a machine signed in to a different account cannot write it. That is why a
+machine may need a board of its own.
+
+The new board must already exist as an artifact published from `main`'s
+`board.html` with the `db` capability, passed as `capabilities: {"db": {}}` on
+its first publish. A round never adds it. Step 6 of "Publish from main" leaves
+`capabilities` out of the call, which keeps whatever the artifact already has,
+and a page without `db` shows only the banner saying it cannot reach the live
+board.
+
+A new board's database holds no document, so the next round builds one, per "A
+board with no document yet" below. That round also finds no `state.page`, so
+it publishes the page from `main`, per "Record what is live".
 
 ### Read, edit, and write one document
 
@@ -271,7 +318,7 @@ redraws on every write. Read it into a scratch directory rather than the repo,
 because nothing read here belongs in a commit.
 
 ```text
-ArtifactData action="get" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+ArtifactData action="get" url="<board url>"
              collection="board" doc_id="data" out_dir="<scratch>/readback"
 ```
 
@@ -280,7 +327,7 @@ That saves `readback/board/data.json`, and the result names the document's
 pinned to that version.
 
 ```text
-ArtifactData action="set" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+ArtifactData action="set" url="<board url>"
              collection="board" doc_id="data"
              file_path="<scratch>/readback/board/data.json" if_version=<read version>
 ```
@@ -382,6 +429,44 @@ The page filters cards by milestone, with a selector that defaults to "MVP 2".
 So a card's milestone comes only from `tracker`, and an issue missing from
 `tracker` never draws, whatever `next` or `prs` say about it.
 
+### A board with no document yet
+
+A board's database starts empty, so the first round against a new board finds
+no `data` document to read. There is nothing to edit, so the round builds the
+whole document from the tracker and creates it.
+
+- `schema` is `1`, as "The document's shape" above lists.
+- `tracker`, `prs` and `state.issues` come from GitHub exactly as a usual
+  round's do, with `--limit 1000` on every list.
+- `next` ranks the current MVP milestone's open issues, per `CLAUDE.md`'s
+  ranking directive, plus the bugs that directive never defers.
+- `state.main` and `state.updatedAt` take the fetched head and the time of the
+  write.
+- `state.lake` and `state.suite` must exist for `usable()`, and the page draws
+  neither. Write `{}` for each unless the round measured their figures.
+- `state.deployed` and `state.page` stay out. The page reads neither.
+  `state.deployed` waits for the owner to name the commit their last restart
+  ran, and `state.page` is written after the publish below.
+- `working`, `planned` and `untracked` start as `[]`. Their entries came from
+  other sessions, and the tracker cannot rebuild them. Say so in the report, so
+  a session still building or planning adds its own entry back. Step 4 then
+  has no `working` or `planned` entries to read, and reports that.
+
+Write it with `set` and no `if_version`, because the pin applies only to a
+document that already exists.
+
+```text
+ArtifactData action="set" url="<board url>"
+             collection="board" doc_id="data"
+             file_path="<scratch>/readback/board/data.json"
+```
+
+This cannot overwrite another session's board. The tool refuses a write
+without `if_version` to a document that already exists, so if another session
+created it first, read it and edit it as usual. The result names the new
+document's `version`, which the `state.page` write below pins to. The page is
+published next, because `state.page` is missing, per "Record what is live".
+
 ### What a round usually changes
 
 - `prs` takes each open pull request's checks at its current head and its
@@ -399,7 +484,7 @@ So a card's milestone comes only from `tracker`, and an issue missing from
   scope should not hide a finished pull request. Ask whoever added an entry
   before calling it stale.
 - The round compares `state.page` with `main` and publishes the page when they
-  differ, per "Record what is live" below.
+  differ or `state.page` is missing, per "Record what is live" below.
 
 Pass `--limit 1000` to every `gh` list command that feeds the board, because
 `gh` stops at its limit without a warning and its default is 30. A cut list
@@ -417,8 +502,8 @@ look at the page and confirm every card this round added or moved.
    captured minute and bugs in an alarm carry no milestone. Their cards often
    rank first in `next`, and they never draw under the default.
 2. **View the page in a browser.** The `Artifact` tool's `open` action shows
-   the page to the owner and shows the session nothing. Open the page in a
-   browser signed in to claude.ai, through Claude in Chrome, and read a
+   the page to the owner and shows the session nothing. Open `<board url>` in
+   a browser signed in to claude.ai, through Claude in Chrome, and read a
    screenshot. Text extraction cannot read the page, because it renders inside
    a frame.
 
@@ -499,7 +584,7 @@ document's shape" above.
    the page's database access and its runtime version as they are.
 
 ```text
-Artifact action="publish" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+Artifact action="publish" url="<board url>"
          file_path="<scratch>/board.html" label="<short sha>"
 ```
 
@@ -532,13 +617,15 @@ touched the page's source, which
 `git log -1 --format=%H origin/main -- .claude/skills/sync-prune-next/board.html`
 prints. Write it with an `update` pinned to the document's current version,
 which the round's last read or write names. Its `data` carries `state` exactly
-as read, with only `page` set. Sending the whole `state` keeps the write
+as last read or written, with only `page` set. On a new board, nothing was
+read, so that is the `state` the round's own `set` wrote. Sending the whole `state` keeps the write
 correct whether `update` merges nested fields or replaces the `state` object.
 
 ```text
-ArtifactData action="update" url="https://claude.ai/artifact/83eeHmHAA19A6hy8kKGJBw"
+ArtifactData action="update" url="<board url>"
              collection="board" doc_id="data"
-             data={"state": {<state as read>, "page": "<full sha>"}} if_version=<read version>
+             data={"state": {<state as last read or written>, "page": "<full sha>"}}
+             if_version=<last version>
 ```
 
 Each sync round compares `state.page` with what that `git log` command prints
