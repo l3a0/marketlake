@@ -226,9 +226,10 @@ two steps change as follows.
    Run `first-upload` only on the host whose lake the bucket should hold, because it
    replaces the bucket's `manifest.jsonl`. It refuses when some path's latest entry in the
    bucket's copy is one this lake never recorded, such as the other host's sessions after
-   a switch, since replacing the copy would drop them from the bucket's record. Run
-   `live-check` in the same order, after the IAM role's write half is turned on, since the
-   check writes probe objects.
+   a switch, since replacing the copy would drop them from the bucket's record. After a
+   switch, `resync`, command 5 below, brings the lake level instead. Run `live-check` in the
+   same order, after the IAM role's write half is turned on, since the check writes probe
+   objects.
 
 The client asks the instance metadata service for credentials only when `config.yaml`
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
@@ -239,9 +240,9 @@ credentials, such as a VM with no instance profile or a laptop that carries the 
 by mistake, refuses with one line naming both fixes: attach the instance profile, or set
 `bucket_credentials: assume_role` in `config.yaml`.
 
-Five commands go with the bucket. The first two and the range restore refuse with exit 2 on a
+Six commands go with the bucket. The first two and the range restore refuse with exit 2 on a
 shadow host, which is any host whose config sets `role` to something other than `primary`.
-The restore, command 3, runs on either.
+The restore, command 3, and the resync, command 5, run on either.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -268,10 +269,9 @@ The restore, command 3, runs on either.
    line naming it. When the copy stopped being a prefix because some path's latest entry
    in it is one this lake never recorded, from another host's sessions or a lake restored
    from an older copy, the nightly upload's line says not to run `first-upload`, and
-   `first-upload` refuses too.
-   [#832](https://github.com/l3a0/marketlake/issues/832) adds the resync that brings the
-   lake level. A line damaged in either manifest that still parses reads the same way.
-   When the damage is in the lake's own `manifest.jsonl`, the fix is to repair that line.
+   `first-upload` refuses too. The resync, command 5, brings the lake level instead. A
+   line damaged in either manifest that still parses reads the same way. When the damage
+   is in the lake's own `manifest.jsonl`, the fix is to repair that line, not the resync.
    `networkQuality -s`, built into macOS, measures upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
    downloads the current version of every object into `<dest>`, less what the next
@@ -343,7 +343,54 @@ The restore, command 3, runs on either.
    copy. A version that does not match is repaired by "Putting a version back for the range
    restore" below, and a refusal for a trimmed partition names the version its trim line
    recorded.
-5. The nightly upload needs no command. Once `backup_target` names the bucket, the
+5. `uv run python -m lake.bucket resync --target s3://example-lake-backup/lake` brings this
+   lake level with the bucket on a host about to become primary again, after the other host
+   was primary ([#832](https://github.com/l3a0/marketlake/issues/832)). It reads the
+   bucket's `manifest.jsonl` and finds the entries both copies share. Past them, the
+   bucket's copy holds the other host's sessions, and this lake holds what it captured,
+   compacted, swept and judged with the battery while it was the shadow. It plans to
+   download each file the bucket's entries name that this lake lacks or holds with other
+   bytes, and to drop this lake's own entries. On a host that trims, it also downloads each
+   partition this lake trimmed after its last upload, since the close+15 uploads before it
+   trims and the bucket's `trimmed.jsonl` lacks those lines. It then takes the bucket's
+   `trimmed.jsonl`, or deletes this lake's when the bucket names none. It prints one line
+   per download and per deletion, then a last line counting them and naming the time the run
+   must stop by. It sends no write to the bucket, so it runs under either role. It refuses
+   with exit 2 when this lake's own `manifest.jsonl` is empty or missing, which is what a
+   wrong `lake_root` looks like, when the bucket holds no `manifest.jsonl`, when run as
+   root, on Sunday from 19:55 to 23:30, and inside a session or within 30 minutes of its
+   open. It refuses when either `manifest.jsonl` holds a line past the entries both share
+   that is not a whole entry, other than a torn last line, and names that line for a repair
+   by hand. A damaged line among the shared entries refuses nothing, since both copies hold
+   it. It also refuses when the two copies differ only by a hand repair, which
+   `first-upload` is for, when they share no whole line, since the rewrite would empty this
+   lake's `manifest.jsonl` before writing the bucket's, and when the bucket's current
+   version of a file is newer than its `manifest.jsonl` names, which the other host's
+   unfinished upload leaves. A bucket `trimmed.jsonl` newer than its manifest entry refuses
+   with the same cause. It refuses, too, when this lake holds a file the bucket's copy would
+   lose or leave unrecorded. That covers a chains or quotes partition or a journal segment
+   the bucket does not hold, and any other file only this lake's own entries name, whatever
+   bytes it holds now, except the covered segments and `bars/` partitions it deletes. It
+   covers a partition the bucket's `trimmed.jsonl` says was removed on purpose while this
+   lake still holds a file there with other bytes. A file with the trimmed bytes themselves
+   stays. It also covers an `onboard`, `retire` or `seed_spans` change to the capture spans
+   and a quarantine sign-off, while the file still holds this lake's own version. Move such
+   a file out of the lake by hand, or redo the decision on the new primary after the switch,
+   then run it again. It refuses when a file it would download or delete differs only by
+   case from another path either manifest names, because on macOS the two are one file. It
+   refuses when the volume would be left with less free space than the journal reserve, 13
+   times the busiest sealed day in the bucket, counted with the downloads in place, and when
+   a directory or another file that is not a regular file sits where a download lands. Run
+   it again with `--apply` to carry the plan out, as the owner and not under `sudo`, with
+   the daemon stopped. It refuses while the daemon, the 18:30 sweep or the Sunday job is
+   executing, or while `launchctl` or `systemctl` cannot say whether one is. It downloads
+   each file beside its target with the lake-root lock released, then takes the lock to move
+   the files in, delete the planned files, and rewrite `manifest.jsonl` in place to equal
+   the bucket's. A run that stops discards its downloads, and running it again finishes what
+   a crash left. Its last lines are the roster check's verdict, the running schema
+   version's, and, when `backup_target` is not the bucket it read, a line saying so, since
+   that host's next close+15 would not upload there.
+6. The nightly upload needs no command. Once `backup_target` names the bucket, the
    close+15 compaction uploads to it in place of `rsync`, and the Sunday job scrubs it and
    downloads the week's share of it to verify. A `shadow` host does neither.
    Compaction prints the upload's throughput to its log, in the line the first upload
@@ -358,10 +405,13 @@ The laptop's `config.yaml` must never set `lake_window_sessions`. Since the cuto
 ([#638](https://github.com/l3a0/marketlake/issues/638)) the laptop runs `role: shadow`,
 which the trim's role gate refuses. A switch back to `primary` would pass that gate, and
 the laptop's `s3://` target passes the bucket gate, so the key's absence would then be the
-only thing that keeps the laptop's own compaction from trimming. Once the resync [#832](https://github.com/l3a0/marketlake/issues/832) plans
-lands, a laptop that resyncs from the bucket after a trim will hold a trimmed lake without
-the key, because that resync will skip the partitions the bucket's trimmed ledger says
-were removed on purpose.
+only thing that keeps the laptop's own compaction from trimming. A laptop that resyncs from
+the bucket after a trim keeps its own copy of each partition it held before the switch,
+because those partitions sit in the entries both copies share, and the resync, command 5
+above, downloads and deletes only what the entries past them name. Each kept copy reads as
+present beside its trim line, and the scrub passes. A partition the VM both sealed and
+trimmed while it was the primary is not downloaded, since the bucket's trimmed ledger
+explains its absence. The key stays unset either way, for the reason above.
 
 The restore brings back current versions only, so a file that fails it is repaired by
 hand. Which repair fits depends on whether the lake still holds a good copy.

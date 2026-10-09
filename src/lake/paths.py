@@ -4,7 +4,7 @@ This is the single production home for path construction. It covers two location
 
 The lake is the first. Give it a ``lake_root`` and it builds every path the lake
 uses: the surface partitions, the journal segments, the daemon's journal metadata
-stamp, the four append-only ledgers, and the reference tables. The root is an argument,
+stamp, the four ledgers, and the reference tables. The root is an argument,
 so a test points it at a throwaway directory and production points it at the configured
 ``lake_root``.
 

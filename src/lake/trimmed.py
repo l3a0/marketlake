@@ -18,7 +18,9 @@ The ledger is ``trimmed.jsonl`` at the lake root, the fourth append-only ledger 
 ``manifest.jsonl``, ``quarantine.jsonl`` and ``actions/corporate_actions.jsonl``. It follows
 the manifest's line rules: one entry is one line in a single ``O_APPEND`` write, and the last
 line per partition wins. It carries its own manifest entry, the way ``quarantine.jsonl`` does,
-so the Sunday scrub checks its sha like any sealed file.
+so the Sunday scrub checks its sha like any sealed file. One writer does not append:
+``python -m lake.bucket resync`` (marketlake #832), on a host about to become primary
+again, replaces the file whole with the bucket's copy.
 
 It holds two kinds of line, told apart by ``kind``.
 

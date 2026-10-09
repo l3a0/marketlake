@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import bucket
-from lake.bucket import UploadSummary, nightly_upload
+from lake.bucket import RESYNC_COMMAND, UploadSummary, nightly_upload
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.manifest import append_manifest, manifest_path, sha256_file
@@ -515,7 +515,7 @@ def test_a_foreign_copy_refuses_with_exit_2_and_no_put(tmp_path, monkeypatch, ca
     named = ", ".join(repr(rel) for rel in FOREIGN[:3])
     assert f"({named} and 1 more)" in line
     assert FOREIGN[3] not in line
-    assert "marketlake #832" in line
+    assert RESYNC_COMMAND in line
     assert "after 0 PUT(s)" in line
     assert client.puts() == []
     assert client.body(MANIFEST_KEY) == copy

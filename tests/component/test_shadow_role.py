@@ -800,6 +800,31 @@ def test_the_bucket_commands_refuse_on_a_shadow_host(tmp_path, monkeypatch, caps
     assert not (lake_root / "journal").exists()
 
 
+def test_the_resync_runs_on_a_shadow_host(tmp_path, monkeypatch, capsys):
+    # The resync is how a shadow becomes level with the bucket before it resumes as the
+    # primary, and it sends no write, so neither shadow refusal stops it (marketlake #832).
+    from tests.support.bucket import FakeS3
+
+    lake_root = FixtureLake(tmp_path / "lake").with_chains("SPY", date(2026, 8, 28)).build()
+    config = _bucket_config(tmp_path, lake_root)
+    target = bucket.parse_backup_target(S3_TARGET)
+    client = FakeS3()
+    calendar = weekday_sessions(date(2026, 8, 31), date(2026, 9, 7))
+    bucket.first_upload(
+        lake_root, target, client=client, clock=ManualClock(SATURDAY), calendar=calendar
+    )
+    monkeypatch.setattr(bucket, "connect", lambda config, given: (given, client))
+
+    code = bucket.main(
+        ["resync", "--config", str(config)], clock=ManualClock(SATURDAY), calendar=calendar
+    )
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith("resync: nothing to do")
+
+
 def test_a_bucket_command_names_an_unrecognised_role_before_refusing(tmp_path, monkeypatch, capsys):
     lake_root = tmp_path / "lake"
     lake_root.mkdir()

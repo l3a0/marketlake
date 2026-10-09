@@ -14,7 +14,11 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    last line, and it stops being the last one as soon as a later append lands: a torn
    write leaves no terminating newline, so the next entry fuses onto the fragment and
    the entries behind that line are unreachable. Marketlake #447 carries what that
-   costs the manifest and the corporate-actions ledgers, which still read short.
+   costs the manifest and the corporate-actions ledgers, which still read short. Entries
+   are only ever appended, with one exception, the resync. ``python -m lake.bucket
+   resync`` (marketlake #832), run by hand under the lake-root lock, cuts the manifest
+   back to the entries it shares with the bucket's copy and appends that copy's tail in
+   place, so the file ends equal to the bucket's.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
 3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha,
@@ -27,7 +31,9 @@ The quarantine ledger at ``quarantine.jsonl`` follows rules 1 and 3, and resolve
 partition and each keeps its own current verdict. :func:`latest_quarantine_by_check` is that
 resolution and marketlake #426 is why it is not the path alone. It records
 data-quality verdicts per partition. Un-quarantine is a superseding entry, never a
-deletion. This module gives it the same append helper and its own reader.
+deletion. This module gives it the same append helper and its own reader. The resync is
+the one writer that does not append to it: it replaces the file whole with the bucket's
+copy, as it does the corporate-actions and trimmed ledgers below.
 
 The read is where it parts from rule 1, and marketlake #469 is why. Its entries are a guard,
 so a read that stopped with whole lines behind it would resolve to a ledger missing its own
@@ -98,7 +104,9 @@ from lake.paths import (
 # have to be named here. Four are.
 #
 # 1. The manifest cannot cover itself.
-# 2. Journal segments are manifest-less by rule, so the whole tree is out.
+# 2. ``journal/`` is out as a whole tree. Capture records each segment it writes, but the
+#    tree also holds files that never get an entry: the metadata stamp, the request timing
+#    files and a shadow host's outbox files.
 # 3. ``reports/`` holds the nightly report, one dated file per sweep run, and four trees
 #    beside it: one file per page that never reached the phone, one file per close+5
 #    guard run, one file per ticker-day compaction's merge had something to say about,
@@ -1488,8 +1496,10 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     the backup, and must not read as loss.
 
     Why the copy can say that exactly. The manifest is append-only, so the copy on the
-    backup is a prefix of the lake's. Every lake write appends its manifest entry under
-    the lake-root lock, and the compaction job's sync holds that same lock, so at the
+    backup is a prefix of the lake's. The bucket resync is the one exception to rule 1, and
+    it leaves the lake's manifest equal to a bucket's copy, which the next sync copies.
+    Every lake write appends its manifest entry under the lake-root lock, and the
+    compaction job's sync holds that same lock, so at the
     moment the copy was taken every file's bytes matched its newest entry at or before
     the copy's last line. The number of lines in the copy is therefore a watermark.
     Resolving the lake's own entries up to that watermark gives exactly what the backup
@@ -1520,8 +1530,9 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     list written, so the two scrubs skip the same files and a decision about that list is made
     once. The price is named rather than hidden: that list skips ``journal/``, ``reports/`` and
     ``lost+found/``, so a killed sync's temp file under any of them is not seen. Scanning the
-    journal instead would name every segment in it, because segments carry no manifest entry by
-    rule.
+    journal instead would name files that never get an entry: the metadata stamp, the
+    request timing files and a shadow host's outbox files. Capture records each segment it
+    writes, and the list still skips ``journal/`` as a whole tree for those files.
 
     ``BACKUP_EXCLUSIONS`` is deliberately not consulted. Its two patterns name a temp
     file, which is renamed away before any entry is appended and so can never be

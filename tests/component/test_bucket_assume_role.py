@@ -191,10 +191,13 @@ def _bucket_main(tmp_path: Path, monkeypatch, client: FakeS3, argv: list[str]) -
         pytest.param(["live-check", "--target", LIVE_TARGET], id="live-check"),
         pytest.param(["first-upload", "--target", str(TARGET)], id="first-upload"),
         pytest.param(["restore", "DEST", "--target", str(TARGET)], id="restore"),
+        pytest.param(["resync", "--target", str(TARGET)], id="resync"),
     ],
 )
 def test_each_command_prints_one_line_for_a_refused_assume(tmp_path, monkeypatch, capsys, argv):
     (tmp_path / "lake").mkdir()
+    # The resync refuses a lake with no manifest before any request, so the lake holds one.
+    (tmp_path / "lake" / "manifest.jsonl").write_text('{"partition": "x"}\n')
     argv = [str(tmp_path / "dest") if part == "DEST" else part for part in argv]
     client = FakeS3()
     client.fail_with = REFUSED

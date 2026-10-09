@@ -41,6 +41,7 @@ from lake import bucket
 from lake.bucket import (
     FIRST_UPLOAD_COMMAND,
     NIGHTLY_UPLOAD_BUDGET,
+    RESYNC_COMMAND,
     STORAGE_CLASS,
     ChecksumRefused,
     FirstUploadRefused,
@@ -284,7 +285,7 @@ def _foreign_lake(tmp_path: Path, client: FakeS3, *, own_tail: bool = True) -> t
     return lake, copy
 
 
-def test_a_foreign_tail_says_not_to_run_first_upload_and_names_832(tmp_path):
+def test_a_foreign_tail_says_not_to_run_first_upload_and_names_the_resync(tmp_path):
     client = FakeS3()
     lake, copy = _foreign_lake(tmp_path, client)
     shared = len(copy.splitlines()) - 2
@@ -297,7 +298,7 @@ def test_a_foreign_tail_says_not_to_run_first_upload_and_names_832(tmp_path):
     assert "\n" not in message
     assert FIRST_UPLOAD_COMMAND not in message
     assert "do not run first-upload" in message
-    assert "marketlake #832" in message
+    assert RESYNC_COMMAND in message
     assert "never recorded" in message
     assert f"shares {shared} entries" in message
     # The bucket's first partition holds a newline, and it renders escaped on the line.
