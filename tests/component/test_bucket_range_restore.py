@@ -557,12 +557,20 @@ def test_a_present_file_that_differs_refuses_and_restores_nothing(tmp_path):
 
 @pytest.mark.parametrize("surface", ["bars", "actions"])
 def test_a_surface_other_than_chains_or_quotes_refuses(tmp_path, surface):
+    """The refusal names the range restore, the two surfaces it takes, and the one given.
+
+    Catches the range restore refusing in the reading restore's words, since the two share
+    the refusal's text.
+    """
     root, client, _originals = _lake(tmp_path)
     client.calls.clear()
 
     line = _refuses(root, client, surface=surface)
 
-    assert repr(surface) in line
+    assert line == (
+        f"the range restore takes chains or quotes partitions, not {surface!r}, so nothing was "
+        "restored. Restore any other file by hand from the bucket."
+    )
     assert client.calls == []
 
 

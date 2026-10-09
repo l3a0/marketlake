@@ -14,6 +14,7 @@ Verification list.
 5. The verified marker records the mode and the range, so a waiting directory moves in only
    for the run that made it. Refusals on the arguments and on an empty range come first.
 6. The command runs on a shadow host.
+7. The command hands its config and arguments through, and prints one line per fact.
 
 The inventory bucket is built by the real ``first_upload``, then the range restore tests'
 ``_trim_away``, then the real ``nightly_upload``, so it holds what an uploaded trimmed lake
@@ -55,7 +56,7 @@ from tests.component import test_load_contract_life as life
 from tests.component import test_oi_view as oi
 from tests.component import test_settlement_view as settle
 from tests.component.test_bucket_range_restore import _trim_away
-from tests.support.bucket import FakeS3
+from tests.support.bucket import FakeS3, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -630,6 +631,82 @@ def test_a_mismatched_file_names_its_role_and_both_causes(tmp_path, monkeypatch,
     assert len(err) == 3
 
 
+def test_each_role_has_its_own_failure_line_and_a_missing_file_prints_no_causes(
+    tmp_path, monkeypatch, capsys
+):
+    """A bars partition, the next partition and a support file, each missing from the bucket.
+
+    Catches a role's words dropped from the failure line, and the line naming the two causes
+    of a mismatch printed on a run where no file mismatched.
+    """
+    lake = _inventory(tmp_path)
+    dest = tmp_path / "reading"
+    for rel in (_bars("SPY", "1d", D3), _chains("SPY", D4), MASTER):
+        lake.client.objects.pop(f"lake/{rel}")
+
+    code = _main(tmp_path, lake.root, lake.client, monkeypatch, [str(dest), "--surface", "chains"])
+
+    assert code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        f"{LABEL}: missing from the bucket: {_bars('SPY', '1d', D3)}, a bars partition of the "
+        "range's tickers and days",
+        f"{LABEL}: missing from the bucket: {_chains('SPY', D4)}, the next chains partition "
+        "after the range",
+        f"{LABEL}: missing from the bucket: {MASTER}, a file a reader needs beside the range",
+        f"{LABEL}: 3 file(s) from s3://lake-backup/lake failed, so {dest} holds no reading set. "
+        f"Every file that verified stays in {dest / WORK}, and a re-run resumes there",
+    ]
+
+
+def test_a_symbolic_link_inside_the_working_directory_is_never_written_through(tmp_path):
+    """A ``chains`` link in a working directory a restore made points outside it.
+
+    Catches the plan checking only the key's spelling and not where it resolves, which
+    downloads every chains partition into the directory the link names.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    work = dest / WORK
+    work.mkdir(parents=True)
+    (work / ".marketlake-restore").write_text("a marketlake restore in progress\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (work / "chains").symlink_to(outside)
+
+    summary = _read(client, dest, root)
+
+    why = "names a path outside the lake, so it was not written"
+    assert summary.restored is False
+    assert summary.failures == [
+        (_chains("SPY", D2), why),
+        (_chains("SPY", D3), why),
+        (_chains("SPY", D4), why),
+    ]
+    assert os.listdir(outside) == []
+
+
+def test_a_key_that_vanishes_during_its_download_leaves_no_in_flight_file(tmp_path):
+    """The listing holds D3's key and the download finds it gone.
+
+    Catches the absent branch keeping the empty ``.part`` file the download opened.
+    """
+    root, client = _simple(tmp_path)
+    key = f"lake/{_chains('SPY', D3)}"
+
+    def vanish(kwargs) -> None:
+        if kwargs["Key"] == key:
+            client.objects.pop(key, None)
+
+    client.on_get = vanish
+    dest = tmp_path / "reading"
+
+    summary = _read(client, dest, root)
+
+    assert summary.failures == [(_chains("SPY", D3), "missing from the bucket")]
+    assert list((dest / WORK).rglob("*.part")) == []
+    assert not (dest / WORK / _chains("SPY", D3)).exists()
+
+
 # -- 3. destinations that refuse ---------------------------------------------------------
 
 
@@ -743,6 +820,77 @@ def test_a_destination_beside_lake_root_with_a_shared_prefix_is_outside(tmp_path
     summary = _read(client, tmp_path / "lake-reading", root)
 
     assert summary.restored is True
+
+
+def test_a_destination_whose_ancestor_cannot_be_statted_is_one_line(tmp_path):
+    """A destination under a directory nobody may search refuses before any request.
+
+    Catches the inside check's ``OSError`` escaping as a traceback.
+    """
+    _skip_as_root()
+    root, client = _simple(tmp_path)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    dest = locked / "inner" / "reading"
+    locked.chmod(0)
+    client.calls.clear()
+    try:
+        with pytest.raises(RestoreRefused) as refused:
+            _read(client, dest, root)
+    finally:
+        locked.chmod(0o755)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"checking whether {dest} is inside lake_root {root} failed (PermissionError: "
+    )
+    assert message.endswith(", so nothing was restored")
+    assert "\n" not in message
+    assert client.calls == []
+    assert os.listdir(locked) == []
+
+
+def test_a_destination_under_a_regular_file_refuses_for_its_parent(tmp_path):
+    """The inside check skips an ancestor that is a file, and the destination check refuses.
+
+    Catches the inside check treating ``NotADirectoryError`` as a failure to stat, which
+    reports a failed check rather than the parent that is not a directory.
+    """
+    root, client = _simple(tmp_path)
+    plain = tmp_path / "plain.txt"
+    plain.write_text("x")
+    client.calls.clear()
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, plain / "reading", root)
+
+    assert str(refused.value) == f"{plain} does not exist, so nothing was restored"
+    assert client.calls == []
+
+
+def test_a_lake_root_spelled_with_a_tilde_still_refuses_a_destination_inside_it(
+    tmp_path, monkeypatch
+):
+    """A direct caller passing ``~/lake`` gets the refusal a caller passing the full path gets.
+
+    ``HOME`` points at the test's own directory. Catches ``lake_root`` left unexpanded, where
+    ``~/lake`` names a directory under the working directory and the destination reads as
+    outside it.
+    """
+    root, client = _simple(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    dest = root / "reading"
+    client.calls.clear()
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, dest, "~/lake")
+
+    assert str(refused.value) == (
+        f"{dest} is inside lake_root {root}. A reading restore writes only outside the live "
+        "lake, so nothing was restored. Name a directory elsewhere"
+    )
+    assert not dest.exists()
+    assert client.calls == []
 
 
 def _linked_work(tmp_path: Path, root: Path) -> Path:
@@ -987,6 +1135,71 @@ def test_the_real_device_check_puts_a_sibling_directory_on_lake_root_s_filesyste
         _read(client, tmp_path / "reading", root, free=needed)
 
 
+def test_an_existing_empty_destination_is_where_free_space_and_the_device_are_read(tmp_path):
+    """A fresh mount point is its own filesystem, so both checks ask about it, not its parent.
+
+    The parent has no space and shares ``lake_root``'s device, so asking it refuses. Catches
+    reading the parent, which on a mount point measures the wrong filesystem.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "mount"
+    dest.mkdir()
+    free_asked: list[Path] = []
+    device_asked: list[Path] = []
+
+    def free_space(path: Path) -> int:
+        free_asked.append(path)
+        return PLENTY if path == dest else 0
+
+    def device_of(path: Path) -> int:
+        device_asked.append(path)
+        return 2 if path == dest else 1
+
+    summary = restore_for_reading(
+        dest,
+        TARGET,
+        client=client,
+        lake_root=root,
+        surface="chains",
+        ticker="SPY",
+        first=D2,
+        last=D3,
+        free_space=free_space,
+        device_of=device_of,
+    )
+
+    assert summary.restored is True
+    assert free_asked == [dest]
+    assert device_asked == [dest, root]
+
+
+def test_a_working_file_larger_than_its_listed_size_counts_toward_the_space_needed(tmp_path):
+    """A working copy of D2 that grew past its listed size will be downloaded again.
+
+    A first run fails on D3, so D2, D4 and the ledger wait verified in the working
+    directory. Then D2's copy grows, and room for all but one of the bytes still to download
+    refuses. Catches counting a file as done when it is at least its listed size rather than
+    exactly it, which leaves D2 out of the space needed.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    key = f"lake/{_chains('SPY', D3)}"
+    good = client.body(key)
+    client.store(key, good + b"rot")
+    assert _read(client, dest, root).restored is False
+    client.store(key, good)
+    grown = dest / WORK / _chains("SPY", D2)
+    grown.write_bytes(grown.read_bytes() + b"extra")
+    listed = len(client.body(f"lake/{_chains('SPY', D2)}"))
+    needed = len(client.body("lake/manifest.jsonl")) + len(good) + listed
+    elsewhere = _devices(root, same=False)
+
+    with pytest.raises(RestoreRefused, match="MB free, so nothing was restored"):
+        _read(client, dest, root, free=needed - 1, device_of=elsewhere)
+
+    assert _read(client, dest, root, free=needed, device_of=elsewhere).restored is True
+
+
 # -- 5. the marker, and refusals before the work ------------------------------------------
 
 
@@ -1051,6 +1264,29 @@ def test_a_waiting_restore_refuses_a_reading_restore(tmp_path, monkeypatch):
     assert sorted(os.listdir(dest)) == [WORK]
 
     assert bucket.restore_lake(dest, TARGET, client=client).finished_move is True
+
+
+def test_an_unreadable_marker_on_a_waiting_reading_restore_is_named_as_unreadable(
+    tmp_path, monkeypatch
+):
+    """A verified marker torn while its reading restore waited refuses for the marker itself.
+
+    Catches reading the torn marker as one with no mode, which refuses it as another
+    command's verified ``restore of a lake`` and names the wrong command to finish it.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    _waiting(tmp_path, monkeypatch, lambda: _read(client, dest, root))
+    (dest / WORK / ".marketlake-verified").write_text("{torn")
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(client, dest, root)
+
+    assert str(refused.value) == (
+        f"{dest / WORK} no longer holds .marketlake-verified as it verified, so nothing was "
+        f"moved. Delete {dest / WORK} and run the same command again"
+    )
+    assert sorted(os.listdir(dest)) == [WORK]
 
 
 def test_a_marker_with_no_mode_reads_as_a_restore(tmp_path, monkeypatch):
@@ -1211,6 +1447,21 @@ def test_a_range_selecting_nothing_refuses_after_the_manifest_and_creates_nothin
     assert not dest.exists()
 
 
+def test_an_every_ticker_range_selecting_nothing_says_every_ticker(tmp_path):
+    """Catches the range's words printing ``None`` when no ticker was given."""
+    root, client = _simple(tmp_path)
+
+    with pytest.raises(RestoreRefused) as refused:
+        _read(
+            client, tmp_path / "reading", root, ticker=None, first="2026-08-21", last="2026-08-21"
+        )
+
+    assert str(refused.value) == (
+        "the manifest records no chains partitions for every ticker from 2026-08-21 to "
+        "2026-08-21, so nothing was restored. Check the surface, the ticker and the dates"
+    )
+
+
 # -- 6. the shadow host --------------------------------------------------------------------
 
 
@@ -1223,10 +1474,13 @@ def _main(
     *,
     role: str | None = None,
     extra: bool = True,
+    ticker: bool = True,
+    window: str | None = None,
 ) -> int:
     """``main`` with the client patched in, as ``test_bucket_rebuild.py`` drives it.
 
-    ``extra`` fills in the ticker and the D2 to D3 range when the arguments leave them out.
+    ``extra`` fills in the D2 to D3 range, and ``ticker`` fills in SPY, when the arguments
+    leave them out. ``window`` writes ``lake_window_sessions`` with that text.
     """
     config = write_config(
         tmp_path,
@@ -1236,9 +1490,11 @@ def _main(
         bucket_secret_access_key="secret-bucket-key",
         bucket_region="us-east-2",
     )
+    if window is not None:
+        config.write_text(config.read_text() + f"lake_window_sessions: {window}\n")
     monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
     argv = [LABEL, *args]
-    if "--ticker" not in argv:
+    if ticker and "--ticker" not in argv:
         argv += ["--ticker", "SPY"]
     if extra and "--from" not in argv:
         argv += ["--from", D2.isoformat(), "--to", D3.isoformat()]
@@ -1300,3 +1556,130 @@ def test_a_finished_move_has_its_own_line_through_main(tmp_path, monkeypatch, ca
         f"{dest}. Read it with lake_root={dest}, and never make it a daemon's or a job's "
         "lake_root, since its manifest records partitions it does not hold\n"
     )
+
+
+# -- 7. the command's arguments and lines -------------------------------------------------
+
+
+def test_main_refuses_a_destination_inside_the_configured_lake_root(tmp_path, monkeypatch, capsys):
+    """Catches ``main`` handing the reading restore anything but ``config.lake_root``.
+
+    With any other root, the destination under the live lake reads as outside and is filled.
+    """
+    root, client = _simple(tmp_path)
+    dest = root / "reading"
+    client.calls.clear()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
+
+    assert exc.value.code == 2
+    assert capsys.readouterr().err == (
+        f"{LABEL}: {dest} is inside lake_root {root}. A reading restore writes only outside the "
+        "live lake, so nothing was restored. Name a directory elsewhere\n"
+    )
+    assert not dest.exists()
+    assert client.calls == []
+
+
+def test_main_without_a_ticker_takes_every_ticker(tmp_path, monkeypatch, capsys):
+    """Leaving ``--ticker`` out takes QQQ's D2 beside SPY's.
+
+    Catches the parser defaulting ``--ticker`` to one ticker rather than to every ticker.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    args = [str(dest), "--surface", "chains", "--from", D2.isoformat(), "--to", D2.isoformat()]
+
+    code = _main(tmp_path, root, client, monkeypatch, args, ticker=False)
+
+    assert code == 0
+    assert capsys.readouterr().out.startswith(
+        f"{LABEL}: restored for reading 2 partition(s) in the range (QQQ 1, SPY 1)"
+    )
+    assert (dest / _chains("QQQ", D2)).is_file()
+
+
+def test_main_without_a_surface_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    """Catches the parser defaulting ``--surface`` rather than requiring it."""
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+    client.calls.clear()
+
+    with pytest.raises(SystemExit) as exc:
+        _main(tmp_path, root, client, monkeypatch, [str(dest)])
+
+    assert exc.value.code == 2
+    assert "the following arguments are required: --surface" in capsys.readouterr().err
+    assert client.calls == []
+    assert not dest.exists()
+
+
+def test_an_unreachable_bucket_says_a_rerun_resumes(tmp_path, monkeypatch, capsys):
+    """One line that says the destination is untouched and a re-run resumes.
+
+    Catches the reading restore left out of the commands whose unreachable line says so.
+    """
+    root, client = _simple(tmp_path)
+    client.fail_with = unreachable()
+    dest = tmp_path / "reading"
+
+    with pytest.raises(SystemExit) as exc:
+        _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
+
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"{LABEL}: ")
+    assert err.endswith(
+        ". The destination is untouched, and a re-run resumes in the working directory\n"
+    )
+    assert err.count("\n") == 1
+    assert not dest.exists()
+
+
+def test_a_malformed_window_key_does_not_block_a_reading_restore(tmp_path, monkeypatch, capsys):
+    """``lake_window_sessions: many`` refuses a ``restore`` and never a reading restore.
+
+    Catches the reading restore judging the window key, which it never uses.
+    """
+    root, client = _simple(tmp_path)
+    dest = tmp_path / "reading"
+
+    code = _main(
+        tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"], window="many"
+    )
+
+    assert code == 0
+    assert "lake_window_sessions" not in capsys.readouterr().err
+    assert (dest / "manifest.jsonl").is_file()
+
+
+def test_the_summary_counts_decimal_megabytes(tmp_path):
+    """1,500,000 bytes print as 1.5 MB. Catches dividing by 1,048,576, which prints 1.4."""
+    summary = bucket.ReadingRestoreSummary(
+        target="s3://lake-backup/lake",
+        dest=tmp_path,
+        work=tmp_path / WORK,
+        downloaded=1,
+        downloaded_bytes=1_500_000,
+    )
+
+    assert "downloaded 1 (1.5 MB)" in summary.render()
+
+
+def test_the_summary_lists_the_tickers_in_sorted_order(tmp_path):
+    """``BRK`` prints before ``BRK.B``, though the plan meets ``BRK.B`` first.
+
+    ``ticker=BRK.B/`` sorts before ``ticker=BRK/``, since ``.`` sorts before ``/``. Catches
+    printing the tickers in the order the plan met them.
+    """
+    lake = FixtureLake(tmp_path / "lake")
+    lake.with_chains("BRK", D2, sample_chains_table()).with_chains("BRK.B", D2)
+    lake.with_reference("schema_versions", chain._ledger_table())
+    root = lake.build()
+    client = _upload(root)
+
+    summary = _read(client, tmp_path / "reading", root, ticker=None, first=D2, last=D2)
+
+    assert list(summary.range_by_ticker) == ["BRK.B", "BRK"]
+    assert "in the range (BRK 1, BRK.B 1)" in summary.render()
