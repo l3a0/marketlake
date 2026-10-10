@@ -22,7 +22,10 @@ Two design rules shape this file.
    ``from_token`` factory builds the real client from a token file through
    ``client_from_token``, the only place this module imports ``schwab-py``. It runs from the
    capture daemon on every cycle, and in the by-hand live check. Continuous integration
-   reaches it only through ``httpx.MockTransport`` and a temporary token file.
+   reaches it only through ``httpx.MockTransport`` and a temporary token file. The file is
+   read on every build. The one exception to building from it is a refreshed token whose
+   write failed, which the process keeps until the file catches up (marketlake #860).
+   ``client_from_token`` carries that rule.
 2. No wall-clock read. ``token_mint_time`` derives its instant from the token the
    injected client already holds, never from ``datetime.now`` and never from a
    separate file read. The mint time is a stored epoch second on the client's token
@@ -49,12 +52,14 @@ A fake client with no ``session`` records nothing, and its responses carry no ti
 
 from __future__ import annotations
 
+import errno
+import functools
 import json
 import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -72,6 +77,24 @@ from lake.vendor import RequestTiming, VendorError, VendorResponse, require_utc_
 # string, so this is a tuple. The values are exactly the Fields enum's own values, and
 # the client is built with enforce_enums=False so the raw strings pass through.
 QUOTE_FIELD_GROUPS = ("quote", "fundamental", "regular", "extended", "reference")
+
+
+def _say_built(line: Callable[[], str]) -> None:
+    """Build one diagnostic and print it to stderr, and drop it rather than raise on either step.
+
+    Every line this module prints sits on a request's path, inside a token refresh or a
+    client's close. On the laptop the daemon's stderr is a file on the same volume as
+    ``token.json``, and a probe on a full ramdisk showed ``print`` raising ``ENOSPC`` once the
+    log's last block filled. A closed stderr raises ``ValueError``. Either raise, let out of a
+    refresh, would cost the request its minute, so this catches ``Exception``. The string is
+    built inside the guard too, so an exception whose ``__str__`` raises costs only the line.
+    This is ``capture._say_built``'s shape, written again because ``lake.capture`` imports this
+    module.
+    """
+    try:
+        print(line(), file=sys.stderr)
+    except Exception:  # noqa: BLE001 - nowhere left to report it, and the request goes on
+        pass
 
 
 @runtime_checkable
@@ -455,7 +478,8 @@ def _auth_failures_named() -> Iterator[None]:
 # One lock for the whole process, not one per client. The capture loop builds a new client
 # every cycle, and once cycles overlap (marketlake #534) two clients can find the token
 # expired at the same moment. A lock per client would let both refresh and both rewrite
-# ``token.json``. This one lets one refresh, and the other re-reads the file the first wrote.
+# ``token.json``. This one lets one refresh, and the other adopts what the first left: the
+# file it wrote, or the token this process holds when that write failed (marketlake #860).
 # It is reentrant so that a session wrapped twice waits on nothing but itself. A plain lock
 # would leave the outer wrapper holding it while the inner one waits, and that hangs every
 # client in the process.
@@ -487,31 +511,38 @@ def serialize_token_refresh(
     clients refreshing at once is the same race one level up (marketlake #564). Sharing the
     lock is not enough on its own. A second client that waited still holds the expired token
     it was built with, since the first client's refresh changed the first client's session
-    and the file, never the second's session. Checking only its own session, it would refresh
-    again. ``adopt_stored`` closes that gap. When the session's token has expired, it is
-    called under the lock to replace the session's token with the one stored in the token
-    file. The file's token is then the one checked, so a refresh another client already
+    and the file, never the second's session. Checking only its own session, it would
+    refresh again. ``adopt_stored`` closes that gap. When the session's token has expired,
+    it is called under the lock to replace the session's token with the newest one the
+    process can see: the token file's, or a refreshed token this process holds because its
+    write failed. That token is then the one checked, so a refresh another client already
     made is adopted rather than repeated, and a refresh that does happen uses the newest
-    refresh token on disk. That keeps the lake correct whether or not Schwab rotates the
-    refresh token on each refresh. marketlake #633 measured it on 2026-10-05: a refresh
-    issued a new access token and left the refresh token unchanged, and a refresh on one
-    host did not revoke the other host's copy. Had Schwab rotated, a second refresh with
-    the superseded refresh token would have been refused and read as auth death, and the
-    adoption is what still guards against Schwab starting to.
+    refresh token, whether it is on disk or held. That keeps the lake correct whether or not
+    Schwab rotates the refresh token on each refresh. marketlake #633 measured it on
+    2026-10-05: a refresh issued a new access token and left the refresh token unchanged,
+    and a refresh on one host did not revoke the other host's copy. Had Schwab rotated, a
+    second refresh with the superseded refresh token would have been refused and read as
+    auth death, and the adoption is what still guards against Schwab starting to.
 
-    One case would open if Schwab ever rotated, and it predates the re-read. A refresh
-    whose file write fails leaves the new token in that client's memory and the old one
-    on disk. The client's own request raises the write's error. Under rotation, every
-    client that later adopted the file would refresh with a superseded refresh token.
+    A refresh whose file write fails leaves the new token in memory and the old one on
+    disk. Until marketlake #860 the write's error raised out of the request, so a full
+    disk lost one request every minute, and every client built afterwards started from the
+    stale file and refreshed again. Now the refresh writer keeps the new token in the
+    process and lets the request go on, and the reader hands it to later clients while it
+    is newer than the file. ``client_from_token`` carries that rule, and what changes when
+    the refresh token rotated.
 
     A re-read that fails leaves the session's own token in place and prints one line naming
     the failure's type, never its message or anything from the file. The request then goes
     ahead as it did before the re-read existed, so an unreadable file costs at most the
-    duplicate refresh the re-read was there to save, not the cycle.
+    duplicate refresh the re-read was there to save, not the cycle. The line goes through
+    ``_say_built``, so a stderr that refuses it costs the line and not the request.
 
     The lock also keeps the token writer safe. ``reauth.write_token`` names its temp file by
-    process id, so two threads writing at once would share one temp file. Every write from
-    a refresh happens inside ``ensure_active_token``, and so inside this lock.
+    process id, so two threads writing at once would share one temp file. The process
+    writes the token from two places, and both take this lock. A refresh writes from inside
+    ``ensure_active_token``, and the reader retries a held token's write inside its own
+    section of the lock.
 
     It reaches into the session by attribute, so a library upgrade that moves it raises
     ``AttributeError`` from ``from_token`` rather than running capture with the refresh
@@ -529,10 +560,11 @@ def serialize_token_refresh(
                 try:
                     adopt_stored()
                 except Exception as exc:  # noqa: BLE001 - the session's own token still works
-                    print(
-                        "schwab: token file re-read failed, refreshing from the client's own "
-                        f"token: {type(exc).__name__}",
-                        file=sys.stderr,
+                    _say_built(
+                        lambda exc=exc: (
+                            "schwab: token file re-read failed, refreshing from the client's "
+                            f"own token: {type(exc).__name__}"
+                        )
                     )
             return ensure_active_token(session.token)
 
@@ -550,9 +582,11 @@ _STORED_TOKEN_KEYS = ("access_token", "refresh_token")
 
 
 def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> None:
-    """Replace a client's token with the one stored in the token file.
+    """Replace a client's token with the one ``read_token`` returns.
 
-    The file holds ``schwab-py``'s envelope: the token itself and ``creation_timestamp``,
+    That is the token file's token, or a refreshed token this process holds because its
+    write failed and that is newer than the file's. ``client_from_token``'s reader decides
+    which. Either way it is ``schwab-py``'s envelope: the token itself and ``creation_timestamp``,
     the refresh token's mint time. Both are adopted. The session takes the token, which is
     what the next request is sent with. The client's ``token_metadata`` takes both, because
     ``schwab-py`` writes its ``creation_timestamp`` back into the file on the next refresh.
@@ -583,45 +617,297 @@ def _adopt_stored_token(client: object, read_token: Callable[[], object]) -> Non
     metadata.creation_timestamp = created
 
 
+@dataclass
+class _HeldToken:
+    """A refreshed token whose write to the token file failed, kept for this process.
+
+    ``text`` is the envelope as JSON, the same text the write would have landed. Each
+    client parses it afresh, so a client built from it matches one built from the file and
+    no two clients share one token object. It is a full brokerage credential, so the
+    ``repr`` leaves it out. The two stamps are what the reader compares against the file.
+    ``printed`` is the errno name the failure line last printed, and ``None`` when no
+    failure line has printed for this token, as after a rotated refresh.
+    """
+
+    text: str = field(repr=False)
+    creation_timestamp: int | float
+    expires_at: int
+    printed: str | None
+
+
+# The held tokens, one per token path. Guarded by ``_TOKEN_REFRESH_LOCK`` alone. The writer
+# that fills it already runs under that lock, so a second lock could deadlock against it.
+_HELD: dict[Path, _HeldToken] = {}
+
+
+def reset_held_tokens() -> None:
+    """Forget every held token. For tests, which share one process."""
+    with _TOKEN_REFRESH_LOCK:
+        _HELD.clear()
+
+
+def _usable_stamps(envelope: object) -> tuple[int | float, int] | None:
+    """The envelope's ``creation_timestamp`` and ``expires_at``, or ``None`` when either fails.
+
+    ``creation_timestamp`` must pass ``token_epoch.epoch_second_to_utc``, the one guard for
+    that field. ``expires_at`` must be an ``int`` and not a ``bool``, because authlib's
+    ``is_expired`` judges nothing else and comparing a string raises ``TypeError``.
+    """
+    if not isinstance(envelope, Mapping):
+        return None
+    token = envelope.get("token")
+    created = envelope.get("creation_timestamp")
+    if not isinstance(token, Mapping):
+        return None
+    try:
+        epoch_second_to_utc(created)
+    except ValueError:
+        return None
+    expires_at = token.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+        return None
+    return created, expires_at
+
+
+def _errno_name(exc: OSError) -> str:
+    """The errno's name, such as ``ENOSPC``, or the exception's class when it has none."""
+    code = exc.errno
+    name = errno.errorcode.get(code) if isinstance(code, int) else None
+    return name if name is not None else type(exc).__name__
+
+
+def _errno_and_reason(exc: OSError) -> str:
+    """The errno's name with the system's text for it, never a ``None`` text."""
+    name = _errno_name(exc)
+    reason = exc.strerror
+    return f"{name}: {reason}" if isinstance(reason, str) and reason else name
+
+
+def _say_recovered(path: Path) -> None:
+    """Print that the file caught up. It says nothing about whether the disk recovered."""
+    _say_built(
+        lambda: (
+            f"schwab: token file at {path} now holds a token at least as new as this "
+            "process's, so the held token is dropped"
+        )
+    )
+
+
+def _hold(
+    path: Path,
+    envelope: object,
+    stamps: tuple[int | float, int] | None,
+    printed: str | None,
+) -> None:
+    """Hold ``envelope`` for ``path``, or clear an older held token when it cannot be held."""
+    if stamps is None:
+        _HELD.pop(path, None)
+        return
+    created, expires_at = stamps
+    _HELD[path] = _HeldToken(json.dumps(envelope), created, expires_at, printed)
+
+
+@functools.cache
+def _refresh_writer_type() -> type:
+    """The refresh writer's class, built once on first use.
+
+    It subclasses ``reauth.TokenWriter``, which is imported here rather than at the top for
+    the reason ``client_from_token`` gives.
+    """
+    from lake.reauth import TokenWriter
+
+    class RefreshTokenWriter(TokenWriter):
+        """The ``token_write_func`` for refreshes: a write that fails keeps the token.
+
+        A refresh's write that lands clears any held token for the path, and prints the
+        recovery line when one was held. A write that raises ``OSError``, of any errno,
+        keeps the refreshed token in the process. ``EROFS`` after a remount, ``EDQUOT`` and
+        ``EIO`` lose the request the same way ``ENOSPC`` does. Nothing wider is caught, so a
+        ``TypeError`` from serialising the token is a bug and still raises.
+
+        What happens next turns on whether the refresh token rotated, which authlib's
+        ``refresh_token`` keyword, the one the refresh sent, says. A writer called without
+        it cannot tell, and takes the rotated side, which is the loud one.
+
+        1. **Not rotated.** The request goes on. The failure line prints once per outage:
+           when nothing was held before, or when the errno changed, as when ``ENOSPC``
+           turns into ``EROFS`` after a remount.
+        2. **Rotated.** Only this process now holds a refresh token Schwab accepts. The
+           rotation line prints on every such failure, since each one costs a request, and
+           the write's own error is raised again. A short-lived process such as the canary
+           then fails as loudly as before, and its re-auth reminder is the right action.
+
+        A token with no usable stamps, per ``_usable_stamps``, is never held. When it did not
+        rotate, an older held token stays, because it carries the same refresh token and
+        later clients still need one that works. When it rotated, the older held token is
+        cleared, because its refresh token is the superseded one. Neither line names a
+        token field.
+        """
+
+        def __call__(self, token: object, *args: object, **kwargs: object) -> None:
+            with _TOKEN_REFRESH_LOCK:
+                held = _HELD.get(self.token_path)
+                try:
+                    super().__call__(token, *args, **kwargs)
+                except OSError as exc:
+                    if self._kept(token, held, exc, kwargs):
+                        raise
+                    return
+                if self.token_path in _HELD:
+                    del _HELD[self.token_path]
+                    _say_recovered(self.token_path)
+
+        def _kept(self, token: object, held: _HeldToken | None, exc: OSError, kwargs: dict) -> bool:
+            """Keep the token after a failed write, print, and say whether it rotated."""
+            path = self.token_path
+            sent = kwargs.get("refresh_token")
+            new = token.get("token") if isinstance(token, Mapping) else None
+            fresh = new.get("refresh_token") if isinstance(new, Mapping) else None
+            stamps = _usable_stamps(token)
+            name = _errno_name(exc)
+            if fresh != sent or sent is None:
+                _hold(path, token, stamps, None)
+                _say_built(
+                    lambda: (
+                        f"schwab: token file write failed ({_errno_and_reason(exc)}) at "
+                        f"{path} and the refresh token rotated; only this process holds the "
+                        "new one, so this request fails, and a restart before the write "
+                        "lands will need a re-auth"
+                    )
+                )
+                return True
+            if held is None or held.printed != name:
+                _say_built(
+                    lambda: (
+                        f"schwab: token file write failed ({_errno_and_reason(exc)}) at "
+                        f"{path}; the refreshed token stays in this process and the request "
+                        "goes on, and each new client retries the write"
+                    )
+                )
+            if stamps is not None:
+                _hold(path, token, stamps, name)
+            return False
+
+    return RefreshTokenWriter
+
+
+def _retry_held(path: Path, held: _HeldToken) -> bool:
+    """Write the held token to the file, and say whether it landed. Prints nothing.
+
+    The write takes ``_TOKEN_REFRESH_LOCK``, because ``write_token``'s temp name is per
+    process, so two threads writing at once would share one temp file.
+    """
+    from lake.reauth import write_token
+
+    with _TOKEN_REFRESH_LOCK:
+        try:
+            write_token(path, json.loads(held.text))
+        except OSError:
+            return False
+    return True
+
+
+def _read_or_held(path: Path) -> object:
+    """The token a client at ``path`` should run on: the file's, or a held one newer than it.
+
+    The whole decision runs in one section of ``_TOKEN_REFRESH_LOCK``: look up the held
+    token, read the file, compare, retry the write and clear. Cycles overlap, and the
+    close+5 fill builds in the same process. A reader that compared outside the lock could
+    decide the held token wins, wait, and then write it over a newer token a refresh landed
+    in the meantime.
+
+    1. With nothing held, the file is returned as it always was.
+    2. A file that cannot be read or parsed raises, held token or not, and is not touched.
+       A full disk does not cause that, since ``write_token`` is atomic. Letting the held
+       token win would hide the fault until the next restart, and would write over a file
+       a hand pull landed after a re-login, the one case where the file is newer.
+    3. A file that parses without usable stamps, per ``_usable_stamps``, is returned as it
+       is, and the held token is kept.
+    4. The file wins when its ``creation_timestamp`` is later, meaning a re-login or a
+       pulled newer token landed, or when the two are equal and its ``expires_at`` is no
+       earlier. The held token is dropped and the recovery line printed.
+    5. Otherwise the held token wins. The write is retried. A retry that lands drops the
+       held token and prints the recovery line. One that fails prints nothing, and leaves
+       the errno last printed as it was. Either way the held envelope is returned, parsed
+       afresh.
+    """
+    with _TOKEN_REFRESH_LOCK:
+        held = _HELD.get(path)
+        stored = _read_token_file(path)
+        if held is None:
+            return stored
+        stamps = _usable_stamps(stored)
+        if stamps is None:
+            return stored
+        created, expires_at = stamps
+        if created > held.creation_timestamp or (
+            created == held.creation_timestamp and expires_at >= held.expires_at
+        ):
+            del _HELD[path]
+            _say_recovered(path)
+            return stored
+        if _retry_held(path, held):
+            del _HELD[path]
+            _say_recovered(path)
+        return json.loads(held.text)
+
+
 def client_from_token(token_path: str | Path, *, api_key: str, app_secret: str) -> object:
     """Build a real ``schwab-py`` client from a token file, with its refreshes made safe.
 
     This is the one place this module imports ``schwab-py``, and it is imported lazily. So
     ``import lake.schwab`` and the whole unit suite run without the library installed.
 
-    Two things differ from ``schwab-py``'s own ``client_from_token_file``.
+    Three things differ from ``schwab-py``'s own ``client_from_token_file``.
 
     1. **The token is written atomically.** ``schwab-py``'s writer opens the file with
        ``open(token_path, 'w')`` and then writes into it, so the file is empty between the
        two and a reader in that moment meets a truncated token. That reader can be another
-       cycle's client, onboarding, the close+5 fill or the Sunday canary, each in its own
-       process. ``client_from_access_functions`` takes a ``token_write_func``, and this
-       passes the re-auth ritual's ``TokenWriter``: a temp file, an fsync, mode 0600, then
-       one ``os.replace``. A reader meets the old token or the new one, never part of
+       thread's client in the daemon, which builds the close+5 fill's clients too, or
+       onboarding or the Sunday canary in a process of its own.
+       ``client_from_access_functions`` takes a ``token_write_func``, and this passes a
+       subclass of the re-auth ritual's ``TokenWriter``: a temp file, an fsync, mode 0600,
+       then one ``os.replace``. A reader meets the old token or the new one, never part of
        either. The mode is set before the rename because the daemon's umask is 022, so a
        plainly created file would publish the credential readable by every account.
     2. **One refresh at a time in the process, and a waiting client adopts the file's
        token.** ``serialize_token_refresh`` carries the reasoning.
+    3. **A refresh whose write fails keeps its token in the process** (marketlake #860).
+       On a full root volume ``write_token`` raises ``ENOSPC``, and before this the error
+       raised out of the request that refreshed. That lost one request every minute,
+       usually the quote batch for every ticker, because each new client started from the
+       stale file, refreshed, and failed the write again. Now the writer keeps the token
+       and the request goes on, and ``_read_or_held`` hands the held token to every later
+       client while it is newer than the file, retrying the write each time. So a cycle on
+       a still-full disk makes no token call, and the first cycle after space is freed
+       rewrites ``token.json``. When the refresh token rotated, the request still raises.
+       ``_refresh_writer_type`` says why.
 
-    The loader is the same file read ``client_from_token_file`` does, so the client is built
-    from exactly what it built from before.
+    The price of the third is a token that lives in the process and not on disk until the
+    write lands. A restart while the disk is still full, a CI deploy included, starts from
+    the stale file and costs one refresh, or a re-auth when the refresh token rotated. It
+    also puts a write with an ``fsync`` under the process-wide lock on every client build
+    while a token is held, so a disk that hangs rather than refuses blocks every request in
+    the process each minute.
+
+    The re-login and ``token_store pull`` keep the plain writer. Their token exists nowhere
+    else, so a failed write must stay loud.
 
     ``enforce_enums=False`` lets ``get_quotes`` pass the field groups as plain strings
     rather than ``schwab-py`` ``Fields`` enum members, keeping this layer enum-agnostic.
     """
     from schwab.auth import client_from_access_functions  # lazy: real dep, live only
 
-    # Lazy too: ``lake.reauth`` imports ``lake.config`` and so ``yaml``, and the by-hand tools
-    # that import this module promise to import where ``lake.config`` is absent.
-    from lake.reauth import TokenWriter
-
+    # The refresh writer is lazy too: ``lake.reauth`` imports ``lake.config`` and so
+    # ``yaml``, and the by-hand tools that import this module promise to import where
+    # ``lake.config`` is absent.
     path = Path(token_path)
 
     def read_token() -> object:
-        return _read_token_file(path)
+        return _read_or_held(path)
 
     client = client_from_access_functions(
-        api_key, app_secret, read_token, TokenWriter(path), enforce_enums=False
+        api_key, app_secret, read_token, _refresh_writer_type()(path), enforce_enums=False
     )
     serialize_token_refresh(client.session, lambda: _adopt_stored_token(client, read_token))
     return client
@@ -779,8 +1065,9 @@ class SchwabVendor:
         runs rather than when the module was imported.
 
         ``client_from_token`` builds the client, and its docstring says what it adds to
-        ``schwab-py``'s own: an atomic token write, and one refresh at a time across every
-        client in the process. The only live callers are the daemon and the by-hand tools,
+        ``schwab-py``'s own: an atomic token write, one refresh at a time across every
+        client in the process, and a refreshed token kept in the process when its write
+        fails. The only live callers are the daemon and the by-hand tools,
         since a real call needs a real token and real credentials. The suite drives it
         against ``httpx.MockTransport`` and a temporary token file.
 
@@ -815,4 +1102,4 @@ class SchwabVendor:
         try:
             session.close()
         except Exception as exc:  # noqa: BLE001 - a close must never cost a captured cycle
-            print(f"schwab: client close failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            _say_built(lambda exc=exc: f"schwab: client close failed: {type(exc).__name__}: {exc}")

@@ -21,6 +21,7 @@ with every other test still green.
 from __future__ import annotations
 
 import builtins
+import errno
 import inspect
 import json
 import os
@@ -279,6 +280,29 @@ def test_a_failed_rename_leaves_the_previous_token_untouched(tmp_path, monkeypat
     assert json.loads(token.read_text()) == OLD_TOKEN
     # The temp file is cleaned up, so a failed re-auth leaves nothing beside the token.
     assert [p.name for p in tmp_path.iterdir()] == ["token.json"]
+
+
+def test_a_full_disk_still_fails_the_relogin_loudly(tmp_path, monkeypatch):
+    """A refresh whose write fails keeps its token and goes on (marketlake #860).
+
+    A re-login is not a refresh. Its token exists nowhere else, so a write that fails must
+    raise, and the writer must not claim the token landed.
+    """
+    from lake import schwab
+    from tests.support.full_disk import fill_disk
+
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps(OLD_TOKEN))
+    flow = RecordingFlow()
+    fill_disk(monkeypatch, errno.ENOSPC)
+
+    with pytest.raises(OSError) as raised:
+        _run(flow, token)
+    assert raised.value.errno == errno.ENOSPC
+    (writer,) = flow.writers
+    assert writer.wrote is False
+    assert json.loads(token.read_text()) == OLD_TOKEN
+    assert schwab._HELD == {}
 
 
 def test_the_write_publishes_by_renaming_the_paths_temp_file(tmp_path, monkeypatch):

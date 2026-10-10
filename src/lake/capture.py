@@ -2849,10 +2849,13 @@ def run_cycle_from_config(
     This is the thin production entry the slice-1 runner (D8) and the daemon loop (D9)
     call. It loads the machine-local config and the portable roster, builds the
     authenticated vendor from the token file, and runs the same core cycle. Every call
-    reloads all four inputs: the config, the roster, the token, and the chain plan. Nothing
-    is cached across calls. That is the per-cycle re-read the design wants, so a nightly
-    plan rewrite takes effect the next minute. A re-auth is picked up the next cycle on
-    the host whose file the re-auth rewrote. A host that receives the token through the
+    reloads all four inputs: the config, the roster, the token, and the chain plan. That is
+    the per-cycle re-read the design wants, so a nightly plan rewrite takes effect the next
+    minute. One thing does outlive a call: a refreshed token whose write to ``token.json``
+    failed, as on a full disk, which ``lake.schwab`` keeps for the process and uses while it
+    is newer than the file (marketlake #860). The file is still read every call, and a
+    re-auth's later mint time wins over the held token. A re-auth is picked up the next
+    cycle on the host whose file the re-auth rewrote. A host that receives the token through the
     token parameter picks it up the cycle after its next pull writes the file.
     The ``schwab-py`` client is built only here, lazily inside ``SchwabVendor.from_token``,
     so importing this module and running the offline suite need neither the library nor a
@@ -2871,7 +2874,8 @@ def run_cycle_from_config(
     Closing the client under it discards the response, which for a refresh is the new token.
     marketlake #633 measured that a refresh leaves the refresh token unchanged, so today
     that costs one more refresh. If Schwab ever rotated the refresh token on each refresh,
-    the file would keep one Schwab has superseded. Closing sooner would stop
+    the file would keep one Schwab has superseded, since a discarded response never reaches
+    the token writer and so is neither written nor held. Closing sooner would stop
     nothing sooner either: a probe with httpx 0.28.1 closed a client one second into a
     request, and the request still ran to its 30s read timeout. So the close waits, and an
     abandoned request's sockets close at most that long after the bound.

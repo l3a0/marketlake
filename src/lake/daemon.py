@@ -64,7 +64,11 @@ the session clock per minute, so it is the piece that stamps them.
 
 The daemon holds no expiration state and no cached plan. The production cycle runner
 reloads the config, the roster, the token, and the chain plan on every call, so a nightly
-plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
+plan rewrite takes effect the next minute and a re-auth is picked up the next cycle. The
+token is the one input that can outlive a call. A refreshed token whose write to
+``token.json`` failed stays in the process, and each cycle uses it while it is newer than
+the file (marketlake #860). A re-auth writes a later mint time, so it still wins the next
+cycle.
 
 A slow cycle never delays or shifts a later sample, because the loop never waits for one
 cycle before firing the next. A cycle ends when its own requests are done, or at the bound
@@ -1180,8 +1184,10 @@ def _idle_stamp(
 
     A capture cycle stamps its own mint time off the vendor it fetched with. Off the
     capture window no cycle runs and no client exists, so the mint comes from the token
-    file instead. That file is what the next cycle builds its client from, so the two
-    agree. The dashboard still never reads it. One timestamp crosses, never a secret.
+    file instead. The next cycle builds its client from that file, or from a refreshed
+    token this process holds when the file's write failed (marketlake #860). A refresh
+    carries the mint time over unchanged, so either way the two agree. The dashboard still
+    never reads it. One timestamp crosses, never a secret.
 
     Sunday evening is the minute this exists for. The re-auth ritual mints a fresh token
     on a day that captures nothing, and the design wants the panel showing that mint the

@@ -452,6 +452,26 @@ def _no_exec() -> Iterator[None]:
         yield
 
 
+# -- the held token ---------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_held_token() -> Iterator[None]:
+    """Start and end every test with no refreshed token held in ``lake.schwab``.
+
+    A refresh whose write fails keeps its token in a process-wide holder keyed by the token
+    path (marketlake #860). The suite is one process, so a token one test held would reach
+    the next test's client whenever two used the same path, and ``tmp_path`` names can
+    repeat across runs of a parametrized test. Autouse, because a test that forgets the
+    reset is a test that did not know the holder existed.
+    """
+    from lake import schwab
+
+    schwab.reset_held_tokens()
+    yield
+    schwab.reset_held_tokens()
+
+
 # -- the host pin -----------------------------------------------------------------------
 
 # ``control_plane.is_macos`` decides which probes the jobs wire, and it reads
