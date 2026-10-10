@@ -12,7 +12,9 @@ The roster is ``control_plane.all_jobs``, the list ``render_all`` writes one pli
 from, so a job added there is covered here with no edit. The compaction child joins it
 with the argv ``daemon.compaction_command`` builds, the token pull the daemon spawns in
 auth death with the argv ``daemon.token_pull_command`` builds, and the evening upload the
-vendor sweep execs with the argv ``sweep.evening_upload_command`` builds. Each entry runs
+vendor sweep execs with the argv ``sweep.evening_upload_command`` builds. The hosted VM's
+two pings, ``vm-up`` from its 07:40 timer and ``vm-stop`` from ``deploy/vm-stop.sh``, join
+it by hand, since neither is in ``all_jobs``. Each entry runs
 in process under ``runpy`` with the entry's own arguments, and stops at the config load,
 because the suite's config directory is an empty throwaway. That exit is the first stop
 between the entry and live work. The conftest's network and subprocess guards catch some
@@ -63,11 +65,25 @@ TOKEN_PULL = "token-pull"
 # covers the join between the flag the sweep spells and the one compaction's parser takes.
 EVENING_UPLOAD = "evening-upload"
 
+# The two pings only a systemd host starts (marketlake #868), which ``all_jobs`` does not
+# hold. The 07:40 timer's argv comes from its unit. ``deploy/vm-stop.sh`` builds the stop's
+# in bash, so it is written out here as that script runs it, with no ``--config`` since
+# the VM's units set none. ``tests/component/test_vm_stop.py`` checks the script runs it.
+VM_UP = cp.VM_UP_LABEL
+VM_STOP = "vm-stop.sh"
+SYSTEMD_HOST = cp.SystemdHost(
+    python=HOST.python, owner=HOST.owner, home="/home/someone", project_dir="/home/someone/m"
+)
+VM_UP_ARGV = cp.vm_up_job(SYSTEMD_HOST).program_arguments
+VM_STOP_ARGV = (HOST.python, "-m", "lake.control_plane", "ping", cp.VM_STOP_SLUG)
+
 # Every unattended entry, as a label and the argv it starts with.
 ENTRIES = [(job.label, job.program_arguments) for job in JOBS] + [
     (COMPACTION, tuple(daemon.compaction_command(None))),
     (TOKEN_PULL, tuple(daemon.token_pull_command(None, None))),
     (EVENING_UPLOAD, tuple(sweep.evening_upload_command(None))),
+    (VM_UP, VM_UP_ARGV),
+    (VM_STOP, VM_STOP_ARGV),
 ]
 
 # Every current entry exits at the config load in well under a second. The deadline is

@@ -12,9 +12,13 @@
 #
 # In order, it:
 #
-#   1. finds the one running instance that carries the tag, and sends nothing unless
-#      exactly one matches. It sends by instance id, because a command sent to a tag
-#      reports Success when nothing matches;
+#   1. finds the one instance that carries the tag, in the states infra/README.md's
+#      "Find the VM's address" lists, and sends nothing unless exactly one matches. A
+#      terminated instance left behind by a replacement is not counted. It sends only
+#      when that instance is running. The VM stops itself each night (#868), so a
+#      stopped or starting VM ends the run with a line that says how to start it and to
+#      re-run the workflow once it runs. It sends by instance id, because a command sent
+#      to a tag reports Success when nothing matches;
 #   2. sends the document with sha and notAfter, the send time plus 600 seconds, and a
 #      delivery timeout of the same 600 seconds. The host refuses a start after notAfter
 #      with exit 3, so a command delivered late never deploys;
@@ -95,22 +99,38 @@ error_code() {
 
 # -- 1. the instance ----------------------------------------------------------------
 
-if ! ids="$(aws ec2 describe-instances \
-  --filters "Name=tag:$DEPLOY_TAG_KEY,Values=$DEPLOY_TAG_VALUE" "Name=instance-state-name,Values=running" \
-  --query 'Reservations[].Instances[].InstanceId' --output text 2> "$WORK/err")"; then
+# Each instance comes back as its id and its state on one line.
+if ! pairs="$(aws ec2 describe-instances \
+  --filters "Name=tag:$DEPLOY_TAG_KEY,Values=$DEPLOY_TAG_VALUE" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text 2> "$WORK/err")"; then
   finish 1 "not sent: DescribeInstances failed with $(error_code)"
 fi
 set -f
-# shellcheck disable=SC2086 # the ids are split on whitespace on purpose
-set -- $ids
+# shellcheck disable=SC2086 # the pairs are split on whitespace on purpose
+set -- $pairs
 set +f
-if [[ $# -ne 1 ]]; then
-  finish 1 "not sent: $# running instances carry the tag $DEPLOY_TAG_KEY = $DEPLOY_TAG_VALUE, and a deploy needs exactly one"
+if [[ $(($# % 2)) -ne 0 ]]; then
+  finish 1 "not sent: DescribeInstances returned something that is not an instance id and its state"
+fi
+if [[ $# -ne 2 ]]; then
+  finish 1 "not sent: $(($# / 2)) instances carry the tag $DEPLOY_TAG_KEY = $DEPLOY_TAG_VALUE, and a deploy needs exactly one"
 fi
 INSTANCE="$1"
-if [[ ! "$INSTANCE" =~ ^i-[0-9a-f]+$ ]]; then
-  finish 1 "not sent: DescribeInstances returned something that is not an instance id"
+INSTANCE_STATE="$2"
+if [[ ! "$INSTANCE" =~ ^i-[0-9a-f]+$ || ! "$INSTANCE_STATE" =~ ^[a-z-]+$ ]]; then
+  finish 1 "not sent: DescribeInstances returned something that is not an instance id and its state"
 fi
+FIND="infra/README.md's \"Find the VM's address\" finds its id and state"
+START="\"Start a stopped instance\" starts it"
+case "$INSTANCE_STATE" in
+  running) ;;
+  pending)
+    finish 1 "not sent: the VM is still starting. $FIND. Re-run this workflow once it runs" ;;
+  stopping | stopped)
+    finish 1 "not sent: the VM is stopped. $FIND, and $START. Re-run this workflow once it runs" ;;
+  *)
+    finish 1 "not sent: the VM is $INSTANCE_STATE, not running. $FIND" ;;
+esac
 
 # -- 2. the send --------------------------------------------------------------------
 

@@ -36,7 +36,11 @@ To read a trimmed range, the reading restore brings it from the bucket into a di
 outside the live lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
 A merge to `main` reaches the VM through `.github/workflows/deploy.yml`, which asks the VM
 to deploy the commit once the owner approves the run
-([#676](https://github.com/l3a0/marketlake/issues/676)).
+([#676](https://github.com/l3a0/marketlake/issues/676)). The VM can power itself off once
+each day's work is done, through `deploy/vm-stop.sh` every 10 minutes, and does so only
+once the owner creates its switch file
+([#868](https://github.com/l3a0/marketlake/issues/868)). The schedule that starts it again
+each morning is [#867](https://github.com/l3a0/marketlake/issues/867).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
@@ -118,12 +122,18 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `deploy/vm-deploy.sh` deploys one commit on `main` to the VM: outside the jobs' hours
   and forward only, it runs the bootstrap, restarts the daemon when that is owed, and
   rolls back a restart that does not hold.
+- `deploy/busy-check.sh` holds the check, sourced by the deploy and the stop, that says
+  whether a scheduled job or a compaction is running on the VM.
+- `deploy/vm-stop.sh` powers the VM off once the day's work is done. Its systemd timer runs
+  it every 10 minutes, and it stops the VM only when its switch file exists, the VM has
+  been up an hour, no one is at a terminal, nothing is busy, the scheduled jobs' hours
+  allow it and no deploy runs.
 - `deploy/send-deploy.sh` runs on a GitHub runner for `.github/workflows/deploy.yml`. It
   sends the VM the deploy document for one commit, waits for the result, and prints only a
-  summary, because the repository's logs are public.
+  summary, because the repository's logs are public. It says so when the VM is stopped.
 - `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
-  It refuses unless the lake volume is mounted, `role` is `shadow`, every unit is
-  stopped and nothing is mounted below the lake root.
+  It refuses unless the lake volume is mounted, `role` is `shadow`, every
+  `com.marketlake.*` unit is stopped and nothing is mounted below the lake root.
 - `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
   and `python -m lake.roster apply` copies it onto a host.
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
@@ -265,7 +275,11 @@ by mistake, refuses with one line naming both fixes: attach the instance profile
 Seven commands go with the bucket. The first two and the range restore refuse with exit 2 on
 a shadow host, which is any host whose config sets `role` to something other than `primary`.
 The restore, command 3, the resync, command 5, and the reading restore, command 6, run on
-either.
+either. On the hosted VM, which stops itself once the day's work is done, start it first if
+it is stopped and remove the stop's switch before running any of these, then create it
+again after, as
+[The nightly stop](infra/README.md#the-nightly-stop) in the infrastructure runbook says.
+A command run by hand is not a unit the stop can see.
 
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
@@ -740,6 +754,16 @@ it uses only the SSH port the VM already allows from the owner's address. The de
 dashboard section carries the reasoning, and
 [#637](https://github.com/l3a0/marketlake/issues/637) carries the plan.
 
+The VM stops itself once each day's work is done
+([#868](https://github.com/l3a0/marketlake/issues/868)), so once its switch is on the
+dashboard is dark from about 19:00 ET on a weeknight until the VM starts again. With
+[#867](https://github.com/l3a0/marketlake/issues/867)'s schedule applied, that is 07:30 the
+next weekday, and the VM is dark over the weekend except while Sunday's maintenance job
+runs, from 19:30 to about 23:40. An open forward does not hold the VM up, because
+`ssh -N` opens no terminal, so `who` on the VM does not list it. Each start brings a new
+public address, which [Find the VM's address](infra/README.md#find-the-vms-address)
+prints.
+
 Nothing is installed on the VM for this. The forward needs only a running dashboard and
 the SSH port. The dashboard runs on the VM under its systemd unit,
 `com.marketlake.dashboard.service`, which the Linux install places. While it is down
@@ -775,13 +799,16 @@ host name:
 ```text
 Host marketlake-vm
     HostName <vm address>
+    HostKeyAlias marketlake-vm
     User <vm user>
     LocalForward 127.0.0.1:8766 127.0.0.1:8765
     ExitOnForwardFailure yes
     ServerAliveInterval 15
 ```
 
-`ssh -N marketlake-vm` then opens it.
+`ssh -N marketlake-vm` then opens it. `HostKeyAlias` files the VM's host key under the
+entry's name rather than its address, so the address that changes at every start asks
+nothing new. Update `HostName` after each start.
 
 When the dashboard is not running on the VM, ssh prints `channel N: open failed: connect
 failed: Connection refused` once for each connection the browser opens. A page already

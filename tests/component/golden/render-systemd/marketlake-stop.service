@@ -1,0 +1,13 @@
+# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,
+# not this file: the install entry point renders afresh on every run.
+
+[Unit]
+Description=marketlake-stop
+RequiresMountsFor=/srv/lake
+
+[Service]
+Type=oneshot
+ExecStart=/home/someone/marketlake/deploy/vm-stop.sh
+TimeoutStartSec=5min
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle

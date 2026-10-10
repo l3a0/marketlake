@@ -388,7 +388,8 @@ def test_every_publisher_takes_its_secrets_from_page_secrets():
         "sweep.py",
     ):
         assert expected in files
-    assert sum(name == "control_plane.py" for name, _, _ in sites) == 2
+    # The self-check, the Sunday job and the ping entry (#868).
+    assert sum(name == "control_plane.py" for name, _, _ in sites) == 3
     for name, line, call in sites:
         secrets = [kw.value for kw in call.keywords if kw.arg == "secrets"]
         assert len(secrets) == 1, f"{name}:{line} passes no secrets"

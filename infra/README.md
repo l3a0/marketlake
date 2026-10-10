@@ -640,7 +640,10 @@ from the laptop under the admin profile. Three things set this apply apart from 
 
 With no approval gate, two rules that an approval would enforce fall to the owner. Once
 the VM exists, start it if it is stopped, as in
-[Start a stopped instance](#start-a-stopped-instance), before running any plan. Never
+[Start a stopped instance](#start-a-stopped-instance), before running any plan. A started
+VM gets an hour before it may stop again, so remove the switch, as
+[The nightly stop](#the-nightly-stop) says, when the work may take longer, and create it
+again after. Never
 apply between 09:25 and 16:15 ET on a session day, the window
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
 sets for CI's apply.
@@ -715,7 +718,11 @@ AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live
 ## Changing the bootstrap
 
 Apply any later change to `infra/bootstrap/*.tf` from the laptop first, as in
-step 7, then approve its live apply. Apply it only from the bootstrap pull
+step 7, then approve its live apply. The live apply needs the VM running, so start it
+first if it is stopped, as in [Start a stopped instance](#start-a-stopped-instance). A
+started VM gets an hour before it may stop again. Remove the switch, as
+[The nightly stop](#the-nightly-stop) says, when the plan and the apply may take longer,
+and create it again after. Apply it only from the bootstrap pull
 request's branch at its final head, and only when its plan changes nothing that pull
 request does not change. Every checkout reads the same backend file in
 `~/.config/marketlake/infra/`, so a checkout that predates a merged change plans that
@@ -1436,6 +1443,10 @@ same evening as the first boot.
 
 `deploy/vm-bootstrap.sh` can run again at any time, as root, over SSH. Each step skips
 work that is already done, so a second run under the same conditions changes nothing.
+Start the VM first if it is stopped, as in
+[Start a stopped instance](#start-a-stopped-instance), and remove the switch that lets it
+stop, as [The nightly stop](#the-nightly-stop) says. Create the switch again once the run
+has ended.
 
 ```bash
 sudo ~/marketlake/deploy/vm-bootstrap.sh
@@ -1673,8 +1684,10 @@ sudo ~/.local/state/marketlake/systemd/restart.sh all
 
 **Before stopping the daemon on purpose**, such as for the resync of
 [#832](https://github.com/l3a0/marketlake/issues/832) or the switch back of
-[#638](https://github.com/l3a0/marketlake/issues/638), check that no deploy is running,
-and wait while this prints `active`.
+[#638](https://github.com/l3a0/marketlake/issues/638), start the VM if it is stopped and
+remove the switch that lets it stop, as [The nightly stop](#the-nightly-stop) says, and
+create it again once the work has ended. A resync runs by hand, so the stop cannot see it.
+Then check that no deploy is running, and wait while this prints `active`.
 
 ```bash
 systemctl is-active marketlake-deploy
@@ -1688,8 +1701,10 @@ and that starts a stopped daemon again.
 A restore is not part of the first boot. The shadow day captures beside the laptop and
 needs no history. [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover filled the
 VM's lake by emptying the shadow lake with `deploy/vm-empty-shadow-lake.sh` and then
-restoring from the bucket. Four facts hold for any
-restore onto the VM.
+restoring from the bucket. Start the VM first if it is stopped, and remove the switch that
+lets it stop, as [The nightly stop](#the-nightly-stop) says, because a restore is not a
+unit the stop can see. Create the switch again once the restore and the bootstrap rerun
+after it have ended. Four facts hold for any restore onto the VM.
 
 1. The instance role reads the bucket from the first boot, so `bucket restore` runs on
    the VM through its instance profile, with no stored key.
@@ -1743,8 +1758,10 @@ check and writes the roster. The daemon then takes the lake lock, which creates
 `manifest.jsonl`, writes `journal/metadata.json` every idle minute, and writes outbox
 lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of that.
 
-1. Once `systemctl is-active marketlake-deploy` prints `inactive`, stop every unit,
-   timers included. A deploy that is running would start them again.
+1. Once `systemctl is-active marketlake-deploy` prints `inactive`, stop every
+   `com.marketlake.*` unit, timers included. A deploy that is running would start them
+   again. The stop's own `marketlake-*` units keep running, and cannot power the VM off
+   while the switch is removed, as this section's opening paragraph says.
 
    ```bash
    sudo systemctl stop 'com.marketlake.*'
@@ -1791,8 +1808,12 @@ session makes that night's re-tune skip the day.
 
 ### Start a stopped instance
 
-A stopped instance captures nothing, and AWS takes back its public address. Before
-approving any apply, start a stopped instance and wait for it to run. A plan of a stopped
+A stopped instance captures nothing, and AWS takes back its public address. The VM stops
+itself every night, as [The nightly stop](#the-nightly-stop) says, so outside the hours it
+runs it is usually stopped. Before approving any apply, start a stopped instance and wait
+for it to run. A VM started by hand gets an hour before the stop may power it off again.
+For work that may take longer, remove the switch, as
+[The nightly stop](#the-nightly-stop) says, and create it again after. A plan of a stopped
 instance reads it with no public address, and only the `ignore_changes` entry for that
 address keeps the plan from replacing the instance and its root volume. Starting it
 first means no plan depends on that one entry.
@@ -1903,12 +1924,205 @@ carries no such tag, so it never appears here.
 aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]' --output text --profile marketlake-admin --region us-east-1
 ```
 
+Since the VM stops each night, as [The nightly stop](#the-nightly-stop) says, the address
+changes every morning. The roles that may call `ec2:DescribeInstances`, the deploy role
+and the plan and apply roles through `ReadOnlyAccess`, can be assumed only from CI, and the
+laptop's `marketlake-command` user holds no EC2 action. So each lookup and each hand start
+takes an admin session. A narrow grant to a principal that is not an admin is deferred to
+[#866](https://github.com/l3a0/marketlake/issues/866).
+
 A new address goes in the `HostName` of the laptop's `~/.ssh/config` entry, which the
 root README's
 [Reach the dashboard on a hosted VM](../README.md#reach-the-dashboard-on-a-hosted-vm)
-shows. That entry names no key, so add `IdentityFile ~/.ssh/marketlake_vm` to it. A
-replacement also brings a new host key. When ssh refuses an address because a different
-key was seen there before, clear the old key with `ssh-keygen -R "<vm-address>"`.
+shows. That entry names no key, so add `IdentityFile ~/.ssh/marketlake_vm` to it. It also
+sets `HostKeyAlias`, so ssh files the host key under the entry's name rather than the
+address. A new address then asks nothing, and an address AWS hands out again does not warn
+that its key changed. A replacement brings a new host key. When ssh refuses the entry
+because a different key was seen before, clear the old key with
+`ssh-keygen -R marketlake-vm`, the alias the entry names.
+
+### The nightly stop
+
+The VM costs about $19.6 a month running around the clock, while capture and its jobs need
+it for about 62 to 68 of the week's 168 hours. So it powers itself off once the day's work
+is done ([#865](https://github.com/l3a0/marketlake/issues/865)). The stop is
+[#868](https://github.com/l3a0/marketlake/issues/868)'s. The start is
+[#867](https://github.com/l3a0/marketlake/issues/867)'s, a schedule in AWS that starts the
+VM at 07:30 ET each weekday, holidays included, and at 19:30 ET each Sunday, built in
+[PR #870](https://github.com/l3a0/marketlake/pull/870). Until that schedule is applied,
+nothing starts a stopped VM, which is why turning the stop on waits for it. The price is
+a new way to lose the open: capture now depends on a start succeeding every weekday
+morning, which the `vm-up` check below watches.
+
+`marketlake-stop.timer` runs `deploy/vm-stop.sh` as root every 10 minutes. The script
+powers the VM off only when all six of its checks pass, in this order.
+
+1. **switch.** `/etc/marketlake/stop-when-idle` exists.
+2. **uptime.** The VM has been up at least an hour, so a VM started by hand for a deploy
+   or an apply gets that hour, and only that hour. Remove the switch for longer work.
+3. **terminal.** `who` lists no login, and no login session is `closing`. sshd records a
+   login where `who` reads it only when the login has a terminal, so an interactive SSH
+   login holds the VM up and the dashboard's tunnel, `ssh -N -L`, does not. logind cannot
+   tell those two apart, because systemd 255 records no terminal for an SSH session. A
+   command left running after logout keeps its session `closing`. A command run over SSM,
+   or as `ssh <vm> <command>`, opens no terminal either, so remove the switch first for
+   work run that way.
+4. **busy.** No `com.marketlake.*` job is running and no compaction runs in the daemon's
+   cgroup. The deploy runs the same check, from `deploy/busy-check.sh`. It covers the
+   close+15 compaction and its trim, the 18:30 sweep and the evening upload after it.
+5. **window.** `python -m lake.deploy_window` allows a start now, which keeps the stop out
+   of 08:00 to 18:45 ET on a weekday and 19:30 to 23:30 ET on Sunday, and out of the 210
+   minutes before each.
+6. **deploy.** `marketlake-deploy.service` is not running. The script then takes the deploy
+   lock and the install lock without waiting, checks the deploy again, and holds both
+   locks through the poweroff.
+
+When every check passes, it pings `vm-stop` and runs `systemctl poweroff`, whatever the
+ping returned. That command can return before the poweroff starts, while logind waits up
+to 30 seconds for a program such as the unattended upgrade to finish. So the script keeps
+both locks and waits up to 240 seconds for the poweroff, and if none comes it ends on an
+error line saying so. A weekday usually stops between 18:50 and 19:00, at the first run
+after the evening upload, and an upload that uses its whole budget moves that to about
+20:20. A Sunday stops after 23:30.
+
+Each run prints one line saying why it kept the VM up, or what it did. A line that starts
+`vm-stop: staying up, check <n> (<name>):` is a routine refusal. A line that starts
+`vm-stop: error` means a check could not tell, and the unit reads failed. Read the runs in
+Eastern time.
+
+```bash
+TZ=America/New_York journalctl -u marketlake-stop
+```
+
+After a morning start, the run that powered the VM off sits in the previous boot's journal.
+
+```bash
+TZ=America/New_York journalctl -u marketlake-stop -b -1
+```
+
+**Turn the stop on** only once the start schedule is applied, or nothing starts the VM
+again. The schedule is [#867](https://github.com/l3a0/marketlake/issues/867)'s, and its
+section, "The start schedule", arrives with
+[PR #870](https://github.com/l3a0/marketlake/pull/870). Wait until that section's
+CloudTrail check has shown the schedule's `StartInstances`. Then create the switch, and
+log out, since an open terminal holds the VM up.
+
+```bash
+sudo touch /etc/marketlake/stop-when-idle
+```
+
+Before logging out, run `who`. It should list only this login, since any other login
+listed holds the VM up too.
+
+**Keep the VM up** for longer work by removing the switch, and create it again after. Only
+the first boot's shim writes `/etc/marketlake/`, and cloud-init runs it once, so a removed
+switch stays removed across deploys and reboots. A rebuilt VM has no switch until the owner
+creates one, so it stays up and `vm-stop` pages that night.
+
+```bash
+sudo rm -f /etc/marketlake/stop-when-idle
+```
+
+**Roll back** by removing the switch, then pausing `vm-stop` in healthchecks.
+`sudo systemctl disable --now marketlake-stop.timer` does not last, because the next
+deploy's install enables every timer again.
+
+#### The two checks
+
+Two healthchecks checks watch the stop and the start. Both are fed through
+`python -m lake.control_plane ping`, which accepts these two slugs and no other.
+
+| Check | Fed by | Schedule, `America/New_York` | Grace | Routing |
+| --- | --- | --- | --- | --- |
+| `vm-up` | `marketlake-up.timer`, at 07:40 each weekday | OnCalendar `Mon..Fri 07:35` | 15 minutes | Every integration |
+| `vm-stop` | `deploy/vm-stop.sh`, just before the poweroff | OnCalendar `Mon..Fri 18:45` and `Sun 23:30`, two lines on one check | 4 hours | Email only, recommended |
+
+healthchecks measures each deadline from the last ping, so the 07:40 ping counts for that
+morning's 07:35 slot, and the night's stop counts for that evening's slot. A check that was
+never pinged stays `new` and never pages. So press Ping Now on each check only once the
+thing that feeds it is live: `vm-up` after the deploy that installs its timer, and
+`vm-stop` on the day the switch is created. Pressed earlier, a check pages every morning or
+night until then.
+
+Every failure that only `vm-stop` catches costs about $0.02 an hour, since a hung job is
+already paged by `eod-sweep`, `evening-upload` or `sunday`. So the recommendation, the
+owner's to set, is to route `vm-stop` to email only, so a cost alarm does not train the
+owner to ignore pages. A check created in the healthchecks UI gets every integration, so
+switch ntfy off on `vm-stop` by hand. A ping healthchecks refuses, such as a 404 for a
+check that was never created or is misnamed, pages through ntfy for either check, because
+then the alarm itself is broken.
+
+A shadow VM writes both pings to its outbox rather than sending them, like every other
+ping. Pause both checks for the length of a shadow run, such as
+[#638](https://github.com/l3a0/marketlake/issues/638)'s switch-back rehearsal, and create
+the switch only once the VM is primary again.
+
+#### When `vm-up` pages
+
+`vm-up` pages at about 07:50 when the 07:40 ping did not arrive. `pre-open` and `capture`
+then page at about 08:35, and the first captured minute is at 09:30, which leaves about
+100 minutes to start the VM by hand.
+
+1. Find the instance and its state with [Find the VM's address](#find-the-vms-address).
+2. When it is `stopped`, run [Start a stopped instance](#start-a-stopped-instance). When
+   the start fails on capacity, see the next section. When it is `pending`, it is already
+   starting, so wait for it to read `running` and go on.
+3. When it is `running` and SSH answers, run `findmnt /srv/marketlake` and `uptime -s`.
+   1. When `findmnt` prints the mount and `uptime -s` shows a boot after 07:40, the start
+      was late and only the page is wrong. The VM is up with its lake, and the 07:40 timer
+      replays nothing on purpose, so press Ping Now on `vm-up` to clear the page.
+   2. When `findmnt` prints nothing, the volume did not mount. Follow
+      [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4).
+   3. When it prints the mount and the boot is before 07:40, the cause is the unit.
+      `journalctl -u marketlake-up` shows a ping that ran and failed.
+4. When it is `running` and SSH does not answer, read the console.
+
+   ```bash
+   aws ec2 get-console-output --instance-id "<instance-id>" --latest --output text --profile marketlake-admin --region us-east-1
+   ```
+
+   Each daily boot now loads any kernel the unattended upgrade installed, which used to
+   wait for a deliberate reboot, so a boot that hangs is new exposure.
+
+A start after 08:30 also pages `pre-open`, because that timer replays no missed run on
+purpose.
+
+#### When a start fails on capacity
+
+AWS refuses a start with `InsufficientInstanceCapacity` when the zone has no `t4g.small` to
+give. The zone is fixed, because the lake volume lives in `us-east-1c`, so the fast
+fallback is another arm64 type in the same zone. Change the type by hand while the
+instance is stopped, then start it.
+
+```bash
+aws ec2 modify-instance-attribute --instance-id "<instance-id>" --instance-type Value=t4g.medium --profile marketlake-admin --region us-east-1
+```
+
+The image is arm64, so the type must be too, such as `t4g.medium` or `m7g.medium`. The
+price is drift from `instance_type` in `infra/live/`, which the next apply reverts with a
+stop and a start. Approve that apply outside the hours in
+[Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window).
+
+#### When `vm-stop` pages
+
+`vm-stop` pages by about 22:45 on a weekday with no stop, and by about 03:30 Monday after a
+Sunday with none. Read the evening's runs with the `journalctl -u marketlake-stop` command
+above. Each refusal names its check, so act on the last one before the page.
+
+- **switch.** The switch was removed and not created again. Create it, unless it was left
+  removed on purpose.
+- **terminal.** A login stayed open. Log out. `who` lists the logins. A `closing`
+  session is a command left running after logout, and `loginctl list-sessions` lists the
+  sessions.
+- **busy.** A job ran long. Read its own journal, such as
+  `journalctl -u com.marketlake.eod-sweep`. Its own check pages if it failed.
+- **window.** Every run read the refused hours. That is expected before 18:45 on a weekday
+  and before 23:30 on Sunday. After them, check the VM's clock with `timedatectl`.
+- **deploy.** A deploy ran or held a lock. `systemctl is-active marketlake-deploy` prints
+  `active` while one runs.
+- **An error line.** The named check could not tell, such as a `who`, `loginctl` or
+  `systemctl` that failed. Fix the cause it names. An error on check `poweroff` means
+  `systemctl poweroff` failed, or returned and no poweroff came within 240 seconds.
 
 ### The duplicate-name check
 
@@ -2033,10 +2247,20 @@ The run takes four steps.
 2. It skips, with a green summary, when `main` has moved past the run's commit. The newer
    commit's own run deploys it.
 3. It assumes `marketlake-deploy` through OIDC.
-4. It runs `deploy/send-deploy.sh`. The script finds the one running instance tagged
-   `marketlake:host = capture`, sends it the SSM document `marketlake-deploy` with the
-   commit and a ten-minute delivery window, waits for the command to end, and prints one
-   summary.
+4. It runs `deploy/send-deploy.sh`. The script finds the one instance tagged
+   `marketlake:host = capture` in the states
+   [Find the VM's address](#find-the-vms-address) lists. When that instance is running,
+   the script sends it the SSM document `marketlake-deploy` with the commit and a
+   ten-minute delivery window, waits for the command to end, and prints one summary.
+
+The VM stops itself once each day's work is done, as [The nightly stop](#the-nightly-stop)
+says, so a deploy approved in the evening or at the weekend can find it stopped. The run
+then sends nothing and ends on a line that says so. Find the instance's id with
+[Find the VM's address](#find-the-vms-address), start it with
+[Start a stopped instance](#start-a-stopped-instance), and re-run the job once it runs.
+The started VM gets an hour before the stop considers it, and a deploy that starts inside
+that hour holds it up until the deploy ends. For longer work, remove the switch as that
+section says.
 
 The VM, not the moment of approval, decides whether a deploy is safe. An approval during
 the hours it refuses fails the run with exit 3 and names the time a deploy may start. A
@@ -2053,7 +2277,9 @@ The repository is public, so the run's log and its summary show only the summary
 | `not delivered, so re-run` | 1 | The command never reached the VM, for example while the SSM agent was down. Re-run the job. |
 | `not started` | 1 | The command was cancelled before it started. |
 | `outcome unknown: ...` | 1 | Compare `HEAD` with `/var/lib/marketlake/deployed` on the VM, and read `deploy.log`. When they differ, re-run the deploy for `HEAD`. |
-| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of running instances with the tag when it is not exactly one, or a `DescribeInstances` reply that is not an instance id. |
+| `not sent: the VM is stopped. ...` | 1 | The VM stopped itself for the night. Start it as the line says, then re-run the job once it runs. |
+| `not sent: the VM is still starting. ...` | 1 | Wait for it to run, then re-run the job. |
+| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of instances with the tag when it is not exactly one, or a `DescribeInstances` reply that is not an instance id and its state. |
 
 ### The `deploy` environment and its secret
 

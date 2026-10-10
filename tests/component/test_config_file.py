@@ -174,6 +174,8 @@ def test_input_errors_exit_lets_every_other_exception_through():
         ("lake.dashboard", ["--config", "MISSING"]),
         ("lake.probe_calendar", ["--config", "MISSING"]),
         ("lake.control_plane", ["sunday", "--config", "MISSING"]),
+        ("lake.control_plane", ["ping", "vm-up", "--config", "MISSING"]),
+        ("lake.control_plane", ["ping", "vm-stop", "--config", "MISSING"]),
         ("lake.schema_versions", ["--config", "MISSING"]),
         ("lake.bucket", ["first-upload", "--config", "MISSING"]),
     ],

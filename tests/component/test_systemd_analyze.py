@@ -9,7 +9,8 @@ skips where it is absent and fails where it is absent under ``CI``, through
 1. ``verify`` reads every unit. It fails on an ``ExecStart=`` binary that does not exist,
    so the render uses this test's own interpreter and a checkout and home under
    ``tmp_path``. ``--recursive-errors=no`` keeps it to these units, and without it a
-   misplaced key exits 0. ``--man=no`` skips the man-page lookup.
+   misplaced key exits 0. ``--man=no`` skips the man-page lookup. The stop's unit runs
+   the checkout's ``deploy/vm-stop.sh``, so the checkout holds an executable file there.
 2. ``calendar`` computes each timer's next elapses under an explicit ``TZ`` across the
    2026-11-01 clock change, and every one must land on the job's Eastern wall-clock time.
 
@@ -42,6 +43,10 @@ def test_systemd_reads_every_rendered_unit(tmp_path):
     lake = tmp_path / "lake"
     for path in (checkout, home, lake):
         path.mkdir()
+    stop = checkout / cp.STOP_SCRIPT
+    stop.parent.mkdir()
+    stop.write_text("#!/bin/bash\n")
+    stop.chmod(0o755)
     out = tmp_path / "out"
     args = [
         "render",
@@ -62,7 +67,7 @@ def test_systemd_reads_every_rendered_unit(tmp_path):
     ]
     assert cp.main(args) == 0
     units = sorted(str(path) for path in out.iterdir() if path.suffix in (".service", ".timer"))
-    assert len(units) == 10, units
+    assert len(units) == 14, units
     proc = subprocess.run(
         [tool, "verify", "--recursive-errors=no", "--man=no", *units],
         capture_output=True,
@@ -96,12 +101,15 @@ _EASTERN_STANDARD = timedelta(hours=-5)
         (cp.EOD_SWEEP_LABEL, "2026-10-29 00:00:00 UTC", 6),
         # 25 October in daylight time, then 1 and 8 November in standard time.
         (cp.SUNDAY_LABEL, "2026-10-20 00:00:00 UTC", 3),
+        # The hosted VM's morning ping, a systemd-only unit (#868).
+        (cp.VM_UP_LABEL, "2026-10-29 00:00:00 UTC", 6),
     ],
 )
 def test_each_timer_keeps_its_eastern_time_across_the_clock_change(label, base, iterations):
     tool = require_tool(ANALYZE)
     host = cp.SystemdHost(python="/py", owner="someone", home="/h", project_dir="/p")
-    (unit,) = [unit for unit in cp.systemd_units(host) if unit.label == label]
+    timed = [*cp.systemd_units(host), cp.vm_up_job(host)]
+    (unit,) = [unit for unit in timed if unit.label == label]
     assert unit.schedule is not None
     proc = subprocess.run(
         [

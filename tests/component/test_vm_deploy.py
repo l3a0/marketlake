@@ -47,6 +47,7 @@ from tests.support.fake_systemd import NEXT_RC, install_deploy_fakes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VM_DEPLOY = REPO_ROOT / "deploy" / "vm-deploy.sh"
+BUSY_CHECK = REPO_ROOT / "deploy" / "busy-check.sh"
 
 OWNER = "someone"
 VOLUME_ID = "vol-0123456789abcdef0"
@@ -193,6 +194,7 @@ def build_tools(shared: Path) -> Tools:
         assert found is not None, name
         (system / name).symlink_to(found)
     (shared / VM_DEPLOY.name).symlink_to(VM_DEPLOY)
+    (shared / BUSY_CHECK.name).symlink_to(BUSY_CHECK)
     install(shared / "vm-bootstrap.sh", FAKE_BOOTSTRAP)
     install(shared / "python", FAKE_VENV_PYTHON)
     install(shared / "restart.sh", FAKE_RESTART_SH)
@@ -205,6 +207,8 @@ def build_tools(shared: Path) -> Tools:
     deploy = seed / "deploy"
     deploy.mkdir()
     (deploy / VM_DEPLOY.name).symlink_to(shared / VM_DEPLOY.name)
+    # The script sources the busy check from beside itself, as it does on the VM.
+    (deploy / BUSY_CHECK.name).symlink_to(shared / BUSY_CHECK.name)
     (deploy / "vm-bootstrap.sh").symlink_to(shared / "vm-bootstrap.sh")
     commits = {}
     for name in ("c1", "c2", "c3"):
@@ -420,8 +424,9 @@ def test_every_executable_is_a_link_to_the_dispatcher_or_the_script(tools, vm):
     assert shared["systemd-run"] == dispatcher().resolve()
     assert "git" not in shared
     assert checked_links(tools.path / "needrestart") == {"needrestart": dispatcher().resolve()}
-    own = checked_links(vm.checkout / "deploy", VM_DEPLOY)
+    own = checked_links(vm.checkout / "deploy", VM_DEPLOY, BUSY_CHECK)
     assert own[VM_DEPLOY.name] == VM_DEPLOY.resolve()
+    assert own[BUSY_CHECK.name] == BUSY_CHECK.resolve()
     assert own["vm-bootstrap.sh"] == dispatcher().resolve()
     assert checked_links(vm.home / ".local")["state/marketlake/systemd/restart.sh"] == (
         dispatcher().resolve()
@@ -438,6 +443,15 @@ def test_the_script_is_tracked_executable():
     ).stdout
     assert staged.split()[0] == "100755", staged
     assert os.access(VM_DEPLOY, os.X_OK)
+
+
+def test_a_missing_busy_check_stops_the_deploy_before_anything_moves(vm):
+    (vm.checkout / "deploy" / BUSY_CHECK.name).unlink()
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: could not read deploy/busy-check.sh"
+    _assert_untouched(vm)
+    assert not vm.ran(f"sudo -u {OWNER} -H {vm.checkout}/.venv/bin/python")
 
 
 # -- the caps --------------------------------------------------------------------------
@@ -1163,6 +1177,21 @@ def test_a_running_timer_service_refuses_the_deploy(vm):
     proc = vm.deploy(vm.c["c2"])
     assert proc.returncode == 3, proc.stdout + proc.stderr
     assert _outcome(proc) == f"not deployed: {SWEEP} is activating"
+    _assert_untouched(vm)
+
+
+@pytest.mark.parametrize(
+    "states",
+    ["deactivating stop-sigterm", "reloading reload"],
+    ids=["deactivating", "reloading"],
+)
+def test_a_timer_service_stopping_or_reloading_refuses_the_deploy(vm, states):
+    """A job that is stopping still has processes alive, so only inactive and failed pass."""
+    (vm.state / "unit-state").mkdir(exist_ok=True)
+    (vm.state / "unit-state" / SWEEP).write_text(states)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: {SWEEP} is {states.split()[0]}"
     _assert_untouched(vm)
 
 

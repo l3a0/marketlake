@@ -55,21 +55,23 @@ Terms, glossed at first use.
   assertion* adds the token's lifetime to the mint and requires the sum to clear the
   week's last option close.
 
-Nine operational wall-clock times live here as named integer constants, in order. They
+Ten operational wall-clock times live here as named integer constants, in order. They
 are not session times. The session times come from the calendar. These are the moments
 the design pins to the machine's clock, so launchd, systemd timers and pmset can fire
 them.
 
-1. The 08:25 weekday firmware wake.
-2. The 08:30 weekday pre-open self-check.
-3. The 09:35 weekday says-closed-but-open calendar probe.
-4. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
-5. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
-6. The 19:55 Sunday one-shot wake.
-7. The 20:00 Sunday canary and maintenance job.
-8. The 23:00 Sunday canary cutoff, the last retry the canary attempts.
-9. The 23:30 Sunday assertion end, the ``sunday`` check's deadline. It sits half an hour
-   past the cutoff so the last retry finishes inside the power assertion.
+1. The 07:40 weekday ``vm-up`` ping, on a systemd host only, which proves the hosted VM
+   started that morning.
+2. The 08:25 weekday firmware wake.
+3. The 08:30 weekday pre-open self-check.
+4. The 09:35 weekday says-closed-but-open calendar probe.
+5. The 18:30 weekday vendor sweep, whose Friday run sets the Sunday one-shot.
+6. The weekday assertion end near 18:45, when the vendor sweep's ping lands.
+7. The 19:55 Sunday one-shot wake.
+8. The 20:00 Sunday canary and maintenance job.
+9. The 23:00 Sunday canary cutoff, the last retry the canary attempts.
+10. The 23:30 Sunday assertion end, the ``sunday`` check's deadline. It sits half an hour
+    past the cutoff so the last retry finishes inside the power assertion.
 
 The re-auth reminder's hours derive from the last two rather than adding constants of
 their own. Every one of these is a pair of integers, never a ``"HH:MM"`` string, so
@@ -214,6 +216,7 @@ class Schedule:
 # The operational wall-clock times, per the design's deployment section. These are
 # machine-clock moments, not session times. launchd, systemd timers and pmset can only
 # fire on the wall clock, so the design pins them there.
+VM_UP_PING = WallClockTime(7, 40)  # the hosted VM's morning ping, Mon-Fri, systemd only
 WEEKDAY_WAKE = WallClockTime(8, 25)  # pmset repeat wakeorpoweron MTWRF
 PRE_OPEN_SELF_CHECK = WallClockTime(8, 30)  # the self-check job, Mon-Fri
 CALENDAR_PROBE = WallClockTime(9, 35)  # the says-closed-but-open probe, Mon-Fri
@@ -315,9 +318,32 @@ EOD_SWEEP_SLUG = "eod-sweep"
 # ``lake.compact`` imports it back and re-exports it beside ``COMPACTION_SLUG``.
 EVENING_UPLOAD_SLUG = "evening-upload"
 
+# The two checks only a systemd host feeds (marketlake #868). ``vm-up`` is pinged by the
+# 07:40 weekday timer, so a VM that did not start that morning pages. ``vm-stop`` is pinged
+# by ``deploy/vm-stop.sh`` just before it powers the VM off, so a VM that never stopped
+# pages. Both go through ``python -m lake.control_plane ping``, which accepts these two
+# slugs and no other, so it cannot feed a check some other job owns.
+VM_UP_SLUG = "vm-up"
+VM_STOP_SLUG = "vm-stop"
+
+
+def vm_power_slugs() -> tuple[str, ...]:
+    """The two checks the hosted VM's stop and morning ping feed, systemd hosts only.
+
+    They stay out of :func:`live_check_slugs`, which the launchd install's arming block and
+    its uninstall warning read, because a laptop feeds neither and would be told to press
+    checks it never pings. The systemd uninstall's warning names them from here. A
+    function, for the reason ``live_check_slugs`` gives.
+    """
+    return (VM_UP_SLUG, VM_STOP_SLUG)
+
 
 def live_check_slugs() -> tuple[str, ...]:
-    """Every live dead-man check, in the order the first install presses them.
+    """Every live dead-man check that a job on either host feeds, in the order the first
+    install presses them.
+
+    The hosted VM's two systemd-only checks, ``vm-up`` and ``vm-stop``, are not here. They
+    come from :func:`vm_power_slugs`, since a laptop feeds neither.
 
     ``capture`` leads because inside the capture window its deadline is five minutes away,
     while every other deadline here is hours or days out.
@@ -363,6 +389,16 @@ _NUMBER_WORDS = (
     "eight",
     "nine",
     "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
 )
 
 
@@ -375,11 +411,11 @@ def _spelled(count: int) -> str:
     take the whole render down, and the third would take down the install text the
     operator pastes from. Either way it is over the spelling of one word.
 
-    The words stop at ten, because the systemd render counts ten unit files. The design's
-    check budget is larger: it puts the per-job check pattern "well inside the free tier's
-    20-check allowance". An eleventh check is a thing this project expects to have one
-    day, and reading "Pause all 11 from healthchecks" is a smaller cost than a renderer
-    that will not run.
+    The words stop at twenty, the design's check budget: it puts the per-job check pattern
+    "well inside the free tier's 20-check allowance". The systemd render counts fourteen
+    unit files and nine checks, so both read as words. A count past twenty is a thing this
+    project may reach one day, and reading "removes the 21 units" is a smaller cost than a
+    renderer that will not run.
     """
     if 0 <= count < len(_NUMBER_WORDS):
         return _NUMBER_WORDS[count]
@@ -431,8 +467,8 @@ RESTART_SCRIPT_FILE = "restart.sh"
 # terminal, so pointing launchd at it fails fast rather than hanging on the callback.
 REAUTH_SCRIPT_FILE = "reauth.sh"
 
-# The systemd render's one host file beside the ten units and the three scripts. It is a
-# needrestart drop-in, and ``install.sh`` places it as ``NEEDRESTART_INSTALLED``.
+# The systemd render's one host file beside the fourteen units and the three scripts. It is
+# a needrestart drop-in, and ``install.sh`` places it as ``NEEDRESTART_INSTALLED``.
 NEEDRESTART_FILE = "needrestart.conf"
 NEEDRESTART_INSTALLED = "marketlake.conf"
 
@@ -686,6 +722,76 @@ class SystemdUnit:
         return _UNIT_HEADER + "\n".join("\n".join(section) + "\n" for section in sections)
 
 
+@dataclass(frozen=True)
+class SystemdRootUnit:
+    """A unit that runs a tracked script as root on a short repeating timer.
+
+    ``SystemdUnit`` cannot express it, because that type always writes ``User=`` the owner
+    and takes one wall-clock time a day. The stop (marketlake #868) runs as root, for
+    ``systemctl poweroff`` and the locks under ``/run``, every ten minutes. It reads the
+    owner from ``bootstrap.conf`` and runs its Python steps as that account itself.
+
+    1. The service is ``Type=oneshot`` with no ``User=``, so it runs as root, and no
+       ``[Install]`` section, so only its timer starts it.
+    2. ``TimeoutStartSec=`` bounds a run. A timer never starts a service that is still
+       running, so one hung run with no timeout would stop every later one.
+    3. ``CPUSchedulingPolicy=idle`` and ``IOSchedulingClass=idle`` keep a run behind every
+       other process on the 2 GiB VM.
+    4. ``requires_mounts_for`` is the lake's mount, as on every other unit, so a failed
+       mount leaves the VM up for the owner to repair.
+    5. The timer's ``OnCalendar=`` repeats within the hour, so it names no zone, and it has
+       no ``Persistent=``, so a run missed while the VM was stopped is not replayed.
+
+    ``keep_alive`` and ``late_run_ok`` are always false. They are here so the install, the
+    uninstall and the summary read this type and ``SystemdUnit`` the same way.
+    """
+
+    label: str
+    exec_start: str
+    on_calendar: str
+    timeout: str
+    environment: dict[str, str]
+    requires_mounts_for: str | None = None
+
+    keep_alive = False
+    late_run_ok = False
+
+    @property
+    def service_name(self) -> str:
+        """The service's file and unit name, ``<label>.service``."""
+        return f"{self.label}.service"
+
+    @property
+    def timer_name(self) -> str:
+        """The timer's file and unit name, ``<label>.timer``."""
+        return f"{self.label}.timer"
+
+    def service(self) -> str:
+        """The ``.service`` unit file."""
+        unit = ["[Unit]", f"Description={self.label}"]
+        if self.requires_mounts_for is not None:
+            unit.append(f"RequiresMountsFor={self.requires_mounts_for}")
+        service = [
+            "[Service]",
+            "Type=oneshot",
+            *(f"Environment={key}={value}" for key, value in self.environment.items()),
+            f"ExecStart={self.exec_start}",
+            f"TimeoutStartSec={self.timeout}",
+            "CPUSchedulingPolicy=idle",
+            "IOSchedulingClass=idle",
+        ]
+        return _UNIT_HEADER + "\n".join("\n".join(section) + "\n" for section in (unit, service))
+
+    def timer(self) -> str:
+        """The ``.timer`` unit file."""
+        sections = [
+            ["[Unit]", f"Description={self.label}"],
+            ["[Timer]", f"OnCalendar={self.on_calendar}"],
+            ["[Install]", "WantedBy=timers.target"],
+        ]
+        return _UNIT_HEADER + "\n".join("\n".join(section) + "\n" for section in sections)
+
+
 # Characters the systemd render refuses in any value it writes. systemd expands ``%``
 # as a specifier in every unit setting, and ``$`` in ``ExecStart=`` but not in
 # ``Environment=``, while quotes, backslashes and whitespace split or escape a value, so
@@ -929,6 +1035,65 @@ def all_jobs(host: Host) -> tuple[Job, ...]:
         sunday_job(host),
         eod_sweep_job(host),
     )
+
+
+# -- the hosted VM's stop and morning ping, systemd hosts only ------------------------
+#
+# These units come from a second list beside ``all_jobs``, read by the systemd install, the
+# uninstall and the summary, and by nothing else (marketlake #868). ``deploy_window`` reads
+# ``systemd_units``, so a unit in the roster moves the hours a deploy may run: a timer every
+# ten minutes would refuse deploys all day, and the 07:40 ping would move the weekday span
+# from 08:00 to 07:10. Both are named ``marketlake-*`` rather than ``com.marketlake.*``, so
+# the busy check's glob never finds the stop busy with itself.
+
+STOP_LABEL = "marketlake-stop"
+VM_UP_LABEL = "marketlake-up"
+
+# The stop's script, relative to the checkout, and its timer and bound.
+STOP_SCRIPT = "deploy/vm-stop.sh"
+STOP_ON_CALENDAR = "*:0/10"
+STOP_TIMEOUT = "5min"
+
+
+def stop_unit(host: SystemdHost) -> SystemdRootUnit:
+    """The unit that runs ``deploy/vm-stop.sh`` as root every ten minutes.
+
+    The script powers the VM off only when its six checks pass, and its header names them.
+    A ``MARKETLAKE_CONFIG`` the render was given reaches the script through
+    ``Environment=``, and the script hands it to the ``vm-stop`` ping as ``--config``,
+    since ``sudo`` clears the environment.
+    """
+    environment = {} if host.config_path is None else {"MARKETLAKE_CONFIG": host.config_path}
+    return SystemdRootUnit(
+        label=STOP_LABEL,
+        exec_start=f"{host.project_dir}/{STOP_SCRIPT}",
+        on_calendar=STOP_ON_CALENDAR,
+        timeout=STOP_TIMEOUT,
+        environment=environment,
+        requires_mounts_for=host.lake_mount,
+    )
+
+
+def vm_up_job(host: SystemdHost) -> SystemdUnit:
+    """The 07:40 weekday ping of ``vm-up``, which proves the VM started that morning.
+
+    It runs as the owner like any job. It has no ``Persistent=``, so a VM that boots late
+    sends nothing and the check pages, and a lake volume that fails to mount keeps it from
+    starting, which pages too. A ping at boot would fail the other way: a VM that never
+    stopped never boots, so it would page every morning after a failed stop.
+    """
+    return host.job(
+        VM_UP_LABEL,
+        "lake.control_plane",
+        "ping",
+        VM_UP_SLUG,
+        calendar=Schedule(VM_UP_PING, _SCHEDULE_WEEKDAYS),
+    )
+
+
+def vm_power_units(host: SystemdHost) -> tuple[SystemdUnit | SystemdRootUnit, ...]:
+    """The systemd-only units: the stop and the morning ping, in that order."""
+    return (stop_unit(host), vm_up_job(host))
 
 
 # -- the pre-open self-check ---------------------------------------------------
@@ -4232,10 +4397,19 @@ def systemd_units(host: SystemdHost) -> tuple[SystemdUnit, ...]:
     return typed
 
 
+def _installed_units(host: SystemdHost) -> tuple[SystemdUnit | SystemdRootUnit, ...]:
+    """Every unit the systemd install places: the roster, then the systemd-only units.
+
+    The install, the uninstall, the summary and the render read this. ``deploy_window``
+    and ``restart.sh`` read the roster alone, through ``systemd_units``.
+    """
+    return (*systemd_units(host), *vm_power_units(host))
+
+
 def systemd_unit_files(host: SystemdHost) -> list[str]:
     """Every unit file name the render writes, each service followed by its timer."""
     names: list[str] = []
-    for unit in systemd_units(host):
+    for unit in _installed_units(host):
         names.append(unit.service_name)
         if unit.timer_name is not None:
             names.append(unit.timer_name)
@@ -4248,7 +4422,7 @@ def _enabled_units(host: SystemdHost) -> list[str]:
     Enabling a timer-run service instead would print systemd's long notice about a unit
     with no installation config into the caller's log, and would do nothing.
     """
-    units = systemd_units(host)
+    units = _installed_units(host)
     residents = [unit.service_name for unit in units if unit.keep_alive]
     timers = [unit.timer_name for unit in units if unit.timer_name is not None]
     return residents + timers
@@ -4258,7 +4432,7 @@ def _persistent_stamps(host: SystemdHost) -> list[str]:
     """The timer stamp file each ``Persistent=true`` timer writes, by name."""
     return [
         f"stamp-{unit.timer_name}"
-        for unit in systemd_units(host)
+        for unit in _installed_units(host)
         if unit.timer_name is not None and unit.late_run_ok
     ]
 
@@ -4275,8 +4449,9 @@ def needrestart_dropin() -> str:
     service on the host restarts.
 
     The second rule covers ``marketlake-deploy.service``, the transient unit
-    ``deploy/vm-deploy.sh`` runs in (marketlake #676). An unattended upgrade between 01:00
-    and 03:00 Eastern falls inside the hours a deploy may run, and a restart of that unit
+    ``deploy/vm-deploy.sh`` runs in (marketlake #676). Ubuntu's unattended upgrade runs
+    daily from 06:00 UTC, and at the next boot when the VM was stopped then (marketlake
+    #868), so it can fall inside the hours a deploy may run, and a restart of that unit
     would stop the deploy between its merge and its restart. Its name is not
     ``com.marketlake.deploy``, because the deploy's busy check lists the
     ``com.marketlake.*`` services and would refuse itself.
@@ -4348,8 +4523,12 @@ def systemd_install_script(host: SystemdHost) -> str:
        only when its content differs from the installed copy. A copy that happens prints
        ``changed: <file>``, so a caller can tell whether a restart would pick up a new
        definition.
-    2. A ``com.marketlake.*`` service or timer in the unit directory that the render no
-       longer names is stopped, disabled, has its timer stamp deleted, and is removed.
+    2. A ``com.marketlake.*`` or ``marketlake-*`` service or timer in the unit directory
+       that the render no longer names is stopped, disabled, has its timer stamp deleted,
+       and is removed. The second pattern covers the systemd-only units, so a stop unit
+       dropped from a later render cannot keep powering the VM off. The deploy's own
+       ``marketlake-deploy.service`` is transient, and systemd keeps a transient unit's
+       file under ``/run/systemd/transient``, so the pattern never meets it.
        ``systemctl edit`` drop-in directories are left alone.
     3. ``systemctl daemon-reload``, which restarts nothing.
     4. ``systemctl enable --now`` on the units with an ``[Install]`` section, which
@@ -4374,10 +4553,11 @@ def systemd_install_script(host: SystemdHost) -> str:
         "# so it can interleave with a deploy and leave the older commit's units installed.",
         "#",
         "# It copies a unit only when its content changed, and prints `changed: <file>`",
-        "# when it does. It retires any com.marketlake unit the render no longer names,",
-        "# reloads systemd, and enables and starts the residents and the timers. Starting",
-        "# skips what already runs, so a running service keeps its old definition until",
-        f"# its next restart. ./{RESTART_SCRIPT_FILE} is how to give it the new one.",
+        "# when it does. It retires any com.marketlake or marketlake- unit the render no",
+        "# longer names, reloads systemd, and enables and starts the residents and the",
+        "# timers. Starting skips what already runs, so a running service keeps its old",
+        f"# definition until its next restart. ./{RESTART_SCRIPT_FILE} is how to give it the",
+        "# new one.",
         "#",
         "# It closes by reading back each resident's state. A resident that restarts every",
         f"# {RESTART_SECONDS} seconds is expected until config.yaml and tickers.yaml land.",
@@ -4422,9 +4602,12 @@ def systemd_install_script(host: SystemdHost) -> str:
         "done",
         f'place "$HERE/{NEEDRESTART_FILE}" "$NEEDRESTART_DIR/{NEEDRESTART_INSTALLED}"',
         "",
-        "# 2. Retire a com.marketlake unit the render no longer names. A timer's stamp goes",
-        "# with it, or a reinstall of that timer would fire a replay at once.",
-        'for path in "$UNIT_DIR"/com.marketlake.*.service "$UNIT_DIR"/com.marketlake.*.timer; do',
+        "# 2. Retire a com.marketlake or marketlake- unit the render no longer names. A",
+        "# timer's stamp goes with it, or a reinstall of that timer would fire a replay at",
+        "# once. The deploy's marketlake-deploy.service is transient, so its file lives",
+        "# under /run/systemd/transient and never here.",
+        'for path in "$UNIT_DIR"/com.marketlake.*.service "$UNIT_DIR"/com.marketlake.*.timer \\',
+        '    "$UNIT_DIR"/marketlake-*.service "$UNIT_DIR"/marketlake-*.timer; do',
         '  if [[ ! -f "$path" ]]; then continue; fi',
         '  unit="${path##*/}"',
         '  if rendered "$unit"; then continue; fi',
@@ -4467,8 +4650,10 @@ def systemd_uninstall_script(host: SystemdHost) -> str:
 
     It acts on each unit whose file is present, so it converges from a partial install,
     because systemd 255's ``disable`` fails on a missing unit file. Then it deletes the
-    persistent timers' stamps, removes the ten units and the drop-in, and reloads. The
+    persistent timers' stamps, removes the fourteen units and the drop-in, and reloads. The
     stamps go because a reinstall would otherwise fire both persistent timers at once.
+    The systemd-only units go too, or an uninstalled VM would keep powering itself off,
+    since with no daemon the busy check finds nothing busy.
 
     ``systemctl clean --what=state`` would delete the stamps too, and is rejected: systemd
     255 refuses it on an active timer, a timer without ``Persistent=`` and a unit whose
@@ -4477,12 +4662,12 @@ def systemd_uninstall_script(host: SystemdHost) -> str:
     It leaves the lake and the config directory. It warns that the dead-man checks go
     silent if this host is the primary, since the render cannot know the host's role.
     """
-    units = systemd_units(host)
+    units = _installed_units(host)
     # Timers first, so none fires a service in the middle of the teardown.
     ordered = [unit.timer_name for unit in units if unit.timer_name is not None] + [
         unit.service_name for unit in units
     ]
-    slugs = live_check_slugs()
+    slugs = (*live_check_slugs(), *vm_power_slugs())
     lines = [
         "#!/bin/bash",
         "# Marketlake control plane on a systemd host: take the units back off.",
@@ -4722,7 +4907,7 @@ def systemd_restart_script(host: SystemdHost) -> str:
 def render_systemd(host: SystemdHost) -> tuple[RenderedFile, ...]:
     """Every unit, script and host file the systemd install needs, as text."""
     files: list[RenderedFile] = []
-    for unit in systemd_units(host):
+    for unit in _installed_units(host):
         files.append(RenderedFile(unit.service_name, unit.service()))
         if unit.timer_name is not None:
             files.append(RenderedFile(unit.timer_name, unit.timer()))
@@ -4819,7 +5004,47 @@ def _build_parser():
 
     sub.add_parser("pmset", help="Print the two pmset commands for the coming week.")
 
+    ping = sub.add_parser(
+        "ping",
+        help=(
+            "Ping one of the hosted VM's two checks: vm-up from the 07:40 timer, or vm-stop "
+            "from deploy/vm-stop.sh before it powers the VM off."
+        ),
+    )
+    ping.add_argument("slug", choices=vm_power_slugs(), help="The check to ping.")
+    ping.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
+
     return parser
+
+
+def ping_check(
+    *,
+    slug: str,
+    pinger: Pinger,
+    ping_url: str,
+    publisher: Publisher | None,
+    now: datetime,
+) -> str | None:
+    """Ping one check, and page when healthchecks refuses the ping.
+
+    Returns ``None`` when the ping landed and a short problem otherwise. The ``ping``
+    subcommand is the only caller, and it feeds ``vm-up`` and ``vm-stop``. Those checks
+    prove the hosted VM started and stopped, so the ping is the whole job and there is no
+    success condition to test first.
+
+    A refused ping, such as a 404 for a check that was never created or is misnamed,
+    feeds no check, so no check will ever go silent to report it. It pages through
+    ``escalate_ping_failure``, as every other producer of a live check does, even for
+    ``vm-stop``, since a refusal means the alarm is broken rather than that the VM cost
+    money. A ping that merely did not land pages nothing, and healthchecks pages for the
+    missed ping after the grace.
+    """
+    try:
+        pinger.ping(ping_url)
+    except PING_FAILURES as exc:
+        escalate_ping_failure(exc, slug=slug, publisher=publisher, now=now)
+        return f"ping failed: {type(exc).__name__}"
+    return None
 
 
 def _render(args) -> int:
@@ -5090,6 +5315,29 @@ def main(
         print(f"sunday: attempts={len(outcomes)} pinged={pinged} slug={SUNDAY_SLUG}")
         return 0 if pinged else 1
 
+    if args.command == "ping":
+        with input_errors_exit("ping"):
+            config = load_config(args.config)
+        ping_clock = _system_clock()
+        sends = outbox.senders(config, process="ping", clock=ping_clock)
+        problem = ping_check(
+            slug=args.slug,
+            pinger=sends.pinger,
+            ping_url=config.healthchecks_url(args.slug),
+            # A refused ping pages, as the self-check's does. The secrets are the values
+            # that must never reach a phone, checked against the page itself.
+            publisher=Publisher(
+                lake_root=config.lake_root,
+                transport=sends.transport,
+                secrets=config.page_secrets(),
+            ),
+            now=ping_clock.now(),
+        )
+        if problem is not None:
+            print(f"ping: {problem}")
+        print(f"ping: pinged={problem is None} slug={args.slug}")
+        return 0 if problem is None else 1
+
     if args.command == "pmset":
         now = (clock if clock is not None else _system_clock()).now()
         cal = calendar if calendar is not None else _exchange_calendar()
@@ -5178,7 +5426,21 @@ __all__ = [
     "WallClockTime",
     "Schedule",
     "SystemdHost",
+    "SystemdRootUnit",
     "SystemdUnit",
+    "STOP_LABEL",
+    "STOP_ON_CALENDAR",
+    "STOP_SCRIPT",
+    "STOP_TIMEOUT",
+    "VM_STOP_SLUG",
+    "VM_UP_LABEL",
+    "VM_UP_PING",
+    "VM_UP_SLUG",
+    "ping_check",
+    "stop_unit",
+    "vm_power_slugs",
+    "vm_power_units",
+    "vm_up_job",
     "INSTALL_LOCK",
     "INSTALL_ROOT_ENV",
     "INSTALL_TEST_ENV",

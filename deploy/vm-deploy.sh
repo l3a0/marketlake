@@ -35,7 +35,8 @@
 #        as the owner from the current venv, says no, when a com.marketlake.* service
 #        other than the two residents is in a state other than inactive or failed, or
 #        when the daemon's cgroup holds a process besides its main one, such as a
-#        compaction. It keeps the window's next_span_start for step 6;
+#        compaction. It keeps the window's next_span_start for step 6. The two busy
+#        checks live in deploy/busy-check.sh, which deploy/vm-stop.sh sources too;
 #     4. fetches origin main as the owner, and refuses with exit 2 a sha not on
 #        origin/main, a sha behind HEAD, a dirty tree or a branch other than main. It
 #        repeats step 3's busy checks, since the fetch can take minutes. Root then
@@ -105,8 +106,7 @@ HOLD_SECONDS=120                 # how long the daemon's MainPID must hold after
 
 DEPLOY_UNIT=marketlake-deploy
 DEPLOY_SERVICE="$DEPLOY_UNIT.service"
-DAEMON=com.marketlake.daemon.service
-DASHBOARD=com.marketlake.dashboard.service
+# DAEMON and DASHBOARD come from deploy/busy-check.sh, which the inner run sources.
 UNKNOWN="outcome unknown: read deploy.log"
 FAILED_STEP=", with a failed step in deploy.log"
 NOT_RUN_BEFORE=", which has not run before"
@@ -383,73 +383,13 @@ logged() {
   return "$rc"
 }
 
-# Reads three of a unit's properties. systemctl prints them in its own order, so each is
-# matched by name.
-P_ACTIVE=""
-P_PID=""
-P_CGROUP=""
-props() {
-  local out line
-  P_ACTIVE=""
-  P_PID=""
-  P_CGROUP=""
-  out="$(systemctl show -p ActiveState,MainPID,ControlGroup "$1")" || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    case "$line" in
-      ActiveState=*) P_ACTIVE="${line#*=}" ;;
-      MainPID=*) P_PID="${line#*=}" ;;
-      ControlGroup=*) P_CGROUP="${line#*=}" ;;
-    esac
-  done <<< "$out"
-}
-
-# Returns 0 when nothing is busy, 1 when something is, and 2 when it cannot tell, with
-# BUSY_REASON saying which. It lists services only, because a waiting timer reads active.
-# It reads the daemon's cgroup rather than TasksCurrent, which counts the daemon's own
-# threads. A daemon that is not active, or has no MainPID, never counts as busy.
-BUSY_REASON=""
-busy_check() {
-  local units unit active pid procs file
-  BUSY_REASON=""
-  if ! units="$(systemctl list-units --type=service --all --no-legend --plain 'com.marketlake.*')"; then
-    BUSY_REASON="systemctl list-units failed"
-    return 2
-  fi
-  while read -r unit _ active _ || [[ -n "${unit:-}" ]]; do
-    case "${unit:-}" in
-      ""|"$DAEMON"|"$DASHBOARD") continue ;;
-    esac
-    case "${active:-}" in
-      inactive|failed) ;;
-      *)
-        BUSY_REASON="$unit is ${active:-in no state}"
-        return 1 ;;
-    esac
-  done <<< "$units"
-  if ! props "$DAEMON"; then
-    BUSY_REASON="systemctl show failed for $DAEMON"
-    return 2
-  fi
-  if [[ "$P_ACTIVE" != active || -z "$P_PID" || "$P_PID" == 0 ]]; then
-    return 0
-  fi
-  if [[ -z "$P_CGROUP" ]]; then
-    BUSY_REASON="$DAEMON has no control group"
-    return 2
-  fi
-  file="$ROOT/sys/fs/cgroup$P_CGROUP/cgroup.procs"
-  if ! procs="$(cat -- "$file")"; then
-    BUSY_REASON="could not read the daemon's cgroup.procs"
-    return 2
-  fi
-  while read -r pid || [[ -n "${pid:-}" ]]; do
-    if [[ -n "${pid:-}" && "$pid" != "$P_PID" ]]; then
-      BUSY_REASON="the daemon's cgroup holds process $pid beside its main process $P_PID, such as a compaction"
-      return 1
-    fi
-  done <<< "$procs"
-  return 0
-}
+# busy_check and props, and the two resident names they skip, live in a file both this
+# script and deploy/vm-stop.sh source. It is read here, once, before the merge moves the
+# checkout, so the check this run calls after the merge is the one it started with.
+# bash 3.2 ends the whole script when . cannot find its file, so the file is tested first.
+if [[ ! -r "$CHECKOUT/deploy/busy-check.sh" ]] || ! . "$CHECKOUT/deploy/busy-check.sh"; then
+  finish 1 "not deployed: could not read deploy/busy-check.sh"
+fi
 
 # -- 2. the daemon is running ----------------------------------------------------------
 

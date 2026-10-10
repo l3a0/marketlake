@@ -24,7 +24,9 @@ its latest start and the end of that day's ``control_plane.assertion_window``. T
 schedules come from ``control_plane.systemd_units``, built on a placeholder host because
 every job factory is pure, so no time is restated here. Today that gives 08:00 to 18:45
 on every weekday, sessions and holidays alike, and 19:30 to 23:30 on Sunday. Saturday has
-none.
+none. The hosted VM's stop and its 07:40 ping come from ``control_plane.vm_power_units``
+rather than the roster, so neither moves a span (marketlake #868). ``deploy/vm-stop.sh``
+runs this module too, so the VM may stop exactly when a deploy may start.
 
 **The margin refuses a start too close to the next span.** ``vm-deploy.sh`` caps each of
 its steps, and the caps sum to 200 minutes, a rollback included. ``MARGIN`` is 210

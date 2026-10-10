@@ -29,7 +29,10 @@ a test too.
    ``--quiet`` is given.
 
 A unit whose name is a file in ``$STATE/activating`` reads ``activating``, as a oneshot
-does while it runs, until a ``restart`` of it. A unit named in ``$STATE/crashing`` hands
+does while it runs, until a ``restart`` of it. A unit whose name is a file in
+``$STATE/unit-state`` reads the active state and sub-state the file holds, such as
+``deactivating stop-sigterm`` for a unit whose processes are still being stopped, ahead
+of every other state. A unit named in ``$STATE/crashing`` hands
 out a fresh pid on every ``MainPID`` read, as a daemon that dies and restarts does.
 
 ``FAIL_START`` names units whose interpreter cannot start. ``RESTART_MODE`` picks what a
@@ -39,9 +42,12 @@ process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is
 units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
-which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
+which macOS lacks, and for ``git``, ``sleep``, ``who`` and ``loginctl``. The fake ``who``
+prints ``FAKE_WHO`` and exits ``WHO_RC``, and the fake ``loginctl`` prints
+``FAKE_SESSIONS`` and exits ``LOGINCTL_RC``. Each logs its argv to ``$LOG``. The
 fake ``flock`` takes both of its forms. With a bare descriptor, as ``flock -w 600 9``, it
-exits ``FLOCK_RC``. With a file and a command, as ``flock -w 600 <file> <command>``, it
+exits the next code in ``FLOCK_RCS`` when that is set, one per call, and ``FLOCK_RC``
+otherwise. With a file and a command, as ``flock -w 600 <file> <command>``, it
 creates the file and runs the command, unless the next code in ``FLOCK_FILE_RCS`` is not
 0, which it exits with instead, as a lock held for the whole wait makes the real one. The
 fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. Its
@@ -165,7 +171,10 @@ property() {
     MainPID) main_pid "$unit" ;;
     NeedDaemonReload) need_reload "$unit" ;;
     ActiveState)
-      if [[ -f "$STATE/activating/$unit" ]]; then echo activating
+      if [[ -f "$STATE/unit-state/$unit" ]]; then
+        read -r active _ < "$STATE/unit-state/$unit"
+        echo "$active"
+      elif [[ -f "$STATE/activating/$unit" ]]; then echo activating
       elif [[ -f "$STATE/pid/$unit" ]]; then echo active
       elif [[ -f "$STATE/failed/$unit" ]]; then echo failed
       else echo inactive; fi ;;
@@ -262,12 +271,16 @@ case "$cmd" in
     done
     names=""
     for f in "$UNIT_DIR"/com.marketlake.* "$STATE"/pid/com.marketlake.* \
-        "$STATE"/failed/com.marketlake.* "$STATE"/activating/com.marketlake.*; do
+        "$STATE"/failed/com.marketlake.* "$STATE"/activating/com.marketlake.* \
+        "$STATE"/unit-state/com.marketlake.*; do
       if [[ -e "$f" ]]; then names="$names ${f##*/}"; fi
     done
     for name in $(printf '%s\n' $names | sort -u); do
       if [[ $services == 1 && "$name" != *.service ]]; then continue; fi
-      if [[ -f "$STATE/activating/$name" ]]; then
+      if [[ -f "$STATE/unit-state/$name" ]]; then
+        read -r active sub < "$STATE/unit-state/$name"
+        echo "$name loaded $active $sub $name"
+      elif [[ -f "$STATE/activating/$name" ]]; then
         echo "$name loaded activating start $name"
       elif [[ -f "$STATE/pid/$name" ]]; then
         sub=running; [[ "$name" == *.timer ]] && sub=waiting
@@ -384,8 +397,9 @@ NEXT_RC = r"""next_rc() {
 }
 """
 
-# Both forms of flock: a bare descriptor answers FLOCK_RC, and a file with a command runs
-# the command, unless FLOCK_FILE_RCS says the lock stayed held.
+# Both forms of flock: a bare descriptor answers the next code in FLOCK_RCS, or FLOCK_RC
+# when no sequence is set, and a file with a command runs the command, unless
+# FLOCK_FILE_RCS says the lock stayed held.
 FAKE_FLOCK = (
     "#!/bin/bash\n"
     'printf \'flock %s\\n\' "$*" >> "$LOG"\n'
@@ -398,6 +412,7 @@ FAKE_FLOCK = (
   esac
 done
 if [[ $# -le 1 ]]; then
+  if [[ -n "${FLOCK_RCS:-}" ]]; then exit "$(next_rc flock-fd "$FLOCK_RCS")"; fi
   exit "${FLOCK_RC:-0}"
 fi
 rc="$(next_rc flock-file "${FLOCK_FILE_RCS:-}")"
@@ -420,6 +435,27 @@ exit 0
 
 FAKE_SLEEP = "#!/bin/bash\nexit 0\n"
 
+# who, which deploy/vm-stop.sh reads for a login at a terminal. It prints FAKE_WHO through
+# printf %b, one login a line as who prints it: NAME, LINE, then the time and the host,
+# such as `someone  pts/0  2026-10-12 19:02 (203.0.113.7)`. sshd writes the utmp record
+# that who reads only for a session with a pty, so a tunnel has no line. It exits WHO_RC.
+FAKE_WHO = r"""#!/bin/bash
+printf 'who %s\n' "$*" >> "$LOG"
+if [[ -n "${FAKE_WHO:-}" ]]; then printf '%b' "$FAKE_WHO"; fi
+exit "${WHO_RC:-0}"
+"""
+
+# loginctl list-sessions --no-legend, which deploy/vm-stop.sh reads for a closing session.
+# It prints FAKE_SESSIONS through printf %b, one session a line in systemd 255's columns:
+# SESSION, UID, USER, SEAT, TTY, STATE, IDLE and SINCE, with - for an empty cell. An SSH
+# session shows - for its TTY there too, since pam_systemd records none for it. It exits
+# LOGINCTL_RC.
+FAKE_LOGINCTL = r"""#!/bin/bash
+printf 'loginctl %s\n' "$*" >> "$LOG"
+if [[ -n "${FAKE_SESSIONS:-}" ]]; then printf '%b' "$FAKE_SESSIONS"; fi
+exit "${LOGINCTL_RC:-0}"
+"""
+
 FAKES = {
     "systemctl": FAKE_SYSTEMCTL,
     "id": FAKE_ID,
@@ -428,6 +464,8 @@ FAKES = {
     "flock": FAKE_FLOCK,
     "git": FAKE_GIT,
     "sleep": FAKE_SLEEP,
+    "loginctl": FAKE_LOGINCTL,
+    "who": FAKE_WHO,
 }
 
 

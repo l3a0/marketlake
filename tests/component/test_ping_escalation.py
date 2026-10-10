@@ -1,9 +1,10 @@
 """Every live producer escalates a refused ping, and every one of them is wired for it.
 
-Six jobs ping a health check. A slug with no row is refused on every one of their runs
+Six jobs ping a health check, and so does the ``ping`` entry the hosted VM's stop and its
+07:40 timer call (#868). A slug with no row is refused on every one of their runs
 forever, and the only symptom is silence, which is the symptom the check exists to
-report. So the page has to come from the producer that made the ping, and each of the
-six is covered here twice.
+report. So the page has to come from the producer that made the ping, and each of them
+is covered here twice. The ping entry's two cases close the file.
 
 1. The producer escalates. Given a publisher and a ping healthchecks refuses, it pages,
    and the page names the slug it pinged.
@@ -46,6 +47,7 @@ from tests.support.calendar import FakeCalendar, SessionTimes, et, weekday_sessi
 from tests.support.clock import ManualClock
 from tests.support.config import NTFY_TOPIC, PING_KEY, write_config
 from tests.support.lake import FixtureLake
+from tests.support.pinger import FakePinger
 from tests.support.transport import FakeTransport
 
 WEEK = date(2026, 8, 31)
@@ -483,3 +485,65 @@ def test_no_page_a_root_sent_carried_a_secret(tmp_path, monkeypatch, capsys):
     assert PING_KEY not in page.body and NTFY_TOPIC not in page.body
     assert PING_KEY not in page.title and NTFY_TOPIC not in page.title
     capsys.readouterr()
+
+
+# -- the hosted VM's ping entry (#868) ----------------------------------------
+
+
+@pytest.mark.parametrize("slug", [cp.VM_UP_SLUG, cp.VM_STOP_SLUG])
+def test_the_ping_helper_escalates_a_refused_ping_and_nothing_else(slug):
+    sink = Sink()
+    problem = cp.ping_check(
+        slug=slug, pinger=Refusing(slug), ping_url=_url(slug), publisher=sink, now=SATURDAY
+    )
+    assert problem == "ping failed: HTTPError"
+    assert _paged(sink) == [slug]
+    # A ping the network never carried pages nothing.
+    lost = Sink()
+    problem = cp.ping_check(
+        slug=slug, pinger=Unreachable(), ping_url=_url(slug), publisher=lost, now=SATURDAY
+    )
+    assert problem == "ping failed: URLError"
+    assert lost.sent == []
+
+
+@pytest.mark.parametrize("slug", [cp.VM_UP_SLUG, cp.VM_STOP_SLUG])
+def test_the_ping_entry_pages_through_a_real_publisher(slug, tmp_path, monkeypatch, capsys):
+    config = write_config(tmp_path, tmp_path / "lake")
+    (tmp_path / "lake").mkdir(exist_ok=True)
+    transport = FakeTransport()
+    pinger = Refusing(slug)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=SATURDAY))
+    code = cp.main(["ping", slug, "--config", str(config)])
+    assert code == 1
+    assert [m.body.split(":")[0] for m in _refused_pages(transport)] == [slug]
+    # The URL addresses the check the page names.
+    assert pinger.urls == [_url(slug)]
+    printed = capsys.readouterr().out
+    assert printed == f"ping: ping failed: HTTPError\nping: pinged=False slug={slug}\n"
+    assert PING_KEY not in printed
+
+
+def test_a_ping_that_lands_exits_0_and_pages_nothing(tmp_path, monkeypatch, capsys):
+    config = write_config(tmp_path, tmp_path / "lake")
+    (tmp_path / "lake").mkdir(exist_ok=True)
+    transport = FakeTransport()
+    pinger = FakePinger()
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: pinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=SATURDAY))
+    assert cp.main(["ping", cp.VM_STOP_SLUG, "--config", str(config)]) == 0
+    assert pinger.urls == [_url(cp.VM_STOP_SLUG)]
+    assert transport.messages == []
+    assert capsys.readouterr().out == f"ping: pinged=True slug={cp.VM_STOP_SLUG}\n"
+
+
+@pytest.mark.parametrize("slug", [CAPTURE_SLUG, PRE_OPEN_SLUG, "vm-other"])
+def test_the_ping_entry_feeds_no_check_but_its_two(slug, tmp_path, capsys):
+    # A check another job owns would go quiet about that job if this could feed it.
+    with pytest.raises(SystemExit) as exited:
+        cp.main(["ping", slug, "--config", str(tmp_path / "never-read.yaml")])
+    assert exited.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
