@@ -12,9 +12,16 @@ Nothing in the suite drove this factory before. Every test that reaches capture 
 and no test has a token. So a cache added inside the factory would satisfy the whole
 suite and still break re-auth recovery. These tests close that hole.
 
+One thing does outlive a build since marketlake #860: a refreshed token whose write
+failed, which the process keeps until the file catches up. That is not a cache of the file.
+The file is still read on every build, and a re-auth writes a later ``creation_timestamp``,
+which wins over a held token. ``tests/component/test_token_file_refresh.py`` covers that
+rule. Nothing is held in these tests, so every build here returns the file.
+
 The client build is faked at its seam, ``schwab.auth.client_from_access_functions``, not
 at the factory. So the real ``from_token`` runs: it hands the seam a reader of the path and
-the atomic writer, forwards the secrets, and wraps whatever the seam returns. The fake seam
+the refresh writer, a subclass of the re-auth ritual's atomic ``TokenWriter``, forwards the
+secrets, and wraps whatever the seam returns. The fake seam
 calls the reader it is handed and returns a client whose mint time is the file's
 ``creation_timestamp``. So "built from the file" is observable through the public API,
 because ``token_mint_time`` reads that value back. A rewrite of the file changes that value,
@@ -108,8 +115,9 @@ def test_from_token_builds_the_client_from_the_token_file(tmp_path, monkeypatch)
     This covers the seam's contract: the client is built from the token path's contents,
     the two secrets pass through verbatim, and the enum flag is the ``False`` this layer
     pins so the field groups stay plain strings. The resulting vendor's mint time is the one
-    the file names. A refresh is written by the re-auth ritual's atomic writer, aimed at the
-    same path, never by ``schwab-py``'s writer, which truncates the file in place.
+    the file names. A refresh is written by a subclass of the re-auth ritual's atomic
+    writer, aimed at the same path, never by ``schwab-py``'s writer, which truncates the file
+    in place.
     """
     token = tmp_path / "token.json"
     _write_token(token, MINT_BEFORE)

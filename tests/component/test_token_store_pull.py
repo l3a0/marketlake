@@ -14,6 +14,7 @@ credentials yet, the one worth retrying.
 
 from __future__ import annotations
 
+import errno
 import json
 from collections.abc import Iterator
 
@@ -23,6 +24,7 @@ from botocore.awsrequest import AWSResponse
 from lake import aws_session, token_store
 from tests.component.test_bucket_instance_profile import METADATA, _Server
 from tests.support.config import write_config
+from tests.support.full_disk import fill_disk
 
 ACCESS = "ACCESS-TOKEN-SENTINEL-90cc"
 REFRESH = "REFRESH-TOKEN-SENTINEL-17ab"
@@ -222,6 +224,23 @@ def test_a_write_that_fails_exits_one_with_one_line(
     assert _pull(_vm_config(tmp_path, lake_root), token) == 1
     assert _one_line(capsys) == f"token_store: {token} could not be written (PermissionError)"
     assert not token.exists()
+
+
+def test_a_full_disk_still_fails_the_pull_loudly(
+    tmp_path, lake_root, monkeypatch, capsys, metadata
+):
+    # A refresh whose write fails keeps its token and goes on (marketlake #860). The pull is
+    # not a refresh. It has no client to go on with, so the same ``ENOSPC`` still exits 1.
+    from lake import schwab
+
+    StoreHook(json.dumps(TOKEN)).install(monkeypatch)
+    fill_disk(monkeypatch, errno.ENOSPC)
+    token = tmp_path / "token.json"
+
+    assert _pull(_vm_config(tmp_path, lake_root), token) == 1
+    assert _one_line(capsys) == f"token_store: {token} could not be written (OSError)"
+    assert not token.exists()
+    assert schwab._HELD == {}
 
 
 def test_the_pull_does_not_read_token_store(tmp_path, lake_root, monkeypatch, capsys, metadata):

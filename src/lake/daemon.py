@@ -64,7 +64,11 @@ the session clock per minute, so it is the piece that stamps them.
 
 The daemon holds no expiration state and no cached plan. The production cycle runner
 reloads the config, the roster, the token, and the chain plan on every call, so a nightly
-plan rewrite takes effect the next minute and a re-auth is picked up the next cycle.
+plan rewrite takes effect the next minute and a re-auth is picked up the next cycle. The
+token is the one input that can outlive a call. A refreshed token whose write to
+``token.json`` failed stays in the process, and each cycle uses it while it is newer than
+the file (marketlake #860). A re-auth writes a later mint time, so it still wins the next
+cycle.
 
 A slow cycle never delays or shifts a later sample, because the loop never waits for one
 cycle before firing the next. A cycle ends when its own requests are done, or at the bound

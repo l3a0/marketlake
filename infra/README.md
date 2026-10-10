@@ -1388,8 +1388,8 @@ between two runs a minute apart.
 stat -c %y /srv/marketlake/journal/metadata.json
 ```
 
-The root volume is 16 GiB, and the checkout, the venv and `uv`'s cache are estimated at 5
-to 6 GB of it.
+The root volume is 16 GiB, which `df -h` reported as 15G. On 2026-10-09, two days after the
+first boot, 2.9G of it was used. `uv`'s cache held 391M and the venv 28M of that.
 
 ```bash
 df -h /
@@ -1398,6 +1398,23 @@ df -h /
 ```bash
 du -sh ~/.cache/uv ~/marketlake/.venv
 ```
+
+The token file lives on the root volume too, so a full or broken root volume fails the
+token's write each time the access token is refreshed, about every 25 minutes. Capture
+goes on, because the daemon keeps the refreshed token in memory and retries the write on
+every cycle ([#860](https://github.com/l3a0/marketlake/issues/860)). The daemon prints one
+line when that starts, naming the errno and the path, and another when the file catches
+up. A full disk may keep the first line from being stored at all, so search for both.
+
+```bash
+TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'token file'
+```
+
+The errno says what to repair. `ENOSPC` means free space on `/`, and `EROFS` or `EIO`
+mean the filesystem needs repair. Hold deploys and restarts until the line saying the
+token file now holds a token at least as new as the process's prints. A restart drops
+the token the daemon holds, so it starts again from the stale file. That costs one
+refresh, or a re-auth when the line also says the refresh token rotated.
 
 At the next open, data segments appear under `/srv/marketlake`. A shadow's pings land as
 lines in the outbox under `/srv/marketlake/journal/outbox/`, and a primary's reach
