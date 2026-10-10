@@ -78,6 +78,28 @@ run "trust_policies_match_the_oidc_subjects" {
     condition     = aws_iam_role.deploy.name == "marketlake-deploy"
     error_message = "The deploy role is not named marketlake-deploy."
   }
+
+  # Scheduler alone, and only for a schedule in this account's default group (#867). The
+  # apply role cannot edit a trust once it exists, so it must be right at creation.
+  assert {
+    condition = jsondecode(aws_iam_role.scheduler.assume_role_policy).Statement == [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = "000000000000"
+          "aws:SourceArn"     = "arn:aws:scheduler:us-east-1:000000000000:schedule-group/default"
+        }
+      }
+    }]
+    error_message = "The scheduler role's trust is not exactly Scheduler, for this account's default schedule group."
+  }
+
+  assert {
+    condition     = aws_iam_role.scheduler.name == "marketlake-scheduler"
+    error_message = "The scheduler role is not named marketlake-scheduler."
+  }
 }
 
 run "every_deny_is_present" {
@@ -156,6 +178,7 @@ run "no_allow_grants_a_forbidden_action" {
         jsondecode(aws_iam_role_policy.plan.policy).Statement,
         jsondecode(aws_iam_role_policy.apply.policy).Statement,
         jsondecode(aws_iam_role_policy.deploy.policy).Statement,
+        jsondecode(aws_iam_role_policy.scheduler.policy).Statement,
         ) : s.Effect == "Allow" && (
         can(s.NotAction)
         || length(setintersection(toset(flatten([s.Action])), toset([
@@ -413,6 +436,25 @@ run "policies_are_exactly_the_reviewed_statements" {
           ]
           Resource = ["arn:aws:ssm:us-east-1:000000000000:document/marketlake-deploy*"]
         },
+        {
+          Sid    = "StartSchedulesWrite"
+          Effect = "Allow"
+          Action = [
+            "scheduler:CreateSchedule",
+            "scheduler:UpdateSchedule",
+            "scheduler:DeleteSchedule",
+          ]
+          Resource = ["arn:aws:scheduler:us-east-1:000000000000:schedule/default/marketlake-*"]
+        },
+        {
+          Sid      = "PassTheSchedulerRole"
+          Effect   = "Allow"
+          Action   = ["iam:PassRole"]
+          Resource = ["arn:aws:iam::000000000000:role/marketlake-scheduler"]
+          Condition = {
+            StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" }
+          }
+        },
       ]
     }
     error_message = "The apply role's inline policy is not exactly the reviewed Denies and Allows."
@@ -457,6 +499,31 @@ run "policies_are_exactly_the_reviewed_statements" {
   assert {
     condition     = aws_iam_role_policy.deploy.role == aws_iam_role.deploy.name
     error_message = "The deploy policy is not on marketlake-deploy."
+  }
+
+  # The case for keeping this role in the bootstrap rests on it holding this one grant
+  # (#865). Any other action would be callable through Scheduler's universal target.
+  assert {
+    condition = jsondecode(aws_iam_role_policy.scheduler.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "StartTheCaptureHost"
+          Effect   = "Allow"
+          Action   = ["ec2:StartInstances"]
+          Resource = ["arn:aws:ec2:us-east-1:000000000000:instance/*"]
+          Condition = {
+            StringEquals = { "aws:ResourceTag/marketlake:host" = "capture" }
+          }
+        },
+      ]
+    }
+    error_message = "The scheduler role's inline policy is not exactly ec2:StartInstances on the instance tagged marketlake:host = capture."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.scheduler.role == aws_iam_role.scheduler.name
+    error_message = "The scheduler policy is not on marketlake-scheduler."
   }
 }
 
@@ -564,5 +631,30 @@ run "config_denies_follow_the_callers_account" {
   assert {
     condition     = jsondecode(aws_iam_role.deploy.assume_role_policy).Statement[0].Principal.Federated == "arn:aws:iam::111111111111:oidc-provider/token.actions.githubusercontent.com"
     error_message = "The deploy role's trust does not name the caller's OIDC provider."
+  }
+
+  assert {
+    condition = [
+      for s in jsondecode(aws_iam_role_policy.apply.policy).Statement : s.Resource
+      if contains(["StartSchedulesWrite", "PassTheSchedulerRole"], try(s.Sid, ""))
+      ] == [
+      ["arn:aws:scheduler:us-east-1:111111111111:schedule/default/marketlake-*"],
+      ["arn:aws:iam::111111111111:role/marketlake-scheduler"],
+    ]
+    error_message = "The apply role's schedule or PassRole grant does not name the caller's account."
+  }
+
+  assert {
+    condition = [
+      jsondecode(aws_iam_role.scheduler.assume_role_policy).Statement[0].Condition.StringEquals,
+      jsondecode(aws_iam_role_policy.scheduler.policy).Statement[0].Resource,
+      ] == [
+      {
+        "aws:SourceAccount" = "111111111111"
+        "aws:SourceArn"     = "arn:aws:scheduler:us-east-1:111111111111:schedule-group/default"
+      },
+      ["arn:aws:ec2:us-east-1:111111111111:instance/*"],
+    ]
+    error_message = "The scheduler role's trust or grant does not name the caller's account."
   }
 }

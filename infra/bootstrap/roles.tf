@@ -1,10 +1,11 @@
-# Three roles, each assumed through GitHub's OIDC provider: the plan role, the apply
-# role, and the deploy role that .github/workflows/deploy.yml uses (#676). Every policy
-# is a jsonencode() literal rather than an aws_iam_policy_document, because under tofu
-# test's mock provider that data source returns a random string and no test could read
-# the document. The statements are written out in full in each role, rather than
-# shared through a local, so tests/component/test_infra_config.py can read them from
-# the parse.
+# Four roles. Three are assumed through GitHub's OIDC provider: the plan role, the apply
+# role, and the deploy role that .github/workflows/deploy.yml uses (#676). EventBridge
+# Scheduler assumes the fourth, the scheduler role, to start the stopped VM (#867).
+# Every policy is a jsonencode() literal rather than an aws_iam_policy_document, because
+# under tofu test's mock provider that data source returns a random string and no test
+# could read the document. The statements are written out in full in each role, rather
+# than shared through a local, so tests/component/test_infra_config.py can read them
+# from the parse.
 
 locals {
   # GitHub writes this repository's OIDC subjects with its owner and repository ids,
@@ -324,6 +325,32 @@ resource "aws_iam_role_policy" "apply" {
         ]
         Resource = ["arn:aws:ssm:us-east-1:${local.account_id}:document/marketlake-deploy*"]
       },
+      {
+        # The start schedules in infra/live/schedule.tf (#867). Listed one by one, since
+        # the wildcard ban allows no other wildcard than ec2:*. The name prefix lets a new
+        # schedule land with no bootstrap apply, and the default group is the one the
+        # scheduler role's trust names.
+        Sid    = "StartSchedulesWrite"
+        Effect = "Allow"
+        Action = [
+          "scheduler:CreateSchedule",
+          "scheduler:UpdateSchedule",
+          "scheduler:DeleteSchedule",
+        ]
+        Resource = ["arn:aws:scheduler:us-east-1:${local.account_id}:schedule/default/marketlake-*"]
+      },
+      {
+        # A schedule names the scheduler role as its target's role, and Scheduler checks
+        # that the caller may pass it. No grant here writes that role or its policy, so an
+        # approved apply cannot widen what the schedules may call (#865).
+        Sid      = "PassTheSchedulerRole"
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = ["arn:aws:iam::${local.account_id}:role/marketlake-scheduler"]
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" }
+        }
+      },
     ]
   })
 }
@@ -401,6 +428,56 @@ resource "aws_iam_role_policy" "deploy" {
         Effect   = "Allow"
         Action   = ["ssm:GetCommandInvocation"]
         Resource = ["*"]
+      },
+    ]
+  })
+}
+
+# -- the scheduler role -------------------------------------------------------------
+
+# EventBridge Scheduler assumes this role when a start schedule in infra/live/schedule.tf
+# fires, and it may only start the capture host. It lives here rather than in infra/live,
+# because there the apply role would need to write its policy as well as pass it, and one
+# approved apply could then call any action through Scheduler's universal target (#865).
+# The trust is scoped to the default schedule group, the only scope AWS documents for
+# aws:SourceArn here, and the apply role cannot edit a trust once it exists.
+resource "aws_iam_role" "scheduler" {
+  name = "marketlake-scheduler"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = local.account_id
+          "aws:SourceArn"     = "arn:aws:scheduler:us-east-1:${local.account_id}:schedule-group/default"
+        }
+      }
+    }]
+  })
+}
+
+# StartInstances on a running instance changes nothing, so a schedule that fires while
+# the VM is up is harmless. The tag is the one infra/live/vm.tf gives the VM, and the
+# deploy role's SendToTheCaptureHost names it too.
+resource "aws_iam_role_policy" "scheduler" {
+  name = "start-the-capture-host"
+  role = aws_iam_role.scheduler.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StartTheCaptureHost"
+        Effect   = "Allow"
+        Action   = ["ec2:StartInstances"]
+        Resource = ["arn:aws:ec2:us-east-1:${local.account_id}:instance/*"]
+        Condition = {
+          StringEquals = { "aws:ResourceTag/marketlake:host" = "capture" }
+        }
       },
     ]
   })

@@ -20,8 +20,10 @@ except the bootstrap that CI itself stands on, which the owner applies from the 
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
 bucket, the instance role, the laptop's one IAM user, `marketlake-command`, with the two
 roles it assumes ([#737](https://github.com/l3a0/marketlake/issues/737)), the VM
-itself ([#686](https://github.com/l3a0/marketlake/issues/686)), and the SSM document that
-deploys `main` to the VM ([#676](https://github.com/l3a0/marketlake/issues/676)). The role
+itself ([#686](https://github.com/l3a0/marketlake/issues/686)), the SSM document that
+deploys `main` to the VM ([#676](https://github.com/l3a0/marketlake/issues/676)), and the
+two schedules that start the VM at 07:30 on weekdays and 19:30 on Sundays, once it stops
+itself after the day's work ([#867](https://github.com/l3a0/marketlake/issues/867)). The role
 `marketlake-backup` reaches the bucket, and the role `marketlake-token-writer` writes the
 Schwab token to the VM's config parameters. cloud-init takes a new VM from nothing to a
 running daemon with no login, through `deploy/vm-bootstrap.sh`. The VM ran as a shadow

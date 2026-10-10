@@ -1,7 +1,8 @@
 # What CI needs before it can run: the state bucket, GitHub's OIDC provider, and the
-# plan, apply and deploy roles. The owner applies this from the laptop, because the CI
-# it creates cannot apply it. infra/README.md carries the runbook, and docs/design.md's
-# "Infrastructure, defined" carries the reasoning.
+# plan, apply and deploy roles, with the scheduler role that infra/live's start schedules
+# pass (#867). The owner applies this from the laptop, because the CI it creates cannot
+# apply it. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
+# defined" carries the reasoning.
 
 terraform {
   required_version = "~> 1.13"
