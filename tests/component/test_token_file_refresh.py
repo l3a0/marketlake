@@ -726,3 +726,217 @@ def test_a_refresh_that_lands_while_a_reader_waits_is_not_overwritten(
     assert capsys.readouterr().err.count(_RECOVERED) == 1
     (second,) = built
     assert _sent_with(second) == "Bearer fresh-2"
+
+
+def test_a_refresh_that_lands_during_a_readers_file_read_is_not_overwritten(tmp_path, monkeypatch):
+    # The test above stops the reader before its holder lookup. This one stops it inside its
+    # file read, after the lookup, while another client lands a newer token. Holding the lock
+    # from lookup through retry, the reader makes that client wait, so the newer token lands
+    # last. A reader that read and compared outside the lock would write the held token over
+    # it.
+    token, server = _hold_one(tmp_path, monkeypatch, expires_in=100)
+    first = _vendor(token)
+    free_disk(monkeypatch)
+    server.expires_in = 1800
+    reading, landed = threading.Event(), threading.Event()
+    reader: list[int] = []
+    read = lake.schwab._read_token_file
+
+    def stalled(path: Path) -> object:
+        stored = read(path)
+        if reader and threading.get_ident() == reader[0]:
+            reading.set()
+            landed.wait(timeout=1)
+        return stored
+
+    monkeypatch.setattr(lake.schwab, "_read_token_file", stalled)
+    failed: list[BaseException] = []
+
+    def build() -> None:
+        reader.append(threading.get_ident())
+        try:
+            _vendor(token)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            failed.append(exc)
+
+    waiting = threading.Thread(target=build, daemon=True)
+    waiting.start()
+    assert reading.wait(timeout=5)
+    assert _sent_with(first) == "Bearer fresh-2"
+    landed.set()
+    waiting.join(timeout=5)
+
+    assert failed == []
+    assert _stored(token)["token"]["access_token"] == "fresh-2"
+
+
+# -- every line costs only the line, and says what it claims ------------------------------
+
+
+class _Closed:
+    """A stderr that was closed, which refuses a write with ``ValueError``, not ``OSError``."""
+
+    def write(self, text: str) -> int:
+        raise ValueError("I/O operation on closed file.")
+
+    def flush(self) -> None:
+        raise ValueError("I/O operation on closed file.")
+
+
+class _NoReason(OSError):
+    """An ``OSError`` whose text cannot be read, so the line naming it cannot be built."""
+
+    @property
+    def strerror(self) -> str:
+        raise RuntimeError("no text for this error")
+
+
+def _refuse_with(monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+    """Make every token write in ``lake.reauth`` refuse with ``error``."""
+    disk = fill_disk(monkeypatch, errno.ENOSPC)
+
+    def refuse(fd: int) -> None:
+        raise error
+
+    monkeypatch.setattr(disk, "fsync", refuse)
+
+
+def test_a_closed_stderr_costs_the_failure_line_not_the_request(tmp_path, monkeypatch):
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _serve(monkeypatch, _Server(rotate=False))
+    fill_disk(monkeypatch, errno.ENOSPC)
+    monkeypatch.setattr(sys, "stderr", _Closed())
+
+    assert _sent_with(_vendor(token)) == "Bearer fresh-1"
+
+
+def test_a_failure_line_that_cannot_be_built_costs_only_the_line(tmp_path, monkeypatch):
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _serve(monkeypatch, _Server(rotate=False))
+    _refuse_with(monkeypatch, _NoReason(errno.ENOSPC, "unread"))
+
+    assert _sent_with(_vendor(token)) == "Bearer fresh-1"
+    assert _held(token) is not None
+
+
+def test_a_refused_rotation_line_still_raises_the_writes_own_error(tmp_path, monkeypatch):
+    # The log refuses with ``ENOSPC`` and the token write with ``EROFS``. The request raises
+    # the write's error, and the rotated token is still held.
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _serve(monkeypatch, _Server(rotate=True))
+    fill_disk(monkeypatch, errno.EROFS)
+    monkeypatch.setattr(sys, "stderr", _Refusing())
+
+    with pytest.raises(OSError) as raised:
+        _sent_with(_vendor(token))
+    assert raised.value.errno == errno.EROFS
+    assert _held(token) is not None
+
+
+def test_a_refused_recovery_line_costs_the_line_not_the_request(tmp_path, monkeypatch):
+    # A re-login lands while the disk is still full, and the log on that disk refuses.
+    token, _ = _hold_one(tmp_path, monkeypatch)
+    _write(token, access="relogin", refresh="refresh-0", expires_in=1800, mint=MINT_AFTER)
+    monkeypatch.setattr(sys, "stderr", _Refusing())
+
+    assert _sent_with(_vendor(token)) == "Bearer relogin"
+    assert _held(token) is None
+
+
+@pytest.mark.parametrize("stderr", [_Refusing, _Closed], ids=["refusing", "closed"])
+def test_a_failed_close_costs_only_the_line(monkeypatch, stderr):
+    from tests.support.schwab import FakeSchwabClient
+
+    class _Unprintable(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no text for this error")
+
+    client = FakeSchwabClient()
+    vendor = SchwabVendor(client)
+
+    def refuse_unprintably() -> None:
+        raise _Unprintable
+
+    client.session.close = refuse_unprintably
+    vendor.close()
+
+    def refuse() -> None:
+        raise OSError("socket already gone")
+
+    client.session.close = refuse
+    monkeypatch.setattr(sys, "stderr", stderr())
+    vendor.close()
+
+
+def test_the_recovery_line_names_the_token_file(tmp_path, monkeypatch, capsys):
+    token, _ = _hold_one(tmp_path, monkeypatch)
+    _write(token, access="relogin", refresh="refresh-0", expires_in=1800, mint=MINT_AFTER)
+    capsys.readouterr()
+
+    assert _sent_with(_vendor(token)) == "Bearer relogin"
+    assert f"token file at {token} {_RECOVERED}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("error", "named"),
+    [
+        (TimeoutError("the disk stopped answering"), "(TimeoutError)"),
+        (OSError(errno.ENOSPC, ""), "(ENOSPC)"),
+    ],
+    ids=["no-errno-subclass", "empty-reason"],
+)
+def test_the_failure_line_names_what_the_error_carries(tmp_path, monkeypatch, capsys, error, named):
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    _serve(monkeypatch, _Server(rotate=False))
+    _refuse_with(monkeypatch, error)
+
+    assert _sent_with(_vendor(token)) == "Bearer fresh-1"
+    assert f"{named} at {token};" in capsys.readouterr().err
+
+
+def test_a_rotation_then_a_failure_that_did_not_rotate_prints_the_failure_line(
+    tmp_path, monkeypatch, capsys
+):
+    # The rotation line is not the failure line. A later failure on the same errno that did
+    # not rotate still owes its own line once.
+    token = tmp_path / "token.json"
+    _write(token, access="stale", refresh="refresh-0", expires_in=-10)
+    server = _Server(rotate=True, expires_in=100)
+    _serve(monkeypatch, server)
+    fill_disk(monkeypatch, errno.ENOSPC)
+    with pytest.raises(OSError):
+        _sent_with(_vendor(token))
+    capsys.readouterr()
+
+    server.rotate = False
+    assert _sent_with(_vendor(token)) == "Bearer fresh-2"
+    assert server.refreshed_with == ["refresh-0", "refresh-1"]
+    err = capsys.readouterr().err
+    assert err.count(_FAILED) == 1
+    assert _GOES_ON in err
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        [],
+        {"creation_timestamp": MINT_AFTER, "token": "not a mapping"},
+        {"creation_timestamp": MINT_AFTER, "token": {**_on_disk(), "expires_at": True}},
+        {"creation_timestamp": MINT_AFTER, "token": {**_on_disk(), "expires_at": 4.0e9}},
+    ],
+    ids=["envelope-is-a-list", "token-is-a-string", "expiry-is-a-bool", "expiry-is-a-float"],
+)
+def test_the_reader_returns_a_file_it_cannot_compare_as_it_is(tmp_path, monkeypatch, envelope):
+    # At the reader's own seam, since ``schwab-py`` refuses some of these shapes itself. The
+    # disk is free, so a reader that let the held token win would write it.
+    token, _ = _hold_one(tmp_path, monkeypatch)
+    free_disk(monkeypatch)
+    token.write_text(json.dumps(envelope))
+
+    assert lake.schwab._read_or_held(token) == envelope
+    assert json.loads(token.read_text()) == envelope
+    assert _held(token) is not None
