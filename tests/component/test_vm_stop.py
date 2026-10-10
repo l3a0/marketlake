@@ -29,6 +29,8 @@ which every check passes ends in the script's own line that no poweroff came, an
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,6 +44,9 @@ from tests.support.fake_disk import FAKE_VENV_PYTHON, install_disk_fakes
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VM_STOP = REPO_ROOT / "deploy" / "vm-stop.sh"
 BUSY_CHECK = REPO_ROOT / "deploy" / "busy-check.sh"
+VM_DEPLOY = REPO_ROOT / "deploy" / "vm-deploy.sh"
+LINUX_INSTALL = REPO_ROOT / "deploy" / "linux-install.sh"
+EMPTY_SHADOW_LAKE = REPO_ROOT / "deploy" / "vm-empty-shadow-lake.sh"
 
 OWNER = "someone"
 DAEMON = "com.marketlake.daemon.service"
@@ -62,6 +67,9 @@ WINDOW_REFUSAL = (
 # An interactive SSH login as who prints it. sshd writes this utmp record only for a
 # session with a pty, so the dashboard tunnel, ssh -N -L, has none.
 SSH_LOGIN = "someone  pts/0        2026-10-12 19:02 (203.0.113.7)\n"
+# A login at the serial console, as who prints it. login writes a utmp record for any
+# terminal, so the check refuses for this one as for an SSH terminal.
+SERIAL_LOGIN = "someone  ttyS0        2026-10-12 19:02\n"
 
 # One loginctl line each, in systemd 255's columns: SESSION, UID, USER, SEAT, TTY, STATE,
 # IDLE and SINCE. systemd 255's pam_systemd records no TTY for an SSH session, so an
@@ -168,6 +176,19 @@ class VM:
         (self.state / "activating").mkdir(exist_ok=True)
         (self.state / "activating" / unit).write_text("")
 
+    def unit_state(self, unit: str, states: str) -> None:
+        """``unit`` reads ``states``, its active state and sub-state, such as
+        ``deactivating stop-sigterm``."""
+        (self.state / "unit-state").mkdir(exist_ok=True)
+        (self.state / "unit-state" / unit).write_text(states)
+
+    def window_prints(self, output: str) -> None:
+        """The checkout's python prints ``output`` and exits 0, whatever it is asked to run."""
+        python = self.checkout / ".venv" / "bin" / "python"
+        python.unlink()
+        python.write_text(f"#!/bin/bash\nprintf '%s' {shlex.quote(output)}\n")
+        python.chmod(0o755)
+
     def procs(self, *pids: str) -> None:
         group = self.root / "sys" / "fs" / "cgroup" / "system.slice" / DAEMON
         group.mkdir(parents=True, exist_ok=True)
@@ -266,6 +287,40 @@ def test_the_script_is_tracked_executable_and_the_busy_check_is_not():
 def test_the_unit_runs_the_script_this_test_runs():
     host = cp.SystemdHost(python="/p/python", owner="o", home="/h", project_dir="/h/m")
     assert cp.stop_unit(host).exec_start == f"/h/m/{VM_STOP.relative_to(REPO_ROOT)}"
+
+
+def _shell_value(script: Path, name: str) -> str:
+    """The one value ``script`` assigns to ``name`` at the start of a line, with the test
+    prefix ``$ROOT`` dropped and every other variable it names expanded from the same file."""
+    values = re.findall(rf"^{name}=(.*)$", script.read_text(), re.MULTILINE)
+    assert len(values) == 1, (script.name, name, values)
+    value = values[0].strip('"').removeprefix("$ROOT")
+    return re.sub(r"\$(\w+)", lambda found: _shell_value(script, found.group(1)), value)
+
+
+def test_the_stop_and_the_deploy_name_the_same_locks_and_deploy_unit():
+    """Each script spells the two locks and the deploy unit itself, and each script's tests
+    check only their own spelling. A rename in one would leave a deploy and a stop holding
+    different locks, so neither would wait for the other."""
+    names = ("DEPLOY_LOCK", "INSTALL_LOCK", "DEPLOY_SERVICE")
+    stop = {name: _shell_value(VM_STOP, name) for name in names}
+    deploy = {name: _shell_value(VM_DEPLOY, name) for name in names}
+    assert stop == deploy
+    assert stop == {
+        "DEPLOY_LOCK": "/run/marketlake-deploy.lock",
+        "INSTALL_LOCK": cp.INSTALL_LOCK,
+        "DEPLOY_SERVICE": DEPLOY_SERVICE,
+    }
+    # The install, and the shadow lake's emptying, take the same install lock.
+    assert _shell_value(LINUX_INSTALL, "LOCK") == cp.INSTALL_LOCK
+    assert _shell_value(EMPTY_SHADOW_LAKE, "LOCK") == cp.INSTALL_LOCK
+
+
+def test_the_script_pings_the_slug_the_control_plane_accepts():
+    """The script spells the slug itself, while the ping's choices and the unit tests both
+    read ``VM_STOP_SLUG``, so a rename on either side would leave the stop's ping refused."""
+    assert _shell_value(VM_STOP, "SLUG") == cp.VM_STOP_SLUG
+    assert 'PING=(-m lake.control_plane ping "$SLUG")' in VM_STOP.read_text()
 
 
 # -- every check passes ----------------------------------------------------------------
@@ -386,8 +441,15 @@ CLOSING_REASON = "session 6 of someone is closing, so a command it started may s
         (SSH_LOGIN, TUNNEL + SSH_SESSION, "someone is logged in at pts/0"),
         ("", CLOSING, CLOSING_REASON),
         ("", TUNNEL + CLOSING, CLOSING_REASON),
+        (SERIAL_LOGIN, "", "someone is logged in at ttyS0"),
     ],
-    ids=["ssh terminal", "terminal beside a tunnel", "closing", "closing behind a tunnel"],
+    ids=[
+        "ssh terminal",
+        "terminal beside a tunnel",
+        "closing",
+        "closing behind a tunnel",
+        "serial console",
+    ],
 )
 def test_a_login_at_a_terminal_or_a_closing_session_keeps_the_vm_up(vm, logins, sessions, reason):
     proc = vm.run(FAKE_WHO=logins, FAKE_SESSIONS=sessions)
@@ -411,11 +473,27 @@ def test_a_running_timer_job_keeps_the_vm_up(vm):
     assert not vm.ran(f"sudo -u {OWNER}")
 
 
-def test_a_compaction_in_the_daemons_cgroup_keeps_the_vm_up(vm):
-    vm.procs(DAEMON_PID, "2002")
+@pytest.mark.parametrize(
+    "states",
+    ["deactivating stop-sigterm", "reloading reload"],
+    ids=["deactivating", "reloading"],
+)
+def test_a_timer_job_stopping_or_reloading_keeps_the_vm_up(vm, states):
+    """A job that is stopping still has processes alive, and a reload runs while the job
+    does, so only inactive and failed let the VM stop."""
+    vm.unit_state(SWEEP, states)
+    proc = vm.run()
+    _refused(vm, proc, "4 (busy)", f"{SWEEP} is {states.split()[0]}")
+    assert not vm.ran(f"sudo -u {OWNER}")
+
+
+@pytest.mark.parametrize("child", ["2002", "512"], ids=["above", "below after a wraparound"])
+def test_a_compaction_in_the_daemons_cgroup_keeps_the_vm_up(vm, child):
+    # Process ids wrap around, so a compaction can have a lower id than the daemon.
+    vm.procs(DAEMON_PID, child)
     proc = vm.run()
     reason = (
-        f"the daemon's cgroup holds process 2002 beside its main process {DAEMON_PID},"
+        f"the daemon's cgroup holds process {child} beside its main process {DAEMON_PID},"
         " such as a compaction"
     )
     _refused(vm, proc, "4 (busy)", reason)
@@ -494,8 +572,11 @@ def test_a_failing_loginctl_is_an_error(vm):
     _failed(vm, vm.run(LOGINCTL_RC="1"), "3 (terminal)", "loginctl list-sessions failed")
 
 
-def test_a_session_line_short_of_six_fields_is_an_error(vm):
-    proc = vm.run(FAKE_SESSIONS="4 1000 someone -\n")
+@pytest.mark.parametrize(
+    "line", ["4 1000 someone -\n", "4 1000 someone - -\n"], ids=["four fields", "five fields"]
+)
+def test_a_session_line_short_of_six_fields_is_an_error(vm, line):
+    proc = vm.run(FAKE_SESSIONS=line)
     _failed(vm, proc, "3 (terminal)", "loginctl printed a session with fewer than six fields")
 
 
@@ -533,6 +614,22 @@ def test_window_output_without_its_span_line_is_an_error(vm, code):
     _failed(vm, proc, "5 (window)", "python -m lake.deploy_window printed no next_span_start line")
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "a deploy may start now\nnext_span_start=soon\n",
+        "a deploy may start now\nnext_span_start=4102444800\nmore\n",
+        "\nnext_span_start=4102444800\n",
+        "a deploy may start now\n4102444800\n",
+    ],
+    ids=["not a number", "a third line", "an empty first line", "no prefix"],
+)
+def test_window_output_of_another_shape_is_an_error(vm, output):
+    vm.window_prints(output)
+    proc = vm.run()
+    _failed(vm, proc, "5 (window)", "python -m lake.deploy_window printed no next_span_start line")
+
+
 def test_a_missing_bootstrap_conf_is_an_error(vm):
     vm.conf.unlink()
     _failed(vm, vm.run(), "5 (window)", "/etc/marketlake/bootstrap.conf is missing")
@@ -543,13 +640,17 @@ def test_a_missing_bootstrap_conf_is_an_error(vm):
     [
         ("OWNER=nobody-here\n", "the OWNER in bootstrap.conf names no account on this host"),
         ("OWNER=someone\nOWNER=someone\n", "bootstrap.conf sets OWNER twice"),
+        (
+            "OWNER=someone\nLAKE_VOLUME_ID=vol-1\nLAKE_VOLUME_ID=vol-2\n",
+            "bootstrap.conf sets LAKE_VOLUME_ID twice",
+        ),
         ("OWNER=someone\nOTHER=1\n", "bootstrap.conf holds an unknown key"),
         ("OWNER someone\n", "bootstrap.conf holds a line that is not KEY=VALUE"),
         ("LAKE_VOLUME_ID=vol-1\n", "bootstrap.conf must set OWNER to an account name"),
     ],
-    ids=["no account", "twice", "unknown key", "not a pair", "no owner"],
+    ids=["no account", "twice", "volume twice", "unknown key", "not a pair", "no owner"],
 )
-def test_a_bootstrap_conf_that_names_no_owner_is_an_error(vm, conf, reason):
+def test_a_bootstrap_conf_it_cannot_use_is_an_error(vm, conf, reason):
     vm.conf.write_text(conf)
     _failed(vm, vm.run(), "5 (window)", reason)
 

@@ -29,7 +29,10 @@ a test too.
    ``--quiet`` is given.
 
 A unit whose name is a file in ``$STATE/activating`` reads ``activating``, as a oneshot
-does while it runs, until a ``restart`` of it. A unit named in ``$STATE/crashing`` hands
+does while it runs, until a ``restart`` of it. A unit whose name is a file in
+``$STATE/unit-state`` reads the active state and sub-state the file holds, such as
+``deactivating stop-sigterm`` for a unit whose processes are still being stopped, ahead
+of every other state. A unit named in ``$STATE/crashing`` hands
 out a fresh pid on every ``MainPID`` read, as a daemon that dies and restarts does.
 
 ``FAIL_START`` names units whose interpreter cannot start. ``RESTART_MODE`` picks what a
@@ -168,7 +171,10 @@ property() {
     MainPID) main_pid "$unit" ;;
     NeedDaemonReload) need_reload "$unit" ;;
     ActiveState)
-      if [[ -f "$STATE/activating/$unit" ]]; then echo activating
+      if [[ -f "$STATE/unit-state/$unit" ]]; then
+        read -r active _ < "$STATE/unit-state/$unit"
+        echo "$active"
+      elif [[ -f "$STATE/activating/$unit" ]]; then echo activating
       elif [[ -f "$STATE/pid/$unit" ]]; then echo active
       elif [[ -f "$STATE/failed/$unit" ]]; then echo failed
       else echo inactive; fi ;;
@@ -265,12 +271,16 @@ case "$cmd" in
     done
     names=""
     for f in "$UNIT_DIR"/com.marketlake.* "$STATE"/pid/com.marketlake.* \
-        "$STATE"/failed/com.marketlake.* "$STATE"/activating/com.marketlake.*; do
+        "$STATE"/failed/com.marketlake.* "$STATE"/activating/com.marketlake.* \
+        "$STATE"/unit-state/com.marketlake.*; do
       if [[ -e "$f" ]]; then names="$names ${f##*/}"; fi
     done
     for name in $(printf '%s\n' $names | sort -u); do
       if [[ $services == 1 && "$name" != *.service ]]; then continue; fi
-      if [[ -f "$STATE/activating/$name" ]]; then
+      if [[ -f "$STATE/unit-state/$name" ]]; then
+        read -r active sub < "$STATE/unit-state/$name"
+        echo "$name loaded $active $sub $name"
+      elif [[ -f "$STATE/activating/$name" ]]; then
         echo "$name loaded activating start $name"
       elif [[ -f "$STATE/pid/$name" ]]; then
         sub=running; [[ "$name" == *.timer ]] && sub=waiting

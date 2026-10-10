@@ -1180,6 +1180,21 @@ def test_a_running_timer_service_refuses_the_deploy(vm):
     _assert_untouched(vm)
 
 
+@pytest.mark.parametrize(
+    "states",
+    ["deactivating stop-sigterm", "reloading reload"],
+    ids=["deactivating", "reloading"],
+)
+def test_a_timer_service_stopping_or_reloading_refuses_the_deploy(vm, states):
+    """A job that is stopping still has processes alive, so only inactive and failed pass."""
+    (vm.state / "unit-state").mkdir(exist_ok=True)
+    (vm.state / "unit-state" / SWEEP).write_text(states)
+    proc = vm.deploy(vm.c["c2"])
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: {SWEEP} is {states.split()[0]}"
+    _assert_untouched(vm)
+
+
 def test_a_waiting_timer_does_not_refuse_the_deploy(vm):
     """A timer reads active while it waits, so only services are listed."""
     vm.start("com.marketlake.eod-sweep.timer", "1500")
