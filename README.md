@@ -22,8 +22,9 @@ bucket, the instance role, the laptop's one IAM user, `marketlake-command`, with
 roles it assumes ([#737](https://github.com/l3a0/marketlake/issues/737)), the VM
 itself ([#686](https://github.com/l3a0/marketlake/issues/686)), the SSM document that
 deploys `main` to the VM ([#676](https://github.com/l3a0/marketlake/issues/676)), and the
-two schedules that start the VM at 07:30 on weekdays and 19:30 on Sundays, once it stops
-itself after the day's work ([#867](https://github.com/l3a0/marketlake/issues/867)). The role
+two schedules that start the VM at 07:30 on weekdays and 19:30 on Sundays
+([#867](https://github.com/l3a0/marketlake/issues/867)), which matter once
+[#868](https://github.com/l3a0/marketlake/issues/868)'s stop is switched on. The role
 `marketlake-backup` reaches the bucket, and the role `marketlake-token-writer` writes the
 Schwab token to the VM's config parameters. cloud-init takes a new VM from nothing to a
 running daemon with no login, through `deploy/vm-bootstrap.sh`. The VM ran as a shadow
@@ -92,8 +93,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
-  that holds the infrastructure's state, GitHub's OIDC provider, and the plan, apply and
-  deploy roles. The owner applies it from the laptop.
+  that holds the infrastructure's state, GitHub's OIDC provider, the plan, apply and
+  deploy roles, and the scheduler role the start schedules pass. The owner applies it
+  from the laptop.
 - `infra/live` is the configuration CI applies: the backup bucket, the instance role,
   the laptop's IAM user `marketlake-command` with the two roles it assumes, one for the
   bucket and one that writes the Schwab token, and the hosted VM. `infra/live/vm.tf`
@@ -101,6 +103,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `infra/live/user-data.sh.tftpl` is the first-boot script it hands to cloud-init.
   `infra/live/deploy.tf` holds the SSM document that deploys `main` to the VM, and
   `infra/live/deploy-step.sh` is the one shell step it runs there.
+  `infra/live/schedule.tf` holds the two schedules that start the VM at 07:30 on weekdays
+  and 19:30 on Sundays.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
@@ -898,13 +902,14 @@ tofu -chdir=infra/live validate
 tofu -chdir=infra/live test
 ```
 
-Seven things those checks cannot see are covered by `uv run pytest` instead.
+Eight things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups, captured minutes or
    the infrastructure's state, and on the laptop's user, its two roles and their
    policies, which CI cannot delete.
 2. The exact set of policies each bootstrap role and each live IAM user and role carries,
-   and distinct names for the inline policies on one role.
+   distinct names for the inline policies on one role, and no permissions boundary or
+   path on a bootstrap role.
 3. The live backend's state key matching what the apply role may write.
 4. No resource or data source that would store an SSM parameter's value in state.
 5. The VM's `ignore_changes` list and the grants it waits for, the one zone its volume
@@ -915,6 +920,10 @@ Seven things those checks cannot see are covered by `uv run pytest` instead.
 7. The deploy: the document's shell step run under dash, `deploy/send-deploy.sh` run
    against a fake `aws`, the guards in `deploy.yml`, and the document name, tag and
    timeouts that `deploy.yml` shares with both configurations.
+8. The start schedules: the role each passes, its name and group, and the role's tag
+   condition, each against what `infra/bootstrap/` declares, every `iam:PassRole` naming
+   the one service its role goes to, and each start's time against the roster's jobs and
+   the morning check that pages when the VM is not up.
 
 ### Keep development runs off the real config directory
 
