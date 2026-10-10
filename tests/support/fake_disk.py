@@ -304,7 +304,8 @@ FAKE_LINUX_INSTALL = (
 # The checkout's venv interpreter. The render and the roster read stdin, which the fake
 # keeps so a test can check what each was fed. The deploy window prints its two lines,
 # FAKE_WINDOW_LINE and a next_span_start of FAKE_NEXT_SPAN, and exits FAKE_WINDOW_RC.
-# FAKE_WINDOW_BAD prints one line with no span instead.
+# FAKE_WINDOW_BAD prints one line with no span instead. The control plane, which
+# deploy/vm-stop.sh runs as `ping vm-stop`, prints a ping line and exits FAKE_PING_RC.
 FAKE_VENV_PYTHON = (
     "#!/bin/bash\n"
     'printf \'venv-python %s\\n\' "$*" >> "$LOG"\n'
@@ -318,6 +319,9 @@ FAKE_VENV_PYTHON = (
     echo "${FAKE_WINDOW_LINE:-a deploy may start now, and until Mon 2026-10-12 04:30 EDT}"
     echo "next_span_start=${FAKE_NEXT_SPAN:-4102444800}"
     exit "${FAKE_WINDOW_RC:-0}" ;;
+  lake.control_plane)
+    echo "ping: pinged=$([[ "${FAKE_PING_RC:-0}" == 0 ]] && echo True || echo False) slug=${4:-}"
+    exit "${FAKE_PING_RC:-0}" ;;
 esac
 echo "fake venv python: unexpected module $2" >&2
 exit 9

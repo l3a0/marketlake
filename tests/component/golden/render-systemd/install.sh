@@ -8,10 +8,11 @@
 # so it can interleave with a deploy and leave the older commit's units installed.
 #
 # It copies a unit only when its content changed, and prints `changed: <file>`
-# when it does. It retires any com.marketlake unit the render no longer names,
-# reloads systemd, and enables and starts the residents and the timers. Starting
-# skips what already runs, so a running service keeps its old definition until
-# its next restart. ./restart.sh is how to give it the new one.
+# when it does. It retires any com.marketlake or marketlake- unit the render no
+# longer names, reloads systemd, and enables and starts the residents and the
+# timers. Starting skips what already runs, so a running service keeps its old
+# definition until its next restart. ./restart.sh is how to give it the
+# new one.
 #
 # It closes by reading back each resident's state. A resident that restarts every
 # 10 seconds is expected until config.yaml and tickers.yaml land.
@@ -34,8 +35,8 @@ NEEDRESTART_DIR="$ROOT/etc/needrestart/conf.d"
 STAMP_DIR="$ROOT/var/lib/systemd/timers"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-UNITS=(com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.service com.marketlake.self-check.timer com.marketlake.calendar-probe.service com.marketlake.calendar-probe.timer com.marketlake.sunday.service com.marketlake.sunday.timer com.marketlake.eod-sweep.service com.marketlake.eod-sweep.timer)
-ENABLE=(com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.timer com.marketlake.calendar-probe.timer com.marketlake.sunday.timer com.marketlake.eod-sweep.timer)
+UNITS=(com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.service com.marketlake.self-check.timer com.marketlake.calendar-probe.service com.marketlake.calendar-probe.timer com.marketlake.sunday.service com.marketlake.sunday.timer com.marketlake.eod-sweep.service com.marketlake.eod-sweep.timer marketlake-stop.service marketlake-stop.timer marketlake-up.service marketlake-up.timer)
+ENABLE=(com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.timer com.marketlake.calendar-probe.timer com.marketlake.sunday.timer com.marketlake.eod-sweep.timer marketlake-stop.timer marketlake-up.timer)
 RESIDENTS=(com.marketlake.daemon.service com.marketlake.dashboard.service)
 
 rendered() {
@@ -69,9 +70,12 @@ for unit in ${UNITS[@]+"${UNITS[@]}"}; do
 done
 place "$HERE/needrestart.conf" "$NEEDRESTART_DIR/marketlake.conf"
 
-# 2. Retire a com.marketlake unit the render no longer names. A timer's stamp goes
-# with it, or a reinstall of that timer would fire a replay at once.
-for path in "$UNIT_DIR"/com.marketlake.*.service "$UNIT_DIR"/com.marketlake.*.timer; do
+# 2. Retire a com.marketlake or marketlake- unit the render no longer names. A
+# timer's stamp goes with it, or a reinstall of that timer would fire a replay at
+# once. The deploy's marketlake-deploy.service is transient, so its file lives
+# under /run/systemd/transient and never here.
+for path in "$UNIT_DIR"/com.marketlake.*.service "$UNIT_DIR"/com.marketlake.*.timer \
+    "$UNIT_DIR"/marketlake-*.service "$UNIT_DIR"/marketlake-*.timer; do
   if [[ ! -f "$path" ]]; then continue; fi
   unit="${path##*/}"
   if rendered "$unit"; then continue; fi

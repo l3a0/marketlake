@@ -95,6 +95,10 @@ SYSTEMD_EXPECTED_FILES = {
     "com.marketlake.sunday.timer",
     "com.marketlake.eod-sweep.service",
     "com.marketlake.eod-sweep.timer",
+    "marketlake-stop.service",
+    "marketlake-stop.timer",
+    "marketlake-up.service",
+    "marketlake-up.timer",
     cp.NEEDRESTART_FILE,
     cp.INSTALL_SCRIPT_FILE,
     cp.UNINSTALL_SCRIPT_FILE,
@@ -122,9 +126,12 @@ def test_render_writes_every_file_into_the_directory_and_nothing_outside(host, t
     assert [p.name for p in tmp_path.iterdir()] == ["out"]
     printed = capsys.readouterr().out
     if host == "systemd":
-        # Every service names the owner, and the summary names every file written.
+        # Every service names the owner, except the stop, which runs as root (#868), and
+        # the summary names every file written.
         for name in SYSTEMD_EXPECTED_FILES:
-            if name.endswith(".service"):
+            if name == "marketlake-stop.service":
+                assert "\nUser=" not in (out / name).read_text(), name
+            elif name.endswith(".service"):
                 assert "\nUser=someone\n" in (out / name).read_text(), name
             assert name in printed, name
         return

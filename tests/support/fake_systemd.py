@@ -39,9 +39,11 @@ process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is
 units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
-which macOS lacks, and for ``git`` and ``sleep``. Each logs its argv to ``$LOG``. The
+which macOS lacks, and for ``git``, ``sleep`` and ``loginctl``. The fake ``loginctl``
+prints ``FAKE_SESSIONS`` and exits ``LOGINCTL_RC``. Each logs its argv to ``$LOG``. The
 fake ``flock`` takes both of its forms. With a bare descriptor, as ``flock -w 600 9``, it
-exits ``FLOCK_RC``. With a file and a command, as ``flock -w 600 <file> <command>``, it
+exits the next code in ``FLOCK_RCS`` when that is set, one per call, and ``FLOCK_RC``
+otherwise. With a file and a command, as ``flock -w 600 <file> <command>``, it
 creates the file and runs the command, unless the next code in ``FLOCK_FILE_RCS`` is not
 0, which it exits with instead, as a lock held for the whole wait makes the real one. The
 fake ``getent`` answers the owner's uid, 1000, as well as the name, as glibc's does. Its
@@ -384,8 +386,9 @@ NEXT_RC = r"""next_rc() {
 }
 """
 
-# Both forms of flock: a bare descriptor answers FLOCK_RC, and a file with a command runs
-# the command, unless FLOCK_FILE_RCS says the lock stayed held.
+# Both forms of flock: a bare descriptor answers the next code in FLOCK_RCS, or FLOCK_RC
+# when no sequence is set, and a file with a command runs the command, unless
+# FLOCK_FILE_RCS says the lock stayed held.
 FAKE_FLOCK = (
     "#!/bin/bash\n"
     'printf \'flock %s\\n\' "$*" >> "$LOG"\n'
@@ -398,6 +401,7 @@ FAKE_FLOCK = (
   esac
 done
 if [[ $# -le 1 ]]; then
+  if [[ -n "${FLOCK_RCS:-}" ]]; then exit "$(next_rc flock-fd "$FLOCK_RCS")"; fi
   exit "${FLOCK_RC:-0}"
 fi
 rc="$(next_rc flock-file "${FLOCK_FILE_RCS:-}")"
@@ -420,6 +424,16 @@ exit 0
 
 FAKE_SLEEP = "#!/bin/bash\nexit 0\n"
 
+# loginctl list-sessions --no-legend, which deploy/vm-stop.sh reads. It prints
+# FAKE_SESSIONS through printf %b, one session a line in systemd 255's columns: SESSION,
+# UID, USER, SEAT, TTY, STATE, IDLE and SINCE, with - for an empty cell. It exits
+# LOGINCTL_RC.
+FAKE_LOGINCTL = r"""#!/bin/bash
+printf 'loginctl %s\n' "$*" >> "$LOG"
+if [[ -n "${FAKE_SESSIONS:-}" ]]; then printf '%b' "$FAKE_SESSIONS"; fi
+exit "${LOGINCTL_RC:-0}"
+"""
+
 FAKES = {
     "systemctl": FAKE_SYSTEMCTL,
     "id": FAKE_ID,
@@ -428,6 +442,7 @@ FAKES = {
     "flock": FAKE_FLOCK,
     "git": FAKE_GIT,
     "sleep": FAKE_SLEEP,
+    "loginctl": FAKE_LOGINCTL,
 }
 
 

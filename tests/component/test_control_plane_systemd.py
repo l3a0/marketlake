@@ -1,6 +1,6 @@
 """The systemd render and its scripts across one real boundary: the filesystem.
 
-``render --init systemd`` writes ten units, three scripts and a needrestart drop-in. The
+``render --init systemd`` writes fourteen units, three scripts and a needrestart drop-in. The
 rendered ``install.sh``, ``uninstall.sh`` and ``restart.sh`` then run for real, as do the
 tracked ``deploy/linux-install.sh``, against the fakes in ``tests.support.fake_systemd``
 with ``MARKETLAKE_INSTALL_ROOT`` pointed at a temporary directory. Nothing needs root and
@@ -15,11 +15,14 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
 from lake import control_plane as cp
+from lake import deploy_window as dw
+from lake.calendar import MARKET_TZ
 from lake.paths import TOKEN_FILE, config_dir, default_token_path
 from tests.component.test_control_plane_render import (
     EVERY_DAY_AT_THREE,
@@ -37,6 +40,8 @@ UNITS = sorted(name for name in SYSTEMD_EXPECTED_FILES if name.endswith((".servi
 RESIDENTS = ["com.marketlake.daemon.service", "com.marketlake.dashboard.service"]
 TIMERS = [name for name in UNITS if name.endswith(".timer")]
 PERSISTENT_STAMPS = ["stamp-com.marketlake.eod-sweep.timer", "stamp-com.marketlake.sunday.timer"]
+# The one service that runs a tracked script as root rather than Python as the owner.
+STOP_SERVICE = "marketlake-stop.service"
 
 
 def _render(out: Path, *extra: str) -> None:
@@ -162,7 +167,13 @@ def test_the_restart_offers_exactly_the_residents(tmp_path):
     script = (out / cp.RESTART_SCRIPT_FILE).read_text()
     for unit in RESIDENTS:
         assert f"UNITS=({unit})" in script, unit
-    for label in (cp.SELF_CHECK_LABEL, cp.CALENDAR_PROBE_LABEL, cp.SUNDAY_LABEL):
+    for label in (
+        cp.SELF_CHECK_LABEL,
+        cp.CALENDAR_PROBE_LABEL,
+        cp.SUNDAY_LABEL,
+        cp.STOP_LABEL,
+        cp.VM_UP_LABEL,
+    ):
         assert label not in script, label
     assert cp.EOD_SWEEP_LABEL not in script
 
@@ -193,7 +204,7 @@ def test_the_summary_counts_the_units_it_wrote(tmp_path, capsys):
     _render(out)
     printed = capsys.readouterr().out
     assert f"  {len(UNITS)} unit files:" not in printed
-    assert "  ten unit files:" in printed
+    assert "  fourteen unit files:" in printed
     # The next step is the entry point, which holds the install lock, never a hand run
     # of the rendered install.sh, which would skip it.
     (next_line,) = [line for line in printed.splitlines() if line.startswith("  next: ")]
@@ -206,7 +217,7 @@ def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch, capsys):
     """One roster, so a job added to ``all_jobs`` lands in the plists and the units both.
 
     The summary counts the grown roster too, which only a roster other than the real
-    one can show: a count spelled as a literal ten reads right on the real roster.
+    one can show: a count spelled as a literal fourteen reads right on the real roster.
     """
     original = cp.all_jobs
 
@@ -220,7 +231,7 @@ def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     _render(systemd)
     summary = capsys.readouterr().out.splitlines()
-    assert "  12 unit files:" in summary, summary
+    assert "  sixteen unit files:" in summary, summary
     for name in ("com.marketlake.seventh.service", "com.marketlake.seventh.timer"):
         assert f"    {name}" in summary, name
     assert (launchd / "com.marketlake.seventh.plist").exists()
@@ -230,7 +241,91 @@ def test_a_seventh_job_reaches_both_renders(tmp_path, monkeypatch, capsys):
     install = (systemd / cp.INSTALL_SCRIPT_FILE).read_text()
     assert "com.marketlake.seventh.timer" in install
     uninstall = (systemd / cp.UNINSTALL_SCRIPT_FILE).read_text()
-    assert "removes the 12 units" in uninstall
+    assert "removes the sixteen units" in uninstall
+
+
+# -- the stop and the morning ping (#868) -----------------------------------------------
+
+
+def _lines(path: Path) -> list[str]:
+    return path.read_text().splitlines()
+
+
+def test_the_stop_runs_its_script_as_root_every_ten_minutes(tmp_path):
+    out = tmp_path / "out"
+    _render(out)
+    service = _lines(out / "marketlake-stop.service")
+    # No User= line, so systemd runs it as root, for the poweroff and the locks in /run.
+    assert not [line for line in service if line.startswith(("User=", "Group="))], service
+    for line in (
+        "Type=oneshot",
+        "ExecStart=/home/someone/marketlake/deploy/vm-stop.sh",
+        "TimeoutStartSec=5min",
+        "CPUSchedulingPolicy=idle",
+        "IOSchedulingClass=idle",
+        "RequiresMountsFor=/srv/lake",
+    ):
+        assert line in service, (line, service)
+    # Only its timer starts it.
+    assert "[Install]" not in service
+    timer = _lines(out / "marketlake-stop.timer")
+    assert "OnCalendar=*:0/10" in timer, timer
+    assert not [line for line in timer if line.startswith("Persistent=")], timer
+    assert "WantedBy=timers.target" in timer
+
+
+def test_a_config_the_render_names_reaches_the_stop(tmp_path):
+    out = tmp_path / "out"
+    _render(out, "--config", "/srv/conf/config.yaml")
+    service = _lines(out / "marketlake-stop.service")
+    assert "Environment=MARKETLAKE_CONFIG=/srv/conf/config.yaml" in service, service
+    # Without one the stop carries no environment of its own.
+    bare = tmp_path / "bare"
+    _render(bare)
+    assert not [line for line in _lines(bare / "marketlake-stop.service") if "Environment" in line]
+
+
+def test_the_morning_ping_runs_as_the_owner_at_0740_on_weekdays(tmp_path):
+    out = tmp_path / "out"
+    _render(out)
+    service = _lines(out / "marketlake-up.service")
+    assert "User=someone" in service, service
+    (exec_start,) = [line for line in service if line.startswith("ExecStart=")]
+    assert exec_start.endswith(" -m lake.control_plane ping vm-up"), exec_start
+    assert "RequiresMountsFor=/srv/lake" in service
+    timer = _lines(out / "marketlake-up.timer")
+    assert "OnCalendar=Mon..Fri 07:40:00 America/New_York" in timer, timer
+    # A VM that boots late must send nothing, so the check pages.
+    assert not [line for line in timer if line.startswith("Persistent=")], timer
+
+
+def test_the_systemd_only_units_stay_out_of_the_roster_and_the_refused_spans(tmp_path):
+    """The units are rendered, and the hours a deploy may run do not move.
+
+    ``deploy_window`` reads ``systemd_units``. A ten-minute timer there would refuse
+    deploys all day, and the 07:40 ping would move the weekday span to 07:10.
+    """
+    out = tmp_path / "out"
+    _render(out)
+    power = {cp.STOP_LABEL, cp.VM_UP_LABEL}
+    assert {unit.label for unit in cp.vm_power_units(_host())} == power
+    for label in power:
+        assert (out / f"{label}.service").exists(), label
+        assert (out / f"{label}.timer").exists(), label
+    roster = {unit.label for unit in cp.systemd_units(_host())}
+    assert not roster & power
+    assert not {unit.label for unit in dw.default_units()} & power
+    assert not {job.label for job in cp.all_jobs(cp.LaunchdHost(*["/x"] * 5))} & power
+    # 08:00 to 18:45 Eastern on a weekday, and 19:30 to 23:30 on a Sunday, as before.
+    monday, sunday = date(2026, 10, 12), date(2026, 10, 11)
+    assert dw.refused_span(monday, dw.default_units()) == dw.Span(
+        datetime(2026, 10, 12, 8, 0, tzinfo=MARKET_TZ).astimezone(UTC),
+        datetime(2026, 10, 12, 18, 45, tzinfo=MARKET_TZ).astimezone(UTC),
+    )
+    assert dw.refused_span(sunday, dw.default_units()) == dw.Span(
+        datetime(2026, 10, 11, 19, 30, tzinfo=MARKET_TZ).astimezone(UTC),
+        datetime(2026, 10, 11, 23, 30, tzinfo=MARKET_TZ).astimezone(UTC),
+    )
 
 
 # -- the harness -----------------------------------------------------------------------
@@ -358,8 +453,9 @@ def test_the_install_reloads_then_enables_only_what_has_an_install_section(tmp_p
 
 
 def _order(timer: str) -> int:
-    """The roster's order, which is the order the install enables the timers in."""
-    labels = [job.label for job in cp.all_jobs(_host())]
+    """The roster's order, then the systemd-only units', which is the order the install
+    enables the timers in."""
+    labels = [job.label for job in (*cp.all_jobs(_host()), *cp.vm_power_units(_host()))]
     return labels.index(timer.removesuffix(".timer"))
 
 
@@ -405,9 +501,18 @@ def test_a_unit_dropped_from_the_render_is_retired_with_its_stamp(tmp_path, rend
     harness = Harness(tmp_path)
     harness.unit_dir.mkdir(parents=True)
     harness.stamp_dir.mkdir(parents=True)
-    for name in ("com.marketlake.retired.service", "com.marketlake.retired.timer"):
+    # A com.marketlake unit and a systemd-only one the render no longer names, such as a
+    # stop unit a later render dropped, which would otherwise keep powering the VM off.
+    retired = (
+        "com.marketlake.retired.service",
+        "com.marketlake.retired.timer",
+        "marketlake-retired.service",
+        "marketlake-retired.timer",
+    )
+    for name in retired:
         (harness.unit_dir / name).write_text("[Unit]\n")
     (harness.stamp_dir / "stamp-com.marketlake.retired.timer").write_text("")
+    (harness.stamp_dir / "stamp-marketlake-retired.timer").write_text("")
     # A systemctl edit drop-in directory, and a unit that is not marketlake's.
     edit = harness.unit_dir / "com.marketlake.daemon.service.d"
     edit.mkdir()
@@ -416,13 +521,14 @@ def test_a_unit_dropped_from_the_render_is_retired_with_its_stamp(tmp_path, rend
 
     proc = _install(harness, rendered)
     assert proc.returncode == 0, proc.stderr
-    assert not (harness.unit_dir / "com.marketlake.retired.service").exists()
-    assert not (harness.unit_dir / "com.marketlake.retired.timer").exists()
+    for name in retired:
+        assert not (harness.unit_dir / name).exists(), name
     assert not (harness.stamp_dir / "stamp-com.marketlake.retired.timer").exists()
+    assert not (harness.stamp_dir / "stamp-marketlake-retired.timer").exists()
     assert (edit / "override.conf").exists()
     assert (harness.unit_dir / "other.service").exists()
     calls = harness.calls()
-    for name in ("com.marketlake.retired.service", "com.marketlake.retired.timer"):
+    for name in retired:
         stop = calls.index(f"systemctl stop {name}")
         disable = calls.index(f"systemctl disable {name}")
         assert stop < disable < calls.index("systemctl daemon-reload"), calls
@@ -519,6 +625,7 @@ def test_an_empty_list_is_harmless_in_both_scripts(tmp_path, monkeypatch, render
         assert "[@]" not in bare, script
 
     monkeypatch.setattr(cp, "systemd_units", lambda host: ())
+    monkeypatch.setattr(cp, "vm_power_units", lambda host: ())
     empty = tmp_path / "empty"
     empty.mkdir()
     (empty / cp.NEEDRESTART_FILE).write_text(cp.needrestart_dropin())
@@ -601,8 +708,11 @@ def test_the_uninstall_warns_that_the_checks_go_silent_on_a_primary(tmp_path, re
     last = proc.stdout.splitlines()[-1]
     assert "primary" in last and "dead-man checks" in last, last
     header = (rendered / cp.UNINSTALL_SCRIPT_FILE).read_text().split("set -euo pipefail")[0]
-    for slug in cp.live_check_slugs():
+    # The systemd-only checks go silent too, since the uninstall removes the stop and the
+    # morning ping with the rest.
+    for slug in (*cp.live_check_slugs(), *cp.vm_power_slugs()):
         assert slug in header, slug
+    assert "nine dead-man checks go silent" in header, header
 
 
 # -- restart.sh ------------------------------------------------------------------------
@@ -1047,6 +1157,9 @@ def test_two_runs_swap_the_render_and_carry_the_lake_mount(tmp_path):
             text = (harness.unit_dir / unit).read_text()
             assert "\nRequiresMountsFor=/srv/lake\n" in text, unit
             assert "\nEnvironment=MARKETLAKE_CONFIG=/srv/ml.yaml\n" in text, unit
+            if unit == STOP_SERVICE:
+                assert f"\nExecStart={checkout}/deploy/vm-stop.sh\n" in text, unit
+                continue
             assert f"\nWorkingDirectory={checkout}\n" in text, unit
             assert f"\nExecStart={checkout}/.venv/bin/python -m " in text, unit
     assert sorted(path.name for path in state.iterdir()) == ["systemd"]

@@ -7,12 +7,12 @@
 #     sudo ./uninstall.sh
 #
 # It disables and stops each unit that is installed, deletes the persistent timers'
-# stamps, removes the ten units and the needrestart drop-in, and reloads systemd.
+# stamps, removes the fourteen units and the needrestart drop-in, and reloads systemd.
 # It acts only on units whose files are present, so it finishes on a partial
 # install too. It leaves the lake and the config directory.
 #
-# If this host is the primary, seven dead-man checks go silent when these units stop:
-# capture, pre-open, sunday, compaction, calendar-probe, eod-sweep and evening-upload.
+# If this host is the primary, nine dead-man checks go silent when these units stop:
+# capture, pre-open, sunday, compaction, calendar-probe, eod-sweep, evening-upload, vm-up and vm-stop.
 # Pause them in healthchecks first if the host is meant to stay uninstalled. A
 # shadow host feeds none of them, so uninstalling one silences nothing.
 set -euo pipefail
@@ -32,7 +32,7 @@ UNIT_DIR="$ROOT/etc/systemd/system"
 NEEDRESTART_DIR="$ROOT/etc/needrestart/conf.d"
 STAMP_DIR="$ROOT/var/lib/systemd/timers"
 
-UNITS=(com.marketlake.self-check.timer com.marketlake.calendar-probe.timer com.marketlake.sunday.timer com.marketlake.eod-sweep.timer com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.service com.marketlake.calendar-probe.service com.marketlake.sunday.service com.marketlake.eod-sweep.service)
+UNITS=(com.marketlake.self-check.timer com.marketlake.calendar-probe.timer com.marketlake.sunday.timer com.marketlake.eod-sweep.timer marketlake-stop.timer marketlake-up.timer com.marketlake.daemon.service com.marketlake.dashboard.service com.marketlake.self-check.service com.marketlake.calendar-probe.service com.marketlake.sunday.service com.marketlake.eod-sweep.service marketlake-stop.service marketlake-up.service)
 STAMPS=(stamp-com.marketlake.sunday.timer stamp-com.marketlake.eod-sweep.timer)
 
 # 1. Disable and stop each unit whose file is present. systemd 255's disable fails
@@ -63,4 +63,4 @@ rm -f "$NEEDRESTART_DIR/marketlake.conf"
 # 4. Reload, so systemd forgets the units.
 echo "+ systemctl daemon-reload"
 systemctl daemon-reload
-echo "uninstall.sh: done. On a primary host the seven dead-man checks now go silent and page."
+echo "uninstall.sh: done. On a primary host the nine dead-man checks now go silent and page."

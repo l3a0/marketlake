@@ -1,0 +1,11 @@
+# Written by `python -m lake.control_plane render --init systemd`. Change the renderer,
+# not this file: the install entry point renders afresh on every run.
+
+[Unit]
+Description=marketlake-stop
+
+[Timer]
+OnCalendar=*:0/10
+
+[Install]
+WantedBy=timers.target

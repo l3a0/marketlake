@@ -25,7 +25,9 @@ spawns run the same way, with the argv ``daemon.compaction_command`` or
 ``daemon.token_pull_command`` builds and the daemon job's environment and working
 directory, which each inherits because its spawn passes neither. The evening upload the
 vendor sweep execs runs with the argv ``sweep.evening_upload_command`` builds and the
-eod-sweep job's environment and working directory, which an ``exec`` keeps. The host is
+eod-sweep job's environment and working directory, which an ``exec`` keeps. The hosted
+VM's two pings run once each, as a systemd host starts them, since neither has a launchd
+form. The host is
 built per test with ``HOME`` under ``tmp_path``, which makes the child's config directory
 and ``sunday``'s ``--token`` throwaway without editing the job. The job's environment carries no
 ``MARKETLAKE_CONFIG_DIR``, so the suite's redirect does not reach the child, and the
@@ -50,6 +52,9 @@ from tests.unit.test_unattended_entries import (
     EVENING_UPLOAD,
     JOBS,
     TOKEN_PULL,
+    VM_STOP,
+    VM_STOP_ARGV,
+    VM_UP,
     stderr_label,
 )
 
@@ -167,4 +172,50 @@ def test_the_entry_imports_cleanly_from_a_fresh_interpreter(host_kind, label, tm
     # line matters as well as the code: ``argparse`` exits 2 too.
     label_printed = stderr_label(module, args)
     expected = f"{label_printed}: config file not found: {config_path}\n"
+    assert (finished.returncode, finished.stderr) == (2, expected), finished.stderr
+
+
+def systemd_only_entry(label: str, home: Path) -> tuple[list[str], dict[str, str], str]:
+    """The argv, environment and working directory of one of the VM's two pings (#868).
+
+    ``vm-up`` runs as its unit, with the environment and directory any job gets.
+    ``deploy/vm-stop.sh`` runs ``vm-stop`` as the owner through ``sudo -u <owner> -H``,
+    which clears the environment, sets ``HOME``, ``USER``, ``LOGNAME`` and ``SHELL`` and
+    its own ``PATH``, and keeps the stop unit's working directory, ``/``.
+    """
+    if label == VM_UP:
+        host = cp.SystemdHost(
+            python=sys.executable, owner=OWNER, home=str(home), project_dir=str(REPO_ROOT)
+        )
+        job = cp.vm_up_job(host)
+        env = started_environment("systemd", job, home)
+        return list(job.program_arguments), env, job.working_directory
+    env = {
+        "PATH": SYSTEMD_PATH,
+        "HOME": str(home),
+        "USER": OWNER,
+        "LOGNAME": OWNER,
+        "SHELL": "/bin/bash",
+    }
+    return [sys.executable, *VM_STOP_ARGV[1:]], env, "/"
+
+
+@pytest.mark.parametrize("label", [VM_UP, VM_STOP])
+def test_the_vm_pings_import_cleanly_from_a_fresh_interpreter(label, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    argv, env, cwd = systemd_only_entry(label, home)
+    _, flag, module, *args = argv
+    assert flag == "-m", argv
+    assert CONFIG_PATH_ENV not in env
+    assert CONFIG_DIR_ENV not in env
+    config_path = home.joinpath(*CONFIG_DIR_PARTS) / CONFIG_FILE
+    assert not config_path.exists()
+    assert not is_protected(config_path)
+
+    finished = subprocess.run(
+        argv, env=env, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT_SECONDS
+    )
+
+    expected = f"{stderr_label(module, args)}: config file not found: {config_path}\n"
     assert (finished.returncode, finished.stderr) == (2, expected), finished.stderr

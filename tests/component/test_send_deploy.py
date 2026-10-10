@@ -9,8 +9,8 @@ reaches stdout, stderr or the step summary.
 ``tests.support.fake_bin``'s one program. The fake ``aws`` logs its argv to ``$LOG`` and
 answers by what it was asked.
 
-- ``ec2 describe-instances`` prints ``INSTANCES``, the running instance ids that carry the
-  tag, or fails with ``DESCRIBE_ERROR``.
+- ``ec2 describe-instances`` prints ``INSTANCES``, one line per instance that carries the
+  tag, its id and its state, or fails with ``DESCRIBE_ERROR``.
 - ``ssm send-command`` prints a command id, or fails with ``SEND_ERROR``.
 - ``ssm get-command-invocation`` with ``--query StandardOutputContent`` prints the file
   ``HOST_OUTPUT``, or fails with ``OUTPUT_ERROR``. With any other query it answers the
@@ -135,7 +135,7 @@ class Runner:
             "DEPLOY_DOCUMENT": "marketlake-deploy",
             "DEPLOY_TAG_KEY": "marketlake:host",
             "DEPLOY_TAG_VALUE": "capture",
-            "INSTANCES": INSTANCE,
+            "INSTANCES": f"{INSTANCE}\trunning",
             "FAKE_COMMAND_ID": COMMAND_ID,
             "FAKE_ACCOUNT": ACCOUNT,
             "HOST_OUTPUT": str(self.output),
@@ -498,8 +498,8 @@ def test_the_send_names_the_instance_the_document_and_the_window(runner):
     calls = runner.calls("aws")
     assert calls[0] == (
         "aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture "
-        "Name=instance-state-name,Values=running "
-        "--query Reservations[].Instances[].InstanceId --output text"
+        "Name=instance-state-name,Values=pending,running,stopping,stopped "
+        "--query Reservations[].Instances[].[InstanceId,State.Name] --output text"
     )
     assert calls[1] == (
         "aws ssm send-command --document-name marketlake-deploy "
@@ -521,10 +521,17 @@ def test_the_send_names_the_instance_the_document_and_the_window(runner):
     )
 
 
+OTHER_INSTANCE = "i-0fedcba9876543210"
+
+
 @pytest.mark.parametrize(
     ("instances", "count"),
-    [("", 0), (f"{INSTANCE}\ti-0fedcba9876543210", 2), (f"{INSTANCE}\ni-0fedcba9876543210", 2)],
-    ids=["none", "two-tab", "two-line"],
+    [
+        ("", 0),
+        (f"{INSTANCE}\trunning\n{OTHER_INSTANCE}\trunning", 2),
+        (f"{INSTANCE}\trunning\n{OTHER_INSTANCE}\tstopped", 2),
+    ],
+    ids=["none", "two running", "one running and one stopped"],
 )
 def test_anything_but_one_instance_sends_nothing(runner, instances, count):
     result = runner.run(INSTANCES=instances)
@@ -532,7 +539,7 @@ def test_anything_but_one_instance_sends_nothing(runner, instances, count):
         runner,
         result,
         1,
-        f"not sent: {count} running instances carry the tag marketlake:host = capture, "
+        f"not sent: {count} instances carry the tag marketlake:host = capture, "
         "and a deploy needs exactly one",
         "none",
         "none",
@@ -540,17 +547,53 @@ def test_anything_but_one_instance_sends_nothing(runner, instances, count):
     assert not runner.calls("aws ssm")
 
 
-def test_an_id_that_is_not_an_instance_sends_nothing(runner):
-    result = runner.run(INSTANCES="None")
+@pytest.mark.parametrize(
+    "instances",
+    ["None", f"{INSTANCE}", "None\trunning", f"{INSTANCE}\tRunning!", f"{INSTANCE} running x"],
+    ids=["none", "no state", "no id", "bad state", "odd count"],
+)
+def test_a_reply_that_is_not_an_id_and_its_state_sends_nothing(runner, instances):
+    result = runner.run(INSTANCES=instances)
     _assert_reported(
         runner,
         result,
         1,
-        "not sent: DescribeInstances returned something that is not an instance id",
+        "not sent: DescribeInstances returned something that is not an instance id and its state",
         "none",
         "none",
     )
     assert not runner.calls("aws ssm")
+
+
+FIND = "infra/README.md's \"Find the VM's address\" finds its id and state"
+
+
+@pytest.mark.parametrize(
+    ("state", "summary"),
+    [
+        (
+            "stopped",
+            f'not sent: the VM is stopped. {FIND}, and "Start a stopped instance" starts it.'
+            " Re-run this workflow once it runs",
+        ),
+        (
+            "stopping",
+            f'not sent: the VM is stopped. {FIND}, and "Start a stopped instance" starts it.'
+            " Re-run this workflow once it runs",
+        ),
+        (
+            "pending",
+            f"not sent: the VM is still starting. {FIND}. Re-run this workflow once it runs",
+        ),
+    ],
+)
+def test_a_vm_that_is_not_running_is_named_and_sent_nothing(runner, state, summary):
+    """The VM stops itself each night (#868), so a deploy can find it stopped."""
+    result = runner.run(INSTANCES=f"{INSTANCE}\t{state}")
+    _assert_reported(runner, result, 1, summary, "none", "none")
+    assert not runner.calls("aws ssm")
+    # The instance id stays out of the public log.
+    assert INSTANCE not in result.stdout
 
 
 def test_a_failed_lookup_sends_nothing_and_prints_only_the_code(runner):
