@@ -737,8 +737,11 @@ def _refresh_writer_type() -> type:
            the write's own error is raised again. A short-lived process such as the canary
            then fails as loudly as before, and its re-auth reminder is the right action.
 
-        A token with no usable stamps, per ``_usable_stamps``, is never held, and it
-        clears any older held token it supersedes. Neither line names a token field.
+        A token with no usable stamps, per ``_usable_stamps``, is never held. When it did not
+        rotate, an older held token stays, because it carries the same refresh token and
+        later clients still need one that works. When it rotated, the older held token is
+        cleared, because its refresh token is the superseded one. Neither line names a
+        token field.
         """
 
         def __call__(self, token: object, *args: object, **kwargs: object) -> None:
@@ -781,7 +784,8 @@ def _refresh_writer_type() -> type:
                         "goes on, and each new client retries the write"
                     )
                 )
-            _hold(path, token, stamps, name)
+            if stamps is not None:
+                _hold(path, token, stamps, name)
             return False
 
     return RefreshTokenWriter

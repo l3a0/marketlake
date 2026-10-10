@@ -641,12 +641,45 @@ def test_a_refreshed_token_with_no_expiry_lets_the_request_go_on(tmp_path, monke
     assert capsys.readouterr().err.count(_FAILED) == 1
 
 
-def test_a_refreshed_token_with_no_expiry_drops_an_older_held_one(tmp_path, monkeypatch):
+def test_a_refreshed_token_with_no_expiry_keeps_an_older_held_one(tmp_path, monkeypatch):
+    # The new token cannot be held, and it did not rotate, so the older held token carries
+    # the same refresh token. Dropping it would leave later clients only the file's, which
+    # under an earlier rotation is the superseded one.
     token, server = _hold_one(tmp_path, monkeypatch, expires_in=100)
+    held = _held(token)
     server.expires_in = 0
 
     assert _sent_with(_vendor(token)) == "Bearer fresh-2"
+    assert _held(token) == held
+
+
+def test_a_file_with_the_held_tokens_exact_stamps_wins(tmp_path, monkeypatch, capsys):
+    # Two refreshes in one second compare equal, and the file wins, so the held token is
+    # never written over a token as new as itself.
+    token, _ = _hold_one(tmp_path, monkeypatch)
+    held = _held(token)
+    stamped = {
+        "access_token": "on-disk",
+        "refresh_token": "refresh-0",
+        "token_type": "Bearer",
+        "expires_at": held.expires_at,
+    }
+    token.write_text(json.dumps({"creation_timestamp": held.creation_timestamp, "token": stamped}))
+    free_disk(monkeypatch)
+    capsys.readouterr()
+
+    assert _sent_with(_vendor(token)) == "Bearer on-disk"
     assert _held(token) is None
+    assert _stored(token)["token"]["access_token"] == "on-disk"
+    assert capsys.readouterr().err.count(_RECOVERED) == 1
+
+
+def test_the_held_tokens_repr_names_no_token_field(tmp_path, monkeypatch):
+    token, _ = _hold_one(tmp_path, monkeypatch)
+
+    shown = repr(lake.schwab._HELD)
+    assert "fresh-1" not in shown
+    assert "refresh-0" not in shown
 
 
 class _WatchedLock:
