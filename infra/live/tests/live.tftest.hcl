@@ -617,8 +617,8 @@ run "instance_is_built_as_the_issue_describes" {
     error_message = "The instance does not ask for a public address, so with no NAT it reaches nothing."
   }
 
-  # The VM powers itself off each night (#865), and a poweroff under "terminate" would
-  # delete the instance and its root volume.
+  # Once #868's stop is switched on, the VM powers itself off each night (#865), and a
+  # poweroff under "terminate" would delete the instance and its root volume.
   assert {
     condition     = aws_instance.vm.instance_initiated_shutdown_behavior == "stop"
     error_message = "The instance's shutdown behavior is not stop, so a poweroff from inside could terminate it."
@@ -776,11 +776,11 @@ run "deploy_document_runs_only_vm_deploy" {
   }
 }
 
-# The two schedules that start the stopped VM (#867). Scheduler does not check a target's
-# input until the schedule fires, so the input is compared with an exact string under the
-# mocked instance id. The role's name, the group and the tag condition are compared with
-# infra/bootstrap by tests/component/test_infra_config.py, which also checks each start
-# against the roster.
+# The two schedules that start the VM once #868's stop is switched on (#867). Scheduler
+# does not check a target's input until the schedule fires, so the input is compared with
+# an exact string under the mocked instance id, and again under a second id below. The
+# role's name, the group and the tag condition are compared with infra/bootstrap by
+# tests/component/test_infra_config.py, which also checks each start against the roster.
 run "start_schedules_start_the_vm_before_capture" {
   command = plan
 
@@ -837,6 +837,51 @@ run "start_schedules_start_the_vm_before_capture" {
       s.kms_key_arn == null
     ])
     error_message = "A start schedule sets kms_key_arn."
+  }
+
+  # Written out, so a pull request that disables a schedule must edit this test too, and
+  # its reviewer sees that the disable is on purpose. Once #868's stop is switched on, a
+  # disabled start leaves the VM stopped through the open.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.state == "ENABLED"
+    ])
+    error_message = "A start schedule is not ENABLED, so it starts nothing."
+  }
+
+  # A start date in the future fires nothing until it comes, and an end date fires
+  # nothing after it passes. Either applies cleanly and leaves the VM stopped.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.start_date == null && s.end_date == null
+    ])
+    error_message = "A start schedule sets a start or end date, so on some days it fires nothing."
+  }
+}
+
+# The input under a second instance id, so a schedule that writes the mocked id in
+# literally fails here rather than starting no instance in the account.
+run "start_schedules_carry_the_vms_own_id" {
+  command = plan
+
+  override_resource {
+    target = aws_instance.vm
+    values = {
+      id = "i-0fedcba9876543210"
+    }
+  }
+
+  assert {
+    condition = [
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.target[0].input
+      ] == [
+      "{\"InstanceIds\":[\"i-0fedcba9876543210\"]}",
+      "{\"InstanceIds\":[\"i-0fedcba9876543210\"]}",
+    ]
+    error_message = "A start schedule's input does not carry the VM's own instance id."
   }
 }
 

@@ -11,7 +11,9 @@
    branch change the account. The deploy role carries no ``ReadOnlyAccess``, so an
    attachment there would widen it past the one document it may send. Any grant the
    scheduler role gains can be called through Scheduler's universal target by a schedule
-   the apply role writes (#865).
+   the apply role writes (#865). No role may set a permissions boundary, which would cap
+   it below its policy and fail its calls, or a path, which would move the ARN that
+   infra/live, the PassRole grants and the workflows name.
 3. Whether the live backend's key is the one the apply role may write. A mismatch
    passes every pull request check and fails the first apply after the merge.
 4. The backend's own settings. Without ``use_lockfile`` two applies can write the state
@@ -58,9 +60,9 @@
 16. The shim template's variables. A third one could carry a value into ``user_data``,
     which anyone who can describe the instance reads, and the plan shows only the
     rendered text.
-17. Each bootstrap role's ``depends_on`` on GitHub's OIDC provider. The trust names the
-    provider by a string, so nothing else orders the role after the provider on a first
-    apply, and a plan shows no ordering.
+17. The ``depends_on`` on GitHub's OIDC provider of each role GitHub assumes, the plan,
+    apply and deploy roles. The trust names the provider by a string, so nothing else
+    orders the role after the provider on a first apply, and a plan shows no ordering.
 18. Whether the role each start schedule passes is the scheduler role the bootstrap
     declares and the apply role may pass. A mismatch passes both configurations' tests
     and the plan, and fails the apply after the merge.
@@ -82,6 +84,13 @@ config render reads the backup target there. ``infra.yml`` runs ``tofu test`` on
 the workflow or a file under ``infra/`` other than Markdown changes, and a mock provider
 plans any key, so the rule sits here, where every pull request's required ``test`` job
 runs it.
+
+A second one states a rule where ``tofu test`` compares a literal: every ``iam:PassRole``
+grant names the one service its role goes to (#867). The apply role may recreate
+``marketlake-instance`` with any trust and policy, so a pass of it to Scheduler would let
+one approved apply call ``ec2:DeleteVolume`` through a schedule. The bootstrap's
+exact-policy run catches a dropped condition, and a pull request that edits the policy
+and that run's literal together passes it.
 
 These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The parse is
 ``python-hcl2``'s, which keeps a function call such as ``jsonencode({...})`` as text, so
@@ -404,6 +413,12 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     for role in roles:
         body = resources[f"aws_iam_role.{role}"]
         assert "managed_policy_arns" not in body and "inline_policy" not in body
+        # A boundary caps the role below its policy, so a boundary that denies the one
+        # action a role needs fails each call while every policy check here passes.
+        assert "permissions_boundary" not in body, f"aws_iam_role.{role} sets a boundary"
+        # A path moves the role's ARN, so infra/live's literal scheduler ARN, the apply
+        # role's PassRole grants and the workflows' role ARNs would name no role.
+        assert body.get("path", "/") == "/", f"aws_iam_role.{role} sets a path"
 
     attached: list[tuple[str, str]] = []
     inline: dict[str, list[list[dict[str, Any]]]] = {}
@@ -439,6 +454,40 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
             "Condition": {"StringEquals": {"aws:ResourceTag/marketlake:host": "capture"}},
         }
     ]
+
+
+# Each role an apply may pass, and the one service it may go to. The apply role may
+# recreate marketlake-instance with any trust and policy, so a pass to Scheduler would let
+# one approved apply call any action through a schedule, ec2:DeleteVolume on the lake
+# volume included, where DenyVolumeDelete does not reach (#867).
+_PASSES = {
+    "arn:aws:iam::${local.account_id}:role/marketlake-instance": "ec2.amazonaws.com",
+    "arn:aws:iam::${local.account_id}:role/marketlake-scheduler": "scheduler.amazonaws.com",
+}
+
+
+def test_every_pass_role_names_the_one_service_that_takes_the_role() -> None:
+    """A statement that grants ``iam:PassRole`` grants nothing else, so its condition
+    binds the pass alone, and names ``iam:PassedToService``. Each passable role goes to
+    exactly one service."""
+    passes: dict[str, str] = {}
+    for address, body in _resources("bootstrap").items():
+        if address.split(".")[0] != "aws_iam_role_policy":
+            continue
+        for statement in _jsonencode_argument(body["policy"])["Statement"]:
+            if statement["Effect"] != "Allow" or "iam:PassRole" not in _actions(statement):
+                continue
+            assert _actions(statement) == ["iam:PassRole"], (address, statement.get("Sid"))
+            condition = statement.get("Condition")
+            assert condition is not None and list(condition) == ["StringEquals"], (
+                f"{address}'s {statement.get('Sid')} passes a role to any service"
+            )
+            assert list(condition["StringEquals"]) == ["iam:PassedToService"]
+            service = condition["StringEquals"]["iam:PassedToService"]
+            for resource in _listed(statement["Resource"]):
+                assert resource not in passes, f"{resource} is passed by two statements"
+                passes[resource] = service
+    assert passes == _PASSES
 
 
 @pytest.mark.parametrize("role", ["apply", "deploy", "plan"])
@@ -874,12 +923,20 @@ def test_scheduler_role_starts_the_vm_by_its_own_tag() -> None:
 # lake.deploy_window. Two of the numbers belong to the stop that #868 builds, so no
 # constant in src/lake holds them yet, and they are written here until it does.
 
-# marketlake-up's 07:40 timer, the morning check that pages when the VM is not up. A
-# weekday start at or after it pages every morning (#868).
+# marketlake-up's 07:40 timer, the morning check that pages when the VM is not up (#868).
+# A copy of the value PR #869 defines in code, which #871 replaces with a read of it once
+# both pull requests merge.
 VM_UP_AT = time(7, 40)
 
-# The stop leaves a VM alone for its first hour of uptime (#868).
+# The stop leaves a VM alone for its first hour of uptime (#868). A copy of the value
+# PR #869 defines in deploy/vm-stop.sh, which #871 replaces with a read of it once both
+# pull requests merge.
 STOP_UPTIME_GRACE = timedelta(hours=1)
+
+# The time a weekday start allows for the VM to boot from stopped and its units to come up
+# before marketlake-up checks it. No boot from stopped has been timed on this VM yet, so
+# this is an allowance with room to spare, not a measurement.
+BOOT_ALLOWANCE = timedelta(minutes=5)
 
 # The least time a start keeps before the earliest roster unit of its day, so the VM has
 # booted and mounted the lake volume before the first job runs (#865).
@@ -918,7 +975,7 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
     """Moving a job or a start fails here rather than at the open. Each start must
 
     1. come at least ``START_LEAD`` before the earliest roster unit of its day,
-    2. on a weekday, come before ``VM_UP_AT``, and
+    2. on a weekday, come more than ``BOOT_ALLOWANCE`` before ``VM_UP_AT``, and
     3. end its uptime grace after ``MARGIN`` before the next refused span, so the stop's
        span check already refuses when the grace lets go.
 
@@ -947,7 +1004,10 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
             f"{START_LEAD} before the first unit at {min(todays):%H:%M}"
         )
         if day.weekday() < 5:
-            assert at < VM_UP_AT, f"{address} starts at {at}, not before marketlake-up"
+            assert start + BOOT_ALLOWANCE < datetime.combine(day, VM_UP_AT, tzinfo=MARKET_TZ), (
+                f"{address} starts at {at}, which leaves less than {BOOT_ALLOWANCE} to boot "
+                f"before marketlake-up at {VM_UP_AT}"
+            )
         span = deploy_window.spans_from(start, units)[0]
         assert start + STOP_UPTIME_GRACE > span.start - deploy_window.MARGIN, (
             f"{address}'s grace ends on {day} while the span check still allows a stop"

@@ -123,9 +123,9 @@ resource "aws_instance" "vm" {
   # NAT, an instance without a public address reaches neither Schwab, uv nor GitHub.
   associate_public_ip_address = true
 
-  # The VM powers itself off once the day's work is done, and schedule.tf starts it
-  # again (#865). AWS's default for an EBS-backed instance is already stop, and naming
-  # it means a poweroff can never terminate the instance.
+  # Once #868's stop is switched on, the VM powers itself off after the day's work, and
+  # schedule.tf starts it again (#865). AWS's default for an EBS-backed instance is
+  # already stop, and naming it means a poweroff can never terminate the instance.
   instance_initiated_shutdown_behavior = "stop"
 
   # IMDSv2 only (#663). A hop limit of 1 keeps the metadata service's answers, the

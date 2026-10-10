@@ -2,8 +2,8 @@
 # user marketlake-command with the two roles it assumes, marketlake-backup for the
 # bucket and marketlake-token-writer for the Schwab token, the hosted VM with its lake
 # volume, the SSM document that deploys main to the VM, and the two schedules that start
-# the stopped VM. The apply role in infra/bootstrap/roles.tf grants writes on exactly
-# these. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
+# the VM once #868's stop is switched on. The apply role in infra/bootstrap/roles.tf
+# grants writes on exactly these. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
 # defined" carries the reasoning.
 
 terraform {

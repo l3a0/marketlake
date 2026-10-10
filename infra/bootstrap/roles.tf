@@ -1,6 +1,7 @@
 # Four roles. Three are assumed through GitHub's OIDC provider: the plan role, the apply
 # role, and the deploy role that .github/workflows/deploy.yml uses (#676). EventBridge
-# Scheduler assumes the fourth, the scheduler role, to start the stopped VM (#867).
+# Scheduler assumes the fourth, the scheduler role, to start the VM once #868's stop is
+# switched on (#867).
 # Every policy is a jsonencode() literal rather than an aws_iam_policy_document, because
 # under tofu test's mock provider that data source returns a random string and no test
 # could read the document. The statements are written out in full in each role, rather
@@ -250,7 +251,6 @@ resource "aws_iam_role_policy" "apply" {
           "iam:UntagRole",
           "iam:PutRolePolicy",
           "iam:DeleteRolePolicy",
-          "iam:PassRole",
         ]
         Resource = ["arn:aws:iam::${local.account_id}:role/marketlake-instance"]
       },
@@ -341,14 +341,31 @@ resource "aws_iam_role_policy" "apply" {
       },
       {
         # A schedule names the scheduler role as its target's role, and Scheduler checks
-        # that the caller may pass it. No grant here writes that role or its policy, so an
-        # approved apply cannot widen what the schedules may call (#865).
+        # that the caller may pass it. No grant here writes that role or its policy, and
+        # the instance role, which an apply may write, passes only to EC2 under
+        # PassTheInstanceRole below. So this is the one role an apply can hand to
+        # Scheduler, and an approved apply cannot widen what a schedule may call (#865).
         Sid      = "PassTheSchedulerRole"
         Effect   = "Allow"
         Action   = ["iam:PassRole"]
         Resource = ["arn:aws:iam::${local.account_id}:role/marketlake-scheduler"]
         Condition = {
           StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" }
+        }
+      },
+      {
+        # The instance role goes only to EC2, through RunInstances or
+        # AssociateIamInstanceProfile. InstanceRoleWrite lets an apply recreate that role
+        # with any trust and any policy, so without the condition one approved apply could
+        # pass it to Scheduler in a marketlake-* schedule and call ec2:DeleteVolume around
+        # DenyVolumeDelete, which binds only this role (#867). Appended after the last
+        # statement, per infra/README.md's "Reading a statement inserted into a policy".
+        Sid      = "PassTheInstanceRole"
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = ["arn:aws:iam::${local.account_id}:role/marketlake-instance"]
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
         }
       },
     ]
@@ -439,6 +456,8 @@ resource "aws_iam_role_policy" "deploy" {
 # fires, and it may only start the capture host. It lives here rather than in infra/live,
 # because there the apply role would need to write its policy as well as pass it, and one
 # approved apply could then call any action through Scheduler's universal target (#865).
+# The apply role may pass Scheduler this role alone. The instance role it may write is
+# passed only to EC2, under PassTheInstanceRole.
 # The trust is scoped to the default schedule group, the only scope AWS documents for
 # aws:SourceArn here, and the apply role cannot edit a trust once it exists.
 resource "aws_iam_role" "scheduler" {

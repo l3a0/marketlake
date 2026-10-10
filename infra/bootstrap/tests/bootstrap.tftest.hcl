@@ -375,7 +375,6 @@ run "policies_are_exactly_the_reviewed_statements" {
             "iam:UntagRole",
             "iam:PutRolePolicy",
             "iam:DeleteRolePolicy",
-            "iam:PassRole",
           ]
           Resource = ["arn:aws:iam::000000000000:role/marketlake-instance"]
         },
@@ -455,6 +454,15 @@ run "policies_are_exactly_the_reviewed_statements" {
             StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" }
           }
         },
+        {
+          Sid      = "PassTheInstanceRole"
+          Effect   = "Allow"
+          Action   = ["iam:PassRole"]
+          Resource = ["arn:aws:iam::000000000000:role/marketlake-instance"]
+          Condition = {
+            StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
+          }
+        },
       ]
     }
     error_message = "The apply role's inline policy is not exactly the reviewed Denies and Allows."
@@ -502,7 +510,9 @@ run "policies_are_exactly_the_reviewed_statements" {
   }
 
   # The case for keeping this role in the bootstrap rests on it holding this one grant
-  # (#865). Any other action would be callable through Scheduler's universal target.
+  # (#865), and on it being the only role the apply role may pass to Scheduler, which
+  # PassTheInstanceRole's condition in the apply policy above checks. Any other action
+  # would be callable through Scheduler's universal target.
   assert {
     condition = jsondecode(aws_iam_role_policy.scheduler.policy) == {
       Version = "2012-10-17"
@@ -636,12 +646,13 @@ run "config_denies_follow_the_callers_account" {
   assert {
     condition = [
       for s in jsondecode(aws_iam_role_policy.apply.policy).Statement : s.Resource
-      if contains(["StartSchedulesWrite", "PassTheSchedulerRole"], try(s.Sid, ""))
+      if contains(["StartSchedulesWrite", "PassTheSchedulerRole", "PassTheInstanceRole"], try(s.Sid, ""))
       ] == [
       ["arn:aws:scheduler:us-east-1:111111111111:schedule/default/marketlake-*"],
       ["arn:aws:iam::111111111111:role/marketlake-scheduler"],
+      ["arn:aws:iam::111111111111:role/marketlake-instance"],
     ]
-    error_message = "The apply role's schedule or PassRole grant does not name the caller's account."
+    error_message = "The apply role's schedule or PassRole grants do not name the caller's account."
   }
 
   assert {
