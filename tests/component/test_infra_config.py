@@ -69,8 +69,9 @@
 20. Whether the scheduler role's tag condition names the VM's own ``marketlake:host``
     tag and value. A mismatch applies cleanly, and every start then fails silently at
     07:30.
-21. Whether each start comes early enough for the roster in ``lake.deploy_window`` and
-    late enough that the stop cannot power the VM off again before the day's span.
+21. Whether every day the roster in ``lake.deploy_window`` runs has a start, early
+    enough for the day's first unit and late enough that the stop cannot power the VM
+    off again before the day's span.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -953,3 +954,17 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
         )
         checked += 1
     assert checked >= 5, f"{address} fired on {checked} of the days checked"
+
+
+def test_every_day_the_roster_runs_has_a_start() -> None:
+    """The bounds above check each start on the days it fires, so a day dropped from a
+    cron passes them. Once the VM stops itself, a roster day with no start is a day the
+    VM never comes up, holidays included."""
+    started: set[int] = set()
+    for body in _schedules().values():
+        started |= _cron_start(body["schedule_expression"])[1]
+    roster_days = {
+        day for unit in deploy_window.default_units() if unit.schedule for day in unit.schedule.days
+    }
+    assert roster_days, "the roster has no scheduled unit, so this check reads nothing"
+    assert roster_days <= started, f"no schedule starts the VM on {sorted(roster_days - started)}"
