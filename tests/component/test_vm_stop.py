@@ -4,20 +4,26 @@ The script runs here under ``/bin/bash`` with ``MARKETLAKE_INSTALL_ROOT`` pointe
 temporary directory, from ``/`` as systemd runs a unit with no working directory. Every
 tool it calls is a fake from ``tests.support.fake_systemd`` or ``tests.support.fake_disk``:
 ``systemctl``, which keeps each unit's state in a directory and records ``poweroff``,
-``loginctl``, which prints the sessions a test gives it in systemd 255's columns, ``flock``,
-whose descriptor form answers one exit code per call, ``sudo``, which clears the
-environment as the real one does, and the checkout's venv ``python``, which answers
-``lake.deploy_window`` and ``lake.control_plane ping``.
+``who``, which prints the logins a test gives it, ``loginctl``, which prints the sessions a
+test gives it in systemd 255's columns, ``flock``, whose descriptor form answers one exit
+code per call, ``sudo``, which clears the environment as the real one does, ``sleep``,
+which returns at once and records whether descriptor 9 was open, and the checkout's venv
+``python``, which answers ``lake.deploy_window`` and ``lake.control_plane ping``.
 
 ``PATH`` holds the fakes, then a directory of links to the few real tools the scripts
-call. ``/usr/bin`` is never on it, so a Linux runner's own ``systemctl`` or ``loginctl``
-cannot answer for a fake. The checkout's ``deploy/vm-stop.sh`` and ``deploy/busy-check.sh``
-are links to the tracked files, so the script finds the busy check beside itself as it
-does on the VM.
+call. ``/usr/bin`` is never on it, so a Linux runner's own ``systemctl``, ``who`` or
+``loginctl`` cannot answer for a fake. The checkout's ``deploy/vm-stop.sh`` and
+``deploy/busy-check.sh`` are links to the tracked files, so the script finds the busy
+check beside itself as it does on the VM.
 
 Each case starts from a VM where every check passes: the switch exists, the VM has been
 up two hours, no one is logged in, nothing is busy, the window allows a stop and no
 deploy runs. A test changes the one thing it is about.
+
+The fake ``systemctl poweroff`` records the call and returns, as the real one does when
+logind waits out a delay inhibitor, and the fake ``sleep`` returns at once. So a run in
+which every check passes ends in the script's own line that no poweroff came, and exits
+1. On the VM the poweroff kills the script during that sleep.
 """
 
 from __future__ import annotations
@@ -53,11 +59,23 @@ WINDOW_REFUSAL = (
     "a deploy may start next at Mon 2026-10-12 18:45 EDT, because the scheduled jobs run until then"
 )
 
+# An interactive SSH login as who prints it. sshd writes this utmp record only for a
+# session with a pty, so the dashboard tunnel, ssh -N -L, has none.
+SSH_LOGIN = "someone  pts/0        2026-10-12 19:02 (203.0.113.7)\n"
+
 # One loginctl line each, in systemd 255's columns: SESSION, UID, USER, SEAT, TTY, STATE,
-# IDLE and SINCE.
-SSH_TERMINAL = "     4 1000 someone -    pts/0 active no   -\n"
+# IDLE and SINCE. systemd 255's pam_systemd records no TTY for an SSH session, so an
+# interactive SSH login and a tunnel print the same line, - in the TTY column, and only
+# who tells them apart.
+SSH_SESSION = "     4 1000 someone -    -     active no   -\n"
 TUNNEL = "     5 1000 someone -    -     active no   -\n"
 CLOSING = "     6 1000 someone -    -     closing no  -\n"
+
+POWEROFF_WAIT = "240"
+NO_POWEROFF = (
+    "vm-stop: error, check poweroff: systemctl poweroff returned, and no poweroff came"
+    f" within {POWEROFF_WAIT} seconds\n"
+)
 
 
 @pytest.fixture(scope="module")
@@ -196,6 +214,14 @@ def vm(tmp_path, tools) -> VM:
     return VM(tmp_path, tools)
 
 
+def _stopped(vm: VM, proc: subprocess.CompletedProcess[str]) -> None:
+    """The poweroff ran, then the bounded wait with the locks held, then the line that
+    no poweroff came, which a fake poweroff always reaches."""
+    assert (proc.returncode, proc.stderr) == (1, NO_POWEROFF), proc.stdout + proc.stderr
+    calls = vm.calls()
+    assert calls[-2:] == ["systemctl poweroff", f"sleep {POWEROFF_WAIT} with fd 9 open"], calls
+
+
 def _refused(vm: VM, proc: subprocess.CompletedProcess[str], check: str, reason: str) -> None:
     """One line on stdout naming the check, exit 0, and no ping and no poweroff."""
     assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout + proc.stderr
@@ -247,17 +273,19 @@ def test_the_unit_runs_the_script_this_test_runs():
 
 def test_every_check_passing_takes_the_locks_last_then_pings_and_powers_off(vm):
     proc = vm.run()
-    assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout + proc.stderr
+    _stopped(vm, proc)
     assert proc.stdout.splitlines() == [
         "vm-stop: every check passed, so pinging vm-stop and powering off",
         "ping: pinged=True slug=vm-stop",
         "vm-stop: powering off",
+        f"vm-stop: waiting up to {POWEROFF_WAIT} seconds for the poweroff, with the locks held",
     ]
     calls = vm.calls()
     window = f"sudo -u {OWNER} -H {vm.python} -m lake.deploy_window"
     ping = f"sudo -u {OWNER} -H {vm.python} -m lake.control_plane ping vm-stop"
     is_active = f"systemctl is-active {DEPLOY_SERVICE}"
     order = [
+        "who ",
         "loginctl list-sessions --no-legend",
         "systemctl list-units --type=service --all --no-legend --plain com.marketlake.*",
         window,
@@ -267,25 +295,42 @@ def test_every_check_passing_takes_the_locks_last_then_pings_and_powers_off(vm):
         is_active,
         ping,
         "systemctl poweroff",
+        f"sleep {POWEROFF_WAIT} with fd 9 open",
     ]
     picked = [line for line in calls if line in order]
     assert picked == order, calls
-    # The poweroff is the last thing the script does.
-    assert calls[-1] == "systemctl poweroff"
     assert (vm.root / "run" / "marketlake-deploy.lock").exists()
     assert (vm.root / "run" / "marketlake-install.lock").exists()
 
 
 def test_a_failed_ping_still_powers_off(vm):
     proc = vm.run(FAKE_PING_RC="1")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    _stopped(vm, proc)
     assert "vm-stop: the vm-stop ping exited 1, and the VM powers off anyway\n" in proc.stdout
-    assert vm.calls()[-1] == "systemctl poweroff"
+
+
+def test_both_locks_stay_held_through_the_wait_for_the_poweroff(vm):
+    """systemctl poweroff returns before the poweroff is queued while logind waits out a
+    delay inhibitor, so a deploy could start in that time unless the locks stay held."""
+    body = (
+        "held=\n"
+        "for fd in 8 9; do\n"
+        '  if { : >&$fd; } 2>/dev/null; then held="$held $fd"; fi\n'
+        "done\n"
+        'printf \'held%s\\n\' "$held" >> "$LOG"\n'
+    )
+    proc = vm.run(PATH=vm.wrapped("sleep", body))
+    assert (proc.returncode, proc.stderr) == (1, NO_POWEROFF), proc.stdout + proc.stderr
+    assert vm.calls()[-3:] == [
+        "systemctl poweroff",
+        "held 8 9",
+        f"sleep {POWEROFF_WAIT} with fd 9 open",
+    ]
 
 
 def test_a_config_the_unit_names_reaches_the_ping_through_sudo(vm):
     proc = vm.run(MARKETLAKE_CONFIG="/srv/conf/config.yaml")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    _stopped(vm, proc)
     assert vm.ran(f"sudo -u {OWNER} -H {vm.python} -m lake.control_plane") == [
         f"sudo -u {OWNER} -H {vm.python} -m lake.control_plane ping vm-stop"
         " --config /srv/conf/config.yaml"
@@ -294,14 +339,13 @@ def test_a_config_the_unit_names_reaches_the_ping_through_sudo(vm):
 
 def test_exactly_an_hour_up_is_enough(vm):
     vm.uptime("3600.00 100.00")
-    assert vm.run().returncode == 0
-    assert vm.powered_off()
+    _stopped(vm, vm.run())
 
 
-def test_a_tunnel_session_with_no_terminal_does_not_hold_the_vm_up(vm):
+def test_a_tunnel_session_with_no_login_does_not_hold_the_vm_up(vm):
+    # The tunnel has a logind session, active, and no utmp line, so who lists nothing.
     proc = vm.run(FAKE_SESSIONS=TUNNEL)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert vm.powered_off()
+    _stopped(vm, proc)
 
 
 @pytest.mark.parametrize("state", ["inactive", "failed"])
@@ -309,8 +353,7 @@ def test_a_finished_deploy_does_not_hold_the_vm_up(vm, state):
     if state == "failed":
         (vm.state / "failed").mkdir()
         (vm.state / "failed" / DEPLOY_SERVICE).write_text("")
-    assert vm.run().returncode == 0
-    assert vm.powered_off()
+    _stopped(vm, vm.run())
 
 
 # -- each check refusing on its own ----------------------------------------------------
@@ -329,22 +372,36 @@ def test_less_than_an_hour_up_keeps_the_vm_up(vm):
     vm.uptime("3599.99 100.00")
     proc = vm.run()
     _refused(vm, proc, "2 (uptime)", "the VM has been up 3599 seconds, less than 3600")
+    assert not vm.ran("who")
     assert not vm.ran("loginctl")
 
 
+CLOSING_REASON = "session 6 of someone is closing, so a command it started may still run"
+
+
 @pytest.mark.parametrize(
-    ("sessions", "reason"),
+    ("logins", "sessions", "reason"),
     [
-        (SSH_TERMINAL, "session 4 of someone is at terminal pts/0"),
-        (CLOSING, "session 6 of someone is closing, so a command it started may still run"),
-        (TUNNEL + SSH_TERMINAL, "session 4 of someone is at terminal pts/0"),
+        (SSH_LOGIN, SSH_SESSION, "someone is logged in at pts/0"),
+        (SSH_LOGIN, TUNNEL + SSH_SESSION, "someone is logged in at pts/0"),
+        ("", CLOSING, CLOSING_REASON),
+        ("", TUNNEL + CLOSING, CLOSING_REASON),
     ],
-    ids=["terminal", "closing", "behind a tunnel"],
+    ids=["ssh terminal", "terminal beside a tunnel", "closing", "closing behind a tunnel"],
 )
-def test_a_session_at_a_terminal_or_closing_keeps_the_vm_up(vm, sessions, reason):
-    proc = vm.run(FAKE_SESSIONS=sessions)
+def test_a_login_at_a_terminal_or_a_closing_session_keeps_the_vm_up(vm, logins, sessions, reason):
+    proc = vm.run(FAKE_WHO=logins, FAKE_SESSIONS=sessions)
     _refused(vm, proc, "3 (terminal)", reason)
     assert not vm.ran("systemctl list-units")
+
+
+def test_an_ssh_terminal_logind_shows_without_a_tty_still_keeps_the_vm_up(vm):
+    """systemd 255's pam_systemd records no TTY for an SSH session, so logind's line for an
+    interactive login is the tunnel's line. who still lists the login."""
+    assert SSH_SESSION.split()[4] == "-"
+    proc = vm.run(FAKE_WHO=SSH_LOGIN, FAKE_SESSIONS=SSH_SESSION)
+    _refused(vm, proc, "3 (terminal)", "someone is logged in at pts/0")
+    assert not vm.ran("loginctl")
 
 
 def test_a_running_timer_job_keeps_the_vm_up(vm):
@@ -428,6 +485,11 @@ def test_an_unreadable_uptime_is_an_error(vm, text, files):
     _failed(vm, vm.run(), "2 (uptime)", "/proc/uptime holds no uptime in seconds")
 
 
+def test_a_failing_who_is_an_error(vm):
+    _failed(vm, vm.run(WHO_RC="1"), "3 (terminal)", "who failed")
+    assert not vm.ran("loginctl")
+
+
 def test_a_failing_loginctl_is_an_error(vm):
     _failed(vm, vm.run(LOGINCTL_RC="1"), "3 (terminal)", "loginctl list-sessions failed")
 
@@ -490,6 +552,19 @@ def test_a_missing_bootstrap_conf_is_an_error(vm):
 def test_a_bootstrap_conf_that_names_no_owner_is_an_error(vm, conf, reason):
     vm.conf.write_text(conf)
     _failed(vm, vm.run(), "5 (window)", reason)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    ["some one", "-x", "someone;id", "some\tone", "#1000"],
+    ids=["space", "option", "semicolon", "tab", "hash"],
+)
+def test_an_owner_that_is_not_an_account_name_is_an_error_before_sudo(vm, owner):
+    # The fake getent answers each one, so only the name check stands between it and sudo.
+    vm.conf.write_text(f"OWNER={owner}\nLAKE_VOLUME_ID=vol-0123456789abcdef0\n")
+    proc = vm.run(FAKE_OWNER=owner)
+    _failed(vm, proc, "5 (window)", "bootstrap.conf must set OWNER to an account name")
+    assert not vm.ran("sudo")
 
 
 def test_an_owner_the_account_database_names_differently_is_an_error(vm):

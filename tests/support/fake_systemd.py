@@ -39,8 +39,9 @@ process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is
 units whose ``show`` exits 1, as a D-Bus timeout makes it.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
-which macOS lacks, and for ``git``, ``sleep`` and ``loginctl``. The fake ``loginctl``
-prints ``FAKE_SESSIONS`` and exits ``LOGINCTL_RC``. Each logs its argv to ``$LOG``. The
+which macOS lacks, and for ``git``, ``sleep``, ``who`` and ``loginctl``. The fake ``who``
+prints ``FAKE_WHO`` and exits ``WHO_RC``, and the fake ``loginctl`` prints
+``FAKE_SESSIONS`` and exits ``LOGINCTL_RC``. Each logs its argv to ``$LOG``. The
 fake ``flock`` takes both of its forms. With a bare descriptor, as ``flock -w 600 9``, it
 exits the next code in ``FLOCK_RCS`` when that is set, one per call, and ``FLOCK_RC``
 otherwise. With a file and a command, as ``flock -w 600 <file> <command>``, it
@@ -424,9 +425,20 @@ exit 0
 
 FAKE_SLEEP = "#!/bin/bash\nexit 0\n"
 
-# loginctl list-sessions --no-legend, which deploy/vm-stop.sh reads. It prints
-# FAKE_SESSIONS through printf %b, one session a line in systemd 255's columns: SESSION,
-# UID, USER, SEAT, TTY, STATE, IDLE and SINCE, with - for an empty cell. It exits
+# who, which deploy/vm-stop.sh reads for a login at a terminal. It prints FAKE_WHO through
+# printf %b, one login a line as who prints it: NAME, LINE, then the time and the host,
+# such as `someone  pts/0  2026-10-12 19:02 (203.0.113.7)`. sshd writes the utmp record
+# that who reads only for a session with a pty, so a tunnel has no line. It exits WHO_RC.
+FAKE_WHO = r"""#!/bin/bash
+printf 'who %s\n' "$*" >> "$LOG"
+if [[ -n "${FAKE_WHO:-}" ]]; then printf '%b' "$FAKE_WHO"; fi
+exit "${WHO_RC:-0}"
+"""
+
+# loginctl list-sessions --no-legend, which deploy/vm-stop.sh reads for a closing session.
+# It prints FAKE_SESSIONS through printf %b, one session a line in systemd 255's columns:
+# SESSION, UID, USER, SEAT, TTY, STATE, IDLE and SINCE, with - for an empty cell. An SSH
+# session shows - for its TTY there too, since pam_systemd records none for it. It exits
 # LOGINCTL_RC.
 FAKE_LOGINCTL = r"""#!/bin/bash
 printf 'loginctl %s\n' "$*" >> "$LOG"
@@ -443,6 +455,7 @@ FAKES = {
     "git": FAKE_GIT,
     "sleep": FAKE_SLEEP,
     "loginctl": FAKE_LOGINCTL,
+    "who": FAKE_WHO,
 }
 
 

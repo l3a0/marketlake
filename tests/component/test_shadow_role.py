@@ -491,6 +491,20 @@ def test_the_self_check_twin_records_its_ping(tmp_path, monkeypatch):
     assert _outbox(lake_root, SATURDAY.date()) == [_ping(SATURDAY, "self-check", PRE_OPEN_SLUG)]
 
 
+def test_the_ping_entry_twin_records_its_ping(tmp_path, monkeypatch, capsys):
+    """The hosted VM's stop pings ``vm-stop`` through this entry (#868). A shadow VM stops
+    too, so its ping is one recorded line and nothing leaves the machine."""
+    lake_root = tmp_path / "lake"
+    lake_root.mkdir()
+    config = write_config(tmp_path, lake_root, role="shadow")
+    monkeypatch.setattr(cp, "_system_clock", lambda: ManualClock(start=SATURDAY))
+
+    assert cp.main(["ping", cp.VM_STOP_SLUG, "--config", str(config)]) == 0
+
+    assert _outbox(lake_root, SATURDAY.date()) == [_ping(SATURDAY, "ping", cp.VM_STOP_SLUG)]
+    assert capsys.readouterr().out == f"ping: pinged=True slug={cp.VM_STOP_SLUG}\n"
+
+
 def _excluded(paths) -> str:
     """A reader reporting every path already excluded, the healthy Time Machine state."""
     return "".join(f"[Excluded]\t{p}\n" for p in paths)

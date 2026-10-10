@@ -13,12 +13,16 @@
 #      stop on, and removes it to keep the VM up for longer work, such as a restore or a
 #      step run over SSM. Nothing stops until it exists, so it is also the rollout gate.
 #   2. uptime: the VM has been up at least an hour, read from /proc/uptime. A VM the owner
-#      starts by hand for a deploy gets that hour before the stop considers it.
-#   3. terminal: no line of `loginctl list-sessions --no-legend` has a TTY in its fifth
-#      field, or `closing` in its sixth, for any user. That is systemd 255's column order.
-#      An interactive SSH session has a TTY, and a command left running after logout
-#      keeps its session closing. The dashboard tunnel, ssh -N -L, has no TTY and does not
-#      hold the VM up.
+#      starts by hand for a deploy gets that hour before the stop considers it, and only
+#      that hour.
+#   3. terminal: `who` lists no login, and no line of `loginctl list-sessions --no-legend`
+#      has `closing` in its sixth field, systemd 255's STATE column. sshd writes the utmp
+#      record that `who` reads only for a session with a pty, so an interactive SSH login
+#      is listed and the dashboard tunnel, ssh -N -L, is not, and a tunnel left open does
+#      not hold the VM up. logind cannot tell the two apart: systemd 255's pam_systemd
+#      records no TTY for an SSH session, because sshd registers the session before it
+#      allocates the pty. A command left running after logout keeps its logind session
+#      closing, which loginctl still shows.
 #   4. busy: the busy check in deploy/busy-check.sh finds no com.marketlake.* service
 #      running other than the two residents, and no compaction in the daemon's cgroup.
 #   5. window: python -m lake.deploy_window, run as the owner, exits 0. Exit 3 refuses,
@@ -29,6 +33,13 @@
 #      /run/marketlake-deploy.lock and /run/marketlake-install.lock without waiting,
 #      checks the deploy unit again, and holds both locks through the poweroff. Once the
 #      poweroff is queued, systemd refuses to start a new deploy unit.
+#
+# systemctl poweroff, run as root, asks logind, which waits out any delay inhibitor (Ubuntu's
+# unattended-upgrade-shutdown holds one, for up to InhibitDelayMaxSec, 30 seconds) and
+# returns before the poweroff is queued. So after it returns the script keeps both locks
+# and sleeps for POWEROFF_WAIT seconds, inside the unit's TimeoutStartSec of five minutes.
+# The poweroff kills it there. If the sleep ends instead, the poweroff did not come, and
+# the script exits 1 saying so.
 #
 # A refusal prints one line on stdout naming its check, and exits 0, so the unit is not
 # marked failed about 140 times a day. An error, a check that cannot tell, prints its
@@ -52,6 +63,8 @@
 set -euo pipefail
 
 UPTIME_SECONDS=3600
+# Inside marketlake-stop.service's TimeoutStartSec=5min, with a minute to spare.
+POWEROFF_WAIT=240
 SWITCH=/etc/marketlake/stop-when-idle
 UPTIME=/proc/uptime
 DEPLOY_SERVICE=marketlake-deploy.service
@@ -121,18 +134,24 @@ fi
 
 # -- 3. terminal -----------------------------------------------------------------------
 
+# who reads utmp, where sshd records only a login with a pty.
+if ! LOGINS="$(who)"; then
+  fail "3 (terminal)" "who failed"
+fi
+while read -r login tty _ || [[ -n "${login:-}" ]]; do
+  if [[ -n "${login:-}" ]]; then
+    refuse "3 (terminal)" "$login is logged in at ${tty:-an unnamed terminal}"
+  fi
+done <<< "$LOGINS"
 if ! SESSIONS="$(loginctl list-sessions --no-legend)"; then
   fail "3 (terminal)" "loginctl list-sessions failed"
 fi
-while read -r session _ user _ tty state _ || [[ -n "${session:-}" ]]; do
+while read -r session _ user _ _ state _ || [[ -n "${session:-}" ]]; do
   if [[ -z "${session:-}" ]]; then
     continue
   fi
   if [[ -z "$state" ]]; then
     fail "3 (terminal)" "loginctl printed a session with fewer than six fields"
-  fi
-  if [[ "$tty" != - ]]; then
-    refuse "3 (terminal)" "session $session of $user is at terminal $tty"
   fi
   if [[ "$state" == closing ]]; then
     refuse "3 (terminal)" "session $session of $user is closing, so a command it started may still run"
@@ -264,3 +283,8 @@ say "powering off"
 if ! systemctl poweroff; then
   fail "poweroff" "systemctl poweroff failed"
 fi
+# Descriptors 8 and 9 stay open, so no deploy or install starts while logind waits out
+# its delay inhibitors.
+say "waiting up to $POWEROFF_WAIT seconds for the poweroff, with the locks held"
+sleep "$POWEROFF_WAIT" || true
+fail "poweroff" "systemctl poweroff returned, and no poweroff came within $POWEROFF_WAIT seconds"
