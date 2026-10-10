@@ -18,13 +18,16 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    temporary AWS credentials. The plan role reads, and pull requests may assume it. The
    apply role writes, and only the `infra` environment on `main` may assume it. The
    deploy role can only ask the VM to deploy a commit, and only the `deploy` environment
-   on `main` may assume it. CI cannot apply the configuration that creates them, so the
-   owner applies this one from the laptop.
+   on `main` may assume it. A fourth role, `marketlake-scheduler`, can only start the VM,
+   and only EventBridge Scheduler, for a schedule in the account's `default` group, may
+   assume it ([#867](https://github.com/l3a0/marketlake/issues/867)). CI cannot apply the
+   configuration that creates them, so the owner applies this one from the laptop.
 2. `infra/live/` holds the backup bucket, the instance role `marketlake-instance` with its
    read of the bucket and the config parameters, the laptop's one IAM user,
-   `marketlake-command` ([#737](https://github.com/l3a0/marketlake/issues/737)), and the
-   hosted VM with its security group, key pair and lake volume, and the SSM document
-   `marketlake-deploy` that [Deploy from CI](#deploy-from-ci) sends to the VM. That user
+   `marketlake-command` ([#737](https://github.com/l3a0/marketlake/issues/737)), the
+   hosted VM with its security group, key pair and lake volume, the SSM document
+   `marketlake-deploy` that [Deploy from CI](#deploy-from-ci) sends to the VM, and the
+   two schedules in [The start schedule](#the-start-schedule) that start the VM. That user
    can only assume two roles: `marketlake-backup`, which reaches the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
@@ -54,6 +57,9 @@ The rest are read when they are needed.
   [Retire the old users](#retire-the-old-users).
 - `<switch-time>` is when the laptop's `config.yaml` moved to `assume_role`, in UTC as
   `2026-10-07T21:00:00Z`. The CloudTrail lookup reads every event since then.
+- `<start-time>` is a moment shortly before the scheduled start to look up, in UTC as
+  `2026-10-12T11:00:00Z`, half an hour before Monday's 07:30 start in daylight saving
+  time.
 - `<branch>` and `<n>` are the pull request's branch and number.
 - `<run-id>`, `<lock-id>`, `<branch-head>` and `<merge-commit>` are ids that an earlier
   command prints, named where each one appears.
@@ -246,7 +252,8 @@ turns versioning on.
 
 ### 6. Check the repository's OIDC subject format
 
-Each role's trust policy matches the `sub` claim, a field GitHub writes into each token.
+The trust policy of each role GitHub assumes, the plan, apply and deploy roles, matches
+the `sub` claim, a field GitHub writes into each token.
 Read the format this repository uses before applying those policies, because a mismatch
 needs a code change and checking first costs nothing.
 
@@ -1809,6 +1816,81 @@ start once it is mounted, provided the bootstrap's last install has run. A first
 off before that install left no unit enabled, so nothing starts. Then
 [rerun the bootstrap](#rerun-the-bootstrap).
 
+### The start schedule
+
+Once [#868](https://github.com/l3a0/marketlake/issues/868)'s stop is switched on, the VM stops
+itself after the day's work, only a schedule starts it again, and a VM still stopped at
+09:30 captures nothing. Two schedules in `infra/live/schedule.tf` start it
+([#867](https://github.com/l3a0/marketlake/issues/867)). They run in EventBridge Scheduler, AWS's
+service that calls an AWS API at set times.
+
+1. `marketlake-start-weekday` fires at 07:30 Monday to Friday, holidays included, because
+   every weekday check still expects its ping on a holiday.
+2. `marketlake-start-sunday` fires at 19:30 on Sunday, half an hour before the Sunday job.
+
+Both run in `America/New_York`, so they follow daylight saving time. Each calls
+`ec2:StartInstances` on the VM's instance id as the role `marketlake-scheduler`, which
+`infra/bootstrap/roles.tf` declares and which may start only an instance tagged
+`marketlake:host = capture`. Starting a running instance changes nothing, so a start that
+finds the VM up does no harm, and every start does so until the stop is switched on.
+Scheduler retries a failed call for up to 24 hours and 185 attempts, but only when it
+treats the error as retryable, such as throttling. A wrong trust, an input EC2 refuses or
+`Client.UnauthorizedOperation` is not retried, so that day's start is simply missed.
+[#865](https://github.com/l3a0/marketlake/issues/865) carries the reasoning for each setting.
+
+Nothing pages on a failed start itself. Once
+[#868](https://github.com/l3a0/marketlake/issues/868)'s stop is live, a weekday start that
+leaves the VM stopped pages `vm-up` at about 07:50, and a Sunday one pages `sunday` at
+23:30, whose missed 20:00 job then replays at Monday's 07:30 boot. The section "When
+`vm-up` pages", which [PR #869](https://github.com/l3a0/marketlake/pull/869) adds to this
+file for [#868](https://github.com/l3a0/marketlake/issues/868), says what to do.
+
+The schedules start the VM only at those two times. Before an apply or a deploy at any
+other time, start it by hand, as [Start a stopped instance](#start-a-stopped-instance)
+says.
+
+#### Read the starts in CloudTrail
+
+CloudTrail's event history records each `StartInstances`, allowing about 5 minutes for
+delivery. The command prints each event's time, the caller's ARN with its account prefix
+stripped, and the event's error code, or `-` when it has none. A start by a schedule
+names `assumed-role/marketlake-scheduler/` and then the session Scheduler opened. It never
+prints the instance id or the account id.
+
+```bash
+aws cloudtrail lookup-events --region us-east-1 --profile marketlake-admin --lookup-attributes AttributeKey=EventName,AttributeValue=StartInstances --start-time "<start-time>" --output json | jq -r '.Events[].CloudTrailEvent | fromjson | [.eventTime, ((.userIdentity.arn // "-") | sub("^arn:aws:[a-z]+::[0-9]+:"; "")), (.errorCode // "-")] | @tsv'
+```
+
+A start that carries an error code, or a morning with no start at all, is the case to
+fix. Start the VM by hand first, as [Start a stopped instance](#start-a-stopped-instance)
+says, since the open does not wait. `Client.UnauthorizedOperation` means the role's tag
+condition no longer matches the VM's tag, and a missing event means the schedule did not
+fire or could not assume its role.
+
+A start with no error code and a VM still stopped afterwards means EC2 accepted the call
+and the instance fell back to stopped while booting. Scheduler counts that as a success
+and does not retry it. Read the reason EC2 gives.
+
+```bash
+aws ec2 describe-instances --region us-east-1 --profile marketlake-admin --filters Name=tag:marketlake:host,Values=capture --query 'Reservations[].Instances[].[State.Name, StateReason.Code, StateReason.Message]' --output text
+```
+
+`Client.InvalidKMSKey.InvalidState` or another KMS reason means a volume is encrypted
+with a key the scheduler role may not use. The role carries no KMS grant, because the
+VM's volumes are expected to use the account's default EBS key, AWS's own `aws/ebs`,
+which needs none.
+
+#### Turn a schedule off
+
+Set the schedule's `state` to `"DISABLED"` in `infra/live/schedule.tf` in a pull request
+that also edits the live test's `start_schedules_start_the_vm_before_capture` run, which
+checks that each schedule is `"ENABLED"`. The test edit is what tells the reviewer the
+disable is on purpose. Then approve its `infra` apply as [Replace the instance, and the approval
+window](#replace-the-instance-and-the-approval-window) says. A disabled schedule stays in
+place and fires nothing until a later pull request sets its `state` back to `"ENABLED"`.
+Turn the stop off first, or the VM stops after its next day's work and nothing starts it
+again. [#868](https://github.com/l3a0/marketlake/issues/868) says how.
+
 ### Find the VM's address
 
 The VM has no Elastic IP, AWS's fixed address for an account, so its public address
@@ -2099,7 +2181,11 @@ first deploy takes seven steps, in order.
 
 ## Bootstrap changes already known
 
-No open issue on the MVP 2 path changes `infra/bootstrap/`.
+[#867](https://github.com/l3a0/marketlake/issues/867) added the role `marketlake-scheduler`, the
+apply role's two statements that let it write the start schedules and pass that role, and
+a third that passes `marketlake-instance` only to EC2, in place of the unconditioned
+`iam:PassRole` that `InstanceRoleWrite` carried. No other open issue on the MVP 2 path
+changes `infra/bootstrap/`.
 [#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
 changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to accept a
 second environment, and its body gives the order for that change.

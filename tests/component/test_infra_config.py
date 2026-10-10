@@ -1,21 +1,27 @@
 """Checks on ``infra/`` that ``tofu test`` cannot make, read from the ``.tf`` files.
 
-``tofu test`` sees one configuration's plan, and seventeen things are not in one.
+``tofu test`` sees one configuration's plan, and twenty-one things are not in one.
 
 1. ``prevent_destroy``. A test refuses destroy-mode plans, and ``tofu show -json`` omits
    ``lifecycle``, so removing the line leaves every ``tofu test`` run green.
-2. Every policy attached to each of the bootstrap's three roles, the plan, apply and
-   deploy roles. An assert names the attachments it knows about, so a second attachment
-   of the same type passes it. The plan role is trusted on every pull request from a
-   branch here with no approval, so any write it gains lets an unreviewed branch change
-   the account. The deploy role carries no ``ReadOnlyAccess``, so an attachment there
-   would widen it past the one document it may send.
+2. Every policy attached to each of the bootstrap's four roles, the plan, apply,
+   deploy and scheduler roles. An assert names the attachments it knows about, so a
+   second attachment of the same type passes it. The plan role is trusted on every pull
+   request from a branch here with no approval, so any write it gains lets an unreviewed
+   branch change the account. The deploy role carries no ``ReadOnlyAccess``, so an
+   attachment there would widen it past the one document it may send. Any grant the
+   scheduler role gains can be called through Scheduler's universal target by a schedule
+   the apply role writes (#865). No role may set a permissions boundary, which would cap
+   it below its policy and fail its calls, or a path, which would move the ARN that
+   infra/live, the PassRole grants and the workflows name.
 3. Whether the live backend's key is the one the apply role may write. A mismatch
    passes every pull request check and fails the first apply after the merge.
 4. The backend's own settings. Without ``use_lockfile`` two applies can write the state
    at once, and without ``encrypt`` it lands unencrypted.
 5. Whether the IAM names the apply role may write in ``infra/bootstrap`` are the names
-   ``infra/live`` declares. Each configuration's tests see only their own side.
+   ``infra/live`` declares. Each configuration's tests see only their own side. The
+   scheduler role is the one exception, since the bootstrap declares it and the apply
+   role may only pass it.
 6. Whether every managed policy ``infra/live`` attaches is one the apply role may
    attach to that role. A plan only reads, so an ARN the apply role's ``iam:PolicyARN``
    condition refuses passes every pull request check and first fails with an
@@ -54,9 +60,20 @@
 16. The shim template's variables. A third one could carry a value into ``user_data``,
     which anyone who can describe the instance reads, and the plan shows only the
     rendered text.
-17. Each bootstrap role's ``depends_on`` on GitHub's OIDC provider. The trust names the
-    provider by a string, so nothing else orders the role after the provider on a first
-    apply, and a plan shows no ordering.
+17. The ``depends_on`` on GitHub's OIDC provider of each role GitHub assumes, the plan,
+    apply and deploy roles. The trust names the provider by a string, so nothing else
+    orders the role after the provider on a first apply, and a plan shows no ordering.
+18. Whether the role each start schedule passes is the scheduler role the bootstrap
+    declares and the apply role may pass. A mismatch passes both configurations' tests
+    and the plan, and fails the apply after the merge.
+19. Whether each start schedule's name and group fit the apply role's grant and the
+    scheduler role's trust. A mismatch fails the same way.
+20. Whether the scheduler role's tag condition names the VM's own ``marketlake:host``
+    tag and value. A mismatch applies cleanly, and every start then fails silently at
+    07:30.
+21. Whether every day the roster in ``lake.deploy_window`` runs has a start, early
+    enough for the day's first unit and late enough that the stop cannot power the VM
+    off again before the day's span.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -68,6 +85,13 @@ the workflow or a file under ``infra/`` other than Markdown changes, and a mock 
 plans any key, so the rule sits here, where every pull request's required ``test`` job
 runs it.
 
+A second one states a rule where ``tofu test`` compares a literal: every ``iam:PassRole``
+grant names the one service its role goes to (#867). The apply role may recreate
+``marketlake-instance`` with any trust and policy, so a pass of it to Scheduler would let
+one approved apply call ``ec2:DeleteVolume`` through a schedule. The bootstrap's
+exact-policy run catches a dropped condition, and a pull request that edits the policy
+and that run's literal together passes it.
+
 These run in ``ci.yml``'s required ``test`` job, which has no OpenTofu. The parse is
 ``python-hcl2``'s, which keeps a function call such as ``jsonencode({...})`` as text, so
 :func:`_jsonencode_argument` parses the call's argument as HCL on its own.
@@ -77,11 +101,15 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
 import hcl2
 import pytest
+
+from lake import deploy_window
+from lake.calendar import MARKET_TZ
 
 INFRA = Path(__file__).resolve().parents[2] / "infra"
 
@@ -144,6 +172,7 @@ LIVE_TYPES = {
     "aws_ebs_volume",
     "aws_volume_attachment",
     "aws_ssm_document",
+    "aws_scheduler_schedule",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -380,10 +409,16 @@ def test_live_roles_leave_their_policies_to_separate_resources() -> None:
 def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     resources = _resources("bootstrap")
     roles = sorted(a.split(".")[1] for a in resources if a.startswith("aws_iam_role."))
-    assert roles == ["apply", "deploy", "plan"]
+    assert roles == ["apply", "deploy", "plan", "scheduler"]
     for role in roles:
         body = resources[f"aws_iam_role.{role}"]
         assert "managed_policy_arns" not in body and "inline_policy" not in body
+        # A boundary caps the role below its policy, so a boundary that denies the one
+        # action a role needs fails each call while every policy check here passes.
+        assert "permissions_boundary" not in body, f"aws_iam_role.{role} sets a boundary"
+        # A path moves the role's ARN, so infra/live's literal scheduler ARN, the apply
+        # role's PassRole grants and the workflows' role ARNs would name no role.
+        assert body.get("path", "/") == "/", f"aws_iam_role.{role} sets a path"
 
     attached: list[tuple[str, str]] = []
     inline: dict[str, list[list[dict[str, Any]]]] = {}
@@ -400,14 +435,59 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
             inline.setdefault(role, []).append(_jsonencode_argument(body["policy"])["Statement"])
 
     assert sorted(attached) == [("apply", READ_ONLY), ("plan", READ_ONLY)]
-    assert sorted(inline) == ["apply", "deploy", "plan"]
+    assert sorted(inline) == ["apply", "deploy", "plan", "scheduler"]
     assert len(inline["apply"]) == 1
     assert len(inline["deploy"]) == 1
     assert len(inline["plan"]) == 1
+    assert len(inline["scheduler"]) == 1
     plan_effects = [statement["Effect"] for statement in inline["plan"][0]]
     assert plan_effects and set(plan_effects) == {"Deny"}
     deploy_effects = [statement["Effect"] for statement in inline["deploy"][0]]
     assert deploy_effects and set(deploy_effects) == {"Allow"}
+    # The case for keeping this role in the bootstrap rests on this one grant (#865).
+    assert inline["scheduler"][0] == [
+        {
+            "Sid": "StartTheCaptureHost",
+            "Effect": "Allow",
+            "Action": ["ec2:StartInstances"],
+            "Resource": ["arn:aws:ec2:us-east-1:${local.account_id}:instance/*"],
+            "Condition": {"StringEquals": {"aws:ResourceTag/marketlake:host": "capture"}},
+        }
+    ]
+
+
+# Each role an apply may pass, and the one service it may go to. The apply role may
+# recreate marketlake-instance with any trust and policy, so a pass to Scheduler would let
+# one approved apply call any action through a schedule, ec2:DeleteVolume on the lake
+# volume included, where DenyVolumeDelete does not reach (#867).
+_PASSES = {
+    "arn:aws:iam::${local.account_id}:role/marketlake-instance": "ec2.amazonaws.com",
+    "arn:aws:iam::${local.account_id}:role/marketlake-scheduler": "scheduler.amazonaws.com",
+}
+
+
+def test_every_pass_role_names_the_one_service_that_takes_the_role() -> None:
+    """A statement that grants ``iam:PassRole`` grants nothing else, so its condition
+    binds the pass alone, and names ``iam:PassedToService``. Each passable role goes to
+    exactly one service."""
+    passes: dict[str, str] = {}
+    for address, body in _resources("bootstrap").items():
+        if address.split(".")[0] != "aws_iam_role_policy":
+            continue
+        for statement in _jsonencode_argument(body["policy"])["Statement"]:
+            if statement["Effect"] != "Allow" or "iam:PassRole" not in _actions(statement):
+                continue
+            assert _actions(statement) == ["iam:PassRole"], (address, statement.get("Sid"))
+            condition = statement.get("Condition")
+            assert condition is not None and list(condition) == ["StringEquals"], (
+                f"{address}'s {statement.get('Sid')} passes a role to any service"
+            )
+            assert list(condition["StringEquals"]) == ["iam:PassedToService"]
+            service = condition["StringEquals"]["iam:PassedToService"]
+            for resource in _listed(statement["Resource"]):
+                assert resource not in passes, f"{resource} is passed by two statements"
+                passes[resource] = service
+    assert passes == _PASSES
 
 
 @pytest.mark.parametrize("role", ["apply", "deploy", "plan"])
@@ -454,11 +534,20 @@ _IAM_KINDS = {
 }
 
 
+# The role the bootstrap declares for itself, which the apply role may pass to Scheduler
+# and never write (#865). It is the one IAM name the apply role's grants carry that
+# infra/live does not declare.
+_PASSED_ONLY = ("role", "marketlake-scheduler")
+
+
 def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
     """A rename on either side passes both configurations' own tests and fails the
-    first apply after the merge, with an AccessDenied on the renamed resource."""
+    first apply after the merge, with an AccessDenied on the renamed resource. The
+    scheduler role is excepted by name, and only while the bootstrap declares it and the
+    apply role's every grant on it is ``iam:PassRole``."""
     policy = _jsonencode_argument(_resources("bootstrap")["aws_iam_role_policy.apply"]["policy"])
     granted = set()
+    passed_only_actions = set()
     for statement in policy["Statement"]:
         if statement["Effect"] != "Allow":
             continue
@@ -466,6 +555,8 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
             match = re.fullmatch(r"arn:aws:iam::\$\{local\.account_id\}:([a-z-]+)/(.+)", resource)
             if match:
                 granted.add((match.group(1), match.group(2)))
+                if (match.group(1), match.group(2)) == _PASSED_ONLY:
+                    passed_only_actions.update(_actions(statement))
 
     declared = {
         (kind, body["name"])
@@ -473,14 +564,22 @@ def test_apply_role_grants_name_the_iam_resources_live_declares() -> None:
         for address, body in _resources("live").items()
         if address.split(".")[0] == rtype
     }
+    bootstrap_roles = {
+        ("role", body["name"])
+        for address, body in _resources("bootstrap").items()
+        if address.split(".")[0] == "aws_iam_role"
+    }
     assert granted == {
         ("role", "marketlake-instance"),
         ("instance-profile", "marketlake-instance"),
         ("user", "marketlake-command"),
         ("role", "marketlake-backup"),
         ("role", "marketlake-token-writer"),
+        _PASSED_ONLY,
     }
-    assert declared == granted
+    assert _PASSED_ONLY in bootstrap_roles
+    assert passed_only_actions == {"iam:PassRole"}
+    assert declared == granted - {_PASSED_ONLY}
 
 
 # The actions that would let an apply delete a command role or its policy, and so replace
@@ -723,3 +822,209 @@ def test_instance_tag_keys_are_ones_instance_metadata_can_serve() -> None:
     assert "marketlake:backup-target" in tags
     for key in tags:
         assert _METADATA_TAG_KEY.fullmatch(key), f"the instance tag key {key!r} has a / or space"
+
+
+# -- the start schedules (#867) -----------------------------------------------------
+
+_SCHEDULER_ROLE_ARN = re.compile(r"arn:aws:iam::\$\{local\.account_id\}:role/(.+)")
+
+
+def _schedules() -> dict[str, dict[str, Any]]:
+    """Every ``aws_scheduler_schedule`` in infra/live. The pair is named, so a third
+    schedule fails here until the checks below account for it."""
+    schedules = {
+        address: body
+        for address, body in _resources("live").items()
+        if address.split(".")[0] == "aws_scheduler_schedule"
+    }
+    assert sorted(schedules) == [
+        "aws_scheduler_schedule.start_sunday",
+        "aws_scheduler_schedule.start_weekday",
+    ]
+    return schedules
+
+
+def _bootstrap_policy(address: str) -> dict[str, Any]:
+    return _jsonencode_argument(_resources("bootstrap")[address]["policy"])
+
+
+def test_start_schedules_pass_the_role_the_bootstrap_declares() -> None:
+    """Live builds the role's ARN from a name, and the bootstrap declares the role and
+    grants the pass. A rename on either side passes both configurations' tests and the
+    plan, and the apply after the merge fails on ``iam:PassRole`` or on a role that does
+    not exist."""
+    name = _resources("bootstrap")["aws_iam_role.scheduler"]["name"]
+    passed = [
+        resource
+        for statement in _bootstrap_policy("aws_iam_role_policy.apply")["Statement"]
+        if statement["Effect"] == "Allow"
+        and "iam:PassRole" in _actions(statement)
+        and statement.get("Condition")
+        == {"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}}
+        for resource in _listed(statement["Resource"])
+    ]
+    assert passed == [f"arn:aws:iam::${{local.account_id}}:role/{name}"]
+    for address, body in _schedules().items():
+        [target] = body["target"]
+        match = _SCHEDULER_ROLE_ARN.fullmatch(target["role_arn"])
+        assert match, f"infra/live/{address}'s role_arn is not built from the account id"
+        assert match.group(1) == name, f"infra/live/{address} passes {match.group(1)}"
+
+
+def test_start_schedules_fit_the_apply_grant_and_the_trust() -> None:
+    """The apply role may write only ``schedule/default/marketlake-*``, and the scheduler
+    role's trust accepts only the default group. A schedule outside the prefix fails the
+    apply after the merge, and so does one in another group."""
+    writes = [
+        statement
+        for statement in _bootstrap_policy("aws_iam_role_policy.apply")["Statement"]
+        if statement["Effect"] == "Allow" and "scheduler:CreateSchedule" in _actions(statement)
+    ]
+    assert len(writes) == 1
+    assert sorted(_actions(writes[0])) == [
+        "scheduler:CreateSchedule",
+        "scheduler:DeleteSchedule",
+        "scheduler:UpdateSchedule",
+    ]
+    trust = _jsonencode_argument(
+        _resources("bootstrap")["aws_iam_role.scheduler"]["assume_role_policy"]
+    )
+    [statement] = trust["Statement"]
+    source_arn = statement["Condition"]["StringEquals"]["aws:SourceArn"]
+    for address, body in _schedules().items():
+        group = body.get("group_name", "default")
+        assert group == "default", f"infra/live/{address} sits in group {group}"
+        arn = f"arn:aws:scheduler:us-east-1:${{local.account_id}}:schedule/{group}/{body['name']}"
+        assert any(
+            fnmatch.fnmatchcase(arn, pattern) for pattern in _listed(writes[0]["Resource"])
+        ), f"the apply role may not write infra/live/{address}, {arn}"
+        assert source_arn == (
+            f"arn:aws:scheduler:us-east-1:${{local.account_id}}:schedule-group/{group}"
+        ), f"the scheduler role's trust does not accept group {group}"
+
+
+def test_scheduler_role_starts_the_vm_by_its_own_tag() -> None:
+    """The role's condition names a tag, and the VM carries tags. A key or value that
+    differs applies cleanly in both configurations, and every 07:30 start is then
+    refused with nothing but the morning check to say so."""
+    tags = _resources("live")["aws_instance.vm"]["tags"]
+    starts = [
+        statement
+        for statement in _bootstrap_policy("aws_iam_role_policy.scheduler")["Statement"]
+        if "ec2:StartInstances" in _actions(statement)
+    ]
+    assert len(starts) == 1
+    assert starts[0]["Condition"] == {
+        "StringEquals": {"aws:ResourceTag/marketlake:host": tags["marketlake:host"]}
+    }
+
+
+# The three bounds below come from #865's item 7.8. The roster and MARGIN come from
+# lake.deploy_window. Two of the numbers belong to the stop that #868 builds, so no
+# constant in src/lake holds them yet, and they are written here until it does.
+
+# marketlake-up's 07:40 timer, the morning check that pages when the VM is not up (#868).
+# A copy of the value PR #869 defines in code, which #871 replaces with a read of it once
+# both pull requests merge.
+VM_UP_AT = time(7, 40)
+
+# The stop leaves a VM alone for its first hour of uptime (#868). A copy of the value
+# PR #869 defines in deploy/vm-stop.sh, which #871 replaces with a read of it once both
+# pull requests merge.
+STOP_UPTIME_GRACE = timedelta(hours=1)
+
+# The time a weekday start allows for the VM to boot from stopped and its units to come up
+# before marketlake-up checks it. No boot from stopped has been timed on this VM yet, so
+# this is an allowance with room to spare, not a measurement.
+BOOT_ALLOWANCE = timedelta(minutes=5)
+
+# The least time a start keeps before the earliest roster unit of its day, so the VM has
+# booted and mounted the lake volume before the first job runs (#865).
+START_LEAD = timedelta(minutes=20)
+
+# Scheduler numbers the days SUN 1 to SAT 7. Python numbers them MON 0 to SUN 6.
+_SCHEDULER_DAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+
+# The one cron form the bounds can read: a minute, an hour, any day of any month, one
+# day or a range of days, and any year. Any other form fails here rather than being
+# read wrongly.
+_CRON = re.compile(r"cron\((\d{1,2}) (\d{1,2}) \? \* ([A-Z]{3})(?:-([A-Z]{3}))? \*\)")
+
+
+def _cron_start(expression: str) -> tuple[time, set[int]]:
+    """The wall-clock time and the Python weekdays a schedule's cron fires on."""
+    match = _CRON.fullmatch(expression)
+    assert match, f"the bounds cannot read {expression!r}"
+    minute, hour, first, last = match.groups()
+    first_index = _SCHEDULER_DAYS.index(first)
+    last_index = _SCHEDULER_DAYS.index(last or first)
+    assert first_index <= last_index, f"{expression!r} wraps past Saturday"
+    days = {(index - 1) % 7 for index in range(first_index, last_index + 1)}
+    return time(int(hour), int(minute)), days
+
+
+# Five weeks, which cross the end of daylight saving time on 2026-11-01 and the early
+# close on 2026-11-27.
+_BOUND_DAYS = [date(2026, 10, 26) + timedelta(days=offset) for offset in range(35)]
+
+
+@pytest.mark.parametrize(
+    "address", ["aws_scheduler_schedule.start_weekday", "aws_scheduler_schedule.start_sunday"]
+)
+def test_start_schedule_fits_the_roster(address: str) -> None:
+    """Moving a job or a start fails here rather than at the open. Each start must
+
+    1. come at least ``START_LEAD`` before the earliest roster unit of its day,
+    2. on a weekday, come more than ``BOOT_ALLOWANCE`` before ``VM_UP_AT``, and
+    3. end its uptime grace after ``MARGIN`` before the next refused span, so the stop's
+       span check already refuses when the grace lets go.
+
+    The third bound is strict. ``deploy_window`` still allows a stop at exactly
+    ``MARGIN`` before a span, 04:30 on a weekday and 16:00 on a Sunday, so a weekday
+    start at 03:30 or a Sunday start at 15:00 would pass the first two bounds and power
+    off before the session, with nothing to start the VM again.
+    """
+    body = _schedules()[address]
+    assert body["schedule_expression_timezone"] == str(MARKET_TZ)
+    at, days = _cron_start(body["schedule_expression"])
+    units = deploy_window.default_units()
+    checked = 0
+    for day in _BOUND_DAYS:
+        if day.weekday() not in days:
+            continue
+        start = datetime.combine(day, at, tzinfo=MARKET_TZ)
+        todays = [
+            unit.schedule.at.on(day)
+            for unit in units
+            if unit.schedule is not None and day.weekday() in unit.schedule.days
+        ]
+        assert todays, f"{address} starts the VM on {day}, when no roster unit runs"
+        assert start <= min(todays) - START_LEAD, (
+            f"{address} starts at {start:%H:%M} on {day}, less than "
+            f"{START_LEAD} before the first unit at {min(todays):%H:%M}"
+        )
+        if day.weekday() < 5:
+            assert start + BOOT_ALLOWANCE < datetime.combine(day, VM_UP_AT, tzinfo=MARKET_TZ), (
+                f"{address} starts at {at}, which leaves less than {BOOT_ALLOWANCE} to boot "
+                f"before marketlake-up at {VM_UP_AT}"
+            )
+        span = deploy_window.spans_from(start, units)[0]
+        assert start + STOP_UPTIME_GRACE > span.start - deploy_window.MARGIN, (
+            f"{address}'s grace ends on {day} while the span check still allows a stop"
+        )
+        checked += 1
+    assert checked >= 5, f"{address} fired on {checked} of the days checked"
+
+
+def test_every_day_the_roster_runs_has_a_start() -> None:
+    """The bounds above check each start on the days it fires, so a day dropped from a
+    cron passes them. Once the VM stops itself, a roster day with no start is a day the
+    VM never comes up, holidays included."""
+    started: set[int] = set()
+    for body in _schedules().values():
+        started |= _cron_start(body["schedule_expression"])[1]
+    roster_days = {
+        day for unit in deploy_window.default_units() if unit.schedule for day in unit.schedule.days
+    }
+    assert roster_days, "the roster has no scheduled unit, so this check reads nothing"
+    assert roster_days <= started, f"no schedule starts the VM on {sorted(roster_days - started)}"

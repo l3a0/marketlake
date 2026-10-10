@@ -24,6 +24,13 @@ mock_provider "aws" {
       id = "vol-0123456789abcdef0"
     }
   }
+
+  # An instance id of the real shape, which each start schedule's input carries.
+  mock_resource "aws_instance" {
+    defaults = {
+      id = "i-0123456789abcdef0"
+    }
+  }
 }
 
 # The address is from TEST-NET-3, a range reserved for documentation, and the key is not
@@ -610,6 +617,13 @@ run "instance_is_built_as_the_issue_describes" {
     error_message = "The instance does not ask for a public address, so with no NAT it reaches nothing."
   }
 
+  # Once #868's stop is switched on, the VM powers itself off each night (#865), and a
+  # poweroff under "terminate" would delete the instance and its root volume.
+  assert {
+    condition     = aws_instance.vm.instance_initiated_shutdown_behavior == "stop"
+    error_message = "The instance's shutdown behavior is not stop, so a poweroff from inside could terminate it."
+  }
+
   # The bucket is the file-level variable's, written out here so the test does not
   # rebuild the tag the way vm.tf builds it.
   assert {
@@ -759,6 +773,138 @@ run "deploy_document_runs_only_vm_deploy" {
   assert {
     condition     = strcontains(jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0], "conf=/etc/marketlake/bootstrap.conf\n")
     error_message = "The deploy step does not read the owner from bootstrap.conf."
+  }
+}
+
+# The two schedules that start the VM once #868's stop is switched on (#867). Scheduler
+# does not check a target's input until the schedule fires, so the input is compared with
+# an exact string under the mocked instance id, and again under a second id below. The
+# role's name, the group and the tag condition are compared with infra/bootstrap by
+# tests/component/test_infra_config.py, which also checks each start against the roster.
+run "start_schedules_start_the_vm_before_capture" {
+  command = plan
+
+  assert {
+    condition = [
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      [s.name, s.schedule_expression, s.schedule_expression_timezone]
+      ] == [
+      ["marketlake-start-weekday", "cron(30 7 ? * MON-FRI *)", "America/New_York"],
+      ["marketlake-start-sunday", "cron(30 19 ? * SUN *)", "America/New_York"],
+    ]
+    error_message = "The start schedules are not 07:30 on weekdays and 19:30 on Sunday, in America/New_York."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      [for w in s.flexible_time_window : w.mode] == ["OFF"]
+    ])
+    error_message = "A start schedule's flexible time window is not off, so its start can drift."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      [for t in s.target : [t.arn, t.role_arn, t.input]] == [[
+        "arn:aws:scheduler:::aws-sdk:ec2:startInstances",
+        "arn:aws:iam::000000000000:role/marketlake-scheduler",
+        "{\"InstanceIds\":[\"i-0123456789abcdef0\"]}",
+      ]]
+    ])
+    error_message = "A start schedule does not call ec2:startInstances on the VM alone as marketlake-scheduler."
+  }
+
+  # AWS's own limits, written out, so a start that first succeeds late still saves the
+  # rest of the session.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      [
+        for t in s.target : [
+          for r in t.retry_policy : [r.maximum_event_age_in_seconds, r.maximum_retry_attempts]
+        ]
+      ] == [[[86400, 185]]]
+    ])
+    error_message = "A start schedule's retry policy is not 86,400 seconds and 185 attempts."
+  }
+
+  # Scheduler's own key needs no KMS grant. A customer key the role cannot use would
+  # leave every start failing.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.kms_key_arn == null
+    ])
+    error_message = "A start schedule sets kms_key_arn."
+  }
+
+  # Written out, so a pull request that disables a schedule must edit this test too, and
+  # its reviewer sees that the disable is on purpose. Once #868's stop is switched on, a
+  # disabled start leaves the VM stopped through the open.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.state == "ENABLED"
+    ])
+    error_message = "A start schedule is not ENABLED, so it starts nothing."
+  }
+
+  # A start date in the future fires nothing until it comes, and an end date fires
+  # nothing after it passes. Either applies cleanly and leaves the VM stopped.
+  assert {
+    condition = alltrue([
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.start_date == null && s.end_date == null
+    ])
+    error_message = "A start schedule sets a start or end date, so on some days it fires nothing."
+  }
+}
+
+# The input under a second instance id, so a schedule that writes the mocked id in
+# literally fails here rather than starting no instance in the account.
+run "start_schedules_carry_the_vms_own_id" {
+  command = plan
+
+  override_resource {
+    target = aws_instance.vm
+    values = {
+      id = "i-0fedcba9876543210"
+    }
+  }
+
+  assert {
+    condition = [
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.target[0].input
+      ] == [
+      "{\"InstanceIds\":[\"i-0fedcba9876543210\"]}",
+      "{\"InstanceIds\":[\"i-0fedcba9876543210\"]}",
+    ]
+    error_message = "A start schedule's input does not carry the VM's own instance id."
+  }
+}
+
+# A role ARN naming a hard-coded account id names nobody's role.
+run "scheduler_role_arn_follows_the_callers_account" {
+  command = plan
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "111111111111"
+    }
+  }
+
+  assert {
+    condition = [
+      for s in [aws_scheduler_schedule.start_weekday, aws_scheduler_schedule.start_sunday] :
+      s.target[0].role_arn
+      ] == [
+      "arn:aws:iam::111111111111:role/marketlake-scheduler",
+      "arn:aws:iam::111111111111:role/marketlake-scheduler",
+    ]
+    error_message = "A start schedule's role ARN does not name the caller's account."
   }
 }
 
