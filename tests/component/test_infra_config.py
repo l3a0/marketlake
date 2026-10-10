@@ -918,11 +918,13 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
 
     1. come at least ``START_LEAD`` before the earliest roster unit of its day,
     2. on a weekday, come before ``VM_UP_AT``, and
-    3. still be inside its uptime grace once ``MARGIN`` before the next refused span has
-       begun, so the stop's span check refuses as soon as the grace lets go.
+    3. end its uptime grace after ``MARGIN`` before the next refused span, so the stop's
+       span check already refuses when the grace lets go.
 
-    A weekday start at 03:30 or a Sunday start at 15:00 would pass the first two and
-    power off before the session, with nothing to start the VM again.
+    The third bound is strict. ``deploy_window`` still allows a stop at exactly
+    ``MARGIN`` before a span, 04:30 on a weekday and 16:00 on a Sunday, so a weekday
+    start at 03:30 or a Sunday start at 15:00 would pass the first two bounds and power
+    off before the session, with nothing to start the VM again.
     """
     body = _schedules()[address]
     assert body["schedule_expression_timezone"] == str(MARKET_TZ)
@@ -946,8 +948,8 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
         if day.weekday() < 5:
             assert at < VM_UP_AT, f"{address} starts at {at}, not before marketlake-up"
         span = deploy_window.spans_from(start, units)[0]
-        assert start + STOP_UPTIME_GRACE >= span.start - deploy_window.MARGIN, (
-            f"{address}'s grace ends on {day} before the span check refuses a stop"
+        assert start + STOP_UPTIME_GRACE > span.start - deploy_window.MARGIN, (
+            f"{address}'s grace ends on {day} while the span check still allows a stop"
         )
         checked += 1
     assert checked >= 5, f"{address} fired on {checked} of the days checked"
