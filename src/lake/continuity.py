@@ -422,10 +422,12 @@ def continuity_view(
 
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed drops out of a range
     with no error, because the read lists sessions from disk. Nothing nightly calls this door.
-    Reading a trimmed session means restoring it into a directory outside the live lake, and
-    the tool that restores a range there is marketlake #837, deferred. A partition removed
-    between the directory check and its listing raises ``FileNotFoundError`` rather than this
-    door's own refusal.
+    Reading a trimmed session means restoring it into a directory outside the live lake, which
+    ``python -m lake.bucket restore-for-reading`` does (marketlake #837). Call this with
+    ``lake_root`` at that directory and ``end`` at the range's last day, because the restore
+    also brings the next chains partition after the range, without its bars, and an open end
+    would read it. A partition removed between the directory check and its listing raises
+    ``FileNotFoundError`` rather than this door's own refusal.
     """
     root = resolve_lake_root(lake_root)
     first, last = _session(start), _session(end)

@@ -1,10 +1,10 @@
-"""Rebuilding a trimmed lake from the bucket, and the journal reserve on every restore.
+"""Rebuilding a trimmed lake from the bucket, and the journal reserve on every ``restore``.
 
 Marketlake #785. A host that keeps a window of sessions, the hosted VM, trims old partitions
 from its lake and records each trim in ``trimmed.jsonl``. Its restore leaves out each partition
 the bucket's copy of that ledger says was removed on purpose, and a host without the window key
-restores the whole lake. Every restore that downloads also checks that the destination keeps the
-journal reserve free. The cases follow the issue's Verification list.
+restores the whole lake. Every ``restore`` that downloads also checks that the destination keeps
+the journal reserve free. The cases follow the issue's Verification list.
 
 1. The exclusion restores everything but the designed absences, a refused day's journal
    segments and ``reports/`` included, and restores a partition trimmed on the volume after the

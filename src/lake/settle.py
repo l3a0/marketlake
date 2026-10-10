@@ -287,7 +287,8 @@ def settlement_view(
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed raises
     ``PartitionAbsent``, the same answer as a session never captured. Nothing nightly calls
     this door. Reading a trimmed session means restoring it into a directory outside the live
-    lake, and the tool that restores a range there is marketlake #837, deferred.
+    lake, which ``python -m lake.bucket restore-for-reading`` does (marketlake #837), bringing
+    the session's bars with it.
     """
     session_text = day.isoformat() if isinstance(day, date) else str(day)
     session = date.fromisoformat(session_text)

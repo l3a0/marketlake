@@ -34,8 +34,9 @@ A restore line also holds its partition back from the trim until a split checkpo
 session after the restore's day exists, which clause 6 in ``lake.trim`` decides, so a range
 restore lasts until the walk that needs it. No kind of line holds a partition for a reader. The
 owner decided on 2026-10-07 (decision 5 on marketlake #755) that reading trimmed data restores
-the range into a directory outside the live lake, the tool deferred to marketlake #837, so
-nothing in the live lake needs that kind of hold.
+the range into a directory outside the live lake, which ``python -m lake.bucket
+restore-for-reading`` does (marketlake #837), so nothing in the live lake needs that kind of
+hold.
 
 A **designed absence** is a partition whose latest manifest sha equals the sha on its latest
 trimmed line, where that latest line is a trim line. A trim line beside a file that is still

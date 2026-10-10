@@ -613,7 +613,12 @@ which uploads a lake with the real upload code, restores it into an empty direct
 compares every file byte for byte. The same command's rebuild of a trimmed lake, on a host
 that keeps a window, is driven by `tests/component/test_bucket_rebuild.py`, which trims the
 lake between the real first and nightly uploads
-([#785](https://github.com/l3a0/marketlake/issues/785)).
+([#785](https://github.com/l3a0/marketlake/issues/785)). The reading restore,
+`python -m lake.bucket restore-for-reading`, is driven by
+`tests/component/test_bucket_read_restore.py`, which restores a range of a trimmed bucket into
+an empty directory and checks the exact file set, then compares each view's answer from a
+reading directory with the same bounded call on the source lake
+([#837](https://github.com/l3a0/marketlake/issues/837)).
 
 ## The 10 live checks
 

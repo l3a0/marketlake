@@ -6,7 +6,7 @@ default, so switching back is one setting. The design's Backup section carries t
 reasoning for a bucket at all, and marketlake #630 carries the provider choice: S3
 Standard-IA, versioning on, no Object Lock, and credentials with a narrow policy.
 
-Six jobs live here.
+Seven jobs live here.
 
 1. **The nightly upload**, ``BucketBackup``, runs where ``RsyncBackup`` runs, inside
    compaction's lake-root lock. That is the close+15 run, and again the run the 18:30
@@ -39,6 +39,10 @@ Six jobs live here.
    what would bring this lake level with it: what to download, what to delete, and what
    refuses. The plan writes nothing. With ``--apply`` it downloads, deletes, and rewrites the
    lake's ``manifest.jsonl`` in place under the lake-root lock to equal the bucket's.
+7. **The reading restore**, ``python -m lake.bucket restore-for-reading``, is run by hand.
+   It restores a chosen chains or quotes range from the bucket into an empty directory
+   outside ``lake_root``, with what a reader needs beside it, so a session the VM's trim
+   removed can be read there with ``lake_root`` pointed at that directory (marketlake #837).
 
 **The manifest's digest travels with every upload.** ``manifest.jsonl`` records each
 file's SHA-256 as 64 hex characters. S3 takes a SHA-256 as ``ChecksumSHA256``, the
@@ -57,14 +61,16 @@ downloading it, the same byte-prefix rule ``manifest.backup_scrub`` applies to a
 copy. The number of entries in that prefix is the watermark. The nightly upload downloads
 the copy only when it is present and not a prefix, so ``bucket_divergence`` can tell
 another host's entries from a hand repair, and the refusal can say which. The first upload
-and the bucket scrub download it under the same condition. The restore and the resync
-download it every time, because the copy is what each makes the lake's manifest from.
+and the bucket scrub download it under the same condition. The restore, the reading restore
+and the resync download it every time, because the copy is what each makes the lake's
+manifest from.
 
 **What stays on the machine.** ``runner.BACKUP_EXCLUSIONS`` decides it, with ``rsync``'s
 own matching rules, because the uploader walks the tree itself and ``rsync`` is not
 there to apply them. Of this module's jobs, only the range restore and the resync write
 into a live lake. The restore writes only into an empty destination, which on the VM is
-``lake_root`` before any lake is there. The range restore writes only partitions the
+``lake_root`` before any lake is there. The reading restore writes only into an empty
+directory, and refuses one inside ``lake_root``. The range restore writes only partitions the
 lake's own manifest already records, a restore line in the trimmed ledger, and that
 ledger's manifest entry, which are what any lake writer leaves, so switching back to a path
 stays free. The resync leaves the lake's files and its ``manifest.jsonl`` as the bucket's
@@ -173,12 +179,19 @@ from lake.manifest import (
     sha256_file,
 )
 from lake.paths import (
+    ACTIONS,
+    CHAINS,
+    CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
     DATE_PREFIX,
     LOST_AND_FOUND,
     MANIFEST_FILE,
+    QUARANTINE_FILE,
+    REFERENCE_DIR,
     TEMP_MARKER,
     TRIMMED_FILE,
+    LakePaths,
+    PartitionRef,
     parse_date_dir,
     parse_partition_rel,
     temp_write_path,
@@ -186,6 +199,7 @@ from lake.paths import (
 from lake.runner import BACKUP_EXCLUSIONS
 from lake.session import SessionClock
 from lake.trimmed import is_designed_absence, latest_by_partition, latest_trimmed, parse_trimmed
+from lake.vendor import BAR_FREQS
 from lake.window import WindowRefused, window_sessions
 
 # The storage class every PUT sets. Standard-IA bills each version for at least 30 days
@@ -2023,13 +2037,19 @@ RESTORE_WORK_DIR = ".marketlake-restoring"
 # write.
 RESTORE_MARKER = ".marketlake-restore"
 
-# The file that says every file in the working directory verified. A run that finds it
-# finishes moving the files into the destination and downloads nothing.
+# The file that says every file in the working directory verified, and which command and
+# range made it. A run of that same command and range that finds it finishes moving the files
+# into the destination and downloads nothing. Any other run refuses with nothing moved.
 VERIFIED_MARKER = ".marketlake-verified"
 
 # The suffix a file carries while its download is in flight. It is renamed onto its own
 # name only once its bytes have hashed to what they must.
 _PART_SUFFIX = ".part"
+
+# The two commands whose working directory the verified marker names. A run finds the
+# directory waiting and finishes only its own command's move (marketlake #837).
+RESTORE_MODE = "restore"
+READING_MODE = "restore-for-reading"
 
 # Top-level names a bucket key may not restore to, because the restore itself uses them,
 # compared case-folded. macOS's filesystem ignores case, so ``Manifest.jsonl`` there is
@@ -2042,7 +2062,9 @@ _RESERVED = frozenset(
 
 
 class RestoreRefused(BucketRefusal):
-    """The restore command refused to start, or stopped, with one line for an operator."""
+    """The restore or the reading restore refused to start, or stopped, with one line for an
+    operator.
+    """
 
 
 def _free_bytes(path: Path) -> int:
@@ -2144,11 +2166,24 @@ def _destination_state(dest: Path) -> str:
     1. A symbolic link is refused, because the files would land wherever it points.
     2. A destination that exists and is not a directory is refused.
     3. An absent destination needs an existing parent, and is created later.
-    4. A directory counts as empty when it holds nothing but ``lost+found`` and the
+    4. A working directory that is a symbolic link is refused, for the same reason as the
+       destination. Every download and every move goes through it.
+    5. A directory counts as empty when it holds nothing but ``lost+found`` and the
        working directory. Anything else refuses, which keeps a restore off a live lake.
-    5. A working directory with files in it and no marker was not made by a restore,
+    6. A working directory with files in it and no marker was not made by a restore,
        and is refused rather than pruned.
+
+    A destination that cannot be read, such as one whose mode lets nobody list it, refuses
+    with one line rather than raising its ``OSError``. Both commands call this first.
     """
+    try:
+        return _destination_kind(dest)
+    except OSError as exc:
+        raise RestoreRefused(_local(f"reading {dest}", exc) + ", so nothing was restored") from None
+
+
+def _destination_kind(dest: Path) -> str:
+    """:func:`_destination_state`'s checks, which may raise an ``OSError``."""
     if dest.is_symlink():
         raise RestoreRefused(
             f"{dest} is a symbolic link. Name the directory it points to, so nothing was restored"
@@ -2160,6 +2195,11 @@ def _destination_state(dest: Path) -> str:
             raise RestoreRefused(f"{dest.parent} does not exist, so nothing was restored")
         return "download"
     work = dest / RESTORE_WORK_DIR
+    if work.is_symlink():
+        raise RestoreRefused(
+            f"{work} is a symbolic link, and the files would land wherever it points, so "
+            "nothing was restored. Remove it, since a restore makes its own working directory"
+        )
     if work.is_dir() and (work / VERIFIED_MARKER).is_file():
         return "move"
     others = sorted(set(os.listdir(dest)) - {LOST_AND_FOUND, RESTORE_WORK_DIR})
@@ -2184,7 +2224,7 @@ def _destination_state(dest: Path) -> str:
     if work.is_dir() and any(work.iterdir()) and not (work / RESTORE_MARKER).is_file():
         raise RestoreRefused(
             f"{work} holds files and no restore made it, so nothing was restored. Move it "
-            "aside and run the restore again"
+            "aside and run the same command again"
         )
     return "download"
 
@@ -2265,16 +2305,74 @@ def _prune(work: Path, keep: set[str]) -> None:
             here.rmdir()
 
 
-def _write_verified(work: Path, plan: Iterable[str]) -> None:
+def _write_verified(
+    work: Path, plan: Iterable[str], *, mode: str, selection: Mapping[str, Any] | None
+) -> None:
     """Mark the working directory verified, recording each file it must hold and its size.
 
     The finishing run checks against this list rather than re-hashing, because a year-end
     lake is about 154 GB. Sizes catch a file removed or truncated between the runs. The
     manifest is listed too, so a working directory that lost it never moves in a lake
     with no ledger.
+
+    ``mode`` names the command that made the directory, and ``selection`` the range a reading
+    restore chose, so a run that finds the directory waiting can tell whether it is finishing
+    its own move (marketlake #837). ``RESTORE_MARKER`` cannot carry them, because ``_finish``
+    deletes it first and ``_prepare_work`` never rewrites it.
     """
     files = {rel: (work / rel).stat().st_size for rel in [*plan, MANIFEST_FILE]}
-    (work / VERIFIED_MARKER).write_text(json.dumps({"files": files}, sort_keys=True) + "\n")
+    record = {"files": files, "mode": mode, "selection": selection}
+    (work / VERIFIED_MARKER).write_text(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _verified_record(work: Path) -> Mapping[str, Any] | None:
+    """What the verified marker records, or ``None`` when it cannot be read as an object.
+
+    An unreadable marker is left for ``_check_before_move`` to refuse, which names it.
+    """
+    try:
+        record = json.loads((work / VERIFIED_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _run_text(mode: object, selection: object) -> str:
+    """A run of ``mode`` over ``selection``, in words, as a verified marker records the two."""
+    if mode == RESTORE_MODE:
+        return "restore of a lake"
+    if mode == READING_MODE and isinstance(selection, dict):
+        scope = _range_scope(
+            selection.get("surface"),
+            selection.get("ticker"),
+            selection.get("first"),
+            selection.get("last"),
+        )
+        return f"reading restore of {scope}"
+    return f"run of {mode!r}"
+
+
+def _refuse_other_waiting(
+    work: Path, dest: Path, *, mode: str, selection: Mapping[str, Any] | None
+) -> None:
+    """Refuse to finish a verified move that another command or another range made.
+
+    A marker with no ``mode`` was written before reading restores existed, so it reads as a
+    ``restore``, which covers the windowed and the whole-lake restore alike, since moving either
+    lands a valid lake. A marker that cannot be read refuses later, in ``_check_before_move``.
+    """
+    record = _verified_record(work)
+    if record is None:
+        return
+    held_mode = record.get("mode", RESTORE_MODE)
+    held_selection = record.get("selection")
+    if held_mode == mode and held_selection == selection:
+        return
+    raise RestoreRefused(
+        f"{work} holds a verified {_run_text(held_mode, held_selection)}, waiting to move into "
+        f"{dest}, and this run is a {_run_text(mode, selection)}, so nothing was moved. Run the "
+        f"command that made it again to finish its move, or delete {work} and run this one again"
+    )
 
 
 def _check_before_move(work: Path, dest: Path) -> None:
@@ -2305,13 +2403,13 @@ def _check_before_move(work: Path, dest: Path) -> None:
             f"{dest} gained a {present[MANIFEST_FILE]} while the verified restore waited in "
             f"{work}, so something is using it as a lake and nothing was moved. Stop what "
             f"writes there, remove {dest / present[MANIFEST_FILE]} if it holds nothing worth "
-            "keeping, and run the restore again"
+            "keeping, and run the same command again"
         )
     clashes = sorted(present[name] for name in staged.keys() & present.keys())
     if clashes:
         raise RestoreRefused(
             f"{dest} holds {clashes[0]}, which the restore is about to move in from {work}, "
-            "so nothing was moved. Move it aside and run the restore again"
+            "so nothing was moved. Move it aside and run the same command again"
         )
     try:
         files = json.loads((work / VERIFIED_MARKER).read_text())["files"]
@@ -2328,7 +2426,7 @@ def _check_before_move(work: Path, dest: Path) -> None:
     if gaps:
         raise RestoreRefused(
             f"{work} no longer holds {gaps[0]} as it verified, so nothing was moved. Delete "
-            f"{work} and run the restore again"
+            f"{work} and run the same command again"
         )
 
 
@@ -2358,7 +2456,7 @@ def _finish_or_refuse(work: Path, dest: Path) -> None:
     except OSError as exc:
         raise RestoreRefused(
             f"every file verified and {_local(f'moving them from {work} into {dest}', exc)}. "
-            "Fix that and run the restore again, which finishes the move"
+            "Fix that and run the same command again, which finishes the move"
         ) from None
 
 
@@ -2459,77 +2557,16 @@ def _reserve_refusal(
     return line
 
 
-def restore_lake(
-    dest: Path | str,
-    target: BucketTarget,
-    *,
-    client: Any,
-    free_space: Callable[[Path], int] = _free_bytes,
-    skip_designed_absences: bool = False,
-) -> RestoreSummary:
-    """Restore the bucket's current versions into the empty directory ``dest``.
+def _bucket_manifest(
+    client: Any, target: BucketTarget, read: Callable[[str], Iterator[bytes]]
+) -> tuple[dict[str, int], bytes, dict[str, dict]]:
+    """The bucket's listing, its ``manifest.jsonl`` checked against S3's stored SHA-256, and
+    the latest entry per partition in it, for a restore to plan from.
 
-    ``skip_designed_absences`` chooses what comes back. Left false, the default, the whole
-    lake is restored. Set, the restore rebuilds a lake that keeps only a window of sessions,
-    leaving out each partition the bucket's ``trimmed.jsonl`` says that lake removed on
-    purpose (marketlake #785). ``main`` sets it on a host whose config sets
-    ``lake_window_sessions``. Every other caller passes it or takes the whole-lake default,
-    and none reads a config.
-
-    The steps, in order.
-
-    1. ``dest`` must be absent, or a directory holding nothing but ``lost+found`` and
-       the working directory, and not a symbolic link. Anything else refuses before a
-       request is sent. A working directory whose files already verified skips to step 7.
-    2. The bucket's ``manifest.jsonl`` is downloaded into memory and checked against the
-       SHA-256 S3 stored for it. The latest entry per partition is read from it, with a
-       torn last line discarded the way every reader discards one. When skipping designed
-       absences, the bucket's ``trimmed.jsonl`` is read too, by :func:`read_bucket_trimmed`,
-       unless a copy matching its manifest entry already waits in the working directory.
-       A missing, damaged or mismatched ledger refuses before any data file. A mismatch
-       first leaves a marked working directory holding the bucket's ``manifest.jsonl``, and
-       its refusal names the SHA-256 a copy put there by hand has to match.
-    3. The plan is every object under the target, less each journal segment whose
-       compacted partition the manifest records, and less S3's zero-byte folder
-       markers. The bucket never deletes, so it can hold the segments of a day
-       compacted after they uploaded, and the restore leaves them out by the scrub's own
-       rule, ``_compacted_partition_for_segment``. When skipping designed absences, each key
-       that ``trimmed.is_designed_absence`` calls designed against the bucket's two ledgers
-       is left out too. A key whose path would land outside the working directory is never
-       written and is named as a failure. A manifested file the bucket does not hold is a
-       failure named missing, unless it is a designed absence being skipped. That one is
-       named in ``trimmed_lost`` and fails nothing, since the rebuilt lake never needed it.
-    4. The free space on the destination's filesystem must cover every planned byte not
-       already verified in the working directory, or the command refuses before the
-       first data file. What is left after those bytes must then cover the journal
-       reserve, by ``runway.reserve_shortfall`` with the busiest sealed day in the bucket's
-       listing, or the command refuses the same way. The next session's journal lands on
-       this filesystem, and a lake that cannot seal its next close loses captured minutes.
-    5. Each planned file streams into ``<dest>/.marketlake-restoring`` and is hashed as
-       it arrives. A manifested file must match its latest entry. Any other file must
-       match the SHA-256 S3 stored at upload, since the manifest has no entry for it. A
-       file already there with the right hash is not downloaded again.
-    6. Any failure stops here, names the file, and leaves no ``manifest.jsonl`` at
-       ``dest``.
-    7. Otherwise the working directory is pruned to the plan, marked verified, and its
-       entries are moved up into ``dest``, ``manifest.jsonl`` last.
-
-    Nothing takes the lake-root lock. ``lake_lock`` creates ``manifest.jsonl`` under the
-    root it is handed, and a restore writes into a directory nothing else uses. A client
-    error other than a missing key stops the run and raises, and a local filesystem
-    failure stops it with a ``RestoreRefused``. Either way the working directory keeps
-    every file that verified for the next run.
+    A torn last line is discarded the way every reader discards one. A bucket holding no
+    manifest, one stored with no full-object SHA-256, one whose bytes do not match it, and one
+    that does not parse each refuse before any data file.
     """
-    dest = Path(os.path.abspath(Path(dest).expanduser()))
-    work = dest / RESTORE_WORK_DIR
-    summary = RestoreSummary(target=str(target), dest=dest, work=work)
-    if _destination_state(dest) == "move":
-        _finish_or_refuse(work, dest)
-        summary.finished_move = True
-        summary.restored = True
-        return summary
-    read = bucket_reader(client, target)
-
     listing = list_bucket(client, target)
     if MANIFEST_FILE not in listing:
         raise RestoreRefused(
@@ -2553,77 +2590,31 @@ def restore_lake(
         )
     except ManifestError as exc:
         raise RestoreRefused(f"the bucket's {exc}, so nothing was restored") from None
-    trimmed_latest: Mapping[str, Mapping] = (
-        _restore_trimmed(client, target, latest, raw, dest, work) if skip_designed_absences else {}
-    )
+    return listing, raw, latest
 
-    def superseded(rel: str) -> bool:
-        compacted = _compacted_partition_for_segment(rel)
-        return compacted is not None and compacted in latest
 
-    def designed(rel: str) -> bool:
-        return skip_designed_absences and is_designed_absence(rel, latest, trimmed_latest)
+def _download_plan(
+    client: Any,
+    target: BucketTarget,
+    read: Callable[[str], Iterator[bytes]],
+    plan: Mapping[str, str | None],
+    raw: bytes,
+    dest: Path,
+    work: Path,
+    summary: RestoreSummary | ReadingRestoreSummary,
+) -> None:
+    """Download every planned file into the working directory, then write ``manifest.jsonl``.
 
-    plan: dict[str, str | None] = {}
-    for rel in sorted(listing):
-        if rel == MANIFEST_FILE or (rel.endswith("/") and listing[rel] == 0):
-            # A zero-byte key ending in "/" is the folder marker the S3 console writes.
-            # It names no file, and written as one it would block a directory's name.
-            continue
-        if _unsafe(rel) or not _inside(work, rel):
-            summary.failures.append((rel, "names a path outside the lake, so it was not written"))
-            continue
-        if superseded(rel):
-            summary.segments_left_out += 1
-            continue
-        if designed(rel):
-            summary.trimmed_left_out += 1
-            continue
-        plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
-    by_case: dict[str, list[str]] = {}
-    for rel in plan:
-        by_case.setdefault(rel.casefold(), []).append(rel)
-    for same in by_case.values():
-        for rel in same[1:]:
-            summary.failures.append(
-                (
-                    rel,
-                    f"differs from {same[0]} only by case, so one would overwrite the other "
-                    "on a filesystem that ignores case",
-                )
-            )
-    for rel in sorted(latest):
-        if rel not in listing and not superseded(rel):
-            if designed(rel):
-                summary.trimmed_lost.append(rel)
-                continue
-            summary.failures.append((rel, "missing from the bucket"))
+    ``plan`` maps each path to its latest manifest sha, or to ``None`` for a file the manifest
+    does not record, which is checked against the SHA-256 S3 stored at upload instead. A file
+    already in the working directory with the right hash is resumed rather than downloaded.
+    A file that is missing or does not match is a failure in ``summary`` and stops nothing. A
+    local filesystem failure stops the run with a ``RestoreRefused``.
 
-    needed = len(raw) + sum(
-        listing[rel]
-        for rel in plan
-        if not ((work / rel).is_file() and (work / rel).stat().st_size == listing[rel])
-    )
-    free = free_space(dest if dest.is_dir() else dest.parent)
-    if free < needed:
-        raise RestoreRefused(
-            f"the restore needs {needed / 1_000_000:.1f} MB and the filesystem holding "
-            f"{dest} has {free / 1_000_000:.1f} MB free, so nothing was restored"
-        )
-    busiest = runway.listing_busiest_sealed_day(listing)
-    short = runway.reserve_shortfall(free=free, planned=needed, busiest_sealed_day=busiest)
-    if short:
-        raise RestoreRefused(
-            _reserve_refusal(
-                dest,
-                needed=needed,
-                busiest=busiest,
-                free=free,
-                short=short,
-                windowed=skip_designed_absences,
-            )
-        )
-
+    The manifest is written even when a file failed, so the operator can read the entry a
+    failing file was checked against. It is still only in the working directory, so the
+    destination holds no lake.
+    """
     try:
         _prepare_work(dest, work)
     except OSError as exc:
@@ -2671,32 +2662,222 @@ def restore_lake(
         os.replace(_part(path), path)
         summary.downloaded += 1
         summary.downloaded_bytes += size
-
-    summary.files = len(plan) + 1
-    summary.unrecorded = [
-        rel for rel in plan if rel not in latest and not _is_excluded(rel, SCRUB_EXCLUSIONS)
-    ]
     try:
-        # The manifest is written even when a file failed, so the operator can read the
-        # entry a failing file was checked against. It is still only in the working
-        # directory, so the destination holds no lake.
         (work / MANIFEST_FILE).write_bytes(raw)
     except OSError as exc:
         raise RestoreRefused(
             _local(f"writing manifest.jsonl into {work}", exc) + f". Nothing was moved into {dest}"
         ) from None
-    if summary.failures:
-        return summary
+
+
+def _move_verified(
+    work: Path,
+    dest: Path,
+    plan: Iterable[str],
+    *,
+    mode: str,
+    selection: Mapping[str, Any] | None,
+) -> None:
+    """Prune the working directory to the plan, mark it verified, and move it into ``dest``."""
+    planned = list(plan)
     try:
-        _prune(work, {*plan, MANIFEST_FILE})
-        _write_verified(work, plan)
+        _prune(work, {*planned, MANIFEST_FILE})
+        _write_verified(work, planned, mode=mode, selection=selection)
     except OSError as exc:
         raise RestoreRefused(
             _local(f"finishing {work}", exc) + f". Nothing was moved into {dest}"
         ) from None
     _finish_or_refuse(work, dest)
+
+
+def restore_lake(
+    dest: Path | str,
+    target: BucketTarget,
+    *,
+    client: Any,
+    free_space: Callable[[Path], int] = _free_bytes,
+    skip_designed_absences: bool = False,
+) -> RestoreSummary:
+    """Restore the bucket's current versions into the empty directory ``dest``.
+
+    ``skip_designed_absences`` chooses what comes back. Left false, the default, the whole
+    lake is restored. Set, the restore rebuilds a lake that keeps only a window of sessions,
+    leaving out each partition the bucket's ``trimmed.jsonl`` says that lake removed on
+    purpose (marketlake #785). ``main`` sets it on a host whose config sets
+    ``lake_window_sessions``. Every other caller passes it or takes the whole-lake default,
+    and none reads a config.
+
+    The steps, in order.
+
+    1. ``dest`` must be absent, or a directory holding nothing but ``lost+found`` and
+       the working directory, and not a symbolic link. Anything else refuses before a
+       request is sent. A working directory whose files already verified skips to step 7,
+       unless its marker says a reading restore made it, which refuses with nothing moved.
+    2. The bucket's ``manifest.jsonl`` is downloaded into memory and checked against the
+       SHA-256 S3 stored for it. The latest entry per partition is read from it, with a
+       torn last line discarded the way every reader discards one. When skipping designed
+       absences, the bucket's ``trimmed.jsonl`` is read too, by :func:`read_bucket_trimmed`,
+       unless a copy matching its manifest entry already waits in the working directory.
+       A missing, damaged or mismatched ledger refuses before any data file. A mismatch
+       first leaves a marked working directory holding the bucket's ``manifest.jsonl``, and
+       its refusal names the SHA-256 a copy put there by hand has to match.
+    3. The plan is every object under the target, less each journal segment whose
+       compacted partition the manifest records, and less S3's zero-byte folder
+       markers. The bucket never deletes, so it can hold the segments of a day
+       compacted after they uploaded, and the restore leaves them out by the scrub's own
+       rule, ``_compacted_partition_for_segment``. When skipping designed absences, each key
+       that ``trimmed.is_designed_absence`` calls designed against the bucket's two ledgers
+       is left out too. A key whose path would land outside the working directory is never
+       written and is named as a failure. A manifested file the bucket does not hold is a
+       failure named missing, unless it is a designed absence being skipped. That one is
+       named in ``trimmed_lost`` and fails nothing, since the rebuilt lake never needed it.
+    4. The free space on the destination's filesystem must cover every planned byte not
+       already verified in the working directory, or the command refuses before the
+       first data file. What is left after those bytes must then cover the journal
+       reserve, by ``runway.reserve_shortfall`` with the busiest sealed day in the bucket's
+       listing, or the command refuses the same way. The next session's journal lands on
+       this filesystem, and a lake that cannot seal its next close loses captured minutes.
+    5. Each planned file streams into ``<dest>/.marketlake-restoring`` and is hashed as
+       it arrives. A manifested file must match its latest entry. Any other file must
+       match the SHA-256 S3 stored at upload, since the manifest has no entry for it. A
+       file already there with the right hash is not downloaded again.
+    6. Any failure stops here, names the file, and leaves no ``manifest.jsonl`` at
+       ``dest``.
+    7. Otherwise the working directory is pruned to the plan, marked verified, and its
+       entries are moved up into ``dest``, ``manifest.jsonl`` last.
+
+    Nothing takes the lake-root lock. ``lake_lock`` creates ``manifest.jsonl`` under the
+    root it is handed, and a restore writes into a directory nothing else uses. A client
+    error other than a missing key stops the run and raises, and a local filesystem
+    failure stops it with a ``RestoreRefused``. Either way the working directory keeps
+    every file that verified for the next run.
+    """
+    dest = Path(os.path.abspath(Path(dest).expanduser()))
+    work = dest / RESTORE_WORK_DIR
+    summary = RestoreSummary(target=str(target), dest=dest, work=work)
+    if _destination_state(dest) == "move":
+        _refuse_other_waiting(work, dest, mode=RESTORE_MODE, selection=None)
+        _finish_or_refuse(work, dest)
+        summary.finished_move = True
+        summary.restored = True
+        return summary
+    read = bucket_reader(client, target)
+    listing, raw, latest = _bucket_manifest(client, target, read)
+    trimmed_latest: Mapping[str, Mapping] = (
+        _restore_trimmed(client, target, latest, raw, dest, work) if skip_designed_absences else {}
+    )
+
+    def superseded(rel: str) -> bool:
+        compacted = _compacted_partition_for_segment(rel)
+        return compacted is not None and compacted in latest
+
+    def designed(rel: str) -> bool:
+        return skip_designed_absences and is_designed_absence(rel, latest, trimmed_latest)
+
+    plan: dict[str, str | None] = {}
+    for rel in sorted(listing):
+        if rel == MANIFEST_FILE or (rel.endswith("/") and listing[rel] == 0):
+            # A zero-byte key ending in "/" is the folder marker the S3 console writes.
+            # It names no file, and written as one it would block a directory's name.
+            continue
+        if _unsafe(rel) or not _inside(work, rel):
+            summary.failures.append((rel, "names a path outside the lake, so it was not written"))
+            continue
+        if superseded(rel):
+            summary.segments_left_out += 1
+            continue
+        if designed(rel):
+            summary.trimmed_left_out += 1
+            continue
+        plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
+    summary.failures.extend(_case_collisions(plan))
+    for rel in sorted(latest):
+        if rel not in listing and not superseded(rel):
+            if designed(rel):
+                summary.trimmed_lost.append(rel)
+                continue
+            summary.failures.append((rel, "missing from the bucket"))
+
+    needed = _needed_bytes(work, raw, plan, listing)
+    free = free_space(dest if dest.is_dir() else dest.parent)
+    if free < needed:
+        raise RestoreRefused(_short_of_plan(dest, needed=needed, free=free))
+    busiest = runway.listing_busiest_sealed_day(listing)
+    short = runway.reserve_shortfall(free=free, planned=needed, busiest_sealed_day=busiest)
+    if short:
+        raise RestoreRefused(
+            _reserve_refusal(
+                dest,
+                needed=needed,
+                busiest=busiest,
+                free=free,
+                short=short,
+                windowed=skip_designed_absences,
+            )
+        )
+
+    _download_plan(client, target, read, plan, raw, dest, work, summary)
+    summary.files = len(plan) + 1
+    summary.unrecorded = [
+        rel for rel in plan if rel not in latest and not _is_excluded(rel, SCRUB_EXCLUSIONS)
+    ]
+    if summary.failures:
+        return summary
+    _move_verified(work, dest, plan, mode=RESTORE_MODE, selection=None)
     summary.restored = True
     return summary
+
+
+def _case_collisions(plan: Iterable[str]) -> list[tuple[str, str]]:
+    """A failure for each planned path that differs from an earlier one only by case."""
+    by_case: dict[str, list[str]] = {}
+    for rel in plan:
+        by_case.setdefault(rel.casefold(), []).append(rel)
+    return [
+        (
+            rel,
+            f"differs from {same[0]} only by case, so one would overwrite the other "
+            "on a filesystem that ignores case",
+        )
+        for same in by_case.values()
+        for rel in same[1:]
+    ]
+
+
+def _short_of_plan(dest: Path, *, needed: int, free: int) -> str:
+    """The line a restore refuses with when its filesystem cannot hold the download itself."""
+    return (
+        f"the restore needs {needed / 1_000_000:.1f} MB and the filesystem holding "
+        f"{dest} has {free / 1_000_000:.1f} MB free, so nothing was restored"
+    )
+
+
+def _floor_refusal(dest: Path, lake_root: Path, *, needed: int, free: int) -> str:
+    """The line a reading restore refuses with when it would leave less than the floor free.
+
+    Only a directory on a filesystem other than ``lake_root``'s meets it. The floor is
+    ``runway.OFF_LAKE_FREE_FLOOR_BYTES``, which keeps room for the files a host writes there
+    during a session. The line names the plan, the floor, the free space and the shortfall,
+    in the decimal megabytes the reserve's line uses.
+    """
+    floor = runway.OFF_LAKE_FREE_FLOOR_BYTES
+    short = floor - (free - needed)
+    return (
+        f"the restore needs {needed / 1_000_000:.1f} MB, and a filesystem lake_root "
+        f"{lake_root} does not use must keep {floor / 1_000_000:.1f} MB free beside it for the "
+        "files a host writes during a session, such as token.json. The filesystem holding "
+        f"{dest} has {free / 1_000_000:.1f} MB free, {short / 1_000_000:.1f} MB short of that "
+        "floor, so nothing was restored. Free that much or use a larger filesystem"
+    )
+
+
+def _needed_bytes(work: Path, raw: bytes, plan: Iterable[str], listing: Mapping[str, int]) -> int:
+    """The bytes a restore still has to download: the manifest and each file not yet verified."""
+    return len(raw) + sum(
+        listing[rel]
+        for rel in plan
+        if not ((work / rel).is_file() and (work / rel).stat().st_size == listing[rel])
+    )
 
 
 # -- the range restore --------------------------------------------------------
@@ -2720,6 +2901,66 @@ RANGE_RESTORE_SHADOW = (
 
 class RangeRestoreRefused(BucketRefusal):
     """The range restore refused to start, or stopped, with one line for an operator."""
+
+
+# The range a command selects, shared by the range restore and the reading restore
+# (marketlake #837). Each helper returns text, because the range restore raises
+# ``RangeRestoreRefused`` and the reading restore ``RestoreRefused``.
+
+
+def _range_scope(surface: object, ticker: object, first: object, last: object) -> str:
+    """The selected range in words. A date prints as ``YYYY-MM-DD``, as its ``isoformat``."""
+    return (
+        f"{surface} partitions for {ticker if ticker is not None else 'every ticker'} "
+        f"from {first} to {last}"
+    )
+
+
+def _surface_refusal(surface: str, command: str) -> str | None:
+    """Why ``command`` refuses ``surface``, or ``None`` for a surface it takes."""
+    if surface in DATE_PARTITIONED:
+        return None
+    return (
+        f"{command} takes {' or '.join(sorted(DATE_PARTITIONED))} partitions, not "
+        f"{surface!r}, so nothing was restored. Restore any other file by hand from the bucket"
+    )
+
+
+def _reversed_refusal(first: date, last: date) -> str | None:
+    """Why a range that ends before it starts refuses, or ``None`` for one that does not."""
+    if first <= last:
+        return None
+    return (
+        f"the range ends on {last.isoformat()}, before it starts on {first.isoformat()}, "
+        "so nothing was restored"
+    )
+
+
+def _in_range(
+    rel: str, *, surface: str, ticker: str | None, first: date, last: date
+) -> PartitionRef | None:
+    """The partition ``rel`` names when the range selects it, and ``None`` otherwise.
+
+    The range is every path ``paths.parse_partition_rel`` reads as ``surface``, for ``ticker``
+    or for every ticker when it is ``None``, dated ``first`` to ``last`` inclusive.
+    """
+    ref = parse_partition_rel(rel)
+    if (
+        ref is not None
+        and ref.surface == surface
+        and (ticker is None or ref.ticker == ticker)
+        and first <= ref.day <= last
+    ):
+        return ref
+    return None
+
+
+def _nothing_selected(scope: str) -> str:
+    """The refusal for a range the manifest records nothing in."""
+    return (
+        f"the manifest records no {scope}, so nothing was restored. Check the surface, the "
+        "ticker and the dates"
+    )
 
 
 @dataclass
@@ -2855,10 +3096,7 @@ def restore_range(
 
     root = Path(lake_root)
     summary = RangeRestoreSummary(target=str(target))
-    scope = (
-        f"{surface} partitions for {ticker if ticker is not None else 'every ticker'} "
-        f"from {first.isoformat()} to {last.isoformat()}"
-    )
+    scope = _range_scope(surface, ticker, first, last)
 
     def refuse(why: str) -> RangeRestoreRefused:
         done = (
@@ -2909,17 +3147,9 @@ def restore_range(
             )
         return refuse(f"{rel}: {why}, so it was not restored. {recovery}")
 
-    if surface not in DATE_PARTITIONED:
-        raise refuse(
-            f"the range restore takes {' or '.join(sorted(DATE_PARTITIONED))} partitions, not "
-            f"{surface!r}, so nothing was restored. Restore any other file by hand from the "
-            "bucket"
-        )
-    if first > last:
-        raise refuse(
-            f"the range ends on {last.isoformat()}, before it starts on {first.isoformat()}, "
-            "so nothing was restored"
-        )
+    wrong = _surface_refusal(surface, "the range restore") or _reversed_refusal(first, last)
+    if wrong is not None:
+        raise refuse(wrong)
     guard()
     if not manifest_path(root).is_file():
         raise refuse(
@@ -2948,20 +3178,12 @@ def restore_range(
             trimmed = latest_trimmed(root)
             selected: dict[str, str] = {}
             for rel, entry in sorted(latest.items()):
-                ref = parse_partition_rel(rel)
-                if (
-                    ref is not None
-                    and ref.surface == surface
-                    and (ticker is None or ref.ticker == ticker)
-                    and first <= ref.day <= last
-                ):
+                ref = _in_range(rel, surface=surface, ticker=ticker, first=first, last=last)
+                if ref is not None:
                     selected[rel] = str(entry["sha256"])
                     days[rel] = ref.day
             if not selected:
-                raise refuse(
-                    f"the manifest records no {scope}, so nothing was restored. Check the "
-                    "surface, the ticker and the dates"
-                )
+                raise refuse(_nothing_selected(scope))
             summary.selected = len(selected)
             for rel, sha in selected.items():
                 path = root / rel
@@ -3158,6 +3380,355 @@ def restore_range(
                 # A directory that refuses the unlink refused the write first, and that
                 # refusal is the one line the operator needs.
                 pass
+    return summary
+
+
+# -- the reading restore ------------------------------------------------------
+#
+# ``python -m lake.bucket restore-for-reading <dest>`` restores a chosen range from the bucket
+# into an empty directory outside the live lake, so a session the VM's trim removed can be read
+# there (marketlake #837, decision 5 on #755). It downloads through the ``restore`` command's
+# own path and differs only in what it plans: the range, each selected ticker's next chains
+# partition after it, the bars of the same tickers and days, and the ledgers and reference
+# tables a reader needs. The directory it fills is for reading. Its manifest names partitions it
+# does not hold, so it is never a ``lake_root`` for the daemon or any job. The design's Backup
+# section carries the reasoning.
+
+# What each planned file is to the range. The summary counts by it and a failure names it.
+_RANGE_ROLE = "range"
+_NEXT_ROLE = "next"
+_BARS_ROLE = "bars"
+_SUPPORT_ROLE = "support"
+_ROLE_TEXT = {
+    _RANGE_ROLE: "a partition in the range",
+    _NEXT_ROLE: "the next chains partition after the range",
+    _BARS_ROLE: "a bars partition of the range's tickers and days",
+    _SUPPORT_ROLE: "a file a reader needs beside the range",
+}
+
+# The two ledgers a reader needs beside the range, when the bucket's manifest records them.
+# ``load_bars`` and ``continuity_view`` adjust by the corporate-actions ledger, and every door
+# excludes what the quarantine ledger flags. Either one absent reads as no entries and raises
+# nothing, so leaving one out would change an answer silently. Everything the manifest records
+# under ``reference/`` joins them.
+_READING_LEDGERS = frozenset({f"{ACTIONS}/{CORPORATE_ACTIONS_FILE}", QUARANTINE_FILE})
+
+
+def _device(path: Path) -> int:
+    """The device number of the filesystem holding ``path``."""
+    return os.stat(path).st_dev
+
+
+def _read_it(dest: Path) -> str:
+    """The sentence every reading restore's success line ends with."""
+    return (
+        f"Read it with lake_root={dest}, and never make it a daemon's or a job's lake_root, "
+        "since its manifest records partitions it does not hold"
+    )
+
+
+@dataclass
+class ReadingRestoreSummary:
+    """What one reading restore did, for the lines the command prints.
+
+    ``roles`` maps each planned file to what it is to the range: in it, the next chains
+    partition after it, a bars partition of its tickers and days, or a file a reader needs
+    beside it. ``range_by_ticker`` counts the range's partitions per ticker. ``failures``,
+    ``downloaded``, ``downloaded_bytes``, ``resumed``, ``restored`` and ``finished_move`` mean
+    what :class:`RestoreSummary`'s fields of those names mean.
+    """
+
+    target: str
+    dest: Path
+    work: Path
+    roles: dict[str, str] = field(default_factory=dict)
+    range_by_ticker: dict[str, int] = field(default_factory=dict)
+    downloaded: int = 0
+    downloaded_bytes: int = 0
+    resumed: int = 0
+    failures: list[tuple[str, str]] = field(default_factory=list)
+    restored: bool = False
+    finished_move: bool = False
+
+    def count(self, role: str) -> int:
+        """How many planned files have ``role``."""
+        return sum(1 for held in self.roles.values() if held == role)
+
+    def render(self) -> str:
+        """One line naming what came down, from where, to where, and how to read it."""
+        if self.finished_move:
+            return (
+                "finished moving a reading restore that had already verified every file into "
+                f"{self.dest}. {_read_it(self.dest)}"
+            )
+        tickers = ", ".join(f"{name} {n}" for name, n in sorted(self.range_by_ticker.items()))
+        support = sorted(
+            [rel for rel, role in self.roles.items() if role == _SUPPORT_ROLE] + [MANIFEST_FILE]
+        )
+        megabytes = self.downloaded_bytes / 1_000_000
+        return (
+            f"restored for reading {self.count(_RANGE_ROLE)} partition(s) in the range "
+            f"({tickers}), {self.count(_NEXT_ROLE)} next chains partition(s) after it, "
+            f"{self.count(_BARS_ROLE)} bars partition(s), and {len(support)} support file(s) "
+            f"({', '.join(support)}) from {self.target} into {self.dest}: downloaded "
+            f"{self.downloaded} ({megabytes:.1f} MB), {self.resumed} already verified in the "
+            f"working directory. {_read_it(self.dest)}"
+        )
+
+
+def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
+    """Refuse a destination that is ``lake_root`` or sits anywhere under it.
+
+    The resolved destination and each of its ancestors is compared with ``lake_root`` by
+    ``os.path.samestat``, which compares the device and the inode. A path comparison is not
+    enough: macOS's filesystem ignores case and ``realpath`` does not normalize it, so a
+    destination under ``lake`` read as outside a ``lake_root`` spelled ``Lake``. A
+    ``lake_root`` that cannot be statted falls back to comparing resolved paths. A failure to
+    stat anything else is one line rather than a traceback.
+    """
+    refused = RestoreRefused(
+        f"{dest} is inside lake_root {lake_root}. A reading restore writes only outside the live "
+        "lake, so nothing was restored. Name a directory elsewhere"
+    )
+    try:
+        resolved = dest.resolve()
+        try:
+            root_stat = os.stat(lake_root)
+        except OSError:
+            root = lake_root.resolve()
+            if resolved == root or resolved.is_relative_to(root):
+                raise refused from None
+            return
+        for path in (resolved, *resolved.parents):
+            try:
+                here = os.stat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                # Not there yet. The destination is created later, and a missing parent is
+                # ``_destination_state``'s refusal to make.
+                continue
+            if os.path.samestat(here, root_stat):
+                raise refused
+    except OSError as exc:
+        raise RestoreRefused(
+            _local(f"checking whether {dest} is inside lake_root {lake_root}", exc)
+            + ", so nothing was restored"
+        ) from None
+    except RuntimeError as exc:
+        # Python 3.12's ``Path.resolve`` raises this on a symbolic link loop.
+        raise RestoreRefused(
+            f"checking whether {dest} is inside lake_root {lake_root} failed ({exc}), so "
+            "nothing was restored"
+        ) from None
+
+
+def _shares_lake_filesystem(probe: Path, lake_root: Path, device_of: Callable[[Path], int]) -> bool:
+    """Whether ``probe`` sits on the filesystem holding ``lake_root``, by device number.
+
+    Yes means the journal reserve applies, and no means ``runway.OFF_LAKE_FREE_FLOOR_BYTES``
+    applies in its place. A ``lake_root`` that cannot be statted answers yes, so the reserve
+    applies whenever nothing proves the two filesystems apart. A failure to stat ``probe`` is
+    one line.
+    """
+    try:
+        here = device_of(probe)
+    except OSError as exc:
+        raise RestoreRefused(
+            _local(f"reading which filesystem holds {probe}", exc) + ", so nothing was restored"
+        ) from None
+    try:
+        return here == device_of(lake_root)
+    except OSError:
+        return True
+
+
+def _reading_plan(
+    latest: Mapping[str, Mapping],
+    *,
+    surface: str,
+    ticker: str | None,
+    first: date,
+    last: date,
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Each manifested file a reading restore plans, with its role, and the range per ticker.
+
+    Every planned file is one of the bucket manifest's latest entries.
+
+    1. The range, by :func:`_in_range`.
+    2. On ``chains``, each ticker the range selected gets its next chains partition after the
+       range, the earliest the manifest records past ``last``. ``oi.oi_view`` reads the next
+       session's chains, and with none sealed it answers ``pending``. The next one the manifest
+       records, rather than the calendar's, keeps a capture gap a gap, because any later
+       sealed partition makes ``oi_view``'s gap answer ``absent``, as on the full lake.
+    3. The bars of the same tickers on each calendar day in the range, at each frequency in
+       ``vendor.BAR_FREQS``. Each key is built with ``LakePaths.bars_partition_path`` and kept
+       when the manifest records it, since ``paths`` has no parser for a bars key and
+       ``lake.bars`` decided that the manifested skip is built, never parsed.
+    4. ``actions/corporate_actions.jsonl`` and ``quarantine.jsonl``, and every file under
+       ``reference/``: the security master, the capture spans, the schema-version ledger and
+       the split checkpoint.
+
+    A key the bucket lists and the manifest does not record is never planned, because every
+    file a reader needs is manifested. A refused day's journal segments and ``reports/`` are
+    left out too, since the loader reads only sealed partitions.
+    """
+    roles: dict[str, str] = {}
+    by_ticker: dict[str, int] = {}
+    for rel in sorted(latest):
+        ref = _in_range(rel, surface=surface, ticker=ticker, first=first, last=last)
+        if ref is not None:
+            roles[rel] = _RANGE_ROLE
+            by_ticker[ref.ticker] = by_ticker.get(ref.ticker, 0) + 1
+    if surface == CHAINS:
+        after: dict[str, PartitionRef] = {}
+        nearest: dict[str, str] = {}
+        for rel in sorted(latest):
+            ref = parse_partition_rel(rel)
+            if ref is None or ref.surface != CHAINS or ref.ticker not in by_ticker:
+                continue
+            held = after.get(ref.ticker)
+            if ref.day > last and (held is None or ref.day < held.day):
+                after[ref.ticker] = ref
+                nearest[ref.ticker] = rel
+        for rel in nearest.values():
+            roles[rel] = _NEXT_ROLE
+    # Any root serves, since only the key relative to it is kept.
+    paths = LakePaths(Path("lake"))
+    days = [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
+    for name in sorted(by_ticker):
+        for freq in BAR_FREQS:
+            for day in days:
+                rel = paths.bars_partition_path(name, freq, day).relative_to(paths.root).as_posix()
+                if rel in latest:
+                    roles[rel] = _BARS_ROLE
+    for rel in latest:
+        if rel in _READING_LEDGERS or rel.startswith(f"{REFERENCE_DIR}/"):
+            roles[rel] = _SUPPORT_ROLE
+    return roles, by_ticker
+
+
+def restore_for_reading(
+    dest: Path | str,
+    target: BucketTarget,
+    *,
+    client: Any,
+    lake_root: Path | str,
+    surface: str,
+    ticker: str | None,
+    first: date,
+    last: date,
+    free_space: Callable[[Path], int] = _free_bytes,
+    device_of: Callable[[Path], int] = _device,
+) -> ReadingRestoreSummary:
+    """Restore the ``surface`` range from ``first`` to ``last`` into the empty directory ``dest``.
+
+    The range is what ``restore-range`` selects: the latest manifest entries
+    ``paths.parse_partition_rel`` reads as ``surface``, for ``ticker`` or for every ticker when
+    it is ``None``, dated ``first`` to ``last`` inclusive. The selection reads the bucket's own
+    ``manifest.jsonl``, never the lake's. :func:`_reading_plan` adds what a reader needs beside
+    it. ``lake_root`` is the configured live lake, which the destination must stay out of.
+
+    The steps, in order.
+
+    1. A surface other than ``chains`` or ``quotes``, and a range that ends before it starts,
+       refuse before any request.
+    2. ``dest`` must not be ``lake_root`` or sit under it, by :func:`_refuse_inside_lake_root`,
+       and it must pass ``_destination_state``, as for :func:`restore_lake`. A working directory
+       that already verified finishes its move with no request, but only when its marker
+       records this command and this range. Any other refuses with nothing moved.
+    3. The bucket's ``manifest.jsonl`` is read and checked as :func:`restore_lake` reads it. A
+       range it records nothing in refuses before any data file, and before a working
+       directory is created.
+    4. Each planned file must have a safe path, must not differ from another planned path only
+       by case, and must be in the bucket's listing. A key the plan leaves out fails nothing,
+       so one bad key elsewhere in the bucket does not block a read.
+    5. Free space on the destination's filesystem must cover every planned byte not already
+       verified in the working directory. When that filesystem is ``lake_root``'s, by
+       ``device_of``, what is left must also cover the journal reserve, as in
+       :func:`restore_lake`, since the next session's journal lands there. Elsewhere the
+       reserve protects nothing and is not checked, and what is left must instead be at least
+       ``runway.OFF_LAKE_FREE_FLOOR_BYTES``, for the files a host writes there during a
+       session. Exactly the floor passes.
+    6. The download, the verification and the move are :func:`restore_lake`'s own: every file
+       must hash to its latest manifest entry, ``manifest.jsonl`` to the SHA-256 S3 stored
+       for it, and the working directory moves in only once every file verified,
+       ``manifest.jsonl`` last. The verified marker records this command and the range.
+
+    Designed absences are not skipped, and nothing reads ``lake_window_sessions``, because
+    the partitions the trim removed are what a reader came for. Nothing takes the lake-root
+    lock, as for :func:`restore_lake`. A manifest that changes between the read and the
+    downloads fails a file rather than landing a wrong set, since the expected shas and the
+    written ``manifest.jsonl`` come from the bytes read once. Two runs into one destination
+    at once are unsupported, as for ``restore``.
+    """
+    wrong = _surface_refusal(surface, "the reading restore") or _reversed_refusal(first, last)
+    if wrong is not None:
+        raise RestoreRefused(wrong)
+    dest = Path(os.path.abspath(Path(dest).expanduser()))
+    root = Path(lake_root).expanduser()
+    work = dest / RESTORE_WORK_DIR
+    selection = {
+        "surface": surface,
+        "ticker": ticker,
+        "first": first.isoformat(),
+        "last": last.isoformat(),
+    }
+    summary = ReadingRestoreSummary(target=str(target), dest=dest, work=work)
+    _refuse_inside_lake_root(dest, root)
+    if _destination_state(dest) == "move":
+        _refuse_other_waiting(work, dest, mode=READING_MODE, selection=selection)
+        _finish_or_refuse(work, dest)
+        summary.finished_move = True
+        summary.restored = True
+        return summary
+    read = bucket_reader(client, target)
+    listing, raw, latest = _bucket_manifest(client, target, read)
+    roles, by_ticker = _reading_plan(latest, surface=surface, ticker=ticker, first=first, last=last)
+    if not by_ticker:
+        raise RestoreRefused(_nothing_selected(_range_scope(surface, ticker, first, last)))
+    summary.roles = roles
+    summary.range_by_ticker = by_ticker
+
+    plan: dict[str, str | None] = {}
+    for rel in sorted(roles):
+        if _unsafe(rel) or not _inside(work, rel):
+            summary.failures.append((rel, "names a path outside the lake, so it was not written"))
+            continue
+        if rel not in listing:
+            summary.failures.append((rel, "missing from the bucket"))
+            continue
+        plan[rel] = str(latest[rel]["sha256"])
+    summary.failures.extend(_case_collisions(plan))
+
+    needed = _needed_bytes(work, raw, plan, listing)
+    probe = dest if dest.is_dir() else dest.parent
+    try:
+        free = free_space(probe)
+    except OSError as exc:
+        raise RestoreRefused(
+            _local(f"reading the free space under {probe}", exc) + ", so nothing was restored"
+        ) from None
+    if free < needed:
+        raise RestoreRefused(_short_of_plan(dest, needed=needed, free=free))
+    floor = runway.OFF_LAKE_FREE_FLOOR_BYTES
+    if _shares_lake_filesystem(probe, root, device_of):
+        busiest = runway.listing_busiest_sealed_day(listing)
+        short = runway.reserve_shortfall(free=free, planned=needed, busiest_sealed_day=busiest)
+        if short:
+            raise RestoreRefused(
+                _reserve_refusal(
+                    dest, needed=needed, busiest=busiest, free=free, short=short, windowed=False
+                )
+                + f". A directory on a filesystem other than lake_root {root}'s needs no "
+                f"reserve, only {floor / 1_000_000:.1f} MB free beside the plan"
+            )
+    elif free - needed < floor:
+        raise RestoreRefused(_floor_refusal(dest, root, needed=needed, free=free))
+
+    _download_plan(client, target, read, plan, raw, dest, work, summary)
+    if summary.failures:
+        return summary
+    _move_verified(work, dest, plan, mode=READING_MODE, selection=selection)
+    summary.restored = True
     return summary
 
 
@@ -4303,6 +4874,60 @@ def _resync_command(
     return 0
 
 
+def _read_restore_command(
+    dest: str,
+    target: BucketTarget,
+    client: Any,
+    *,
+    lake_root: Path,
+    surface: str,
+    ticker: str | None,
+    first: date,
+    last: date,
+) -> int:
+    """Run the reading restore and print its lines. A refusal raises, for ``main`` to print.
+
+    A failed file gets a line naming what it is to the range. A file that does not match its
+    SHA-256 adds one line naming the two causes and their repairs, and the last line names the
+    target once and says the destination holds no reading set.
+    """
+    summary = restore_for_reading(
+        dest,
+        target,
+        client=client,
+        lake_root=lake_root,
+        surface=surface,
+        ticker=ticker,
+        first=first,
+        last=last,
+    )
+    if summary.restored:
+        print(f"{READING_MODE}: {summary.render()}")
+        return 0
+    for rel, why in summary.failures:
+        role = _ROLE_TEXT.get(summary.roles.get(rel, ""), "a planned file")
+        print(f"{READING_MODE}: {why}: {rel}, {role}", file=sys.stderr)
+    if any(why == "does not match its SHA-256" for _rel, why in summary.failures):
+        print(
+            f"{READING_MODE}: a file that does not match its SHA-256 has one of two causes. An "
+            "upload is running or stopped part-way, so the bucket's current version is newer "
+            "than its manifest.jsonl, and a run after the next complete nightly upload passes. "
+            "Or the current version is damaged. When the bucket holds an earlier good version, "
+            'the README\'s "When the lake is gone" console steps put it into '
+            f"{summary.work}. They write nothing to the bucket, so they work from a shadow host "
+            "too. A partition the trim removed usually has a single bucket version, so it has "
+            "none to recover",
+            file=sys.stderr,
+        )
+    print(
+        f"{READING_MODE}: {len(summary.failures)} file(s) from {target} failed, so "
+        f"{summary.dest} holds no reading set. Every file that verified stays in "
+        f"{summary.work}, and a re-run resumes there",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The ``python -m lake.bucket`` argument parser."""
     parser = argparse.ArgumentParser(
@@ -4310,7 +4935,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Seed the backup bucket by hand, restore a lake from it, put chosen partitions "
             "back into the live lake from it, bring a lake level with it after the other "
-            "host was primary, or check the provider's behavior live."
+            "host was primary, restore a chosen range from it into an empty directory for "
+            "reading, or check the provider's behavior live. restore, resync and "
+            "restore-for-reading run on a shadow host too, and the rest only on the primary."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4386,6 +5013,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Download, delete and rewrite manifest.jsonl. Without it the run only plans.",
     )
+    reading = sub.add_parser(
+        READING_MODE,
+        help=(
+            "Restore a chosen chains or quotes range from the bucket into an empty directory "
+            "outside the live lake, with what a reader needs beside it, for reading trimmed "
+            "data."
+        ),
+    )
+    reading.add_argument(
+        "dest",
+        help="The empty directory to restore into, outside lake_root. It may also not exist yet.",
+    )
+    reading.add_argument("--surface", required=True, help="chains or quotes.")
+    reading.add_argument("--ticker", help="One ticker. Every ticker when left out.")
+    reading.add_argument(
+        "--from", dest="first", required=True, type=_day_arg, help="The first day, YYYY-MM-DD."
+    )
+    reading.add_argument(
+        "--to", dest="last", required=True, type=_day_arg, help="The last day, YYYY-MM-DD."
+    )
+    reading.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
+    reading.add_argument(
+        "--target",
+        help="The bucket, as s3://<bucket>[/<prefix>]. Defaults to backup_target when it is one.",
+    )
     return parser
 
 
@@ -4457,7 +5109,9 @@ def main(
     directory, which may be a fresh volume's mount point holding only ``lost+found``.
     That is how a new host is seeded. ``resync`` runs under either role too. It sends no
     write to the bucket, and a shadow is the host that runs it, to become level with the
-    bucket before it resumes as the primary.
+    bucket before it resumes as the primary. ``restore-for-reading`` runs under either role as
+    well. It sends no write to the bucket and writes only into an empty directory outside
+    ``lake_root``, and the laptop, a shadow, is where a reader is likeliest to sit.
 
     ``restore`` reads ``lake_window_sessions`` through ``window.window_sessions`` before the
     client is built, so a bad value refuses before any request. A host that sets the key
@@ -4466,8 +5120,10 @@ def main(
     one under the floor, refuses with one line and exit 2. No other command reads the key, so
     a bad one breaks nothing else.
 
-    ``restore`` exits 0 when the destination was filled, 1 when a file failed
-    verification, with one line per failing file, and 2 on a refusal, with one line.
+    ``restore`` and ``restore-for-reading`` exit 0 when the destination was filled, 1 when a
+    file failed verification, with one line per failing file, and 2 on a refusal, with one
+    line. ``restore-for-reading`` passes ``config.lake_root`` in, so it can refuse a
+    destination inside the live lake, and reads no ``lake_window_sessions``.
     ``restore-range`` exits 0 when every selected partition is in the lake, and 2 on a
     refusal, with one line. ``resync`` exits 0 when it printed its plan, found nothing to
     do, or applied the plan, and 2 on a refusal, with one line. Once ``--apply`` has
@@ -4484,7 +5140,7 @@ def main(
         if role != outbox.PRIMARY and args.command == "restore-range":
             print(f"{label}: {RANGE_RESTORE_SHADOW}", file=sys.stderr)
             return 2
-        if role != outbox.PRIMARY and args.command not in ("restore", "resync"):
+        if role != outbox.PRIMARY and args.command not in ("restore", "resync", READING_MODE):
             print(f"{label}: {BUCKET_SHADOW}", file=sys.stderr)
             return 2
         windowed = False
@@ -4528,6 +5184,17 @@ def main(
                 return _resync_command(
                     config, target, client, apply=args.apply, clock=clock, calendar=calendar
                 )
+            if args.command == READING_MODE:
+                return _read_restore_command(
+                    args.dest,
+                    target,
+                    client,
+                    lake_root=config.lake_root,
+                    surface=args.surface,
+                    ticker=args.ticker,
+                    first=args.first,
+                    last=args.last,
+                )
             if args.command == "first-upload":
                 if calendar is None:
                     from lake.calendar import ExchangeCalendar
@@ -4546,7 +5213,7 @@ def main(
             line = _one_line(exc, target)
             if line is None:
                 raise
-            if args.command == "restore":
+            if args.command in ("restore", READING_MODE):
                 line = BucketUnreachable(
                     f"{line}. The destination is untouched, and a re-run resumes in the "
                     "working directory"
@@ -4602,6 +5269,9 @@ __all__ = [
     "RANGE_RESTORE_SOURCE",
     "RangeRestoreRefused",
     "RangeRestoreSummary",
+    "READING_MODE",
+    "RESTORE_MODE",
+    "ReadingRestoreSummary",
     "RestoreRefused",
     "RestoreSummary",
     "ResyncRefused",
@@ -4631,6 +5301,7 @@ __all__ = [
     "read_copy_state",
     "read_ledger",
     "restore_lake",
+    "restore_for_reading",
     "restore_range",
     "resync",
     "rsync_excluded",
