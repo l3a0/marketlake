@@ -1751,8 +1751,10 @@ check and writes the roster. The daemon then takes the lake lock, which creates
 `manifest.jsonl`, writes `journal/metadata.json` every idle minute, and writes outbox
 lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of that.
 
-1. Once `systemctl is-active marketlake-deploy` prints `inactive`, stop every unit,
-   timers included. A deploy that is running would start them again.
+1. Once `systemctl is-active marketlake-deploy` prints `inactive`, stop every
+   `com.marketlake.*` unit, timers included. A deploy that is running would start them
+   again. The stop's own `marketlake-*` units keep running, and cannot power the VM off
+   while the switch is removed, as this section's opening paragraph says.
 
    ```bash
    sudo systemctl stop 'com.marketlake.*'
@@ -1802,7 +1804,9 @@ session makes that night's re-tune skip the day.
 A stopped instance captures nothing, and AWS takes back its public address. The VM stops
 itself every night, as [The nightly stop](#the-nightly-stop) says, so outside the hours it
 runs it is usually stopped. Before approving any apply, start a stopped instance and wait
-for it to run. A plan of a stopped
+for it to run. A VM started by hand gets an hour before the stop may power it off again.
+For work that may take longer, remove the switch, as
+[The nightly stop](#the-nightly-stop) says, and create it again after. A plan of a stopped
 instance reads it with no public address, and only the `ignore_changes` entry for that
 address keeps the plan from replacing the instance and its root volume. Starting it
 first means no plan depends on that one entry.
@@ -1839,8 +1843,9 @@ aws ec2 describe-instances --filters Name=tag:marketlake:host,Values=capture Nam
 ```
 
 Since the VM stops each night, as [The nightly stop](#the-nightly-stop) says, the address
-changes every morning. Only the deploy role may call `ec2:DescribeInstances`, and the
-laptop's `marketlake-command` user holds no EC2 action, so each lookup and each hand start
+changes every morning. The roles that may call `ec2:DescribeInstances`, the deploy role
+and the plan and apply roles through `ReadOnlyAccess`, can be assumed only from CI, and the
+laptop's `marketlake-command` user holds no EC2 action. So each lookup and each hand start
 takes an admin session. A narrow grant to a principal that is not an admin is deferred to
 [#866](https://github.com/l3a0/marketlake/issues/866).
 
@@ -1858,24 +1863,28 @@ because a different key was seen before, clear the old key with
 
 The VM costs about $19.6 a month running around the clock, while capture and its jobs need
 it for about 62 to 68 of the week's 168 hours. So it powers itself off once the day's work
-is done, and a schedule starts it again at 07:30 ET each weekday, holidays included, and at
-19:30 ET each Sunday ([#865](https://github.com/l3a0/marketlake/issues/865)). The schedule
-is [#867](https://github.com/l3a0/marketlake/issues/867)'s, and the stop is
-[#868](https://github.com/l3a0/marketlake/issues/868)'s. The price is a new way to lose the
-open: capture now depends on a start succeeding every weekday morning, which the `vm-up`
-check below watches.
+is done ([#865](https://github.com/l3a0/marketlake/issues/865)). The stop is
+[#868](https://github.com/l3a0/marketlake/issues/868)'s. The start is
+[#867](https://github.com/l3a0/marketlake/issues/867)'s, a schedule in AWS that starts the
+VM at 07:30 ET each weekday, holidays included, and at 19:30 ET each Sunday, built in
+[PR #870](https://github.com/l3a0/marketlake/pull/870). Until that schedule is applied,
+nothing starts a stopped VM, which is why turning the stop on waits for it. The price is
+a new way to lose the open: capture now depends on a start succeeding every weekday
+morning, which the `vm-up` check below watches.
 
 `marketlake-stop.timer` runs `deploy/vm-stop.sh` as root every 10 minutes. The script
 powers the VM off only when all six of its checks pass, in this order.
 
 1. **switch.** `/etc/marketlake/stop-when-idle` exists.
 2. **uptime.** The VM has been up at least an hour, so a VM started by hand for a deploy
-   or an apply gets that hour.
-3. **terminal.** No login session has a terminal, and none is `closing`. An interactive
-   SSH session has a terminal, and a command left running after logout keeps its session
-   `closing`. The dashboard's tunnel, `ssh -N -L`, has no terminal and does not hold the
-   VM up. A command run over SSM, or as `ssh <vm> <command>`, opens no terminal either, so
-   remove the switch first for work run that way.
+   or an apply gets that hour, and only that hour. Remove the switch for longer work.
+3. **terminal.** `who` lists no login, and no login session is `closing`. sshd records a
+   login where `who` reads it only when the login has a terminal, so an interactive SSH
+   login holds the VM up and the dashboard's tunnel, `ssh -N -L`, does not. logind cannot
+   tell those two apart, because systemd 255 records no terminal for an SSH session. A
+   command left running after logout keeps its session `closing`. A command run over SSM,
+   or as `ssh <vm> <command>`, opens no terminal either, so remove the switch first for
+   work run that way.
 4. **busy.** No `com.marketlake.*` job is running and no compaction runs in the daemon's
    cgroup. The deploy runs the same check, from `deploy/busy-check.sh`. It covers the
    close+15 compaction and its trim, the 18:30 sweep and the evening upload after it.
@@ -1887,9 +1896,12 @@ powers the VM off only when all six of its checks pass, in this order.
    locks through the poweroff.
 
 When every check passes, it pings `vm-stop` and runs `systemctl poweroff`, whatever the
-ping returned. A weekday usually stops between 18:50 and 19:00, at the first run after the
-evening upload, and an upload that uses its whole budget moves that to about 20:20. A
-Sunday stops after 23:30.
+ping returned. That command can return before the poweroff starts, while logind waits up
+to 30 seconds for a program such as the unattended upgrade to finish. So the script keeps
+both locks and waits up to 240 seconds for the poweroff, and if none comes it ends on an
+error line saying so. A weekday usually stops between 18:50 and 19:00, at the first run
+after the evening upload, and an upload that uses its whole budget moves that to about
+20:20. A Sunday stops after 23:30.
 
 Each run prints one line saying why it kept the VM up, or what it did. A line that starts
 `vm-stop: staying up, check <n> (<name>):` is a routine refusal. A line that starts
@@ -1906,12 +1918,19 @@ After a morning start, the run that powered the VM off sits in the previous boot
 TZ=America/New_York journalctl -u marketlake-stop -b -1
 ```
 
-**Turn the stop on** by creating the switch, then log out, since an open terminal holds
-the VM up.
+**Turn the stop on** only once the start schedule is applied, or nothing starts the VM
+again. The schedule is [#867](https://github.com/l3a0/marketlake/issues/867)'s, and its
+section, "The start schedule", arrives with
+[PR #870](https://github.com/l3a0/marketlake/pull/870). Wait until that section's
+CloudTrail check has shown the schedule's `StartInstances`. Then create the switch, and
+log out, since an open terminal holds the VM up.
 
 ```bash
 sudo touch /etc/marketlake/stop-when-idle
 ```
+
+Before logging out, run `who`. It should list only this login, since any other login
+listed holds the VM up too.
 
 **Keep the VM up** for longer work by removing the switch, and create it again after. Only
 the first boot's shim writes `/etc/marketlake/`, and cloud-init runs it once, so a removed
@@ -1964,11 +1983,16 @@ then page at about 08:35, and the first captured minute is at 09:30, which leave
 
 1. Find the instance and its state with [Find the VM's address](#find-the-vms-address).
 2. When it is `stopped`, run [Start a stopped instance](#start-a-stopped-instance). When
-   the start fails on capacity, see the next section.
-3. When it is `running` and SSH answers, the cause is the lake's mount or the unit. Run
-   `findmnt /srv/marketlake`, which prints nothing when the volume did not mount, then
-   follow [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4).
-   `journalctl -u marketlake-up` shows a ping that ran and failed.
+   the start fails on capacity, see the next section. When it is `pending`, it is already
+   starting, so wait for it to read `running` and go on.
+3. When it is `running` and SSH answers, run `findmnt /srv/marketlake` and `uptime -s`.
+   1. When `findmnt` prints the mount and `uptime -s` shows a boot after 07:40, the start
+      was late and only the page is wrong. The VM is up with its lake, and the 07:40 timer
+      replays nothing on purpose, so press Ping Now on `vm-up` to clear the page.
+   2. When `findmnt` prints nothing, the volume did not mount. Follow
+      [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4).
+   3. When it prints the mount and the boot is before 07:40, the cause is the unit.
+      `journalctl -u marketlake-up` shows a ping that ran and failed.
 4. When it is `running` and SSH does not answer, read the console.
 
    ```bash
@@ -1984,9 +2008,9 @@ purpose.
 #### When a start fails on capacity
 
 AWS refuses a start with `InsufficientInstanceCapacity` when the zone has no `t4g.small` to
-give. Nothing written before covered this. The zone is fixed, because the lake volume lives
-in `us-east-1c`, so the fast fallback is another arm64 type in the same zone. Change the
-type by hand while the instance is stopped, then start it.
+give. The zone is fixed, because the lake volume lives in `us-east-1c`, so the fast
+fallback is another arm64 type in the same zone. Change the type by hand while the
+instance is stopped, then start it.
 
 ```bash
 aws ec2 modify-instance-attribute --instance-id "<instance-id>" --instance-type Value=t4g.medium --profile marketlake-admin --region us-east-1
@@ -2005,16 +2029,18 @@ above. Each refusal names its check, so act on the last one before the page.
 
 - **switch.** The switch was removed and not created again. Create it, unless it was left
   removed on purpose.
-- **terminal.** A session stayed open. Log out. A `closing` session is a command left
-  running after logout. `loginctl list-sessions` lists the sessions.
+- **terminal.** A login stayed open. Log out. `who` lists the logins. A `closing`
+  session is a command left running after logout, and `loginctl list-sessions` lists the
+  sessions.
 - **busy.** A job ran long. Read its own journal, such as
   `journalctl -u com.marketlake.eod-sweep`. Its own check pages if it failed.
 - **window.** Every run read the refused hours. That is expected before 18:45 on a weekday
   and before 23:30 on Sunday. After them, check the VM's clock with `timedatectl`.
 - **deploy.** A deploy ran or held a lock. `systemctl is-active marketlake-deploy` prints
   `active` while one runs.
-- **An error line.** The named check could not tell, such as a `loginctl` or `systemctl`
-  that failed. Fix the cause it names.
+- **An error line.** The named check could not tell, such as a `who`, `loginctl` or
+  `systemctl` that failed. Fix the cause it names. An error on check `poweroff` means
+  `systemctl poweroff` failed, or returned and no poweroff came within 240 seconds.
 
 ### The duplicate-name check
 

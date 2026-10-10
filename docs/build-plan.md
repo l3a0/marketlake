@@ -672,6 +672,15 @@ Each healthchecks.io check is created by hand, in the session that first makes i
 5. **D16**, `eod-sweep`, and the nightly summary. `lake.sweep` ships the producer, so this row is owed on the next weekday its 18:30 job runs through. Create the check and confirm ntfy and email both read on for it. Until the row exists the ping goes to a slug healthchecks does not know, and the job pages once to say so, which is the refused-ping page working rather than a fault. That page is the one [#213](https://github.com/l3a0/marketlake/issues/213) could not wire, because no code pinged this slug when it shipped. The report channel is created here too: the sweep's own ping lands before the digest it sends. Scope in [#281](https://github.com/l3a0/marketlake/issues/281).
 6. **D20a**, the battery's delayed-feed page. The battery's second page, its own nightly schema drift, is [#427](https://github.com/l3a0/marketlake/issues/427) and ships after it, as `lake.battery_drift`. The message table's schema-drift row names four producers and all four now ship: the parser's mid-day, the close+5 fill's through the same page, the battery's at night, and compaction's at the merge.
 7. **Evening upload**, `evening-upload`, from [#833](https://github.com/l3a0/marketlake/issues/833). The vendor sweep now hands off to `python -m lake.compact --after-vendor-sweep`, which pings this check, so the row is owed on the next weekday the 18:30 job runs through on the primary. Create it in the session that deploys the change, named `Evening upload` with slug `evening-upload` and the design's expected time, weekdays by \~20:30, and confirm ntfy and email both read on for it. A run before the row exists pages once to say so, which is the refused-ping page working. Then press `Ping Now` so the check is armed. The systemd render carries no `Ping Now` step, and a check that never heard a ping stays `new` and pages for nothing.
+8. **The hosted VM's stop and start**, `vm-up` and `vm-stop`, from
+   [#868](https://github.com/l3a0/marketlake/issues/868). `marketlake-up.timer` pings
+   `vm-up` at 07:40 each weekday, and `deploy/vm-stop.sh` pings `vm-stop` just before each
+   poweroff, both through `python -m lake.control_plane ping`. Both rows are created by hand
+   with the schedules and grace in `infra/README.md`'s "The two checks", and left `new`.
+   [#868](https://github.com/l3a0/marketlake/issues/868)'s owner steps say when each is
+   armed: `vm-up` by `Ping Now` once the deploy that installs its timer has run, and
+   `vm-stop` by `Ping Now` on the day the switch is created. A check created in the UI gets
+   every integration, so ntfy is switched off on `vm-stop` by hand for email only.
 
 ## Discipline rules
 

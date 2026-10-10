@@ -126,8 +126,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   sends the VM the deploy document for one commit, waits for the result, and prints only a
   summary, because the repository's logs are public. It says so when the VM is stopped.
 - `deploy/vm-empty-shadow-lake.sh` empties a shadow VM's lake so a restore can fill it.
-  It refuses unless the lake volume is mounted, `role` is `shadow`, every unit is
-  stopped and nothing is mounted below the lake root.
+  It refuses unless the lake volume is mounted, `role` is `shadow`, every
+  `com.marketlake.*` unit is stopped and nothing is mounted below the lake root.
 - `config/tickers.yaml` is the capture roster. A change to it is a reviewed pull request,
   and `python -m lake.roster apply` copies it onto a host.
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
@@ -749,11 +749,14 @@ dashboard section carries the reasoning, and
 [#637](https://github.com/l3a0/marketlake/issues/637) carries the plan.
 
 The VM stops itself once each day's work is done
-([#868](https://github.com/l3a0/marketlake/issues/868)), so the dashboard is dark from about
-19:00 ET on a weeknight until the VM starts at 07:30 the next weekday, and over the weekend
-except while Sunday's maintenance job runs, from 19:30 to about 23:40. An open forward does
-not hold the VM up, because it opens no terminal. Each start brings a new public address,
-which [Find the VM's address](infra/README.md#find-the-vms-address) prints.
+([#868](https://github.com/l3a0/marketlake/issues/868)), so once its switch is on the
+dashboard is dark from about 19:00 ET on a weeknight until the VM starts again. With
+[#867](https://github.com/l3a0/marketlake/issues/867)'s schedule applied, that is 07:30 the
+next weekday, and the VM is dark over the weekend except while Sunday's maintenance job
+runs, from 19:30 to about 23:40. An open forward does not hold the VM up, because
+`ssh -N` opens no terminal, so `who` on the VM does not list it. Each start brings a new
+public address, which [Find the VM's address](infra/README.md#find-the-vms-address)
+prints.
 
 Nothing is installed on the VM for this. The forward needs only a running dashboard and
 the SSH port. The dashboard runs on the VM under its systemd unit,

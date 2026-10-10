@@ -339,7 +339,11 @@ def vm_power_slugs() -> tuple[str, ...]:
 
 
 def live_check_slugs() -> tuple[str, ...]:
-    """Every live dead-man check, in the order the first install presses them.
+    """Every live dead-man check that a job on either host feeds, in the order the first
+    install presses them.
+
+    The hosted VM's two systemd-only checks, ``vm-up`` and ``vm-stop``, are not here. They
+    come from :func:`vm_power_slugs`, since a laptop feeds neither.
 
     ``capture`` leads because inside the capture window its deadline is five minutes away,
     while every other deadline here is hours or days out.
