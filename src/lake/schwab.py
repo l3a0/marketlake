@@ -478,7 +478,8 @@ def _auth_failures_named() -> Iterator[None]:
 # One lock for the whole process, not one per client. The capture loop builds a new client
 # every cycle, and once cycles overlap (marketlake #534) two clients can find the token
 # expired at the same moment. A lock per client would let both refresh and both rewrite
-# ``token.json``. This one lets one refresh, and the other re-reads the file the first wrote.
+# ``token.json``. This one lets one refresh, and the other adopts what the first left: the
+# file it wrote, or the token this process holds when that write failed (marketlake #860).
 # It is reentrant so that a session wrapped twice waits on nothing but itself. A plain lock
 # would leave the outer wrapper holding it while the inner one waits, and that hangs every
 # client in the process.
@@ -510,17 +511,18 @@ def serialize_token_refresh(
     clients refreshing at once is the same race one level up (marketlake #564). Sharing the
     lock is not enough on its own. A second client that waited still holds the expired token
     it was built with, since the first client's refresh changed the first client's session
-    and the file, never the second's session. Checking only its own session, it would refresh
-    again. ``adopt_stored`` closes that gap. When the session's token has expired, it is
-    called under the lock to replace the session's token with the one stored in the token
-    file. The file's token is then the one checked, so a refresh another client already
+    and the file, never the second's session. Checking only its own session, it would
+    refresh again. ``adopt_stored`` closes that gap. When the session's token has expired,
+    it is called under the lock to replace the session's token with the newest one the
+    process can see: the token file's, or a refreshed token this process holds because its
+    write failed. That token is then the one checked, so a refresh another client already
     made is adopted rather than repeated, and a refresh that does happen uses the newest
-    refresh token on disk. That keeps the lake correct whether or not Schwab rotates the
-    refresh token on each refresh. marketlake #633 measured it on 2026-10-05: a refresh
-    issued a new access token and left the refresh token unchanged, and a refresh on one
-    host did not revoke the other host's copy. Had Schwab rotated, a second refresh with
-    the superseded refresh token would have been refused and read as auth death, and the
-    adoption is what still guards against Schwab starting to.
+    refresh token, whether it is on disk or held. That keeps the lake correct whether or not
+    Schwab rotates the refresh token on each refresh. marketlake #633 measured it on
+    2026-10-05: a refresh issued a new access token and left the refresh token unchanged,
+    and a refresh on one host did not revoke the other host's copy. Had Schwab rotated, a
+    second refresh with the superseded refresh token would have been refused and read as
+    auth death, and the adoption is what still guards against Schwab starting to.
 
     A refresh whose file write fails leaves the new token in memory and the old one on
     disk. Until marketlake #860 the write's error raised out of the request, so a full

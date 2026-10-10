@@ -1184,8 +1184,10 @@ def _idle_stamp(
 
     A capture cycle stamps its own mint time off the vendor it fetched with. Off the
     capture window no cycle runs and no client exists, so the mint comes from the token
-    file instead. That file is what the next cycle builds its client from, so the two
-    agree. The dashboard still never reads it. One timestamp crosses, never a secret.
+    file instead. The next cycle builds its client from that file, or from a refreshed
+    token this process holds when the file's write failed (marketlake #860). A refresh
+    carries the mint time over unchanged, so either way the two agree. The dashboard still
+    never reads it. One timestamp crosses, never a secret.
 
     Sunday evening is the minute this exists for. The re-auth ritual mints a fresh token
     on a day that captures nothing, and the design wants the panel showing that mint the

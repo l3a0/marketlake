@@ -1402,7 +1402,9 @@ du -sh ~/.cache/uv ~/marketlake/.venv
 The token file lives on the root volume too, so a full or broken root volume fails the
 token's write each time the access token is refreshed, about every 25 minutes. Capture
 goes on, because the daemon keeps the refreshed token in memory and retries the write on
-every cycle ([#860](https://github.com/l3a0/marketlake/issues/860)). The daemon prints one
+every cycle ([#860](https://github.com/l3a0/marketlake/issues/860)). If Schwab ever rotated
+the refresh token on a refresh, which it did not when measured, the refreshing request
+would still fail about every 25 minutes, with a line saying the refresh token rotated. The daemon prints one
 line when that starts, naming the errno and the path, and another when the file catches
 up. A full disk may keep the first line from being stored at all, so search for both.
 
@@ -1411,10 +1413,10 @@ TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'token file'
 ```
 
 The errno says what to repair. `ENOSPC` means free space on `/`, and `EROFS` or `EIO`
-mean the filesystem needs repair. Hold deploys and restarts until the line saying the
-token file now holds a token at least as new as the process's prints. A restart drops
-the token the daemon holds, so it starts again from the stale file. That costs one
-refresh, or a re-auth when the line also says the refresh token rotated.
+mean the filesystem needs repair. Hold deploys and restarts until the recovery line
+prints. That line says the token file now holds a token at least as new as the
+process's. A restart drops the token the daemon holds, so it starts again from the stale
+file. That costs one refresh, or a re-auth after a line saying the refresh token rotated.
 
 At the next open, data segments appear under `/srv/marketlake`. A shadow's pings land as
 lines in the outbox under `/srv/marketlake/journal/outbox/`, and a primary's reach
