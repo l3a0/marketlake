@@ -10,8 +10,8 @@ backup target is an instance tag. This module joins the three and writes the fil
     python -m lake.vm_config render < config/vm.yaml
 
 It reads the settings on standard input, as ``python -m lake.roster apply`` reads its
-roster. cloud-init's first boot runs it, and marketlake #676's deploy runs it again after
-each pull.
+roster. cloud-init's first boot runs it, and every run of marketlake #676's
+``deploy/vm-deploy.sh`` runs it again through the bootstrap.
 
 The parameters are fetched by a literal list in one ``GetParameters`` call with
 decryption. The call takes at most ten names and returns them in its own order, so each

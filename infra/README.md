@@ -1253,7 +1253,7 @@ runs the daemon.
       for the shadow day only. Every earlier session the VM runs costs the laptop the
       same.
    2. The VM runs the commit it cloned at first boot, and nothing pulls new code onto it
-      until [#676](https://github.com/l3a0/marketlake/issues/676)'s deploy. So the apply
+      until a deploy runs, as [Deploy a commit](#deploy-a-commit) says. So the apply
       follows the merges of the two blockers of
       [#638](https://github.com/l3a0/marketlake/issues/638) that change code the VM runs:
       [#702](https://github.com/l3a0/marketlake/issues/702), and
@@ -1265,7 +1265,7 @@ runs the daemon.
       [PR #751](https://github.com/l3a0/marketlake/pull/751) the same day. With
       [#702](https://github.com/l3a0/marketlake/issues/702) on the VM from its first boot,
       the VM pulls each weekly token on its own. A merge after the apply reaches the VM
-      only as [Rerun the bootstrap](#rerun-the-bootstrap) describes.
+      only through a deploy, as [Deploy a commit](#deploy-a-commit) describes.
 
    Whether the VM keeps capturing between the shadow day and the cutover is
    [#638](https://github.com/l3a0/marketlake/issues/638)'s call.
@@ -1427,13 +1427,16 @@ Each failure prints one line naming the step, and the exit code says how the run
       line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
-3. Exit 1 covers every other failure. A disk step that fails stops the run at once,
-   and so does the first install, the one that syncs the environment, even when it
-   refused with its own exit 2. A failed render, token pull or roster apply skips only
-   the steps that need it, and the run then ends with exit 1, even when the step itself
-   refused with its own exit 2. The last install, the one that starts the units, runs
-   whatever those steps returned. When it fails, its line says whether a rerun installs
-   and starts the units, and the run ends with exit 1 the same way.
+3. Exit 1 covers every failure of a disk step or an install. A disk step that fails
+   stops the run at once, and so does the first install, the one that syncs the
+   environment, even when it refused with its own exit 2. The last install, the one
+   that starts the units, runs whatever the config steps returned. When it fails, its
+   line says whether a rerun installs and starts the units, and the run ends with exit 1.
+4. Exit 4 means the last install installed and started the units, but a render, token
+   pull or roster apply failed, even when the step itself refused with its own exit 2.
+   Each of those skips only the steps that need it. A deploy reads exit 4 as units in
+   place, so it still restarts the daemon when a restart is owed, and it writes no record
+   of the deploy until a run passes every step.
 
 So read every line, not only the last.
 
@@ -1441,25 +1444,14 @@ Three things call for a rerun.
 
 1. **A parameter or the tag was missing at first boot.** A missing parameter makes
    the render refuse, and a missing tag makes it exit 3 on all six attempts. Either
-   way the bootstrap ended with exit 1, and the daemon restarts every ten seconds
+   way the bootstrap ended with exit 4, and the daemon restarts every ten seconds
    without a `config.yaml`. Put a missing parameter, or fix a missing tag in
    `infra/live/vm.tf` through an approved apply, as the render's line says. Then rerun.
 2. **Code merged after the apply.** A merge reaches the VM through
-   [Deploy from CI](#deploy-from-ci) once the owner approves its run, or by hand.
-   After the close, pull as the owner, rerun, and restart, because the install restarts
-   nothing. Timers start fresh processes and pick up new code by themselves.
-
-   ```bash
-   git -C ~/marketlake pull --ff-only
-   ```
-
-   ```bash
-   sudo ~/marketlake/deploy/vm-bootstrap.sh
-   ```
-
-   ```bash
-   sudo ~/.local/state/marketlake/systemd/restart.sh all
-   ```
+   [Deploy from CI](#deploy-from-ci) once the owner approves its run, or by hand, as
+   [Deploy a commit](#deploy-a-commit) says. The deploy runs the bootstrap and restarts
+   the daemon when it is owed, because the install restarts nothing. Timers start fresh
+   processes and pick up new code by themselves.
 
 3. **A larger lake volume.** Raise `lake_volume_gib` in a reviewed pull request. The
    apply grows the volume in place, and nothing grows the ext4 filesystem on it until the
@@ -1560,6 +1552,111 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
    sudo dd if=/dev/zero of=<dev> bs=4096 seek=<block> count=1 conv=fsync
    ```
 
+### Deploy a commit
+
+A merge to `main` reaches the VM only through a deploy, and a deploy at the wrong moment
+loses captured minutes for good. `deploy/vm-deploy.sh` moves the checkout forward to one
+commit on `main`, runs the bootstrap, and restarts the daemon only when that is owed and
+safe ([#676](https://github.com/l3a0/marketlake/issues/676)). Pass the full 40-digit sha
+of a commit on `main`. A pull request's page shows only 7 digits, so read the full sha of
+`main`'s tip from the VM.
+
+```bash
+git -C ~/marketlake ls-remote origin refs/heads/main | cut -f1
+```
+
+```bash
+sudo ~/marketlake/deploy/vm-deploy.sh --sha <sha>
+```
+
+A checkout older than the script has no `deploy/vm-deploy.sh` yet. For that first
+deploy, pull inside the hours below, then deploy the commit the pull reached.
+
+```bash
+git -C ~/marketlake pull --ff-only
+```
+
+```bash
+sudo ~/marketlake/deploy/vm-deploy.sh --sha "$(git -C ~/marketlake rev-parse HEAD)"
+```
+
+The terminal stays blank until the run ends, because the script prints its one line
+only then. No run on the VM has been timed yet. A run that restarts the daemon takes at
+least the bootstrap plus the 120 seconds it watches the daemon after the restart, and its
+caps bound the longest run, a rollback included, at 200 minutes. Follow the progress from
+a second shell.
+
+```bash
+sudo tail -f /var/lib/marketlake/deploy.log
+```
+
+Ctrl-C stops only the hand run's wait, which prints `outcome unknown: read deploy.log`.
+The deploy keeps running as `marketlake-deploy.service`, so read its outcome in the log.
+
+A deploy may start from 18:45 to 04:30 Eastern on a weekday night, all of Saturday,
+Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. Outside those hours the script
+refuses with exit 3 and names the next moment one may start. The hours keep the merge and
+the restart away from capture, compaction, the sweep and the Sunday job, with enough room
+that a deploy which rolls back still ends before the jobs start.
+
+It prints exactly one line, and its exit code is 0 to 3. The progress goes to
+`/var/lib/marketlake/deploy.log`, which only root reads.
+
+```bash
+sudo tail -n 50 /var/lib/marketlake/deploy.log
+```
+
+`/var/lib/marketlake/deployed` holds the sha the running daemon started from. It is absent
+when that is unknown, and an absent record makes the next deploy restart the daemon.
+
+| Last line | Exit | What to do next |
+| --- | --- | --- |
+| `deployed: <sha>` or `deployed: <sha> (already current)` | 0 | Nothing. |
+| `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. A config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
+| `deployed: <sha>, but the dashboard did not restart` | 1 | Read `journalctl -u com.marketlake.dashboard`, fix the cause, then run `sudo ~/.local/state/marketlake/systemd/restart.sh dashboard`. Capture is unaffected. |
+| `deployed: <sha>, with a failed step in deploy.log, but the dashboard did not restart` | 1 | The two rows above both apply. Fix the dashboard as its row says, then the failed step as its row says. |
+| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. |
+| `rollback to <sha> failed: <reason>` | 1 | The daemon may be down. Check `systemctl status com.marketlake.daemon`, then recover by the hand procedure below. |
+| `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
+| `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |
+| `not deployed: <reason>` | 1, 2 or 3 | Exit 3 means not now: run again at the moment the line names, or once the named job has finished. Exit 2 is a refusal, such as a sha not on `main`, a dirty checkout or a daemon that is not running, and the line names what to fix. Exit 1 is a failure, and the log says which step. |
+| `outcome unknown: read deploy.log` | 1 | The run was killed, left no result, or found the checkout in a state it could not restore. First run `systemctl is-active marketlake-deploy`, and wait while it prints `active`, because Ctrl-C on a hand run leaves the deploy running. Then compare `git -C ~/marketlake rev-parse HEAD` with `sudo cat /var/lib/marketlake/deployed`. When they differ, deploy `HEAD` again. When `git -C ~/marketlake status --porcelain` lists changes, a merge failed partway and so did its restore, so first run `git -C ~/marketlake reset --hard` and `git -C ~/marketlake clean -fd` inside the hours above. |
+
+**The hand procedure, for a daemon that is not running.** The script refuses with exit 2
+unless the daemon is `active`, because the install would start a daemon stopped on
+purpose, such as during a resync or a restore. Inside the hours above, pull, rerun the
+bootstrap, remove the record, and restart. After a pull, a hand restart starts a commit
+the record does not name, and only the script writes the record. Removing it makes the
+next deploy restart the daemon rather than trust a stale sha.
+
+```bash
+git -C ~/marketlake pull --ff-only
+```
+
+```bash
+sudo ~/marketlake/deploy/vm-bootstrap.sh
+```
+
+```bash
+sudo rm -f /var/lib/marketlake/deployed
+```
+
+```bash
+sudo ~/.local/state/marketlake/systemd/restart.sh all
+```
+
+**Before stopping the daemon on purpose**, such as for the resync of
+[#832](https://github.com/l3a0/marketlake/issues/832) or the switch back of
+[#638](https://github.com/l3a0/marketlake/issues/638), check that no deploy is running,
+and wait while this prints `active`.
+
+```bash
+systemctl is-active marketlake-deploy
+```
+
+A deploy that is running reruns the bootstrap, whose install ends with `enable --now`,
+and that starts a stopped daemon again.
+
 ### Restore the lake
 
 A restore is not part of the first boot. The shadow day captures beside the laptop and
@@ -1602,7 +1699,7 @@ The order depends on the `role` in `config/vm.yaml`.
 
 **Under `role: primary`, the bootstrap leaves the lake empty.** A new root volume holds
 no roster, and on an empty lake the roster apply refuses, so the bootstrap ends with
-exit 1. The daemon then exits 2 without a roster, the capture dead-man pages during a
+exit 4. The daemon then exits 2 without a roster, the capture dead-man pages during a
 session, and no other job writes to the lake.
 
 1. Let the bootstrap finish, with the roster refused.
@@ -1620,7 +1717,8 @@ check and writes the roster. The daemon then takes the lake lock, which creates
 `manifest.jsonl`, writes `journal/metadata.json` every idle minute, and writes outbox
 lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of that.
 
-1. Stop every unit, timers included.
+1. Once `systemctl is-active marketlake-deploy` prints `inactive`, stop every unit,
+   timers included. A deploy that is running would start them again.
 
    ```bash
    sudo systemctl stop 'com.marketlake.*'
@@ -1849,7 +1947,7 @@ The repository is public, so the run's log and its summary show only the summary
 
 | Summary | Exit | What it means |
 | --- | --- | --- |
-| A line from the table of last lines that `vm-deploy.sh` prints, from [PR #856](https://github.com/l3a0/marketlake/pull/856) | 0 to 3 | The VM ran the deploy and printed that line. |
+| A line from the table of last lines that `vm-deploy.sh` prints, under [Deploy a commit](#deploy-a-commit) | 0 to 3 | The VM ran the deploy and printed that line. |
 | `vm-deploy.sh is missing on the VM, so run the manual first deploy` | 1 | The VM's checkout predates `vm-deploy.sh`. Run step 1 of [The owner's first deploy](#the-owners-first-deploy). |
 | `not delivered, so re-run` | 1 | The command never reached the VM, for example while the SSM agent was down. Re-run the job. |
 | `not started` | 1 | The command was cancelled before it started. |
@@ -1866,8 +1964,8 @@ does, until the job has run cleanly enough times to drop it.
 creates it, edits it or approves its runs, per the "Deployment approvals" section of
 [`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06). GitHub
 creates a missing environment, with no protection rules, the first time a job names it.
-So the owner creates `deploy` before `deploy.yml` reaches `main`, with the same settings
-[step 8](#8-create-the-infra-environment) gives `infra`.
+So the owner creates `deploy`, or protects the one a run created, with the same settings
+[step 8](#8-create-the-infra-environment) gives `infra`. The `PUT` below does either.
 
 ```bash
 gh api -X PUT repos/l3a0/marketlake/environments/deploy --input - <<'EOF'
@@ -1904,20 +2002,19 @@ A deploy may start, and so may a pull by hand, from 18:45 to 04:30 ET on a weekd
 night, all of Saturday, Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. The
 first deploy takes seven steps, in order.
 
-1. With [PR #856](https://github.com/l3a0/marketlake/pull/856), the host side of
-   [#676](https://github.com/l3a0/marketlake/issues/676), merged, pull on the VM inside
-   those hours and run the manual deploy once, so `vm-deploy.sh` exists there.
+1. Pull on the VM inside those hours and run the manual first deploy that
+   [Deploy a commit](#deploy-a-commit) describes, so `vm-deploy.sh` exists there.
 2. Create the `deploy` environment with the owner as required reviewer, `main` as its
    only deployment branch, and admin bypass off, as
    [The `deploy` environment and its secret](#the-deploy-environment-and-its-secret)
    says. Leave self-review allowed, since the owner merges.
-3. Apply `infra/bootstrap/` from the final head of
-   [PR #854](https://github.com/l3a0/marketlake/pull/854), the CI side, per
+3. Apply `infra/bootstrap/` from `main`, per
    [Changing the bootstrap](#changing-the-bootstrap). Then set `AWS_DEPLOY_ROLE_ARN` as
    a secret on `deploy`.
-4. Merge, and approve the waiting run in
+4. Approve the waiting run in
    [the `infra` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)
-   that creates the document, outside 09:25 to 16:15 ET.
+   that the merge of [PR #854](https://github.com/l3a0/marketlake/pull/854) queued, which
+   creates the document, outside 09:25 to 16:15 ET.
 5. Approve the run that the merge queued in
    [the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy),
    inside the hours above, and read its

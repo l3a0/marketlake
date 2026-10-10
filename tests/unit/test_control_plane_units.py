@@ -332,6 +332,9 @@ def test_an_empty_value_is_refused(field):
         cp.SystemdHost(**values)
 
 
-def test_the_needrestart_dropin_defers_every_marketlake_unit():
+def test_the_needrestart_dropin_defers_every_marketlake_unit_and_the_deploy():
     lines = [line for line in cp.needrestart_dropin().splitlines() if not line.startswith("#")]
-    assert lines == ["$nrconf{override_rc}->{qr(^com\\.marketlake\\.)} = 0;"]
+    assert lines == [
+        "$nrconf{override_rc}->{qr(^com\\.marketlake\\.)} = 0;",
+        "$nrconf{override_rc}->{qr(^marketlake-deploy\\.service$)} = 0;",
+    ]

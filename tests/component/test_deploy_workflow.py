@@ -34,17 +34,13 @@ from typing import Any
 import pytest
 import yaml
 
+from lake.deploy_window import MARGIN
 from tests.component.test_infra_config import _jsonencode_argument, _resources
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 SEND = ROOT / "deploy" / "send-deploy.sh"
 FRESH = "steps.head.outputs.state == 'fresh'"
-
-# The margin lake.deploy_window keeps before a refused span, in minutes. The first pull
-# request for #676 adds that module and its constant, and is not on main as this is
-# written. Once it merges, read the constant from lake.deploy_window instead.
-DEPLOY_MARGIN_MINUTES = 210
 
 
 def _workflow() -> dict[Any, Any]:
@@ -421,7 +417,7 @@ def _delivery_seconds() -> int:
 def test_the_timeouts_follow_from_the_margin() -> None:
     (step,) = _document()["mainSteps"]
     timeout = step["inputs"]["timeoutSeconds"]
-    assert timeout == DEPLOY_MARGIN_MINUTES * 60 + 600
+    assert timeout == MARGIN.total_seconds() + 600
     delivery = _delivery_seconds()
     assert delivery == 600
     job_minutes = _job()["timeout-minutes"]

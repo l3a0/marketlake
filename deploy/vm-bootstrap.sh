@@ -37,10 +37,17 @@
 #
 # Every disk step and step 9's install stop the run at once with one line, because a
 # later step on a wrong disk would write the lake where nothing keeps it. A failure in
-# step 10 prints one line, skips only the steps that need what failed, and makes the run
-# exit 1 at the end. A final failure in step 11 prints one line and makes the run exit 1
-# the same way. A refusal, when the script declines on purpose, exits 2. No line prints
-# a config value, and the script never runs with set -x.
+# step 10 prints one line and skips only the steps that need what failed. A final failure
+# in step 11 prints one line too. The run then ends on one of four exits:
+#
+#   0  every step passed;
+#   1  a disk step or an install failed, including step 11's after a step 10 failure;
+#   2  the script refused, declining on purpose before the first install;
+#   4  step 11 installed the units, and a step 10 failure is listed above.
+#
+# Exit 4 lets deploy/vm-deploy.sh tell a run that installed the units apart from one that
+# stopped before them, since it restarts the daemon only after the units are in place.
+# No line prints a config value, and the script never runs with set -x.
 #
 # docs/design.md and issue #686 carry the reasoning for each step.
 #
@@ -67,10 +74,18 @@ stop() {
   exit 1
 }
 
+# FAILED marks a failed step 10, and INSTALL_FAILED a failed step 11. The end check
+# reads both, so a run where both failed exits 1 rather than 4.
 FAILED=0
 fail() {
   echo "vm-bootstrap: $*" >&2
   FAILED=1
+}
+
+INSTALL_FAILED=0
+install_fail() {
+  echo "vm-bootstrap: $*" >&2
+  INSTALL_FAILED=1
 }
 
 if [[ $# -gt 0 ]]; then
@@ -406,10 +421,13 @@ else
   # script. sudo's env_reset would drop UV_NO_MODIFY_PATH set before sudo, so env sets it
   # after. --retry alone skips a failed DNS lookup (exit 6) and a refused connection
   # (exit 7), and curl 8.5 has no flag for DNS alone, so --retry-all-errors retries
-  # every failure, still at most 5 times.
+  # every failure, still at most 5 times. --connect-timeout and --max-time bound each
+  # attempt, because a stalled transfer otherwise waits forever, and a deploy caps the
+  # whole bootstrap.
   say "installing uv $UV_VERSION as $OWNER"
   INSTALLER="$(mktemp)" || stop "could not create a temporary file for the uv installer"
-  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-all-errors -o "$INSTALLER" \
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-all-errors \
+      --connect-timeout 20 --max-time 300 -o "$INSTALLER" \
       "https://astral.sh/uv/$UV_VERSION/install.sh"; then
     rm -f -- "$INSTALLER"
     stop "could not download the uv $UV_VERSION installer, so nothing is installed"
@@ -557,18 +575,22 @@ fi
 
 # This runs whatever the steps above returned. After a failed render the residents fall
 # into the restart loop a missing config.yaml causes, and each restart reads the config
-# again, so they come up on their own once it is rendered. The run still exits 1. A
+# again, so they come up on their own once it is rendered. The run then exits 4. A
 # failure here is not a stop, so the end check below still prints its line last. The
 # words differ from step 9's on purpose, so each line names its own install.
 say "installing and starting the units"
 install_retried
 case "$INSTALL_RC" in
   0) ;;
-  1) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited 1 on each of $INSTALL_TRIES tries. A rerun of the bootstrap installs and starts the units" ;;
-  *) fail "the install that starts the units did not finish, because deploy/linux-install.sh exited $INSTALL_RC, which no retry fixes. The lines above it say why, and when one names the install lock, a rerun of the bootstrap installs and starts the units" ;;
+  1) install_fail "the install that starts the units did not finish, because deploy/linux-install.sh exited 1 on each of $INSTALL_TRIES tries. A rerun of the bootstrap installs and starts the units" ;;
+  *) install_fail "the install that starts the units did not finish, because deploy/linux-install.sh exited $INSTALL_RC, which no retry fixes. The lines above it say why, and when one names the install lock, a rerun of the bootstrap installs and starts the units" ;;
 esac
 
-if [[ $FAILED != 0 ]]; then
+if [[ $INSTALL_FAILED != 0 ]]; then
   stop "finished with a failed step, listed above"
+fi
+if [[ $FAILED != 0 ]]; then
+  echo "vm-bootstrap: installed the units, but a config step failed, listed above" >&2
+  exit 4
 fi
 say "done"

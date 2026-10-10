@@ -83,6 +83,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
   keeping the old file when any input is wrong.
+- `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
+  the hours the scheduled jobs run in.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
@@ -105,6 +107,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   the lake volume, installs `uv`, syncs the environment, renders `config.yaml`, pulls
   the token, applies the roster, and only then installs and starts the units. It is safe
   to run again over SSH.
+- `deploy/vm-deploy.sh` deploys one commit on `main` to the VM: outside the jobs' hours
+  and forward only, it runs the bootstrap, restarts the daemon when that is owed, and
+  rolls back a restart that does not hold.
 - `deploy/send-deploy.sh` runs on a GitHub runner for `.github/workflows/deploy.yml`. It
   sends the VM the deploy document for one commit, waits for the result, and prints only a
   summary, because the repository's logs are public.
@@ -520,12 +525,15 @@ in-flight cycle. A role change in `config.yaml` reaches the daemon only through
 
 New code does not wait for a restart. `lake` is an editable install, so once the checkout
 moves or the install runs, the timer jobs, the compaction the daemon starts at close+15,
-and any module the running daemon imports for the first time all run the new code. A
-deploy therefore waits for the session's close before it updates the checkout or installs,
-not only before it restarts ([#676](https://github.com/l3a0/marketlake/issues/676)).
-On a weekday evening it also waits for the upload after the vendor sweep, which runs in the
-eod-sweep unit from about 18:32 ET and can run past 20:00 on a night it retries a failed
-seal or upload ([#833](https://github.com/l3a0/marketlake/issues/833)). Once it has finished,
+and any module the running daemon imports for the first time all run the new code. So
+`deploy/vm-deploy.sh` moves the checkout, installs and restarts only outside the hours the
+scheduled jobs run, which end at 18:45 Eastern on a weekday
+([#676](https://github.com/l3a0/marketlake/issues/676)). `python -m lake.deploy_window`
+says whether a deploy may start now. On a weekday evening a deploy also waits for the
+upload after the vendor sweep, which runs in the eod-sweep unit from about 18:32 ET and can
+run past 20:00 on a night it retries a failed seal or upload
+([#833](https://github.com/l3a0/marketlake/issues/833)). The script refuses with exit 3
+while that unit reads `activating`. Once it has finished,
 `systemctl is-active com.marketlake.eod-sweep.service` prints `inactive`.
 
 Each unit logs to journald. The VM's clock runs in UTC, so read a unit's lines in Eastern
@@ -539,8 +547,8 @@ On the hosted VM, `deploy/vm-bootstrap.sh` runs this install at first boot, afte
 rendered `config.yaml`, pulled the token and applied the roster, so after a render that
 succeeded the residents start with their config in place.
 [The hosted VM](infra/README.md#the-hosted-vm) in the infrastructure runbook says how to
-create the VM, rerun the bootstrap and restore its lake. The design doc's Deployment
-section carries the reasoning for each unit setting.
+create the VM, rerun the bootstrap, deploy a commit and restore its lake. The design doc's
+Deployment section carries the reasoning for each unit setting.
 
 ## Carry the Schwab token to a hosted VM
 
