@@ -313,9 +313,10 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
 
    marketlake: FALLBACK carries no board data. A copy of the document used to
    sit here, and a copy goes stale silently: the old board's read as current
-   while nine days out of date. Until board.json arrives, or when it cannot be
-   fetched, the page draws only the banner under the strip, which says why
-   there is nothing to show.
+   while nine days out of date. Until a fetched board.json has drawn, the page
+   draws only the banner under the strip, which says why there is nothing to
+   show. Once one has drawn, a failed fetch or a refused document keeps that
+   board on screen, and the banner says live updates stopped.
 
    The document's shape is { schema, state, prs, working, planned, next,
    untracked, tracker }, and each field is what the constant of the same name
@@ -423,11 +424,13 @@ function usable(d) {
   return Object.keys(ITEM_OK).every(k => Array.isArray(d[k]) && d[k].every(ITEM_OK[k]));
 }
 
-/* A delivered snapshot is frozen, so the page works on a clone. */
-function adopt(src) {
-  NONE = !!src.none; /* marketlake: only FALLBACK carries it. */
+/* marketlake: adopt() takes the document as it is. The page used to work on
+   a clone, because a database snapshot arrived frozen. Each fetch now parses a
+   fresh object that nothing else holds, and the drawing code reads the fields
+   without writing to them, so a clone protects nothing. */
+function adopt(d) {
+  NONE = !!d.none; /* marketlake: only FALLBACK carries it. */
   if (NONE) return;
-  const d = JSON.parse(JSON.stringify(src));
   STATE = d.state; PRS = d.prs; WORKING = d.working; PLANNED = d.planned;
   NEXT = d.next; UNTRACKED = d.untracked || []; TRACKER = d.tracker;
   NEXT_SORTED = NEXT.slice().sort((a, b) =>
@@ -438,8 +441,11 @@ function adopt(src) {
 }
 
 /* The banner is empty while the page shows live data, and says what it is
-   showing otherwise. A failed fetch names only what the fetch reported, such as
-   the status board.json answered with, and guesses at nothing beyond it. */
+   showing otherwise. A fetch that fails after a board has drawn names only what
+   the fetch reported, such as the status board.json answered with, and guesses
+   at nothing beyond it. marketlake: a first fetch that fails names nothing. It
+   shows the `none` line, the one a view with no fetch shows, because either
+   way there is no board here to show. */
 function source() {
   const el = document.getElementById("source");
   if (!el) return;
