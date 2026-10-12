@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -212,6 +213,21 @@ def test_a_closing_link_to_another_repository_names_no_issue_here() -> None:
     assert entries(board) == [(10, 1), (10, 3), (11, 4)]
     four = board["prs"][-1]
     assert (four["linked"], four["partOf"]) == (False, True)
+
+
+@pytest.mark.parametrize(
+    ("query", "field"),
+    [("PRS_QUERY", "closingIssuesReferences"), ("ISSUES_QUERY", "blockedBy")],
+)
+def test_the_query_reads_each_linked_issues_repository(query: str, field: str) -> None:
+    """The fake serves the repository whatever the query asks for, and GitHub does not.
+
+    Without it every link reads as another repository's, and the board drops them all.
+    """
+    text = " ".join(getattr(bb, query).split())
+    selection = re.search(rf"{field}\(first:100\)\{{(.*?)\}}\}}", text)
+    assert selection, f"{query} reads no {field}"
+    assert re.search(r"nodes\{[^}]*\brepository\{nameWithOwner", selection.group(1))
 
 
 @pytest.mark.parametrize(
