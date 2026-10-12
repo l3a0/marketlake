@@ -108,10 +108,11 @@ from typing import Any
 import hcl2
 import pytest
 
-from lake import deploy_window
+from lake import control_plane, deploy_window
 from lake.calendar import MARKET_TZ
 
 INFRA = Path(__file__).resolve().parents[2] / "infra"
+VM_STOP = INFRA.parent / "deploy" / "vm-stop.sh"
 
 _OPTIONS = hcl2.SerializationOptions(
     strip_string_quotes=True, explicit_blocks=False, with_comments=False
@@ -920,18 +921,25 @@ def test_scheduler_role_starts_the_vm_by_its_own_tag() -> None:
 
 
 # The three bounds below come from #865's item 7.8. The roster and MARGIN come from
-# lake.deploy_window. Two of the numbers belong to the stop that #868 builds, so no
-# constant in src/lake holds them yet, and they are written here until it does.
+# lake.deploy_window. The other two numbers belong to the stop that #868 built, and the
+# bounds read both from where the VM reads them rather than from a copy (#871).
+#
+# marketlake-up's timer, the morning check that pages when the VM is not up, is a unit
+# lake.control_plane renders, so the bounds read its time and days from that unit. Every
+# host renders the same schedule, so this host's paths are placeholders.
+_ANY_HOST = control_plane.SystemdHost(python="/p/python", owner="o", home="/h", project_dir="/h/m")
 
-# marketlake-up's 07:40 timer, the morning check that pages when the VM is not up (#868).
-# A copy of the value PR #869 defines in code, which #871 replaces with a read of it once
-# both pull requests merge.
-VM_UP_AT = time(7, 40)
-
-# The stop leaves a VM alone for its first hour of uptime (#868). A copy of the value
-# PR #869 defines in deploy/vm-stop.sh, which #871 replaces with a read of it once both
-# pull requests merge.
-STOP_UPTIME_GRACE = timedelta(hours=1)
+# The stop leaves a VM alone for its first stretch of uptime. marketlake-stop.service runs
+# deploy/vm-stop.sh from the checkout and nothing renders it, so the bounds parse the
+# script's one assignment. The one form they can read is a line that assigns a number and
+# nothing else, written without a leading zero, since bash reads one as octal. Any other
+# form, or a second line that names it other than to read it, fails here rather than
+# being read wrongly. A comment line is skipped.
+_UPTIME_FORM = "UPTIME_SECONDS=<digits>"
+_UPTIME_ASSIGNMENT = re.compile(r"UPTIME_SECONDS=(0|[1-9]\d*)")
+# A line that only reads the value, as $UPTIME_SECONDS or ${UPTIME_SECONDS}, sets nothing.
+_UPTIME_READ = re.compile(r"\$UPTIME_SECONDS\b|\$\{UPTIME_SECONDS\}")
+_UPTIME_NAME = re.compile(r"\bUPTIME_SECONDS\b")
 
 # The time a weekday start allows for the VM to boot from stopped and its units to come up
 # before marketlake-up checks it. No boot from stopped has been timed on this VM yet, so
@@ -963,6 +971,22 @@ def _cron_start(expression: str) -> tuple[time, set[int]]:
     return time(int(hour), int(minute)), days
 
 
+def _uptime_grace(script: str) -> timedelta:
+    """The stop's uptime grace, read from the one line of ``script`` that sets it."""
+    setting = [
+        line
+        for line in script.splitlines()
+        if not line.lstrip().startswith("#") and _UPTIME_NAME.search(_UPTIME_READ.sub("", line))
+    ]
+    assert len(setting) == 1, (
+        f"the bounds read one line {_UPTIME_FORM}, and {len(setting)} lines set "
+        f"UPTIME_SECONDS: {setting!r}"
+    )
+    match = _UPTIME_ASSIGNMENT.fullmatch(setting[0])
+    assert match, f"the bounds read only a line {_UPTIME_FORM}, not {setting[0]!r}"
+    return timedelta(seconds=int(match.group(1)))
+
+
 # Five weeks, which cross the end of daylight saving time on 2026-11-01 and the early
 # close on 2026-11-27.
 _BOUND_DAYS = [date(2026, 10, 26) + timedelta(days=offset) for offset in range(35)]
@@ -975,9 +999,11 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
     """Moving a job or a start fails here rather than at the open. Each start must
 
     1. come at least ``START_LEAD`` before the earliest roster unit of its day,
-    2. on a weekday, come more than ``BOOT_ALLOWANCE`` before ``VM_UP_AT``, and
-    3. end its uptime grace after ``MARGIN`` before the next refused span, so the stop's
-       span check already refuses when the grace lets go.
+    2. on a day marketlake-up checks the VM, come more than ``BOOT_ALLOWANCE`` before
+       that check, at the time and on the days ``control_plane.vm_up_job`` renders, and
+    3. end the stop's uptime grace, read from ``deploy/vm-stop.sh``, after ``MARGIN``
+       before the next refused span, so the stop's span check already refuses when the
+       grace lets go.
 
     The third bound is strict. ``deploy_window`` still allows a stop at exactly
     ``MARGIN`` before a span, 04:30 on a weekday and 16:00 on a Sunday, so a weekday
@@ -987,6 +1013,9 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
     body = _schedules()[address]
     assert body["schedule_expression_timezone"] == str(MARKET_TZ)
     at, days = _cron_start(body["schedule_expression"])
+    vm_up = control_plane.vm_up_job(_ANY_HOST).schedule
+    assert vm_up is not None, "marketlake-up has no timer, so bound 2 reads nothing"
+    grace = _uptime_grace(VM_STOP.read_text())
     units = deploy_window.default_units()
     checked = 0
     for day in _BOUND_DAYS:
@@ -1003,17 +1032,67 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
             f"{address} starts at {start:%H:%M} on {day}, less than "
             f"{START_LEAD} before the first unit at {min(todays):%H:%M}"
         )
-        if day.weekday() < 5:
-            assert start + BOOT_ALLOWANCE < datetime.combine(day, VM_UP_AT, tzinfo=MARKET_TZ), (
+        if day.weekday() in vm_up.days:
+            assert start + BOOT_ALLOWANCE < vm_up.at.on(day), (
                 f"{address} starts at {at}, which leaves less than {BOOT_ALLOWANCE} to boot "
-                f"before marketlake-up at {VM_UP_AT}"
+                f"before marketlake-up at {vm_up.at.on(day):%H:%M}"
             )
         span = deploy_window.spans_from(start, units)[0]
-        assert start + STOP_UPTIME_GRACE > span.start - deploy_window.MARGIN, (
+        assert start + grace > span.start - deploy_window.MARGIN, (
             f"{address}'s grace ends on {day} while the span check still allows a stop"
         )
         checked += 1
     assert checked >= 5, f"{address} fired on {checked} of the days checked"
+
+
+def test_uptime_grace_reads_the_assignment_and_skips_the_reads() -> None:
+    """Bound 3 has hours of slack on both live starts, so no grace of zero or more turns it
+    red, and a wrong read would pass it. The read is checked here instead, on a value the
+    live script does not hold."""
+    script = (
+        "#!/bin/bash\n"
+        "# UPTIME_SECONDS=7200 in a comment sets nothing.\n"
+        "set -euo pipefail\n"
+        "\n"
+        "UPTIME_SECONDS=1800\n"
+        "POWEROFF_WAIT=240\n"
+        'if [[ "$UP" -lt "$UPTIME_SECONDS" ]]; then\n'
+        '  refuse "2 (uptime)" "up $UP seconds, less than ${UPTIME_SECONDS}"\n'
+        "fi\n"
+    )
+    assert _uptime_grace(script) == timedelta(minutes=30)
+    assert _uptime_grace("UPTIME_SECONDS=0\n") == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "set -euo pipefail\nPOWEROFF_WAIT=240\n",
+        "readonly UPTIME_SECONDS=3600\n",
+        "export UPTIME_SECONDS=3600\n",
+        "declare -r UPTIME_SECONDS=3600\n",
+        "  UPTIME_SECONDS=3600\n",
+        'UPTIME_SECONDS="3600"\n',
+        'UPTIME_SECONDS="${X:-3600}"\n',
+        ': "${UPTIME_SECONDS:=3600}"\n',
+        "UPTIME_SECONDS=$((60*60))\n",
+        "UPTIME_SECONDS=03600\n",
+        "UPTIME_SECONDS=3600  # an hour\n",
+        "UPTIME_SECONDS=3600\nUPTIME_SECONDS=1800\n",
+        'UPTIME_SECONDS=3600\n[[ -n "${FAST:-}" ]] && UPTIME_SECONDS=60\n',
+        "UPTIME_SECONDS=3600\nreadonly UPTIME_SECONDS\n",
+    ],
+)
+def test_uptime_grace_refuses_any_other_form(script: str) -> None:
+    """A form the parse cannot read fails, naming the one form it reads, rather than
+    handing bound 3 a number the script does not use."""
+    with pytest.raises(AssertionError, match=re.escape(_UPTIME_FORM)):
+        _uptime_grace(script)
+
+
+def test_uptime_grace_reads_the_stop_script() -> None:
+    """The live script is written in the one form the parse reads."""
+    assert isinstance(_uptime_grace(VM_STOP.read_text()), timedelta)
 
 
 def test_every_day_the_roster_runs_has_a_start() -> None:
