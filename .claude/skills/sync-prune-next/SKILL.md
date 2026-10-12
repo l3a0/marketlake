@@ -248,8 +248,8 @@ git worktree prune
 ```
 
 Archive a finished session only when the owner has asked for it in this
-conversation. Archiving stops the session and is the owner's call, even when the
-board says its loop exited.
+conversation. Archiving stops the session and is the owner's call, even when its
+loop has exited.
 
 Report what was removed, and what was kept with the reason for each. Include
 stash entries from `git stash list`, which survive every removal above and
@@ -262,7 +262,8 @@ A GitHub Action rebuilds the board from GitHub and publishes it at
 <https://l3a0.github.io/marketlake/>, so a round writes nothing to it. This
 step checks that the Action's last run succeeded. Then it builds the same
 `board.json` into a scratch directory, so step 4 reads GitHub as it stands
-rather than as the last run saw it.
+rather than as the last run saw it. Last, it confirms the page drew the
+published board, as "Confirm the page drew it" below describes.
 
 This prints the board workflow's newest finished run that was not cancelled.
 
@@ -282,9 +283,12 @@ unreported until the stale banner in
 [#874](https://github.com/l3a0/marketlake/issues/874) lands.
 
 Then build the board into scratch. Replace `<scratch>` with the round's
-scratch directory.
+scratch directory. The first line removes any `board.json` an earlier build
+left there, because a failed build writes no new one and step 4 would read
+the old file as current.
 
 ```bash
+rm -f <scratch>/board.json
 uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <scratch>
 ```
 
@@ -293,9 +297,8 @@ requests and points. Run it with `uv run python`, never `python3`. macOS's
 `/usr/bin/python3` is 3.9 and cannot import the script. The script reads
 GitHub through the session's `gh` login and fails closed, so a failed call
 stops it with a non-zero exit before it writes `board.json`. Report the
-failure. Step 4 then reads the open pull requests, their checks and their
-review markers straight from GitHub, as "What the generator writes" below
-describes `prs`.
+failure. Step 4 then reads the last board the workflow published, and reads
+the open pull requests again from GitHub.
 
 ### The board on GitHub Pages
 
@@ -308,7 +311,9 @@ events start a run.
 - A pull request into `main` opening, updating, reopening, closing or being
   edited.
 - The CI or Infra workflow finishing.
-- The schedule, twice an hour.
+- The schedule, twice an hour. GitHub fired none of its first four due
+  slots here on 2026-10-12, so the runs the events above start are what keep
+  the board current.
 
 A submitted review starts no run, and neither does a "blocked by" link or a
 sub-issue, so each reaches the board with the next run. `build_board.py`,
@@ -364,7 +369,7 @@ tests that check them together.
   whether its review finished. GitHub's review decision cannot tell whether
   the review ran, so it does not decide `reviewed`. The rule for writing the
   heading lives in `CLAUDE.md`, under "Pull requests", where review sessions
-  read it. `review` is one of two fixed phrases, `review complete` or
+  read it. `review` is a fixed phrase, either `review complete` or
   `no Review complete marker since the head commit`, so it never names the
   lens still running.
 
@@ -408,11 +413,13 @@ tests that check them together.
   needs}`. Its `ms` is the milestone's title up to its first comma, so
   "MVP 2, capture on a hosted VM" reads `"MVP 2"`, or `"no milestone"`. Its
   `kind` is `parent` while an open sub-issue exists, else `deferred` under
-  that label, else `ready`. The page also draws `decision` and `data`, which
-  the generator never writes. Its `needs` holds the open issues in this
-  repository that a native "blocked by" link names. Dependency sections in
-  issue bodies are not read, so a blocker written only in a body is not on the
-  board until someone adds the link.
+  that label, else `ready`. The page also draws the kinds `decision` and
+  `data`, which the generator never writes. Its `needs` holds the open issues
+  in this repository that a native "blocked by" link names. Dependency
+  sections in issue bodies are not read, so a blocker written only in a body
+  is not on the board until someone adds the link. The page also reads an
+  `after` list, the cards a card should land behind, which the generator does
+  not write until [#873](https://github.com/l3a0/marketlake/issues/873).
 
 The generator writes no `untracked`, which the page reads as empty.
 
@@ -526,12 +533,23 @@ re-deriving it. Until then `next`, `planned` and `working` are empty. So rank
 the candidates from the directive itself, and report that the round had no
 `working` or `planned` entries to read.
 
-When step 3 could not build the file, read the open pull requests, their
-checks and their review markers straight from GitHub, as "What the generator
-writes" in step 3 describes `prs`. Pass `--limit 1000` to every `gh` list
-command that feeds a candidate, because `gh` stops at its limit without a
-warning and its default is 30. A cut list prints the same way a complete one
-does.
+When step 3 could not build the file, read the last board the workflow
+published instead, and print the time it read GitHub.
+
+```bash
+curl -fsS "https://l3a0.github.io/marketlake/board.json?t=$(date +%s)" -o <scratch>/board.json
+jq -r .state.updatedAt <scratch>/board.json
+```
+
+The `t` parameter asks for a URL no cache has seen, because Pages tells
+caches to keep `board.json` for ten minutes. Report the `updatedAt` time,
+because the file is as old as the workflow's last good run. Read its
+tracker as it is. Then read the open pull requests, their checks and their
+review markers again straight from GitHub, as "What the generator writes" in
+step 3 describes `prs`, rather than trust the file's `prs`. Pass
+`--limit 1000` to every `gh` list command that feeds a candidate, because `gh`
+stops at its limit without a warning and its default is 30. A cut list prints
+the same way a complete one does.
 
 The open MVP milestone tracks the work
 ([MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5),
