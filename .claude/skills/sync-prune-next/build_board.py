@@ -5,8 +5,9 @@ sync round measured every figure on it by hand and wrote them into a claude.ai
 artifact's database. That cost a turn on every change, missed any change no session
 saw, and tied the board to one claude.ai account. This script reads the figures GitHub
 already holds and writes them as one ``board.json``. ``.github/workflows/board.yml``
-runs it on every change and on a schedule, and publishes the file beside
-``board.html`` on GitHub Pages. No Claude runs at any step. It is a port of
+runs it and publishes the file beside ``board.html`` on GitHub Pages. That workflow's
+``on:`` block lists what starts a run. A submitted review starts none, so it reaches
+the board with the next run. No Claude runs at any step. It is a port of
 l3a0/quantitative-trading's ``scripts/build_board.py``, cut to what marketlake's page
 draws.
 
@@ -22,7 +23,8 @@ The document keeps the flat shape the page already reads::
    ``deferred`` under that label, else ``ready``. ``needs`` holds the open issues in
    this repository that a native "blocked by" link names.
 3. ``prs`` has one entry per open pull request and open issue it names, through
-   GitHub's closing link or a ``Part of #N`` reference outside code.
+   GitHub's closing link or a ``Part of #N`` reference outside code. A closing link to
+   an issue in another repository names none here.
 4. ``working``, ``planned`` and ``next`` stay empty until issue 873 moves those
    judgements onto GitHub.
 
@@ -39,7 +41,10 @@ It fails closed. A failed call, a GraphQL error, a top-level list whose read cou
 disagrees with its ``totalCount``, or a nested list with more entries than one read
 returns stops the run with a non-zero exit, and Pages keeps the last good board.
 Treating an error as an empty list would publish a board that reads as correct and
-is not.
+is not. Comments and reviews are the exception. Each is read as its newest 100, and a
+longer list never stops the run, because only a marker newer than the head commit
+counts. Such a marker falls outside the newest 100 only when a hundred more comments
+follow it, or for a review, a hundred more reviews.
 
 It reads every open issue and pull request through two paged GraphQL queries, one
 request per page. The job token allows 1,000 points an hour per repository, so the
@@ -143,7 +148,8 @@ query($owner:String!, $name:String!, $after:String) {
       totalCount pageInfo{hasNextPage endCursor}
       nodes {
         number body isCrossRepository
-        closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number}}
+        closingIssuesReferences(first:100){pageInfo{hasNextPage}
+          nodes{number repository{nameWithOwner}}}
         comments(last:100){nodes{authorAssociation body createdAt}}
         reviews(last:100){nodes{authorAssociation body submittedAt}}
         commits(last:1){nodes{commit{committedDate statusCheckRollup{
@@ -182,7 +188,10 @@ class GhGraphql:
             flag = "-F" if isinstance(value, int) else "-f"
             args += [flag, f"{key}={value}"]
         self.requests += 1
-        done = subprocess.run(args, capture_output=True, text=True, check=False)
+        try:
+            done = subprocess.run(args, capture_output=True, text=True, check=False)
+        except OSError as e:
+            raise BoardError(f"gh could not be run: {e}") from e
         if done.returncode != 0:
             raise BoardError(f"gh api graphql failed: {done.stderr.strip() or done.stdout}")
         try:
@@ -292,6 +301,11 @@ def card_kind(labels: list[str], sub_issues: dict | None) -> str:
     return "ready"
 
 
+def in_repo(node: dict, repo: str) -> bool:
+    """Whether a linked issue is in ``repo``. GitHub spells the owner as it likes."""
+    return ((node.get("repository") or {}).get("nameWithOwner") or "").lower() == repo.lower()
+
+
 def tracker_card(issue: dict, open_issues: set[int], repo: str) -> dict:
     """One open issue as the card the page draws.
 
@@ -306,9 +320,7 @@ def tracker_card(issue: dict, open_issues: set[int], repo: str) -> dict:
         {
             b["number"]
             for b in blockers
-            if b.get("state") == "OPEN"
-            and ((b.get("repository") or {}).get("nameWithOwner") or "").lower() == repo.lower()
-            and b["number"] in open_issues
+            if b.get("state") == "OPEN" and in_repo(b, repo) and b["number"] in open_issues
         }
     )
     return {
@@ -375,17 +387,23 @@ def review_complete(entries: list[dict], stamp_field: str, head_date: datetime |
     return False
 
 
-def pr_entries(pr: dict, open_issues: set[int]) -> list[dict]:
+def pr_entries(pr: dict, open_issues: set[int], repo: str) -> list[dict]:
     """One entry per open issue the pull request names, or none at all.
 
     A pull request names an issue through GitHub's closing link or through a ``Part
     of`` reference outside code. One that names no open issue gets no entry, because
-    the page keys pull requests by issue. One from a fork gets none either.
+    the page keys pull requests by issue. One from a fork gets none either. A closing
+    link to an issue in another repository is dropped, as ``tracker_card`` drops such
+    a blocker, because its number would match a marketlake issue it does not close.
     """
     if pr.get("isCrossRepository"):
         return []
     n = pr["number"]
-    closing = {c["number"] for c in _whole(pr["closingIssuesReferences"], f"links on PR #{n}")}
+    closing = {
+        c["number"]
+        for c in _whole(pr["closingIssuesReferences"], f"links on PR #{n}")
+        if in_repo(c, repo)
+    }
     part_of = {int(m) for m in PART_OF.findall(outside_code(pr.get("body") or ""))}
     named = sorted((closing | part_of) & open_issues)
     if not named:
@@ -416,7 +434,9 @@ def pr_entries(pr: dict, open_issues: set[int]) -> list[dict]:
 
 def build(gql: Gql, repo: str, now: datetime) -> tuple[dict, dict]:
     """The board, and what the job summary reports about the read."""
-    owner, name = repo.split("/", 1)
+    owner, _, name = repo.partition("/")
+    if not owner or not name or "/" in name:
+        raise BoardError(f"--repo must be owner/name, not {repo!r}")
     issues, repository = _top_pages(gql, ISSUES_QUERY, owner, name, "issues")
     oid = ((repository.get("defaultBranchRef") or {}).get("target") or {}).get("oid")
     if not oid:
@@ -427,7 +447,7 @@ def build(gql: Gql, repo: str, now: datetime) -> tuple[dict, dict]:
     ]
 
     pulls, _ = _top_pages(gql, PRS_QUERY, owner, name, "pullRequests")
-    prs = [entry for pr in pulls for entry in pr_entries(pr, open_issues)]
+    prs = [entry for pr in pulls for entry in pr_entries(pr, open_issues, repo)]
     prs.sort(key=lambda p: (p["issue"], p["pr"]))
 
     board = {

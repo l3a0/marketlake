@@ -78,7 +78,7 @@ def status(context: str, state: str) -> dict[str, Any]:
     return {"__typename": "StatusContext", "context": context, "state": state}
 
 
-def note(body: str, at: str, association: str = "OWNER", *, review: bool = False) -> dict:
+def note(body: str, at: str | None, association: str = "OWNER", *, review: bool = False) -> dict:
     """A comment, or with ``review`` a review, posted at ``at``."""
     return {
         "authorAssociation": association,
@@ -95,19 +95,25 @@ def pull(
     comments: tuple[dict[str, Any], ...] = (),
     reviews: tuple[dict[str, Any], ...] = (),
     contexts: tuple[dict[str, Any], ...] | None = (),
-    committed: str = "2026-10-12T12:00:00Z",
+    committed: str | None = "2026-10-12T12:00:00Z",
     fork: bool = False,
+    closes_elsewhere: tuple[tuple[int, str], ...] = (),
 ) -> dict[str, Any]:
     """An open pull request as the pull requests query returns it.
 
     ``contexts`` of None is a head commit with no status check rollup at all.
+    ``closes`` names issues in this repository, and ``closes_elsewhere`` names
+    ``(number, owner/name)`` pairs in others.
     """
     rollup = None if contexts is None else {"contexts": conn(list(contexts))}
+    closing = [(i, REPO) for i in closes] + list(closes_elsewhere)
     return {
         "number": n,
         "body": body,
         "isCrossRepository": fork,
-        "closingIssuesReferences": conn([{"number": i} for i in closes]),
+        "closingIssuesReferences": conn(
+            [{"number": i, "repository": {"nameWithOwner": r}} for i, r in closing]
+        ),
         "comments": {"nodes": list(comments)},
         "reviews": {"nodes": list(reviews)},
         "commits": {

@@ -298,20 +298,43 @@ else notices.
 ### The board on GitHub Pages
 
 <https://l3a0.github.io/marketlake/> serves the same `board.html` beside a
-`board.json` that `.github/workflows/board.yml` builds from GitHub on every
-issue, comment and pull request event, when CI or Infra finishes, and on a
-schedule. `build_board.py`, beside this skill, is the generator, and the page
-fetches its output every two minutes. It fills `state`, `tracker` and `prs` in
-the shape below, and leaves `working`, `planned` and `next` empty until
-[#873](https://github.com/l3a0/marketlake/issues/873) moves those judgements
-onto GitHub. So its default view draws every card in the chosen milestone
-rather than only the ranked ones. The artifact stays the board of record until
-the skill stops writing it.
+`board.json` that `.github/workflows/board.yml` builds from GitHub. These
+events start a run.
+
+- An issue event, such as an issue opened, edited, labeled or closed.
+- An issue comment.
+- A pull request into `main` opening, updating, reopening, closing or being
+  edited.
+- The CI or Infra workflow finishing.
+- The schedule, twice an hour.
+
+A submitted review starts no run, and neither does a "blocked by" link or a
+sub-issue, so each reaches the board with the next run. `build_board.py`,
+beside this skill, is the generator, and the page fetches its output every two
+minutes. It fills `state`, `tracker` and `prs`, and leaves `working`, `planned`
+and `next` empty until [#873](https://github.com/l3a0/marketlake/issues/873)
+moves those judgements onto GitHub. So its default view draws every card in the
+chosen milestone rather than only the ranked ones. What it writes differs from
+"The document's shape" below in five ways.
+
+1. `state` holds only `main`, `updatedAt` and `issues.open`.
+2. A card's `needs` comes from native "blocked by" links alone, not from the
+   dependency sections of issue bodies.
+3. Each `prs` entry also carries `partOf`, true when the issue is named by a
+   `Part of #N` reference rather than by a closing link.
+4. `prs` holds one entry per pull request and issue pair, so a pull request
+   naming two open issues has two entries.
+5. It writes no `untracked`, and each `prs` entry's `review` is one of two fixed
+   phrases, `review complete` or `no Review complete marker since the head
+   commit`, so it never names the lens still running.
+
+The artifact stays the board of record until the skill stops writing it.
 
 The page finds which board it is on by itself. Inside the artifact it reads the
 database, and on Pages, where it finds none, it fetches `board.json`.
-`board-harness.js` reaches only the database path, and
-`tests/component/test_board_page.py` runs the fetch path.
+`board-harness.js` reaches only the database path.
+`tests/component/test_board_page.py` runs the fetch path, and three of its
+cases run the database path too, with a fake database.
 
 ### Switching to another board
 
@@ -379,19 +402,25 @@ old content under a new version, and looks exactly like a good write.
   what is live" below. The page itself never reads it.
 - **`prs`** has one entry per open pull request, written as
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
-  An entry keyed `n` drops its card without any error. `linked` comes from the
-  pull request's `closingIssuesReferences`. A reviewed, green card lands in the
-  owner's queue, so `reviewed` is true only once the review is complete. Any
-  review comment is not enough, because a session can post some lenses' results
-  while another lens still runs. That sent
+  An entry keyed `n` drops its card without any error. A pull request from a
+  fork gets no entry, because GitHub registers a fork's closing keyword, so a
+  stranger's fork reading `Closes #640` would otherwise move that issue into In
+  flight. Read `isCrossRepository` to tell. `linked` is true when the pull
+  request's `closingIssuesReferences` names the issue. A reviewed, green card
+  lands in the owner's queue, so `reviewed` is true only once the review is
+  complete. Any review comment is not enough, because a session can post some
+  lenses' results while another lens still runs. That sent
   [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner while its
   mutation lens was running. A review is complete when the pull request carries
-  a comment or review whose whole first line is `## Review complete`, posted
-  after the head commit's `committedDate`. A heading that only starts with
-  those words, like `## Review completeness check`, does not count. Neither
-  does a marker from an earlier round, because the commits pushed since then
-  are code that review never saw. Count the markers with
-  `gh pr view <n> --json comments,reviews,commits --jq '.commits[-1].committedDate as $head | [.comments[] | select(.createdAt > $head) | .body] + [.reviews[] | select(.submittedAt > $head) | .body] | map(select(test("\\A## Review complete\\r?(\\n|\\z)"))) | length'`,
+  a comment or review from the owner whose whole first line is
+  `## Review complete`, posted after the head commit's `committedDate`. The
+  owner's are the ones whose `authorAssociation` is `OWNER`. Anyone can comment
+  on this public repository, so a stranger's marker counts for nothing. A
+  heading that only starts with those words, like
+  `## Review completeness check`, does not count. Neither does a marker from an
+  earlier round, because the commits pushed since then are code that review
+  never saw. Count the markers with
+  `gh pr view <n> --json comments,reviews,commits --jq '.commits[-1].committedDate as $head | [.comments[] | select(.createdAt > $head and .authorAssociation == "OWNER") | .body] + [.reviews[] | select(.submittedAt > $head and .authorAssociation == "OWNER") | .body] | map(select(test("\\A## Review complete\\r?(\\n|\\z)"))) | length'`,
   and set `reviewed` only when the count is above zero. A pull request whose
   final review was posted before this rule carries no marker, so it reads
   `reviewed: false` until a session posts one, and the sync reports it rather
@@ -447,20 +476,36 @@ A `next` or `planned` entry under the wrong key drops its card in silence, the
 same way a `prs` entry keyed `n` does.
 
 The page's `usable()` check refuses the whole document when any one of these
-fails, and draws only a banner saying the document is missing fields.
+fails. With nothing drawn yet, the page then shows only a banner saying the
+document is missing fields. With a board already drawn, it keeps that board on
+screen and says live updates stopped.
 
-1. `state.main` is a string and `state.issues.open` is a number.
+1. `state.main` and `state.updatedAt` are strings, and `state.issues.open` is
+   a number.
 2. `tracker` is a list with at least one entry, and `prs`, `working`, `planned`
    and `next` are lists.
 3. Each `tracker` entry has a number `n`, a string `label` and `ms`, a `kind`
-   of `ready`, `deferred`, `parent`, `decision` or `data`, and a list `needs`.
+   of `ready`, `deferred`, `parent`, `decision` or `data`, and a `needs` list
+   of numbers. An `after`, when present, is a list of numbers, and `labels`,
+   when present, is a list of strings.
 4. Each `prs` entry has a number `pr` and `issue`, a `state` of `open`,
-   `merged` or `closed`, and a string `review`.
-5. Each `planned` and `next` entry has a `ready` of `build`, `decide` or
+   `merged` or `closed`, a string `review`, a boolean `reviewed`, and a
+   `rollup` list whose every entry is a pair of strings. `linked` is a boolean
+   or a list of issue numbers, and `partOf`, when present, is a boolean. The
+   page reads a list as linked only when it names the entry's own `issue`.
+5. Each `working` entry has a number `n` and a string `what`. A `kind`, when
+   present, is a string.
+6. Each `planned` entry has a number `n` and a number `passes`.
+7. Each `next` entry has a number `issue` and a number `band`. An `order`,
+   when present, is a number.
+8. Each `planned` and `next` entry has a `ready` of `build`, `decide` or
    `plan`.
 
 The numbers and the fixed sets are checked because the page writes those
-fields into links and attributes without escaping them.
+fields into links and attributes without escaping them. The booleans are
+checked because the page tests them for truth, and the string `"false"` is
+true. The lists of numbers are checked because the page compares them against
+card numbers, and a string in `needs` matches no card and frees a blocked one.
 
 The page filters cards by milestone, with a selector that defaults to "MVP 2".
 So a card's milestone comes only from `tracker`, and an issue missing from
@@ -562,9 +607,12 @@ It publishes the page only to bring it level with `main`.
 #### Test the page before the pull request
 
 CI runs the page's fetch path in `tests/component/test_board_page.py`, which
-feeds the page fake `board.json` answers through `dom-stub.js`. Nothing in CI
-runs its database path, so a change that throws or draws the wrong thing there
-reaches every viewer of the artifact unless its author runs it first.
+feeds the page fake `board.json` answers through `dom-stub.js`. Three of its
+cases run the database path with a fake database: one checks that a page with
+a database never fetches, and two check the banner after a document fails to
+draw. Nothing else in CI runs that path, so a change that throws or draws the
+wrong thing there reaches every viewer of the artifact unless its author runs
+it first.
 `board-harness.js`, beside this skill, runs the page's inline script against a
 stub DOM and prints what each element drew, as JSON. It runs under
 `osascript -l JavaScript`, because macOS ships that and node may be absent.

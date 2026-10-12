@@ -313,9 +313,10 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
    which says why there is nothing to show.
 
    marketlake: the same page also runs on GitHub Pages, where it has no
-   database. A GitHub Action there rebuilds board.json beside the page on every
-   change and on a schedule, and the page fetches it every FETCH_EVERY
-   milliseconds instead of subscribing. Issue 872 built that path beside the
+   database. A GitHub Action there rebuilds board.json beside the page, and the
+   page fetches it every FETCH_EVERY milliseconds instead of subscribing. The
+   `on:` block of .github/workflows/board.yml lists what starts a run, and a
+   submitted review starts none. Issue 872 built that path beside the
    database rather than in its place, because the artifact board stays the
    board of record until the skill stops writing it. The fetch starts only once
    the database lookup has settled with no database, so the two never race.
@@ -350,9 +351,9 @@ let SOURCE = { live: false, why: "loading" };
    else. */
 let SHOW_ALL = false;
 try { SHOW_ALL = localStorage.getItem("marketlake-board-all") === "1"; } catch (e) { SHOW_ALL = false; }
-let SHOWN = 0, HIDDEN = 0;
-/* marketlake: true when the chosen milestone holds no ranked card outside the
-   In flight section. The ranked-only view would then draw only parents, under a
+let SHOWN = 0, HIDDEN = 0, SHOWN_RANKED = 0;
+/* marketlake: true when the chosen milestone holds no ranked card at all, in
+   flight or not. The ranked-only view would then draw only parents, under a
    line calling them ranked, so buildOrder() draws every card instead. */
 let UNRANKED = false;
 let CHAIN_ESC = null;
@@ -377,7 +378,8 @@ const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
    the whole document, so the page never draws a board silently missing cards.
 
    A field the page writes into an attribute without `esc()` must be a number:
-   a card's `n`, a pull request's `pr` and `issue`, and the open issue count.
+   a card's `n`, a pull request's `pr` and `issue`, a plan's `passes`, and the
+   open issue count.
    A field the page compares against a fixed set must be in that set, because
    an unknown `kind` writes a broken sentence, and `kind`, `state` and `ready`
    each reach a class attribute or a lookup by name. `review` is drawn verbatim, so a missing one would draw "undefined".
@@ -388,18 +390,43 @@ const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
    draws neither. */
 const isNum = v => typeof v === "number" && isFinite(v);
 const isStr = v => typeof v === "string";
+const isBool = v => typeof v === "boolean";
 const oneOf = xs => v => xs.indexOf(v) >= 0;
+const allOf = f => xs => Array.isArray(xs) && xs.every(f);
+/* marketlake: a field the page tests for truth must be a boolean, because the
+   string "false" is true and drew an unreviewed pull request as ready for the
+   owner. A list the page compares against card numbers must hold numbers,
+   because a string in `needs` matches no card and silently frees a blocked one.
+   `linked` also takes a list of issue numbers, because rounds writing the
+   database board wrote the pull request's closing references there, and two of
+   their documents on 2026-10-09 did. `usable` serves both paths, so a
+   board.json holding such a list passes too. `isLinked` reads a list as linked
+   only when it names the entry's own issue, because an empty list, or one
+   naming another issue, registers no closing link for this card.
+
+   A ranking entry's `issue`, `band` and `order` feed the sort, and a string
+   there sorts by text or not at all. A plan's `n` and a session's `n` key the
+   maps the cards read, and a session's `what` is drawn, so a missing one would
+   draw "undefined". A session's `kind` may be absent, which reads as a
+   decompose loop, but it must be a string when present. */
 const ITEM_OK = {
   tracker: c => !!c && isNum(c.n) && isStr(c.label) && isStr(c.ms) &&
-    oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && Array.isArray(c.needs),
+    oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && allOf(isNum)(c.needs) &&
+    (c.after === undefined || allOf(isNum)(c.after)) &&
+    (c.labels === undefined || allOf(isStr)(c.labels)),
   prs: p => !!p && isNum(p.pr) && isNum(p.issue) && oneOf(["open", "merged", "closed"])(p.state) &&
-    isStr(p.review),
-  working: w => !!w,
-  planned: p => !!p && oneOf(["build", "decide", "plan"])(p.ready),
-  next: x => !!x && oneOf(["build", "decide", "plan"])(x.ready)
+    isStr(p.review) && isBool(p.reviewed) && (isBool(p.linked) || allOf(isNum)(p.linked)) &&
+    (p.partOf === undefined || isBool(p.partOf)) &&
+    allOf(r => Array.isArray(r) && r.length === 2 && isStr(r[0]) && isStr(r[1]))(p.rollup),
+  working: w => !!w && isNum(w.n) && isStr(w.what) && (w.kind === undefined || isStr(w.kind)),
+  planned: p => !!p && isNum(p.n) && isNum(p.passes) && oneOf(["build", "decide", "plan"])(p.ready),
+  next: x => !!x && isNum(x.issue) && isNum(x.band) && (x.order === undefined || isNum(x.order)) &&
+    oneOf(["build", "decide", "plan"])(x.ready)
 };
+const isLinked = p => Array.isArray(p.linked) ? p.linked.indexOf(p.issue) >= 0 : p.linked === true;
 function usable(d) {
-  if (!(d && d.state && isStr(d.state.main) && d.state.issues && isNum(d.state.issues.open))) return false;
+  if (!(d && d.state && isStr(d.state.main) && isStr(d.state.updatedAt) &&
+        d.state.issues && isNum(d.state.issues.open))) return false;
   if (!(Array.isArray(d.tracker) && d.tracker.length)) return false;
   return Object.keys(ITEM_OK).every(k => Array.isArray(d[k]) && d[k].every(ITEM_OK[k]));
 }
@@ -471,14 +498,24 @@ function more() {
       : "";
     return;
   }
-  if (!HIDDEN && !SHOW_ALL) { el.innerHTML = ""; return; }
+  /* marketlake: a parent shown beside the ranked cards is not one of them, so
+     the line counts it apart. With every ranked card in flight the board holds
+     no ranked card at all, and the line says why, even with nothing hidden. */
+  const parents = SHOWN - SHOWN_RANKED;
+  const shown = SHOWN_RANKED
+    ? `Showing the ${plu(SHOWN_RANKED, "ranked card")}` +
+      `${parents ? ` and ${plu(parents, "parent")}` : ""}${where}. `
+    : `Every ranked card${where} is in flight, so ` +
+      `${parents ? `only ${plu(parents, "parent")} ${parents === 1 ? "is" : "are"} showing here`
+                 : "no card is showing here"}. `;
+  if (!HIDDEN && !SHOW_ALL && SHOWN_RANKED) { el.innerHTML = ""; return; }
   el.innerHTML = SHOW_ALL
     ? `<span>Showing all ${SHOWN} open issues${where} not in flight.</span>` +
       `<button type="button" data-toggle>Show only the ranked cards</button>`
-    : `<span>Showing the ${SHOWN} ranked ${SHOWN === 1 ? "card" : "cards"}${where}. ` +
-      `${HIDDEN} other open ${HIDDEN === 1 ? "issue" : "issues"}${where} ${HIDDEN === 1 ? "is" : "are"} not in the ` +
-      `priority order.</span>` +
-      `<button type="button" data-toggle>Show all ${SHOWN + HIDDEN}</button>`;
+    : `<span>${shown}` +
+      (HIDDEN ? `${HIDDEN} other open ${HIDDEN === 1 ? "issue" : "issues"}${where} ${HIDDEN === 1 ? "is" : "are"} not in the ` +
+        `priority order.` : ``) + `</span>` +
+      (HIDDEN ? `<button type="button" data-toggle>Show all ${SHOWN + HIDDEN}</button>` : ``);
   el.onclick = e => {
     if (!e.target.matches("[data-toggle]")) return;
     SHOW_ALL = !SHOW_ALL;
@@ -571,8 +608,10 @@ function checkword(rollup) {
    Every branch below rounds a negative age up into "just now", so a page stamped
    into the future says it was measured just now and goes on saying it however
    stale it gets. That is the one sentence this page exists to get right, since
-   it is the only warning a reader has that nothing here refreshes itself, and it
-   failed silently in the direction that reads as healthy.
+   it is the only warning a reader has of how old every figure is, and it failed
+   silently in the direction that reads as healthy. The database board changes
+   only when a round writes it, and the board on GitHub Pages only when a run
+   rebuilds board.json, so on either path the stamp is what dates the figures.
 
    It is not hypothetical and not one session's slip. Two consecutive published
    versions carried it, stamped 20:22Z and 21:52Z against a clock reading 19:26Z,
@@ -605,8 +644,11 @@ function strip() {
 
 /* All that is left of a twenty-paragraph footer. The narrative was a second
    telling of what the cards already say, and it went. This sentence did not,
-   because the page has no way to refresh itself and a page that does not say so
-   reads as live. */
+   because every figure dates from the stamp rather than from the moment of
+   reading, on both paths, and a page that does not say so reads as live. The
+   database board changes only when a round writes it. The board on GitHub Pages
+   fetches board.json again every two minutes, and that file changes only when a
+   run of the board workflow rebuilds it. */
 function stamped() {
   /* The decay warning names the states that can actually decay, rather than
      listing every one of them whenever any is present. A review posted since
@@ -631,14 +673,20 @@ function stamped() {
      hand, so it says how it is built instead. Its figures still date from the
      stamp rather than from the moment of reading, so the decay clause holds for
      both. */
+  /* marketlake: board.yml's `on:` block lists what starts a run. Only the CI
+     or Infra workflow finishing starts one, not any other check, and a
+     submitted review starts none, so the sentence names only what does. */
   const how = FETCHED
     ? `Built from GitHub against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span> by an Action on each change and on a ` +
-      `schedule, and fetched again every ${FETCH_EVERY / 60000} minutes`
+      `<span class="mono">${esc(STATE.main)}</span> by an Action, which rebuilds it on most ` +
+      `issue and pull request activity, whenever CI or Infra finishes, and on a schedule. ` +
+      `The page fetches it again every ${FETCH_EVERY / 60000} minutes, but every figure on it ` +
+      `is current as of the stamp above rather than live.`
     : `Measured by hand against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub`;
+      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll ` +
+      `GitHub, so every figure on it is current as of the stamp above rather than live.`;
   document.getElementById("foot").innerHTML =
-    `<p>${how}, so every figure on it is current as of the stamp above rather than live.` +
+    `<p>${how}` +
     (decay.length ? ` The In flight section decays fastest: ${andlist(decay)}.` : ``) +
     `</p>`;
 }
@@ -780,11 +828,19 @@ function buildOrder() {
      hide the card its children name as what they serve. */
   /* marketlake: and when nothing here is ranked, every card shows. Until issue
      873 the board on GitHub Pages carries no ranking, and the ranked-only view
-     then drew 0 cards under "All" and only the parents under "MVP 2". */
-  UNRANKED = !open.some(c => rankMark(c));
+     then drew 0 cards under "All" and only the parents under "MVP 2". A ranked
+     card in flight still counts, because more() would then write, in the line
+     above the board, that nothing in the milestone is ranked, and that was false
+     while every ranked card was in flight. A deferred card counts as unranked,
+     through `rankMark`, as it does for its chip and for the ranked-only view. */
+  UNRANKED = !TRACKER.some(c => inMs(c) && rankMark(c));
   const rest = open.filter(c => SHOW_ALL || UNRANKED || rankMark(c) ||
     (MS !== MS_ALL && c.kind === "parent"));
   SHOWN = rest.length; HIDDEN = open.length - rest.length;
+  /* marketlake: more() names the ranked cards and the parents apart, because a
+     parent shown beside them is not ranked, and with every ranked card in flight
+     the board holds only parents. */
+  SHOWN_RANKED = rest.filter(c => rankMark(c)).length;
   /* Relaxed to a fixed point rather than resolved in one walk, so a card ends up
      right of everything it waits on however the list happens to be ordered. */
   const depth = new Map(TRACKER.map(c => [c.n, 0]));
@@ -870,7 +926,7 @@ function buildOrder() {
            said plainly instead of being warned about. */
         const loose = p.partOf
           ? `<span class="nolink">part of #${c.n}, which stays open for what this does not do</span>`
-          : p.linked ? "" : `<span class="nolink">${p.state === "merged"
+          : isLinked(p) ? "" : `<span class="nolink">${p.state === "merged"
           ? `merged with no closing link, so #${c.n} is still open and has to be closed by hand`
           : `no closing link registered, so merging will leave #${c.n} open`}</span>`;
         prline += `<div class="pr">
@@ -1170,6 +1226,24 @@ function buildOrder() {
      second word for it. */
   const rankedBehind = ranked.filter(c => c.needs.some(b => by.has(b)))
     .sort((a, b) => rankPos.get(a.n) - rankPos.get(b.n));
+  /* marketlake: why no card below carries a position, read off the ranking's
+     entries that fall in the chosen view. Reading `NEXT.length` alone said a
+     card was ranked that nobody could take when the only ranked card sat in
+     another milestone, free. It said the same of a card in flight, which can be
+     planned with nobody on it and so free as well. Only a deferred card is one
+     the ranking itself says nobody should take. */
+  const unkeyed = () => {
+    const onTracker = NEXT_SORTED.map(it => by.get(it.issue)).filter(Boolean);
+    const here = onTracker.filter(inMs);
+    const where = MS === MS_ALL ? "" : ` in ${esc(MS)}`;
+    if (!NEXT.length) return "nothing is ranked";
+    if (!here.length) return onTracker.length ? `nothing${where} is ranked`
+      : "nothing left in the ranking is a card anybody can take";
+    if (here.every(c => c.kind === "deferred"))
+      return `nothing${here.length < onTracker.length ? where : ""} left in the ranking ` +
+        `is a card anybody can take`;
+    return `every ranked card${where} is in the In flight section above`;
+  };
   const keys = [];
   if (inRest(c => planOf.has(c.n))) keys.push("how finished the plan is");
   if (ranked.length) keys.push("priority");
@@ -1189,8 +1263,7 @@ function buildOrder() {
       : ``) +
     (inRest(c => c.kind === "deferred")
       ? `Anything deferred on purpose sorts last whatever the rest of that says. ` : ``) +
-    (ranked.length ? `` : `Priority is not a key today, because nothing left in the ranking ` +
-      `is a card anybody can take. `) +
+    (ranked.length ? `` : `Priority is not a key today, because ${unkeyed()}. `) +
     `Pick a card to trace its chain.`;
 
   /* Counted rather than written down, because both numbers move whenever a card
@@ -1239,7 +1312,8 @@ function buildOrder() {
      is the single authority for both. This note keeps only what the depth graph
      itself knows, so the two cannot say different things about one card. */
   document.getElementById("boardnote").innerHTML =
-    `<b>${free.length} cards are free for a session to take today</b>, out of ${bucket[0].length} in the ` +
+    `<b>${plu(free.length, "card")} ${free.length === 1 ? "is" : "are"} free for a session to take ` +
+    `today</b>, out of ${bucket[0].length} in the ` +
     `first column${free.length ? `: ${free.map(c => "#" + c.n).join(", ")}` : ""}. ` +
     (held.length
       ? `${plu(held.length, "card")} there ${held.length === 1 ? "is" : "are"} not free, ` +
@@ -1255,8 +1329,8 @@ function buildOrder() {
       : `Nothing sits behind more than one thing any more, so the graph is one level deep. `) +
     (most
       ? (unblocks.length === 1
-          ? `<b>#${unblocks[0].n} is the single card whose landing frees the most</b>, at ${most} others. `
-          : `<b>${andlist(unblocks.map(x => "#" + x.n))} each free ${most} others</b>, and nothing frees more. `)
+          ? `<b>#${unblocks[0].n} is the single card whose landing frees the most</b>, at ${plu(most, "other")}. `
+          : `<b>${andlist(unblocks.map(x => "#" + x.n))} each free ${plu(most, "other")}</b>, and nothing frees more. `)
       : `No card here is waiting on another, so nothing is freed by landing anything. `) +
     (flownTop.length
       ? `${andlist(flownTop.map(x => "#" + x.n))} ${flownTop.length === 1 ? "is" : "are"} in the ` +
@@ -1494,7 +1568,7 @@ function inFlight(ctx) {
      branches are rather than under a board that no longer draws them. */
   const withPr = cols.filter((_, k) => FLOW[k].tone === "owner" || FLOW[k].tone === "mine").flat();
   const openPrs = c => (ctx.prOf.get(c.n) || []).filter(x => x.state === "open");
-  const loose = withPr.filter(c => openPrs(c).some(x => !x.linked && !x.partOf));
+  const loose = withPr.filter(c => openPrs(c).some(x => !isLinked(x) && !x.partOf));
   if (loose.length) bits.push(`<b>GitHub registered no closing link for ` +
     `${andlist(loose.map(c => "PR #" + openPrs(c)[0].pr))}</b>, so merging would leave ` +
     `${ns2(loose)} open`);
