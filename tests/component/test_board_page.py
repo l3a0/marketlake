@@ -312,9 +312,10 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
     assert text(result, "mscount") == "2 of 3 open"
     foot = text(result, "foot")
     assert foot.startswith(
-        "Built from GitHub against main at 5f0b12c by an Action after issue, comment, pull "
-        "request and check events and on a "
-        "schedule, and fetched again every 2 minutes, so every figure on it is current"
+        "Built from GitHub against main at 5f0b12c by an Action, which rebuilds it on most "
+        "issue and pull request activity, whenever CI or Infra finishes, and on a schedule. "
+        "The page fetches it again every 2 minutes, but every figure on it is current as of "
+        "the stamp above rather than live."
     )
     assert "Measured by hand" not in foot
 
@@ -409,13 +410,17 @@ DELETE = object()
 def _control() -> dict[str, Any]:
     """``board()`` carrying every optional field and every allowed value once.
 
-    It adds a plan, a session, a closed and a merged pull request with no ``partOf``,
-    and cards of the kinds ``data`` and ``decision``, one with ``after`` and no
-    ``labels``.
+    It adds a plan, a session with a ``kind`` and one without, a closed and a merged
+    pull request with no ``partOf``, cards of the kinds ``data`` and ``decision``, one
+    with ``after`` and no ``labels``, and a ranking entry with an ``order``.
     """
     doc = board()
     doc["planned"] = [{"n": 1, "passes": 2, "ready": "build"}]
-    doc["working"] = [{"n": 3, "kind": "plan", "what": "a decompose loop"}]
+    # A session with no `kind` reads as a decompose loop, so it may leave it out.
+    doc["working"] = [
+        {"n": 3, "kind": "plan", "what": "a decompose loop"},
+        {"n": 5, "what": "a loop with no kind"},
+    ]
     # Rounds writing the database board wrote `linked` as the closing references.
     for pr, issue_n, state, linked in ((41, 1, "closed", True), (42, 3, "merged", [3])):
         doc["prs"].append(
@@ -429,7 +434,7 @@ def _control() -> dict[str, Any]:
     ]  # fmt: skip
     doc["next"] += [
         {"issue": 4, "band": 1, "ready": "build"},
-        {"issue": 5, "band": 2, "ready": "decide"},
+        {"issue": 5, "band": 2, "order": 1, "ready": "decide"},
     ]
     doc["state"]["issues"]["open"] = 5
     return doc
@@ -471,8 +476,10 @@ REFUSED = {
     "rollup not a list": _set("prs.0.rollup", "success"),
     "rollup pair of three": _set("prs.0.rollup", [["test", "success", "x"]]),
     "rollup word a number": _set("prs.0.rollup", [["test", 1]]),
+    "rollup entry a two-character string": _set("prs.0.rollup", ["ab"]),
     "needs a string": _set("tracker.1.needs", QUOTE),
     "needs holds a string": _set("tracker.1.needs", ["1"]),
+    "needs holds a string after a number": _set("tracker.1.needs", [1, "1"]),
     "missing needs": _set("tracker.2.needs", DELETE),
     "after holds a string": _set("tracker.4.after", ["1"]),
     "labels holds a number": _set("tracker.0.labels", [1]),
@@ -484,6 +491,16 @@ REFUSED = {
     "updatedAt a number": _set("state.updatedAt", 1),
     "missing updatedAt": _set("state.updatedAt", DELETE),
     "working n a string": _set("working.0.n", "3"),
+    "working what a number": _set("working.0.what", 1),
+    "missing working what": _set("working.0.what", DELETE),
+    "working kind a number": _set("working.0.kind", 1),
+    "planned n a string": _set("planned.0.n", "1"),
+    "missing planned n": _set("planned.0.n", DELETE),
+    "next issue a string": _set("next.0.issue", "1"),
+    "missing next issue": _set("next.0.issue", DELETE),
+    "next band a string": _set("next.0.band", "1"),
+    "missing next band": _set("next.0.band", DELETE),
+    "next order a string": _set("next.2.order", "1"),
     "working item null": _set("working.0", None),
     "missing working": _set("working", DELETE),
     "planned item null": _set("planned.0", None),
@@ -518,6 +535,31 @@ def test_a_title_with_a_quote_is_escaped(tmp_path: Path) -> None:
     raw = run_page(tmp_path, [served(doc)])["ids"]["board"]["html"]
     assert "Don&#39;t draw &lt;b&gt;this&lt;/b&gt;" in raw
     assert "Don't" not in raw
+
+
+NO_LINK_CHIP = "no closing link registered, so merging will leave #2 open"
+NO_LINK_NOTE = "GitHub registered no closing link for PR #40 , so merging would leave #2 open"
+
+
+@pytest.mark.parametrize("linked", [[], [999], [1]], ids=["empty", "another", "another card"])
+def test_a_linked_list_not_naming_the_issue_draws_no_closing_link(
+    tmp_path: Path, linked: list[int]
+) -> None:
+    """A list of closing references links this card only when it names the card."""
+    doc = board()
+    doc["prs"][0]["linked"] = linked
+    result = run_page(tmp_path, [served(doc)])
+    assert NO_LINK_CHIP in text(result, "flow")
+    assert NO_LINK_NOTE in text(result, "flownote")
+
+
+@pytest.mark.parametrize("linked", [True, [2], [999, 2]], ids=["true", "the issue", "among others"])
+def test_a_linked_list_naming_the_issue_draws_as_linked(tmp_path: Path, linked: Any) -> None:
+    doc = board()
+    doc["prs"][0]["linked"] = linked
+    result = run_page(tmp_path, [served(doc)])
+    assert "no closing link" not in text(result, "flow")
+    assert "no closing link" not in text(result, "flownote")
 
 
 def _throws() -> dict[str, Any]:
@@ -614,20 +656,85 @@ def test_a_ranked_card_keeps_the_ranked_only_view(tmp_path: Path) -> None:
     doc["next"] = [{"issue": 638, "band": 1, "ready": "plan"}]
     result = run_page(tmp_path, [served(doc)])
     assert cards(result, "board") == {638, 755}
-    assert text(result, "more").startswith("Showing the 2 ranked cards in MVP 2.")
+    # #755 is a parent, shown because its children serve it, and not a ranked card.
+    assert text(result, "more") == (
+        "Showing the 1 ranked card and 1 parent in MVP 2. 1 other open issue in MVP 2 is not "
+        "in the priority order. Show all 3"
+    )
+
+
+IN_FLIGHT_NOTE = (
+    "Priority is not a key today, because every ranked card in MVP 2 is in the In flight "
+    "section above. Pick a card to trace its chain."
+)
 
 
 def test_a_ranked_card_in_flight_keeps_the_ranked_only_view(tmp_path: Path) -> None:
-    """Saying nothing in the milestone is ranked would be false while #2 is."""
+    """Saying nothing in the milestone is ranked would be false while #2 is.
+
+    A card in flight can be planned with nobody on it, so the note does not call it a
+    card nobody can take.
+    """
     doc = board()
     doc["next"] = [{"issue": 2, "band": 1, "ready": "plan"}]
     result = run_page(tmp_path, [served(doc)])
     assert cards(result, "flow") == {2}
     assert cards(result, "board") == set()
-    assert text(result, "more").startswith("Showing the 0 ranked cards in MVP 2.")
-    assert text(result, "ordernote").endswith(
-        "Priority is not a key today, because nothing left in the ranking is a card anybody "
-        "can take. Pick a card to trace its chain."
+    assert text(result, "more") == (
+        "Every ranked card in MVP 2 is in flight, so no card is showing here. 1 other open "
+        "issue in MVP 2 is not in the priority order. Show all 1"
+    )
+    assert text(result, "ordernote").endswith(IN_FLIGHT_NOTE)
+
+
+def test_with_every_ranked_card_in_flight_and_nothing_hidden_the_line_says_why(
+    tmp_path: Path,
+) -> None:
+    """An empty board with no word of why reads as a board that failed to draw."""
+    doc = board()
+    del doc["tracker"][0]
+    doc["state"]["issues"]["open"] = 2
+    doc["next"] = [{"issue": 2, "band": 1, "ready": "plan"}]
+    result = run_page(tmp_path, [served(doc)])
+    assert cards(result, "flow") == {2}
+    assert cards(result, "board") == set()
+    assert (
+        text(result, "more")
+        == "Every ranked card in MVP 2 is in flight, so no card is showing here."
+    )
+
+
+def test_with_every_ranked_card_in_flight_a_parent_is_not_called_ranked(tmp_path: Path) -> None:
+    doc = board()
+    doc["tracker"].append(
+        {"n": 4, "label": "Fourth", "labels": [], "ms": "MVP 2", "kind": "parent", "needs": []}
+    )
+    doc["next"] = [{"issue": 2, "band": 1, "ready": "plan"}]
+    result = run_page(tmp_path, [served(doc)])
+    assert cards(result, "board") == {4}
+    assert text(result, "more") == (
+        "Every ranked card in MVP 2 is in flight, so only 1 parent is showing here. 1 other "
+        "open issue in MVP 2 is not in the priority order. Show all 2"
+    )
+    assert text(result, "ordernote").endswith(IN_FLIGHT_NOTE)
+
+
+def test_a_ranked_parent_alone_in_the_ranking_keeps_the_ranked_only_view(
+    tmp_path: Path,
+) -> None:
+    """A parent the ranking names is ranked, so the milestone is not unranked."""
+    doc = board()
+    doc["tracker"].append(
+        {"n": 4, "label": "Fourth", "labels": [], "ms": "MVP 2", "kind": "parent", "needs": []}
+    )
+    doc["next"] = [{"issue": 4, "band": 1, "ready": "plan"}]
+    result = run_page(tmp_path, [served(doc)])
+    assert cards(result, "board") == {4}
+    more = text(result, "more")
+    assert not more.startswith("Nothing")
+    assert more == (
+        "Showing the 1 ranked card in MVP 2. 1 other open issue in MVP 2 is not in the "
+        "priority order. Show all 2"
     )
 
 
@@ -642,6 +749,11 @@ def test_a_deferred_card_alone_in_the_ranking_leaves_the_milestone_unranked(
     assert text(result, "more") == (
         "Nothing in MVP 2 is ranked yet, so the 1 open issue in MVP 2 not in flight is showing."
     )
+    # A deferred card is one the ranking says nobody should take, so this stays true.
+    assert text(result, "ordernote").endswith(
+        "Priority is not a key today, because nothing left in the ranking is a card anybody "
+        "can take. Pick a card to trace its chain."
+    )
 
 
 def test_a_ranking_in_another_milestone_leaves_this_one_unranked(tmp_path: Path) -> None:
@@ -651,6 +763,11 @@ def test_a_ranking_in_another_milestone_leaves_this_one_unranked(tmp_path: Path)
     assert cards(result, "board") == {638, 812}
     assert text(result, "more") == (
         "Nothing in MVP 2 is ranked yet, so all 2 open issues in MVP 2 not in flight are showing."
+    )
+    # #900 is free in MVP 3, so calling the ranking a list nobody can take is false.
+    assert text(result, "ordernote").endswith(
+        "Priority is not a key today, because nothing in MVP 2 is ranked. "
+        "Pick a card to trace its chain."
     )
 
 
@@ -668,6 +785,26 @@ def test_with_no_ranking_the_note_says_nothing_is_ranked(tmp_path: Path) -> None
     note = text(result, "ordernote")
     assert note.endswith(
         "Priority is not a key today, because nothing is ranked. Pick a card to trace its chain."
+    )
+
+
+def test_a_deferred_card_ranked_here_beside_a_free_one_elsewhere_names_the_milestone(
+    tmp_path: Path,
+) -> None:
+    """With #900 free in MVP 3, only the cards ranked in MVP 2 are ones nobody can take."""
+    doc = board()
+    doc["tracker"][0]["kind"] = "deferred"
+    doc["tracker"].append(
+        {"n": 900, "label": "Later", "labels": [], "ms": "MVP 3", "kind": "ready", "needs": []}
+    )
+    doc["next"] = [
+        {"issue": 1, "band": 1, "ready": "plan"},
+        {"issue": 900, "band": 1, "ready": "plan"},
+    ]
+    result = run_page(tmp_path, [served(doc)])
+    assert text(result, "ordernote").endswith(
+        "Priority is not a key today, because nothing in MVP 2 left in the ranking is a card "
+        "anybody can take. Pick a card to trace its chain."
     )
 
 
@@ -691,6 +828,29 @@ def test_the_board_note_agrees_in_number_for_a_tie_at_one(tmp_path: Path) -> Non
     )
     note = text(run_page(tmp_path, [served(doc)]), "boardnote")
     assert "#1 and #2 each free 1 other , and nothing frees more." in note
+
+
+def test_the_board_note_agrees_in_number_for_two(tmp_path: Path) -> None:
+    doc = _generated(
+        [issue(638), issue(759, blocked_by=(blocker(638),)), issue(760, blocked_by=(blocker(638),))]
+    )
+    note = text(run_page(tmp_path, [served(doc)]), "boardnote")
+    assert "#638 is the single card whose landing frees the most , at 2 others." in note
+
+
+def test_the_board_note_agrees_in_number_for_a_tie_at_two(tmp_path: Path) -> None:
+    doc = _generated(
+        [
+            issue(1),
+            issue(2),
+            issue(3, blocked_by=(blocker(1),)),
+            issue(4, blocked_by=(blocker(1),)),
+            issue(5, blocked_by=(blocker(2),)),
+            issue(6, blocked_by=(blocker(2),)),
+        ]
+    )
+    note = text(run_page(tmp_path, [served(doc)]), "boardnote")
+    assert "#1 and #2 each free 2 others , and nothing frees more." in note
 
 
 def test_the_page_carries_its_own_document_skeleton() -> None:

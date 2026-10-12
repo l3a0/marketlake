@@ -314,10 +314,9 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
 
    marketlake: the same page also runs on GitHub Pages, where it has no
    database. A GitHub Action there rebuilds board.json beside the page, and the
-   page fetches it every FETCH_EVERY milliseconds instead of subscribing. An
-   issue event, an issue comment, a pull request into main opening, updating,
-   reopening, closing or being edited, the CI or Infra workflow finishing, and a
-   schedule each start a run. A submitted review starts none. Issue 872 built that path beside the
+   page fetches it every FETCH_EVERY milliseconds instead of subscribing. The
+   `on:` block of .github/workflows/board.yml lists what starts a run, and a
+   submitted review starts none. Issue 872 built that path beside the
    database rather than in its place, because the artifact board stays the
    board of record until the skill stops writing it. The fetch starts only once
    the database lookup has settled with no database, so the two never race.
@@ -352,7 +351,7 @@ let SOURCE = { live: false, why: "loading" };
    else. */
 let SHOW_ALL = false;
 try { SHOW_ALL = localStorage.getItem("marketlake-board-all") === "1"; } catch (e) { SHOW_ALL = false; }
-let SHOWN = 0, HIDDEN = 0;
+let SHOWN = 0, HIDDEN = 0, SHOWN_RANKED = 0;
 /* marketlake: true when the chosen milestone holds no ranked card at all, in
    flight or not. The ranked-only view would then draw only parents, under a
    line calling them ranked, so buildOrder() draws every card instead. */
@@ -400,8 +399,16 @@ const allOf = f => xs => Array.isArray(xs) && xs.every(f);
    because a string in `needs` matches no card and silently frees a blocked one.
    `linked` also takes a list of issue numbers, because rounds writing the
    database board wrote the pull request's closing references there, and two of
-   their documents on 2026-10-09 did. The database path is the only one that
-   reads such a list, and it reads any list as linked, as it always has. */
+   their documents on 2026-10-09 did. `usable` serves both paths, so a
+   board.json holding such a list passes too. `isLinked` reads a list as linked
+   only when it names the entry's own issue, because an empty list, or one
+   naming another issue, registers no closing link for this card.
+
+   A ranking entry's `issue`, `band` and `order` feed the sort, and a string
+   there sorts by text or not at all. A plan's `n` and a session's `n` key the
+   maps the cards read, and a session's `what` is drawn, so a missing one would
+   draw "undefined". A session's `kind` may be absent, which reads as a
+   decompose loop, but it must be a string when present. */
 const ITEM_OK = {
   tracker: c => !!c && isNum(c.n) && isStr(c.label) && isStr(c.ms) &&
     oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && allOf(isNum)(c.needs) &&
@@ -411,10 +418,12 @@ const ITEM_OK = {
     isStr(p.review) && isBool(p.reviewed) && (isBool(p.linked) || allOf(isNum)(p.linked)) &&
     (p.partOf === undefined || isBool(p.partOf)) &&
     allOf(r => Array.isArray(r) && r.length === 2 && isStr(r[0]) && isStr(r[1]))(p.rollup),
-  working: w => !!w && isNum(w.n),
-  planned: p => !!p && isNum(p.passes) && oneOf(["build", "decide", "plan"])(p.ready),
-  next: x => !!x && oneOf(["build", "decide", "plan"])(x.ready)
+  working: w => !!w && isNum(w.n) && isStr(w.what) && (w.kind === undefined || isStr(w.kind)),
+  planned: p => !!p && isNum(p.n) && isNum(p.passes) && oneOf(["build", "decide", "plan"])(p.ready),
+  next: x => !!x && isNum(x.issue) && isNum(x.band) && (x.order === undefined || isNum(x.order)) &&
+    oneOf(["build", "decide", "plan"])(x.ready)
 };
+const isLinked = p => Array.isArray(p.linked) ? p.linked.indexOf(p.issue) >= 0 : p.linked === true;
 function usable(d) {
   if (!(d && d.state && isStr(d.state.main) && isStr(d.state.updatedAt) &&
         d.state.issues && isNum(d.state.issues.open))) return false;
@@ -489,14 +498,24 @@ function more() {
       : "";
     return;
   }
-  if (!HIDDEN && !SHOW_ALL) { el.innerHTML = ""; return; }
+  /* marketlake: a parent shown beside the ranked cards is not one of them, so
+     the line counts it apart. With every ranked card in flight the board holds
+     no ranked card at all, and the line says why, even with nothing hidden. */
+  const parents = SHOWN - SHOWN_RANKED;
+  const shown = SHOWN_RANKED
+    ? `Showing the ${plu(SHOWN_RANKED, "ranked card")}` +
+      `${parents ? ` and ${plu(parents, "parent")}` : ""}${where}. `
+    : `Every ranked card${where} is in flight, so ` +
+      `${parents ? `only ${plu(parents, "parent")} ${parents === 1 ? "is" : "are"} showing here`
+                 : "no card is showing here"}. `;
+  if (!HIDDEN && !SHOW_ALL && SHOWN_RANKED) { el.innerHTML = ""; return; }
   el.innerHTML = SHOW_ALL
     ? `<span>Showing all ${SHOWN} open issues${where} not in flight.</span>` +
       `<button type="button" data-toggle>Show only the ranked cards</button>`
-    : `<span>Showing the ${SHOWN} ranked ${SHOWN === 1 ? "card" : "cards"}${where}. ` +
-      `${HIDDEN} other open ${HIDDEN === 1 ? "issue" : "issues"}${where} ${HIDDEN === 1 ? "is" : "are"} not in the ` +
-      `priority order.</span>` +
-      `<button type="button" data-toggle>Show all ${SHOWN + HIDDEN}</button>`;
+    : `<span>${shown}` +
+      (HIDDEN ? `${HIDDEN} other open ${HIDDEN === 1 ? "issue" : "issues"}${where} ${HIDDEN === 1 ? "is" : "are"} not in the ` +
+        `priority order.` : ``) + `</span>` +
+      (HIDDEN ? `<button type="button" data-toggle>Show all ${SHOWN + HIDDEN}</button>` : ``);
   el.onclick = e => {
     if (!e.target.matches("[data-toggle]")) return;
     SHOW_ALL = !SHOW_ALL;
@@ -654,15 +673,20 @@ function stamped() {
      hand, so it says how it is built instead. Its figures still date from the
      stamp rather than from the moment of reading, so the decay clause holds for
      both. */
+  /* The Action's triggers are listed in board.yml's `on:` block. A check
+     settling starts no run by itself, and neither does a submitted review, so
+     the sentence names only what does. */
   const how = FETCHED
     ? `Built from GitHub against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span> by an Action after issue, comment, ` +
-      `pull request and check events and on a schedule, and fetched again every ` +
-      `${FETCH_EVERY / 60000} minutes`
+      `<span class="mono">${esc(STATE.main)}</span> by an Action, which rebuilds it on most ` +
+      `issue and pull request activity, whenever CI or Infra finishes, and on a schedule. ` +
+      `The page fetches it again every ${FETCH_EVERY / 60000} minutes, but every figure on it ` +
+      `is current as of the stamp above rather than live.`
     : `Measured by hand against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub`;
+      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll ` +
+      `GitHub, so every figure on it is current as of the stamp above rather than live.`;
   document.getElementById("foot").innerHTML =
-    `<p>${how}, so every figure on it is current as of the stamp above rather than live.` +
+    `<p>${how}` +
     (decay.length ? ` The In flight section decays fastest: ${andlist(decay)}.` : ``) +
     `</p>`;
 }
@@ -805,14 +829,18 @@ function buildOrder() {
   /* marketlake: and when nothing here is ranked, every card shows. Until issue
      873 the board on GitHub Pages carries no ranking, and the ranked-only view
      then drew 0 cards under "All" and only the parents under "MVP 2". A ranked
-     card in flight still counts, because the line below then says nothing in the
-     milestone is ranked, and that was false while every ranked card was in
-     flight. A deferred card counts as unranked, through `rankMark`, as it does
-     for its chip and for the ranked-only view. */
+     card in flight still counts, because more() would then write, in the line
+     above the board, that nothing in the milestone is ranked, and that was false
+     while every ranked card was in flight. A deferred card counts as unranked,
+     through `rankMark`, as it does for its chip and for the ranked-only view. */
   UNRANKED = !TRACKER.some(c => inMs(c) && rankMark(c));
   const rest = open.filter(c => SHOW_ALL || UNRANKED || rankMark(c) ||
     (MS !== MS_ALL && c.kind === "parent"));
   SHOWN = rest.length; HIDDEN = open.length - rest.length;
+  /* marketlake: more() names the ranked cards and the parents apart, because a
+     parent shown beside them is not ranked, and with every ranked card in flight
+     the board holds only parents. */
+  SHOWN_RANKED = rest.filter(c => rankMark(c)).length;
   /* Relaxed to a fixed point rather than resolved in one walk, so a card ends up
      right of everything it waits on however the list happens to be ordered. */
   const depth = new Map(TRACKER.map(c => [c.n, 0]));
@@ -898,7 +926,7 @@ function buildOrder() {
            said plainly instead of being warned about. */
         const loose = p.partOf
           ? `<span class="nolink">part of #${c.n}, which stays open for what this does not do</span>`
-          : p.linked ? "" : `<span class="nolink">${p.state === "merged"
+          : isLinked(p) ? "" : `<span class="nolink">${p.state === "merged"
           ? `merged with no closing link, so #${c.n} is still open and has to be closed by hand`
           : `no closing link registered, so merging will leave #${c.n} open`}</span>`;
         prline += `<div class="pr">
@@ -1198,6 +1226,24 @@ function buildOrder() {
      second word for it. */
   const rankedBehind = ranked.filter(c => c.needs.some(b => by.has(b)))
     .sort((a, b) => rankPos.get(a.n) - rankPos.get(b.n));
+  /* marketlake: why no card below carries a position, read off the ranking's
+     entries that fall in the chosen view. Reading `NEXT.length` alone said a
+     card was ranked that nobody could take when the only ranked card sat in
+     another milestone, free. It said the same of a card in flight, which can be
+     planned with nobody on it and so free as well. Only a deferred card is one
+     the ranking itself says nobody should take. */
+  const unkeyed = () => {
+    const onTracker = NEXT_SORTED.map(it => by.get(it.issue)).filter(Boolean);
+    const here = onTracker.filter(inMs);
+    const where = MS === MS_ALL ? "" : ` in ${esc(MS)}`;
+    if (!NEXT.length) return "nothing is ranked";
+    if (!here.length) return onTracker.length ? `nothing${where} is ranked`
+      : "nothing left in the ranking is a card anybody can take";
+    if (here.every(c => c.kind === "deferred"))
+      return `nothing${here.length < onTracker.length ? where : ""} left in the ranking ` +
+        `is a card anybody can take`;
+    return `every ranked card${where} is in the In flight section above`;
+  };
   const keys = [];
   if (inRest(c => planOf.has(c.n))) keys.push("how finished the plan is");
   if (ranked.length) keys.push("priority");
@@ -1217,9 +1263,7 @@ function buildOrder() {
       : ``) +
     (inRest(c => c.kind === "deferred")
       ? `Anything deferred on purpose sorts last whatever the rest of that says. ` : ``) +
-    (ranked.length ? `` : NEXT.length
-      ? `Priority is not a key today, because nothing left in the ranking is a card anybody can take. `
-      : `Priority is not a key today, because nothing is ranked. `) +
+    (ranked.length ? `` : `Priority is not a key today, because ${unkeyed()}. `) +
     `Pick a card to trace its chain.`;
 
   /* Counted rather than written down, because both numbers move whenever a card
@@ -1524,7 +1568,7 @@ function inFlight(ctx) {
      branches are rather than under a board that no longer draws them. */
   const withPr = cols.filter((_, k) => FLOW[k].tone === "owner" || FLOW[k].tone === "mine").flat();
   const openPrs = c => (ctx.prOf.get(c.n) || []).filter(x => x.state === "open");
-  const loose = withPr.filter(c => openPrs(c).some(x => !x.linked && !x.partOf));
+  const loose = withPr.filter(c => openPrs(c).some(x => !isLinked(x) && !x.partOf));
   if (loose.length) bits.push(`<b>GitHub registered no closing link for ` +
     `${andlist(loose.map(c => "PR #" + openPrs(c)[0].pr))}</b>, so merging would leave ` +
     `${ns2(loose)} open`);
