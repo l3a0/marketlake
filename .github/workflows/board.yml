@@ -10,10 +10,12 @@ name: Board
 # A "blocked by" link and a sub-issue start none, because GitHub Actions lists no
 # trigger for either, so they reach the board on the next scheduled run.
 #
-# Every trigger below except workflow_dispatch fires only once this file is on main,
-# and every one of them runs on the default branch, which is the only branch the
-# github-pages environment lets deploy. pull_request_target runs on a pull request's
-# base branch, so its filter admits only pull requests into main.
+# Every trigger below, workflow_dispatch included, fires only once this file is on
+# main. Every one but workflow_dispatch runs on the default branch.
+# pull_request_target runs on a pull request's base branch, so its filter admits only
+# pull requests into main. workflow_dispatch alone can run another ref, and what stops
+# such a run from deploying is the github-pages environment's deployment branch
+# policy, which names main only.
 #
 # Two rules keep strangers out of this workflow, and keep it inside the ruleset, which
 # refuses a merge while CodeQL reports a high or critical alert.

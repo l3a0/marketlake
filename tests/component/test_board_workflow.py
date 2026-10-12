@@ -65,7 +65,9 @@ def test_the_workflows_it_watches_exist_under_those_names() -> None:
 
 
 def test_one_cron_line_off_minute_zero() -> None:
+    """Twice an hour, as the sibling's ``8,38``, at minutes of its own."""
     (entry,) = _workflow()[True]["schedule"]
+    assert entry == {"cron": "19,49 * * * *"}
     minute, *rest = entry["cron"].split()
     assert rest == ["*", "*", "*", "*"]
     minutes = [int(m) for m in minute.split(",")]
@@ -118,30 +120,85 @@ def test_one_checkout_of_the_default_ref_keeping_no_credentials() -> None:
     assert checkout["with"] == {"persist-credentials": False}
 
 
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+def _strings(node: Any) -> list[str]:
+    """Every key and value in the parsed workflow that is a string."""
+    if isinstance(node, dict):
+        return [s for k, v in node.items() for s in _strings(k) + _strings(v)]
+    if isinstance(node, list):
+        return [s for v in node for s in _strings(v)]
+    return [node] if isinstance(node, str) else []
+
+
 def test_the_only_expressions_are_the_token_and_the_page_address() -> None:
-    """No expression can carry an event's text into a step."""
+    """No expression can carry an event's text into a step.
+
+    The file's text and every string YAML parses out of it are both searched, and an
+    expression may span a line break, which a folded or literal block allows.
+    """
+    expected = ["github.token", "steps.deployment.outputs.page_url"]
     text = WORKFLOW.read_text(encoding="utf-8")
-    found = sorted({" ".join(e.split()) for e in re.findall(r"\$\{\{(.*?)\}\}", text)})
-    assert found == ["github.token", "steps.deployment.outputs.page_url"]
+    assert sorted({" ".join(e.split()) for e in EXPRESSION.findall(text)}) == expected
+    parsed = {" ".join(e.split()) for s in _strings(_workflow()) for e in EXPRESSION.findall(s)}
+    assert sorted(parsed) == expected
     for step in _steps():
         assert "${{" not in step.get("run", ""), step
 
 
-def test_the_build_runs_the_generator_and_adds_the_page() -> None:
-    runs = [" ".join(s["run"].split()) for s in _jobs()["board-build"]["steps"] if "run" in s]
-    assert any(
-        r.startswith("python3 .claude/skills/sync-prune-next/build_board.py build") for r in runs
-    )
-    assert "cp .claude/skills/sync-prune-next/board.html _site/index.html" in runs
-    (build,) = [s for s in _jobs()["board-build"]["steps"] if "build_board.py" in s.get("run", "")]
-    assert build["env"] == {"GH_TOKEN": "${{ github.token }}"}
+def test_the_expression_search_spans_line_breaks() -> None:
+    """The control for the search above: a split expression is still found."""
+    folded = yaml.safe_load("run: |\n  echo ${{\n    github.event.issue.title }}\n")
+    assert [" ".join(e.split()) for e in EXPRESSION.findall(folded["run"])] == [
+        "github.event.issue.title"
+    ]
+
+
+SHA = re.compile(r"@[0-9a-f]{40}$")
+
+
+def _unpinned(step: dict[str, Any]) -> dict[str, Any]:
+    """A step with its action's commit replaced, so the shape compares without it."""
+    return {k: SHA.sub("@<sha>", v) if k == "uses" else v for k, v in step.items()}
+
+
+def test_the_build_runs_exactly_the_generator_and_the_copy() -> None:
+    """Any other step could read the payload, or publish something else."""
+    steps = [_unpinned(s) for s in _jobs()["board-build"]["steps"]]
+    for step in steps:
+        if "run" in step:
+            step["run"] = " ".join(step["run"].split())
+    assert steps == [
+        {"uses": "actions/checkout@<sha>", "with": {"persist-credentials": False}},
+        {
+            "name": "Build board.json from GitHub",
+            "env": {"GH_TOKEN": "${{ github.token }}"},
+            "run": "python3 .claude/skills/sync-prune-next/build_board.py build"
+            ' --repo "$GITHUB_REPOSITORY" --out _site',
+        },
+        {
+            "name": "Add the page",
+            "run": "cp .claude/skills/sync-prune-next/board.html _site/index.html",
+        },
+        {"uses": "actions/upload-pages-artifact@<sha>", "with": {"path": "_site"}},
+    ]
     for path in ("build_board.py", "board.html"):
         assert (ROOT / ".claude" / "skills" / "sync-prune-next" / path).is_file()
 
 
-def test_each_job_sets_a_timeout() -> None:
-    for name, job in _jobs().items():
-        assert isinstance(job.get("timeout-minutes"), int), name
+def test_the_deploy_runs_exactly_the_one_deploy_step() -> None:
+    """``id: deployment`` is what the environment's address reads its URL from."""
+    steps = [_unpinned(s) for s in _jobs()["board-deploy"]["steps"]]
+    assert steps == [{"id": "deployment", "uses": "actions/deploy-pages@<sha>"}]
+
+
+def test_each_job_sets_a_ten_minute_timeout() -> None:
+    """Ten minutes bounds a hung step far inside GitHub's default of 360."""
+    assert {name: job.get("timeout-minutes") for name, job in _jobs().items()} == {
+        "board-build": 10,
+        "board-deploy": 10,
+    }
 
 
 def test_no_other_workflow_uses_the_boards_job_names() -> None:
