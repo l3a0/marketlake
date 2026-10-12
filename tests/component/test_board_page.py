@@ -39,6 +39,7 @@ from typing import Any
 
 import pytest
 
+from lake import favicon
 from tests.support.board_github import (
     REPO,
     SKILL,
@@ -897,7 +898,7 @@ def check_icon(icon: bytes) -> None:
     reserved, kind, count = struct.unpack_from("<HHH", icon, 0)
     assert (reserved, kind) == (0, 1)
     entries = [icon[6 + 16 * i : 22 + 16 * i] for i in range(count)]
-    assert sorted(entry[0] or 256 for entry in entries) == [16, 32, 48, 256]
+    assert sorted(entry[0] or 256 for entry in entries) == [16, 32, 48]
     spans = []
     for entry in entries:
         width, height = entry[0] or 256, entry[1] or 256
@@ -926,3 +927,14 @@ def test_the_page_links_its_icon_and_the_icon_is_one() -> None:
     (link,) = icon_links(PAGE.read_text(encoding="utf-8"))
     assert (link["href"], link.get("sizes")) == ("favicon.ico", "any")
     check_icon((SKILL / "favicon.ico").read_bytes())
+
+
+def test_the_shipped_icon_is_exactly_what_the_renderer_draws() -> None:
+    """Protects the board's icon from drifting away from its grid (#886).
+
+    ``python -m lake.favicon --board`` draws the icon from the dashboard's mark, the
+    tick and the board's ink. Comparing the shipped file with that render means the
+    checked-in binary is never the only record of the icon, as with the dashboard's.
+    A grid, an ink or a size changed without regenerating the file fails here.
+    """
+    assert (SKILL / "favicon.ico").read_bytes() == favicon.render_board()
