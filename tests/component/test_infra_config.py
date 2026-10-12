@@ -72,8 +72,10 @@
     tag and value. A mismatch applies cleanly, and every start then fails silently at
     07:30.
 21. Whether every day the roster in ``lake.deploy_window`` runs has a start, early
-    enough for the day's first unit and late enough that the stop cannot power the VM
-    off again before the day's span.
+    enough for the day's first unit and for marketlake-up's morning check, and late
+    enough that the stop cannot power the VM off again before the day's span. The
+    bounds read that check's timer from ``lake.control_plane`` and the stop's uptime
+    grace from ``deploy/vm-stop.sh``, rather than from copies.
 
 A ``module`` block would hide its resources from every check here, so neither
 configuration may call one.
@@ -103,15 +105,17 @@ import fnmatch
 import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import hcl2
 import pytest
 
-from lake import deploy_window
+from lake import control_plane, deploy_window
 from lake.calendar import MARKET_TZ
 
 INFRA = Path(__file__).resolve().parents[2] / "infra"
+VM_STOP = INFRA.parent / "deploy" / "vm-stop.sh"
 
 _OPTIONS = hcl2.SerializationOptions(
     strip_string_quotes=True, explicit_blocks=False, with_comments=False
@@ -920,18 +924,27 @@ def test_scheduler_role_starts_the_vm_by_its_own_tag() -> None:
 
 
 # The three bounds below come from #865's item 7.8. The roster and MARGIN come from
-# lake.deploy_window. Two of the numbers belong to the stop that #868 builds, so no
-# constant in src/lake holds them yet, and they are written here until it does.
+# lake.deploy_window. The other two numbers belong to the stop that #868 built, and the
+# bounds read both from where the VM reads them rather than from a copy (#871).
+#
+# marketlake-up's timer, the morning check that pages when the VM is not up, is a unit
+# lake.control_plane renders, so the bounds read its time and days from that unit. Every
+# host renders the same schedule, so this host's paths are placeholders.
+_ANY_HOST = control_plane.SystemdHost(python="/p/python", owner="o", home="/h", project_dir="/h/m")
 
-# marketlake-up's 07:40 timer, the morning check that pages when the VM is not up (#868).
-# A copy of the value PR #869 defines in code, which #871 replaces with a read of it once
-# both pull requests merge.
-VM_UP_AT = time(7, 40)
-
-# The stop leaves a VM alone for its first hour of uptime (#868). A copy of the value
-# PR #869 defines in deploy/vm-stop.sh, which #871 replaces with a read of it once both
-# pull requests merge.
-STOP_UPTIME_GRACE = timedelta(hours=1)
+# The stop leaves a VM alone for its first stretch of uptime. marketlake-stop.service runs
+# deploy/vm-stop.sh from the checkout and nothing renders it, so the bounds parse the
+# script's one assignment. The one form they can read is a line that assigns a number and
+# nothing else, written without a leading zero, since bash reads one as octal. Any other
+# form fails here rather than being read wrongly, and so does any second line that names
+# the variable other than as a $ read. That includes a bare name inside (( )), which
+# only reads it, so the parse refuses more than it must. A comment line is skipped.
+_UPTIME_FORM = "UPTIME_SECONDS=<digits>"
+# [0-9] rather than \d, which also matches digits bash does not read, such as Arabic-Indic.
+_UPTIME_ASSIGNMENT = re.compile(r"UPTIME_SECONDS=(0|[1-9][0-9]*)")
+# A $ read, as $UPTIME_SECONDS or ${UPTIME_SECONDS}, sets nothing.
+_UPTIME_READ = re.compile(r"\$UPTIME_SECONDS\b|\$\{UPTIME_SECONDS\}")
+_UPTIME_NAME = re.compile(r"\bUPTIME_SECONDS\b")
 
 # The time a weekday start allows for the VM to boot from stopped and its units to come up
 # before marketlake-up checks it. No boot from stopped has been timed on this VM yet, so
@@ -963,30 +976,47 @@ def _cron_start(expression: str) -> tuple[time, set[int]]:
     return time(int(hour), int(minute)), days
 
 
+def _uptime_grace(script: str) -> timedelta:
+    """The stop's uptime grace, read from the one line of ``script`` that sets it."""
+    naming = [
+        line
+        for line in script.splitlines()
+        if not line.lstrip().startswith("#") and _UPTIME_NAME.search(_UPTIME_READ.sub("", line))
+    ]
+    assert len(naming) == 1, (
+        f"the bounds read one line {_UPTIME_FORM}, and {len(naming)} lines name "
+        f"UPTIME_SECONDS: {naming!r}"
+    )
+    match = _UPTIME_ASSIGNMENT.fullmatch(naming[0])
+    assert match, f"the bounds read only a line {_UPTIME_FORM}, not {naming[0]!r}"
+    return timedelta(seconds=int(match.group(1)))
+
+
 # Five weeks, which cross the end of daylight saving time on 2026-11-01 and the early
 # close on 2026-11-27.
 _BOUND_DAYS = [date(2026, 10, 26) + timedelta(days=offset) for offset in range(35)]
 
 
-@pytest.mark.parametrize(
-    "address", ["aws_scheduler_schedule.start_weekday", "aws_scheduler_schedule.start_sunday"]
-)
-def test_start_schedule_fits_the_roster(address: str) -> None:
-    """Moving a job or a start fails here rather than at the open. Each start must
+def _check_start(address: str, at: time, days: set[int], stop_script: Path) -> int:
+    """Check a start at ``at`` on ``days`` against the three bounds on every day of
+    ``_BOUND_DAYS`` it fires, and return how many days it checked. Each start must
 
     1. come at least ``START_LEAD`` before the earliest roster unit of its day,
-    2. on a weekday, come more than ``BOOT_ALLOWANCE`` before ``VM_UP_AT``, and
-    3. end its uptime grace after ``MARGIN`` before the next refused span, so the stop's
-       span check already refuses when the grace lets go.
+    2. on a day marketlake-up checks the VM, come more than ``BOOT_ALLOWANCE`` before
+       that check, at the time and on the days ``control_plane.vm_up_job`` renders, and
+    3. end the stop's uptime grace, read from ``stop_script``, at a moment the stop's
+       own rule, ``deploy_window.decide``, refuses, so the window check already holds
+       the VM up when the grace lets go.
 
-    The third bound is strict. ``deploy_window`` still allows a stop at exactly
-    ``MARGIN`` before a span, 04:30 on a weekday and 16:00 on a Sunday, so a weekday
-    start at 03:30 or a Sunday start at 15:00 would pass the first two bounds and power
-    off before the session, with nothing to start the VM again.
+    The third bound asks ``decide`` itself rather than restating its rule. ``decide``
+    still allows a stop at exactly ``MARGIN`` before a span, 04:30 on a weekday and
+    16:00 on a Sunday, so a weekday start at 03:30 or a Sunday start at 15:00 with an
+    hour's grace would pass the first two bounds and power off before the session, with
+    nothing to start the VM again.
     """
-    body = _schedules()[address]
-    assert body["schedule_expression_timezone"] == str(MARKET_TZ)
-    at, days = _cron_start(body["schedule_expression"])
+    vm_up = control_plane.vm_up_job(_ANY_HOST).schedule
+    assert vm_up is not None, "marketlake-up has no timer, so bound 2 reads nothing"
+    grace = _uptime_grace(stop_script.read_text())
     units = deploy_window.default_units()
     checked = 0
     for day in _BOUND_DAYS:
@@ -1003,17 +1033,141 @@ def test_start_schedule_fits_the_roster(address: str) -> None:
             f"{address} starts at {start:%H:%M} on {day}, less than "
             f"{START_LEAD} before the first unit at {min(todays):%H:%M}"
         )
-        if day.weekday() < 5:
-            assert start + BOOT_ALLOWANCE < datetime.combine(day, VM_UP_AT, tzinfo=MARKET_TZ), (
-                f"{address} starts at {at}, which leaves less than {BOOT_ALLOWANCE} to boot "
-                f"before marketlake-up at {VM_UP_AT}"
+        if day.weekday() in vm_up.days:
+            assert start + BOOT_ALLOWANCE < vm_up.at.on(day), (
+                f"{address} starts at {start:%H:%M} on {day}, which leaves less than "
+                f"{BOOT_ALLOWANCE} to boot before marketlake-up at {vm_up.at.on(day):%H:%M}"
             )
-        span = deploy_window.spans_from(start, units)[0]
-        assert start + STOP_UPTIME_GRACE > span.start - deploy_window.MARGIN, (
-            f"{address}'s grace ends on {day} while the span check still allows a stop"
+        released = start + grace
+        assert deploy_window.decide(released, units).code == deploy_window.REFUSED, (
+            f"{address}'s grace ends at {released:%H:%M} on {day}, when deploy_window "
+            "still allows a stop"
         )
         checked += 1
+    return checked
+
+
+@pytest.mark.parametrize(
+    "address", ["aws_scheduler_schedule.start_weekday", "aws_scheduler_schedule.start_sunday"]
+)
+def test_start_schedule_fits_the_roster(address: str) -> None:
+    """Moving a job or a start fails here rather than at the open. ``_check_start``
+    names the three bounds each start must meet."""
+    body = _schedules()[address]
+    assert body["schedule_expression_timezone"] == str(MARKET_TZ)
+    at, days = _cron_start(body["schedule_expression"])
+    checked = _check_start(address, at, days, VM_STOP)
     assert checked >= 5, f"{address} fired on {checked} of the days checked"
+
+
+_WEEKDAYS = {0, 1, 2, 3, 4}
+_BOUND_2_FAILS = "to boot before marketlake-up"
+_BOUND_3_FAILS = "when deploy_window still allows a stop"
+
+
+def _stub_vm_up(
+    monkeypatch: pytest.MonkeyPatch, at: control_plane.WallClockTime, days: tuple[int, ...]
+) -> None:
+    """Make ``control_plane.vm_up_job`` render a timer at ``at`` on ``days``."""
+    schedule = control_plane.Schedule(at, days)
+    monkeypatch.setattr(control_plane, "vm_up_job", lambda host: SimpleNamespace(schedule=schedule))
+
+
+def _script(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "vm-stop.sh"
+    path.write_text(text)
+    return path
+
+
+def test_bound_2_fails_a_start_that_leaves_too_little_to_boot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 07:30 start leaves exactly ``BOOT_ALLOWANCE`` before a 07:35 check, which bound 2
+    refuses, and one minute more before a 07:36 check, which it allows."""
+    script = _script(tmp_path, "UPTIME_SECONDS=3600\n")
+    _stub_vm_up(monkeypatch, control_plane.WallClockTime(7, 35), (0, 1, 2, 3, 4))
+    with pytest.raises(AssertionError, match=_BOUND_2_FAILS):
+        _check_start("test", time(7, 30), _WEEKDAYS, script)
+    _stub_vm_up(monkeypatch, control_plane.WallClockTime(7, 36), (0, 1, 2, 3, 4))
+    assert _check_start("test", time(7, 30), _WEEKDAYS, script) == 25
+
+
+def test_bound_2_reads_the_days_of_the_timer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timer that also fires on Sunday puts the Sunday evening start under bound 2."""
+    script = _script(tmp_path, "UPTIME_SECONDS=3600\n")
+    _stub_vm_up(monkeypatch, control_plane.WallClockTime(7, 40), (0, 1, 2, 3, 4, 6))
+    with pytest.raises(AssertionError, match=_BOUND_2_FAILS):
+        _check_start("test", time(19, 30), {6}, script)
+
+
+def test_bound_3_fails_a_grace_that_ends_while_a_stop_is_allowed(tmp_path: Path) -> None:
+    """A 04:00 start with a 20-minute grace lets go at 04:20, before 04:30, the last
+    moment ``decide`` allows a stop before the session. A 30-minute grace lets go at
+    04:30 itself, which ``decide`` still allows. An hour lets go at 05:00."""
+    for seconds in [1200, 1800]:
+        short = _script(tmp_path, f"UPTIME_SECONDS={seconds}\n")
+        with pytest.raises(AssertionError, match=_BOUND_3_FAILS):
+            _check_start("test", time(4, 0), _WEEKDAYS, short)
+    hour = _script(tmp_path, "UPTIME_SECONDS=3600\n")
+    assert _check_start("test", time(4, 0), _WEEKDAYS, hour) == 25
+
+
+def test_uptime_grace_reads_the_assignment_and_skips_the_reads() -> None:
+    """Bound 3 has hours of slack on both live starts, so no grace of zero or more turns it
+    red, and a wrong read would pass it. The read is checked here instead, on a value the
+    live script does not hold."""
+    script = (
+        "#!/bin/bash\n"
+        "# UPTIME_SECONDS=7200 in a comment sets nothing.\n"
+        "#UPTIME_SECONDS=7200\n"
+        "  # UPTIME_SECONDS=7200 in an indented comment sets nothing.\n"
+        "MAX_UPTIME_SECONDS=86400\n"
+        "set -euo pipefail\n"
+        "\n"
+        "UPTIME_SECONDS=1800\n"
+        "POWEROFF_WAIT=240\n"
+        'if [[ "$UP" -lt "$UPTIME_SECONDS" ]]; then\n'
+        '  refuse "2 (uptime)" "up $UP seconds, less than ${UPTIME_SECONDS}"\n'
+        "fi\n"
+    )
+    assert _uptime_grace(script) == timedelta(minutes=30)
+    assert _uptime_grace("UPTIME_SECONDS=0\n") == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "set -euo pipefail\nPOWEROFF_WAIT=240\n",
+        "readonly UPTIME_SECONDS=3600\n",
+        "export UPTIME_SECONDS=3600\n",
+        "declare -r UPTIME_SECONDS=3600\n",
+        "  UPTIME_SECONDS=3600\n",
+        'UPTIME_SECONDS="3600"\n',
+        'UPTIME_SECONDS="${X:-3600}"\n',
+        ': "${UPTIME_SECONDS:=3600}"\n',
+        "UPTIME_SECONDS=$((60*60))\n",
+        "UPTIME_SECONDS=03600\n",
+        # A 3 followed by Arabic-Indic digits, which int() reads as 3600 and bash does not.
+        "UPTIME_SECONDS=3٦٠٠\n",
+        "UPTIME_SECONDS=3600  # an hour\n",
+        "UPTIME_SECONDS=3600\nUPTIME_SECONDS=1800\n",
+        "UPTIME_SECONDS=3600\nUPTIME_SECONDS=60  # for a test\n",
+        'UPTIME_SECONDS=3600\n[[ -n "${FAST:-}" ]] && UPTIME_SECONDS=60\n',
+        "UPTIME_SECONDS=3600\nreadonly UPTIME_SECONDS\n",
+    ],
+)
+def test_uptime_grace_refuses_any_other_form(script: str) -> None:
+    """A form the parse cannot read fails, naming the one form it reads, rather than
+    handing bound 3 a number the script does not use."""
+    with pytest.raises(AssertionError, match=re.escape(_UPTIME_FORM)):
+        _uptime_grace(script)
+
+
+def test_uptime_grace_reads_the_stop_script() -> None:
+    """The live script is written in the one form the parse reads."""
+    assert isinstance(_uptime_grace(VM_STOP.read_text()), timedelta)
 
 
 def test_every_day_the_roster_runs_has_a_start() -> None:
