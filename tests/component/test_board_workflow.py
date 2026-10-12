@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "board.yml"
 JOBS = {"board-build", "board-deploy"}
+SKILL_DIR = ".claude/skills/sync-prune-next"
+SKILL = ROOT / SKILL_DIR
 
 
 def _workflow(path: Path = WORKFLOW) -> dict[Any, Any]:
@@ -132,11 +134,33 @@ def test_the_build_runs_the_generator_and_adds_the_page() -> None:
     assert any(
         r.startswith("python3 .claude/skills/sync-prune-next/build_board.py build") for r in runs
     )
-    assert "cp .claude/skills/sync-prune-next/board.html _site/index.html" in runs
+    assert any(
+        r.startswith("cp .claude/skills/sync-prune-next/board.html _site/index.html") for r in runs
+    )
     (build,) = [s for s in _jobs()["board-build"]["steps"] if "build_board.py" in s.get("run", "")]
     assert build["env"] == {"GH_TOKEN": "${{ github.token }}"}
     for path in ("build_board.py", "board.html"):
         assert (ROOT / ".claude" / "skills" / "sync-prune-next" / path).is_file()
+
+
+def test_the_icon_is_published_where_the_page_links_it() -> None:
+    """Protects the board's tab from a blank icon (#884).
+
+    The page links its icon by a relative address, so Pages serves it only when the
+    step that adds the page puts the icon in the same folder under that name. A step
+    that dropped the copy, or a page that renamed the link, would leave a browser
+    asking for a file that is not there. The icon's copy runs only after the page's
+    copy succeeds, so joining the two with ``||`` would skip it on every run that works.
+    """
+    page = (SKILL / "board.html").read_text(encoding="utf-8")
+    href = re.search(r'<link rel="icon" href="([^"]+)"', page)
+    assert href, "the page links no icon"
+    href = href.group(1)
+    (step,) = [s for s in _jobs()["board-build"]["steps"] if s.get("name") == "Add the page"]
+    assert " ".join(step["run"].split()) == (
+        f"cp {SKILL_DIR}/board.html _site/index.html && cp {SKILL_DIR}/{href} _site/{href}"
+    )
+    assert (SKILL / href).is_file()
 
 
 def test_each_job_sets_a_timeout() -> None:

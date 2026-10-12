@@ -313,6 +313,11 @@ database, and on Pages, where it finds none, it fetches `board.json`.
 `board-harness.js` reaches only the database path, and
 `tests/component/test_board_page.py` runs the fetch path.
 
+`favicon.ico` beside this skill is the page's tab icon. The page links it as
+`favicon.ico`, and the workflow's "Add the page" step copies it beside
+`index.html`, so renaming it means changing the link, that copy and the two
+tests that check them together.
+
 ### Switching to another board
 
 To move the round to another board, the owner writes the new board's URL into

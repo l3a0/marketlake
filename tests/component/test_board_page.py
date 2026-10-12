@@ -30,6 +30,7 @@ import html
 import json
 import re
 import shutil
+import struct
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -550,3 +551,25 @@ def test_the_page_carries_its_own_document_skeleton() -> None:
     assert re.search(r"\n  body \{ margin: 0;", markup)
     assert "\n  [hidden] { display: none !important; }\n" in markup
     assert PAGE.read_text(encoding="utf-8").endswith("</script>\n</body>\n</html>\n")
+
+
+def test_the_page_links_its_icon_and_the_icon_is_one() -> None:
+    """Protects the board's tab from looking like every other page's (#884).
+
+    The link sits in the head, where a browser looks for it, and the file beside the
+    page has to be an icon a browser can read at tab size. An ICO file opens with a
+    six-byte header, reserved zero then type 1 then a count, and a sixteen-byte
+    directory entry per image whose first byte is the width, with 0 meaning 256. Each
+    entry ends with the image's size and its offset. A file cut short keeps a whole
+    directory, so each image is checked to lie inside the file.
+    """
+    head = PAGE.read_text(encoding="utf-8").split("</head>", 1)[0]
+    assert '<link rel="icon" href="favicon.ico" sizes="any">' in head
+    icon = (SKILL / "favicon.ico").read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", icon, 0)
+    assert (reserved, kind) == (0, 1)
+    entries = [icon[6 + 16 * i : 22 + 16 * i] for i in range(count)]
+    assert sorted(entry[0] or 256 for entry in entries) == [16, 32, 48, 256]
+    for entry in entries:
+        size, offset = struct.unpack_from("<II", entry, 8)
+        assert offset + size <= len(icon)
