@@ -3,9 +3,13 @@
 The board's icon is the dashboard's mark in blue with a tick in its empty top-left
 corner, and ``lake.favicon`` renders it with the same encoder as the dashboard's. The
 grid, the ink and the command-line contract are each a value or a pure function, so the
-tier is unit. One case writes a file to a temporary directory and nothing else touches
-the filesystem. The golden test, which reads the shipped file beside the skill, lives in
-``tests/component/test_board_page.py`` with the board's other icon checks.
+tier is unit. Two cases touch the filesystem, and neither crosses a subsystem boundary.
+
+1. The command-line case writes one file to a temporary directory.
+2. The pixel case reads the shipped icon beside the skill, as bytes.
+
+The golden test, which compares the shipped file with ``render_board`` byte for byte,
+lives in ``tests/component/test_board_page.py`` with the board's other icon checks.
 
 The expected grid and ink are written here as literals rather than read from the
 module's own constants, so a change to a constant cannot carry the test with it.
@@ -13,9 +17,15 @@ module's own constants, so a change to a constant cannot carry the test with it.
 
 from __future__ import annotations
 
+import struct
+from pathlib import Path
+
 import pytest
 
 from lake import favicon
+from tests.unit.test_dashboard_contract import _decode_png
+
+SHIPPED_ICON = Path(__file__).resolve().parents[2] / ".claude/skills/sync-prune-next/favicon.ico"
 
 # The tick's cells as (column, row), counting from the grid's top-left.
 TICK_CELLS = {
@@ -32,6 +42,27 @@ TICK_CELLS = {
 }
 
 BLUE = (0x3B, 0x82, 0xF6)
+
+# The board's whole grid, written out: the dashboard's mark with the tick in its empty
+# top-left corner. ``#`` is the board's blue and ``.`` is transparent.
+BOARD_GRID = (
+    "....#...........",
+    "...##...........",
+    "#.##..####......",
+    "###...####......",
+    ".#....####..####",
+    "......####..####",
+    "####..####..####",
+    "####..####..####",
+    "####..####..####",
+    "####..####..####",
+    "####..####..####",
+    "................",
+    "################",
+    "################",
+    "################",
+    "################",
+)
 
 
 def _inked(grid: tuple[str, ...]) -> set[tuple[int, int]]:
@@ -76,15 +107,44 @@ def test_the_board_ink_is_blue():
 
 def test_the_board_icon_draws_its_grid_in_blue():
     # The expected grid is built here from the mark and the literal tick cells, and the
-    # ink is the literal blue. The dashboard's tests read every rendered pixel of what
-    # ``render`` draws, so equality with ``render`` on these inputs is the board's
-    # pixel check.
+    # ink is the literal blue. Both sides go through ``render``, so this says only that
+    # the board passes ``render`` the right grid and ink. The pixel test below says what
+    # ``render`` draws with them.
     expected = tuple(
         "".join("#" if (x, y) in TICK_CELLS or cell == "#" else "." for x, cell in enumerate(row))
         for y, row in enumerate(favicon.MARK)
     )
+    assert expected == BOARD_GRID
     assert favicon.render_board() == favicon.render(expected, BLUE)
     assert favicon.render_board() != favicon.render()
+
+
+@pytest.mark.parametrize("source", ["rendered", "shipped"])
+def test_every_pixel_of_the_board_icon_matches_the_literal_grid(source):
+    # Every pixel at every size is compared with ``BOARD_GRID`` in the literal blue,
+    # fully opaque where inked and fully transparent elsewhere. Neither side reads the
+    # module's constants or calls ``render`` for the expected value, so a ``render``
+    # that drops its grid or its ink fails here even after the shipped file has been
+    # regenerated from it. The rendered case fails such a ``render`` before that.
+    icon = favicon.render_board() if source == "rendered" else SHIPPED_ICON.read_bytes()
+    ink = bytes((0x3B, 0x82, 0xF6, 0xFF))
+    clear = bytes((0, 0, 0, 0))
+    count = struct.unpack_from("<H", icon, 4)[0]
+    sides = []
+    for index in range(count):
+        side = struct.unpack_from("<B", icon, 6 + 16 * index)[0]
+        length, offset = struct.unpack_from("<II", icon, 6 + 16 * index + 8)
+        pixels = _decode_png(icon[offset : offset + length])
+        sides.append(side)
+        scale = side // 16
+        assert len(pixels) == side
+        assert all(len(row) == side for row in pixels)
+        for y in range(side):
+            for x in range(side):
+                cell = BOARD_GRID[y // scale][x // scale]
+                expected = ink if cell == "#" else clear
+                assert pixels[y][x] == expected, f"{side}px pixel ({x},{y})"
+    assert sides == [16, 32, 48]
 
 
 def test_the_cli_writes_the_board_icon_with_board(tmp_path):

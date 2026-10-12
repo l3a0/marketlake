@@ -342,8 +342,9 @@ mark in blue with a tick in its empty corner, and
 renders it, so a change to the icon is a change to `src/lake/favicon.py` followed
 by that command, and a test fails while the two disagree. The page links it as
 `favicon.ico`, and the workflow's "Add the page" step copies it beside
-`index.html`, so renaming it means changing the link, that copy and the four
-tests that check them together.
+`index.html`. Renaming it means changing the link, that copy and the five
+tests that check them together. It also means changing the regeneration command
+above, which `README.md` and the `src/lake/favicon.py` docstring name too.
 
 ### Switching to another board
 
