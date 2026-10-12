@@ -229,6 +229,10 @@ def board(**state: Any) -> dict[str, Any]:
 
 STOPPED = "Live updates stopped"
 RETRY = "The page tries again every 2 minutes."
+NONE_LINE = (
+    "Showing no board data. This view cannot reach the live board, "
+    "and the page carries no copy of its own."
+)
 
 
 # -- the old modes, as fetch answers -------------------------------------------------
@@ -237,8 +241,7 @@ RETRY = "The page tries again every 2 minutes."
 def test_a_host_with_no_fetch_says_it_cannot_reach_the_board(tmp_path: Path) -> None:
     result = run_page(tmp_path, None)
     banner = text(result, "source")
-    assert banner.startswith("Showing no board data.")
-    assert "This view cannot reach the live board" in banner
+    assert banner == NONE_LINE
     assert result["fetches"] == []
     assert 120000 not in result["timers"], "a page with no fetch set a fetch timer"
     assert_no_board_data(result)
@@ -261,7 +264,7 @@ def test_a_fetch_that_never_settles_says_the_board_has_not_arrived(tmp_path: Pat
 )
 def test_a_first_fetch_that_fails_says_there_is_no_board(tmp_path: Path, answer: dict) -> None:
     result = run_page(tmp_path, [answer])
-    assert "This view cannot reach the live board" in text(result, "source")
+    assert text(result, "source") == NONE_LINE
     assert_no_board_data(result)
 
 
@@ -293,6 +296,24 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         "the stamp above rather than live."
     )
     assert "Measured by hand" not in foot
+    assert foot.endswith(
+        "The In flight section decays fastest: a check that has gone green or red since "
+        "then still reads here as it read then and a review posted since then still reads "
+        "as owed."
+    )
+
+
+def test_a_board_with_nothing_in_flight_names_no_decay(tmp_path: Path) -> None:
+    doc = board()
+    doc["prs"] = []
+    foot = text(run_page(tmp_path, [served(doc)]), "foot")
+    assert foot.endswith("is current as of the stamp above rather than live.")
+
+
+def test_the_footer_escapes_the_main_sha(tmp_path: Path) -> None:
+    raw = run_page(tmp_path, [served(board(main="5f0<b>12c"))])["ids"]["foot"]["html"]
+    assert "5f0&lt;b&gt;12c" in raw
+    assert "<b>12c" not in raw
 
 
 def test_each_fetch_asks_for_a_url_no_cache_has_seen(tmp_path: Path) -> None:
@@ -311,16 +332,17 @@ def test_each_fetch_asks_for_a_url_no_cache_has_seen(tmp_path: Path) -> None:
         ({"status": 404, "body": ""}, "board.json answered 404"),
         ({"throw": True}, "board.json could not be fetched"),
         (served({"schema": 1}), "unreadable board.json"),
+        ({"status": 200, "body": "<html>"}, "board.json is not JSON"),
     ],
-    ids=["404", "network failure", "refused document"],
+    ids=["404", "network failure", "refused document", "not JSON"],
 )
 def test_a_failed_poll_keeps_the_last_board_and_says_it_retries(
     tmp_path: Path, answer: dict, code: str
 ) -> None:
     result = run_page(tmp_path, [served(board()), answer])
     banner = text(result, "source")
-    assert banner.startswith(f"{STOPPED} ({code}). What is shown is the last live data")
-    assert banner.endswith(RETRY)
+    assert banner.startswith(f"{STOPPED} ({code}). What is shown is the last live data, measured ")
+    assert banner.endswith(f" against 5f0b12c . {RETRY}")
     assert "Reload" not in banner
     assert cards(result, "board") == {1}
     assert text(result, "strip").startswith("3 open issues")
@@ -495,12 +517,12 @@ def test_a_linked_list_naming_the_issue_draws_as_linked(tmp_path: Path, linked: 
     assert "no closing link" not in text(result, "flownote")
 
 
-def _throws() -> dict[str, Any]:
+def _throws(**state: Any) -> dict[str, Any]:
     """A document that passes the item check and still breaks the drawing code.
 
     The check does not read ``untracked``, which the page maps over as a list.
     """
-    doc = board()
+    doc = board(**state)
     doc["untracked"] = "not a list"
     return doc
 
@@ -516,11 +538,19 @@ def test_a_first_document_that_breaks_the_drawing_code_draws_nothing(tmp_path: P
 def test_a_later_document_that_breaks_the_drawing_code_keeps_the_last_board(
     tmp_path: Path,
 ) -> None:
-    result = run_page(tmp_path, [served(board()), served(_throws())])
+    """The kept board is the earlier one, so none of the broken document's state shows."""
+    broken = _throws(main="badbad1", issues={"open": 99})
+    result = run_page(tmp_path, [served(board()), served(broken)])
     banner = text(result, "source")
     assert banner.startswith(f"{STOPPED} (the board could not be drawn).")
-    assert banner.endswith(RETRY)
+    assert banner.endswith(f" against 5f0b12c . {RETRY}")
+    assert "badbad1" not in banner
     assert cards(result, "board") == {1}
+    for element in CONTENT:
+        assert not hidden(result, element), f"{element} is hidden behind a kept board"
+    assert text(result, "strip").startswith("3 open issues")
+    assert "99" not in text(result, "strip")
+    assert "badbad1" not in text(result, "foot")
 
 
 def test_a_failed_poll_after_a_first_draw_that_threw_still_shows_no_board(
