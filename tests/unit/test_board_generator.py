@@ -215,6 +215,22 @@ def test_a_closing_link_to_another_repository_names_no_issue_here() -> None:
     assert (four["linked"], four["partOf"]) == (False, True)
 
 
+def test_the_repo_is_matched_whatever_its_case() -> None:
+    """``--repo`` spelled in another case still keeps this repository's links."""
+    issues = [issue(1, blocked_by=(blocker(2),)), issue(2)]
+    board = bb.build(FakeGitHub(issues, [pull(10, closes=(1,))]), "L3A0/MarketLake", NOW)[0]
+    assert card(board, 1)["needs"] == [2]
+    (entry,) = board["prs"]
+    assert (entry["issue"], entry["linked"]) == (1, True)
+
+
+def test_comments_and_reviews_are_read_newest_first() -> None:
+    """Only a marker newer than the head commit counts, so the newest 100 are read."""
+    text = " ".join(bb.PRS_QUERY.split())
+    assert "comments(last:100)" in text
+    assert "reviews(last:100)" in text
+
+
 @pytest.mark.parametrize(
     ("query", "field"),
     [("PRS_QUERY", "closingIssuesReferences"), ("ISSUES_QUERY", "blockedBy")],
@@ -590,6 +606,14 @@ def test_the_command_line_stops_with_one_line_and_writes_nothing(
 
 
 @pytest.mark.parametrize("repo", ["marketlake", "l3a0/", "/marketlake", "l3a0/marketlake/x"])
+def test_a_repo_that_is_not_owner_and_name_stops_before_any_read(repo: str) -> None:
+    gh = FakeGitHub([issue(1)])
+    with pytest.raises(bb.BoardError, match="--repo must be owner/name"):
+        bb.build(gh, repo, NOW)
+    assert gh.calls == []
+
+
+@pytest.mark.parametrize("repo", ["marketlake", "l3a0/", "/marketlake", "l3a0/marketlake/x"])
 def test_a_repo_that_is_not_owner_and_name_stops_with_one_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], repo: str
 ) -> None:
@@ -606,5 +630,24 @@ def test_a_missing_gh_stops_with_one_line(
     assert bb.main(["build", "--repo", REPO, "--out", str(tmp_path / "site")]) == 1
     err = capsys.readouterr().err
     assert err.startswith("build_board: gh could not be run: ")
+    assert "'gh'" in err, "the error lost the reason the operating system gave"
+    assert err.count("\n") == 1
+    assert not (tmp_path / "site").exists()
+
+
+def test_a_gh_that_cannot_be_executed_stops_with_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``gh`` on PATH without execute permission raises PermissionError, not FileNotFound."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o644)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert bb.main(["build", "--repo", REPO, "--out", str(tmp_path / "site")]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("build_board: gh could not be run: ")
+    assert "'gh'" in err
     assert err.count("\n") == 1
     assert not (tmp_path / "site").exists()
