@@ -180,6 +180,22 @@ def test_only_the_daemon_survives_a_child_killed_for_memory(label):
 
 
 @pytest.mark.parametrize("label", RESIDENTS + TIMED)
+def test_only_the_dashboard_is_first_for_the_kernel_to_kill(label):
+    """A captured minute is lost for good and a dashboard refresh is not.
+
+    ``1000`` is the only value that ranks the dashboard above the daemon whatever the
+    daemon's size, so the test reads the literal rather than a constant from the code.
+    The daemon carries nothing, because its compaction and token pull children would
+    inherit a negative value.
+    """
+    text = _units()[label].service()
+    if label == cp.DASHBOARD_LABEL:
+        assert _parsed(text)["Service"]["OOMScoreAdjust"] == "1000"
+    else:
+        assert "OOMScoreAdjust" not in text
+
+
+@pytest.mark.parametrize("label", RESIDENTS + TIMED)
 def test_only_the_daemon_waits_for_the_network(label):
     unit = _parsed(_units()[label].service())["Unit"]
     if label == cp.DAEMON_LABEL:

@@ -672,7 +672,9 @@ class SystemdUnit:
         3. The daemon alone waits for the network and carries ``OOMPolicy=continue``, so
            the kernel killing its compaction child or its token pull child does not stop
            it.
-        4. ``User=`` is the owner and no ``Group=`` is set, so systemd takes the owner's
+        4. The dashboard alone carries ``OOMScoreAdjust=1000``, so when the host runs out
+           of memory the kernel kills the dashboard before the daemon.
+        5. ``User=`` is the owner and no ``Group=`` is set, so systemd takes the owner's
            primary group. ``PATH`` is left to systemd's default.
         """
         unit = ["[Unit]", f"Description={self.label}"]
@@ -697,6 +699,8 @@ class SystemdUnit:
             service += ["Restart=always", f"RestartSec={RESTART_SECONDS}"]
         if self.label == DAEMON_LABEL:
             service.append("OOMPolicy=continue")
+        if self.label == DASHBOARD_LABEL:
+            service.append("OOMScoreAdjust=1000")
         sections = [unit, service]
         if self.keep_alive:
             sections.append(["[Install]", "WantedBy=multi-user.target"])
