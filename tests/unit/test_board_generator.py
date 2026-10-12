@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -86,16 +87,20 @@ def test_the_document_has_the_flat_shape_the_page_reads() -> None:
 
 
 def test_two_runs_over_the_same_data_differ_only_in_the_stamp() -> None:
-    """Lists come out sorted whatever order GitHub returns them in."""
+    """Lists come out sorted whatever order GitHub returns them in.
+
+    Issue 5's labels arrive unsorted, and its blockers are 16 and 1, which a Python
+    set of small integers iterates as 16 then 1, so neither list is sorted by accident.
+    """
     issues = [
-        issue(5, labels=("bug", "enhancement"), blocked_by=(blocker(3), blocker(1))),
-        issue(3),
+        issue(5, labels=("enhancement", "bug"), blocked_by=(blocker(16), blocker(1))),
+        issue(16),
         issue(1),
     ]
     prs = [
         pull(
             20,
-            closes=(5, 3),
+            closes=(5, 16),
             contexts=(check("test", "SUCCESS"), status("CodeQL", "SUCCESS"), check("a", "SKIPPED")),
         ),
         pull(11, body="Part of #1."),
@@ -103,15 +108,21 @@ def test_two_runs_over_the_same_data_differ_only_in_the_stamp() -> None:
     first = build(FakeGitHub(issues, prs), NOW)
     shuffled_issues = [dict(i) for i in issues]
     random.Random(7).shuffle(shuffled_issues)
-    shuffled_issues[0]["labels"] = dict(shuffled_issues[0]["labels"])
-    shuffled_issues[0]["labels"]["nodes"] = list(reversed(shuffled_issues[0]["labels"]["nodes"]))
+    (five,) = [i for i in shuffled_issues if i["number"] == 5]
+    five["labels"] = dict(five["labels"], nodes=list(reversed(five["labels"]["nodes"])))
     second = build(FakeGitHub(shuffled_issues, list(reversed(prs))), LATER)
     assert first["state"].pop("updatedAt") != second["state"].pop("updatedAt")
     assert json.dumps(first) == json.dumps(second)
-    assert [c["n"] for c in first["tracker"]] == [1, 3, 5]
-    assert card(first, 5)["labels"] == ["bug", "enhancement"]
-    assert card(first, 5)["needs"] == [1, 3]
-    assert entries(first) == [(11, 1), (20, 3), (20, 5)]
+    assert [c["n"] for c in first["tracker"]] == [1, 5, 16]
+    assert card(first, 5)["labels"] == card(second, 5)["labels"] == ["bug", "enhancement"]
+    assert card(first, 5)["needs"] == [1, 16]
+    assert entries(first) == [(11, 1), (20, 5), (20, 16)]
+
+
+def test_entries_sort_by_issue_then_by_pull_request() -> None:
+    issues = [issue(1), issue(2)]
+    prs = [pull(10, closes=(2,)), pull(20, closes=(1,)), pull(5, closes=(2,))]
+    assert entries(build(FakeGitHub(issues, prs))) == [(20, 1), (5, 2), (10, 2)]
 
 
 # -- tracker -------------------------------------------------------------------------
@@ -122,6 +133,7 @@ def test_two_runs_over_the_same_data_differ_only_in_the_stamp() -> None:
     [
         ("MVP 2, capture on a hosted VM", "MVP 2"),
         ("MVP 3", "MVP 3"),
+        ("MVP 2 , spaced before the comma", "MVP 2"),
         (None, "no milestone"),
     ],
 )
@@ -183,18 +195,91 @@ def test_a_pull_request_naming_two_issues_gives_two_entries() -> None:
     assert linked["state"] == part_of["state"] == "open"
 
 
+def test_an_issue_both_linked_and_named_part_of_reads_as_linked() -> None:
+    """The closing link decides, because merging closes the issue whatever else is said."""
+    (entry,) = build(FakeGitHub([issue(1)], [pull(10, closes=(1,), body="Part of #1.")]))["prs"]
+    assert (entry["linked"], entry["partOf"]) == (True, False)
+
+
+def test_a_closing_link_to_another_repository_names_no_issue_here() -> None:
+    """Its number would otherwise land on the marketlake issue that shares it."""
+    elsewhere = ((2, "l3a0/quantitative-trading"), (3, "L3A0/Marketlake"))
+    prs = [
+        pull(10, closes=(1,), closes_elsewhere=elsewhere),
+        pull(11, closes_elsewhere=((4, "l3a0/quantitative-trading"),), body="Part of #4."),
+    ]
+    board = build(FakeGitHub([issue(1), issue(2), issue(3), issue(4)], prs))
+    # GitHub spells the owner as it likes, so 3 is in this repository.
+    assert entries(board) == [(10, 1), (10, 3), (11, 4)]
+    four = board["prs"][-1]
+    assert (four["linked"], four["partOf"]) == (False, True)
+
+
+def test_the_repo_is_matched_whatever_its_case() -> None:
+    """``--repo`` spelled in another case still keeps this repository's links."""
+    issues = [issue(1, blocked_by=(blocker(2),)), issue(2)]
+    board = bb.build(FakeGitHub(issues, [pull(10, closes=(1,))]), "L3A0/MarketLake", NOW)[0]
+    assert card(board, 1)["needs"] == [2]
+    (entry,) = board["prs"]
+    assert (entry["issue"], entry["linked"]) == (1, True)
+
+
+def test_comments_and_reviews_are_read_newest_first() -> None:
+    """Only a marker newer than the head commit counts, so the newest 100 are read."""
+    text = " ".join(bb.PRS_QUERY.split())
+    assert "comments(last:100)" in text
+    assert "reviews(last:100)" in text
+
+
+@pytest.mark.parametrize(
+    ("query", "field"),
+    [("PRS_QUERY", "closingIssuesReferences"), ("ISSUES_QUERY", "blockedBy")],
+)
+def test_the_query_reads_each_linked_issues_repository(query: str, field: str) -> None:
+    """The fake serves the repository whatever the query asks for, and GitHub does not.
+
+    Without it every link reads as another repository's, and the board drops them all.
+    """
+    text = " ".join(getattr(bb, query).split())
+    selection = re.search(rf"{field}\(first:100\)\{{(.*?)\}}\}}", text)
+    assert selection, f"{query} reads no {field}"
+    assert re.search(r"nodes\{[^}]*\brepository\{nameWithOwner", selection.group(1))
+
+
 @pytest.mark.parametrize(
     "body",
     [
         "Mentions `Part of #1` in a code span.",
         "```\nPart of #1\n```",
+        "~~~\nPart of #1\n~~~",
+        "```\n\nPart of #1\n\n```",
         "This is part of #1, in lowercase prose.",
         "Part of #1x is no reference.",
         "Part of #2, which is closed.",
+        "NotPart of #1 is another word.",
+        "Part of 1 has no hash.",
+        "Part of `x`#1 is split by a code span.",
+        "``a` Part of #1 ``",
+        "`` never closed, then `Part of #1` in a span.",
     ],
 )
 def test_a_part_of_reference_counts_only_outside_code_and_capitalised(body: str) -> None:
     assert build(FakeGitHub([issue(1)], [pull(10, body=body)]))["prs"] == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "```\nfenced\n```\nPart of #1.",
+        "A stray ` tick.\n\nPart of #1, and another stray `.",
+        "A stray ` tick.\r\n\r\nPart of #1, and another stray `.",
+    ],
+    ids=["after a closed fence", "ticks in two paragraphs", "the same with CRLF"],
+)
+def test_a_part_of_reference_outside_code_counts(body: str) -> None:
+    """A fence ends at its closing line, and a code span never crosses a blank line."""
+    (entry,) = build(FakeGitHub([issue(1)], [pull(10, body=body)]))["prs"]
+    assert (entry["issue"], entry["partOf"]) == (1, True)
 
 
 def test_a_pull_request_naming_no_open_issue_gets_no_entry() -> None:
@@ -216,9 +301,13 @@ def test_a_pull_request_from_a_fork_gets_no_entry() -> None:
         ((note("## Review complete", AFTER),), (), True),
         ((note("## Review complete\r\nAll lenses.", AFTER),), (), True),
         ((note(MARKER, AFTER, "CONTRIBUTOR"),), (), False),
+        ((note(MARKER, AFTER, "COLLABORATOR"),), (), False),
         ((), (note(MARKER, AFTER, "MEMBER", review=True),), False),
         ((note(MARKER, BEFORE),), (), False),
         ((), (note(MARKER, BEFORE, review=True),), False),
+        ((note(MARKER, COMMITTED),), (), False),
+        ((note(MARKER, None),), (), False),
+        ((note("## Review complete  \n\nTrailing blanks.", AFTER),), (), False),
         ((note("## Review completeness check\n\nStill running.", AFTER),), (), False),
         ((note("Notes first.\n## Review complete", AFTER),), (), False),
         ((note(" ## Review complete", AFTER),), (), False),
@@ -234,6 +323,13 @@ def test_only_the_owners_marker_after_the_head_commit_counts(
     assert entry["review"] == (
         "review complete" if reviewed else "no Review complete marker since the head commit"
     )
+
+
+def test_a_head_commit_with_no_date_reads_as_unreviewed() -> None:
+    """With nothing to compare against, no marker can be shown to be newer."""
+    pr = pull(10, closes=(1,), comments=(note(MARKER, AFTER),), committed=None)
+    (entry,) = build(FakeGitHub([issue(1)], [pr]))["prs"]
+    assert entry["reviewed"] is False
 
 
 @pytest.mark.parametrize(
@@ -271,11 +367,13 @@ def test_the_boards_own_checks_leave_the_rollup() -> None:
         check("board-deploy", "FAILURE"),
         check("board-build", "FAILURE", app="some-other-app"),
         status("board-deploy", "PENDING"),
+        check("board-other", "FAILURE"),
     )
     (entry,) = build(FakeGitHub([issue(1)], [pull(10, closes=(1,), contexts=contexts)]))["prs"]
     assert entry["rollup"] == [
         ["board-build", "failure"],
         ["board-deploy", "running"],
+        ["board-other", "failure"],
         ["test", "success"],
     ]
 
@@ -314,9 +412,45 @@ def test_a_list_that_disagrees_with_its_count_stops_the_run(gh: FakeGitHub) -> N
         build(gh)
 
 
-def test_a_page_repeating_an_issue_stops_the_run() -> None:
+@pytest.mark.parametrize(
+    "issues",
+    [[issue(1), issue(1)], [issue(1), issue(1), issue(2)]],
+    ids=["one short", "one extra"],
+)
+def test_a_page_repeating_an_issue_stops_the_run(issues: list[dict[str, Any]]) -> None:
+    """A repeat with an extra issue still holds as many numbers as the count says."""
     with pytest.raises(bb.BoardError, match="against a total of"):
-        build(FakeGitHub([issue(1), issue(1)], issue_total=2))
+        build(FakeGitHub(issues, issue_total=2))
+
+
+class _Moving(FakeGitHub):
+    """A repository that changes after the first page: one issue fewer, or a new head."""
+
+    def __init__(self, *args: Any, what: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.what = what
+
+    def __call__(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        data = super().__call__(query, variables)
+        if variables.get("after") and "issues(states:OPEN" in query:
+            repository = data["repository"]
+            if self.what == "count":
+                repository["issues"]["totalCount"] -= 1
+            else:
+                repository["defaultBranchRef"]["target"]["oid"] = "f" * 40
+        return data
+
+
+def test_the_count_is_read_from_the_first_page() -> None:
+    """A later page agreeing with the read does not excuse a first page that did not."""
+    gh = _Moving([issue(n) for n in range(1, 151)], issue_total=151, what="count")
+    with pytest.raises(bb.BoardError, match="read 150 issues against a total of 151"):
+        build(gh)
+
+
+def test_main_is_read_from_the_first_page() -> None:
+    board = build(_Moving([issue(n) for n in range(1, 151)], what="head"))
+    assert board["state"]["main"] == HEAD[:7]
 
 
 def _overflow(what: str) -> FakeGitHub:
@@ -387,8 +521,13 @@ def test_the_client_counts_requests_and_points_and_passes_variables(
         (_Done(1, "", "HTTP 401: Bad credentials"), "gh api graphql failed: HTTP 401"),
         (_Done(0, "not json"), "returned no JSON"),
         (_Done(0, json.dumps({"errors": [{"message": "no field"}]})), "GraphQL errors"),
+        (
+            _Done(0, json.dumps({"data": {"x": 1}, "errors": [{"message": "partial"}]})),
+            "GraphQL errors",
+        ),
         (_Done(0, json.dumps({"data": None})), "returned no data"),
     ],
+    ids=["failed call", "not JSON", "errors", "errors beside partial data", "no data"],
 )
 def test_the_client_stops_on_a_failed_call_or_an_error(
     monkeypatch: pytest.MonkeyPatch, done: _Done, message: str
@@ -425,16 +564,19 @@ def ci_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_the_command_line_writes_board_json_and_the_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ci_env: Path
 ) -> None:
-    gh = FakeGitHub([issue(1), issue(2)], [pull(10, closes=(1,))])
+    gh = FakeGitHub([issue(1), issue(2)], [pull(10, closes=(1, 2)), pull(11), pull(12)])
     monkeypatch.setattr(bb, "GhGraphql", _fake_client(gh))
     out = tmp_path / "site"
     assert bb.main(["build", "--repo", REPO, "--out", str(out)]) == 0
     board = json.loads((out / "board.json").read_text(encoding="utf-8"))
     assert [c["n"] for c in board["tracker"]] == [1, 2]
     summary = ci_env.read_text(encoding="utf-8")
+    assert f"| main | {HEAD[:7]} |" in summary
     assert "| GraphQL requests | 2 |" in summary
     assert "| GraphQL points | 5 |" in summary
     assert "| Open issues | 2 |" in summary
+    assert "| Open pull requests | 3 |" in summary
+    assert "| Pull request entries written | 2 |" in summary
     assert not (tmp_path / "output").exists()
 
 
@@ -461,3 +603,51 @@ def test_the_command_line_stops_with_one_line_and_writes_nothing(
     assert err == "build_board: read 1 issues against a total of 2\n"
     assert not (out / "board.json").exists()
     assert not ci_env.exists()
+
+
+@pytest.mark.parametrize("repo", ["marketlake", "l3a0/", "/marketlake", "l3a0/marketlake/x"])
+def test_a_repo_that_is_not_owner_and_name_stops_before_any_read(repo: str) -> None:
+    gh = FakeGitHub([issue(1)])
+    with pytest.raises(bb.BoardError, match="--repo must be owner/name"):
+        bb.build(gh, repo, NOW)
+    assert gh.calls == []
+
+
+@pytest.mark.parametrize("repo", ["marketlake", "l3a0/", "/marketlake", "l3a0/marketlake/x"])
+def test_a_repo_that_is_not_owner_and_name_stops_with_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], repo: str
+) -> None:
+    monkeypatch.setattr(bb, "GhGraphql", _fake_client(FakeGitHub([issue(1)])))
+    assert bb.main(["build", "--repo", repo, "--out", str(tmp_path / "site")]) == 1
+    assert capsys.readouterr().err == f"build_board: --repo must be owner/name, not {repo!r}\n"
+
+
+def test_a_missing_gh_stops_with_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The real client, with a PATH on which no ``gh`` exists."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert bb.main(["build", "--repo", REPO, "--out", str(tmp_path / "site")]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("build_board: gh could not be run: ")
+    assert "'gh'" in err, "the error lost the reason the operating system gave"
+    assert err.count("\n") == 1
+    assert not (tmp_path / "site").exists()
+
+
+def test_a_gh_that_cannot_be_executed_stops_with_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``gh`` on PATH without execute permission raises PermissionError, not FileNotFound."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o644)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert bb.main(["build", "--repo", REPO, "--out", str(tmp_path / "site")]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("build_board: gh could not be run: ")
+    assert "'gh'" in err
+    assert err.count("\n") == 1
+    assert not (tmp_path / "site").exists()
