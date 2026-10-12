@@ -140,12 +140,13 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `lake_root`, so a reviewed pull request is the one way they change.
 - `.tool-versions` pins the `uv` version that CI and the VM's bootstrap install.
 - `.claude/skills/sync-prune-next/` holds the sync skill and the build board. Its
-  `board.html` is the board's page, `build_board.py` builds the page's `board.json`
-  from GitHub, and `dom-stub.js` stands in for a browser when the tests run the page.
+  `board.html` is the board's page, `favicon.ico` is its tab icon, `build_board.py`
+  builds the page's `board.json` from GitHub, and `dom-stub.js` stands in for a browser
+  when the tests run the page.
   CI lints the Python there and the tests load it.
-- `.github/workflows/board.yml` runs `build_board.py` and publishes the page and
-  `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its `on:` block
-  lists what starts a run, and a submitted review starts none.
+- `.github/workflows/board.yml` runs `build_board.py` and publishes the page, its
+  icon and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its
+  `on:` block lists what starts a run, and a submitted review starts none.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 

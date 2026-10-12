@@ -89,9 +89,12 @@ jobs:
           --repo "$GITHUB_REPOSITORY"
           --out _site
 
-      # Pages serves index.html at the site's root.
+      # Pages serves index.html at the site's root. The page links its icon
+      # as favicon.ico beside it, so the icon goes in the same folder.
       - name: Add the page
-        run: cp .claude/skills/sync-prune-next/board.html _site/index.html
+        run: >-
+          cp .claude/skills/sync-prune-next/board.html _site/index.html &&
+          cp .claude/skills/sync-prune-next/favicon.ico _site/favicon.ico
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

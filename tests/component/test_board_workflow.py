@@ -19,10 +19,14 @@ from typing import Any
 
 import yaml
 
+from tests.support.board_page import icon_links
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "board.yml"
 JOBS = {"board-build", "board-deploy"}
+SKILL_DIR = ".claude/skills/sync-prune-next"
+SKILL = ROOT / SKILL_DIR
 
 
 def _workflow(path: Path = WORKFLOW) -> dict[Any, Any]:
@@ -208,12 +212,33 @@ def test_the_build_runs_exactly_the_generator_and_the_copy() -> None:
         },
         {
             "name": "Add the page",
-            "run": "cp .claude/skills/sync-prune-next/board.html _site/index.html",
+            "run": "cp .claude/skills/sync-prune-next/board.html _site/index.html"
+            " && cp .claude/skills/sync-prune-next/favicon.ico _site/favicon.ico",
         },
         {"uses": "actions/upload-pages-artifact@<sha>", "with": {"path": "_site"}},
     ]
     for path in ("build_board.py", "board.html"):
         assert (ROOT / ".claude" / "skills" / "sync-prune-next" / path).is_file()
+
+
+def test_the_icon_is_published_where_the_page_links_it() -> None:
+    """Protects the board's tab from a blank icon (#884).
+
+    The page links its icon by a relative address, so Pages serves it only when the
+    step that adds the page puts the icon in the same folder under that name. A step
+    that dropped the copy, or a page that renamed the link, would leave a browser
+    asking for a file that is not there. The icon's copy runs only after the page's
+    copy succeeds, so joining the two with ``||`` would skip it on every run that works.
+    The link is read from the parsed head, so one inside a comment or a ``noscript``
+    block, which a browser never loads, does not count.
+    """
+    (link,) = icon_links((SKILL / "board.html").read_text(encoding="utf-8"))
+    href = link["href"]
+    (step,) = [s for s in _jobs()["board-build"]["steps"] if s.get("name") == "Add the page"]
+    assert " ".join(step["run"].split()) == (
+        f"cp {SKILL_DIR}/board.html _site/index.html && cp {SKILL_DIR}/{href} _site/{href}"
+    )
+    assert (SKILL / href).is_file()
 
 
 def test_the_deploy_runs_exactly_the_one_deploy_step() -> None:
