@@ -1,6 +1,6 @@
 ---
 name: sync-prune-next
-description: Sync with origin, prune the worktrees and branches whose work is finished, refresh the Marketlake build board, and recommend what to take next on the current MVP milestone. Use when asked to "git sync prune", to clean up worktrees or branches, to "update the build board and say what's next", or for any status round of this repo's sessions and pull requests.
+description: Sync with origin, prune the worktrees and branches whose work is finished, check the Marketlake build board, and recommend what to take next on the current MVP milestone. Use when asked to "git sync prune", to clean up worktrees or branches, to "update the build board and say what's next", or for any status round of this repo's sessions and pull requests.
 ---
 
 # Sync, prune, and say what's next
@@ -16,7 +16,7 @@ next.
 
 1. Fetch and prune, so every later check reads the current `main`.
 2. Remove what is finished, and only that.
-3. Update the build board.
+3. Check the build board.
 4. Recommend what to take next.
 
 ## 1. Fetch and prune
@@ -256,48 +256,50 @@ stash entries from `git stash list`, which survive every removal above and
 which nothing else surfaces. The kept list is where the owner learns about work
 in progress that nothing else announces, such as the worktree above.
 
-## 3. Update the build board
+## 3. Check the build board
 
-The board of record is a claude.ai artifact, and this step writes it. A second
-board on GitHub Pages builds itself, as "The board on GitHub Pages" below
-describes, and a round writes nothing to it. The artifact's URL lives in a file
-on this machine rather than in the repository, so switching to another board
-needs no commit. Read it before anything else in this step.
+A GitHub Action rebuilds the board from GitHub and publishes it at
+<https://l3a0.github.io/marketlake/>, so a round writes nothing to it. This
+step checks that the Action's last run succeeded. Then it builds the same
+`board.json` into a scratch directory, so step 4 reads GitHub as it stands
+rather than as the last run saw it.
+
+This prints the board workflow's newest finished run that was not cancelled.
 
 ```bash
-d="${MARKETLAKE_CONFIG_DIR:-$HOME/.config/marketlake}"; d="${d/#\~/$HOME}"
-tr -d '\r' < "$d/board-url" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'
+gh run list --repo l3a0/marketlake --workflow board.yml --status completed --limit 20 --json databaseId,conclusion,createdAt,event,url --jq 'map(select(.conclusion != "cancelled"))[0]'
 ```
 
-The first line names the config directory the way `lake.paths.config_dir`
-resolves it. That is `MARKETLAKE_CONFIG_DIR` when it is set and not empty, with
-a leading `~` read as this user's home, and `~/.config/marketlake` otherwise.
-The same lines work in bash and zsh. The second line drops carriage returns,
-spaces around the URL, and blank lines, so a file saved by any editor reads the
-same.
+A cancelled run is normal, so the command reads past it. The workflow's
+`pages` concurrency group replaces a waiting run with a newer one, and 111 of
+the sibling board's last 300 runs ended `cancelled` that way. A run whose
+`conclusion` is not `success` goes in the report as a link, written
+`[run <databaseId>](<url>)`. Pages keeps the last good board while runs fail,
+so the page then shows GitHub as it stood before the failure. An output of
+`null` means every one of the last 20 finished runs was cancelled, so raise
+`--limit` and run it again. A board that is stale rather than failed goes
+unreported until the stale banner in
+[#874](https://github.com/l3a0/marketlake/issues/874) lands.
 
-The file is usable when the second line prints exactly one line. Every
-`<board url>` below stands for that line. The round only reads this file. Like
-everything else in that directory, it is the owner's to write, per
-`CLAUDE.md`.
+Then build the board into scratch. Replace `<scratch>` with the round's
+scratch directory.
 
-When the file is missing, prints nothing, or prints more than one line, skip
-this step. Do not guess a URL, do not pick one of several, and do not reuse one
-from an earlier report or round. Tell the owner that the board was not updated,
-and that the fix is that file holding the board's URL on one line. Steps 1, 2
-and 4 still run. Step 4 then reads the open pull requests, their checks and
-their review markers straight from GitHub, as "The document's shape" describes
-for `prs`, and ranks from `CLAUDE.md`'s directive. It reports that it had no
-`working` or `planned` entries to read.
+```bash
+uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <scratch>
+```
 
-The artifact board cannot read the disk or poll GitHub, so every figure on it
-was measured by a session and written by hand. A round that changes what the
-board should show and leaves without writing has made it wrong, and nothing
-else notices.
+It writes `<scratch>/board.json` and prints what the read cost in GraphQL
+requests and points. Run it with `uv run python`, never `python3`. macOS's
+`/usr/bin/python3` is 3.9 and cannot import the script. The script reads
+GitHub through the session's `gh` login and fails closed, so a failed call
+stops it with a non-zero exit before it writes `board.json`. Report the
+failure. Step 4 then reads the open pull requests, their checks and their
+review markers straight from GitHub, as "What the generator writes" below
+describes `prs`.
 
 ### The board on GitHub Pages
 
-<https://l3a0.github.io/marketlake/> serves the same `board.html` beside a
+<https://l3a0.github.io/marketlake/> serves `board.html` beside the
 `board.json` that `.github/workflows/board.yml` builds from GitHub. These
 events start a run.
 
@@ -311,174 +313,108 @@ events start a run.
 A submitted review starts no run, and neither does a "blocked by" link or a
 sub-issue, so each reaches the board with the next run. `build_board.py`,
 beside this skill, is the generator, and the page fetches its output every two
-minutes. It fills `state`, `tracker` and `prs`, and leaves `working`, `planned`
-and `next` empty until [#873](https://github.com/l3a0/marketlake/issues/873)
-moves those judgements onto GitHub. So its default view draws every card in the
-chosen milestone rather than only the ranked ones. What it writes differs from
-"The document's shape" below in five ways.
-
-1. `state` holds only `main`, `updatedAt` and `issues.open`.
-2. A card's `needs` comes from native "blocked by" links alone, not from the
-   dependency sections of issue bodies.
-3. Each `prs` entry also carries `partOf`, true when the issue is named by a
-   `Part of #N` reference rather than by a closing link.
-4. `prs` holds one entry per pull request and issue pair, so a pull request
-   naming two open issues has two entries.
-5. It writes no `untracked`, and each `prs` entry's `review` is one of two fixed
-   phrases, `review complete` or `no Review complete marker since the head
-   commit`, so it never names the lens still running.
-
-The artifact stays the board of record until the skill stops writing it.
-
-The page finds which board it is on by itself. Inside the artifact it reads the
-database, and on Pages, where it finds none, it fetches `board.json`.
-`board-harness.js` reaches only the database path.
-`tests/component/test_board_page.py` runs the fetch path, and three of its
-cases run the database path too, with a fake database.
+minutes. The same address serves the same board on every machine, and the
+workflow copies `main`'s `board.html` on every run, so a merged change to the
+page goes live with the next run.
 
 `favicon.ico` beside this skill is the page's tab icon. The page links it as
 `favicon.ico`, and the workflow's "Add the page" step copies it beside
 `index.html`, so renaming it means changing the link, that copy and the three
 tests that check them together.
 
-### Switching to another board
-
-To move the round to another board, the owner writes the new board's URL into
-that file in place of the old one. A board belongs to one claude.ai account,
-and a machine signed in to a different account cannot write it. That is why a
-machine may need a board of its own.
-
-The new board must already exist as an artifact published from `main`'s
-`board.html` with the `db` capability, passed as `capabilities: {"db": {}}` on
-its first publish. A round never adds it. Step 6 of "Publish from main" leaves
-`capabilities` out of the call, which keeps whatever the artifact already has,
-and a page without `db` shows only the banner saying it cannot reach the live
-board.
-
-A new board's database holds no document, so the next round builds one, per "A
-board with no document yet" below. That round also finds no `state.page`, so
-it publishes the page from `main`, per "Record what is live".
-
-### Read, edit, and write one document
-
-The page reads one database document, `data` in the `board` collection, and
-redraws on every write. Read it into a scratch directory rather than the repo,
-because nothing read here belongs in a commit.
+### What the generator writes
 
 ```text
-ArtifactData action="get" url="<board url>"
-             collection="board" doc_id="data" out_dir="<scratch>/readback"
+{ schema: 1, state, prs, working, planned, next, tracker }
 ```
 
-That saves `readback/board/data.json`, and the result names the document's
-`version`. Edit the file, then write the whole document back with `set`,
-pinned to that version.
+- **`state`** holds `main`, the default branch's head as seven characters,
+  `updatedAt`, the time GitHub was read, and `issues.open`. Nothing else is in
+  it. The `deployed`, `lake`, `suite`, `page` and `issues.deferred` fields that
+  rounds once wrote by hand are absent, because the page draws none of them.
+- **`prs`** has one entry per open pull request and open issue it names,
+  keyed by `issue`, as `{issue, pr, state, review, linked, partOf, reviewed,
+  rollup}`. A pull request names an issue through GitHub's closing link or
+  through a `Part of #N` reference outside code, so one naming two open issues
+  has two entries and one naming no open issue has none. `state` is `open`.
+  `linked` is true when the pull request's `closingIssuesReferences` names the
+  issue, and `partOf` is true when only a `Part of` reference does. A pull
+  request from a fork gets no entry, because GitHub registers a fork's closing
+  keyword, so a stranger's fork reading `Closes #640` would otherwise move
+  that issue into In flight.
 
-```text
-ArtifactData action="set" url="<board url>"
-             collection="board" doc_id="data"
-             file_path="<scratch>/readback/board/data.json" if_version=<read version>
-```
-
-The pin is what stops two sessions from losing each other's work. A write based
-on an old version is refused and writes nothing, rather than overwriting
-whatever another session wrote since the read. On a refusal, read the document
-again, redo the edit on what it holds now, and write again. Never drop the pin
-to get a write through.
-
-Never issue the local edit of the JSON file and the `set` in the same parallel
-batch of tool calls. Calls in one batch run in no promised order, so the `set`
-can send the file before the edit lands. The write then succeeds, stores the
-old content under a new version, and looks exactly like a good write.
-
-### The document's shape
-
-```text
-{ schema: 1, state, prs, working, planned, next, untracked, tracker }
-```
-
-- **`state`** carries `main`, `deployed`, `updatedAt`, `lake` (with
-  `sessions`, `chainRows`, `first` and `last`), `suite.tests`, and `issues`
-  (with `open` and `deferred`). The page neither draws nor requires `lake` or
-  `suite`, so a round may leave both as read.
-  `state.deployed` changes only when the owner's restart lands. A fast-forward
-  of the main checkout leaves it as it was. `state.page` is the full sha of the
-  last commit to the page's source that the live page carries, per "Record
-  what is live" below. The page itself never reads it.
-- **`prs`** has one entry per open pull request, written as
-  `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
-  An entry keyed `n` drops its card without any error. A pull request from a
-  fork gets no entry, because GitHub registers a fork's closing keyword, so a
-  stranger's fork reading `Closes #640` would otherwise move that issue into In
-  flight. Read `isCrossRepository` to tell. `linked` is true when the pull
-  request's `closingIssuesReferences` names the issue. A reviewed, green card
-  lands in the owner's queue, so `reviewed` is true only once the review is
-  complete. Any review comment is not enough, because a session can post some
-  lenses' results while another lens still runs. That sent
-  [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner while its
-  mutation lens was running. A review is complete when the pull request carries
-  a comment or review from the owner whose whole first line is
+  A reviewed, green card lands in the owner's queue, so `reviewed` is true
+  only once the review is complete. Any review comment is not enough, because
+  a session can post some lenses' results while another lens still runs. That
+  sent [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner
+  while its mutation lens was running. A review is complete when the pull
+  request carries a comment or review from the owner whose whole first line is
   `## Review complete`, posted after the head commit's `committedDate`. The
-  owner's are the ones whose `authorAssociation` is `OWNER`. Anyone can comment
-  on this public repository, so a stranger's marker counts for nothing. A
-  heading that only starts with those words, like
-  `## Review completeness check`, does not count. Neither does a marker from an
-  earlier round, because the commits pushed since then are code that review
-  never saw. Count the markers with
-  `gh pr view <n> --json comments,reviews,commits --jq '.commits[-1].committedDate as $head | [.comments[] | select(.createdAt > $head and .authorAssociation == "OWNER") | .body] + [.reviews[] | select(.submittedAt > $head and .authorAssociation == "OWNER") | .body] | map(select(test("\\A## Review complete\\r?(\\n|\\z)"))) | length'`,
-  and set `reviewed` only when the count is above zero. A pull request whose
-  final review was posted before this rule carries no marker, so it reads
-  `reviewed: false` until a session posts one, and the sync reports it rather
-  than guessing whether its review finished. GitHub's review
-  decision cannot tell whether the review ran, so it does not decide
-  `reviewed`. The rule for writing the heading lives in `CLAUDE.md`, under
-  "Pull requests", where review sessions read it. A partial comment leaves
-  `reviewed` false, and the entry's `review` text says which lens is still
-  running. `rollup` is a list of `[name, conclusion]` pairs, and the
-  conclusion is one of five words.
+  owner's are the ones whose `authorAssociation` is `OWNER`. Anyone can
+  comment on this public repository, so a stranger's marker counts for
+  nothing. A heading that only starts with those words, like
+  `## Review completeness check`, does not count. Neither does a marker from
+  an earlier round, because the commits pushed since then are code that review
+  never saw. The generator applies this rule. To check one pull request by
+  hand, count its markers with
+  `gh pr view <n> --json comments,reviews,commits --jq '.commits[-1].committedDate as $head | [.comments[] | select(.createdAt > $head and .authorAssociation == "OWNER") | .body] + [.reviews[] | select(.submittedAt > $head and .authorAssociation == "OWNER") | .body] | map(select(test("\\A## Review complete\\r?(\\n|\\z)"))) | length'`.
+  A count above zero means reviewed. A pull request whose final review was
+  posted before this rule carries no marker, so it reads `reviewed: false`
+  until a session posts one, and the round reports it rather than guessing
+  whether its review finished. GitHub's review decision cannot tell whether
+  the review ran, so it does not decide `reviewed`. The rule for writing the
+  heading lives in `CLAUDE.md`, under "Pull requests", where review sessions
+  read it. `review` is one of two fixed phrases, `review complete` or
+  `no Review complete marker since the head commit`, so it never names the
+  lens still running.
 
-  1. `"success"` is a check that ran and passed. Write it for a check run's
-     SUCCESS and a status context's SUCCESS.
+  `rollup` is a list of `[name, conclusion]` pairs for the checks on the head
+  commit, and the conclusion is one of five words.
+
+  1. `"success"` is a check that ran and passed: a check run's or a status
+     context's SUCCESS.
   2. `"skipped"` is GitHub's SKIPPED, a job whose condition kept it from
      running. It counts as settled. The infra workflow's `tofu apply (live)`
      job is skipped on every pull request, because it runs only on main.
   3. `"failure"` is a check that failed, including one that timed out or
-     could not start. Write it for a check run's FAILURE, TIMED_OUT and
-     STARTUP_FAILURE, and for a status context's FAILURE and ERROR.
-  4. `"running"` is a check that has not concluded. Write it for a check run
-     with no conclusion yet, and for a status context's PENDING and EXPECTED.
-  5. `"neutral"` is a check that concluded without passing or failing. Write
-     it for a check run's NEUTRAL, CANCELLED, STALE and ACTION_REQUIRED.
+     could not start: a check run's FAILURE, TIMED_OUT and STARTUP_FAILURE,
+     and a status context's FAILURE and ERROR.
+  4. `"running"` is a check that has not concluded: a check run with no
+     conclusion yet, and a status context's PENDING and EXPECTED.
+  5. `"neutral"` is a check that concluded without passing or failing: a
+     check run's NEUTRAL, CANCELLED, STALE and ACTION_REQUIRED.
 
   Those cover every value of GitHub's `CheckConclusionState` and
-  `StatusState`, so no raw value goes into `rollup` unmapped. A value GitHub
-  adds later goes in as `"neutral"` until this list names it.
+  `StatusState`. A value GitHub adds later is written as `"neutral"` until
+  this list names it. The generator leaves out the board workflow's own
+  checks, `board-build` and `board-deploy`. A `pull_request_target` run
+  attaches them to the pull request's head commit, so without that a reviewed
+  pull request would read as still running while the board rebuilds.
 
   The page reads a rollup as green when every entry is `"success"` or
   `"skipped"` and at least one is `"success"`. It reads any word outside
-  these five as unsettled, the same as `"neutral"`, so a typo keeps a card out
-  of the owner's queue rather than drawing a pass.
-- **`working`** marks a card a session is on right now, as `{n, kind, what}`.
-  An entry with `kind: "build"` draws under Building, and any other `kind`
-  draws under Being planned.
-- **`planned`** holds the cards whose plan is finished. Each entry is keyed by
-  `n` and carries `passes`, `note`, and a `ready` of `build`, `decide` or
-  `plan`.
-- **`next`** is the ranking. Each entry is keyed by `issue` and carries `band`,
-  `order`, `ready` and `why`. Its `ready` takes `build`, `decide` or `plan`,
-  and the page ranks them in that order. It leaves out every issue labeled
-  `deferred`.
-- **`untracked`** carries over as read unless the round has reason to change
-  it.
-- **`tracker`** is every open issue, read from GitHub's GraphQL API. Its `ms`
-  is written as `"MVP 2"` or `"no milestone"`. Its `kind` is one of `ready`,
-  `deferred` or `parent` in the data so far, and the page also draws
-  `decision` and `data`. An issue with open sub-issues gets `kind: "parent"`.
-  Its `needs` comes from the issue's native `blockedBy` links plus the
-  dependency sections of issue bodies.
+  these five as unsettled, the same as `"neutral"`, so an unknown word keeps a
+  card out of the owner's queue rather than drawing a pass.
+- **`working`**, **`planned`** and **`next`** are empty until
+  [#873](https://github.com/l3a0/marketlake/issues/873) moves those
+  judgements onto GitHub. The page still draws each one. A `working` entry,
+  `{n, kind, what}`, marks a card a session is on, and one with
+  `kind: "build"` draws under Building and keeps its pull request out of the
+  owner's queue. A `planned` entry, `{n, passes, ready}`, marks a card whose
+  plan is finished. A `next` entry, `{issue, band, order, ready}`, ranks a
+  card. With `next` empty, the page's default view draws every card in the
+  chosen milestone rather than only the ranked ones.
+- **`tracker`** has one card per open issue, as `{n, label, labels, ms, kind,
+  needs}`. Its `ms` is the milestone's title up to its first comma, so
+  "MVP 2, capture on a hosted VM" reads `"MVP 2"`, or `"no milestone"`. Its
+  `kind` is `parent` while an open sub-issue exists, else `deferred` under
+  that label, else `ready`. The page also draws `decision` and `data`, which
+  the generator never writes. Its `needs` holds the open issues in this
+  repository that a native "blocked by" link names. Dependency sections in
+  issue bodies are not read, so a blocker written only in a body is not on the
+  board until someone adds the link.
 
-A `next` or `planned` entry under the wrong key drops its card in silence, the
-same way a `prs` entry keyed `n` does.
+The generator writes no `untracked`, which the page reads as empty.
 
 The page's `usable()` check refuses the whole document when any one of these
 fails. With nothing drawn yet, the page then shows only a banner saying the
@@ -516,239 +452,101 @@ The page filters cards by milestone, with a selector that defaults to "MVP 2".
 So a card's milestone comes only from `tracker`, and an issue missing from
 `tracker` never draws, whatever `next` or `prs` say about it.
 
-### A board with no document yet
-
-A board's database starts empty, so the first round against a new board finds
-no `data` document to read. There is nothing to edit, so the round builds the
-whole document from the tracker and creates it.
-
-- `schema` is `1`, as "The document's shape" above lists.
-- `tracker`, `prs` and `state.issues` come from GitHub exactly as a usual
-  round's do, with `--limit 1000` on every list.
-- `next` ranks the current MVP milestone's open issues, per `CLAUDE.md`'s
-  ranking directive, plus the bugs that directive never defers.
-- `state.main` and `state.updatedAt` take the fetched head and the time of the
-  write.
-- `state.lake` and `state.suite` can stay out, because the page neither draws
-  nor requires them.
-- `state.deployed` and `state.page` stay out. The page reads neither.
-  `state.deployed` waits for the owner to name the commit their last restart
-  ran, and `state.page` is written after the publish below.
-- `working`, `planned` and `untracked` start as `[]`. Their entries came from
-  other sessions, and the tracker cannot rebuild them. Say so in the report, so
-  a session still building or planning adds its own entry back. Step 4 then
-  has no `working` or `planned` entries to read, and reports that.
-
-Write it with `set` and no `if_version`, because the pin applies only to a
-document that already exists.
-
-```text
-ArtifactData action="set" url="<board url>"
-             collection="board" doc_id="data"
-             file_path="<scratch>/readback/board/data.json"
-```
-
-This cannot overwrite another session's board. The tool refuses a write
-without `if_version` to a document that already exists, so if another session
-created it first, read it and edit it as usual. The result names the new
-document's `version`, which the `state.page` write below pins to. The page is
-published next, because `state.page` is missing, per "Record what is live".
-
-### What a round usually changes
-
-- `prs` takes each open pull request's checks at its current head and its
-  review status, and drops pull requests that merged or closed.
-- `tracker` and `state.issues` take the issues filed, closed or relabeled since
-  the last round. `planned` and `next` drop entries for closed issues.
-- `state.main` takes the head the fetch printed, and `state.updatedAt` takes
-  the time of the write.
-- `working` entries are owed a removal by whoever added them, so report a stale
-  one rather than deleting another session's entry. A build session keeps its
-  entry until it hands its pull request over. Until that session removes it, a
-  `working` entry of `kind: "build"` keeps the card out of "Waiting on your
-  review", even when its pull request is reviewed and green. An entry of any
-  other `kind` does not hold the card, because a planning loop on leftover
-  scope should not hide a finished pull request. Ask whoever added an entry
-  before calling it stale.
-- The round compares `state.page` with `main` and publishes the page when they
-  differ or `state.page` is missing, per "Record what is live" below.
-
-Pass `--limit 1000` to every `gh` list command that feeds the board, because
-`gh` stops at its limit without a warning and its default is 30. A cut list
-prints the same way a complete one does.
-
 ### Confirm the page drew it
 
-A `set` that succeeded proves the database took the document. It does not prove
-the page drew it, because the page refuses a document its `usable()` check
-rejects, and an entry keyed wrong drops its card in silence. So after writing,
-look at the page and confirm every card this round added or moved.
+A green run proves the workflow published the files. It does not prove the
+page drew them, because the page refuses a document its `usable()` check
+rejects and then shows only a banner. So open
+<https://l3a0.github.io/marketlake/> and read what it drew.
 
 1. **Look under both selectors.** Check the cards under "MVP 2", then again
    under "All". The selector defaults to "MVP 2", and bugs that can lose a
-   captured minute and bugs in an alarm carry no milestone. Their cards often
-   rank first in `next`, and they never draw under the default.
-2. **View the page in a browser.** The `Artifact` tool's `open` action shows
-   the page to the owner and shows the session nothing. Open `<board url>` in
-   a browser signed in to claude.ai, through Claude in Chrome, and read a
-   screenshot. Text extraction cannot read the page, because it renders inside
-   a frame.
+   captured minute and bugs in an alarm carry no milestone, so they never draw
+   under the default.
+2. **Read the page's text.** Pages serves the board as an ordinary page rather
+   than inside a frame, so a browser tool's text extraction reads it. On a
+   page drawn from live data, the banner under the strip is empty and the
+   footer names the `main` sha the board was built against.
 
 ### Changing the page
 
-A page republished from a session's scratch copy has no review and no history.
-Fifty-four versions of the board went out that way, and on 2026-10-06 a bug in
-the column logic of one of them sent an unfinished pull request to the owner's
-queue. So the page's source is `.claude/skills/sync-prune-next/board.html`,
-and a change to it goes through a pull request and the same review as any
-other code, per `CLAUDE.md`.
+The page's source is `.claude/skills/sync-prune-next/board.html`, and a change
+to it goes through a pull request and the same review as any other code, per
+`CLAUDE.md`. The workflow publishes `main`'s copy on its next run, so nothing
+else publishes the page. Before the source entered the repository, fifty-four
+versions of the board went out from sessions' scratch copies with no review and
+no history, and on 2026-10-06 a bug in the column logic of one of them sent an
+unfinished pull request to the owner's queue.
 
-One rule decides every publish: the bytes published to the board equal
-`main`'s copy of that file. Where the file sits on disk does not matter.
-
-A round changes what the board shows by writing the `data` document, as above.
-It publishes the page only to bring it level with `main`.
+The workflow builds `board.json` and copies the page in the same run, so a
+change that makes `usable()` or a render path require a new field ships with
+the generator change that writes it, in the same pull request. That pull
+request also updates "What the generator writes" above.
 
 #### Test the page before the pull request
 
-CI runs the page's fetch path in `tests/component/test_board_page.py`, which
-feeds the page fake `board.json` answers through `dom-stub.js`. Three of its
-cases run the database path with a fake database: one checks that a page with
-a database never fetches, and two check the banner after a document fails to
-draw. Nothing else in CI runs that path, so a change that throws or draws the
-wrong thing there reaches every viewer of the artifact unless its author runs
-it first.
-`board-harness.js`, beside this skill, runs the page's inline script against a
-stub DOM and prints what each element drew, as JSON. It runs under
-`osascript -l JavaScript`, because macOS ships that and node may be absent.
+`tests/component/test_board_page.py` runs the page's script under a
+JavaScript engine, with `dom-stub.js` standing in for the browser and a fake
+fetch serving each `board.json` answer in turn, and reads what each element
+drew. It runs under `node` where it is installed, as on CI's runner, and under
+`osascript -l JavaScript` otherwise, which ships with macOS. With neither, it
+skips. CI runs it on every pull request.
 
 ```bash
-osascript -l JavaScript .claude/skills/sync-prune-next/board-harness.js \
-  .claude/skills/sync-prune-next/board.html live - "MVP 2" <scratch>/readback/board/data.json
+uv run pytest tests/component/test_board_page.py
 ```
 
-The arguments, in order, are these five.
+Those tests feed documents someone thought of. To see the changed page draw
+the board as GitHub stands, build `board.json` from live data and serve the
+page beside it, laid out as the workflow lays them out.
 
-1. The page file.
-2. How the database answers: `none`, `loading`, `empty`, `shape`, `stopped`,
-   `live` or `dropped`. The header of `board-harness.js` says what each one
-   delivers.
-3. The saved "Show all" choice, as `1` or `0`, or `-` for none saved.
-4. The saved milestone choice, or `-` for none saved.
-5. The data file, read as described above. Only `live` and `dropped` use it.
-
-In the output, `errors` lists anything that threw, and `visible` maps each
-drawn element to the text a reader would see. Run `main`'s copy and the changed
-copy over the same modes, choices and data, and compare the two outputs. Every
-difference should be one the change intends. Run each mode at least once,
-because the modes with no data take a different path through the page.
-
-#### A change to what the page requires
-
-A page change that makes `usable()` or a render path require a new field ships
-in this order after its pull request merges.
-
-1. Write the field into the `data` document. The live page ignores a field it
-   does not read.
-2. Publish the page.
-
-In the other order the new page refuses the old document, and the board shows
-no data until a round writes the field. The same pull request updates "The
-document's shape" above.
-
-#### Publish from main
-
-1. Fetch with `git fetch origin`.
-2. Write the published file to a scratch directory with
-   `git show origin/main:.claude/skills/sync-prune-next/board.html > <scratch>/board.html`.
-3. Check that `git hash-object <scratch>/board.html` prints the same id as
-   `git rev-parse origin/main:.claude/skills/sync-prune-next/board.html`. Stop
-   if they differ.
-4. Run the `Artifact` tool's `read` action on the board's URL. The only reason
-   for this step is that the tool refuses a publish to an artifact the session
-   has not read. The file the read saves is never a source for the publish.
-5. Publish with the `Artifact` tool, with `url` set to the board's URL and
-   `file_path` set to `<scratch>/board.html`. Set `label` to the short sha of
-   the last commit that touched the page's source, which
-   `git log -1 --format=%h origin/main -- .claude/skills/sync-prune-next/board.html`
-   prints.
-6. Leave `capabilities` and `contract` out of the call. Leaving them out keeps
-   the page's database access and its runtime version as they are.
-
-```text
-Artifact action="publish" url="<board url>"
-         file_path="<scratch>/board.html" label="<short sha>"
+```bash
+uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <scratch>/site
+cp .claude/skills/sync-prune-next/board.html <scratch>/site/index.html
+cp .claude/skills/sync-prune-next/favicon.ico <scratch>/site/favicon.ico
+uv run python -m http.server 8799 --bind 127.0.0.1 --directory <scratch>/site
 ```
 
-Then record the publish in `state.page`, as below, and look at the page, per
-"Confirm the page drew it" above.
-
-#### On a publish conflict
-
-The `Artifact` tool can refuse a publish because the live page changed after
-the read, and hand back the newer content. Its general advice is to merge the
-session's changes into that content. This page overrides that advice, because
-`main` is its only source, and content handed back by a refusal is a version
-nobody reviewed. So fetch again, read the board again, and publish from `origin/main`
-by the steps above.
-
-- Never merge the content the refusal hands back.
-- Never build the published file from a copy read back from the live page.
-- Never pass `force`.
-
-If the refusal repeats, stop and tell the owner rather than forcing the publish.
-
-#### Record what is live
-
-A merge whose author leaves before publishing leaves the board running old code,
-and nothing on the page shows it. So the data document records which commit is
-live, and every sync round checks it.
-
-After a publish, write `state.page` as the full sha of the last commit that
-touched the page's source, which
-`git log -1 --format=%H origin/main -- .claude/skills/sync-prune-next/board.html`
-prints. Write it with an `update` pinned to the document's current version,
-which the round's last read or write names. Its `data` carries `state` exactly
-as last read or written, with only `page` set. On a new board, nothing was
-read, so that is the `state` the round's own `set` wrote. Sending the whole `state` keeps the write
-correct whether `update` merges nested fields or replaces the `state` object.
-
-```text
-ArtifactData action="update" url="<board url>"
-             collection="board" doc_id="data"
-             data={"state": {<state as last read or written>, "page": "<full sha>"}}
-             if_version=<last version>
-```
-
-Each sync round compares `state.page` with what that `git log` command prints
-against the freshly fetched `origin/main`. When they differ, or `state.page` is
-missing, the round publishes by the steps above. That covers the first publish
-after the page's source entered the repository, and any merge whose author is
-gone.
-
-The page's `usable()` check tests only the fields it needs and accepts a
-document that carries more, and no render path reads `state.page`. A document
-with `state.page` set draws exactly what the same document without it draws.
+Run the server in the background, open <http://127.0.0.1:8799/> in a browser,
+and read the page under "MVP 2" and under "All". Serve `main`'s copy of the
+page, from
+`git show origin/main:.claude/skills/sync-prune-next/board.html`, beside the
+same `board.json` and compare the two. Every difference should be one the
+change intends. Stop the server when done.
 
 ## 4. Recommend what to take next
 
-`CLAUDE.md`'s ranking directive and its exceptions decide the order. Read them
-there rather than from a copy here. The board's `next` stores that order, so
-read `next` rather than re-deriving it.
+Read `<scratch>/board.json`, the file step 3 built, rather than the page,
+which can be a run behind. `CLAUDE.md`'s ranking directive and its exceptions
+decide the order. Read them there rather than from a copy here.
+
+Once [#873](https://github.com/l3a0/marketlake/issues/873) moves the ranking
+onto GitHub, the file's `next` stores that order, so read `next` rather than
+re-deriving it. Until then `next`, `planned` and `working` are empty. So rank
+the candidates from the directive itself, and report that the round had no
+`working` or `planned` entries to read.
+
+When step 3 could not build the file, read the open pull requests, their
+checks and their review markers straight from GitHub, as "What the generator
+writes" in step 3 describes `prs`. Pass `--limit 1000` to every `gh` list
+command that feeds a candidate, because `gh` stops at its limit without a
+warning and its default is 30. A cut list prints the same way a complete one
+does.
 
 The open MVP milestone tracks the work
 ([MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5),
 when this was written). An issue off that path carries no milestone and the
 `deferred` label. Bugs that can lose a captured minute, and bugs in an alarm,
 are never deferred, so they carry neither and stay candidates even without the
-milestone. That is why the page check above looks under "All" as well.
+milestone. That is why step 3's check of the page looks under "All" as
+well.
 
 Collect candidates from three places, and give the evidence for each one.
 
 1. **The owner's queue.** Nothing moves until the owner answers, so these come
    first.
-   - Pull requests that are reviewed, green at the current head as the
-     `rollup` entry above defines it, and carry no `working` entry of
+   - Pull requests that are reviewed, green at the current head as step 3's
+     `rollup` words define it, and carry no `working` entry of
      `kind: "build"` on their card. When the card's `needs` names an issue
      still in `tracker`, the owner can review now but not merge, so name each
      open blocker rather than present the pull request as ready to merge.
@@ -757,8 +555,9 @@ Collect candidates from three places, and give the evidence for each one.
 2. **Plans ready to build with no builder.** These are `planned` entries with
    `ready` of `build`, with no `working` entry, no open pull request, and no
    `needs` entry naming an issue still in `tracker`.
-3. **The MVP milestone's remaining issues**, in `next`'s order, each with the
-   blockers its `needs` names. A blocked issue is not a candidate until its
+3. **The MVP milestone's remaining issues**, in `next`'s order, or in the
+   directive's while `next` is empty, each with the blockers its `needs`
+   names. A blocked issue is not a candidate until its
    blockers close, so name what it waits on rather than recommending it.
 
 Link every issue and pull request number, as `[#NN](...)` for an issue and
