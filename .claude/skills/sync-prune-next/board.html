@@ -1,3 +1,8 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Marketlake Build Board</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
 <style>
@@ -48,7 +53,12 @@
     --idle: #8494A2; --idle-soft: #1F272F;
   }
 
-  body { background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
+  /* marketlake: the artifact host used to wrap the page in its own document,
+     which set these. Served raw on GitHub Pages, a page without them renders in
+     quirks mode at 980 pixels wide on a phone, and `.msbar`'s `display: flex`
+     beats `hidden`, drawing an empty milestone select above the loading banner. */
+  body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
+  [hidden] { display: none !important; }
   .wrap { max-width: 1080px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 56px; }
   h1, h2, h3 { text-wrap: balance; margin: 0; }
   a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
@@ -238,6 +248,8 @@
 
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
+</head>
+<body>
 
 <div class="wrap">
   <div class="mast">
@@ -300,11 +312,27 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
    database cannot be reached, the page draws only the banner under the strip,
    which says why there is nothing to show.
 
+   marketlake: the same page also runs on GitHub Pages, where it has no
+   database. A GitHub Action there rebuilds board.json beside the page on every
+   change and on a schedule, and the page fetches it every FETCH_EVERY
+   milliseconds instead of subscribing. Issue 872 built that path beside the
+   database rather than in its place, because the artifact board stays the
+   board of record until the skill stops writing it. The fetch starts only once
+   the database lookup has settled with no database, so the two never race.
+
    The document's shape is { schema, state, prs, working, planned, next,
    untracked, tracker }, and each field is what the constant of the same name
    held on the Quantitative Trading page. `usable` below is the whole contract
    the page checks before adopting a document. */
 const DOC = "board/data";
+/* marketlake: Pages tells a browser to cache board.json for ten minutes, so
+   each fetch asks for a URL no cache has seen and tells the browser to store
+   nothing. */
+const FETCH_EVERY = 120000;
+/* marketlake: true once the page reads board.json rather than the database.
+   The footer and the stopped banner read it, because only the database board
+   is measured by hand and only the fetch tries again on its own. */
+let FETCHED = false;
 /* marketlake: `none` tells render() there is no board to draw. Every section
    below states facts about the tracker, so any stand-in document, however
    empty, makes the page assert facts it does not have. A stand-in card also
@@ -323,6 +351,10 @@ let SOURCE = { live: false, why: "loading" };
 let SHOW_ALL = false;
 try { SHOW_ALL = localStorage.getItem("marketlake-board-all") === "1"; } catch (e) { SHOW_ALL = false; }
 let SHOWN = 0, HIDDEN = 0;
+/* marketlake: true when the chosen milestone holds no ranked card outside the
+   In flight section. The ranked-only view would then draw only parents, under a
+   line calling them ranked, so buildOrder() draws every card instead. */
+let UNRANKED = false;
 let CHAIN_ESC = null;
 
 /* marketlake: the milestone filter. MS_PREF is what the reader chose, kept per
@@ -339,10 +371,37 @@ let MS = MS_ALL;
 let MS_OPTS = "";
 const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
 
+/* marketlake: the check reaches inside each item, as the Quantitative Trading
+   page's ITEM_OK does. It used to check only the outer shape, so a tracker item
+   with no `needs` passed and then threw inside render(). One bad item refuses
+   the whole document, so the page never draws a board silently missing cards.
+
+   A field the page writes into an attribute without `esc()` must be a number:
+   a card's `n`, a pull request's `pr` and `issue`, and the open issue count.
+   A field the page compares against a fixed set must be in that set, because
+   an unknown `kind` writes a broken sentence, and `kind`, `state` and `ready`
+   each reach a class attribute or a lookup by name. `review` is drawn verbatim, so a missing one would draw "undefined".
+   Anyone can write an issue title, and titles pass through `esc()` at both
+   drawing sites. The page's origin, l3a0.github.io, is shared with the
+   Quantitative Trading board, so a script injected into either would run on
+   both. `state.lake` and `state.suite` are no longer required, because the page
+   draws neither. */
+const isNum = v => typeof v === "number" && isFinite(v);
+const isStr = v => typeof v === "string";
+const oneOf = xs => v => xs.indexOf(v) >= 0;
+const ITEM_OK = {
+  tracker: c => !!c && isNum(c.n) && isStr(c.label) && isStr(c.ms) &&
+    oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && Array.isArray(c.needs),
+  prs: p => !!p && isNum(p.pr) && isNum(p.issue) && oneOf(["open", "merged", "closed"])(p.state) &&
+    isStr(p.review),
+  working: w => !!w,
+  planned: p => !!p && oneOf(["build", "decide", "plan"])(p.ready),
+  next: x => !!x && oneOf(["build", "decide", "plan"])(x.ready)
+};
 function usable(d) {
-  return !!(d && d.state && typeof d.state.main === "string" && d.state.lake && d.state.suite &&
-    d.state.issues && Array.isArray(d.tracker) && d.tracker.length && Array.isArray(d.next) &&
-    Array.isArray(d.prs) && Array.isArray(d.working) && Array.isArray(d.planned));
+  if (!(d && d.state && isStr(d.state.main) && d.state.issues && isNum(d.state.issues.open))) return false;
+  if (!(Array.isArray(d.tracker) && d.tracker.length)) return false;
+  return Object.keys(ITEM_OK).every(k => Array.isArray(d[k]) && d[k].every(ITEM_OK[k]));
 }
 
 /* A delivered snapshot is frozen, so the page works on a clone. */
@@ -377,8 +436,12 @@ function source() {
     none: `<b>Showing ${copy}.</b> This view cannot reach the live board, and the page carries no copy of its own.`,
     empty: `<b>Showing ${copy}.</b> The live board holds no document yet.`,
     shape: `<b>Showing ${copy}.</b> The live board's document is missing fields this page needs, so it was not used.`,
+    /* marketlake: a fetched board tries again on its own timer, so it says
+       so rather than asking for the reload a database subscription needs. */
     stopped: `<b>Live updates stopped${SOURCE.code ? ` (${esc(SOURCE.code)})` : ""}.</b> ` +
-      (SOURCE.had ? `What is shown is the last live data, ${age()}. Reload to reconnect.`
+      (SOURCE.had ? `What is shown is the last live data, ${age()}. ` +
+                    (SOURCE.retry ? `The page tries again every ${FETCH_EVERY / 60000} minutes.`
+                                  : `Reload to reconnect.`)
                   : `Showing ${copy}.`)
   };
   el.innerHTML = lines[SOURCE.why] || lines.none;
@@ -395,9 +458,20 @@ function source() {
 function more() {
   const el = document.getElementById("more");
   if (!el) return;
-  if (!HIDDEN && !SHOW_ALL) { el.innerHTML = ""; return; }
   /* marketlake: both counts are within the chosen milestone, so the line says so. */
   const where = MS === MS_ALL ? "" : ` in ${esc(MS)}`;
+  /* marketlake: with nothing ranked, buildOrder() draws every card, so the line
+     says why rather than calling them ranked, and offers no toggle that would
+     change nothing. */
+  if (UNRANKED) {
+    el.onclick = null;
+    el.innerHTML = SHOWN
+      ? `<span>Nothing${where} is ranked yet, so ${SHOWN === 1 ? "the 1 open issue" :
+          `all ${SHOWN} open issues`}${where} not in flight ${SHOWN === 1 ? "is" : "are"} showing.</span>`
+      : "";
+    return;
+  }
+  if (!HIDDEN && !SHOW_ALL) { el.innerHTML = ""; return; }
   el.innerHTML = SHOW_ALL
     ? `<span>Showing all ${SHOWN} open issues${where} not in flight.</span>` +
       `<button type="button" data-toggle>Show only the ranked cards</button>`
@@ -445,7 +519,7 @@ const READY_RANK = { build: 0, decide: 1, plan: 2 };
 /* marketlake: NEXT_SORTED is computed in adopt(), because the ranking can arrive
    from the database after the page has loaded. */
 
-const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const num = n => Number(n || 0).toLocaleString("en-US");
 const plu = (n, w) => n + " " + w + (n === 1 ? "" : /(s|x|ch|sh)$/.test(w) ? "es" : "s");
 /* One join, two conjunctions. A set of things that all hold takes "and", and a
@@ -553,10 +627,18 @@ function stamped() {
   if (WORKING.length) decay.push("a session that has ended since then still reads as running");
   if (open.length) decay.push("a check that has gone green or red since then still reads here as it read then");
   if (open.some(p => !p.reviewed)) decay.push("a review posted since then still reads as owed");
+  /* marketlake: the board on GitHub Pages is built by an Action rather than by
+     hand, so it says how it is built instead. Its figures still date from the
+     stamp rather than from the moment of reading, so the decay clause holds for
+     both. */
+  const how = FETCHED
+    ? `Built from GitHub against <span class="mono">main</span> at ` +
+      `<span class="mono">${esc(STATE.main)}</span> by an Action on each change and on a ` +
+      `schedule, and fetched again every ${FETCH_EVERY / 60000} minutes`
+    : `Measured by hand against <span class="mono">main</span> at ` +
+      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub`;
   document.getElementById("foot").innerHTML =
-    `<p>Measured by hand against <span class="mono">main</span> at ` +
-    `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub, ` +
-    `so every figure on it is current as of the stamp above rather than live.` +
+    `<p>${how}, so every figure on it is current as of the stamp above rather than live.` +
     (decay.length ? ` The In flight section decays fastest: ${andlist(decay)}.` : ``) +
     `</p>`;
 }
@@ -696,7 +778,12 @@ function buildOrder() {
   /* marketlake: under one chosen milestone a parent in it shows too. A parent
      builds nothing, so it is never ranked, and the ranked-only view would always
      hide the card its children name as what they serve. */
-  const rest = open.filter(c => SHOW_ALL || rankMark(c) || (MS !== MS_ALL && c.kind === "parent"));
+  /* marketlake: and when nothing here is ranked, every card shows. Until issue
+     873 the board on GitHub Pages carries no ranking, and the ranked-only view
+     then drew 0 cards under "All" and only the parents under "MVP 2". */
+  UNRANKED = !open.some(c => rankMark(c));
+  const rest = open.filter(c => SHOW_ALL || UNRANKED || rankMark(c) ||
+    (MS !== MS_ALL && c.kind === "parent"));
   SHOWN = rest.length; HIDDEN = open.length - rest.length;
   /* Relaxed to a fixed point rather than resolved in one walk, so a card ends up
      right of everything it waits on however the list happens to be ordered. */
@@ -1153,7 +1240,7 @@ function buildOrder() {
      itself knows, so the two cannot say different things about one card. */
   document.getElementById("boardnote").innerHTML =
     `<b>${free.length} cards are free for a session to take today</b>, out of ${bucket[0].length} in the ` +
-    `first column: ${free.map(c => "#" + c.n).join(", ")}. ` +
+    `first column${free.length ? `: ${free.map(c => "#" + c.n).join(", ")}` : ""}. ` +
     (held.length
       ? `${plu(held.length, "card")} there ${held.length === 1 ? "is" : "are"} not free, ` +
         `because a card can ${orlist(why)}, and depth alone does not say what to pick. `
@@ -1438,8 +1525,8 @@ function inFlight(ctx) {
 /* marketlake: msbar() first, because every section reads the MS it resolves.
    With no board data only the banner is drawn, and the selector, both card
    sections and the footer are hidden, since each states facts about the
-   tracker. The platform's page wrapper makes `hidden` win over a section's own
-   display rule. */
+   tracker. The page's own `[hidden]` rule makes `hidden` win over a section's
+   own display rule, which the artifact host's wrapper used to do. */
 function render() {
   ["msbar", "flightsec", "ordersec", "foot"].forEach(id => {
     const el = document.getElementById(id);
@@ -1451,12 +1538,75 @@ function render() {
 adopt(FALLBACK);
 render();
 
+/* marketlake: draws a document that passed `usable`, and rolls back to the last
+   good board when the draw throws. Both paths call it, the database
+   subscription and the fetch, so a document that breaks the drawing code is
+   handled one way whichever path delivered it. `usable` checks every field the
+   drawing code reads without a guard, and this catches a shape it misses. With
+   no data on screen, a failed first draw goes back to drawing none, and the
+   strip that draw wrote is emptied so no count sits beside a banner saying no
+   board data is shown. */
+function drawLive(d, had, retry) {
+  const last = NONE ? FALLBACK
+    : { state: STATE, prs: PRS, working: WORKING, planned: PLANNED, next: NEXT,
+        untracked: UNTRACKED, tracker: TRACKER };
+  try {
+    adopt(d); SOURCE = { live: true }; render(); return true;
+  } catch (e) {
+    adopt(last);
+    if (NONE) document.getElementById("strip").innerHTML = "";
+    SOURCE = { live: false, why: "stopped", had, retry, code: "the board could not be drawn" };
+    try { render(); } catch (e2) { source(); }
+    return false;
+  }
+}
+
+/* marketlake: the board on GitHub Pages fetches board.json at once and every
+   FETCH_EVERY milliseconds. A fetch that fails after a board has drawn keeps
+   that board on screen and says when the page tries next, and the next good
+   fetch goes live again. A first fetch that fails says what a view with no
+   database says, because to the reader it is the same thing: there is no
+   board here to show. Each good fetch redraws. */
+function connectFetch() {
+  FETCHED = true;
+  let had = false;
+  const failed = code => {
+    SOURCE = had ? { live: false, why: "stopped", had, retry: true, code }
+                 : { live: false, why: "none" };
+    source();
+  };
+  const poll = async () => {
+    let text;
+    try {
+      const r = await fetch(`board.json?t=${Date.now()}`, { cache: "no-store" });
+      if (!r || !r.ok) return failed(`board.json answered ${r ? r.status : "nothing"}`);
+      text = await r.text();
+    } catch (e) { return failed("board.json could not be fetched"); }
+    let d;
+    try { d = JSON.parse(text); } catch (e) { return failed("board.json is not JSON"); }
+    if (!usable(d)) {
+      if (had) return failed("unreadable board.json");
+      SOURCE = { live: false, why: "shape" }; source(); return;
+    }
+    if (drawLive(d, had, true)) had = true;
+  };
+  SOURCE = { live: false, why: "loading" }; source();
+  poll();
+  setInterval(poll, FETCH_EVERY);
+}
+
 /* marketlake: subscribe once. A snapshot that fails `usable` is not adopted, so
-   a half-written or old-shaped document leaves the last good data on screen. */
+   a half-written or old-shaped document leaves the last good data on screen.
+   The lookup stays `window.claude`, because the skill's harness passes `window`
+   in as a parameter. With no database, the page fetches board.json where the
+   host has a fetch, and says it cannot reach the live board where it has none. */
 (async () => {
   let db = null;
   try { db = await window.claude?.use?.("db"); } catch (e) { db = null; }
-  if (!db) { SOURCE = { live: false, why: "none" }; source(); return; }
+  if (!db) {
+    if (typeof fetch === "function") { connectFetch(); return; }
+    SOURCE = { live: false, why: "none" }; source(); return;
+  }
   let had = false;
   try {
     db.doc(DOC).onSnapshot(snap => {
@@ -1466,7 +1616,7 @@ render();
       }
       const d = snap.data();
       if (!usable(d)) { SOURCE = had ? { live: false, why: "stopped", had, code: "unreadable document" } : { live: false, why: "shape" }; source(); return; }
-      adopt(d); had = true; SOURCE = { live: true }; render();
+      if (drawLive(d, had, false)) had = true;
     }, err => {
       SOURCE = { live: false, why: "stopped", had, code: err && err.code };
       source();
@@ -1482,3 +1632,5 @@ setInterval(() => {
   if (el && !NONE) el.textContent = "measured " + ago(STATE.updatedAt);
 }, 60000);
 </script>
+</body>
+</html>

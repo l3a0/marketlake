@@ -258,9 +258,11 @@ in progress that nothing else announces, such as the worktree above.
 
 ## 3. Update the build board
 
-The board is a claude.ai artifact. Its URL lives in a file on this machine
-rather than in the repository, so switching to another board needs no commit.
-Read it before anything else in this step.
+The board of record is a claude.ai artifact, and this step writes it. A second
+board on GitHub Pages builds itself, as "The board on GitHub Pages" below
+describes, and a round writes nothing to it. The artifact's URL lives in a file
+on this machine rather than in the repository, so switching to another board
+needs no commit. Read it before anything else in this step.
 
 ```bash
 d="${MARKETLAKE_CONFIG_DIR:-$HOME/.config/marketlake}"; d="${d/#\~/$HOME}"
@@ -288,10 +290,28 @@ their review markers straight from GitHub, as "The document's shape" describes
 for `prs`, and ranks from `CLAUDE.md`'s directive. It reports that it had no
 `working` or `planned` entries to read.
 
-The board cannot read the disk or poll GitHub, so every figure on it was
-measured by a session and written by hand. A round that changes what the board
-should show and leaves without writing has made it wrong, and nothing else
-notices.
+The artifact board cannot read the disk or poll GitHub, so every figure on it
+was measured by a session and written by hand. A round that changes what the
+board should show and leaves without writing has made it wrong, and nothing
+else notices.
+
+### The board on GitHub Pages
+
+<https://l3a0.github.io/marketlake/> serves the same `board.html` beside a
+`board.json` that `.github/workflows/board.yml` builds from GitHub on every
+issue, comment and pull request event, when CI or Infra finishes, and on a
+schedule. `build_board.py`, beside this skill, is the generator, and the page
+fetches its output every two minutes. It fills `state`, `tracker` and `prs` in
+the shape below, and leaves `working`, `planned` and `next` empty until
+[#873](https://github.com/l3a0/marketlake/issues/873) moves those judgements
+onto GitHub. So its default view draws every card in the chosen milestone
+rather than only the ranked ones. The artifact stays the board of record until
+the skill stops writing it.
+
+The page finds which board it is on by itself. Inside the artifact it reads the
+database, and on Pages, where it finds none, it fetches `board.json`.
+`board-harness.js` reaches only the database path, and
+`tests/component/test_board_page.py` runs the fetch path.
 
 ### Switching to another board
 
@@ -351,8 +371,8 @@ old content under a new version, and looks exactly like a good write.
 
 - **`state`** carries `main`, `deployed`, `updatedAt`, `lake` (with
   `sessions`, `chainRows`, `first` and `last`), `suite.tests`, and `issues`
-  (with `open` and `deferred`). The page no longer draws `lake` or `suite`, but
-  its `usable()` check refuses a document without them, so keep both.
+  (with `open` and `deferred`). The page neither draws nor requires `lake` or
+  `suite`, so a round may leave both as read.
   `state.deployed` changes only when the owner's restart lands. A fast-forward
   of the main checkout leaves it as it was. `state.page` is the full sha of the
   last commit to the page's source that the live page carries, per "Record
@@ -408,7 +428,8 @@ old content under a new version, and looks exactly like a good write.
   An entry with `kind: "build"` draws under Building, and any other `kind`
   draws under Being planned.
 - **`planned`** holds the cards whose plan is finished. Each entry is keyed by
-  `n` and carries `passes`, `note`, and a `ready` of `build` or `decide`.
+  `n` and carries `passes`, `note`, and a `ready` of `build`, `decide` or
+  `plan`.
 - **`next`** is the ranking. Each entry is keyed by `issue` and carries `band`,
   `order`, `ready` and `why`. Its `ready` takes `build`, `decide` or `plan`,
   and the page ranks them in that order. It leaves out every issue labeled
@@ -424,6 +445,22 @@ old content under a new version, and looks exactly like a good write.
 
 A `next` or `planned` entry under the wrong key drops its card in silence, the
 same way a `prs` entry keyed `n` does.
+
+The page's `usable()` check refuses the whole document when any one of these
+fails, and draws only a banner saying the document is missing fields.
+
+1. `state.main` is a string and `state.issues.open` is a number.
+2. `tracker` is a list with at least one entry, and `prs`, `working`, `planned`
+   and `next` are lists.
+3. Each `tracker` entry has a number `n`, a string `label` and `ms`, a `kind`
+   of `ready`, `deferred`, `parent`, `decision` or `data`, and a list `needs`.
+4. Each `prs` entry has a number `pr` and `issue`, a `state` of `open`,
+   `merged` or `closed`, and a string `review`.
+5. Each `planned` and `next` entry has a `ready` of `build`, `decide` or
+   `plan`.
+
+The numbers and the fixed sets are checked because the page writes those
+fields into links and attributes without escaping them.
 
 The page filters cards by milestone, with a selector that defaults to "MVP 2".
 So a card's milestone comes only from `tracker`, and an issue missing from
@@ -442,8 +479,8 @@ whole document from the tracker and creates it.
   ranking directive, plus the bugs that directive never defers.
 - `state.main` and `state.updatedAt` take the fetched head and the time of the
   write.
-- `state.lake` and `state.suite` must exist for `usable()`, and the page draws
-  neither. Write `{}` for each unless the round measured their figures.
+- `state.lake` and `state.suite` can stay out, because the page neither draws
+  nor requires them.
 - `state.deployed` and `state.page` stay out. The page reads neither.
   `state.deployed` waits for the owner to name the commit their last restart
   ran, and `state.page` is written after the publish below.
@@ -524,11 +561,13 @@ It publishes the page only to bring it level with `main`.
 
 #### Test the page before the pull request
 
-Nothing in CI runs the page, so a change that throws or draws the wrong thing
-reaches every viewer unless its author runs it first. `board-harness.js`,
-beside this skill, runs the page's inline script against a stub DOM and prints
-what each element drew, as JSON. It runs under `osascript -l JavaScript`,
-because macOS ships that and node may be absent.
+CI runs the page's fetch path in `tests/component/test_board_page.py`, which
+feeds the page fake `board.json` answers through `dom-stub.js`. Nothing in CI
+runs its database path, so a change that throws or draws the wrong thing there
+reaches every viewer of the artifact unless its author runs it first.
+`board-harness.js`, beside this skill, runs the page's inline script against a
+stub DOM and prints what each element drew, as JSON. It runs under
+`osascript -l JavaScript`, because macOS ships that and node may be absent.
 
 ```bash
 osascript -l JavaScript .claude/skills/sync-prune-next/board-harness.js \
