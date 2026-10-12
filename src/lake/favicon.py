@@ -1,4 +1,4 @@
-"""The dashboard's browser-tab icon, and the pixel grid it is rendered from.
+"""The dashboard's and the build board's browser-tab icons, and the grid they come from.
 
 An alert names the dashboard panel to open, so the status page is a tab the owner returns
 to. A tab with no icon is harder to pick out of a row of them. This module holds the mark
@@ -51,9 +51,27 @@ header must claim double the real height to leave room for a separate transparen
 Safari 26.6.2 and Chrome 152.0.7977.82 both decode the shipped file. That is the support
 this dashboard needs, because it is opened by hand on one Mac over the loopback address.
 
+**The board's icon.** The build board is the second page the owner keeps in a tab, so it
+needs an icon too. It reuses the dashboard's mark rather than a design of its own, so both
+tabs read as marketlake. The board's grid is ``MARK`` with a tick added in the top-left
+corner, rows 0 to 4 and columns 0 to 4, which the mark leaves empty. A clear row and a clear
+column still separate the tick from the columns, so it reads as its own shape. The tick is
+there because two tabs from one product sit side by side, and a hue alone is easy to miss
+at 16 pixels. ``with_corner`` refuses a corner that would ink a cell the mark already inks,
+so the tick can never change the columns or the water it sits beside.
+
+The board's ink is blue, ``#3b82f6``. Against the same three tab strips it measures 3.68,
+4.38 and 3.28, so it clears 3:1 on all three, where the dashboard's green reads 4.25, 3.79
+and 2.84. The board's mark carries no meaning tied to the dashboard's palette, so its ink
+can be chosen for contrast alone. Amber was considered and rejected. The sibling
+``quantitative-trading`` repository's board icon is an amber disc, and two amber board
+tabs open side by side would differ only in shape.
+
 ``render`` is deterministic and depends on nothing outside the standard library. A golden
-test compares its output against the shipped file, so the checked-in binary is never the only
-record of what the icon is. Regenerate the file with ``python -m lake.favicon``.
+test compares each icon against its shipped file, so a checked-in binary is never the only
+record of what an icon is. Regenerate the dashboard's file with ``python -m lake.favicon``.
+The board's file lives in the repository rather than the package, so its command names it:
+``python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico``.
 """
 
 from __future__ import annotations
@@ -89,6 +107,19 @@ MARK: tuple[str, ...] = (
 # The dashboard's ``--captured`` sea green, as red, green and blue bytes.
 INK = (0x2E, 0x8B, 0x57)
 
+# The board's tick, as the cells it inks in the mark's top-left corner. ``with_corner``
+# lays it over ``MARK`` and refuses it if it would touch a cell the mark already inks.
+TICK: tuple[str, ...] = (
+    "....#",
+    "...##",
+    "#.##.",
+    "###..",
+    ".#...",
+)
+
+# The board's blue, as red, green and blue bytes.
+BOARD_INK = (0x3B, 0x82, 0xF6)
+
 # The square sizes the container carries. Each must be a whole multiple of the grid, so
 # that every edge in the mark lands on a pixel boundary at every size.
 SIZES = (16, 32, 48)
@@ -96,11 +127,34 @@ SIZES = (16, 32, 48)
 GRID = len(MARK)
 
 
-def _rgba(scale: int) -> bytes:
-    """The mark as raw top-down RGBA rows, each grid cell drawn ``scale`` pixels square."""
-    ink = bytes(INK) + b"\xff"
+def with_corner(mark: Sequence[str], corner: Sequence[str]) -> tuple[str, ...]:
+    """``mark`` with the ink of ``corner`` added at its top-left.
+
+    Every other cell is the mark's own, so the result shares the mark's columns and water
+    rather than carrying a second copy of them. A corner that would ink a cell the mark
+    already inks raises ``ValueError``, because the corner is meant to sit where the mark
+    is empty, and overlapping ink would merge the two shapes into one.
+    """
+    rows = [list(line) for line in mark]
+    for y, line in enumerate(corner):
+        for x, cell in enumerate(line):
+            if cell != "#":
+                continue
+            if rows[y][x] != ".":
+                raise ValueError(f"the corner inks cell ({x},{y}), which the mark already inks")
+            rows[y][x] = "#"
+    return tuple("".join(line) for line in rows)
+
+
+# The board's grid: the dashboard's mark with the tick in its empty corner.
+BOARD_MARK = with_corner(MARK, TICK)
+
+
+def _rgba(mark: Sequence[str], ink: tuple[int, int, int], scale: int) -> bytes:
+    """``mark`` as raw top-down RGBA rows, each grid cell drawn ``scale`` pixels square."""
+    opaque = bytes(ink) + b"\xff"
     clear = b"\x00\x00\x00\x00"
-    rows = [b"".join((ink if cell == "#" else clear) * scale for cell in line) for line in MARK]
+    rows = [b"".join((opaque if cell == "#" else clear) * scale for cell in line) for line in mark]
     return b"".join(row for row in rows for _ in range(scale))
 
 
@@ -155,14 +209,22 @@ def _ico(images: Sequence[tuple[int, bytes]]) -> bytes:
     return struct.pack("<HHH", 0, 1, len(images)) + bytes(entries) + bytes(payloads)
 
 
-def render() -> bytes:
-    """The icon's bytes: one PNG per size in ``SIZES``, wrapped in an ICO container."""
+def render(mark: Sequence[str] = MARK, ink: tuple[int, int, int] = INK) -> bytes:
+    """An icon's bytes: one PNG per size in ``SIZES``, wrapped in an ICO container.
+
+    The defaults draw the dashboard's icon. ``render_board`` passes the board's grid and ink.
+    """
     for side in SIZES:
         if side % GRID:
             raise ValueError(f"size {side} is not a whole multiple of the {GRID}-pixel grid")
         if not 0 < side <= 256:
             raise ValueError(f"size {side} is outside the range an ICO entry can name")
-    return _ico([(side, _png(side, _rgba(side // GRID))) for side in SIZES])
+    return _ico([(side, _png(side, _rgba(mark, ink, side // GRID))) for side in SIZES])
+
+
+def render_board() -> bytes:
+    """The build board's icon: the board's grid in the board's ink."""
+    return render(BOARD_MARK, BOARD_INK)
 
 
 def packaged_path() -> Path:
@@ -174,36 +236,56 @@ def build_parser() -> argparse.ArgumentParser:
     """The command-line contract for regenerating the shipped icon."""
     parser = argparse.ArgumentParser(
         prog="python -m lake.favicon",
-        description="Render the dashboard's browser-tab icon.",
+        description="Render the dashboard's browser-tab icon, or the build board's.",
+    )
+    parser.add_argument(
+        "--board",
+        action="store_true",
+        help="Render the build board's icon instead. Needs --out.",
     )
     parser.add_argument(
         "--out",
         type=Path,
         default=None,
-        help="Where to write the icon. Defaults to the packaged path.",
+        help="Where to write the icon. Defaults to the packaged path for the dashboard's.",
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Render the icon and write it. Fully offline, and deterministic."""
-    args = build_parser().parse_args(argv)
-    out = args.out if args.out is not None else packaged_path()
-    body = render()
+    """Render an icon and write it. Fully offline, and deterministic.
+
+    The board's file lives in the repository, outside the package, so no path inside the
+    package can stand in for it. ``--board`` therefore needs ``--out``.
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.board:
+        if args.out is None:
+            parser.error("--board needs --out, since the board's icon lives outside the package")
+        out, body = args.out, render_board()
+    else:
+        out = args.out if args.out is not None else packaged_path()
+        body = render()
     out.write_bytes(body)
     print(f"wrote {out} ({len(body)} bytes, sizes {', '.join(str(s) for s in SIZES)})")
     return 0
 
 
 __all__ = [
+    "BOARD_INK",
+    "BOARD_MARK",
     "GRID",
     "INK",
     "MARK",
     "SIZES",
+    "TICK",
     "build_parser",
     "main",
     "packaged_path",
     "render",
+    "render_board",
+    "with_corner",
 ]
 
 

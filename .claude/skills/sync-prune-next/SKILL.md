@@ -322,10 +322,15 @@ minutes. The same address serves the same board on every machine, and the
 workflow copies `main`'s `board.html` on every run, so a merged change to the
 page goes live with the next run.
 
-`favicon.ico` beside this skill is the page's tab icon. The page links it as
+`favicon.ico` beside this skill is the page's tab icon. It is the dashboard's
+mark in blue with a tick in its empty corner, and
+`python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico`
+renders it, so a change to the icon is a change to `src/lake/favicon.py` followed
+by that command, and a test fails while the two disagree. The page links it as
 `favicon.ico`, and the workflow's "Add the page" step copies it beside
-`index.html`, so renaming it means changing the link, that copy and the three
-tests that check them together.
+`index.html`. Renaming it means changing the link, that copy and the five
+tests that check them together. It also means changing the regeneration command
+above, which `README.md` and the `src/lake/favicon.py` docstring name too.
 
 ### What the generator writes
 

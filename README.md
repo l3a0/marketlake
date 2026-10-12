@@ -143,6 +143,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `board.html` is the board's page, `favicon.ico` is its tab icon, `build_board.py`
   builds the page's `board.json` from GitHub, and `dom-stub.js` stands in for a browser
   when the tests run the page.
+  The tab icon is the dashboard's mark in blue with a tick, and
+  `python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico`
+  renders it. Rerun that command after changing the icon.
   CI lints the Python there and the tests load it.
 - `.github/workflows/board.yml` runs `build_board.py` and publishes the page, its
   icon and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its
