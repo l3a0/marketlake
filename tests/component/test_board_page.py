@@ -534,3 +534,19 @@ def test_a_ranked_card_keeps_the_ranked_only_view(tmp_path: Path) -> None:
     result = run_page(tmp_path, [served(doc)])
     assert cards(result, "board") == {638, 755}
     assert text(result, "more").startswith("Showing the 2 ranked cards in MVP 2.")
+
+
+def test_the_page_carries_its_own_document_skeleton() -> None:
+    """The artifact host wrapped the page in a document, and GitHub Pages does not.
+
+    Served raw without these, the page renders in quirks mode at 980 pixels wide on a
+    phone, and ``.msbar``'s ``display: flex`` beats ``hidden``. No engine here applies
+    CSS, so the rules are read rather than run.
+    """
+    markup, _ = _page_parts()
+    assert markup.startswith("<!doctype html>\n<html")
+    assert '<meta charset="utf-8">' in markup
+    assert '<meta name="viewport" content="width=device-width,initial-scale=1">' in markup
+    assert re.search(r"\n  body \{ margin: 0;", markup)
+    assert "\n  [hidden] { display: none !important; }\n" in markup
+    assert PAGE.read_text(encoding="utf-8").endswith("</script>\n</body>\n</html>\n")
