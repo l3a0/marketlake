@@ -96,6 +96,35 @@ def test_runs_queue_in_the_pages_group_without_cancelling() -> None:
     assert _workflow()["concurrency"] == {"group": "pages", "cancel-in-progress": False}
 
 
+def test_the_workflow_and_each_job_carry_exactly_these_keys() -> None:
+    """A key not listed here changes where or how a job runs, so none may appear.
+
+    ``runs-on: self-hosted`` would put a write token on a machine strangers' events can
+    reach, ``continue-on-error`` would deploy past a failed build, and a job-level
+    ``container``, ``env`` or ``concurrency`` would change what the steps run in or
+    let a second deploy race the first. A workflow-level ``env`` or ``defaults``
+    reaches every step the same way.
+    """
+    workflow = _workflow()
+    assert "env" not in workflow
+    assert "defaults" not in workflow
+    assert set(workflow) == {"name", True, "permissions", "concurrency", "jobs"}
+    jobs = _jobs()
+    assert set(jobs["board-build"]) == {"runs-on", "timeout-minutes", "permissions", "steps"}
+    assert set(jobs["board-deploy"]) == {
+        "needs",
+        "runs-on",
+        "timeout-minutes",
+        "permissions",
+        "environment",
+        "steps",
+    }
+    assert {name: job["runs-on"] for name, job in jobs.items()} == {
+        "board-build": "ubuntu-latest",
+        "board-deploy": "ubuntu-latest",
+    }
+
+
 def test_the_jobs_are_named_by_key_only_and_none_is_test() -> None:
     jobs = _jobs()
     assert set(jobs) == JOBS
