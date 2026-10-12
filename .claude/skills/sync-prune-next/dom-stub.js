@@ -1,7 +1,8 @@
 // A DOM small enough to run board.html's script, plus a no-op setInterval so the
-// page's timers do not keep the process alive. Ported from the Quantitative
-// Trading board's stub for tests/component/test_board_page.py, which serves the
-// page fake fetch answers and reads what it drew.
+// page's timers do not keep the process alive. It is a port of the stub in the
+// l3a0/quantitative-trading repository, which serves that repository's board.
+// Here tests/component/test_board_page.py loads it, serves the page fake fetch
+// answers, and reads what the page drew.
 //
 // A parse check does not catch the defects the board ships. A sentence that
 // renders perfectly can still say something false, so the check is to execute
