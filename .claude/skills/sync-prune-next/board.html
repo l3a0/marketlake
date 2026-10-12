@@ -313,9 +313,11 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
    which says why there is nothing to show.
 
    marketlake: the same page also runs on GitHub Pages, where it has no
-   database. A GitHub Action there rebuilds board.json beside the page on every
-   change and on a schedule, and the page fetches it every FETCH_EVERY
-   milliseconds instead of subscribing. Issue 872 built that path beside the
+   database. A GitHub Action there rebuilds board.json beside the page, and the
+   page fetches it every FETCH_EVERY milliseconds instead of subscribing. An
+   issue event, an issue comment, a pull request into main opening, updating,
+   reopening, closing or being edited, the CI or Infra workflow finishing, and a
+   schedule each start a run. A submitted review starts none. Issue 872 built that path beside the
    database rather than in its place, because the artifact board stays the
    board of record until the skill stops writing it. The fetch starts only once
    the database lookup has settled with no database, so the two never race.
@@ -351,8 +353,8 @@ let SOURCE = { live: false, why: "loading" };
 let SHOW_ALL = false;
 try { SHOW_ALL = localStorage.getItem("marketlake-board-all") === "1"; } catch (e) { SHOW_ALL = false; }
 let SHOWN = 0, HIDDEN = 0;
-/* marketlake: true when the chosen milestone holds no ranked card outside the
-   In flight section. The ranked-only view would then draw only parents, under a
+/* marketlake: true when the chosen milestone holds no ranked card at all, in
+   flight or not. The ranked-only view would then draw only parents, under a
    line calling them ranked, so buildOrder() draws every card instead. */
 let UNRANKED = false;
 let CHAIN_ESC = null;
@@ -377,7 +379,8 @@ const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
    the whole document, so the page never draws a board silently missing cards.
 
    A field the page writes into an attribute without `esc()` must be a number:
-   a card's `n`, a pull request's `pr` and `issue`, and the open issue count.
+   a card's `n`, a pull request's `pr` and `issue`, a plan's `passes`, and the
+   open issue count.
    A field the page compares against a fixed set must be in that set, because
    an unknown `kind` writes a broken sentence, and `kind`, `state` and `ready`
    each reach a class attribute or a lookup by name. `review` is drawn verbatim, so a missing one would draw "undefined".
@@ -388,18 +391,33 @@ const inMs = c => MS === MS_ALL || (!!c && c.ms === MS);
    draws neither. */
 const isNum = v => typeof v === "number" && isFinite(v);
 const isStr = v => typeof v === "string";
+const isBool = v => typeof v === "boolean";
 const oneOf = xs => v => xs.indexOf(v) >= 0;
+const allOf = f => xs => Array.isArray(xs) && xs.every(f);
+/* marketlake: a field the page tests for truth must be a boolean, because the
+   string "false" is true and drew an unreviewed pull request as ready for the
+   owner. A list the page compares against card numbers must hold numbers,
+   because a string in `needs` matches no card and silently frees a blocked one.
+   `linked` also takes a list of issue numbers, because rounds writing the
+   database board wrote the pull request's closing references there, and two of
+   their documents on 2026-10-09 did. The database path is the only one that
+   reads such a list, and it reads any list as linked, as it always has. */
 const ITEM_OK = {
   tracker: c => !!c && isNum(c.n) && isStr(c.label) && isStr(c.ms) &&
-    oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && Array.isArray(c.needs),
+    oneOf(["ready", "deferred", "parent", "decision", "data"])(c.kind) && allOf(isNum)(c.needs) &&
+    (c.after === undefined || allOf(isNum)(c.after)) &&
+    (c.labels === undefined || allOf(isStr)(c.labels)),
   prs: p => !!p && isNum(p.pr) && isNum(p.issue) && oneOf(["open", "merged", "closed"])(p.state) &&
-    isStr(p.review),
-  working: w => !!w,
-  planned: p => !!p && oneOf(["build", "decide", "plan"])(p.ready),
+    isStr(p.review) && isBool(p.reviewed) && (isBool(p.linked) || allOf(isNum)(p.linked)) &&
+    (p.partOf === undefined || isBool(p.partOf)) &&
+    allOf(r => Array.isArray(r) && r.length === 2 && isStr(r[0]) && isStr(r[1]))(p.rollup),
+  working: w => !!w && isNum(w.n),
+  planned: p => !!p && isNum(p.passes) && oneOf(["build", "decide", "plan"])(p.ready),
   next: x => !!x && oneOf(["build", "decide", "plan"])(x.ready)
 };
 function usable(d) {
-  if (!(d && d.state && isStr(d.state.main) && d.state.issues && isNum(d.state.issues.open))) return false;
+  if (!(d && d.state && isStr(d.state.main) && isStr(d.state.updatedAt) &&
+        d.state.issues && isNum(d.state.issues.open))) return false;
   if (!(Array.isArray(d.tracker) && d.tracker.length)) return false;
   return Object.keys(ITEM_OK).every(k => Array.isArray(d[k]) && d[k].every(ITEM_OK[k]));
 }
@@ -571,8 +589,10 @@ function checkword(rollup) {
    Every branch below rounds a negative age up into "just now", so a page stamped
    into the future says it was measured just now and goes on saying it however
    stale it gets. That is the one sentence this page exists to get right, since
-   it is the only warning a reader has that nothing here refreshes itself, and it
-   failed silently in the direction that reads as healthy.
+   it is the only warning a reader has of how old every figure is, and it failed
+   silently in the direction that reads as healthy. The database board changes
+   only when a round writes it, and the board on GitHub Pages only when a run
+   rebuilds board.json, so on either path the stamp is what dates the figures.
 
    It is not hypothetical and not one session's slip. Two consecutive published
    versions carried it, stamped 20:22Z and 21:52Z against a clock reading 19:26Z,
@@ -605,8 +625,11 @@ function strip() {
 
 /* All that is left of a twenty-paragraph footer. The narrative was a second
    telling of what the cards already say, and it went. This sentence did not,
-   because the page has no way to refresh itself and a page that does not say so
-   reads as live. */
+   because every figure dates from the stamp rather than from the moment of
+   reading, on both paths, and a page that does not say so reads as live. The
+   database board changes only when a round writes it. The board on GitHub Pages
+   fetches board.json again every two minutes, and that file changes only when a
+   run of the board workflow rebuilds it. */
 function stamped() {
   /* The decay warning names the states that can actually decay, rather than
      listing every one of them whenever any is present. A review posted since
@@ -633,8 +656,9 @@ function stamped() {
      both. */
   const how = FETCHED
     ? `Built from GitHub against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span> by an Action on each change and on a ` +
-      `schedule, and fetched again every ${FETCH_EVERY / 60000} minutes`
+      `<span class="mono">${esc(STATE.main)}</span> by an Action after issue, comment, ` +
+      `pull request and check events and on a schedule, and fetched again every ` +
+      `${FETCH_EVERY / 60000} minutes`
     : `Measured by hand against <span class="mono">main</span> at ` +
       `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll GitHub`;
   document.getElementById("foot").innerHTML =
@@ -780,8 +804,12 @@ function buildOrder() {
      hide the card its children name as what they serve. */
   /* marketlake: and when nothing here is ranked, every card shows. Until issue
      873 the board on GitHub Pages carries no ranking, and the ranked-only view
-     then drew 0 cards under "All" and only the parents under "MVP 2". */
-  UNRANKED = !open.some(c => rankMark(c));
+     then drew 0 cards under "All" and only the parents under "MVP 2". A ranked
+     card in flight still counts, because the line below then says nothing in the
+     milestone is ranked, and that was false while every ranked card was in
+     flight. A deferred card counts as unranked, through `rankMark`, as it does
+     for its chip and for the ranked-only view. */
+  UNRANKED = !TRACKER.some(c => inMs(c) && rankMark(c));
   const rest = open.filter(c => SHOW_ALL || UNRANKED || rankMark(c) ||
     (MS !== MS_ALL && c.kind === "parent"));
   SHOWN = rest.length; HIDDEN = open.length - rest.length;
@@ -1189,8 +1217,9 @@ function buildOrder() {
       : ``) +
     (inRest(c => c.kind === "deferred")
       ? `Anything deferred on purpose sorts last whatever the rest of that says. ` : ``) +
-    (ranked.length ? `` : `Priority is not a key today, because nothing left in the ranking ` +
-      `is a card anybody can take. `) +
+    (ranked.length ? `` : NEXT.length
+      ? `Priority is not a key today, because nothing left in the ranking is a card anybody can take. `
+      : `Priority is not a key today, because nothing is ranked. `) +
     `Pick a card to trace its chain.`;
 
   /* Counted rather than written down, because both numbers move whenever a card
@@ -1239,7 +1268,8 @@ function buildOrder() {
      is the single authority for both. This note keeps only what the depth graph
      itself knows, so the two cannot say different things about one card. */
   document.getElementById("boardnote").innerHTML =
-    `<b>${free.length} cards are free for a session to take today</b>, out of ${bucket[0].length} in the ` +
+    `<b>${plu(free.length, "card")} ${free.length === 1 ? "is" : "are"} free for a session to take ` +
+    `today</b>, out of ${bucket[0].length} in the ` +
     `first column${free.length ? `: ${free.map(c => "#" + c.n).join(", ")}` : ""}. ` +
     (held.length
       ? `${plu(held.length, "card")} there ${held.length === 1 ? "is" : "are"} not free, ` +
@@ -1255,8 +1285,8 @@ function buildOrder() {
       : `Nothing sits behind more than one thing any more, so the graph is one level deep. `) +
     (most
       ? (unblocks.length === 1
-          ? `<b>#${unblocks[0].n} is the single card whose landing frees the most</b>, at ${most} others. `
-          : `<b>${andlist(unblocks.map(x => "#" + x.n))} each free ${most} others</b>, and nothing frees more. `)
+          ? `<b>#${unblocks[0].n} is the single card whose landing frees the most</b>, at ${plu(most, "other")}. `
+          : `<b>${andlist(unblocks.map(x => "#" + x.n))} each free ${plu(most, "other")}</b>, and nothing frees more. `)
       : `No card here is waiting on another, so nothing is freed by landing anything. `) +
     (flownTop.length
       ? `${andlist(flownTop.map(x => "#" + x.n))} ${flownTop.length === 1 ? "is" : "are"} in the ` +
