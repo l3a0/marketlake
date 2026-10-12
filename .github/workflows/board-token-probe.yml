@@ -1,0 +1,33 @@
+name: Board token probe
+
+# Temporary, per decision 32 of #872. Only `pull_request` runs a branch's copy of a
+# workflow, so this proves before merge that the job token, holding board-build's exact
+# read permissions, can read every field the generator's queries ask for. A later commit
+# on the same branch deletes this file before the review completes.
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  board-token-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # the checkout, and the default branch's head
+      issues: read # open issues, their labels, milestones and links
+      pull-requests: read # open pull requests, their comments and reviews
+      checks: read # check runs in each head commit's rollup
+      statuses: read # status contexts in each head commit's rollup
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build board.json with the job token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$(mktemp -d)"
+          python3 .claude/skills/sync-prune-next/build_board.py build --repo "$GITHUB_REPOSITORY" --out "$out"
+          cat "$GITHUB_STEP_SUMMARY"
