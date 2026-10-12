@@ -673,9 +673,9 @@ function stamped() {
      hand, so it says how it is built instead. Its figures still date from the
      stamp rather than from the moment of reading, so the decay clause holds for
      both. */
-  /* The Action's triggers are listed in board.yml's `on:` block. A check
-     settling starts no run by itself, and neither does a submitted review, so
-     the sentence names only what does. */
+  /* marketlake: board.yml's `on:` block lists what starts a run. Only the CI
+     or Infra workflow finishing starts one, not any other check, and a
+     submitted review starts none, so the sentence names only what does. */
   const how = FETCHED
     ? `Built from GitHub against <span class="mono">main</span> at ` +
       `<span class="mono">${esc(STATE.main)}</span> by an Action, which rebuilds it on most ` +

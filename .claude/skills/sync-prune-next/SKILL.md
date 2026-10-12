@@ -315,7 +315,7 @@ minutes. It fills `state`, `tracker` and `prs`, and leaves `working`, `planned`
 and `next` empty until [#873](https://github.com/l3a0/marketlake/issues/873)
 moves those judgements onto GitHub. So its default view draws every card in the
 chosen milestone rather than only the ranked ones. What it writes differs from
-"The document's shape" below in four ways.
+"The document's shape" below in five ways.
 
 1. `state` holds only `main`, `updatedAt` and `issues.open`.
 2. A card's `needs` comes from native "blocked by" links alone, not from the
@@ -324,6 +324,9 @@ chosen milestone rather than only the ranked ones. What it writes differs from
    `Part of #N` reference rather than by a closing link.
 4. `prs` holds one entry per pull request and issue pair, so a pull request
    naming two open issues has two entries.
+5. It writes no `untracked`, and each `prs` entry's `review` is one of two fixed
+   phrases, `review complete` or `no Review complete marker since the head
+   commit`, so it never names the lens still running.
 
 The artifact stays the board of record until the skill stops writing it.
 
@@ -401,12 +404,12 @@ old content under a new version, and looks exactly like a good write.
   `{issue, pr, state, review, linked, reviewed, rollup}` and keyed by `issue`.
   An entry keyed `n` drops its card without any error. A pull request from a
   fork gets no entry, because GitHub registers a fork's closing keyword, so a
-  stranger's fork reading `Closes #640` would otherwise move #640 into In
+  stranger's fork reading `Closes #640` would otherwise move that issue into In
   flight. Read `isCrossRepository` to tell. `linked` is true when the pull
-  request's `closingIssuesReferences` names the issue. A reviewed, green card lands in the
-  owner's queue, so `reviewed` is true only once the review is complete. Any
-  review comment is not enough, because a session can post some lenses' results
-  while another lens still runs. That sent
+  request's `closingIssuesReferences` names the issue. A reviewed, green card
+  lands in the owner's queue, so `reviewed` is true only once the review is
+  complete. Any review comment is not enough, because a session can post some
+  lenses' results while another lens still runs. That sent
   [PR #713](https://github.com/l3a0/marketlake/pull/713) to the owner while its
   mutation lens was running. A review is complete when the pull request carries
   a comment or review from the owner whose whole first line is
@@ -488,10 +491,14 @@ screen and says live updates stopped.
 4. Each `prs` entry has a number `pr` and `issue`, a `state` of `open`,
    `merged` or `closed`, a string `review`, a boolean `reviewed`, and a
    `rollup` list whose every entry is a pair of strings. `linked` is a boolean
-   or a list of issue numbers, and `partOf`, when present, is a boolean.
-5. Each `working` entry has a number `n`.
-6. Each `planned` entry has a number `passes`.
-7. Each `planned` and `next` entry has a `ready` of `build`, `decide` or
+   or a list of issue numbers, and `partOf`, when present, is a boolean. The
+   page reads a list as linked only when it names the entry's own `issue`.
+5. Each `working` entry has a number `n` and a string `what`. A `kind`, when
+   present, is a string.
+6. Each `planned` entry has a number `n` and a number `passes`.
+7. Each `next` entry has a number `issue` and a number `band`. An `order`,
+   when present, is a number.
+8. Each `planned` and `next` entry has a `ready` of `build`, `decide` or
    `plan`.
 
 The numbers and the fixed sets are checked because the page writes those

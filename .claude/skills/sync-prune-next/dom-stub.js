@@ -1,6 +1,6 @@
 // A DOM small enough to run board.html's script, plus a no-op setInterval so the
-// page's timers do not keep the process alive. It is a port of the stub in the
-// l3a0/quantitative-trading repository, which serves that repository's board.
+// page's timers do not keep the process alive. It is a port of the stub
+// l3a0/quantitative-trading uses to test its own board.
 // Here tests/component/test_board_page.py loads it, serves the page fake fetch
 // answers, and reads what the page drew.
 //

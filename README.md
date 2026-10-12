@@ -144,10 +144,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   from GitHub, and `dom-stub.js` stands in for a browser when the tests run the page.
   CI lints the Python there and the tests load it.
 - `.github/workflows/board.yml` runs `build_board.py` and publishes the page and
-  `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. An issue event, an
-  issue comment, a pull request into `main` opening, updating, reopening, closing or being
-  edited, CI or Infra finishing, and a schedule each start a run. A submitted review
-  starts none.
+  `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its `on:` block
+  lists what starts a run, and a submitted review starts none.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 

@@ -5,11 +5,9 @@ sync round measured every figure on it by hand and wrote them into a claude.ai
 artifact's database. That cost a turn on every change, missed any change no session
 saw, and tied the board to one claude.ai account. This script reads the figures GitHub
 already holds and writes them as one ``board.json``. ``.github/workflows/board.yml``
-runs it and publishes the file beside ``board.html`` on GitHub Pages. An issue event,
-an issue comment, a pull request into ``main`` opening, updating, reopening, closing or
-being edited, the CI or Infra workflow finishing, and a schedule each start a run. A
-submitted review starts none, so it reaches the board with the next run. No Claude
-runs at any step. It is a port of
+runs it and publishes the file beside ``board.html`` on GitHub Pages. That workflow's
+``on:`` block lists what starts a run. A submitted review starts none, so it reaches
+the board with the next run. No Claude runs at any step. It is a port of
 l3a0/quantitative-trading's ``scripts/build_board.py``, cut to what marketlake's page
 draws.
 
@@ -45,7 +43,8 @@ returns stops the run with a non-zero exit, and Pages keeps the last good board.
 Treating an error as an empty list would publish a board that reads as correct and
 is not. Comments and reviews are the exception. Each is read as its newest 100, and a
 longer list never stops the run, because only a marker newer than the head commit
-counts.
+counts. Such a marker falls outside the newest 100 only when a hundred more comments
+follow it, or for a review, a hundred more reviews.
 
 It reads every open issue and pull request through two paged GraphQL queries, one
 request per page. The job token allows 1,000 points an hour per repository, so the
