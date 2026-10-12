@@ -1,10 +1,9 @@
-"""The build board's page, run rather than read, on the fetch path GitHub Pages takes.
+"""The build board's page, run rather than read.
 
-``.claude/skills/sync-prune-next/board.html`` draws the board from one of two sources.
-Inside the claude.ai artifact it subscribes to the artifact's database. On GitHub
-Pages it has no database, so it fetches ``board.json`` every two minutes, which a
-GitHub Action builds beside it (#872). It carries no copy of the board, so when it has
-no good data it must say so and draw nothing that reads as data.
+``.claude/skills/sync-prune-next/board.html`` is served on GitHub Pages, where it
+fetches ``board.json`` at once and every two minutes. A GitHub Action builds that file
+beside it (#872). The page carries no copy of the board, so when it has no good data it
+must say so and draw nothing that reads as data.
 
 A parse check would not catch the failures that matter. A page that draws a refused
 document parses, and a banner sentence that renders perfectly can still say something
@@ -18,10 +17,6 @@ The engine is ``node`` where it is installed, as on GitHub's runners, and ``osas
 than pass. JavaScript for Automation runs promise callbacks only after the script's
 last line, and writes ``console.log`` to stderr, so the driver prints from inside its
 callbacks and both streams are read.
-
-Three cases also run the database path, the one the claude.ai artifact takes, with a
-fake database in place of the artifact's. ``board-harness.js`` drives that path in its
-seven modes too. It cannot reach the fetch path, since it passes no ``fetch``.
 """
 
 from __future__ import annotations
@@ -84,22 +79,14 @@ def _starts_hidden(markup: str) -> list[str]:
 
 
 # The driver. It waits for the page's first fetch to settle, then fires the page's
-# fetch timer once per further answer, as two minutes passing would. A page with a
-# database gets each of `__DB_STEPS` delivered instead: a snapshot holding `data`, or a
-# subscription error carrying `error`. The result arrives after the script's last
-# line, so it is printed rather than returned.
+# fetch timer once per further answer, as two minutes passing would. The result
+# arrives after the script's last line, so it is printed rather than returned.
 DRIVER = """
 var __flush = async function () { for (var i = 0; i < 50; i++) { await null; } };
 (async function () {
   var out = { error: null, ids: {}, fetches: __FETCHES, timers: [] };
   try {
     await __flush();
-    for (var s = 0; s < __DB_STEPS.length; s++) {
-      var step = __DB_STEPS[s];
-      if (step.error) { __DB.onError({ code: step.error }); }
-      else { __DB.onData({ exists: true, data: function () { return step.data; } }); }
-      await __flush();
-    }
     for (var k = 1; k < __RESP.length; k++) {
       __CUR = k;
       __TIMERS.forEach(function (t) { if (t.ms !== 60000) { t.fn(); } });
@@ -119,13 +106,12 @@ void 0;
 """
 
 
-def _prelude(responses: list[dict] | None, db_steps: list[dict] | None) -> str:
-    """A fake fetch serving ``responses`` in turn, an optional fake database, and timers.
+def _prelude(responses: list[dict] | None) -> str:
+    """A fake fetch serving ``responses`` in turn, and timers the driver can fire.
 
     Each response is ``{"status": n, "body": text}``, ``{"throw": true}`` for a network
     failure, or ``{"never": true}`` for a fetch that never settles. ``responses`` of
-    None is a host with no fetch at all. ``db_steps`` of None is a host with no
-    database, which is GitHub Pages.
+    None is a host with no fetch at all.
     """
     lines = [
         "var setTimeout = function () { return 0; };",
@@ -134,8 +120,6 @@ def _prelude(responses: list[dict] | None, db_steps: list[dict] | None) -> str:
         f"var __RESP = {json.dumps(responses or [])};",
         "var __CUR = 0;",
         "var __FETCHES = [];",
-        f"var __DB_STEPS = {json.dumps(db_steps or [])};",
-        "var __DB = {};",
     ]
     if responses is None:
         lines.append("var fetch = undefined;")
@@ -150,27 +134,16 @@ def _prelude(responses: list[dict] | None, db_steps: list[dict] | None) -> str:
             "    text: function () { return Promise.resolve(r.body); } });",
             "};",
         ]
-    if db_steps is not None:
-        lines += [
-            "var window = { claude: { use: function () { return Promise.resolve({",
-            "  doc: function () { return { onSnapshot: function (cb, err) {",
-            "    __DB.onData = cb; __DB.onError = err; } }; } }); } } };",
-        ]
     return "\n".join(lines) + "\n"
 
 
-def run_page(
-    tmp_path: Path,
-    responses: list[dict] | None,
-    *,
-    db_steps: list[dict] | None = None,
-) -> dict[str, Any]:
+def run_page(tmp_path: Path, responses: list[dict] | None) -> dict[str, Any]:
     """Execute the page and return what it drew, what it fetched and its timers."""
     markup, script = _page_parts()
     source = (
         f"var __STARTS_HIDDEN = {json.dumps(_starts_hidden(markup))};\n"
         + STUB.read_text(encoding="utf-8")
-        + _prelude(responses, db_steps)
+        + _prelude(responses)
         + script
         + DRIVER
     )
@@ -361,48 +334,6 @@ def test_a_good_poll_after_a_failed_one_goes_live_again(tmp_path: Path) -> None:
     assert text(result, "strip").startswith("4 open issues")
 
 
-# -- the database path ---------------------------------------------------------------
-
-
-def test_a_page_with_a_database_never_fetches(tmp_path: Path) -> None:
-    """The fetch starts only once the lookup settles with no database.
-
-    The second pull request for #872 deletes this case with the database path.
-    """
-    result = run_page(
-        tmp_path,
-        [served(board(issues={"open": 99}))],
-        db_steps=[{"data": board()}, {"error": "unavailable"}],
-    )
-    assert result["fetches"] == []
-    assert 120000 not in result["timers"]
-    assert text(result, "strip").startswith("3 open issues")
-    assert text(result, "foot").startswith(
-        "Measured by hand against main at 5f0b12c . The page cannot"
-    )
-    banner = text(result, "source")
-    assert banner.startswith(f"{STOPPED} (unavailable).")
-    assert banner.endswith("Reload to reconnect.")
-
-
-def test_a_database_document_that_breaks_the_drawing_code_asks_for_a_reload(
-    tmp_path: Path,
-) -> None:
-    """The database path does not retry, so its banner must not promise to."""
-    result = run_page(tmp_path, None, db_steps=[{"data": board()}, {"data": _throws()}])
-    banner = text(result, "source")
-    assert banner.startswith(f"{STOPPED} (the board could not be drawn).")
-    assert banner.endswith("Reload to reconnect.")
-    assert cards(result, "board") == {1}
-
-
-def test_a_database_with_no_good_draw_yet_shows_no_board_after_an_error(tmp_path: Path) -> None:
-    """A first document that fails to draw leaves nothing live to fall back on."""
-    result = run_page(tmp_path, None, db_steps=[{"data": _throws()}, {"error": "unavailable"}])
-    assert text(result, "source") == f"{STOPPED} (unavailable). Showing no board data."
-    assert_no_board_data(result)
-
-
 # -- what the page refuses -----------------------------------------------------------
 
 QUOTE = '1" onmouseover="alert(1)'
@@ -423,7 +354,7 @@ def _control() -> dict[str, Any]:
         {"n": 3, "kind": "plan", "what": "a decompose loop"},
         {"n": 5, "what": "a loop with no kind"},
     ]
-    # Rounds writing the database board wrote `linked` as the closing references.
+    # Rounds writing the retired artifact board wrote `linked` as closing references.
     for pr, issue_n, state, linked in ((41, 1, "closed", True), (42, 3, "merged", [3])):
         doc["prs"].append(
             {"issue": issue_n, "pr": pr, "state": state, "review": "review complete",
@@ -856,11 +787,11 @@ def test_the_board_note_agrees_in_number_for_a_tie_at_two(tmp_path: Path) -> Non
 
 
 def test_the_page_carries_its_own_document_skeleton() -> None:
-    """The artifact host wrapped the page in a document, and GitHub Pages does not.
+    """GitHub Pages serves the page as written, so it carries its own skeleton.
 
-    Served raw without these, the page renders in quirks mode at 980 pixels wide on a
-    phone, and ``.msbar``'s ``display: flex`` beats ``hidden``. No engine here applies
-    CSS, so the rules are read rather than run.
+    Without these, the page renders in quirks mode at 980 pixels wide on a phone, and
+    ``.msbar``'s ``display: flex`` beats ``hidden``. No engine here applies CSS, so the
+    rules are read rather than run.
     """
     markup, _ = _page_parts()
     assert re.match(r"\s*<!doctype\s+html\s*>\s*<html\b", markup, re.I)

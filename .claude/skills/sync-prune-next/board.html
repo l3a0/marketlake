@@ -54,10 +54,10 @@
     --idle: #8494A2; --idle-soft: #1F272F;
   }
 
-  /* marketlake: the artifact host used to wrap the page in its own document,
-     which set these. Served raw on GitHub Pages, a page without them renders in
-     quirks mode at 980 pixels wide on a phone, and `.msbar`'s `display: flex`
-     beats `hidden`, drawing an empty milestone select above the loading banner. */
+  /* marketlake: GitHub Pages serves the page exactly as written, so the page
+     carries its own document skeleton. Without these rules it renders in quirks
+     mode at 980 pixels wide on a phone, and `.msbar`'s `display: flex` beats
+     `hidden`, drawing an empty milestone select above the loading banner. */
   body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.5; }
   [hidden] { display: none !important; }
   .wrap { max-width: 1080px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 56px; }
@@ -299,42 +299,33 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
 /* The renderer below is the Quantitative Trading Build Board's, line for line,
    except where a comment starts with "marketlake:". Its other comments cite the
    quantitative-trading repository's issues and pull requests, not this one's, so
-   a number in those comments is not a marketlake issue.
+   a number in those comments is not a marketlake issue. The harness some of them
+   name is that repository's too. Here tests/component/test_board_page.py runs
+   the page.
 
-   marketlake: the data lives in the artifact's database, in one document at
-   DOC, and a sync writes that document rather than republishing the page. That
-   is what lets two planning sessions update the board without overwriting each
-   other: each write names the version it was based on and is refused if the
-   document moved. The page subscribes once and redraws on every write.
+   marketlake: the data is one file, board.json, beside this page on GitHub
+   Pages. A GitHub Action, .github/workflows/board.yml, rebuilds it from GitHub
+   by running build_board.py, and no session writes it. The workflow's `on:`
+   block lists what starts a run, and a submitted review starts none. The page
+   fetches the file at once and every FETCH_EVERY milliseconds, and redraws on
+   every good fetch. Until issue 872 the data lived in a claude.ai artifact's
+   database, written by hand, and this page subscribed to it.
 
    marketlake: FALLBACK carries no board data. A copy of the document used to
    sit here, and a copy goes stale silently: the old board's read as current
-   while nine days out of date. Until a live document arrives, or when the
-   database cannot be reached, the page draws only the banner under the strip,
-   which says why there is nothing to show.
-
-   marketlake: the same page also runs on GitHub Pages, where it has no
-   database. A GitHub Action there rebuilds board.json beside the page, and the
-   page fetches it every FETCH_EVERY milliseconds instead of subscribing. The
-   `on:` block of .github/workflows/board.yml lists what starts a run, and a
-   submitted review starts none. Issue 872 built that path beside the
-   database rather than in its place, because the artifact board stays the
-   board of record until the skill stops writing it. The fetch starts only once
-   the database lookup has settled with no database, so the two never race.
+   while nine days out of date. Until board.json arrives, or when it cannot be
+   fetched, the page draws only the banner under the strip, which says why
+   there is nothing to show.
 
    The document's shape is { schema, state, prs, working, planned, next,
    untracked, tracker }, and each field is what the constant of the same name
-   held on the Quantitative Trading page. `usable` below is the whole contract
-   the page checks before adopting a document. */
-const DOC = "board/data";
+   held on the Quantitative Trading page. The generator writes no `untracked`,
+   which the page reads as empty. `usable` below is the whole contract the page
+   checks before adopting a document. */
 /* marketlake: Pages tells a browser to cache board.json for ten minutes, so
    each fetch asks for a URL no cache has seen and tells the browser to store
    nothing. */
 const FETCH_EVERY = 120000;
-/* marketlake: true once the page reads board.json rather than the database.
-   The footer and the stopped banner read it, because only the database board
-   is measured by hand and only the fetch tries again on its own. */
-let FETCHED = false;
 /* marketlake: `none` tells render() there is no board to draw. Every section
    below states facts about the tracker, so any stand-in document, however
    empty, makes the page assert facts it does not have. A stand-in card also
@@ -398,12 +389,12 @@ const allOf = f => xs => Array.isArray(xs) && xs.every(f);
    string "false" is true and drew an unreviewed pull request as ready for the
    owner. A list the page compares against card numbers must hold numbers,
    because a string in `needs` matches no card and silently frees a blocked one.
-   `linked` also takes a list of issue numbers, because rounds writing the
-   database board wrote the pull request's closing references there, and two of
-   their documents on 2026-10-09 did. `usable` serves both paths, so a
-   board.json holding such a list passes too. `isLinked` reads a list as linked
-   only when it names the entry's own issue, because an empty list, or one
-   naming another issue, registers no closing link for this card.
+   `linked` also takes a list of issue numbers, the pull request's closing
+   references, because rounds writing the retired artifact board wrote that
+   form, and two of their documents on 2026-10-09 did. The generator writes a
+   boolean. `isLinked` reads a list as linked only when it names the entry's own
+   issue, because an empty list, or one naming another issue, registers no
+   closing link for this card.
 
    A ranking entry's `issue`, `band` and `order` feed the sort, and a string
    there sorts by text or not at all. A plan's `n` and a session's `n` key the
@@ -447,8 +438,8 @@ function adopt(src) {
 }
 
 /* The banner is empty while the page shows live data, and says what it is
-   showing otherwise. It never guesses at why a view cannot reach the database,
-   because the platform deliberately does not say. */
+   showing otherwise. A failed fetch names only what the fetch reported, such as
+   the status board.json answered with, and guesses at nothing beyond it. */
 function source() {
   const el = document.getElementById("source");
   if (!el) return;
@@ -462,14 +453,12 @@ function source() {
   const lines = {
     loading: `<b>Showing ${copy}.</b> The live board has not arrived yet, and the page carries no copy of its own.`,
     none: `<b>Showing ${copy}.</b> This view cannot reach the live board, and the page carries no copy of its own.`,
-    empty: `<b>Showing ${copy}.</b> The live board holds no document yet.`,
     shape: `<b>Showing ${copy}.</b> The live board's document is missing fields this page needs, so it was not used.`,
-    /* marketlake: a fetched board tries again on its own timer, so it says
-       so rather than asking for the reload a database subscription needs. */
+    /* marketlake: the page tries again on its own timer, so it says so rather
+       than asking for a reload. */
     stopped: `<b>Live updates stopped${SOURCE.code ? ` (${esc(SOURCE.code)})` : ""}.</b> ` +
       (SOURCE.had ? `What is shown is the last live data, ${age()}. ` +
-                    (SOURCE.retry ? `The page tries again every ${FETCH_EVERY / 60000} minutes.`
-                                  : `Reload to reconnect.`)
+                    `The page tries again every ${FETCH_EVERY / 60000} minutes.`
                   : `Showing ${copy}.`)
   };
   el.innerHTML = lines[SOURCE.why] || lines.none;
@@ -554,8 +543,8 @@ function msbar() {
 }
 
 const READY_RANK = { build: 0, decide: 1, plan: 2 };
-/* marketlake: NEXT_SORTED is computed in adopt(), because the ranking can arrive
-   from the database after the page has loaded. */
+/* marketlake: NEXT_SORTED is computed in adopt(), because the ranking arrives
+   with each fetch, after the page has loaded. */
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const num = n => Number(n || 0).toLocaleString("en-US");
@@ -610,9 +599,9 @@ function checkword(rollup) {
    into the future says it was measured just now and goes on saying it however
    stale it gets. That is the one sentence this page exists to get right, since
    it is the only warning a reader has of how old every figure is, and it failed
-   silently in the direction that reads as healthy. The database board changes
-   only when a round writes it, and the board on GitHub Pages only when a run
-   rebuilds board.json, so on either path the stamp is what dates the figures.
+   silently in the direction that reads as healthy. The board changes only when
+   a run of the board workflow rebuilds board.json, so the stamp is what dates
+   the figures.
 
    It is not hypothetical and not one session's slip. Two consecutive published
    versions carried it, stamped 20:22Z and 21:52Z against a clock reading 19:26Z,
@@ -646,10 +635,9 @@ function strip() {
 /* All that is left of a twenty-paragraph footer. The narrative was a second
    telling of what the cards already say, and it went. This sentence did not,
    because every figure dates from the stamp rather than from the moment of
-   reading, on both paths, and a page that does not say so reads as live. The
-   database board changes only when a round writes it. The board on GitHub Pages
-   fetches board.json again every two minutes, and that file changes only when a
-   run of the board workflow rebuilds it. */
+   reading, and a page that does not say so reads as live. The page fetches
+   board.json again every two minutes, and that file changes only when a run of
+   the board workflow rebuilds it. */
 function stamped() {
   /* The decay warning names the states that can actually decay, rather than
      listing every one of them whenever any is present. A review posted since
@@ -670,22 +658,17 @@ function stamped() {
   if (WORKING.length) decay.push("a session that has ended since then still reads as running");
   if (open.length) decay.push("a check that has gone green or red since then still reads here as it read then");
   if (open.some(p => !p.reviewed)) decay.push("a review posted since then still reads as owed");
-  /* marketlake: the board on GitHub Pages is built by an Action rather than by
-     hand, so it says how it is built instead. Its figures still date from the
-     stamp rather than from the moment of reading, so the decay clause holds for
-     both. */
-  /* marketlake: board.yml's `on:` block lists what starts a run. Only the CI
-     or Infra workflow finishing starts one, not any other check, and a
-     submitted review starts none, so the sentence names only what does. */
-  const how = FETCHED
-    ? `Built from GitHub against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span> by an Action, which rebuilds it on most ` +
-      `issue and pull request activity, whenever CI or Infra finishes, and on a schedule. ` +
-      `The page fetches it again every ${FETCH_EVERY / 60000} minutes, but every figure on it ` +
-      `is current as of the stamp above rather than live.`
-    : `Measured by hand against <span class="mono">main</span> at ` +
-      `<span class="mono">${esc(STATE.main)}</span>. The page cannot read the disk or poll ` +
-      `GitHub, so every figure on it is current as of the stamp above rather than live.`;
+  /* marketlake: the board is built by an Action, so the footer says how. Its
+     figures still date from the stamp rather than from the moment of reading,
+     so the decay clause holds. board.yml's `on:` block lists what starts a run.
+     Only the CI or Infra workflow finishing starts one, not any other check,
+     and a submitted review starts none, so the sentence names only what does. */
+  const how =
+    `Built from GitHub against <span class="mono">main</span> at ` +
+    `<span class="mono">${esc(STATE.main)}</span> by an Action, which rebuilds it on most ` +
+    `issue and pull request activity, whenever CI or Infra finishes, and on a schedule. ` +
+    `The page fetches it again every ${FETCH_EVERY / 60000} minutes, but every figure on it ` +
+    `is current as of the stamp above rather than live.`;
   document.getElementById("foot").innerHTML =
     `<p>${how}` +
     (decay.length ? ` The In flight section decays fastest: ${andlist(decay)}.` : ``) +
@@ -1601,7 +1584,7 @@ function inFlight(ctx) {
    With no board data only the banner is drawn, and the selector, both card
    sections and the footer are hidden, since each states facts about the
    tracker. The page's own `[hidden]` rule makes `hidden` win over a section's
-   own display rule, which the artifact host's wrapper used to do. */
+   own display rule. */
 function render() {
   ["msbar", "flightsec", "ordersec", "foot"].forEach(id => {
     const el = document.getElementById(id);
@@ -1614,14 +1597,12 @@ adopt(FALLBACK);
 render();
 
 /* marketlake: draws a document that passed `usable`, and rolls back to the last
-   good board when the draw throws. Both paths call it, the database
-   subscription and the fetch, so a document that breaks the drawing code is
-   handled one way whichever path delivered it. `usable` checks every field the
-   drawing code reads without a guard, and this catches a shape it misses. With
-   no data on screen, a failed first draw goes back to drawing none, and the
-   strip that draw wrote is emptied so no count sits beside a banner saying no
-   board data is shown. */
-function drawLive(d, had, retry) {
+   good board when the draw throws. `usable` checks every field the drawing code
+   reads without a guard, and this catches a shape it misses. With no data on
+   screen, a failed first draw goes back to drawing none, and the strip that
+   draw wrote is emptied so no count sits beside a banner saying no board data
+   is shown. */
+function drawLive(d, had) {
   const last = NONE ? FALLBACK
     : { state: STATE, prs: PRS, working: WORKING, planned: PLANNED, next: NEXT,
         untracked: UNTRACKED, tracker: TRACKER };
@@ -1630,23 +1611,22 @@ function drawLive(d, had, retry) {
   } catch (e) {
     adopt(last);
     if (NONE) document.getElementById("strip").innerHTML = "";
-    SOURCE = { live: false, why: "stopped", had, retry, code: "the board could not be drawn" };
+    SOURCE = { live: false, why: "stopped", had, code: "the board could not be drawn" };
     try { render(); } catch (e2) { source(); }
     return false;
   }
 }
 
-/* marketlake: the board on GitHub Pages fetches board.json at once and every
-   FETCH_EVERY milliseconds. A fetch that fails after a board has drawn keeps
-   that board on screen and says when the page tries next, and the next good
-   fetch goes live again. A first fetch that fails says what a view with no
-   database says, because to the reader it is the same thing: there is no
-   board here to show. Each good fetch redraws. */
+/* marketlake: the page fetches board.json at once and every FETCH_EVERY
+   milliseconds. A fetch that fails after a board has drawn keeps that board on
+   screen and says when the page tries next, and the next good fetch goes live
+   again. A first fetch that fails says what a view with no fetch says, because
+   to the reader it is the same thing: there is no board here to show. Each
+   good fetch redraws. */
 function connectFetch() {
-  FETCHED = true;
   let had = false;
   const failed = code => {
-    SOURCE = had ? { live: false, why: "stopped", had, retry: true, code }
+    SOURCE = had ? { live: false, why: "stopped", had, code }
                  : { live: false, why: "none" };
     source();
   };
@@ -1663,44 +1643,17 @@ function connectFetch() {
       if (had) return failed("unreadable board.json");
       SOURCE = { live: false, why: "shape" }; source(); return;
     }
-    if (drawLive(d, had, true)) had = true;
+    if (drawLive(d, had)) had = true;
   };
   SOURCE = { live: false, why: "loading" }; source();
   poll();
   setInterval(poll, FETCH_EVERY);
 }
 
-/* marketlake: subscribe once. A snapshot that fails `usable` is not adopted, so
-   a half-written or old-shaped document leaves the last good data on screen.
-   The lookup stays `window.claude`, because the skill's harness passes `window`
-   in as a parameter. With no database, the page fetches board.json where the
-   host has a fetch, and says it cannot reach the live board where it has none. */
-(async () => {
-  let db = null;
-  try { db = await window.claude?.use?.("db"); } catch (e) { db = null; }
-  if (!db) {
-    if (typeof fetch === "function") { connectFetch(); return; }
-    SOURCE = { live: false, why: "none" }; source(); return;
-  }
-  let had = false;
-  try {
-    db.doc(DOC).onSnapshot(snap => {
-      if (!snap || !snap.exists) {
-        SOURCE = had ? { live: false, why: "stopped", had, code: "document removed" } : { live: false, why: "empty" };
-        source(); return;
-      }
-      const d = snap.data();
-      if (!usable(d)) { SOURCE = had ? { live: false, why: "stopped", had, code: "unreadable document" } : { live: false, why: "shape" }; source(); return; }
-      if (drawLive(d, had, false)) had = true;
-    }, err => {
-      SOURCE = { live: false, why: "stopped", had, code: err && err.code };
-      source();
-    });
-  } catch (e) {
-    SOURCE = { live: false, why: "stopped", had, code: e && e.code };
-    source();
-  }
-})();
+/* marketlake: a browser always has a fetch. Without one the page says it
+   cannot reach the live board rather than throwing. */
+if (typeof fetch === "function") connectFetch();
+else { SOURCE = { live: false, why: "none" }; source(); }
 
 setInterval(() => {
   const el = document.getElementById("stamp");
