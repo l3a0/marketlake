@@ -139,6 +139,13 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
   `lake_root`, so a reviewed pull request is the one way they change.
 - `.tool-versions` pins the `uv` version that CI and the VM's bootstrap install.
+- `.claude/skills/sync-prune-next/` holds the sync skill and the build board. Its
+  `board.html` is the board's page, `build_board.py` builds the page's `board.json`
+  from GitHub, and `dom-stub.js` stands in for a browser when the tests run the page.
+  CI lints the Python there and the tests load it.
+- `.github/workflows/board.yml` runs `build_board.py` on every issue, comment and pull
+  request event, when CI or Infra finishes, and on a schedule, and publishes the page
+  and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 
@@ -905,6 +912,17 @@ workers costs 2 to 3 seconds, so a small run gains almost nothing. CI runs a pul
 request's suite with `-n auto`, one worker per physical core on its runner, and runs it in
 one process on every push to `main`. A worker that crashes after its last test leaves a
 parallel run green, and the serial run on `main` is what catches that crash.
+
+The build board's page tests in `tests/component/test_board_page.py` run the page's
+script under `node` where it is installed, as on CI's runner. Otherwise they run it under
+`osascript -l JavaScript`, which ships with macOS, so they run on a Mac without `node`.
+With neither, they skip. To build the board's `board.json` from GitHub by hand, run the
+generator with the project's Python rather than the system `python3`, which on macOS is
+too old to import it.
+
+```bash
+uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <dir>
+```
 
 The infrastructure under `infra/` needs OpenTofu, and applying it needs the AWS CLI. Both
 come from Homebrew.
