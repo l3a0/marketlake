@@ -46,6 +46,7 @@ from tests.support.board_github import (
     issue,
     load_generator,
 )
+from tests.support.board_page import icon_links
 
 GENERATOR = load_generator()
 PAGE = SKILL / "board.html"
@@ -553,23 +554,54 @@ def test_the_page_carries_its_own_document_skeleton() -> None:
     assert PAGE.read_text(encoding="utf-8").endswith("</script>\n</body>\n</html>\n")
 
 
-def test_the_page_links_its_icon_and_the_icon_is_one() -> None:
-    """Protects the board's tab from looking like every other page's (#884).
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
-    The link sits in the head, where a browser looks for it, and the file beside the
-    page has to be an icon a browser can read at tab size. An ICO file opens with a
-    six-byte header, reserved zero then type 1 then a count, and a sixteen-byte
-    directory entry per image whose first byte is the width, with 0 meaning 256. Each
-    entry ends with the image's size and its offset. A file cut short keeps a whole
-    directory, so each image is checked to lie inside the file.
+
+def check_icon(icon: bytes) -> None:
+    """Fail unless ``icon`` is an ICO file whose every image a browser can decode.
+
+    An ICO file opens with a six-byte header, reserved zero then type 1 then a count,
+    and a sixteen-byte directory entry per image. An entry's first two bytes are the
+    image's width and height, with 0 meaning 256, and it ends with the image's size and
+    its offset. Reading the directory alone passes a file whose entries point at the
+    wrong bytes, so each image is read too.
+
+    1. Its size is above zero and it lies inside the file, which a file cut short fails.
+    2. Its bytes open with the PNG signature, since every image here is a PNG.
+    3. The PNG's IHDR chunk, the first after the signature, states the width and height
+       the entry claims. That chunk holds the width then the height, big-endian, at
+       bytes 16 and 20 of the image.
+    4. No two images share bytes, which an entry pointing at its neighbour fails.
     """
-    head = PAGE.read_text(encoding="utf-8").split("</head>", 1)[0]
-    assert '<link rel="icon" href="favicon.ico" sizes="any">' in head
-    icon = (SKILL / "favicon.ico").read_bytes()
     reserved, kind, count = struct.unpack_from("<HHH", icon, 0)
     assert (reserved, kind) == (0, 1)
     entries = [icon[6 + 16 * i : 22 + 16 * i] for i in range(count)]
     assert sorted(entry[0] or 256 for entry in entries) == [16, 32, 48, 256]
+    spans = []
     for entry in entries:
+        width, height = entry[0] or 256, entry[1] or 256
         size, offset = struct.unpack_from("<II", entry, 8)
-        assert offset + size <= len(icon)
+        assert size > 0, f"the {width} px image is empty"
+        assert offset + size <= len(icon), f"the {width} px image runs past the file"
+        image = icon[offset : offset + size]
+        assert image.startswith(PNG_SIGNATURE), f"the {width} px image is not a PNG"
+        assert image[12:16] == b"IHDR", f"the {width} px image has no IHDR first"
+        assert struct.unpack_from(">II", image, 16) == (width, height), (
+            f"the {width} px entry points at an image of another size"
+        )
+        spans.append((offset, offset + size))
+    spans.sort()
+    for (_, end), (start, _) in zip(spans, spans[1:], strict=False):
+        assert end <= start, "two images share bytes"
+
+
+def test_the_page_links_its_icon_and_the_icon_is_one() -> None:
+    """Protects the board's tab from looking like every other page's (#884).
+
+    The link sits in the head, where a browser looks for it, and not inside a comment
+    or a ``noscript`` block, where a browser never loads it. The file beside the page
+    has to be an icon a browser can read at tab size, which ``check_icon`` reads.
+    """
+    (link,) = icon_links(PAGE.read_text(encoding="utf-8"))
+    assert (link["href"], link.get("sizes")) == ("favicon.ico", "any")
+    check_icon((SKILL / "favicon.ico").read_bytes())

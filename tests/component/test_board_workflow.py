@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from tests.support.board_page import icon_links
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "board.yml"
@@ -151,11 +153,11 @@ def test_the_icon_is_published_where_the_page_links_it() -> None:
     that dropped the copy, or a page that renamed the link, would leave a browser
     asking for a file that is not there. The icon's copy runs only after the page's
     copy succeeds, so joining the two with ``||`` would skip it on every run that works.
+    The link is read from the parsed head, so one inside a comment or a ``noscript``
+    block, which a browser never loads, does not count.
     """
-    page = (SKILL / "board.html").read_text(encoding="utf-8")
-    href = re.search(r'<link rel="icon" href="([^"]+)"', page)
-    assert href, "the page links no icon"
-    href = href.group(1)
+    (link,) = icon_links((SKILL / "board.html").read_text(encoding="utf-8"))
+    href = link["href"]
     (step,) = [s for s in _jobs()["board-build"]["steps"] if s.get("name") == "Add the page"]
     assert " ".join(step["run"].split()) == (
         f"cp {SKILL_DIR}/board.html _site/index.html && cp {SKILL_DIR}/{href} _site/{href}"
