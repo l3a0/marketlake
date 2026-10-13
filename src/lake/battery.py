@@ -830,7 +830,8 @@ def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list
     takes only sessions before the one it judges, so a whole-lake re-run is deterministic.
 
     That holds on a lake nothing trimmed. On a host that trims chains past its window
-    (marketlake #787), a hand-run whole-lake pass finds fewer partitions, and
+    (marketlake #787), and quotes past it under a landed daily bar (marketlake #794), a
+    hand-run whole-lake pass finds fewer partitions, and
     :func:`trailing_medians` runs on fewer sessions for the oldest days the window still holds.
     So a re-run there can differ from the verdict the night itself reached. The nightly run is
     unaffected, because the window is at least as long as the trailing median's reach.

@@ -84,9 +84,10 @@ fires once at 18:30 on weekdays, under launchd's ``StartCalendarInterval`` with
 into one run.
 
 One re-run does not answer the same. On a host that trims chains past its window
-(marketlake #787), a hand re-run over an old day whose previous chains days were trimmed
-finds no chains baseline within its walk, so its chains half reports the way a day with no
-readable baseline does, below, rather than the way the night did. The nightly run is
+(marketlake #787), and quotes past it under a landed daily bar (marketlake #794), a hand
+re-run over an old day whose previous days were trimmed finds no baseline within its walk for
+that surface, so that half reports the way a day with no readable baseline does, below,
+rather than the way the night did. The nightly run is
 unaffected, because the window always holds the previous session.
 
 **A day with no readable baseline reports and does not page.** With no baseline there is no

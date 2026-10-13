@@ -19,6 +19,7 @@ import hashlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import bucket
@@ -31,7 +32,7 @@ from lake.config import BucketTarget
 from lake.lock import lake_lock
 from lake.manifest import latest_entries
 from lake.trimmed import append_trimmed, restore_line, trimmed_path
-from tests.component.test_compaction import _chains, _segment, _snap
+from tests.component.test_compaction import _chains, _quotes, _segment, _snap
 from tests.component.test_trim import _checkpoint
 from tests.support.backup import FakeBackup
 from tests.support.bucket import FakeS3, unreachable
@@ -61,6 +62,10 @@ def _rel(ticker: str, day: date) -> str:
     return f"chains/ticker={ticker}/date={day.isoformat()}.parquet"
 
 
+def _qrel(ticker: str, day: date) -> str:
+    return f"quotes/ticker={ticker}/date={day.isoformat()}.parquet"
+
+
 def _lake(
     root: Path,
     *,
@@ -68,14 +73,23 @@ def _lake(
     seed: bool = True,
     ledger: bool = False,
     tonight: bool = True,
+    quotes: bool = False,
 ) -> FakeS3:
-    """Old partitions past the edge, one inside it, a checkpoint, and a seeded bucket."""
+    """Old partitions past the edge, one inside it, a checkpoint, and a seeded bucket.
+
+    ``quotes`` adds a quotes partition and a daily bar beside each chains partition.
+    """
     lake = FixtureLake(root)
     for ticker in tickers:
         for day in (*OLD, YESTERDAY):
             lake.with_partition(
                 "chains", ticker, day, _chains(1, snap_ts=_snap(day, 0), ticker=ticker)
             )
+            if quotes:
+                lake.with_partition(
+                    "quotes", ticker, day, _quotes(1, snap_ts=_snap(day, 0), ticker=ticker)
+                )
+                lake.with_bars(ticker, "1d", day, pa.table({"close": [650.0]}))
     lake.build()
     _checkpoint(root, YESTERDAY, dict.fromkeys(tickers, EDGE))
     if ledger:
@@ -501,6 +515,40 @@ def test_a_ticker_whose_last_partition_is_trimmed_loses_its_directory(lake_root)
     assert "  pruned   chains/ticker=QQQ/ held no partition" in result.render()
 
 
+def test_a_ticker_whose_last_quotes_day_is_trimmed_loses_its_quotes_directory(lake_root):
+    """Marketlake #794. Mutation this catches: the prune over ``chains/`` alone. A retired
+    ticker leaves the dashboard once its last quotes day goes, because ``lake_roster`` then
+    finds no directory for it on either surface."""
+    client = _lake(lake_root, tickers=("QQQ", "SPY"), quotes=True)
+    (lake_root / _rel("QQQ", YESTERDAY)).unlink()
+    (lake_root / _qrel("QQQ", YESTERDAY)).unlink()
+    result = _job(lake_root, client, [])
+    assert result.trim is not None
+    assert {_qrel("QQQ", day) for day in OLD} <= set(result.trim.trimmed)
+    assert {_qrel("SPY", day) for day in OLD} <= set(result.trim.trimmed)
+    assert result.pruned == ("chains/ticker=QQQ", "quotes/ticker=QQQ")
+    assert not (lake_root / "quotes" / "ticker=QQQ").exists()
+    assert (lake_root / "quotes" / "ticker=SPY").is_dir()
+    assert "  pruned   quotes/ticker=QQQ/ held no partition" in result.render()
+
+
+def test_a_quotes_directory_left_empty_goes_on_a_host_with_a_ledger(lake_root):
+    _lake(lake_root, seed=False)
+    _ledger(lake_root)
+    left = lake_root / "quotes" / "ticker=IWM"
+    left.mkdir(parents=True)
+    result = compact(
+        lake_root,
+        clock=ManualClock(_et(TONIGHT, 16, 30)),
+        calendar=CALENDAR,
+        backup=FakeBackup([]),
+        backup_target=lake_root.parent / "ssd",
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+    assert not left.exists()
+    assert result.pruned == ("quotes/ticker=IWM",)
+
+
 def _empty_ticker(root: Path) -> Path:
     path = root / "chains" / "ticker=IWM"
     path.mkdir(parents=True)
@@ -678,10 +726,10 @@ def test_an_unlink_refusal_on_one_ticker_leaves_the_other_trimmed(lake_root, mon
 # -- the trim feeds the rebuild ---------------------------------------------------------
 
 
-def _chains_files(root: Path) -> dict[str, bytes]:
+def _chains_files(root: Path, surface: str = "chains") -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
-        for path in sorted((root / "chains").rglob("*.parquet"))
+        for path in sorted((root / surface).rglob("*.parquet"))
     }
 
 
@@ -724,3 +772,30 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
     entries = latest_entries(lake_root)
     for rel in gone:
         assert hashlib.sha256(restored[rel]).hexdigest() == entries[rel]["sha256"]
+
+
+def test_the_real_trim_of_quotes_feeds_the_rebuild(lake_root, tmp_path):
+    """Marketlake #794. The rebuild leaves out each quotes day the trim removed, as it does for
+    chains, and keeps the daily bars the trim judged by."""
+    tickers = ("QQQ", "SPY")
+    client = _lake(lake_root, tickers=tickers, quotes=True)
+    result = _job(lake_root, client, [])
+    assert result.trim is not None
+    gone = {_qrel(ticker, day) for ticker in tickers for day in OLD}
+    assert gone <= set(result.trim.trimmed)
+    with lake_lock(lake_root):
+        nightly_upload(
+            lake_root,
+            TARGET,
+            client=client,
+            clock=ManualClock(_et(TONIGHT, 19, 0)),
+            calendar=CALENDAR,
+        )
+    kept = _chains_files(lake_root, "quotes")
+    assert kept and not gone & set(kept)
+    windowed = restore_lake(
+        tmp_path / "windowed", TARGET, client=client, skip_designed_absences=True
+    )
+    assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
+    assert _chains_files(tmp_path / "windowed", "quotes") == kept
+    assert _chains_files(tmp_path / "windowed", "bars") == _chains_files(lake_root, "bars")

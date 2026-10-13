@@ -154,10 +154,11 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 from lake import control_plane, outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
@@ -568,6 +569,16 @@ def _ledger_outcome(report: ExtractionReport | SplitReport) -> PieceOutcome:
     )
 
 
+def _dividend_outcome(report: ExtractionReport) -> PieceOutcome:
+    """The dividend walk's result, which is :func:`_ledger_outcome`'s plus its ``frozen`` count.
+
+    ``frozen`` is passed here rather than read in :func:`_ledger_outcome`, because only
+    ``ExtractionReport`` carries it, and that function's docstring records why a field one
+    report lacks is not read through a ``getattr`` default.
+    """
+    return replace(_ledger_outcome(report), frozen=report.frozen)
+
+
 def _bars_outcome(report: BarsReport | BackfillReport) -> PieceOutcome:
     """The bar walk's result, reduced the same way.
 
@@ -688,6 +699,7 @@ class SweepOutcome:
                 lines.append(
                     f"  {name}: landed {outcome.landed} held {outcome.held}"
                     f" unchanged {outcome.unchanged} skipped {outcome.skipped}"
+                    + ("" if outcome.frozen is None else f" frozen {outcome.frozen}")
                 )
         if self.battery is None:
             lines.append("  battery: did not run")
@@ -790,6 +802,7 @@ def digest_body(nightly: Nightly) -> str:
             lines.append(
                 f"{name}: landed {outcome.landed}, held {outcome.held},"
                 f" unchanged {outcome.unchanged}, skipped {outcome.skipped}"
+                + ("" if outcome.frozen is None else f", frozen {outcome.frozen}")
             )
     if not nightly.pinged:
         lines.append("ping did not land")
@@ -1203,13 +1216,17 @@ def sweep(
             split_walks.append(walked)
             return walked.report
 
-        walks = (
-            (DIVIDENDS_PIECE, partial(extract_dividends, lake_root=root, clock=clock)),
-            (SPLITS_PIECE, splits_walk),
+        walks: tuple[tuple[str, Callable[[], Any], Callable[[Any], PieceOutcome]], ...] = (
+            (
+                DIVIDENDS_PIECE,
+                partial(extract_dividends, lake_root=root, clock=clock),
+                _dividend_outcome,
+            ),
+            (SPLITS_PIECE, splits_walk, _ledger_outcome),
         )
-        for name, walk in walks:
+        for name, walk, reduce in walks:
             try:
-                pieces.append((name, _ledger_outcome(walk())))
+                pieces.append((name, reduce(walk())))
             except _LEDGER_REFUSALS as exc:
                 pieces.append((name, _refused(exc)))
         for walked in split_walks:

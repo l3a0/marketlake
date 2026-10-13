@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from lake import actions, report
+from lake import actions, report, trimmed
 from lake.actions import (
     CHECK_DIVIDEND_CONSISTENCY,
     CHECK_DIVIDEND_PAYLOAD,
@@ -49,10 +50,25 @@ from lake.actions import (
     check_dividend_consistency,
     extract_dividends,
 )
-from lake.manifest import append_line, quarantine_path
+from lake.bucket import UploadSummary
+from lake.calendar import MARKET_TZ
+from lake.config import BucketTarget
+from lake.lock import lake_lock
+from lake.manifest import (
+    ManifestError,
+    append_line,
+    latest_entries,
+    quarantine_path,
+    read_manifest,
+    record_partition,
+)
 from lake.paths import QUOTES, LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster, master_path
+from lake.trim import trim
+from tests.component.test_trim import _checkpoint
+from tests.support.bucket import FakeS3
+from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
@@ -1541,3 +1557,507 @@ def test_the_command_still_shows_a_stack_for_a_ledger_line_it_cannot_resolve(
     assert isinstance(actions.LedgerLineError("x", 1, "y"), actions.ActionsError), (
         "the premise of this test is that both classes share a base"
     )
+
+
+# -- a lake whose quotes are trimmed (marketlake #794) -----------------------------------
+#
+# The trim drops a quotes day once its copy in the bucket is verified and its daily bar has
+# landed. These tests build the trimmed state by hand, a trim line and then the unlink, the way
+# ``test_trim.py`` builds a crash. The multi-night test at the end runs the real trim.
+
+DAY_FOUR = date(2026, 9, 17)
+THIRD_NIGHT = datetime(2026, 9, 17, 0, 2, tzinfo=UTC)
+LATER_NIGHT = datetime(2026, 9, 18, 0, 3, tzinfo=UTC)
+
+
+def _qrel(ticker: str, day: date) -> str:
+    return f"quotes/ticker={ticker}/date={day.isoformat()}.parquet"
+
+
+def _trim_day(root: Path, ticker: str, day: date, *, unlink: bool = True) -> None:
+    """Write the trim line for one quotes day, then remove its file unless ``unlink`` is off.
+
+    With ``unlink`` off the file stays beside its trim line, which is what a crash between the
+    line and the unlink leaves, and every reader treats that file as present.
+    """
+    rel = _qrel(ticker, day)
+    line = trimmed.trim_line(
+        rel,
+        sha256=latest_entries(root)[rel]["sha256"],
+        version_id="v-1",
+        verified_at="2026-09-20T16:31:00-04:00",
+        trimmed_at="2026-09-20T16:31:00-04:00",
+    )
+    with lake_lock(root):
+        trimmed.append_trimmed(root, line, source="trim", fetched_at=None)
+    if unlink:
+        (root / rel).unlink()
+
+
+def _seal(root: Path, ticker: str, day: date, rows: list[dict]) -> None:
+    """Seal one more quotes partition into a lake already built, with its manifest entry."""
+    rel = _qrel(ticker, day)
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_table(rows), path)
+    record_partition(root, rel, source="capture", rows=len(rows), fetched_at=None)
+
+
+def _quarantine(root: Path, ticker: str, day: date) -> None:
+    """Withhold one quotes day, the sign-off row :func:`_clear_quarantine` later supersedes."""
+    line = json.dumps(
+        {"partition": _qrel(ticker, day), "verdict": "suspect", "check": "delayed_feed"},
+        sort_keys=True,
+    )
+    path = root / "quarantine.jsonl"
+    path.write_text((path.read_text() if path.exists() else "") + line + "\n")
+
+
+def _next() -> dict:
+    """The next quarter's dividend, as a row's keyword arguments."""
+    return {"ex_date": NEXT_EX_DATE, "pay_amount": NEXT_PAY_AMOUNT, "amount": NEXT_ANNUALIZED}
+
+
+def test_a_trimmed_quotes_day_is_no_skip_while_a_lost_one_still_is(fixture_lake: FixtureLake):
+    """Before #794 each trimmed day counted as one more skip every night, so the count an
+    operator reads to find a lost day grew by one a night with nothing lost. Mutation this
+    catches: counting a designed absence as a skip."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO, DAY_THREE)},
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    _trim_day(root, "SPY", DAY_ONE)
+    # A file gone with no trim line beside it is lost, and still a skip.
+    (root / _qrel("SPY", DAY_TWO)).unlink()
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert [(skip.ticker, skip.day, skip.reason) for skip in result.skipped] == [
+        ("SPY", DAY_TWO, REASON_PARTITION_ABSENT)
+    ]
+    assert result.appended == () and result.held == ()
+    assert result.frozen == 1
+    assert len(_entries(root)) == 1
+
+
+def test_a_trimmed_first_observation_freezes_its_key_and_appends_nothing(
+    fixture_lake: FixtureLake,
+):
+    """The fault #794 reproduced: rebuilt from nothing each night, the walk re-recorded the key
+    from the oldest day it could still see, so the ledger gained a line every night the window
+    slid. Mutation this catches: dropping the freeze."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO, DAY_THREE)},
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+
+    _trim_day(root, "SPY", DAY_ONE)
+    second = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    _trim_day(root, "SPY", DAY_TWO)
+    third = extract_dividends(lake_root=root, clock=ManualClock(THIRD_NIGHT))
+
+    assert _entries(root) == before
+    assert before[0]["observed_on"] == DAY_ONE.isoformat()
+    for result in (second, third):
+        assert result.appended == () and result.skipped == () and result.held == ()
+        assert (result.frozen, result.unchanged) == (1, 0)
+    assert "  frozen:    1" in third.render()
+
+
+def test_a_key_met_again_after_it_moved_away_freezes_once(fixture_lake: FixtureLake):
+    """A to B and back to A inside the window. Mutations this catches: ``frozen`` not counted,
+    and counted on every meeting rather than on the first."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+            ("SPY", DAY_THREE): [_row(DAY_THREE, **_next())],
+            ("SPY", DAY_FOUR): [_row(DAY_FOUR)],
+        },
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+    assert len(before) == 2
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert _entries(root) == before
+    assert result.frozen == 1, "the key met on the 15th and again on the 17th counts once"
+    assert result.unchanged == 1, "the next quarter's key was read off a day still on disk"
+    assert result.appended == ()
+
+
+def test_the_seed_gives_a_later_key_observed(fixture_lake: FixtureLake):
+    """The lake watched SPY carrying a value on a day since trimmed, so a new value is a change
+    it saw happen, as a walk of the whole lake would say. Mutation this catches: dropping the
+    seed of ``seen``, which lands the new key as ``vendor_reported``."""
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    _seal(root, "SPY", DAY_TWO, [_row(DAY_TWO, **_next())])
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    (landed,) = result.appended
+    assert landed.entry["ex_date"] == "2026-09-17"
+    assert landed.entry["provenance"] == PROVENANCE_OBSERVED
+    assert landed.entry["observed_on"] == DAY_TWO.isoformat()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"amount": ANNUALIZED * 2},  # the gate disagrees
+        {"pay_amount": -1.0, "amount": -4.0},  # the gate agrees and ``build_entry`` refuses
+    ],
+    ids=["gate", "build-entry"],
+)
+def test_a_bad_payload_on_the_first_day_still_on_disk_files_nothing(
+    fixture_lake: FixtureLake, payload: dict
+):
+    """A walk of the whole lake never judges the 15th, because ``previous`` already carries
+    the key from the 14th. Once the 14th is trimmed the freeze has to stand in for that.
+    Mutation this catches: the freeze moved after the gate, or after ``build_entry``, which
+    holds and files the same finding every night."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, **payload)],
+        },
+    )
+    first = extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    assert first.held == (), "the whole lake never judges the 15th"
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.held == ()
+    assert _findings(root, DAY_TWO) == []
+    assert result.frozen == 1 and result.appended == ()
+
+
+def test_a_renamed_ticker_freezes_through_the_symbol_its_day_was_captured_under(
+    fixture_lake: FixtureLake,
+):
+    """The ledger names the instrument and not the ticker, so the trimmed day's partition is
+    found through ``symbol_at``. Mutation this catches: testing the walk's own ticker, which
+    names ``quotes/ticker=SPY/date=2026-09-14.parquet``, a path that never existed."""
+    master = SecurityMaster()
+    instrument = master.register(
+        kind=KIND_EQUITY,
+        capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+        valid_from=date(2026, 9, 8),
+        ticker="OLD",
+    )
+    master.remap(instrument, ID_TYPE_TICKER, "SPY", DAY_TWO)
+    root = _lake(
+        fixture_lake,
+        {
+            ("OLD", DAY_ONE): [_row(DAY_ONE, ticker="OLD")],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+        },
+        master=master,
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    (entry,) = _entries(root)
+    assert entry["observed_on"] == DAY_ONE.isoformat()
+    _trim_day(root, "OLD", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.appended == ()
+    assert result.frozen == 1
+    assert _entries(root) == [entry]
+
+
+def test_a_day_the_master_names_no_ticker_for_appends_once_and_then_stays(
+    fixture_lake: FixtureLake,
+):
+    """Difference 5 on #794. A hand-edited master can leave an entry's ``observed_on`` on a day
+    no mapping covers, and ``symbol_at`` then answers ``None``, which reads as not trimmed.
+    The key appends once, on its first day still on disk, and reads unchanged after."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO)},
+    )
+    # The master holds SPY from 2026-09-08, so the 1st has no mapping.
+    actions.append(
+        root,
+        instrument_id=1,
+        observed_on=date(2026, 9, 1),
+        recorded_at=FIRST_NIGHT,
+        ex_date=EX_DATE,
+        type=TYPE_DIVIDEND,
+        pay_date=PAY_DATE,
+        declared_date=DECLARED,
+        cash_amount=PAY_AMOUNT,
+        provenance=PROVENANCE_VENDOR_REPORTED,
+    )
+    _trim_day(root, "SPY", DAY_ONE)
+
+    first = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+    second = extract_dividends(lake_root=root, clock=ManualClock(THIRD_NIGHT))
+
+    (landed,) = first.appended
+    assert landed.entry["observed_on"] == DAY_TWO.isoformat()
+    assert first.frozen == 0
+    assert second.appended == () and second.unchanged == 1
+    assert len(_entries(root)) == 2
+
+
+@pytest.mark.parametrize(
+    "observed_on",
+    [None, "not a date", 20260914, "2026-09-14T00:00:00Z", ""],
+    ids=["null", "text", "integer", "a-timestamp", "empty"],
+)
+def test_an_observed_on_that_is_no_iso_date_neither_seeds_nor_freezes_nor_raises(
+    fixture_lake: FixtureLake, observed_on: object
+):
+    """Parsing such a value raises a ``TypeError`` or a ``ValueError``, neither of which the
+    sweep contains, so one hand-written line would cost every ticker's dividends. Mutation this
+    catches: parsing without the guard."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO)},
+    )
+    entry = {
+        "instrument_id": 1,
+        "observed_on": observed_on,
+        "recorded_at": FIRST_NIGHT.isoformat(),
+        "ex_date": "2026-06-18",
+        "type": TYPE_DIVIDEND,
+        "pay_date": "2026-07-31",
+        "declared_date": "2026-01-02",
+        "cash_amount": PAY_AMOUNT,
+        "split_ratio": None,
+        "provenance": PROVENANCE_VENDOR_REPORTED,
+        "schema_version": actions.ACTIONS_SCHEMA_VERSION,
+    }
+    path = LakePaths(root).actions_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    append_line(path, entry)
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    (landed,) = result.appended
+    assert landed.entry["observed_on"] == DAY_TWO.isoformat()
+    assert landed.entry["provenance"] == PROVENANCE_VENDOR_REPORTED, "the bad line seeded seen"
+    assert result.frozen == 0
+
+
+@pytest.mark.parametrize("reads", ["skip", "seed", "freeze"])
+def test_a_trim_line_beside_a_file_still_on_disk_reads_as_present(
+    fixture_lake: FixtureLake, reads: str
+):
+    """A crash between the trim line and the unlink leaves both. The day is on disk, so the walk
+    has to answer as a walk of the whole lake does. ``is_designed_absence`` reads only the
+    ledgers, so the disk check is what carries this.
+
+    1. ``skip``: the day is read, so it is neither a skip nor passed over.
+    2. ``seed``: the 14th is withheld by a verdict and on disk, so the lake cannot read it, and
+       the 15th's key is a first observation, ``vendor_reported``. Mutation this catches: the
+       seed without its disk check, which lands it ``observed``.
+    3. ``freeze``: the same withheld 14th, and the key recorded on it moves to the 15th, the
+       correction a whole-lake walk makes under that verdict. Mutation this catches: the freeze
+       without its disk check, which keeps the 14th.
+    """
+    second = [_row(DAY_TWO, **_next())] if reads == "seed" else [_row(DAY_TWO)]
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    _seal(root, "SPY", DAY_TWO, second)
+    _trim_day(root, "SPY", DAY_ONE, unlink=False)
+    if reads != "skip":
+        _quarantine(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.frozen == 0
+    if reads == "skip":
+        assert result.skipped == () and result.appended == ()
+        assert result.unchanged == 1
+        return
+    assert [skip.reason for skip in result.skipped] == [REASON_QUARANTINED]
+    (landed,) = result.appended
+    assert landed.entry["observed_on"] == DAY_TWO.isoformat()
+    if reads == "seed":
+        assert landed.entry["ex_date"] == "2026-09-17"
+        assert landed.entry["provenance"] == PROVENANCE_VENDOR_REPORTED
+    else:
+        assert landed.entry["ex_date"] == "2026-06-18"
+
+
+def test_a_key_recorded_on_a_later_trimmed_day_is_corrected_from_an_earlier_day_on_disk(
+    fixture_lake: FixtureLake,
+):
+    """The freeze asks only about a recorded day earlier than the one the walk is on. Here the
+    14th was withheld when the key was recorded on the 15th, so the trim kept the 14th while it
+    dropped the 15th, and the verdict has since cleared. A walk of the whole lake moves the key
+    to the 14th, and so does this one. Mutation this catches: the freeze without its
+    earlier-than-today test, which keeps the 15th."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO)},
+        quarantined=("SPY", DAY_ONE),
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    (entry,) = _entries(root)
+    assert entry["observed_on"] == DAY_TWO.isoformat()
+    _clear_quarantine(root, "SPY", DAY_ONE)
+    _trim_day(root, "SPY", DAY_TWO)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    (landed,) = result.appended
+    assert landed.entry["observed_on"] == DAY_ONE.isoformat()
+    assert result.frozen == 0 and result.skipped == ()
+
+
+def test_a_damaged_trimmed_ledger_refuses_the_walk(fixture_lake: FixtureLake):
+    """Walking on would read every trimmed day as a skip and re-derive every key from the
+    oldest day left, so the walk refuses as the split walk does."""
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    trimmed.trimmed_path(root).write_bytes(b"\xef\xbb\xbf" + b'{"kind": "trim"}\n')
+
+    with pytest.raises(ManifestError):
+        extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    assert _entries(root) == []
+
+
+def test_the_command_against_a_damaged_trimmed_ledger_exits_two_with_a_line(
+    fixture_lake: FixtureLake, tmp_path: Path, capsys
+):
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    trimmed.trimmed_path(root).write_bytes(b"\xef\xbb\xbf" + b'{"kind": "trim"}\n')
+    config = write_config(tmp_path, root)
+
+    code = actions.main(["--config", str(config)], clock=ManualClock(FIRST_NIGHT))
+
+    assert code == 2
+    printed = capsys.readouterr().err
+    assert "Traceback" not in printed
+    assert printed.startswith("actions: ")
+
+
+# -- the real trim, night after night -----------------------------------------------------
+
+# Three weeks of sessions, the first on Monday 2026-09-14.
+NIGHTLY_SESSIONS = [
+    date(2026, 9, 14) + timedelta(days=offset) for offset in range(19) if offset % 7 < 5
+]
+NIGHTLY_CALENDAR = weekday_sessions(date(2026, 9, 14), date(2026, 9, 21), date(2026, 9, 28))
+NIGHTLY_TARGET = BucketTarget(bucket="lake-backup", prefix="lake")
+OTHER_EX_DATE = "2026-12-17T00:00:00Z"
+
+
+def _spy_payload(index: int) -> dict:
+    """SPY's dividend on the ``index``-th session: A, A, B, back to A, a held C, then D."""
+    if index < 2 or index == 3:
+        return {}
+    if index == 2:
+        return _next()
+    if index == 4:
+        return {"ex_date": OTHER_EX_DATE, "amount": ANNUALIZED * 2}  # held by the gate
+    if index < 7:
+        return {"ex_date": OTHER_EX_DATE}
+    return {"ex_date": "2027-03-18T00:00:00Z"}
+
+
+def _et_at(day: date, hour: int, minute: int) -> datetime:
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=MARKET_TZ)
+
+
+def test_the_real_trim_and_walk_night_after_night_match_a_walk_of_the_whole_lake(
+    fixture_lake: FixtureLake, tmp_path: Path
+):
+    """#794's verification 2. Each night seals the session's quotes into two lakes, lands the
+    previous session's daily bar in one of them, runs the real trim over it with a window of 3,
+    and walks both. The other lake is never trimmed.
+
+    No key may append twice, and the two ledgers may differ only by #794's difference 1: C is
+    held by the gate on the 18th and passes from the 21st, so the whole lake holds it forever,
+    while the trimmed lake lands it once on the 21st after the 18th is gone. Mutations this
+    catches: the walk without the freeze, which appends A and B again as the window slides, and
+    the designed absence counted as a skip.
+    """
+    master = _master(tickers=("SPY", "QQQ"))
+    roots = []
+    for name in ("trimmed", "whole"):
+        lake = FixtureLake(tmp_path / name)
+        lake.with_reference("schema_versions", _ledger_table())
+        root = lake.build()
+        master.write(master_path(root))
+        roots.append(root)
+    trimmed_root, whole_root = roots
+    client = FakeS3()
+    reports = []
+    for index, tonight in enumerate(NIGHTLY_SESSIONS):
+        for root in roots:
+            _seal(root, "SPY", tonight, [_row(tonight, **_spy_payload(index))])
+            _seal(root, "QQQ", tonight, [_row(tonight, ticker="QQQ")])
+        for ticker in ("SPY", "QQQ"):
+            rel = _qrel(ticker, tonight)
+            client.store(NIGHTLY_TARGET.key(rel), (trimmed_root / rel).read_bytes())
+        if index:
+            yesterday = NIGHTLY_SESSIONS[index - 1]
+            for ticker in ("SPY", "QQQ"):
+                bar = f"bars/ticker={ticker}/freq=1d/date={yesterday.isoformat()}.parquet"
+                (trimmed_root / bar).parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(pa.table({"close": [650.0]}), trimmed_root / bar)
+                record_partition(trimmed_root, bar, source="sweep", rows=1, fetched_at=None)
+            _checkpoint(trimmed_root, yesterday, {"SPY": date.min, "QQQ": date.min})
+            with lake_lock(trimmed_root):
+                trim(
+                    trimmed_root,
+                    window=3,
+                    client=client,
+                    target=NIGHTLY_TARGET,
+                    upload=UploadSummary(
+                        target=str(NIGHTLY_TARGET),
+                        deadline=_et_at(tonight, 17, 45),
+                        watermark=len(read_manifest(trimmed_root)),
+                    ),
+                    clock=ManualClock(_et_at(tonight, 16, 30)),
+                    calendar=NIGHTLY_CALENDAR,
+                )
+        walked = [
+            extract_dividends(
+                lake_root=root,
+                # A minute later each night, so two nights filing one held finding for one
+                # ticker-day never share a file name.
+                clock=ManualClock(_et_at(tonight, 18, 30) + timedelta(minutes=index, seconds=n)),
+            )
+            for n, root in enumerate(roots)
+        ]
+        reports.append(walked[0])
+
+    gone = [
+        rel for rel in trimmed.latest_trimmed(trimmed_root) if not (trimmed_root / rel).exists()
+    ]
+    assert len(gone) >= 2 * 10, "the trim did not slide the window"
+    assert all(report.skipped == () for report in reports)
+    assert reports[-1].frozen > 0
+
+    def keyed(root: Path) -> dict:
+        found: dict = {}
+        for entry in _entries(root):
+            found.setdefault((entry["instrument_id"], entry["ex_date"]), []).append(entry)
+        return found
+
+    kept, whole = keyed(trimmed_root), keyed(whole_root)
+    assert all(len(lines) == 1 for lines in kept.values()), "a key appended twice"
+    held_c = (1, "2026-12-17")
+    assert set(kept) - set(whole) == {held_c}
+    assert set(whole) - set(kept) == set()
+    assert kept[held_c][0]["observed_on"] == NIGHTLY_SESSIONS[5].isoformat()
+    for key in whole:
+        ours, theirs = dict(kept[key][0]), dict(whole[key][0])
+        ours.pop("recorded_at")
+        theirs.pop("recorded_at")
+        assert ours == theirs, key

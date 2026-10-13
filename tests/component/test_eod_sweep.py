@@ -1198,6 +1198,18 @@ def test_the_file_carries_the_counts_and_the_detail_the_digest_dropped(
         "unchanged",
         "unfiled",
     ]
+    # The dividend piece carries ``frozen`` (marketlake #794), and only it: the split and bar
+    # walks keep no such count, so a zero there would claim a count nobody took.
+    assert sorted(filed["pieces"]["dividends"]) == [
+        "frozen",
+        "held",
+        "landed",
+        "skipped",
+        "subjects",
+        "unchanged",
+        "unfiled",
+    ]
+    assert "frozen" not in filed["pieces"]["splits"]
     assert filed["disagreements"] == outcome.nightly.disagreements
 
 
@@ -1330,6 +1342,54 @@ def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
     monkeypatch.setattr(sweep, seam, a_bug)
     with pytest.raises(ValueError):
         _run(root)
+
+
+def test_the_dividend_walks_frozen_count_reaches_the_file_the_digest_and_the_block(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """Marketlake #794. On a trimmed lake a run that re-met every key reads zero appended,
+    held, unchanged and skipped, and ``frozen`` is what tells it from a run that read nothing.
+    Mutation this catches: the dividend piece reduced without its ``frozen``."""
+    from lake.actions import ExtractionReport
+
+    root = _lake(fixture_lake)
+    report_out = ExtractionReport(
+        ticker_days=3, appended=(), held=(), unchanged=0, skipped=(), frozen=2
+    )
+    monkeypatch.setattr(sweep, "extract_dividends", lambda **kwargs: report_out)
+
+    outcome, _, _ = _run(root)
+
+    dividends = dict(outcome.nightly.pieces)["dividends"]
+    assert dividends.frozen == 2
+    assert "dividends: landed 0, held 0, unchanged 0, skipped 0, frozen 2" in outcome.digest.body
+    assert "dividends: landed 0 held 0 unchanged 0 skipped 0 frozen 2" in outcome.render()
+    (filed,) = _filed(root)
+    assert filed["pieces"]["dividends"]["frozen"] == 2
+    # The other walks print no frozen count of their own.
+    assert "splits: landed" in outcome.digest.body
+    for line in outcome.digest.body.splitlines():
+        if line.startswith(("splits:", "bars:")):
+            assert "frozen" not in line
+
+
+def test_a_damaged_trimmed_ledger_refuses_the_dividend_walk_and_keeps_the_evening(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #794. The dividend walk now reads ``trimmed.jsonl``, so a damaged one refuses
+    it every night until repaired. The sweep contains that as "dividends did not run" and
+    withholds the ping, as it already does for the split walk."""
+    root = _lake(fixture_lake)
+    (root / "trimmed.jsonl").write_bytes(b"\xef\xbb\xbf" + b'{"kind": "trim"}\n')
+
+    outcome, pinger, transport = _run(root)
+
+    dividends = dict(outcome.nightly.pieces)["dividends"]
+    assert dividends.refusal_class == "LedgerHasByteOrderMark"
+    assert outcome.filed_at is not None, "no report file was written"
+    assert transport.messages, "no digest went out"
+    assert pinger.urls == [], "a refused piece must withhold the ping"
+    assert "dividends: did not run, LedgerHasByteOrderMark" in outcome.digest.body
 
 
 def _bump_master_schema_version(root: Path) -> None:

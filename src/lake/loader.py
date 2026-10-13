@@ -802,6 +802,15 @@ def load_quotes(
     no ``spot_close`` tag raises ``NoSpotClose`` rather than ``NoOptionClose``, so a caller
     reading the exception name is told which tag was missing rather than being pointed at
     the sibling surface's.
+
+    **On a trimmed lake** (marketlake #794) a session the VM's trim removed raises
+    ``PartitionAbsent``, as any manifested partition whose file is gone does. The trim drops a
+    quotes day only under a landed daily bar, so a day the bars census still reads is never
+    gone. The dividend walk asks the trimmed ledger whether such an absence was on purpose and
+    passes over it, and nothing else that runs nightly reads a trimmed day. Reading one means
+    restoring it into a directory outside the live lake, which ``python -m lake.bucket
+    restore-for-reading`` does for quotes as for chains (marketlake #837), and calling this
+    with ``lake_root`` at that directory.
     """
     return _load_surface(
         ticker,
