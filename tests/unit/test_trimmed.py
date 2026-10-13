@@ -104,7 +104,8 @@ def test_the_designed_absence_table(lines, manifest, designed):
 
 
 def test_the_predicate_assumes_no_surface():
-    """Chains are trimmed first, and every dated surface may be trimmed at the same cutoff."""
+    """Chains are trimmed at the window's cutoff, and quotes at the same cutoff under a landed
+    daily bar, so the predicate reads a quotes path the same way."""
     manifest = {QUOTES: {"partition": QUOTES, "sha256": SHA, "rows": 10}}
     latest = latest_by_partition([_trim(QUOTES)])
     assert is_designed_absence(QUOTES, manifest, latest) is True

@@ -1,10 +1,10 @@
 """The trim's slot inside the close+15 compaction, its gates, and the empty-directory pass.
 
-Marketlake #787. ``compact`` judges the window key and the role, requires a bucket backup
-whose upload left a deadline and a watermark, and runs the trim after the ping, still in the
-lock hold. A trim failure withholds no ping and never raises out of ``compact``. After the trim
-step, on every exit from it, a pass removes each empty ``chains/ticker=T/`` on any host that
-holds a ``trimmed.jsonl``, a shadow and a host with no window included.
+Marketlake #787. ``compact`` judges the window key and the role, requires a bucket backup whose
+upload left a deadline and a watermark, and runs the trim after the ping, still in the lock hold. A
+trim failure withholds no ping and never raises out of ``compact``. After the trim step, on every
+exit from it, a pass removes each empty ``chains/ticker=T/`` and ``quotes/ticker=T/`` on any host
+that holds a ``trimmed.jsonl``, a shadow and a host with no window included.
 
 A window cannot go below ``window.window_floor`` under the default guards, and the window
 of 22 these tests use clears it. So they use a calendar of six weeks, from 2026-07-20 to

@@ -1064,9 +1064,13 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
        an entry, unless step 4a freezes its key. It carries provenance ``observed`` when the
        lake has already watched that instrument carrying a value, and ``vendor_reported`` when
        it has not, because there the change itself was never seen. "Already watched" is
-       ``seen``: every instrument this run met carrying a value, plus every instrument the
-       ledger records a dividend for whose recorded ``observed_on`` day was trimmed, since the
-       lake watched that instrument on a day the walk can no longer read. The dates are
+       what a walk of the whole lake would say at this point in its order, ticker then day.
+       That is every instrument this run met carrying a value, plus every instrument the
+       ledger records a dividend for whose recorded ``observed_on`` day was trimmed, once the
+       walk has passed the earliest such day, since the lake watched that instrument on a day
+       the walk can no longer read. The order matters because the trim keeps an older day,
+       such as one whose daily bar is pending, while it drops a newer one, and because a
+       renamed instrument's newer ticker can sort before its older one. The dates are
        compared normalized, so the vendor writing one date two ways is not a transition. The
        instrument is half of the comparison because a symbol handed from one instrument to
        another is a new thing to record, which is what step 4 of the issue means by grouping
@@ -1105,8 +1109,10 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     1. A designed absence is not a skip. A read that meets ``PartitionAbsent`` on such a day
        passes over it silently, joining neither ``skipped`` nor ``previous``. A trim line
        beside a file still on disk reads as present, because this check follows the read.
-    2. ``seen`` starts with each instrument whose dividend ``latest`` holds with a trimmed
-       ``observed_on`` day, as step 3 says.
+    2. Each instrument whose dividend ``latest`` holds with a trimmed ``observed_on`` day
+       counts as seen from the earliest such day's place in the walk, as step 3 says. The
+       place is the ticker ``symbol_at`` names and the day, compared the way the walk orders
+       them.
     3. Step 4a freezes a key whose first observation was trimmed.
 
     The recorded day's partition is named by ``master.symbol_at(instrument_id, observed_on)``,
@@ -1115,8 +1121,8 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     the day, and that reads as not trimmed. An ``observed_on`` that is not an ISO date string
     is never trimmed either, since parsing one raises a class the sweep does not contain.
 
-    A trimmed run differs from a walk of the whole untrimmed lake in six ways that #794 names
-    and accepts. Each moves ``observed_on`` or ``provenance`` on one entry at most twice, and
+    A trimmed run differs from a walk of the whole untrimmed lake in six ways that marketlake #794
+    names and accepts. Each moves ``observed_on`` or ``provenance`` on one entry at most twice, and
     no reader of the ledger computes an adjusted price from either field.
 
     1. A gate-held value that later passes lands once, on its first passing day.
@@ -1170,14 +1176,19 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     # Every instrument this walk has already seen carrying a value, which is what tells a
     # change the lake watched happen from a value that was already there when it started
     # looking. It is keyed on the instrument rather than the ticker, so a symbol handed from
-    # one instrument to another gives the incoming one its own first observation. It starts
-    # with each instrument the lake watched on a quotes day the trim has since removed.
-    seen: set[int] = {
-        key[0]
-        for key, entry in current.items()
-        if key[2] == TYPE_DIVIDEND
-        and trimmed_days.recorded_day_trimmed(master, key[0], entry.get("observed_on"))
-    }
+    # one instrument to another gives the incoming one its own first observation.
+    seen: set[int] = set()
+    # The earliest place in the walk's order, ticker then day, where the lake watched each
+    # instrument on a quotes day the trim has since removed. A walk of the whole lake has seen
+    # the instrument only at a later place, and the trim can keep an older day while it drops
+    # a newer one, so the walk can meet a day on disk before the trimmed day.
+    seen_trimmed_at: dict[int, tuple[str, date]] = {}
+    for key, entry in current.items():
+        if key[2] != TYPE_DIVIDEND:
+            continue
+        place = trimmed_days.recorded_place_trimmed(master, key[0], entry.get("observed_on"))
+        if place is not None and (key[0] not in seen_trimmed_at or place < seen_trimmed_at[key[0]]):
+            seen_trimmed_at[key[0]] = place
     # Every key this run has already emitted. A key is emitted at the first observation
     # carrying its value, and an ex-date that moves away and comes back is not a second
     # first. Without this the walk emits one key twice under two provenances, neither
@@ -1271,9 +1282,10 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
                     frozen += 1
                 continue
 
-            provenance = (
-                PROVENANCE_OBSERVED if instrument_id in seen else PROVENANCE_VENDOR_REPORTED
+            watched = instrument_id in seen or (
+                instrument_id in seen_trimmed_at and seen_trimmed_at[instrument_id] < (ticker, day)
             )
+            provenance = PROVENANCE_OBSERVED if watched else PROVENANCE_VENDOR_REPORTED
             seen.add(instrument_id)
 
             verdict = check_dividend_consistency(
@@ -1335,7 +1347,9 @@ class _TrimmedQuotes:
     """Which quotes days the trim removed on purpose, read off one snapshot of each ledger.
 
     One predicate answers "was this day trimmed" for the seed of ``seen`` and for the freeze in
-    :func:`extract_dividends`: ``trimmed.is_designed_absence`` names the day's quotes partition
+    :func:`extract_dividends`. The seed asks where in the walk's order a trimmed day sits, so
+    an instrument counts as seen only after the walk passes that place. The predicate holds
+    when ``trimmed.is_designed_absence`` names the day's quotes partition
     and no file is on disk. ``is_designed_absence`` reads only the ledgers, so without the disk
     check a trim line beside a file still present, which a crash between the line and the
     unlink leaves, would freeze a key whose day the walk can still read.
@@ -1368,10 +1382,11 @@ class _TrimmedQuotes:
             return True
         return False
 
-    def recorded_day_trimmed(
+    def recorded_place_trimmed(
         self, master: SecurityMaster, instrument_id: int, observed_on: object
-    ) -> bool:
-        """Whether a ledger entry's ``observed_on`` day was trimmed.
+    ) -> tuple[str, date] | None:
+        """Where a ledger entry's ``observed_on`` day sits in the walk, when that day was
+        trimmed, as the ticker and the day. ``None`` when it was not trimmed.
 
         The day's partition is named by ``symbol_at``, never by the ticker the walk is on,
         because an entry carries only the instrument. ``symbol_at`` never raises, and its
@@ -1380,11 +1395,11 @@ class _TrimmedQuotes:
         """
         recorded = _iso_day(observed_on)
         if recorded is None:
-            return False
+            return None
         symbol = master.symbol_at(instrument_id, recorded)
-        if symbol is None:
-            return False
-        return self.trimmed(symbol, recorded)
+        if symbol is None or not self.trimmed(symbol, recorded):
+            return None
+        return symbol, recorded
 
     def first_seen_before(
         self, master: SecurityMaster, instrument_id: int, observed_on: object, day: date
@@ -1393,7 +1408,7 @@ class _TrimmedQuotes:
         recorded = _iso_day(observed_on)
         if recorded is None or not recorded < day:
             return False
-        return self.recorded_day_trimmed(master, instrument_id, observed_on)
+        return self.recorded_place_trimmed(master, instrument_id, observed_on) is not None
 
 
 def _iso_day(value: object) -> date | None:

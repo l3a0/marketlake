@@ -1709,6 +1709,74 @@ def test_the_seed_gives_a_later_key_observed(fixture_lake: FixtureLake):
     assert landed.entry["observed_on"] == DAY_TWO.isoformat()
 
 
+def test_the_seed_reaches_only_the_days_a_whole_lake_walk_meets_after_the_trimmed_one(
+    fixture_lake: FixtureLake,
+):
+    """The trim keeps an older day, here the 14th, while it drops a later one, the 15th, so the
+    walk meets a day on disk before the trimmed day the seed came from. A walk of the whole
+    lake had not yet seen SPY on the 14th, and lands its key ``vendor_reported``. Mutation this
+    catches: seeding ``seen`` for the whole run, which appends the 14th's key again as
+    ``observed`` every night."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, **_next())],
+            ("SPY", DAY_THREE): [_row(DAY_THREE, **_next())],
+        },
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+    assert [(e["ex_date"], e["observed_on"], e["provenance"]) for e in before] == [
+        ("2026-06-18", DAY_ONE.isoformat(), PROVENANCE_VENDOR_REPORTED),
+        ("2026-09-17", DAY_TWO.isoformat(), PROVENANCE_OBSERVED),
+    ]
+    _trim_day(root, "SPY", DAY_TWO)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.appended == ()
+    assert (result.unchanged, result.frozen) == (1, 1)
+    assert _entries(root) == before
+
+
+def test_the_seed_follows_the_walk_order_across_a_rename(fixture_lake: FixtureLake):
+    """The walk goes ticker by ticker in sorted order, so after ZZZ is renamed AAA it meets the
+    instrument's AAA days before its older ZZZ days. A walk of the whole lake lands AAA's key
+    ``vendor_reported``, because the ZZZ day where the instrument was first seen comes later in
+    that order. Mutation this catches: a seed that ignores the order, which appends AAA's key
+    again as ``observed`` once the ZZZ day is trimmed."""
+    master = SecurityMaster()
+    instrument = master.register(
+        kind=KIND_EQUITY,
+        capture_start=datetime(2026, 9, 8, 17, 7, tzinfo=UTC),
+        valid_from=date(2026, 9, 8),
+        ticker="ZZZ",
+    )
+    master.remap(instrument, ID_TYPE_TICKER, "AAA", DAY_TWO)
+    root = _lake(
+        fixture_lake,
+        {
+            ("ZZZ", DAY_ONE): [_row(DAY_ONE, ticker="ZZZ")],
+            ("AAA", DAY_TWO): [_row(DAY_TWO, ticker="AAA", **_next())],
+        },
+        master=master,
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+    assert [(e["ex_date"], e["observed_on"], e["provenance"]) for e in before] == [
+        ("2026-09-17", DAY_TWO.isoformat(), PROVENANCE_VENDOR_REPORTED),
+        ("2026-06-18", DAY_ONE.isoformat(), PROVENANCE_OBSERVED),
+    ]
+    _trim_day(root, "ZZZ", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.appended == ()
+    assert result.unchanged == 1
+    assert _entries(root) == before
+
+
 @pytest.mark.parametrize(
     "payload",
     [

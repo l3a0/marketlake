@@ -4462,8 +4462,8 @@ def test_a_partition_trimmed_by_design_is_counted_apart_and_not_missing(lake: Pa
 def test_a_trimmed_quotes_partition_counts_the_same_as_a_trimmed_chains_one(lake: Path):
     """The ledger is keyed by partition whatever its surface, and coverage walks both surfaces.
 
-    Chains are trimmed first, and the owner means every dated surface to be trimmed at the same
-    cutoff in time, so a quotes partition trimmed on purpose is not missing either.
+    Chains are trimmed at the window's cutoff, and quotes at the same cutoff under a landed
+    daily bar, so a quotes partition trimmed on purpose is not missing either.
     """
     quotes = f"quotes/ticker=SPY/date={TRIMMED_SESSION.isoformat()}.parquet"
     _seed_spans(lake)

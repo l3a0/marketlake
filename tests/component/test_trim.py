@@ -1,10 +1,10 @@
-"""The trim, called directly over a small window (marketlake #787).
+"""The trim, called directly over a small window (marketlake #787 and marketlake #794).
 
-``lake.trim.trim`` drops a chains partition only when all seven clauses hold, writes its trim
-line before it unlinks, recovers a crash between the two by re-running the whole selection, and
-never raises. A window cannot go below ``window.window_floor``, which is longer than two weeks,
-so these tests call the trim directly with a window of 3 over two weeks of tiny partitions,
-each stored in the fake bucket. The floor and gate tests run at the ``compact`` level in
+``lake.trim.trim`` drops a chains or quotes partition only when all seven clauses hold, writes its
+trim line before it unlinks, recovers a crash between the two by re-running the whole selection, and
+never raises. A window cannot go below ``window.window_floor``, which is longer than two weeks, so
+these tests call the trim directly with a window of 3 over two weeks of tiny partitions, each stored
+in the fake bucket. The floor and gate tests run at the ``compact`` level in
 ``test_compaction_trim.py``.
 
 The lake below holds SPY and QQQ on every weekday from 2026-08-17 to 2026-08-28. Tonight is
@@ -452,7 +452,12 @@ def test_recovery_of_a_quotes_partition_that_still_qualifies_trims_it(lake_root)
     assert _absent_on_purpose(lake_root, rel)
 
 
-@pytest.mark.parametrize("fault", ["unsearchable", "unwritable", "unlink-refused"])
+# The three faults that hold one ticker directory: one the trim cannot search, one it cannot
+# write, and an unlink the volume refuses.
+HOLD_FAULTS = ["unsearchable", "unwritable", "unlink-refused"]
+
+
+@pytest.mark.parametrize("fault", HOLD_FAULTS)
 def test_a_held_chains_directory_holds_only_itself(lake_root, monkeypatch, fault):
     """Marketlake #794. Mutation this catches: the held key back on the ticker, which made a
     fault in ``chains/ticker=QQQ/`` hold QQQ's quotes too, trimming none of them."""
@@ -480,21 +485,31 @@ def test_a_held_chains_directory_holds_only_itself(lake_root, monkeypatch, fault
     assert "QQQ waits" not in held
 
 
-def test_a_held_quotes_directory_holds_only_itself(lake_root):
+@pytest.mark.parametrize("fault", HOLD_FAULTS)
+def test_a_held_quotes_directory_holds_only_itself(lake_root, monkeypatch, fault):
     """The other way round: a quotes directory's fault leaves the ticker's chains trimming."""
     client = _build(lake_root, quotes=True)
     ticker_dir = lake_root / "quotes" / "ticker=QQQ"
-    ticker_dir.chmod(0o600)
+    if fault == "unlink-refused":
+        _failing_unlink(monkeypatch, _qrel("QQQ", SESSIONS[0]), errno.EACCES)
+    else:
+        ticker_dir.chmod(0o600 if fault == "unsearchable" else 0o500)
     try:
         result = _trim(lake_root, client)
     finally:
         ticker_dir.chmod(0o755)
+    assert result.stopped is None
     assert [rel for rel in result.trimmed if rel.startswith("chains/ticker=QQQ/")] == [
         rel for rel in _expected() if "QQQ" in rel
     ]
     assert not any(rel.startswith("quotes/ticker=QQQ/") for rel in result.trimmed)
     (held,) = result.held
     assert held.startswith("quotes/ticker=QQQ/: ")
+    if fault == "unsearchable":
+        assert "so quotes/ticker=QQQ/ waits" in held
+    else:
+        assert "so the rest of quotes/ticker=QQQ/ waits" in held
+    assert "QQQ waits" not in held
 
 
 # -- refusals before any partition -----------------------------------------------------------

@@ -112,8 +112,9 @@ TRIM_SOURCE = "trim"
 # notes.
 ROT_PAGE_CAP = 4
 
-# The unlink errors that stop only their ticker. Unlinking needs write permission on the
-# ticker's directory, which a range restore run with ``sudo`` can leave owned by root.
+# The unlink errors that stop only one ticker directory, such as ``chains/ticker=SPY``.
+# Unlinking needs write permission on that directory, which a range restore run with ``sudo``
+# can leave owned by root.
 _TICKER_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
 
 # What a lake copy hashed to when the bucket's copy did not match.
@@ -145,7 +146,9 @@ class TrimResult:
     refused. ``restored`` lists the partitions recovery wrote a restore line for. ``skipped``
     names each partition skipped for a reason worth reading, such as a key missing from the
     bucket. ``rot`` holds each rotted bucket copy, which ``compact`` pages once for the run.
-    ``held`` names each ticker an unlink refusal stopped, with its repair.
+    ``held`` names each ticker directory a refusal stopped, such as ``quotes/ticker=SPY``, with
+    its repair. An unlink refusal lands one there, and so does a directory the run could not
+    search or write.
 
     ``refused`` is set when a gate refused before any partition was looked at. ``stopped`` is
     set when a failure that would repeat on every partition ended the run. ``deadline`` is

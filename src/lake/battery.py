@@ -406,11 +406,11 @@ class Finding:
 class BatteryReport:
     """What one run did, in the shape the sweep's record and the digest both read.
 
-    The counts are deliberately not ``report.PieceOutcome``'s. That record's fields are
-    ``landed``, ``held``, ``unfiled``, ``unchanged`` and ``skipped``, which describe a ledger
-    walk appending rows. A battery run appends only on a transition, so ``landed`` would read
-    zero on a night that judged the whole lake and found it clean, which is the opposite of what
-    happened. These names say what a battery does instead.
+    The counts are deliberately not ``report.PieceOutcome``'s. That record's fields are ``landed``,
+    ``held``, ``unfiled``, ``unchanged`` and ``skipped``, which describe a ledger walk appending
+    rows, plus ``frozen``, which only the dividends piece sets. A battery run appends only on a
+    transition, so ``landed`` would read zero on a night that judged the whole lake and found it
+    clean, which is the opposite of what happened. These names say what a battery does instead.
 
     ``deferred`` counts the human sign-offs this run re-observed and left standing, which is
     #139's rule producing a number rather than only a log line. It counts those alone.
