@@ -147,7 +147,6 @@
      pull request either, because nothing is written yet. It gets the wait
      colour, which the board already uses for work that is not free to start. */
   .tk.busy { box-shadow: inset 3px 0 0 0 var(--wait); }
-  .tk .wk { font-family: var(--mono); font-size: 0.6875rem; color: var(--wait); }
   /* A card whose plan has been executed against the code is a different thing
      from a card whose body is still a hypothesis, and the difference is what
      decides whether it can be handed to a builder. It is drawn as a filled
@@ -320,9 +319,12 @@ const PRU = "https://github.com/l3a0/marketlake/pull/";
 
    The document's shape is { schema, state, prs, working, planned, next,
    untracked, tracker }, and each field is what the constant of the same name
-   held on the Quantitative Trading page. The generator writes no `untracked`,
-   which the page reads as empty. `usable` below is the whole contract the page
-   checks before adopting a document. */
+   held on the Quantitative Trading page. Since issue 873 the generator fills
+   `working`, `planned` and `next` from labels and from lines the owner writes
+   on GitHub, which the board-markers skill describes, and a `working` entry
+   carries no `what`, because a label has none. The generator writes no
+   `untracked`, which the page reads as empty. `usable` below is the whole
+   contract the page checks before adopting a document. */
 /* marketlake: Pages tells a browser to cache board.json for ten minutes, so
    each fetch asks for a URL no cache has seen and tells the browser to store
    nothing. */
@@ -399,8 +401,7 @@ const allOf = f => xs => Array.isArray(xs) && xs.every(f);
 
    A ranking entry's `issue`, `band` and `order` feed the sort, and a string
    there sorts by text or not at all. A plan's `n` and a session's `n` key the
-   maps the cards read, and a session's `what` is drawn, so a missing one would
-   draw "undefined". A session's `kind` may be absent, which reads as a
+   maps the cards read. A session's `kind` may be absent, which reads as a
    decompose loop, but it must be a string when present. */
 const ITEM_OK = {
   tracker: c => !!c && isNum(c.n) && isStr(c.label) && isStr(c.ms) &&
@@ -411,7 +412,7 @@ const ITEM_OK = {
     isStr(p.review) && isBool(p.reviewed) && (isBool(p.linked) || allOf(isNum)(p.linked)) &&
     (p.partOf === undefined || isBool(p.partOf)) &&
     allOf(r => Array.isArray(r) && r.length === 2 && isStr(r[0]) && isStr(r[1]))(p.rollup),
-  working: w => !!w && isNum(w.n) && isStr(w.what) && (w.kind === undefined || isStr(w.kind)),
+  working: w => !!w && isNum(w.n) && (w.kind === undefined || isStr(w.kind)),
   planned: p => !!p && isNum(p.n) && isNum(p.passes) && oneOf(["build", "decide", "plan"])(p.ready),
   next: x => !!x && isNum(x.issue) && isNum(x.band) && (x.order === undefined || isNum(x.order)) &&
     oneOf(["build", "decide", "plan"])(x.ready)
@@ -435,7 +436,7 @@ function adopt(d) {
   NEXT = d.next; UNTRACKED = d.untracked || []; TRACKER = d.tracker;
   NEXT_SORTED = NEXT.slice().sort((a, b) =>
     a.band - b.band ||
-    (a.order || 50) - (b.order || 50) ||
+    (a.order ?? 50) - (b.order ?? 50) ||
     READY_RANK[a.ready] - READY_RANK[b.ready] ||
     a.issue - b.issue);
 }
@@ -816,9 +817,9 @@ function buildOrder() {
   /* marketlake: under one chosen milestone a parent in it shows too. A parent
      builds nothing, so it is never ranked, and the ranked-only view would always
      hide the card its children name as what they serve. */
-  /* marketlake: and when nothing here is ranked, every card shows. Until issue
-     873 the board on GitHub Pages carries no ranking, and the ranked-only view
-     then drew 0 cards under "All" and only the parents under "MVP 2". A ranked
+  /* marketlake: and when nothing here is ranked, every card shows. With no
+     `Board order:` line on any card in the milestone, the ranked-only view drew
+     0 cards under "All" and only the parents under "MVP 2". A ranked
      card in flight still counts, because more() would then write, in the line
      above the board, that nothing in the milestone is ranked, and that was false
      while every ranked card was in flight. A deferred card counts as unranked,
@@ -949,7 +950,7 @@ function buildOrder() {
       if (!p && KINDSAYS[c.kind]) says.push(KINDSAYS[c.kind]);
       return `<div class="tk k-${c.kind}${p ? " has-pr" : ""}${wk ? " busy" : ""}${
         pn ? " plan-" + pn.ready : ""}" data-n="${c.n}" tabindex="0" role="button"
-        aria-label="Issue ${c.n}. ${esc(c.label)}.${says.length ? " " + esc(says.join(" ")) : ""}${p ? ` Pull request ${p.pr} is ${p.state} against it.` : ""}${wk ? ` A session is working it: ${esc(wk.what)}.` : ""}${
+        aria-label="Issue ${c.n}. ${esc(c.label)}.${says.length ? " " + esc(says.join(" ")) : ""}${p ? ` Pull request ${p.pr} is ${p.state} against it.` : ""}${wk ? ` A session is working it.` : ""}${
           pn ? ` Its plan is complete after ${plu(pn.passes, "pass")}.` +
             /* The label says what the visible line says. It used to read "ready
                to decide", which is not a state, while the line under the card
@@ -979,7 +980,6 @@ function buildOrder() {
             : pn.ready === "decide" ? ", waits on an owner call"
             : waits.length ? "" : ", ready to build"}</div>` : ""}
 
-        ${wk ? `<div class="wk">${esc(wk.what)}</div>` : ""}
         ${prline}
       </div>`;
   }

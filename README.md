@@ -147,6 +147,10 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico`
   renders it. Rerun that command after changing the icon.
   CI lints the Python there and the tests load it.
+- `.claude/skills/board-markers/` holds the skill stating what a session sets on GitHub
+  for the build board, and when: the `working:` labels, the `Board verdict:` comment
+  line, and the `Board order:` and `Board after:` body lines that `build_board.py`
+  reads.
 - `.github/workflows/board.yml` runs `build_board.py` and publishes the page, its
   icon and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its
   `on:` block lists what starts a run, and a submitted review starts none.

@@ -50,15 +50,27 @@ def issue(
     labels: tuple[str, ...] = ("enhancement",),
     blocked_by: tuple[dict[str, Any], ...] = (),
     sub_issues: tuple[int, int] = (0, 0),
+    body: str = "",
+    comments: tuple[str | tuple[str, str], ...] = (),
+    association: str = "OWNER",
 ) -> dict[str, Any]:
-    """An open issue as the issues query returns it. ``sub_issues`` is (total, completed)."""
+    """An open issue as the issues query returns it. ``sub_issues`` is (total, completed).
+
+    ``association`` is the issue author's ``authorAssociation``. Each comment is its
+    body, posted by the owner, or an ``(authorAssociation, body)`` pair, oldest first
+    as GitHub lists them.
+    """
+    notes = [("OWNER", c) if isinstance(c, str) else c for c in comments]
     return {
         "number": n,
         "title": title or f"Issue {n}",
+        "body": body,
+        "authorAssociation": association,
         "milestone": {"title": milestone} if milestone is not None else None,
         "labels": conn([{"name": x} for x in labels]),
         "blockedBy": conn(list(blocked_by)),
         "subIssuesSummary": {"total": sub_issues[0], "completed": sub_issues[1]},
+        "comments": {"nodes": [{"authorAssociation": a, "body": b} for a, b in notes]},
     }
 
 

@@ -42,6 +42,7 @@ from tests.support.board_github import (
     blocker,
     issue,
     load_generator,
+    pull,
 )
 from tests.support.board_page import icon_links
 
@@ -372,11 +373,9 @@ def _control() -> dict[str, Any]:
     """
     doc = board()
     doc["planned"] = [{"n": 1, "passes": 2, "ready": "build"}]
-    # A session with no `kind` reads as a decompose loop, so it may leave it out.
-    doc["working"] = [
-        {"n": 3, "kind": "plan", "what": "a decompose loop"},
-        {"n": 5, "what": "a loop with no kind"},
-    ]
+    # A session with no `kind` reads as a decompose loop, so it may leave it out. A
+    # session carries no `what`, because the label it comes from has none.
+    doc["working"] = [{"n": 3, "kind": "decompose"}, {"n": 5}]
     # Rounds writing the retired artifact board wrote `linked` as closing references.
     for pr, issue_n, state, linked in ((41, 1, "closed", True), (42, 3, "merged", [3])):
         doc["prs"].append(
@@ -447,8 +446,6 @@ REFUSED = {
     "updatedAt a number": _set("state.updatedAt", 1),
     "missing updatedAt": _set("state.updatedAt", DELETE),
     "working n a string": _set("working.0.n", "3"),
-    "working what a number": _set("working.0.what", 1),
-    "missing working what": _set("working.0.what", DELETE),
     "working kind a number": _set("working.0.kind", 1),
     "planned n a string": _set("planned.0.n", "1"),
     "missing planned n": _set("planned.0.n", DELETE),
@@ -599,6 +596,66 @@ def test_the_page_draws_every_card_the_generator_writes_when_nothing_is_ranked(
     assert note.startswith(
         "2 cards are free for a session to take today , out of 3 in the first column: #638, #812."
     )
+
+
+def _rank_chips(result: dict[str, Any]) -> dict[int, int]:
+    """Each drawn card's position in the priority order, read from its label."""
+    raw = result["ids"]["board"]["html"]
+    found = re.findall(r'aria-label="Issue (\d+)\.[^"]*? It is number (\d+) in the priority', raw)
+    return {int(n): int(pos) for n, pos in found}
+
+
+def test_an_order_of_zero_sorts_first(tmp_path: Path) -> None:
+    """The sort read ``a.order || 50``, which turned an order of 0 into 50."""
+    doc = _generated(
+        [issue(10, body="Board order: 1"), issue(11, body="Board order: 0"), issue(12)]
+    )
+    assert [(x["issue"], x["order"]) for x in doc["next"]] == [(10, 1), (11, 0)]
+    result = run_page(tmp_path, [served(doc)])
+    assert _rank_chips(result) == {11: 1, 10: 2}
+
+
+def test_the_page_draws_what_the_generator_writes(tmp_path: Path) -> None:
+    """The join between the two halves, with ``working``, ``planned`` and ``next`` filled.
+
+    A field the generator leaves out, or writes in a shape the page refuses, blanks the
+    board, and neither half's own tests would notice. A ``working`` entry carries no
+    ``what``, which the page used to require, so this is the test that covers that
+    join. Each card here lands somewhere different:
+
+    1. #20 carries ``working:build`` and has no branch, so it is under Building.
+    2. #21 carries ``working:decompose``, so it is under Being planned.
+    3. #22 has an owner verdict and nothing blocking it, so it is under Planned, no
+       builder.
+    4. #23 is ranked, with an order and an after line naming #24, so it stays in the
+       build order with its chip.
+    5. #24 is ranked behind it.
+    """
+    doc = _generated(
+        [
+            issue(20, labels=("working:build",)),
+            issue(21, labels=("working:decompose",)),
+            issue(22, comments=("## Plan audit, pass 3\n\nBoard verdict: build after 3 passes",)),
+            issue(23, body="Board order: 1\nBoard after: #24"),
+            issue(24, body="Board order: 2.5"),
+        ]
+    )
+    assert [w["n"] for w in doc["working"]] == [20, 21]
+    assert [p["n"] for p in doc["planned"]] == [22]
+    assert [x["issue"] for x in doc["next"]] == [23, 24]
+    result = run_page(tmp_path, [served(doc)])
+    assert hidden(result, "source"), text(result, "source")
+    assert text(result, "strip").startswith("5 open issues")
+    assert cards(result, "flow") == {20, 21, 22}
+    flow = text(result, "flow")
+    for heading in ("Building", "Being planned", "Planned, no builder"):
+        assert heading in flow
+    assert "plan complete, 3 passes" in flow
+    assert "A session is working it." in result["ids"]["flow"]["html"]
+    assert "undefined" not in json.dumps(result["ids"])
+    assert cards(result, "board") == {23, 24}
+    assert _rank_chips(result) == {23: 1, 24: 2}
+    assert "it should land after #24" in text(result, "board")
 
 
 def test_a_first_column_with_no_free_card_lists_none(tmp_path: Path) -> None:
@@ -899,3 +956,69 @@ def test_the_shipped_icon_is_exactly_what_the_renderer_draws() -> None:
     A grid, an ink or a size changed without regenerating the file fails here.
     """
     assert (SKILL / "favicon.ico").read_bytes() == favicon.render_board()
+
+
+def _held_doc() -> dict[str, Any]:
+    marker = {
+        "authorAssociation": "OWNER",
+        "body": "## Review complete",
+        "createdAt": "2026-10-12T13:00:00Z",
+    }
+    green = (
+        {
+            "__typename": "CheckRun",
+            "name": "test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "checkSuite": {"app": {"slug": "github-actions"}},
+        },
+    )
+    verdict = ("## Plan audit, pass 4\n\nBoard verdict: build after 4 passes",)
+    issues = [
+        issue(30, labels=("working:build",)),
+        issue(31, labels=("working:decompose",)),
+        issue(32, labels=("working:build",), comments=verdict),
+    ]
+    pulls = [
+        pull(40, closes=(30,), comments=(marker,), contexts=green),
+        pull(41, closes=(31,), comments=(marker,), contexts=green),
+    ]
+    now = datetime(2026, 10, 12, 17, 0, tzinfo=UTC)
+    return GENERATOR.build(FakeGitHub(issues, pulls), REPO, now)[0]
+
+
+def _columns(result: dict[str, Any]) -> dict[str, set[int]]:
+    raw = result["ids"]["flow"]["html"]
+    parts = re.split(r'<div class="col f-([a-z]+)">', raw)[1:]
+    return {
+        tone: {int(n) for n in re.findall(r'data-n="(\d+)"', body)}
+        for tone, body in zip(parts[::2], parts[1::2], strict=True)
+    }
+
+
+def test_a_build_session_keeps_a_handed_over_pull_request_from_the_owner(tmp_path: Path) -> None:
+    result = run_page(tmp_path, [served(_held_doc())])
+    cols = _columns(result)
+    assert cols["owner"] == {31}
+    assert cols["mine"] == {30}
+    assert cols["building"] == {32}
+    flow = result["ids"]["flow"]["html"]
+    card = flow[flow.index('data-n="32"') :]
+    assert "plan-build" not in flow and "4 passes" not in card
+    assert "re-measuring" not in json.dumps(result["ids"])
+
+
+def test_a_session_with_no_kind_is_a_decompose_loop(tmp_path: Path) -> None:
+    doc = _generated([issue(10), issue(11)])
+    doc = copy.deepcopy(doc)
+    doc["working"] = [{"n": 10}]
+    assert _columns(run_page(tmp_path, [served(doc)]))["planning"] == {10}
+
+
+def test_a_ranking_with_no_order_sorts_as_fifty(tmp_path: Path) -> None:
+    doc = copy.deepcopy(_generated([issue(10), issue(11)]))
+    doc["next"] = [
+        {"issue": 10, "band": 0, "ready": "plan"},
+        {"issue": 11, "band": 0, "order": 10, "ready": "plan"},
+    ]
+    assert _rank_chips(run_page(tmp_path, [served(doc)])) == {11: 1, 10: 2}
