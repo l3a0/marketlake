@@ -1134,6 +1134,8 @@ def test_uptime_grace_reads_the_assignment_and_skips_the_reads() -> None:
     )
     assert _uptime_grace(script) == timedelta(minutes=30)
     assert _uptime_grace("UPTIME_SECONDS=0\n") == timedelta(0)
+    # Not a whole number of minutes, so a read that rounds to minutes fails here.
+    assert _uptime_grace("UPTIME_SECONDS=3659\n") == timedelta(seconds=3659)
 
 
 @pytest.mark.parametrize(

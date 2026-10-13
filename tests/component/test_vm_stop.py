@@ -435,9 +435,10 @@ def test_less_than_an_hour_up_keeps_the_vm_up(vm):
 
 def test_check_2_compares_the_grace_the_schedule_bounds_read(vm):
     # test_infra_config's bounds read the grace from the script's one UPTIME_SECONDS line.
-    # The two cases above fix it at an hour, and an edit that moved check 2 to another
-    # value could move them with it. This case runs the script either side of the parsed
-    # value, so check 2 has to compare against the number the bounds read (#878).
+    # test_exactly_an_hour_up_is_enough and test_less_than_an_hour_up_keeps_the_vm_up fix
+    # it at an hour, and an edit that moved check 2 to another value could move them with
+    # it. This case runs the script one second short of the parsed value and at it, so
+    # check 2 has to compare against the number the bounds read (#878).
     grace = _uptime_grace(VM_STOP.read_text()) // timedelta(seconds=1)
     vm.uptime(f"{grace - 1}.99 100.00")
     proc = vm.run()
