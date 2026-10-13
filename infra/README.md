@@ -1594,9 +1594,15 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
 A merge to `main` reaches the VM only through a deploy, and a deploy at the wrong moment
 loses captured minutes for good. `deploy/vm-deploy.sh` moves the checkout forward to one
 commit on `main`, runs the bootstrap, and restarts the daemon only when that is owed and
-safe ([#676](https://github.com/l3a0/marketlake/issues/676)). Pass the full 40-digit sha
-of a commit on `main`. A pull request's page shows only 7 digits, so read the full sha of
-`main`'s tip from the VM.
+safe ([#676](https://github.com/l3a0/marketlake/issues/676)).
+
+Start the VM by hand first if it is stopped, as
+[Start a stopped instance](#start-a-stopped-instance) says. The stop then leaves it up for
+the deploy, because [The nightly stop](#the-nightly-stop)'s check 6 refuses while the
+deploy's unit runs or holds the deploy lock.
+
+Pass the full 40-digit sha of a commit on `main`. A pull request's page shows only 7
+digits, so read the full sha of `main`'s tip from the VM.
 
 ```bash
 git -C ~/marketlake ls-remote origin refs/heads/main | cut -f1
@@ -1864,9 +1870,8 @@ treats the error as retryable, such as throttling. A wrong trust, an input EC2 r
 Nothing pages on a failed start itself. Once
 [#868](https://github.com/l3a0/marketlake/issues/868)'s stop is live, a weekday start that
 leaves the VM stopped pages `vm-up` at about 07:50, and a Sunday one pages `sunday` at
-23:30, whose missed 20:00 job then replays at Monday's 07:30 boot. The section "When
-`vm-up` pages", which [PR #869](https://github.com/l3a0/marketlake/pull/869) adds to this
-file for [#868](https://github.com/l3a0/marketlake/issues/868), says what to do.
+23:30, whose missed 20:00 job then replays at Monday's 07:30 boot.
+[When `vm-up` pages](#when-vm-up-pages) says what to do.
 
 The schedules start the VM only at those two times. Before an apply or a deploy at any
 other time, start it by hand, as [Start a stopped instance](#start-a-stopped-instance)
@@ -1912,7 +1917,7 @@ disable is on purpose. Then approve its `infra` apply as [Replace the instance, 
 window](#replace-the-instance-and-the-approval-window) says. A disabled schedule stays in
 place and fires nothing until a later pull request sets its `state` back to `"ENABLED"`.
 Turn the stop off first, or the VM stops after its next day's work and nothing starts it
-again. [#868](https://github.com/l3a0/marketlake/issues/868) says how.
+again. [The nightly stop](#the-nightly-stop) says how.
 
 ### Find the VM's address
 
@@ -2003,11 +2008,10 @@ TZ=America/New_York journalctl -u marketlake-stop -b -1
 ```
 
 **Turn the stop on** only once the start schedule is applied, or nothing starts the VM
-again. The schedule is [#867](https://github.com/l3a0/marketlake/issues/867)'s, and its
-section, "The start schedule", arrives with
-[PR #870](https://github.com/l3a0/marketlake/pull/870). Wait until that section's
-CloudTrail check has shown the schedule's `StartInstances`. Then create the switch, and
-log out, since an open terminal holds the VM up.
+again. The schedule is [#867](https://github.com/l3a0/marketlake/issues/867)'s. Wait until
+[Read the starts in CloudTrail](#read-the-starts-in-cloudtrail) has shown the schedule's
+`StartInstances`. Then create the switch, and log out, since an open terminal holds the
+VM up.
 
 ```bash
 sudo touch /etc/marketlake/stop-when-idle

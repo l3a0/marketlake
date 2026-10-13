@@ -22,7 +22,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from lake import bucket
+from lake import bucket, report
 from lake import compact as compact_module
 from lake.alert import Publisher
 from lake.bucket import BucketBackup, first_upload, nightly_upload, restore_lake
@@ -740,6 +740,11 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
     this is the one run of the real trim into the real restore. Mutation this catches: a trim
     line the rebuild's exclusion does not read as a designed absence, such as one recording the
     wrong sha or the wrong partition, which would bring every trimmed partition back.
+
+    It also dates the trim's real ledger lines for marketlake #796. Close-guard reports filed on
+    the newest trimmed day, the day after it and the trim's edge go up with the next night's
+    upload, and only the first is left out. The edge is eight days past the newest trimmed day,
+    so a cutoff taken from the edge would leave out all three.
     """
     tickers = ("QQQ", "SPY")
     client = _lake(lake_root, tickers=tickers)
@@ -747,6 +752,12 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
     assert result.trim is not None
     gone = {_rel(ticker, day) for ticker in tickers for day in OLD}
     assert set(result.trim.trimmed) == gone
+    guards = {}
+    for day in (OLD[-1], OLD[-1] + timedelta(days=1), EDGE):
+        path = report.close_guard_dir(lake_root, day) / "162000000000-4242.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"report": true}\n')
+        guards[day] = path.relative_to(lake_root).as_posix()
     with lake_lock(lake_root):
         nightly_upload(
             lake_root,
@@ -766,6 +777,11 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
     assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
     assert windowed.trimmed_left_out == len(gone)
     assert _chains_files(tmp_path / "windowed") == kept
+    assert windowed.reports_left_out == 1
+    assert not (tmp_path / "windowed" / guards[OLD[-1]]).exists()
+    assert (tmp_path / "windowed" / guards[OLD[-1] + timedelta(days=1)]).is_file()
+    assert (tmp_path / "windowed" / guards[EDGE]).is_file()
+    assert all((tmp_path / "whole" / rel).is_file() for rel in guards.values())
     assert (whole.restored, whole.failures) == (True, [])
     restored = _chains_files(tmp_path / "whole")
     assert set(restored) == set(kept) | gone

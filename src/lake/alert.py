@@ -50,7 +50,7 @@ from typing import Protocol, runtime_checkable
 
 from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
-from lake.paths import LakePaths
+from lake.paths import ALERTS_DIR, REPORTS_DIR, LakePaths
 
 # The design's cap on pages a day. The forty-first is written down and never sent, so a
 # storm cannot empty the phone's attention for the one page that matters.
@@ -233,7 +233,9 @@ class Publisher:
         the title is what the refusal objected to.
         """
         eastern = now.astimezone(MARKET_TZ)
-        directory = self._paths.root / "reports" / "alerts" / f"date={eastern.date().isoformat()}"
+        directory = (
+            self._paths.root / REPORTS_DIR / ALERTS_DIR / f"date={eastern.date().isoformat()}"
+        )
         entry = {
             "at": eastern.isoformat(),
             "event": message.event,
@@ -296,7 +298,9 @@ def undelivered(lake_root: Path | str, day: date) -> int:
     Counted from the filesystem rather than queried, because the ordinary day has none
     and a SQL read over an empty glob raises rather than returning zero.
     """
-    directory = LakePaths(Path(lake_root)).root / "reports" / "alerts" / f"date={day.isoformat()}"
+    directory = (
+        LakePaths(Path(lake_root)).root / REPORTS_DIR / ALERTS_DIR / f"date={day.isoformat()}"
+    )
     if not directory.is_dir():
         return 0
     return len(list(directory.glob("*.json")))

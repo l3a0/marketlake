@@ -193,6 +193,18 @@ def test_the_history_width_matches_the_dashboards():
     assert window.HISTORY_WINDOW_DAYS == dashboard.HISTORY_WINDOW_DAYS
 
 
+def test_the_floor_keeps_more_nightly_files_than_the_history_panel_reads():
+    """A rebuilt lake keeps one nightly report per night after its newest trimmed day.
+
+    Marketlake #796. The History panel reads the last ``HISTORY_REPORTS`` nightly files and
+    needs one older still, or it calls the oldest the first the sweep ever filed. The floor is
+    the fewest sessions a trimmed lake keeps, so it has to exceed that count.
+    """
+    from lake import dashboard, window
+
+    assert window.window_floor(GuardConstants()) > dashboard.HISTORY_REPORTS
+
+
 def test_the_window_module_does_not_import_the_dashboard():
     """The render and the sweep load ``lake.window``, and DuckDB is about 17.5 MiB of import."""
     import subprocess
