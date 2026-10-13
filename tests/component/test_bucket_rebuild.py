@@ -16,8 +16,10 @@ the journal reserve free. The cases follow the issue's Verification list.
 5. A designed absence the bucket lost is named and fails nothing, while a restored partition the
    bucket lost still fails.
 6. The journal reserve refuses a destination that holds the plan and not the reserve.
-7. Marketlake #796: the exclusion also leaves out each report whose path names the night it was
-   written, on or before the newest trimmed day, and keeps every other report.
+7. Marketlake #796: the exclusion also leaves out each report whose path names a day the lake's
+   own run reported on, on or before the newest trimmed day, and keeps every other report. The
+   newest designed absence sets that day wherever the ledger lists it, and a designed absence
+   the bucket lost still sets it.
 
 The bucket is built by the real ``first_upload``, then the range restore tests' ``_trim_away``,
 then the real ``nightly_upload``, in that order, so it holds what an uploaded trimmed lake
@@ -64,13 +66,14 @@ D1 = date(2026, 8, 24)
 D2 = date(2026, 8, 25)
 D3 = date(2026, 8, 26)
 SPY_0 = "chains/ticker=SPY/date=2026-08-20.parquet"
+SPY_M1 = "chains/ticker=SPY/date=2026-08-19.parquet"
 SPY_1 = "chains/ticker=SPY/date=2026-08-24.parquet"
 SPY_2 = "chains/ticker=SPY/date=2026-08-25.parquet"
 SPY_3 = "chains/ticker=SPY/date=2026-08-26.parquet"
 QUOTES_1 = "quotes/ticker=SPY/date=2026-08-24.parquet"
 # A dated report, which counts toward its day's sealed bytes as it does on the lake. Its date is
-# the ticker-day a finding was about rather than the night it was written, so a rebuild keeps it
-# although it falls on the newest trimmed day.
+# the ticker-day a finding was about rather than a day the lake's own run reported on, so a
+# rebuild keeps it although it falls on the newest trimmed day.
 REPORT = "reports/withheld/date=2026-08-24/run.json"
 # A day compaction refused: its segment is manifested and no compacted partition exists, so the
 # segment is that day's only copy.
@@ -130,7 +133,7 @@ class Trimmed:
         self.spy_1 = spy_1
 
 
-def _trimmed_bucket(tmp_path: Path, *, older: bool = False) -> Trimmed:
+def _trimmed_bucket(tmp_path: Path, *, older: bool = False, trailing: bool = False) -> Trimmed:
     """A bucket holding a trimmed ledger, built in the order the issue names.
 
     1. The real ``first_upload`` seeds the bucket with five partitions, a report, and a refused
@@ -147,6 +150,8 @@ def _trimmed_bucket(tmp_path: Path, *, older: bool = False) -> Trimmed:
     lake = FixtureLake(tmp_path / "lake")
     if older:
         lake = lake.with_chains("SPY", D0)
+    if trailing:
+        lake = lake.with_chains("SPY", date(2026, 8, 19))
     lake = (
         lake.with_chains("SPY", D1)
         .with_chains("SPY", D2)
@@ -167,6 +172,8 @@ def _trimmed_bucket(tmp_path: Path, *, older: bool = False) -> Trimmed:
     if older:
         _trim_away(root, client, SPY_0)
     _trim_away(root, client, SPY_1)
+    if trailing:
+        _trim_away(root, client, SPY_M1)
     _trim_away(root, client, SPY_3, unlink=False)
     with lake_lock(root):
         append_trimmed(
@@ -1013,3 +1020,34 @@ def test_reports_dated_by_ticker_day_and_names_that_do_not_parse_are_kept(tmp_pa
     assert summary.restored is True
     assert _files(dest) == {**lake.uploaded, **bodies}
     assert summary.reports_left_out == 0
+
+
+def test_the_newest_designed_absence_sets_the_day_wherever_the_ledger_lists_it(tmp_path):
+    # Ledger order is D0, D1, then 2026-08-19. Oldest, first and last each miss D1.
+    lake = _trimmed_bucket(tmp_path, older=True, trailing=True)
+    reports = (_close_guard(BETWEEN), _nightly(D1))
+    _stored(lake.client, *reports)
+    dest = tmp_path / "restored"
+
+    summary = restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    assert summary.restored is True
+    assert summary.trimmed_left_out == 3
+    assert not any((dest / rel).exists() for rel in reports)
+    assert summary.reports_left_out == 2
+    assert "2 report(s) filed on or before the newest trimmed day left out" in summary.render()
+
+
+def test_a_designed_absence_the_bucket_lost_still_sets_the_day(tmp_path):
+    lake = _trimmed_bucket(tmp_path)
+    del lake.client.objects[f"lake/{SPY_1}"]
+    on = _close_guard(D1)
+    _stored(lake.client, on)
+    dest = tmp_path / "restored"
+
+    summary = restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    assert summary.restored is True
+    assert summary.trimmed_lost == [SPY_1]
+    assert not (dest / on).exists()
+    assert summary.reports_left_out == 1

@@ -562,6 +562,13 @@ def test_the_nightly_name_parses_back_to_its_day_and_a_near_miss_does_not(lake_r
     assert report.parse_nightly_name(f"{DAY.isoformat()}-notes.json") is None
     assert report.parse_nightly_name(f"{DAY.isoformat()}-162000000000-11.json.tmp") is None
     assert report.parse_nightly_name("2026-02-30-162000000000-11.json") is None
+    for near_miss in (
+        "2026-09-02-16200000000-11.json",
+        "2026-09-02-162000000000-.json",
+        "2026-09-02-162000000000-11xjson",
+        "2026-W36-3-162000000000-11.json",
+    ):
+        assert report.parse_nightly_name(near_miss) is None, near_miss
 
 
 def test_the_nightly_file_carries_every_count_and_the_detail_the_digest_drops(lake_root):

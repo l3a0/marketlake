@@ -695,8 +695,8 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
 
     It also dates the trim's real ledger lines for marketlake #796. Close-guard reports filed on
     the newest trimmed day, the day after it and the trim's edge go up with the next night's
-    upload, and only the first is left out. The edge is a week past the newest trimmed day, so a
-    cutoff taken from the edge would leave out all three.
+    upload, and only the first is left out. The edge is eight days past the newest trimmed day,
+    so a cutoff taken from the edge would leave out all three.
     """
     tickers = ("QQQ", "SPY")
     client = _lake(lake_root, tickers=tickers)

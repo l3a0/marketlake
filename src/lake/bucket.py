@@ -2744,8 +2744,8 @@ def restore_lake(
        written and is named as a failure. A manifested file the bucket does not hold is a
        failure named missing, unless it is a designed absence being skipped. That one is
        named in ``trimmed_lost`` and fails nothing, since the rebuilt lake never needed it.
-       When skipping designed absences, each report whose key names the night it was written
-       is left out too when that night is on or before the newest trimmed day, by
+       When skipping designed absences, each report whose key names a day the lake's own run
+       reported on is left out too when that day is on or before the newest trimmed day, by
        :func:`_report_night`. That day is the newest one among the designed absences, by
        :func:`_newest_trimmed_day`, and with none every report is restored.
     4. The free space on the destination's filesystem must cover every planned byte not
@@ -2880,17 +2880,19 @@ def _newest_trimmed_day(
     return max(days, default=None)
 
 
-# The two ``reports/`` subdirectories whose ``date=D`` names the night the file was written.
+# The two ``reports/`` subdirectories whose ``date=D`` names a day the lake's own run reported
+# on: the session day the close guard ran for, and the Eastern date a page failed to send.
 # ``withheld/``, ``schema_drift/`` and ``damaged_segments/`` name the ticker-day whose rows
 # produced the finding instead, which can precede the lake's first session by months.
 _NIGHT_KEYED_REPORT_DIRS = frozenset({CLOSE_GUARD_DIR, ALERTS_DIR})
 
 
 def _report_night(rel: str) -> date | None:
-    """The night a report key says its file was written, or None when it says no such night.
+    """The day of the lake's own run a report key names, or None when it names no such day.
 
-    Three producers key the path on that night: the sweep's nightly file at the root of
-    ``reports/``, read by ``report.parse_nightly_name``, and the files under
+    Three producers key the path on that day: the sweep's nightly file at the root of
+    ``reports/``, named by the day the sweep reported on and read by
+    ``report.parse_nightly_name``, and the files under
     ``reports/close_guard/date=D/`` and ``reports/alerts/date=D/``, read by
     ``paths.parse_date_dir``. Every other key answers None and a rebuild keeps it, including
     the three ticker-day subtrees, a root name that does not parse and a malformed ``date=``
@@ -5043,7 +5045,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Download the bucket's current versions into an empty directory and verify them. "
             "On a host whose config sets lake_window_sessions, leave out each partition the "
-            "bucket's trimmed.jsonl says was removed on purpose."
+            "bucket's trimmed.jsonl says was removed on purpose, and each report dated by the "
+            "lake's own run on or before the newest such day."
         ),
     )
     restore.add_argument(
