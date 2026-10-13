@@ -1344,28 +1344,34 @@ def test_a_walk_refuses_the_whole_os_error_class_and_never_an_ordinary_bug(
         _run(root)
 
 
+@pytest.mark.parametrize("frozen", [2, 0])
 def test_the_dividend_walks_frozen_count_reaches_the_file_the_digest_and_the_block(
-    fixture_lake: FixtureLake, monkeypatch
+    fixture_lake: FixtureLake, monkeypatch, frozen: int
 ):
     """Marketlake #794. On a trimmed lake a run that re-met every key reads zero appended,
     held, unchanged and skipped, and ``frozen`` is what tells it from a run that read nothing.
-    Mutation this catches: the dividend piece reduced without its ``frozen``."""
+    A count of zero still prints, because only the walks that carry no count leave it out.
+    Mutations this catches: the dividend piece reduced without its ``frozen``, and the digest
+    or the block testing the count for truth rather than for ``None``."""
     from lake.actions import ExtractionReport
 
     root = _lake(fixture_lake)
     report_out = ExtractionReport(
-        ticker_days=3, appended=(), held=(), unchanged=0, skipped=(), frozen=2
+        ticker_days=3, appended=(), held=(), unchanged=0, skipped=(), frozen=frozen
     )
     monkeypatch.setattr(sweep, "extract_dividends", lambda **kwargs: report_out)
 
     outcome, _, _ = _run(root)
 
     dividends = dict(outcome.nightly.pieces)["dividends"]
-    assert dividends.frozen == 2
-    assert "dividends: landed 0, held 0, unchanged 0, skipped 0, frozen 2" in outcome.digest.body
-    assert "dividends: landed 0 held 0 unchanged 0 skipped 0 frozen 2" in outcome.render()
+    assert dividends.frozen == frozen
+    assert (
+        f"dividends: landed 0, held 0, unchanged 0, skipped 0, frozen {frozen}"
+        in outcome.digest.body
+    )
+    assert f"dividends: landed 0 held 0 unchanged 0 skipped 0 frozen {frozen}" in outcome.render()
     (filed,) = _filed(root)
-    assert filed["pieces"]["dividends"]["frozen"] == 2
+    assert filed["pieces"]["dividends"]["frozen"] == frozen
     # The other walks print no frozen count of their own.
     assert "splits: landed" in outcome.digest.body
     for line in outcome.digest.body.splitlines():

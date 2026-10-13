@@ -47,6 +47,7 @@ from lake.actions import (
     REASON_PARTITION_ABSENT,
     REASON_QUARANTINED,
     TYPE_DIVIDEND,
+    TYPE_SPLIT,
     check_dividend_consistency,
     extract_dividends,
 )
@@ -1838,6 +1839,58 @@ def test_the_seed_counts_an_instrument_seen_only_after_its_trimmed_day(
     assert result.appended == ()
     assert (result.unchanged, result.frozen) == (1, 0)
     assert _entries(root) == before
+
+
+def test_a_split_recorded_on_a_trimmed_day_does_not_seed_seen(fixture_lake: FixtureLake):
+    """``seen`` means the lake watched the instrument carrying a dividend. A split entry says
+    nothing about that, so SPY's first dividend on the 15th is still ``vendor_reported``, as a
+    walk of the whole lake lands it. Mutation this catches: the seed reading every entry type,
+    which lands it ``observed``."""
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE, ex_date=None)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO)],
+        },
+    )
+    actions.append(
+        root,
+        instrument_id=1,
+        observed_on=DAY_ONE,
+        recorded_at=FIRST_NIGHT,
+        ex_date="2026-09-14",
+        type=TYPE_SPLIT,
+        split_ratio=2.0,
+        provenance=PROVENANCE_OBSERVED,
+    )
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    (landed,) = result.appended
+    assert landed.entry["observed_on"] == DAY_TWO.isoformat()
+    assert landed.entry["provenance"] == PROVENANCE_VENDOR_REPORTED
+
+
+def test_a_lost_first_day_with_no_trim_line_neither_freezes_nor_passes_over(
+    fixture_lake: FixtureLake,
+):
+    """A file gone with no trim line beside it was lost, not trimmed, so its key is not frozen
+    and the day is counted as a skip. Mutation this catches: the trimmed check without its
+    trimmed-ledger test, which reads every missing file as trimmed and freezes the key."""
+    root = _lake(
+        fixture_lake,
+        {("SPY", day): [_row(day)] for day in (DAY_ONE, DAY_TWO)},
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    (root / _qrel("SPY", DAY_ONE)).unlink()
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.frozen == 0
+    assert [(skip.ticker, skip.day, skip.reason) for skip in result.skipped] == [
+        ("SPY", DAY_ONE, REASON_PARTITION_ABSENT)
+    ]
 
 
 @pytest.mark.parametrize(

@@ -549,6 +549,19 @@ def test_a_quotes_directory_left_empty_goes_on_a_host_with_a_ledger(lake_root):
     assert result.pruned == ("quotes/ticker=IWM",)
 
 
+def test_the_pass_reaches_quotes_on_a_lake_with_no_chains_directory(lake_root):
+    """Marketlake #794. A lake with no ``chains/`` cannot be listed there, and that surface's
+    error must not end the scan. Mutation this catches: the listing's ``continue`` turned into
+    ``break``, which never reaches ``quotes/``."""
+    _ledger(lake_root)
+    left = lake_root / "quotes" / "ticker=IWM"
+    left.mkdir(parents=True)
+    assert not (lake_root / "chains").exists()
+
+    assert compact_module._prune_trimmed_tickers(lake_root) == ("quotes/ticker=IWM",)
+    assert not left.exists()
+
+
 def _empty_ticker(root: Path) -> Path:
     path = root / "chains" / "ticker=IWM"
     path.mkdir(parents=True)
