@@ -7,8 +7,8 @@ restores the whole lake. Every ``restore`` that downloads also checks that the d
 the journal reserve free. The cases follow the issue's Verification list.
 
 1. The exclusion restores everything but the designed absences, a refused day's journal
-   segments and ``reports/`` included, and restores a partition trimmed on the volume after the
-   bucket's ledger last uploaded.
+   segments and a report under ``reports/withheld/`` included, and restores a partition trimmed
+   on the volume after the bucket's ledger last uploaded.
 2. With no ledger entry in the bucket's manifest, the exclusion restores everything.
 3. A ledger that is missing, damaged or mismatched refuses before any download, and the
    mismatch leaves the working directory the README's repair needs.
@@ -16,6 +16,8 @@ the journal reserve free. The cases follow the issue's Verification list.
 5. A designed absence the bucket lost is named and fails nothing, while a restored partition the
    bucket lost still fails.
 6. The journal reserve refuses a destination that holds the plan and not the reserve.
+7. Marketlake #796: the exclusion also leaves out each report whose path names the night it was
+   written, on or before the newest trimmed day, and keeps every other report.
 
 The bucket is built by the real ``first_upload``, then the range restore tests' ``_trim_away``,
 then the real ``nightly_upload``, in that order, so it holds what an uploaded trimmed lake
@@ -34,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import bucket
+from lake import bucket, report
 from lake.bucket import (
     BucketLedgerMismatch,
     BucketRefusal,
@@ -57,15 +59,19 @@ from tests.support.config import write_config
 from tests.support.lake import FixtureLake, sample_chains_table
 
 TARGET = BucketTarget(bucket="lake-backup", prefix="lake")
+D0 = date(2026, 8, 20)
 D1 = date(2026, 8, 24)
 D2 = date(2026, 8, 25)
 D3 = date(2026, 8, 26)
+SPY_0 = "chains/ticker=SPY/date=2026-08-20.parquet"
 SPY_1 = "chains/ticker=SPY/date=2026-08-24.parquet"
 SPY_2 = "chains/ticker=SPY/date=2026-08-25.parquet"
 SPY_3 = "chains/ticker=SPY/date=2026-08-26.parquet"
 QUOTES_1 = "quotes/ticker=SPY/date=2026-08-24.parquet"
-# A dated report, which counts toward its day's sealed bytes as it does on the lake.
-REPORT = "reports/close_guard/date=2026-08-24/run.json"
+# A dated report, which counts toward its day's sealed bytes as it does on the lake. Its date is
+# the ticker-day a finding was about rather than the night it was written, so a rebuild keeps it
+# although it falls on the newest trimmed day.
+REPORT = "reports/withheld/date=2026-08-24/run.json"
 # A day compaction refused: its segment is manifested and no compacted partition exists, so the
 # segment is that day's only copy.
 SEGMENT = "journal/date=2026-08-27/surface=chains/ticker=SPY/seg-20260827T133000Z-4242.arrows"
@@ -124,7 +130,7 @@ class Trimmed:
         self.spy_1 = spy_1
 
 
-def _trimmed_bucket(tmp_path: Path) -> Trimmed:
+def _trimmed_bucket(tmp_path: Path, *, older: bool = False) -> Trimmed:
     """A bucket holding a trimmed ledger, built in the order the issue names.
 
     1. The real ``first_upload`` seeds the bucket with five partitions, a report, and a refused
@@ -134,10 +140,15 @@ def _trimmed_bucket(tmp_path: Path) -> Trimmed:
        and it stays present.
     3. The real ``nightly_upload`` carries the ledger and the manifest into the bucket.
     4. The volume then trims SPY_2, which the bucket's ledger never hears about.
+
+    ``older`` adds SPY_0 on D0 and trims it before SPY_1, so the bucket's ledger holds a second
+    designed absence, older than the first and listed ahead of it.
     """
+    lake = FixtureLake(tmp_path / "lake")
+    if older:
+        lake = lake.with_chains("SPY", D0)
     lake = (
-        FixtureLake(tmp_path / "lake")
-        .with_chains("SPY", D1)
+        lake.with_chains("SPY", D1)
         .with_chains("SPY", D2)
         .with_chains("SPY", D3)
         .with_quotes("SPY", D1)
@@ -153,6 +164,8 @@ def _trimmed_bucket(tmp_path: Path) -> Trimmed:
     first_upload(root, TARGET, client=client, clock=ManualClock(FRIDAY_19), calendar=CALENDAR)
     spy_1 = (root / SPY_1).read_bytes()
 
+    if older:
+        _trim_away(root, client, SPY_0)
     _trim_away(root, client, SPY_1)
     _trim_away(root, client, SPY_3, unlink=False)
     with lake_lock(root):
@@ -896,3 +909,107 @@ def test_the_reserve_line_puts_each_figure_in_its_own_place(windowed, tail):
         "holding /lake has 10.0 MB free, 8.0 MB short of the reserve, so nothing was restored. "
         "Free that much or use a larger filesystem" + tail
     )
+
+
+# -- 7. old night-keyed reports ------------------------------------------------------
+
+# The day after the fixture's newest trimmed day, D1. SPY_3's restore line on D3 is the newest
+# day in the bucket's ledger, so a day read from the ledger without asking which lines are
+# designed absences lands two days past D1 and cuts this one too.
+AFTER = date(2026, 8, 25)
+BETWEEN = date(2026, 8, 21)
+
+
+def _nightly(day: date) -> str:
+    """The key of a nightly report file about ``day``, named by the sweep's own writer."""
+    return f"reports/{report.nightly_path(Path('.'), day, stamp='200000123456', pid=4242).name}"
+
+
+def _close_guard(day: date) -> str:
+    return f"reports/close_guard/date={day.isoformat()}/162000000000-4242.json"
+
+
+def _alert(day: date) -> str:
+    return f"reports/alerts/date={day.isoformat()}/093000000000-4242-0.json"
+
+
+def _stored(client: FakeS3, *rels: str) -> dict[str, bytes]:
+    """Each report put in the bucket as an upload puts it, with S3's checksum, and its bytes."""
+    bodies = {rel: f'{{"report": "{rel}"}}\n'.encode() for rel in rels}
+    for rel, body in bodies.items():
+        client.store(f"lake/{rel}", body)
+    return bodies
+
+
+@pytest.mark.parametrize(
+    "key", [_nightly, _close_guard, _alert], ids=["nightly", "close-guard", "alerts"]
+)
+def test_a_night_keyed_report_on_the_newest_trimmed_day_is_left_out_and_the_next_kept(
+    tmp_path, key
+):
+    lake = _trimmed_bucket(tmp_path)
+    on, after = key(D1), key(AFTER)
+    bodies = _stored(lake.client, on, after)
+    dest = tmp_path / "restored"
+
+    summary = restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    assert summary.restored is True
+    assert summary.failures == []
+    assert _files(dest) == {**lake.uploaded, after: bodies[after]}
+    assert f"lake/{on}" not in _gets(lake.client)
+    assert summary.reports_left_out == 1
+    assert summary.trimmed_left_out == 1
+    assert summary.render().endswith(
+        "already verified in the working directory, 1 partition(s) trimmed on purpose left "
+        "out, 1 report(s) filed on or before the newest trimmed day left out, 0 compacted "
+        "journal segment(s) left out"
+    )
+
+
+def test_a_whole_lake_restore_brings_every_report_back(tmp_path):
+    lake = _trimmed_bucket(tmp_path)
+    bodies = _stored(lake.client, _nightly(D1), _close_guard(D1), _alert(D1))
+
+    summary = restore_lake(tmp_path / "restored", TARGET, client=lake.client)
+
+    assert _files(tmp_path / "restored") == {**lake.uploaded, SPY_1: lake.spy_1, **bodies}
+    assert summary.reports_left_out == 0
+    assert "report(s)" not in summary.render()
+
+
+def test_the_newest_of_two_designed_absences_sets_the_day(tmp_path):
+    # SPY_0 on D0 is the older designed absence and is listed first, so taking the oldest, or
+    # the first one found, would keep the report filed between the two days.
+    lake = _trimmed_bucket(tmp_path, older=True)
+    between = _close_guard(BETWEEN)
+    _stored(lake.client, between)
+    dest = tmp_path / "restored"
+
+    summary = restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    assert summary.restored is True
+    assert summary.trimmed_left_out == 2
+    assert not (dest / SPY_0).exists() and not (dest / SPY_1).exists()
+    assert not (dest / between).exists()
+    assert summary.reports_left_out == 1
+
+
+def test_reports_dated_by_ticker_day_and_names_that_do_not_parse_are_kept(tmp_path):
+    # Each is dated on or before the newest trimmed day. The three subtrees name the ticker-day
+    # a finding was about, and the root name starts with a real date but is not a nightly name.
+    lake = _trimmed_bucket(tmp_path)
+    kept = (
+        "reports/withheld/date=2026-08-20/093000000000-4242-SPY-0.json",
+        "reports/schema_drift/date=2026-08-24/093000000000-4242.json",
+        "reports/damaged_segments/date=2026-08-24/093000000000-4242.json",
+        "reports/2026-08-24-notes.json",
+    )
+    bodies = _stored(lake.client, *kept)
+    dest = tmp_path / "restored"
+
+    summary = restore_lake(dest, TARGET, client=lake.client, skip_designed_absences=True)
+
+    assert summary.restored is True
+    assert _files(dest) == {**lake.uploaded, **bodies}
+    assert summary.reports_left_out == 0

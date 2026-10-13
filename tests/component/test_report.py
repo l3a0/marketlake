@@ -549,6 +549,21 @@ def test_the_nightly_file_lands_at_the_tree_root_and_no_glob_of_a_producer_finds
     assert list(report.close_guard_dir(lake_root, DAY).glob("*.json")) == []
 
 
+def test_the_nightly_name_parses_back_to_its_day_and_a_near_miss_does_not(lake_root):
+    """A rebuild of a trimmed lake dates root nightly files by this parser (marketlake #796).
+
+    Without the round trip, a parser that refused every real name would keep every nightly
+    file, which looks safe and bounds nothing. The near misses each start with a real date, so
+    a parser that read only the first ten characters would accept them.
+    """
+    path = report.write_nightly(lake_root, NIGHT, now=AT, pid=11)
+
+    assert report.parse_nightly_name(path.name) == DAY
+    assert report.parse_nightly_name(f"{DAY.isoformat()}-notes.json") is None
+    assert report.parse_nightly_name(f"{DAY.isoformat()}-162000000000-11.json.tmp") is None
+    assert report.parse_nightly_name("2026-02-30-162000000000-11.json") is None
+
+
 def test_the_nightly_file_carries_every_count_and_the_detail_the_digest_drops(lake_root):
     """The fields are named here so the History panel's query is not inventing them."""
     report.write_nightly(lake_root, NIGHT, now=AT, pid=11)

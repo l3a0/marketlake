@@ -120,6 +120,10 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
+# The subdirectory of ``reports/`` that ``lake.alert`` files each undelivered page under, as
+# ``reports/alerts/date=D/`` keyed on the Eastern date the page failed. A rebuild of a trimmed
+# lake reads the name too, to date what it leaves out (marketlake #796).
+ALERTS_DIR = "alerts"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
@@ -571,6 +575,7 @@ def default_token_path(home: str | Path | None = None) -> Path:
 
 __all__ = [
     "ACTIONS",
+    "ALERTS_DIR",
     "BARS",
     "CHAINS",
     "CHAIN_PLAN_FILE",
