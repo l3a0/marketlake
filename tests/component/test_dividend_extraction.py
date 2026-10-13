@@ -1777,6 +1777,69 @@ def test_the_seed_follows_the_walk_order_across_a_rename(fixture_lake: FixtureLa
     assert _entries(root) == before
 
 
+def test_the_seed_starts_from_the_earliest_trimmed_day(fixture_lake: FixtureLake):
+    """SPY's keys were first observed on the 14th and the 16th, and both days are trimmed while
+    the 15th between them is kept. A walk of the whole lake had seen SPY on the 14th by the
+    15th, so the 15th's key stays ``observed``. Mutation this catches: the seed keeping the
+    latest trimmed day rather than the earliest, which appends the 15th's key again as
+    ``vendor_reported``."""
+    third = "2026-12-17T00:00:00Z"
+    root = _lake(
+        fixture_lake,
+        {
+            ("SPY", DAY_ONE): [_row(DAY_ONE)],
+            ("SPY", DAY_TWO): [_row(DAY_TWO, **_next())],
+            ("SPY", DAY_THREE): [_row(DAY_THREE, ex_date=third)],
+            ("SPY", DAY_FOUR): [_row(DAY_FOUR, ex_date=third)],
+        },
+    )
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+    assert [(e["observed_on"], e["provenance"]) for e in before] == [
+        (DAY_ONE.isoformat(), PROVENANCE_VENDOR_REPORTED),
+        (DAY_TWO.isoformat(), PROVENANCE_OBSERVED),
+        (DAY_THREE.isoformat(), PROVENANCE_OBSERVED),
+    ]
+    _trim_day(root, "SPY", DAY_THREE)
+    _trim_day(root, "SPY", DAY_ONE)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.appended == ()
+    assert (result.unchanged, result.frozen) == (1, 1)
+    assert _entries(root) == before
+
+
+def test_the_seed_counts_an_instrument_seen_only_after_its_trimmed_day(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """A hand-run ``restore_range`` that lands after the seed puts the 14th back where the walk
+    then reads it, which is #794's difference 6. At the 14th itself a walk of the whole lake has
+    not yet seen SPY, so the key stays ``vendor_reported``. Mutation this catches: the seed
+    counting SPY as seen at its trimmed day rather than strictly after it, which appends the
+    key again as ``observed``."""
+    root = _lake(fixture_lake, {("SPY", DAY_ONE): [_row(DAY_ONE)]})
+    extract_dividends(lake_root=root, clock=ManualClock(FIRST_NIGHT))
+    before = _entries(root)
+    path = root / _qrel("SPY", DAY_ONE)
+    saved = path.read_bytes()
+    _trim_day(root, "SPY", DAY_ONE)
+    real_by_ticker = actions.by_ticker
+
+    def restored_after_the_seed(ticker_days):
+        # The walk starts here, after the seed read the 14th as trimmed.
+        path.write_bytes(saved)
+        return real_by_ticker(ticker_days)
+
+    monkeypatch.setattr(actions, "by_ticker", restored_after_the_seed)
+
+    result = extract_dividends(lake_root=root, clock=ManualClock(SECOND_NIGHT))
+
+    assert result.appended == ()
+    assert (result.unchanged, result.frozen) == (1, 0)
+    assert _entries(root) == before
+
+
 @pytest.mark.parametrize(
     "payload",
     [
