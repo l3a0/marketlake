@@ -9,9 +9,8 @@
 # No tracked file may name that bucket, and this one may not set backup_target.
 #
 # #638's cutover flipped `role` to primary here, in its own pull request. The way back's
-# rehearsal sets it to shadow while the laptop runs one session as primary, and the deploy
-# of this change restarts the VM's daemon before the laptop daemon starts. A second pull
-# request sets it back to primary once the VM's resync has run.
+# rehearsal set it to shadow while the laptop ran one session as primary, and its return set
+# it to primary again once the VM's resync had run and the laptop was a shadow again.
 #
 # `lake_root` is the lake volume's mount point. It changes only with a replacement of the
 # instance, because a kept instance's fstab line would still name the old path.
@@ -26,7 +25,7 @@
 # the restore rebuilds this trimmed lake from the bucket, #785. Removing the key stops the
 # checkpoint and the trim, and makes the restore bring back the whole lake, which outgrows the
 # volume as the lake grows.
-role: shadow
+role: primary
 lake_root: /srv/marketlake
 token_store: store
 bucket_credentials: instance_profile
