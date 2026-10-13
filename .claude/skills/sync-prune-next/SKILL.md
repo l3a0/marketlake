@@ -688,3 +688,30 @@ Collect candidates from three places, and give the evidence for each one.
 Link every issue and pull request number, as `[#NN](...)` for an issue and
 `[PR #NN](...)` for a pull request. Say which candidates only the owner can act
 on, and which a new session can start without them.
+
+### Post the cost totals a merge left owed
+
+`CLAUDE.md`'s "Cost on the issue" section has the session that hands over work
+post a `## Cost` comment on its issue, and has a `## Cost total` posted once
+the issue closes. A merge that closes an issue leaves nobody to post the total,
+so the round posts it. This prints each issue closed in the last 14 days that
+has a `## Cost` comment newer than its newest `## Cost total`, or no total at
+all.
+
+```bash
+since=$(date -v-14d +%Y-%m-%d)
+gh issue list --repo l3a0/marketlake --state closed --limit 1000 --search "closed:>=$since" --json number,comments --jq '.[] | ([.comments[] | select(.body | test("\\A## Cost\\r?\\n")) | .createdAt] | max) as $c | ([.comments[] | select(.body | test("\\A## Cost total\\r?(\\n|\\z)")) | .createdAt] | max) as $t | select($c != null and ($t == null or $c > $t)) | .number'
+```
+
+`date -v-14d` is macOS's form. A `## Cost` comment posted after a total counts
+as owed again, so the newer comment gets a new total that covers it. For each
+issue the command prints, post a comment that starts with the line
+`## Cost total`.
+
+1. Sum every `## Cost` comment on the issue and on each of its closed
+   sub-issues, and link each comment summed.
+2. Name any loop known to have run on the issue that posted no `## Cost`
+   comment.
+3. Give the figures as lower bounds, as the comments do.
+
+Report the totals posted in the round's summary, with their links.
