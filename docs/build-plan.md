@@ -677,10 +677,10 @@ Each healthchecks.io check is created by hand, in the session that first makes i
    `vm-up` at 07:40 each weekday, and `deploy/vm-stop.sh` pings `vm-stop` just before each
    poweroff, both through `python -m lake.control_plane ping`. Both rows are created by hand
    with the schedules and grace in `infra/README.md`'s "The two checks", and left `new`.
-   [#868](https://github.com/l3a0/marketlake/issues/868)'s owner steps say when each is
-   armed: `vm-up` by `Ping Now` once the deploy that installs its timer has run, and
-   `vm-stop` by `Ping Now` on the day the switch is created. A check created in the UI gets
-   every integration, so ntfy is switched off on `vm-stop` by hand for email only.
+   The same section says when each is armed: `vm-up` by `Ping Now` once the deploy that
+   installs its timer has run, and `vm-stop` by `Ping Now` on the day the switch is
+   created. A check created in the UI gets every integration, so ntfy is switched off on
+   `vm-stop` by hand for email only.
 
 ## Discipline rules
 
