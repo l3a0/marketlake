@@ -33,11 +33,13 @@ import re
 import shlex
 import shutil
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from lake import control_plane as cp
+from tests.component.test_infra_config import _uptime_grace
 from tests.support.fake_bin import checked_links, dispatcher, install
 from tests.support.fake_disk import FAKE_VENV_PYTHON, install_disk_fakes
 
@@ -429,6 +431,20 @@ def test_less_than_an_hour_up_keeps_the_vm_up(vm):
     _refused(vm, proc, "2 (uptime)", "the VM has been up 3599 seconds, less than 3600")
     assert not vm.ran("who")
     assert not vm.ran("loginctl")
+
+
+def test_check_2_compares_the_grace_the_schedule_bounds_read(vm):
+    # test_infra_config's bounds read the grace from the script's one UPTIME_SECONDS line.
+    # test_exactly_an_hour_up_is_enough and test_less_than_an_hour_up_keeps_the_vm_up fix
+    # it at an hour, and an edit that moved check 2 to another value could move them with
+    # it. This case runs the script one second short of the parsed value and at it, so
+    # check 2 has to compare against the number the bounds read (#878).
+    grace = _uptime_grace(VM_STOP.read_text()) // timedelta(seconds=1)
+    vm.uptime(f"{grace - 1}.99 100.00")
+    proc = vm.run()
+    _refused(vm, proc, "2 (uptime)", f"the VM has been up {grace - 1} seconds, less than {grace}")
+    vm.uptime(f"{grace}.00 100.00")
+    _stopped(vm, vm.run())
 
 
 CLOSING_REASON = "session 6 of someone is closing, so a command it started may still run"
