@@ -74,8 +74,8 @@ directory, and refuses one inside ``lake_root``. The range restore writes only p
 lake's own manifest already records, a restore line in the trimmed ledger, and that
 ledger's manifest entry, which are what any lake writer leaves, so switching back to a path
 stays free. The resync leaves the lake's files and its ``manifest.jsonl`` as the bucket's
-copy records them. The trim that deletes old chains partitions lives in ``lake.trim`` for
-that reason (marketlake #787), and ``current_digest``, the read it checks a partition's
+copy records them. The trim that deletes old chains and quotes partitions lives in ``lake.trim``
+for that reason (marketlake #787, #794), and ``current_digest``, the read it checks a partition's
 bucket copy with, writes nothing.
 
 **The client is built from ``config.yaml`` alone, with one exception.** On the

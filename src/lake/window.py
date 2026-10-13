@@ -7,15 +7,17 @@ and restores the whole lake from the bucket, which is the laptop today. Besides 
 ``lake.vm_config``, which checks it, three jobs act on it.
 
 1. The 18:30 sweep writes the split checkpoint, which marketlake #786 added with the key.
-2. Marketlake #787's trim removes what falls outside the window.
+2. The trim removes what falls outside the window: chains since marketlake #787, and quotes
+   under a landed daily bar since marketlake #794.
 3. ``lake.bucket``'s restore rebuilds the trimmed lake rather than the whole one, leaving out
    each partition the bucket's ``trimmed.jsonl`` says was removed on purpose (marketlake
    #785).
 
 The key is named for the lake rather than for chains. The owner decided on 2026-10-07
-(decision 9 on #755) that every dated surface is trimmed at one snapshot cutoff, so
-marketlake #794 reuses this key for ``quotes/``. Chains go first, so the floor below is the
-chains readers' until #794 adds the quotes readers'.
+(decision 9 on #755) that every dated surface is trimmed at one snapshot cutoff, and
+marketlake #794 reuses this key for ``quotes/``. A quotes day goes only under a landed daily
+bar, so a day whose bar never lands outlives the cutoff for good. The quotes readers need no
+more history than the chains readers, so the floor below serves both.
 
 **Loading never judges the value.** ``config.load_config`` runs every capture cycle, so a
 refusal there would stop capture on a typo. Loading stores an integer as read and any other
@@ -23,8 +25,8 @@ value as its ``repr``, the way ``role`` is stored, and each job judges it here: 
 in ``lake.vm_config`` refuses a bad value before it reaches the VM, and the sweep, the trim
 and the restore check it again as a backstop.
 
-**The floor is derived, never written down.** Every job that reads sealed chains on a host
-sets a minimum on the window, and marketlake #786's body carries the table. Three set it:
+**The floor is derived, never written down.** Every job that reads sealed chains or quotes
+on a host sets a minimum on the window, and marketlake #786's body carries the table. Three set it:
 
 1. ``battery.trailing_medians`` reads ``trailing_median_sessions`` sessions before the
    judged day, so it needs that many plus the day itself. The value can be overridden in
@@ -123,8 +125,8 @@ def window_sessions(value: object, guards: GuardConstants) -> int | None:
     if value < floor:
         raise WindowRefused(
             f"{WINDOW_KEY} is under the floor of {floor} sessions that the readers of sealed "
-            "chains need, which are the battery's trailing median, the History panel and the "
-            "disk runway. Raise it in config/vm.yaml"
+            "chains and quotes need, which are the battery's trailing median, the History "
+            "panel and the disk runway. Raise it in config/vm.yaml"
         )
     return value
 
@@ -142,8 +144,10 @@ def edge_search_days(sessions: int) -> int:
 def window_edge(calendar: Calendar, tonight: date, sessions: int) -> date:
     """The window edge: the ``sessions``-th session counted back from ``tonight``, tonight first.
 
-    After the next trim and seal the lake then holds exactly ``sessions`` chains sessions. A
-    session the lake did not capture still takes a slot, because the count is the calendar's.
+    After the next trim and seal the lake then holds exactly ``sessions`` chains sessions, and
+    as many quotes sessions plus any quotes day kept for good because its daily bar never
+    landed. A session the lake did not capture still takes a slot, because the count is the
+    calendar's.
     Counting back needs no forward lookup, so it never meets the calendar's one-year bound.
 
     ``tonight`` need not be a session. A day that is not one takes no slot.

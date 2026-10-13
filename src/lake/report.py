@@ -750,6 +750,11 @@ class PieceOutcome:
     carries counts alone and this is where the detail lands, which is what keeps the digest
     under its byte budget on the night that has many rather than only on the nights that have
     none.
+
+    ``frozen`` is the dividend walk's count of keys whose first observation the trim removed
+    (marketlake #794), which ``actions.ExtractionReport`` gives the reason for. It is ``None``
+    on a walk that keeps no such count, the split and bar walks, so their entries and lines
+    carry no field that would read as a zero they never counted.
     """
 
     landed: int = 0
@@ -757,6 +762,7 @@ class PieceOutcome:
     unfiled: int = 0
     unchanged: int = 0
     skipped: int = 0
+    frozen: int | None = None
     subjects: tuple[str, ...] = ()
     refusal: str | None = None
 
@@ -795,6 +801,8 @@ class PieceOutcome:
             "skipped": self.skipped,
             "subjects": [redacted(subject) for subject in self.subjects],
         }
+        if self.frozen is not None:
+            entry["frozen"] = self.frozen
         if self.refusal is not None:
             entry["refusal"] = self.refusal_class
         return entry

@@ -1610,11 +1610,15 @@ def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, ob
     anything has ever been stamped. The owed-through instant is null only where no
     session has closed yet, which is a lake younger than its first close.
 
-    **A retired ticker on a trimmed lake** (marketlake #787). A retired ticker stays on the
-    panel on purpose, and its chains days come from disk. Once the VM's trim drops its last
-    chains partition and compaction's empty-directory pass removes ``chains/ticker=T/``,
-    ``_tickers_in`` no longer lists it on ``chains``, and it stays on the panel through
-    ``quotes/``. Without the pass the row would show a null last capture, the case the bound
+    **A retired ticker on a trimmed lake** (marketlake #787, #794). A retired ticker stays on the
+    panel on purpose, and its days come from disk. Once the VM's trim drops its last chains
+    partition and compaction's empty-directory pass removes ``chains/ticker=T/``, ``_tickers_in`` no
+    longer lists it on ``chains``. The trim drops its quotes days too, each under a landed daily
+    bar, and once the last one goes the same pass removes ``quotes/ticker=T/``. The ticker then
+    leaves the panel, about 22 sessions after it retired, which is the intended reading of
+    ``lake_roster``'s "reachable for the days it did capture". One with a quotes day kept for good,
+    because that day's daily bar never landed, keeps its directory and stays, showing that day as
+    its last capture. Without the pass the row would show a null last capture, the case the bound
     above says it must not imply.
     """
     spans_by_ticker = _capture_spans(ctx.paths, ctx.roster)

@@ -1,10 +1,10 @@
-"""The trim, called directly over a small window (marketlake #787).
+"""The trim, called directly over a small window (marketlake #787 and marketlake #794).
 
-``lake.trim.trim`` drops a chains partition only when all seven clauses hold, writes its trim
-line before it unlinks, recovers a crash between the two by re-running the whole selection, and
-never raises. A window cannot go below ``window.window_floor``, which is longer than two weeks,
-so these tests call the trim directly with a window of 3 over two weeks of tiny partitions,
-each stored in the fake bucket. The floor and gate tests run at the ``compact`` level in
+``lake.trim.trim`` drops a chains or quotes partition only when all seven clauses hold, writes its
+trim line before it unlinks, recovers a crash between the two by re-running the whole selection, and
+never raises. A window cannot go below ``window.window_floor``, which is longer than two weeks, so
+these tests call the trim directly with a window of 3 over two weeks of tiny partitions, each stored
+in the fake bucket. The floor and gate tests run at the ``compact`` level in
 ``test_compaction_trim.py``.
 
 The lake below holds SPY and QQQ on every weekday from 2026-08-17 to 2026-08-28. Tonight is
@@ -25,6 +25,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import trim as trim_module
@@ -72,6 +73,19 @@ def _rel(ticker: str, day: date) -> str:
     return f"chains/ticker={ticker}/date={day.isoformat()}.parquet"
 
 
+def _qrel(ticker: str, day: date) -> str:
+    return f"quotes/ticker={ticker}/date={day.isoformat()}.parquet"
+
+
+def _day(rel: str) -> date:
+    return date.fromisoformat(rel.rsplit("date=", 1)[1].removesuffix(".parquet"))
+
+
+# A daily bar's contents are never read by the trim, which asks only whether its key is in the
+# manifest, so one column is enough.
+BAR = pa.table({"close": [650.0]})
+
+
 def _state(ticker: str, cutoff: date):
     start = starting_state(ticker)
     return start if cutoff == date.min else replace(start, cutoff=cutoff, last_day=cutoff)
@@ -97,14 +111,30 @@ def _build(
     quarantine: tuple[str, ...] = (),
     session_day: date | None = YESTERDAY,
     cutoffs: dict[str, date] | None = None,
+    quotes: bool = False,
+    bar_freqs: tuple[str, ...] = ("1d",),
+    no_bar: tuple[tuple[str, date], ...] = (),
 ) -> FakeS3:
-    """A lake of tiny chains partitions, each stored in the bucket, and a checkpoint."""
+    """A lake of tiny chains partitions, each stored in the bucket, and a checkpoint.
+
+    ``quotes`` adds a quotes partition beside each chains one, also in the bucket, and a bar
+    at each of ``bar_freqs`` for each ticker-day but those ``no_bar`` names.
+    """
     lake = FixtureLake(root)
     for day in days:
         for ticker in tickers:
             lake.with_partition(
                 "chains", ticker, day, _chains(1, snap_ts=_snap(day, 0), ticker=ticker)
             )
+            if not quotes:
+                continue
+            lake.with_partition(
+                "quotes", ticker, day, _quotes(1, snap_ts=_snap(day, 0), ticker=ticker)
+            )
+            if (ticker, day) in no_bar:
+                continue
+            for freq in bar_freqs:
+                lake.with_bars(ticker, freq, day, BAR)
     for rel in quarantine:
         lake.with_quarantine({"partition": rel, "check": "test", "verdict": "held"})
     lake.build()
@@ -117,8 +147,8 @@ def _build(
     client = FakeS3()
     for day in days:
         for ticker in tickers:
-            rel = _rel(ticker, day)
-            client.store(TARGET.key(rel), (root / rel).read_bytes())
+            for rel in (_rel(ticker, day), *([_qrel(ticker, day)] if quotes else [])):
+                client.store(TARGET.key(rel), (root / rel).read_bytes())
     return client
 
 
@@ -154,6 +184,11 @@ def _trim(
 def _expected(edge: date = EDGE, tickers=TICKERS) -> list[str]:
     """Every partition at or before ``edge``, oldest first, the order the trim takes them."""
     return [_rel(ticker, day) for day in SESSIONS if day <= edge for ticker in sorted(tickers)]
+
+
+def _expected_quotes(edge: date = EDGE, tickers=TICKERS) -> list[str]:
+    """Every quotes partition at or before ``edge``, oldest first."""
+    return [_qrel(ticker, day) for day in SESSIONS if day <= edge for ticker in sorted(tickers)]
 
 
 def _gets(client: FakeS3) -> list[str]:
@@ -254,28 +289,227 @@ def test_the_oldest_partitions_go_first_whatever_order_the_manifest_holds(lake_r
 # -- clause 1: present on disk ------------------------------------------------------------
 
 
-def test_a_quotes_partition_is_never_trimmed(lake_root):
-    """Mutation this catches: selecting a partition of any surface. These quotes partitions
-    are manifested, in the bucket and past the window, so only the surface keeps them."""
-    lake = FixtureLake(lake_root)
-    for day in SESSIONS:
-        for ticker in TICKERS:
-            lake.with_partition(
-                "chains", ticker, day, _chains(1, snap_ts=_snap(day, 0), ticker=ticker)
-            )
-    quotes = [f"quotes/ticker=SPY/date={day.isoformat()}.parquet" for day in SESSIONS[:2]]
-    for day in SESSIONS[:2]:
-        lake.with_partition("quotes", "SPY", day, _quotes(1, snap_ts=_snap(day, 0)))
-    lake.build()
-    _checkpoint(lake_root, YESTERDAY, dict.fromkeys(TICKERS, EDGE))
-    client = FakeS3()
-    for rel in [*quotes, *(_rel(t, d) for d in SESSIONS for t in TICKERS)]:
-        client.store(TARGET.key(rel), (lake_root / rel).read_bytes())
+def test_a_quotes_partition_under_a_landed_daily_bar_is_trimmed(lake_root):
+    """Marketlake #794. Mutation this catches: ``_select`` limited to chains. These quotes
+    partitions are manifested, in the bucket, past the window and under a ``1d`` bar."""
+    client = _build(lake_root, quotes=True)
+    result = _trim(lake_root, client)
+    assert sorted(result.trimmed) == sorted(_expected() + _expected_quotes())
+    for rel in _expected_quotes():
+        assert _absent_on_purpose(lake_root, rel)
+    kept = [_qrel(t, d) for d in SESSIONS if d > EDGE for t in TICKERS]
+    assert all((lake_root / rel).exists() for rel in kept)
+    # Oldest first across both surfaces, so a day's quotes go beside its chains.
+    days = [_day(rel) for rel in result.trimmed]
+    assert days == sorted(days)
+    # The bars it judged by stay where they are.
+    assert all(
+        (lake_root / f"bars/ticker={t}/freq=1d/date={d.isoformat()}.parquet").exists()
+        for d in SESSIONS
+        for t in TICKERS
+    )
+
+
+def test_a_quotes_partition_without_a_daily_bar_is_kept(lake_root):
+    """Marketlake #794. Mutation this catches: dropping the bar clause. The bars census reads
+    a quotes day while its daily bar has not landed, so the day stays and no read is sent."""
+    waiting = ("SPY", SESSIONS[0])
+    client = _build(lake_root, quotes=True, no_bar=(waiting,))
+    result = _trim(lake_root, client)
+    rel = _qrel(*waiting)
+    assert rel not in result.trimmed
+    assert (lake_root / rel).exists()
+    assert rel not in _gets(client)
+    assert rel not in trimmed.latest_trimmed(lake_root)
+    assert sorted(result.trimmed) == sorted(
+        _expected() + [q for q in _expected_quotes() if q != rel]
+    )
+
+
+def test_a_ticker_whose_roster_carries_no_daily_bar_keeps_every_quotes_day(lake_root):
+    """A ``TickerConfig`` may list ``1m`` alone, and a minute bar is not the bar the census
+    waits on, so every quotes day of such a ticker stays. Its chains still trim."""
+    client = _build(lake_root, quotes=True, bar_freqs=("1m",))
     result = _trim(lake_root, client)
     assert list(result.trimmed) == _expected()
-    assert all(rel.startswith("chains/") for rel in result.trimmed)
-    assert all((lake_root / rel).exists() for rel in quotes)
-    assert not any(rel in _gets(client) for rel in quotes)
+    assert all((lake_root / rel).exists() for rel in _expected_quotes())
+    assert not any(rel.startswith("quotes/") for rel in _gets(client))
+
+
+def test_recovery_of_a_quotes_partition_whose_bar_is_gone_writes_a_restore_line(lake_root):
+    """Mutation this catches: the bar clause as a ``continue`` rather than a ``kept_by`` value.
+    A crash before the unlink leaves a trim line beside the file, and only a candidate that
+    reaches ``_one`` can supersede that line, or ``restore_lake`` leaves the file out."""
+    waiting = ("SPY", SESSIONS[0])
+    client = _build(lake_root, quotes=True, no_bar=(waiting,))
+    rel = _qrel(*waiting)
+    _crashed_before_unlink(lake_root, rel)
+    result = _trim(lake_root, client)
+    assert rel in result.restored and rel not in result.trimmed
+    assert (lake_root / rel).exists()
+    assert trimmed.latest_trimmed(lake_root)[rel]["kind"] == trimmed.RESTORE_KIND
+    assert rel not in _gets(client)
+
+
+@pytest.mark.parametrize("cutoff", [date.min, SESSIONS[1]], ids=["date-min", "early"])
+def test_the_checkpoint_cutoff_keeps_chains_alone(lake_root, cutoff):
+    """Mutations this catches: the cutoff applied to quotes, and dropped for chains. The split
+    walk reads no quotes, so SPY's quotes trim to the window edge while its chains stop at
+    the cutoff."""
+    client = _build(lake_root, quotes=True, cutoffs={"QQQ": EDGE, "SPY": cutoff})
+    result = _trim(lake_root, client)
+    assert set(_expected_quotes()) <= set(result.trimmed)
+    spy_chains = [rel for rel in result.trimmed if rel.startswith("chains/ticker=SPY/")]
+    assert spy_chains == [_rel("SPY", d) for d in SESSIONS if d <= cutoff]
+    assert (lake_root / _rel("SPY", SESSIONS[2])).exists()
+
+
+def test_a_ticker_with_no_checkpoint_entry_still_trims_its_quotes(lake_root):
+    client = _build(lake_root, quotes=True, cutoffs={"QQQ": EDGE})
+    result = _trim(lake_root, client)
+    assert not any(rel.startswith("chains/ticker=SPY/") for rel in result.trimmed)
+    assert set(_expected_quotes()) <= set(result.trimmed)
+
+
+# The clauses a quotes partition meets as a chains one does. Each names the definite no it is
+# set up to answer, for SPY's quotes on the day the clause can reach.
+QUOTES_CLAUSES = {
+    "inside-window": EDGE,
+    "watermark": SESSIONS[0],
+    "segments": SESSIONS[0],
+    "quarantine": SESSIONS[0],
+    "rot": SESSIONS[0],
+    "missing-key": SESSIONS[0],
+    "restore-hold": SESSIONS[0],
+}
+
+
+def _quotes_clause(root: Path, client: FakeS3, clause: str) -> TrimResult:
+    """Set up one clause's definite no for SPY's quotes on its day, then trim."""
+    day = QUOTES_CLAUSES[clause]
+    rel = _qrel("SPY", day)
+    upload = None
+    # A window of 4 puts the edge on Monday the 24th, so Tuesday the 25th is inside it.
+    window = 4 if clause == "inside-window" else WINDOW
+    if clause == "watermark":
+        order = [entry["partition"] for entry in read_manifest(root)]
+        upload = _upload(root, watermark=order.index(rel))
+    if clause == "segments":
+        segment_dir = LakePaths(root).segment_dir("quotes", "SPY", day)
+        segment_dir.mkdir(parents=True)
+        (segment_dir / "seg-a-1.arrows").write_bytes(b"segment")
+    if clause == "rot":
+        client.store(TARGET.key(rel), b"rotted")
+    if clause == "missing-key":
+        del client.objects[TARGET.key(rel)]
+    if clause == "restore-hold":
+        _restore(root, rel, "2026-08-27T09:00:00-04:00")
+    return _trim(root, client, window=window, upload=upload)
+
+
+@pytest.mark.parametrize("clause", list(QUOTES_CLAUSES))
+def test_a_quotes_partition_meets_every_clause_a_chains_one_does(lake_root, clause):
+    """A quotes partition passes the window edge, the watermark, the segment check, the
+    quarantine clause, the bucket re-hash and the restore-line hold as a chains one does."""
+    rel = _qrel("SPY", QUOTES_CLAUSES[clause])
+    quarantine = (rel,) if clause == "quarantine" else ()
+    client = _build(lake_root, quotes=True, quarantine=quarantine)
+    result = _quotes_clause(lake_root, client, clause)
+    assert rel not in result.trimmed
+    assert (lake_root / rel).exists()
+    assert rel not in result.restored
+    if clause == "rot":
+        (finding,) = result.rot
+        assert finding.partition == rel
+        assert rot_page_body(result.rot).startswith("1 partition(s) in the bucket")
+    # QQQ's quotes on the same day meet no clause but the window, which keeps both.
+    sibling = _qrel("QQQ", QUOTES_CLAUSES[clause])
+    assert (sibling in result.trimmed) is (clause != "inside-window")
+
+
+@pytest.mark.parametrize(
+    "clause", ["inside-window", "segments", "quarantine", "rot", "missing-key"]
+)
+def test_recovery_of_a_quotes_partition_meeting_a_definite_no_writes_a_restore_line(
+    lake_root, clause
+):
+    rel = _qrel("SPY", QUOTES_CLAUSES[clause])
+    quarantine = (rel,) if clause == "quarantine" else ()
+    client = _build(lake_root, quotes=True, quarantine=quarantine)
+    _crashed_before_unlink(lake_root, rel)
+    result = _quotes_clause(lake_root, client, clause)
+    assert rel in result.restored
+    assert (lake_root / rel).exists()
+    assert trimmed.latest_trimmed(lake_root)[rel]["kind"] == trimmed.RESTORE_KIND
+
+
+def test_recovery_of_a_quotes_partition_that_still_qualifies_trims_it(lake_root):
+    client = _build(lake_root, quotes=True)
+    rel = _qrel("SPY", SESSIONS[0])
+    _crashed_before_unlink(lake_root, rel)
+    result = _trim(lake_root, client)
+    assert rel in result.trimmed
+    assert _absent_on_purpose(lake_root, rel)
+
+
+# The three faults that hold one ticker directory: one the trim cannot search, one it cannot
+# write, and an unlink the volume refuses.
+HOLD_FAULTS = ["unsearchable", "unwritable", "unlink-refused"]
+
+
+@pytest.mark.parametrize("fault", HOLD_FAULTS)
+def test_a_held_chains_directory_holds_only_itself(lake_root, monkeypatch, fault):
+    """Marketlake #794. Mutation this catches: the held key back on the ticker, which made a
+    fault in ``chains/ticker=QQQ/`` hold QQQ's quotes too, trimming none of them."""
+    client = _build(lake_root, quotes=True)
+    ticker_dir = lake_root / "chains" / "ticker=QQQ"
+    if fault == "unlink-refused":
+        _failing_unlink(monkeypatch, _rel("QQQ", SESSIONS[0]), errno.EACCES)
+    else:
+        ticker_dir.chmod(0o600 if fault == "unsearchable" else 0o500)
+    try:
+        result = _trim(lake_root, client)
+    finally:
+        ticker_dir.chmod(0o755)
+    assert result.stopped is None
+    qqq_quotes = [rel for rel in _expected_quotes() if "QQQ" in rel]
+    assert [rel for rel in result.trimmed if rel.startswith("quotes/ticker=QQQ/")] == qqq_quotes
+    assert not any(rel.startswith("chains/ticker=QQQ/") for rel in result.trimmed)
+    (held,) = result.held
+    assert held.startswith("chains/ticker=QQQ/: ")
+    # The line names the directory that waits rather than the ticker, whose quotes go on.
+    if fault == "unsearchable":
+        assert "so chains/ticker=QQQ/ waits" in held
+    else:
+        assert "so the rest of chains/ticker=QQQ/ waits" in held
+    assert "QQQ waits" not in held
+
+
+@pytest.mark.parametrize("fault", HOLD_FAULTS)
+def test_a_held_quotes_directory_holds_only_itself(lake_root, monkeypatch, fault):
+    """The other way round: a quotes directory's fault leaves the ticker's chains trimming."""
+    client = _build(lake_root, quotes=True)
+    ticker_dir = lake_root / "quotes" / "ticker=QQQ"
+    if fault == "unlink-refused":
+        _failing_unlink(monkeypatch, _qrel("QQQ", SESSIONS[0]), errno.EACCES)
+    else:
+        ticker_dir.chmod(0o600 if fault == "unsearchable" else 0o500)
+    try:
+        result = _trim(lake_root, client)
+    finally:
+        ticker_dir.chmod(0o755)
+    assert result.stopped is None
+    assert [rel for rel in result.trimmed if rel.startswith("chains/ticker=QQQ/")] == [
+        rel for rel in _expected() if "QQQ" in rel
+    ]
+    assert not any(rel.startswith("quotes/ticker=QQQ/") for rel in result.trimmed)
+    (held,) = result.held
+    assert held.startswith("quotes/ticker=QQQ/: ")
+    if fault == "unsearchable":
+        assert "so quotes/ticker=QQQ/ waits" in held
+    else:
+        assert "so the rest of quotes/ticker=QQQ/ waits" in held
+    assert "QQQ waits" not in held
 
 
 # -- refusals before any partition -----------------------------------------------------------
@@ -443,7 +677,7 @@ def test_two_rotted_copies_fold_into_one_page_body(lake_root):
     assert [finding.local for finding in result.rot] == [LOCAL_GOOD, LOCAL_ROTTED]
     body = rot_page_body(result.rot)
     assert first in body and second in body
-    assert body.startswith("2 chains partition(s)")
+    assert body.startswith("2 partition(s)")
     for finding in result.rot:
         assert f"version {finding.version_id}" in body
     # The night's printed result names each finding too, not only the page.

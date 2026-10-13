@@ -2,8 +2,10 @@
 
 Marketlake #755 keeps only a window of recent sessions on the hosted VM's lake volume, and
 drops an older partition once its copy in the backup bucket is verified. Chains partitions are
-trimmed first, and the owner means every dated surface to be trimmed at the same cutoff in time,
-so nothing here assumes a surface. A line is keyed by the lake-relative ``partition``, which is
+trimmed at the window edge (marketlake #787), and quotes partitions at the same edge under a
+landed daily bar (marketlake #794), so a quotes day whose bar never lands stays for good. The
+owner means every dated surface to be trimmed at one cutoff in time, so nothing here assumes a
+surface. A line is keyed by the lake-relative ``partition``, which is
 any path ``paths.parse_partition_rel`` reads, ``chains`` and ``quotes`` today. Before
 anything deletes a sealed partition, the lake has to be able to say that a missing file was
 removed on purpose. Without a record, every reader that walks the manifest reads a trimmed
@@ -13,6 +15,9 @@ reports the session missing every night, and the first upload refuses to re-base
 This module is that record and nothing that writes into it on a schedule. Marketlake #787 trims
 and writes a trim line. Marketlake #784 restores a range and writes a restore line. Both write
 through :func:`append_trimmed`, and every reader decides through :func:`is_designed_absence`.
+The readers are the Sunday scrub, the first bucket upload, the range restore, the rebuild in
+``lake.bucket.restore_lake``, the battery's coverage check, the split walk's checkpoint, and,
+since marketlake #794, the dividend walk in ``lake.actions``.
 
 The ledger is ``trimmed.jsonl`` at the lake root, the fourth append-only ledger beside
 ``manifest.jsonl``, ``quarantine.jsonl`` and ``actions/corporate_actions.jsonl``. It follows
@@ -261,8 +266,9 @@ def is_designed_absence(
     rebuild can ask it about the bucket's copies of both ledgers, where no local file exists.
 
     A reader of the lake counts a designed absence only for a file it finds absent. Most ask
-    only once the file is found absent. ``split_checkpoint._designed_absences`` asks first and
-    checks the file after, which gives the same answer. A trim line beside a present file is
+    only once the file is found absent. ``split_checkpoint._designed_absences`` and the dividend
+    walk's ``actions._TrimmedQuotes.trimmed`` ask first and check the file after, which gives
+    the same answer. A trim line beside a present file is
     what a crash between the line and the unlink leaves, and that file is present. The rebuild
     in ``lake.bucket.restore_lake`` is the one caller that acts on this answer with no file to
     check. It asks about every key the bucket lists, since the bucket never deletes and still

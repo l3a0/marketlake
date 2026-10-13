@@ -90,8 +90,9 @@ and deterministically.
 
 from __future__ import annotations
 
+import os
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from math import isfinite
@@ -102,9 +103,10 @@ from lake.calendar import MARKET_TZ
 from lake.clock import Clock, SystemClock
 from lake.loader import NoSpotClose, PartialRead, PartitionAbsent, PartitionQuarantined, load_quotes
 from lake.manifest import ManifestError, append_line, latest_entries, parse_jsonl, record_partition
-from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE, QUOTES, parse_partition_rel
+from lake.paths import ACTIONS, CORPORATE_ACTIONS_FILE, QUOTES, LakePaths, parse_partition_rel
 from lake.report import Withheld, write_withheld
 from lake.security_master import AmbiguousSymbol, MasterUnreadable, SecurityMaster, master_path
+from lake.trimmed import is_designed_absence, latest_trimmed
 
 # This module's own schema version, stamped on every entry it writes. It names the shape
 # of a ledger line, not the journal shape a capture row carries, and the two move
@@ -911,13 +913,22 @@ class ExtractionReport:
     ``unchanged`` counts the dividends the walk re-derived and found already in the ledger.
     It is the number that makes a second run legible: a run that appends nothing and holds
     nothing has either learned nothing new or read nothing at all, and only this tells the
-    two apart.
+    two apart. On a lake whose quotes are trimmed under a landed daily bar (marketlake #794)
+    it no longer does that alone. A key whose first observation was trimmed never reaches the
+    comparison, so a second run there can read zero unchanged while it re-met every key.
+
+    ``frozen`` counts those keys. Each is a dividend the ledger already holds whose recorded
+    ``observed_on`` day the trim removed, so the walk keeps the ledger's entry rather than
+    re-deriving one from the oldest day it can still see. A key met twice in one run counts
+    once. Without the count a trimmed run reads zero appended, zero held, zero unchanged and
+    zero skipped, and a second run could not tell "learned nothing" from "read nothing".
 
     ``skipped`` carries every ticker-day the walk could not read, each keeping its reason.
     Catching a refusal without counting it would trade one silence for another: the run would
     survive and report nothing about the partitions it was refused. The cost is real rather
     than nominal, because a skipped session moves ``observed_on`` to the next one the walk
-    reads, and a value that moves and moves back across the skip is not recorded at all.
+    reads, and a value that moves and moves back across the skip is not recorded at all. A
+    quotes day the trim removed on purpose is not a skip and is not counted here.
     """
 
     ticker_days: int
@@ -925,6 +936,7 @@ class ExtractionReport:
     held: tuple[HeldFinding, ...]
     unchanged: int
     skipped: tuple[Skip, ...]
+    frozen: int = 0
 
     @property
     def unfiled(self) -> tuple[HeldFinding, ...]:
@@ -963,6 +975,7 @@ class ExtractionReport:
             else:
                 lines.append(f"      filed at {held.filed_at}")
         lines.append(f"  unchanged: {self.unchanged}")
+        lines.append(f"  frozen:    {self.frozen}")
         lines.append(f"  skipped:   {len(self.skipped)}")
         lines.extend(by_reason(self.skipped))
         return "\n".join(lines)
@@ -977,10 +990,13 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
 
     **The ticker-days come from the manifest**, through :func:`surface_ticker_days`.
     ``manifest.latest_entries`` returns the
-    current entry per partition path, which is the lake's own record of what it holds.
+    current entry per partition path, which is the lake's own record of what it sealed.
     Deriving them from the roster and the exchange calendar instead would ask for every
     session the calendar carries, and ``load_quotes`` raises ``PartitionAbsent`` on a session
-    the lake never captured.
+    the lake never captured. On a host that trims, the manifest is not the whole account of
+    what is on disk: a trimmed partition keeps its entry, and ``trimmed.jsonl`` says which of
+    those are gone on purpose. So the run reads the manifest and the trimmed ledger once each,
+    and the section on a trimmed lake below says what it does with the second.
 
     **Reading the manifest bounds what a refusal can be, and it does not remove refusals.**
     This sentence used to say that every enumerated partition exists, so ``NoSpotClose`` was
@@ -1009,7 +1025,10 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
        - ``NoSpotClose``, the gap day, with nothing to read.
        - ``PartitionQuarantined``, a partition the validation battery withheld, where the
          rows exist and the verdict says not to read them.
-       - ``PartitionAbsent``, a manifested partition whose file is gone.
+       - ``PartitionAbsent``, a manifested partition whose file is gone and that the trimmed
+         ledger does not explain. One the ledger does explain is a quotes day the trim removed
+         on purpose, and the walk passes over it without counting it, as the section on a
+         trimmed lake below says.
        - ``PartialRead``, one the overflow projection could not present whole, where reading
          on would be a comparison against contents nobody saw in full.
 
@@ -1020,8 +1039,11 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
        ``ex_date`` is read off the row. What a skip moves is ``observed_on``, which is no part
        of the key, and :func:`same_but_for_recorded_at` compares it, so the run after a
        verdict clears appends the corrected entry once and every run after that reads
-       unchanged. A ``Withheld`` finding would instead be filed again every night a verdict
-       stood, while ``sweep.count_quarantined`` already carries that count to the same reader.
+       unchanged. That holds while the skipped day is still on disk. Once the trim removes it
+       under a landed daily bar, the key freezes with the later ``observed_on`` the skip gave
+       it, unless ``restore_range`` puts the day back before a walk next reads it. A
+       ``Withheld`` finding would instead be filed again every night a verdict stood, while
+       ``sweep.count_quarantined`` already carries that count to the same reader.
 
        Two costs are named rather than hidden.
 
@@ -1039,25 +1061,85 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
        reports nothing, and an entry of nulls is not an event. Without an ex-date there is no
        key, so there is nothing to land and nothing to hold.
     3. An observation whose instrument and ``div_ex_date`` differ from the previous one emits
-       an entry. It carries provenance ``observed`` when the lake has already watched that
-       instrument carrying a value, and ``vendor_reported`` when it has not, because there
-       the change itself was never seen. The dates are compared normalized, so the vendor
-       writing one date two ways is not a transition. The instrument is half of the
-       comparison because a symbol handed from one instrument to another is a new thing to
-       record, which is what step 4 of the issue means by grouping on the instrument.
+       an entry, unless step 4a freezes its key. It carries provenance ``observed`` when the
+       lake has already watched that instrument carrying a value, and ``vendor_reported`` when
+       it has not, because there the change itself was never seen. "Already watched" is
+       what a walk of the whole lake would say at this point in its order, ticker then day.
+       That is every instrument this run met carrying a value, plus every instrument the
+       ledger records a dividend for whose recorded ``observed_on`` day was trimmed, once the
+       walk has passed the earliest such day, since the lake watched that instrument on a day
+       the walk can no longer read. The order matters because the trim keeps an older day,
+       such as one whose daily bar is pending, while it drops a newer one, and because a
+       renamed instrument's newer ticker can sort before its older one. The dates are
+       compared normalized, so the vendor writing one date two ways is not a transition. The
+       instrument is half of the comparison because a symbol handed from one instrument to
+       another is a new thing to record, which is what step 4 of the issue means by grouping
+       on the instrument.
     4. The instrument is resolved at the date of that first observation carrying the new
        value, and the same date lands in ``observed_on``. They cannot differ: the resolver
        decides which instrument the action is attributed to, so resolving at one date and
        recording another attributes it to whoever held the ticker on a different day.
+    4a. A key whose first observation was trimmed is frozen. The key is the instrument, the
+        ex-date and the type. When ``latest`` already holds it, and its recorded
+        ``observed_on`` is earlier than this day and was trimmed, the key joins the emitted
+        set and the walk moves on. It never reaches the gate, ``build_entry`` or step 7. The
+        check sits here, after the resolution hold and before the gate, because a whole-lake
+        walk would have suppressed this day through ``previous`` too. Placed at the emit, a
+        trimmed key whose first present day carries a bad payload would be held and filed
+        every night.
     5. The gate runs, and a disagreement holds the entry out and files it. So does a payload
        the ledger's own record rules refuse, rather than ending the run as a traceback.
-    6. A key is emitted once per run, at the first observation carrying its value. An ex-date
+    6. A key is emitted once per run, at the first observation the walk can read carrying its
+       value, or frozen at step 4a where that observation was trimmed. An ex-date
        that moves away and comes back is not a second first, and emitting it twice under two
        provenances would leave neither matching what ``latest`` resolves, so the ledger would
        grow by two lines every night forever.
     7. The entry lands only when it differs from what ``latest`` already resolves on its key,
        on every field but ``recorded_at``. Comparing whole entries would append every night
        forever, since ``recorded_at`` is the clock's answer and moves while nothing else does.
+       A key frozen at step 4a never reaches this comparison, and ``frozen`` counts it rather
+       than ``unchanged``.
+
+    **On a lake whose quotes are trimmed** (marketlake #794), the trim drops a quotes day only
+    under a landed daily bar. The walk's state is then partly on days it cannot read, and it
+    resumes from the ledgers the lake already holds rather than from a saved checkpoint. Three
+    rules do that, and all three ask one question, "was this day trimmed", which holds when
+    ``trimmed.is_designed_absence`` names the day's quotes partition and no file is on disk.
+
+    1. A designed absence is not a skip. A read that meets ``PartitionAbsent`` on such a day
+       passes over it silently, joining neither ``skipped`` nor ``previous``. A trim line
+       beside a file still on disk reads as present, because this check follows the read.
+    2. Each instrument whose dividend ``latest`` holds with a trimmed ``observed_on`` day
+       counts as seen from the earliest such day's place in the walk, as step 3 says. The
+       place is the ticker ``symbol_at`` names and the day, compared the way the walk orders
+       them.
+    3. Step 4a freezes a key whose first observation was trimmed.
+
+    The recorded day's partition is named by ``master.symbol_at(instrument_id, observed_on)``,
+    never by the walk's ticker, because a ledger entry carries only the instrument and a rename
+    would test a path that never existed. ``symbol_at`` answers ``None`` when no mapping covers
+    the day, and that reads as not trimmed. An ``observed_on`` that is not an ISO date string
+    is never trimmed either, since parsing one raises a class the sweep does not contain.
+
+    A trimmed run differs from a walk of the whole untrimmed lake in six ways that marketlake #794
+    names and accepts. Each moves ``observed_on`` or ``provenance`` on one entry at most twice, and
+    no reader of the ledger computes an adjusted price from either field.
+
+    1. A gate-held value that later passes lands once, on its first passing day.
+    2. A gate-held value that never passes is filed every night on the oldest present day.
+    3. A quotes day trimmed before any walk read it records its key on the first day the walk
+       can see.
+    4. A restored or newly accepted day trimmed before a walk reads it keeps the ledger's
+       later ``observed_on``. ``restore_range`` before the next walk is the repair.
+    5. A master edited by hand, or a retroactive ``remap``, can leave ``symbol_at`` naming no
+       ticker or the wrong one. The key appends once and freezes the night its day is trimmed.
+    6. A hand run racing the trim or ``restore_range`` can append one line, or a line and its
+       reverse, because this walk reads without ``lake_lock``. The schedule never races them.
+
+    **A damaged trimmed ledger stops the run.** ``latest_trimmed`` raises a ``ManifestError``
+    or an ``OSError``, the sweep contains both as "dividends did not run", and the split walk
+    already stops the same way. Walking on would read every trimmed day as a skip and re-derive
+    every key from the oldest day left.
 
     **Both ways the resolution can fail hold the action and file it.** ``UnresolvedSymbol``
     says the master and the capture spans disagree about a ticker. ``AmbiguousSymbol`` says
@@ -1077,18 +1159,36 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
     # Read once for the run, so every ticker-day is compared against one snapshot of what the
     # ledger already holds, the way the close guard reads the manifest once per run.
     current = latest(lake_root)
+    # The manifest and the trimmed ledger, each read once for the run and outside the lock, as
+    # every other read here is. Together they say which quotes days the trim removed on purpose.
+    # A ledger that cannot be read stops the run, for the reason the docstring gives.
+    manifest_latest = latest_entries(lake_root)
+    trimmed_latest = latest_trimmed(lake_root)
+    trimmed_days = _TrimmedQuotes(lake_root, manifest_latest, trimmed_latest)
 
-    ticker_days = surface_ticker_days(lake_root, QUOTES)
+    ticker_days = surface_ticker_days(lake_root, QUOTES, manifest_latest=manifest_latest)
     appended: list[Landed] = []
     held: list[HeldFinding] = []
     skipped: list[Skip] = []
     unchanged = 0
+    frozen = 0
 
     # Every instrument this walk has already seen carrying a value, which is what tells a
     # change the lake watched happen from a value that was already there when it started
     # looking. It is keyed on the instrument rather than the ticker, so a symbol handed from
     # one instrument to another gives the incoming one its own first observation.
     seen: set[int] = set()
+    # The earliest place in the walk's order, ticker then day, where the lake watched each
+    # instrument on a quotes day the trim has since removed. A walk of the whole lake has seen
+    # the instrument only at a later place, and the trim can keep an older day while it drops
+    # a newer one, so the walk can meet a day on disk before the trimmed day.
+    seen_trimmed_at: dict[int, tuple[str, date]] = {}
+    for key, entry in current.items():
+        if key[2] != TYPE_DIVIDEND:
+            continue
+        place = trimmed_days.recorded_place_trimmed(master, key[0], entry.get("observed_on"))
+        if place is not None and (key[0] not in seen_trimmed_at or place < seen_trimmed_at[key[0]]):
+            seen_trimmed_at[key[0]] = place
     # Every key this run has already emitted. A key is emitted at the first observation
     # carrying its value, and an ex-date that moves away and comes back is not a second
     # first. Without this the walk emits one key twice under two provenances, neither
@@ -1133,6 +1233,10 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
                 hold(_payload_finding(ticker, day, exc))
                 continue
             if isinstance(observation, str):
+                # A quotes day the trim removed on purpose is no skip. The read already found
+                # the file absent, so a trim line beside a present file never reaches here.
+                if observation == REASON_PARTITION_ABSENT and trimmed_days.designed(ticker, day):
+                    continue
                 skipped.append(Skip(ticker, day, observation))
                 continue
             if observation is None:
@@ -1165,9 +1269,23 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
                 continue
 
             assert instrument_id is not None
-            provenance = (
-                PROVENANCE_OBSERVED if instrument_id in seen else PROVENANCE_VENDOR_REPORTED
+            # A key whose first observation was trimmed keeps the ledger's entry. Checked
+            # before the gate, so a bad payload on the oldest day still on disk is suppressed
+            # here exactly as ``previous`` would have suppressed it on an untrimmed lake.
+            key = (instrument_id, ex_date, TYPE_DIVIDEND)
+            existing = current.get(key)
+            if existing is not None and trimmed_days.first_seen_before(
+                master, instrument_id, existing.get("observed_on"), day
+            ):
+                if key not in emitted:
+                    emitted.add(key)
+                    frozen += 1
+                continue
+
+            watched = instrument_id in seen or (
+                instrument_id in seen_trimmed_at and seen_trimmed_at[instrument_id] < (ticker, day)
             )
+            provenance = PROVENANCE_OBSERVED if watched else PROVENANCE_VENDOR_REPORTED
             seen.add(instrument_id)
 
             verdict = check_dividend_consistency(
@@ -1220,7 +1338,87 @@ def extract_dividends(*, lake_root: Path | str, clock: Clock) -> ExtractionRepor
         held=tuple(held),
         unchanged=unchanged,
         skipped=tuple(skipped),
+        frozen=frozen,
     )
+
+
+@dataclass(frozen=True)
+class _TrimmedQuotes:
+    """Which quotes days the trim removed on purpose, read off one snapshot of each ledger.
+
+    One predicate answers "was this day trimmed" for the seed of ``seen`` and for the freeze in
+    :func:`extract_dividends`. The seed asks where in the walk's order a trimmed day sits, so
+    an instrument counts as seen only after the walk passes that place. The predicate holds
+    when ``trimmed.is_designed_absence`` names the day's quotes partition
+    and no file is on disk. ``is_designed_absence`` reads only the ledgers, so without the disk
+    check a trim line beside a file still present, which a crash between the line and the
+    unlink leaves, would freeze a key whose day the walk can still read.
+    """
+
+    root: Path
+    manifest_latest: Mapping[str, Mapping]
+    trimmed_latest: Mapping[str, Mapping]
+
+    def _rel(self, ticker: str, day: date) -> str:
+        paths = LakePaths(self.root)
+        return paths.quotes_partition_path(ticker, day).relative_to(paths.root).as_posix()
+
+    def designed(self, ticker: str, day: date) -> bool:
+        """Whether the trimmed ledger explains this quotes day's absence. Reads no file."""
+        return is_designed_absence(
+            self._rel(ticker, day), self.manifest_latest, self.trimmed_latest
+        )
+
+    def trimmed(self, ticker: str, day: date) -> bool:
+        """Whether this quotes day was trimmed: designed, and no file on disk.
+
+        A path that cannot be checked raises ``OSError``, which the sweep contains.
+        """
+        if not self.designed(ticker, day):
+            return False
+        try:
+            os.lstat(self.root / self._rel(ticker, day))
+        except FileNotFoundError:
+            return True
+        return False
+
+    def recorded_place_trimmed(
+        self, master: SecurityMaster, instrument_id: int, observed_on: object
+    ) -> tuple[str, date] | None:
+        """Where a ledger entry's ``observed_on`` day sits in the walk, when that day was
+        trimmed, as the ticker and the day. ``None`` when it was not trimmed.
+
+        The day's partition is named by ``symbol_at``, never by the ticker the walk is on,
+        because an entry carries only the instrument. ``symbol_at`` never raises, and its
+        ``None`` reads as not trimmed. A value that is not an ISO date string reads as not
+        trimmed too, since parsing it raises a ``TypeError`` or ``ValueError``.
+        """
+        recorded = _iso_day(observed_on)
+        if recorded is None:
+            return None
+        symbol = master.symbol_at(instrument_id, recorded)
+        if symbol is None or not self.trimmed(symbol, recorded):
+            return None
+        return symbol, recorded
+
+    def first_seen_before(
+        self, master: SecurityMaster, instrument_id: int, observed_on: object, day: date
+    ) -> bool:
+        """Whether a key's recorded first observation is earlier than ``day`` and was trimmed."""
+        recorded = _iso_day(observed_on)
+        if recorded is None or not recorded < day:
+            return False
+        return self.recorded_place_trimmed(master, instrument_id, observed_on) is not None
+
+
+def _iso_day(value: object) -> date | None:
+    """``value`` as a date when it is an ISO date string, else ``None``."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def read_master(lake_root: Path) -> SecurityMaster:
@@ -1241,7 +1439,12 @@ def read_master(lake_root: Path) -> SecurityMaster:
         raise MasterAbsent(path) from exc
 
 
-def surface_ticker_days(lake_root: Path, surface: str) -> list[tuple[str, date]]:
+def surface_ticker_days(
+    lake_root: Path,
+    surface: str,
+    *,
+    manifest_latest: Mapping[str, Mapping] | None = None,
+) -> list[tuple[str, date]]:
     """Every sealed ticker-day of one surface the manifest records, in ticker then date order.
 
     The keys are read apart by ``paths.parse_partition_rel``, which inverts the builder that
@@ -1255,9 +1458,14 @@ def surface_ticker_days(lake_root: Path, surface: str) -> list[tuple[str, date]]
     because two walks enumerate this way and they read different surfaces. The dividend
     extraction below reads quotes and ``lake.splits`` reads chains, and a second copy of this
     would be a second place the partition-key convention lives.
+
+    ``manifest_latest`` is a manifest snapshot the caller already read. The dividend walk passes
+    the one it judges trimmed days against, so both answers come from one read. Without it the
+    manifest is read here.
     """
     found: list[tuple[str, date]] = []
-    for partition in latest_entries(lake_root):
+    entries = latest_entries(lake_root) if manifest_latest is None else manifest_latest
+    for partition in entries:
         reference = parse_partition_rel(partition)
         if reference is None or reference.surface != surface:
             continue
@@ -1306,7 +1514,10 @@ def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] |
     ``None`` because the caller has to tell them apart: a ticker-day carrying no ex-date is a
     non-paying instrument reporting nothing, and a ticker-day the battery withheld is a
     session the run could not see. Collapsing the two would file a withheld partition under
-    the count that means the instrument pays no dividend.
+    the count that means the instrument pays no dividend. One reason is not counted: a
+    ``PartitionAbsent`` on a quotes day the trimmed ledger explains is a day the trim removed
+    on purpose, and the caller passes over it. The caller asks the ledger, not this function,
+    because the answer needs the run's one snapshot of the manifest and the trimmed ledger.
 
     The containment is here rather than in the caller's loop or in ``lake.sweep``. A refusal
     caught at the sweep ends the walk, and the walk is ordered by ticker, so it would cost

@@ -8,7 +8,8 @@ deleted. That merge is *compaction*. This module is the close+15 job that does i
 re-sizes the chain chunk plan from what the day captured, then copies the lake to the backup
 target and pings. The backup target is a mounted directory, copied with ``rsync``, or a
 bucket, uploaded to by ``lake.bucket``. On a host whose config sets a window, the job then
-trims chains partitions older than the window, which ``lake.trim`` decides.
+trims chains partitions older than the window, and quotes partitions older than it under a
+landed daily bar, which ``lake.trim`` decides.
 
 The same job runs a second time on a weekday evening. The 18:30 vendor sweep writes bars,
 the actions ledger and reference-table updates into the lake after close+15 has uploaded
@@ -151,12 +152,14 @@ The job's rules, each glossed at first use.
    entry is re-recorded when a trim or restore line landed without it, so the upload never
    sends the ledger under a stale sha. A host with no ``trimmed.jsonl`` reads and writes
    nothing there. After the ping, still in the lock hold, a primary host with a bucket target
-   and a ``lake_window_sessions`` key trims chains partitions older than its window, once each
-   is verified in the bucket (marketlake #787). The trim is the only code that deletes a
+   and a ``lake_window_sessions`` key trims chains partitions older than its window, and
+   quotes partitions older than it under a landed daily bar, once each is verified in the
+   bucket (marketlake #787, #794). The trim is the only code that deletes a
    sealed partition on its own, and the hand-run ``recompact_ticker_day`` is the only code
    that replaces one. The trim records each partition in ``trimmed.jsonl`` first. It never
    raises, so a trim fault withholds no ping and loses none of the night's lines. Then every
-   empty ``chains/ticker=T/`` goes, on any host that holds a trimmed ledger.
+   empty ``chains/ticker=T/`` and ``quotes/ticker=T/`` goes, on any host that holds a trimmed
+   ledger.
 
 This module reads no wall clock. ``clock`` and ``calendar`` are injected, and every
 session-relative moment comes from the session clock over them.
@@ -208,6 +211,7 @@ from lake.parquet_footer import count_disagreement
 from lake.paths import (
     CHAINS,
     DATE_PREFIX,
+    QUOTES,
     REPORTS_DIR,
     SEGMENT_GLOB,
     SURFACE_PREFIX,
@@ -652,8 +656,8 @@ class CompactionResult:
 
     ``trim`` is what the trim after the ping did (marketlake #787), or ``None`` on a host
     whose config sets no window, which never trims. ``pruned`` lists each empty
-    ``chains/ticker=T/`` directory the pass after the trim removed, on any host that holds a
-    ``trimmed.jsonl``.
+    ``chains/ticker=T/`` and ``quotes/ticker=T/`` directory the pass after the trim removed, on
+    any host that holds a ``trimmed.jsonl``.
 
     ``slug`` is the check this run pinged, or would have pinged. It is ``compaction`` for the
     close+15 run and ``evening-upload`` for the run after the vendor sweep, and ``render``
@@ -1532,28 +1536,40 @@ def _trim_step(
 
 
 def _prune_trimmed_tickers(root: Path) -> tuple[str, ...]:
-    """Remove each empty ``chains/ticker=T/`` on a host that holds a trimmed ledger.
+    """Remove each empty ``chains/ticker=T/`` and ``quotes/ticker=T/`` on a host with a ledger.
 
-    A trim's unlink can empty a ticker's directory, and so can a range restore refused after
-    its ``mkdir`` (marketlake #816), on hosts that never trim too. An empty one makes the
-    dashboard list the ticker on ``chains`` with no days. The pass is gated on the ledger,
-    not on the window, so a host rolled back from trimming still runs it, and a host that
-    never held a ledger reads nothing and changes nothing. It runs as a pass on every run
-    rather than right after an unlink, so a crash between the two leaves nothing for good.
-    Only an empty directory goes, so this never deletes data. Neither an ``rmdir`` nor the
-    listing is fsynced, and a lost ``rmdir`` is redone the next night.
+    A trim's unlink can empty a ticker's directory, and so can a range restore refused after its
+    ``mkdir`` (marketlake #816), on hosts that never trim too. An empty one makes the dashboard list
+    the ticker on that surface with no days. ``quotes/`` is scanned since marketlake #794 trims it.
+    A retired ticker then leaves the dashboard once its last quotes day is trimmed, about 22
+    sessions after retirement, because ``lake_roster`` finds no directory. One with a quotes day
+    kept for good, which the trim keeps while no daily bar lands for it, keeps its directory and
+    stays, showing that day as its last capture. The pass is gated on the ledger, not on the window,
+    so a host rolled back from trimming still runs it, and a host that never held a ledger reads
+    nothing and changes nothing. It runs as a pass on every run rather than right after an unlink,
+    so a crash between the two leaves nothing for good. Only an empty directory goes, so this never
+    deletes data. Neither an ``rmdir`` nor the listing is fsynced, and a lost ``rmdir`` is redone
+    the next night.
     """
     try:
         if not trimmed.trimmed_path(root).exists():
             return ()
-        with os.scandir(root / CHAINS) as entries:
-            tickers = sorted(
-                entry.path
-                for entry in entries
-                if entry.name.startswith(TICKER_PREFIX) and entry.is_dir(follow_symlinks=False)
-            )
     except OSError:
         return ()
+    tickers: list[str] = []
+    for surface in (CHAINS, QUOTES):
+        try:
+            with os.scandir(root / surface) as entries:
+                tickers.extend(
+                    sorted(
+                        entry.path
+                        for entry in entries
+                        if entry.name.startswith(TICKER_PREFIX)
+                        and entry.is_dir(follow_symlinks=False)
+                    )
+                )
+        except OSError:
+            continue
     removed: list[str] = []
     for path in tickers:
         try:
