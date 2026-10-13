@@ -35,17 +35,18 @@ def _settings() -> dict:
     return yaml.safe_load(TRACKED_SETTINGS.read_text(encoding="utf-8"))
 
 
-def test_the_vm_runs_as_a_shadow():
-    """The VM shadows the laptop for #638's switch-back rehearsal.
+def test_the_vm_runs_as_the_primary():
+    """The VM is the primary capture host, since #638's cutover and its return.
 
     The cutover flipped ``role`` to ``primary`` and inverted this test in the same change.
-    The way back sets it to ``shadow`` and inverts it again, and the return to the VM
-    inverts it a third time. This test reads only the VM's tracked file. Keeping the laptop
-    and the VM from both running as primary is the way back's order, which #638 writes down.
+    The way back's rehearsal set it to ``shadow`` for one laptop session, and the return to
+    the VM set it to ``primary`` again, each with this test. This test reads only the VM's
+    tracked file. Keeping the laptop from also running as primary is the way back's order,
+    which #638 writes down.
     """
     role = _settings()["role"]
     assert type(role) is str
-    assert role == "shadow"
+    assert role == "primary"
 
 
 def test_the_settings_hold_exactly_the_six_keys():
