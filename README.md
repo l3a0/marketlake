@@ -334,9 +334,13 @@ A command run by hand is not a unit the stop can see.
    bucket's manifest records, including any partition the hosted VM trimmed. On a host
    whose config sets the key, which is the hosted VM, the restore rebuilds that host's
    trimmed lake ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out
-   each partition the bucket's `trimmed.jsonl` says was removed on purpose, so the
-   restored lake holds what the bucket holds, less those. A partition trimmed after the
-   ledger last uploaded comes back, and the next trim removes it again. A removed
+   each partition the bucket's `trimmed.jsonl` says was removed on purpose. It also leaves
+   out each report whose path names a day the lake's own run reported on, when that day is
+   on or before the newest day among those partitions: the nightly files at the root of
+   `reports/`, and the files under `reports/close_guard/` and `reports/alerts/`
+   ([#796](https://github.com/l3a0/marketlake/issues/796)). The restored lake holds what
+   the bucket holds, less those, and every other report comes back. A partition trimmed
+   after the ledger last uploaded comes back, and the next trim removes it again. A removed
    partition the bucket no longer holds is named on its own line and fails nothing. A
    malformed window key, or one under the smallest window the lake's own readers need,
    refuses with exit 2 before any request. For a one-off whole-lake restore on such a

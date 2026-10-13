@@ -180,6 +180,7 @@ from lake.manifest import (
 )
 from lake.paths import (
     ACTIONS,
+    ALERTS_DIR,
     CHAINS,
     CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
@@ -188,6 +189,7 @@ from lake.paths import (
     MANIFEST_FILE,
     QUARANTINE_FILE,
     REFERENCE_DIR,
+    REPORTS_DIR,
     TEMP_MARKER,
     TRIMMED_FILE,
     LakePaths,
@@ -196,6 +198,7 @@ from lake.paths import (
     parse_partition_rel,
     temp_write_path,
 )
+from lake.report import CLOSE_GUARD_DIR, parse_nightly_name
 from lake.runner import BACKUP_EXCLUSIONS
 from lake.session import SessionClock
 from lake.trimmed import is_designed_absence, latest_by_partition, latest_trimmed, parse_trimmed
@@ -2085,11 +2088,15 @@ class RestoreSummary:
     leaves one behind. Each was verified against the checksum S3 stored at upload, so it
     is named rather than failed.
 
-    Two fields count what a restore that skips designed absences left out, and stay empty in a
-    whole-lake restore. ``trimmed_left_out`` counts the listed keys left out because the
+    Three fields count what a restore that skips designed absences left out, and stay empty in
+    a whole-lake restore. ``trimmed_left_out`` counts the listed keys left out because the
     bucket's ``trimmed.jsonl`` says the lake removed them on purpose. ``trimmed_lost`` names each
     designed absence the bucket no longer holds. The rebuilt lake never needed that file, so it
     is named rather than failed, and the Sunday bucket scrub reports the loss every week.
+    ``reports_left_out`` counts the listed report keys left out because the night their path
+    names is on or before the newest trimmed day (marketlake #796). Like ``trimmed_left_out``,
+    it counts keys the plan leaves out, never files a resumed run prunes from its working
+    directory.
     """
 
     target: str
@@ -2102,6 +2109,7 @@ class RestoreSummary:
     segments_left_out: int = 0
     trimmed_left_out: int = 0
     trimmed_lost: list[str] = field(default_factory=list)
+    reports_left_out: int = 0
     unrecorded: list[str] = field(default_factory=list)
     failures: list[tuple[str, str]] = field(default_factory=list)
     restored: bool = False
@@ -2123,6 +2131,11 @@ class RestoreSummary:
             trimmed += (
                 f"{len(self.trimmed_lost)} partition(s) trimmed on purpose and missing from "
                 "the bucket, "
+            )
+        if self.reports_left_out:
+            trimmed += (
+                f"{self.reports_left_out} report(s) filed on or before the newest trimmed day "
+                "left out, "
             )
         return (
             f"restored {self.files} file(s) from {self.target} into {self.dest}: downloaded "
@@ -2731,6 +2744,10 @@ def restore_lake(
        written and is named as a failure. A manifested file the bucket does not hold is a
        failure named missing, unless it is a designed absence being skipped. That one is
        named in ``trimmed_lost`` and fails nothing, since the rebuilt lake never needed it.
+       When skipping designed absences, each report whose key names a day the lake's own run
+       reported on is left out too when that day is on or before the newest trimmed day, by
+       :func:`_report_night`. That day is the newest one among the designed absences, by
+       :func:`_newest_trimmed_day`, and with none every report is restored.
     4. The free space on the destination's filesystem must cover every planned byte not
        already verified in the working directory, or the command refuses before the
        first data file. What is left after those bytes must then cover the journal
@@ -2774,6 +2791,16 @@ def restore_lake(
     def designed(rel: str) -> bool:
         return skip_designed_absences and is_designed_absence(rel, latest, trimmed_latest)
 
+    # Computed once from the ledgers rather than from the listing, so a designed absence the
+    # bucket lost still sets it. A whole-lake restore reads no ledger and gets None.
+    newest_trimmed = _newest_trimmed_day(latest, trimmed_latest)
+
+    def old_report(rel: str) -> bool:
+        if newest_trimmed is None:
+            return False
+        night = _report_night(rel)
+        return night is not None and night <= newest_trimmed
+
     plan: dict[str, str | None] = {}
     for rel in sorted(listing):
         if rel == MANIFEST_FILE or (rel.endswith("/") and listing[rel] == 0):
@@ -2788,6 +2815,9 @@ def restore_lake(
             continue
         if designed(rel):
             summary.trimmed_left_out += 1
+            continue
+        if old_report(rel):
+            summary.reports_left_out += 1
             continue
         plan[rel] = str(latest[rel]["sha256"]) if rel in latest else None
     summary.failures.extend(_case_collisions(plan))
@@ -2826,6 +2856,56 @@ def restore_lake(
     _move_verified(work, dest, plan, mode=RESTORE_MODE, selection=None)
     summary.restored = True
     return summary
+
+
+def _newest_trimmed_day(
+    latest: Mapping[str, Mapping], trimmed_latest: Mapping[str, Mapping]
+) -> date | None:
+    """The newest day among the partitions the two ledgers call designed absences, or None.
+
+    Every designed absence has a line in ``trimmed_latest``, so iterating it covers each one,
+    including one the bucket no longer lists. ``runway.path_day`` dates each, bars paths
+    included, and a designed absence it cannot date is skipped, which can only keep more
+    reports. The day reads no clock and no window edge. It is never later than the newest edge
+    a recorded trim used, and it can be earlier, since a trim stopped by its deadline, a
+    capture gap or the checkpoint's cutoff leaves the newest trimmed day behind the edge.
+    """
+    days = []
+    for rel in trimmed_latest:
+        if not is_designed_absence(rel, latest, trimmed_latest):
+            continue
+        day, _segment = runway.path_day(rel.split("/"))
+        if day is not None:
+            days.append(day)
+    return max(days, default=None)
+
+
+# The two ``reports/`` subdirectories whose ``date=D`` names a day the lake's own run reported
+# on: the session day the close guard ran for, and the Eastern date a page failed to send.
+# ``withheld/``, ``schema_drift/`` and ``damaged_segments/`` name the ticker-day whose rows
+# produced the finding instead, which can precede the lake's first session by months.
+_NIGHT_KEYED_REPORT_DIRS = frozenset({CLOSE_GUARD_DIR, ALERTS_DIR})
+
+
+def _report_night(rel: str) -> date | None:
+    """The day of the lake's own run a report key names, or None when it names no such day.
+
+    Three producers key the path on that day: the sweep's nightly file at the root of
+    ``reports/``, named by the day the sweep reported on and read by
+    ``report.parse_nightly_name``, and the files under
+    ``reports/close_guard/date=D/`` and ``reports/alerts/date=D/``, read by
+    ``paths.parse_date_dir``. Every other key answers None and a rebuild keeps it, including
+    the three ticker-day subtrees, a root name that does not parse and a malformed ``date=``
+    directory.
+    """
+    parts = rel.split("/")
+    if parts[0] != REPORTS_DIR:
+        return None
+    if len(parts) == 2:
+        return parse_nightly_name(parts[1])
+    if len(parts) == 4 and parts[1] in _NIGHT_KEYED_REPORT_DIRS:
+        return parse_date_dir(parts[2])
+    return None
 
 
 def _case_collisions(plan: Iterable[str]) -> list[tuple[str, str]]:
@@ -4965,7 +5045,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Download the bucket's current versions into an empty directory and verify them. "
             "On a host whose config sets lake_window_sessions, leave out each partition the "
-            "bucket's trimmed.jsonl says was removed on purpose."
+            "bucket's trimmed.jsonl says was removed on purpose, and each report dated by the "
+            "lake's own run on or before the newest such day."
         ),
     )
     restore.add_argument(

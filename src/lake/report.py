@@ -100,6 +100,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -872,6 +873,29 @@ def nightly_path(lake_root: Path | str, day: date, *, stamp: str, pid: int) -> P
     return Path(lake_root) / REPORTS_DIR / f"{day.isoformat()}-{stamp}-{pid}.json"
 
 
+# The whole shape of a name :func:`nightly_path` writes: a strict ``YYYY-MM-DD``, the
+# twelve digits of ``%H%M%S%f``, the pid, and ``.json``, joined by hyphens and nothing else.
+_NIGHTLY_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9]{12}-[0-9]+\.json")
+
+
+def parse_nightly_name(name: str) -> date | None:
+    """The day a nightly report file's ``name`` is about, or None for any other name.
+
+    Strict, the way ``paths.parse_date_dir`` is. The whole name must have the shape
+    :func:`nightly_path` writes, and the digits must make a real date, so a name that only
+    starts with a date is refused. A rebuild of a trimmed lake reads this to leave out the
+    nightly files filed on or before its newest trimmed day (marketlake #796), and keeps every
+    name this refuses.
+    """
+    match = _NIGHTLY_NAME.fullmatch(name)
+    if match is None:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
 def write_nightly(
     lake_root: Path | str,
     nightly: Nightly,
@@ -961,6 +985,7 @@ __all__ = [
     "damaged_segments_dir",
     "redacted",
     "nightly_path",
+    "parse_nightly_name",
     "schema_drift_dir",
     "withheld_dir",
     "write_close_guard",
