@@ -3,8 +3,9 @@ name: Board
 # Rebuilds the build board from GitHub and publishes it on GitHub Pages, so no session
 # has to measure and write it by hand (#872). .claude/skills/sync-prune-next/build_board.py
 # reads every figure through the API and writes board.json, and the page beside it,
-# board.html, fetches that file every two minutes. Issue 873 moves the session
-# judgements the board still lacks onto GitHub.
+# board.html, fetches that file every two minutes. Session judgements reach it as
+# working: labels and as lines the owner writes in comments and issue bodies, which
+# the board-markers skill describes (#873).
 #
 # A label, a body edit or a comment starts a run through `issues` and `issue_comment`.
 # A "blocked by" link and a sub-issue start none, because GitHub Actions lists no

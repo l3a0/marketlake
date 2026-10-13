@@ -260,10 +260,33 @@ in progress that nothing else announces, such as the worktree above.
 
 A GitHub Action rebuilds the board from GitHub and publishes it at
 <https://l3a0.github.io/marketlake/>, so a round writes nothing to it. This
-step checks that the Action's last run succeeded. Then it builds the same
-`board.json` into a scratch directory, so step 4 reads GitHub as it stands
-rather than as the last run saw it. Last, it confirms the page drew the
-published board, as "Confirm the page drew it" below describes.
+step runs in this order.
+
+1. It starts a run of the Action.
+2. It checks that the Action's last finished run succeeded.
+3. It builds the same `board.json` into a scratch directory, so step 4 reads
+   GitHub as it stands rather than as the last run saw it.
+4. It reports what that build's summary lists, and any stale `working:`
+   label.
+5. It confirms the page drew the published board, as "Confirm the page drew
+   it" below describes.
+
+The round starts the run first because GitHub's schedule is unreliable. It
+fired none of this workflow's first four due slots on 2026-10-12, and the
+sibling board measured one scheduled run in about 25 due slots. A run takes 25
+to 62 seconds, so a check of the page made straight after starting it reads
+the previous board. Building locally in between gives the run that time. The
+run deploys to the `github-pages` environment, which has a branch policy and
+no required reviewers, so starting it approves nothing.
+
+```bash
+gh workflow run board.yml --repo l3a0/marketlake
+gh run list --repo l3a0/marketlake --workflow board.yml --event workflow_dispatch --limit 1 --json databaseId,status,url
+```
+
+The second command shows the run the first one started. `gh workflow run` may
+ask for permission each round, because no allow rule covers it yet. Say so in
+the report if it does.
 
 This prints the board workflow's newest finished run that was not cancelled.
 
@@ -292,13 +315,81 @@ rm -f <scratch>/board.json
 uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <scratch>
 ```
 
-It writes `<scratch>/board.json` and prints what the read cost in GraphQL
-requests and points. Run it with `uv run python`, never `python3`. macOS's
+It writes `<scratch>/board.json` and prints a summary table: what the read
+cost in GraphQL requests and points, and what it found in the markers sessions
+set. Run it with `uv run python`, never `python3`. macOS's
 `/usr/bin/python3` is 3.9 and cannot import the script. The script reads
 GitHub through the session's `gh` login and fails closed, so a failed call
 stops it with a non-zero exit before it writes `board.json`. Report the
 failure. Step 4 then reads the last board the workflow published, and reads
 the open pull requests again from GitHub.
+
+### Report what the build found
+
+The summary the build printed is the only place a round sees these, because
+nobody reads the Action's own job summary. Report every row that does not read
+`none`, with each issue linked.
+
+- **Markers that disagree.** An issue carrying both `working:` labels, read as
+  `build`, or a body carrying several `Board order:` lines, read as the first.
+- **Marker lines not read.** A line of the owner's that looks meant as a
+  marker and is not read, such as `board order: 3`, `- Board order: 3`, an
+  order of more than 15 digits, or a `Board after:` line naming no issue.
+- **Marker lines refused.** A marker in text the owner did not write, or a
+  `Board after:` reference to another repository.
+- **Markers dropped.** A verdict or an order on a parent, or a verdict on a
+  deferred card.
+- **Finished plans with no verdict after them.** An open issue with no
+  `working:decompose` label whose newest owner `## Plan audit, pass N`
+  comment is newer than its newest owner verdict, or that has passes and no
+  verdict at all. Parents, deferred cards and cards with an open pull request
+  are left out. Each is a plan loop that ended without saying so.
+
+A row names the issue and the marker's kind and never the line's text, so read
+the issue for the line itself. The `board-markers` skill states the grammar
+and when each marker is set.
+
+### Report a stale `working:` label
+
+A `working:` label that outlives its session keeps its card under Building or
+Being planned. For `working:build`, it also keeps the card's pull request out
+of the owner's queue. GitHub cannot tell a live session from an ended one, and
+every label's actor is `l3a0`, because sessions act as the owner. So the round
+reads two triggers, each on its own. The labels are the `working` entries of
+`<scratch>/board.json`.
+
+```bash
+jq -c '.working[]' <scratch>/board.json
+```
+
+1. **No session names the issue.** List the sessions with the
+   session-listing tool, and keep the unarchived ones whose `cwd` is under this
+   repository. Flag `working:*` on #N when none of them names #N in its title
+   or carries a `prNumber` whose pull request links #N. Read a pull request's
+   links with `gh pr view <pr> --repo l3a0/marketlake --json closingIssuesReferences,body`.
+2. **Its pull request finished after the label went on.** Flag
+   `working:build` on #N when no open pull request names #N, in `prs` of
+   `<scratch>/board.json`, and a pull request that closes #N or is `Part of`
+   #N merged or closed after the label was added. Without that time gate, a
+   new build of an issue's remainder would read as stale before its pull
+   request exists. These print the time the label was added, the pull requests
+   that close #N, and those whose body names it as `Part of`.
+
+   ```bash
+   gh api graphql -F n=<N> -f query='query($n:Int!){repository(owner:"l3a0",name:"marketlake"){issue(number:$n){timelineItems(itemTypes:[LABELED_EVENT],last:100){nodes{... on LabeledEvent{createdAt label{name}}}} closedByPullRequestsReferences(first:50,includeClosedPrs:true){nodes{number state closedAt}}}}}' --jq '{labeled: [.data.repository.issue.timelineItems.nodes[] | select(.label.name == "working:build") | .createdAt] | last, closing: .data.repository.issue.closedByPullRequestsReferences.nodes}'
+   gh pr list --repo l3a0/marketlake --state all --limit 1000 --search '"Part of #<N>" in:body' --json number,state,closedAt
+   ```
+
+   The search matches loosely, so confirm a `Part of #N` reference in the
+   body of any pull request it returns before counting it.
+
+Before calling a label stale, ask the session that owns it, when one exists,
+through the session-messaging tool. Report a stale label, and never remove one.
+Removing it is the owning session's step, or the owner's. Neither trigger has
+a test. The first needs the session list, which CI cannot see, and the second
+needs closed pull requests and label timelines, which the generator does not
+fetch. The rule misses sessions on another machine and finished sessions
+nobody archived.
 
 ### The board on GitHub Pages
 
@@ -405,15 +496,18 @@ above, which `README.md` and the `src/lake/favicon.py` docstring name too.
   `"skipped"` and at least one is `"success"`. It reads any word outside
   these five as unsettled, the same as `"neutral"`, so an unknown word keeps a
   card out of the owner's queue rather than drawing a pass.
-- **`working`**, **`planned`** and **`next`** are empty until
-  [#873](https://github.com/l3a0/marketlake/issues/873) moves those
-  judgements onto GitHub. The page still draws each one. A `working` entry,
-  `{n, kind, what}`, marks a card a session is on, and one with
-  `kind: "build"` draws under Building and keeps its pull request out of the
-  owner's queue. A `planned` entry, `{n, passes, ready}`, marks a card whose
-  plan is finished. A `next` entry, `{issue, band, order, ready}`, ranks a
-  card. With `next` empty, the page's default view draws every card in the
-  chosen milestone rather than only the ranked ones.
+- **`working`**, **`planned`** and **`next`** come from markers sessions set
+  on GitHub, which the `board-markers` skill describes and `build_board.py`
+  reads. A `working` entry, `{n, kind}`, comes from a `working:build` or
+  `working:decompose` label. One with `kind: "build"` draws under Building and
+  keeps its pull request out of the owner's queue. A `planned` entry,
+  `{n, passes, ready}`, comes from the owner's newest `Board verdict:` comment
+  line, and marks a card whose plan is finished. A `next` entry,
+  `{issue, band, order, ready}`, comes from a `Board order:` line in the body
+  of an issue the owner opened, and ranks the card. `band` is 0 in every
+  entry. `ready` is the card's verdict, or `plan` without one. With nothing
+  ranked in the chosen milestone, the page's default view draws every card in
+  it rather than only the ranked ones. Each list is sorted by issue number.
 - **`tracker`** has one card per open issue, as `{n, label, labels, ms, kind,
   needs}`. Its `ms` is the milestone's title up to its first comma, so
   "MVP 2, capture on a hosted VM" reads `"MVP 2"`, or `"no milestone"`. Its
@@ -422,9 +516,10 @@ above, which `README.md` and the `src/lake/favicon.py` docstring name too.
   `data`, which the generator never writes. Its `needs` holds the open issues
   in this repository that a native "blocked by" link names. Dependency
   sections in issue bodies are not read, so a blocker written only in a body
-  is not on the board until someone adds the link. The page also reads an
-  `after` list, the cards a card should land behind, which the generator does
-  not write until [#873](https://github.com/l3a0/marketlake/issues/873).
+  is not on the board until someone adds the link. Its `after`, when present,
+  lists the open issues other than itself that a `Board after:` line in the
+  owner's body names, the cards it should land behind. Its `labels` leave out
+  the `working:` labels, which draw as its place under In flight instead.
 
 The generator writes no `untracked`, which the page reads as empty.
 
@@ -446,8 +541,8 @@ screen and says live updates stopped.
    `rollup` list whose every entry is a pair of strings. `linked` is a boolean
    or a list of issue numbers, and `partOf`, when present, is a boolean. The
    page reads a list as linked only when it names the entry's own `issue`.
-5. Each `working` entry has a number `n` and a string `what`. A `kind`, when
-   present, is a string.
+5. Each `working` entry has a number `n`. A `kind`, when present, is a
+   string.
 6. Each `planned` entry has a number `n` and a number `passes`.
 7. Each `next` entry has a number `issue` and a number `band`. An `order`,
    when present, is a number.
@@ -532,11 +627,13 @@ Read `<scratch>/board.json`, the file step 3 built, rather than the page,
 which can be a run behind. `CLAUDE.md`'s ranking directive and its exceptions
 decide the order. Read them there rather than from a copy here.
 
-Once [#873](https://github.com/l3a0/marketlake/issues/873) moves the ranking
-onto GitHub, the file's `next` stores that order, so read `next` rather than
-re-deriving it. Until then `next`, `planned` and `working` are empty. So rank
-the candidates from the directive itself, and report that the round had no
-`working` or `planned` entries to read.
+The file's `next` stores the order the owner's `Board order:` lines set, so
+rank by `next` rather than re-deriving it. Sort it by `order`, lowest first,
+as the page does. Skip a `next` entry whose card is `deferred`,
+as the page does, so the round never recommends a card the page hides. Then
+rank the open issues `next` leaves out by the directive itself, after the
+ranked ones. When `next` is empty, the directive ranks everything, and the
+report says nothing is ranked.
 
 When step 3 could not build the file, read the last board the workflow
 published instead, and print the time it read GitHub.
@@ -576,11 +673,12 @@ Collect candidates from three places, and give the evidence for each one.
    - `planned` entries with `ready` of `decide`.
    - Questions a session handed back.
 2. **Plans ready to build with no builder.** These are `planned` entries with
-   `ready` of `build`, with no `working` entry, no open pull request, and no
-   `needs` entry naming an issue still in `tracker`.
-3. **The MVP milestone's remaining issues**, in `next`'s order, or in the
-   directive's while `next` is empty, each with the blockers its `needs`
-   names. A blocked issue is not a candidate until its
+   `ready` of `build`, with no `working` entry other than one step 3 reported
+   stale, no open pull request, and no `needs` entry naming an issue still in
+   `tracker`.
+3. **The remaining open issues**, ranked as above: `next`'s order first,
+   across every milestone, then the directive's for the rest, each with the
+   blockers its `needs` names. A blocked issue is not a candidate until its
    blockers close, so name what it waits on rather than recommending it.
 
 Link every issue and pull request number, as `[#NN](...)` for an issue and
