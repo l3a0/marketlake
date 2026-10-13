@@ -301,10 +301,10 @@ def test_the_tracked_settings_render(monkeypatch, capsys, metadata, config_dir, 
 
     assert _render(monkeypatch, tracked.read_bytes()) == 0
     # The tracked file also sets the lake window, marketlake #786, the one value it carries
-    # that is not text, and the role is primary since #638's cutover.
+    # that is not text, and the role is shadow for #638's switch-back rehearsal.
     assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == {
         **EXPECTED,
-        "role": "primary",
+        "role": "shadow",
         "lake_window_sessions": 22,
     }
 
