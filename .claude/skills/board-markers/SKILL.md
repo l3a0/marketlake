@@ -116,6 +116,9 @@ number.
    heading comes after its newest verdict, in a later comment or lower in the
    same one, so a loop that exits without a verdict is reported. An exit
    comment headed as the last pass and ending with the verdict is not listed.
+
+   In the same step, post the loop's cost as a separate comment starting with
+   the line `## Cost`, per `CLAUDE.md`'s "Cost on the issue".
 3. **A build starts.** Add `working:build`, after the same check as a plan
    loop.
 
@@ -134,6 +137,10 @@ number.
    ```bash
    gh issue edit <n> --repo l3a0/marketlake --remove-label working:build
    ```
+
+   In the same step, post the build's and the review's cost on the issue as a
+   comment starting with the line `## Cost`, per `CLAUDE.md`'s "Cost on the
+   issue".
 
    A `Part of` pull request leaves its issue open. Once it merges, the card
    drops back to "Planned, no builder" with its old verdict reading "ready to
