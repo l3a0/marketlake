@@ -104,13 +104,19 @@ ORDER = re.compile(r"^[ \t]*Board order: (-?\d+(?:\.\d+)?)[ \t]*$", re.MULTILINE
 AFTER = re.compile(r"^[ \t]*Board after:(.*)$", re.MULTILINE)
 WORKING = {"working:build": "build", "working:decompose": "decompose"}
 
-# A line that looks meant as a marker: one starting, after whitespace and any of
-# `>*-_`, with the marker's words in any case. One the strict grammar above fails is
-# reported as unread rather than ignored, so a typo never drops a marker silently.
-# Matching anywhere on a line instead would report this repository's prose about the
-# markers on every run.
+# A line that looks meant as a marker. It starts, after whitespace, any of `>*_+-` and
+# any list number such as `1.` or `1)`, with "board" and the marker's kind in any case.
+# The kind must then end the line, or be followed by optional `*` or `_`, optional
+# whitespace, and a `:`, a digit or a `#`. So `Board order 3`, `Board Order: 3` and
+# `**Board order**: 3` are near misses, while prose such as "Board orders form one
+# sequence" or "Board after the merge" is not a marker at all. One the strict grammar
+# above fails is reported as unread rather than ignored, so a typo never drops a marker
+# silently. Matching anywhere on a line instead would report this repository's prose
+# about the markers on every run.
 MARKER_LINE = re.compile(
-    r"^(?:[^\S\n]|[>*_-])*board[^\S\n]+(order|verdict|after)", re.MULTILINE | re.IGNORECASE
+    r"^(?:[^\S\n]|[>*_+-]|\d{1,9}[.)])*board[^\S\n]+(order|verdict|after)"
+    r"(?:[*_]*[^\S\n]*[:#\d]|[*_]*[^\S\n]*$)",
+    re.MULTILINE | re.IGNORECASE,
 )
 MARKER_NAME = {"order": "Board order", "verdict": "Board verdict", "after": "Board after"}
 
@@ -124,7 +130,9 @@ MAX_DIGITS = 15
 # form `[#N](url)`. The `{1,15}` and the `\b` after it read a longer number as no
 # reference at all, rather than one `int()` cannot parse.
 LINK_REF = re.compile(r"\[#(\d{1,15})\]\(([^)\s]*)\)")
-ISSUE_URL = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull)/(\d+)/?")
+# An issue's or pull request's address, with anything after the number, such as a
+# comment's `#issuecomment-5` anchor, a query or a `/files` tab.
+ISSUE_URL = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull)/(\d+)(?:[/#?]\S*)?")
 REPO_REF = re.compile(r"(?<![\w.-])([\w.-]+/[\w.-]+)#(\d{1,15})\b")
 BARE_REF = re.compile(r"(?<![\w/.-])#(\d{1,15})\b")
 
@@ -394,13 +402,16 @@ class Notes:
         self.dropped: set[tuple[int, str]] = set()
 
 
-def _marker_lines(text: str) -> list[tuple[str, str]]:
-    """Each line of already unfenced text that looks meant as a marker, with its kind."""
+def _marker_lines(text: str) -> list[tuple[str, str, int]]:
+    """Each line of already unfenced text that looks meant as a marker, with its kind
+    and the offset where the line starts."""
     found = []
+    offset = 0
     for line in text.split("\n"):
         m = MARKER_LINE.match(line)
         if m:
-            found.append((m.group(1).lower(), line))
+            found.append((m.group(1).lower(), line, offset))
+        offset += len(line) + 1
     return found
 
 
@@ -414,25 +425,27 @@ def _order_value(text: str) -> int | float:
     return int(value) if value.is_integer() else value
 
 
-def after_refs(rest: str, repo: str) -> tuple[set[int], int]:
-    """The issues in ``repo`` that the text after ``Board after:`` names, and how many
-    references it refused.
+def after_refs(rest: str, repo: str) -> tuple[set[int], set[str]]:
+    """The issues in ``repo`` that the text after ``Board after:`` names, and the
+    summary phrase for each kind of reference it refused.
 
     A reference to another repository is refused, whether written ``owner/name#N`` or
     as a link whose address names another repository. Read as a bare ``#N``, its
     number would match a marketlake issue it does not mean, the trap ``tracker_card``
-    avoids for ``needs``.
+    avoids for ``needs``. A link whose text names one number and whose address names
+    another is refused too, because nothing says which one was meant.
     """
     named: set[int] = set()
-    refused = 0
+    refused: set[str] = set()
 
     def link(m: re.Match[str]) -> str:
-        nonlocal refused
         url = ISSUE_URL.fullmatch(m.group(2))
-        if url and url.group(1).lower() == repo.lower() and url.group(2) == m.group(1):
-            named.add(int(m.group(1)))
+        if not url or url.group(1).lower() != repo.lower():
+            refused.add("Board after, naming another repository")
+        elif url.group(2) != m.group(1):
+            refused.add("Board after, link and number disagree")
         else:
-            refused += 1
+            named.add(int(m.group(1)))
         return "\0"
 
     rest = LINK_REF.sub(link, rest)
@@ -440,7 +453,7 @@ def after_refs(rest: str, repo: str) -> tuple[set[int], int]:
         if m.group(1).lower() == repo.lower():
             named.add(int(m.group(2)))
         else:
-            refused += 1
+            refused.add("Board after, naming another repository")
     rest = REPO_REF.sub("\0", rest)
     named |= {int(x) for x in BARE_REF.findall(rest)}
     return named, refused
@@ -469,7 +482,7 @@ def read_body(issue: dict, repo: str, notes: Notes) -> tuple[list[int | float], 
         return [], set()
     orders: list[int | float] = []
     after: set[int] = set()
-    for kind, line in _marker_lines(text):
+    for kind, line, _ in _marker_lines(text):
         if kind == "order":
             m = ORDER.match(line)
             if m and _short(m.group(1)):
@@ -480,8 +493,7 @@ def read_body(issue: dict, repo: str, notes: Notes) -> tuple[list[int | float], 
             if m:
                 named, refused = after_refs(m.group(1), repo)
                 after |= named
-                if refused:
-                    notes.refused.add((n, "Board after, naming another repository"))
+                notes.refused |= {(n, phrase) for phrase in refused}
                 if named or refused:
                     continue
         notes.unread.add((n, MARKER_NAME[kind]))
@@ -501,19 +513,21 @@ def read_comments(issue: dict, notes: Notes) -> tuple[tuple[str, int] | None, bo
     n = issue["number"]
     comments = (issue.get("comments") or {}).get("nodes") or []
     verdict: tuple[str, int] | None = None
-    verdict_at = last_pass = -1
+    # Positions are (comment index, offset in the comment), so a pass heading after the
+    # verdict in the same comment counts as newer, and one above it does not.
+    verdict_at = last_pass = (-1, -1)
     for i, c in enumerate(comments):
         text = unfenced(c.get("body") or "")
         if c.get("authorAssociation") != "OWNER":
             if VERDICT.search(text):
                 notes.refused.add((n, "Board verdict, not the owner's"))
             continue
-        if PASS_HEADING.search(text):
-            last_pass = i
-        for kind, line in _marker_lines(text):
+        for heading in PASS_HEADING.finditer(text):
+            last_pass = (i, heading.start())
+        for kind, line, offset in _marker_lines(text):
             m = VERDICT.match(line) if kind == "verdict" else None
             if m and _short(m.group(2)):
-                verdict, verdict_at = (m.group(1), int(m.group(2))), i
+                verdict, verdict_at = (m.group(1), int(m.group(2))), (i, offset)
             else:
                 notes.unread.add((n, MARKER_NAME[kind]))
     return verdict, last_pass > verdict_at

@@ -292,6 +292,8 @@ def test_only_the_owners_newest_verdict_line_plans_a_card(
         ("Intro.\n\n \tBoard order: 7\t\n\nMore prose.", 7),
         ("Board order: 7\r\nBoard after: #2\r\n", 7),
         ("Board order: 123456789012345", 123456789012345),
+        ("Board order: -123456789012345", -123456789012345),
+        ("Board order: 12345678901234.5", 12345678901234.5),
     ],
 )
 def test_an_order_line_in_the_owners_body_ranks_the_card(body: str, order: float) -> None:
@@ -383,6 +385,9 @@ def test_an_after_line_naming_only_a_closed_issue_and_the_card_leaves_after_out(
         "Board after: L3A0/MarketLake#2",
         "Board after: [#2](https://github.com/l3a0/marketlake/issues/2)",
         "Board after: [#2](https://github.com/L3A0/marketlake/pull/2)",
+        "Board after: [#2](https://github.com/l3a0/marketlake/issues/2#issuecomment-5)",
+        "Board after: [#2](https://github.com/l3a0/marketlake/issues/2?q=1)",
+        "Board after: [#2](https://github.com/l3a0/marketlake/pull/2/files)",
     ],
 )
 def test_an_after_reference_to_this_repository_counts(line: str) -> None:
@@ -397,7 +402,7 @@ def test_an_after_reference_to_this_repository_counts(line: str) -> None:
         "Board after: l3a0/quantitative-trading#2",
         "Board after: [#2](https://github.com/l3a0/quantitative-trading/issues/2)",
         "Board after: [#2](https://example.com/l3a0/marketlake/issues/2)",
-        "Board after: [#2](https://github.com/l3a0/marketlake/issues/3)",
+        "Board after: [#2](https://github.com/l3a0/quantitative-trading/issues/2#x)",
     ],
 )
 def test_an_after_reference_to_another_repository_is_refused(line: str) -> None:
@@ -405,6 +410,22 @@ def test_an_after_reference_to_another_repository_is_refused(line: str) -> None:
     board, report = run([issue(1, body=line), issue(2), issue(3)])
     assert "after" not in card(board, 1)
     assert report["refused"] == [(1, "Board after, naming another repository")]
+    assert report["unread"] == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Board after: [#2](https://github.com/l3a0/marketlake/issues/3)",
+        "Board after: [#2](https://github.com/l3a0/marketlake/issues/23)",
+        "Board after: [#2](https://github.com/l3a0/marketlake/issues/3#issuecomment-2)",
+    ],
+)
+def test_an_after_link_whose_text_and_address_disagree_is_refused_as_such(line: str) -> None:
+    """Nothing says which number was meant, and the row names that, not another repository."""
+    board, report = run([issue(1, body=line), issue(2), issue(3), issue(23)])
+    assert "after" not in card(board, 1)
+    assert report["refused"] == [(1, "Board after, link and number disagree")]
     assert report["unread"] == []
 
 
@@ -421,6 +442,9 @@ def test_a_refused_reference_leaves_the_rest_of_its_line() -> None:
         "Board after:",
         "Board after: #" + "9" * 16,
         "Board after: #" + "9" * 5000,
+        f"Board after: [#{'9' * 16}](https://github.com/l3a0/marketlake/issues/{'9' * 16})",
+        "Board after: l3a0/marketlake#" + "9" * 16,
+        "Board after: https://example.com/#638",
     ],
 )
 def test_an_after_line_naming_no_issue_is_listed_as_unread(line: str) -> None:
@@ -474,8 +498,11 @@ def test_a_line_in_a_body_the_owner_did_not_write_is_refused(association: str) -
     assert report["unread"] == []
 
 
-def test_a_strangers_verdict_is_refused() -> None:
-    _, report = run([issue(1, comments=(("NONE", "Board verdict: build after 2 passes"),))])
+@pytest.mark.parametrize(
+    "comment", ["Board verdict: build after 2 passes", "Hi.\n\nBoard verdict: build after 2 passes"]
+)
+def test_a_strangers_verdict_is_refused(comment: str) -> None:
+    _, report = run([issue(1, comments=(("NONE", comment),))])
     assert report["refused"] == [(1, "Board verdict, not the owner's")]
 
 
@@ -503,8 +530,18 @@ ORDER_MISSES = [
     "> Board order: 3",
     "**Board order: 3**",
     "_Board order: 3_",
+    "**Board order**: 3",
+    "Board order 3",
+    "Board order #3",
+    "Board Order: 3",
+    "Board order",
+    "1. Board order: 3",
+    "1) Board order: 3",
+    "12. Board order: 3",
+    "+ Board order: 3",
     "Board order: x",
     "Board order: 3 or so",
+    "Board order: 3.",
     "Board order: " + "9" * 16,
     "Board order: 1." + "0" * 15,
     "Board order: " + "9" * 400,
@@ -531,8 +568,13 @@ VERDICT_MISSES = [
     "Board verdict: build after 3 passes",
     "- Board verdict: build after 3 passes",
     "> Board verdict: build after 3 passes",
+    "1. Board verdict: build after 3 passes",
+    "+ Board verdict: build after 3 passes",
+    "Board Verdict: build after 3 passes",
     "Board verdict: build after 5 passes, and then some",
     "Board verdict: ship after 2 passes",
+    "Board verdict: plan after 2 passes",
+    "Board verdict: build after -3 passes",
     "Board verdict: build after " + "9" * 16 + " passes",
     "Board verdict: build after " + "9" * 400 + " passes",
 ]
@@ -543,6 +585,30 @@ def test_an_owner_verdict_line_the_grammar_fails_is_unread(comment: str) -> None
     board, report = run([issue(1, comments=(comment,))])
     assert board["planned"] == []
     assert report["unread"] == [(1, "Board verdict")]
+
+
+MARKER_PROSE = [
+    "Board orders form one sequence across every milestone.",
+    "Board order is a line in the body.",
+    "Board after the merge, the card drops back to Planned.",
+    "Board afterwards reads the new verdict.",
+    "Board verdicts are read from the owner's comments only.",
+    "Board verdict comes last in the exit comment.",
+    "1. Board orders form one sequence.",
+    "- Board after the merge, rank again.",
+]
+
+
+@pytest.mark.parametrize("line", MARKER_PROSE)
+def test_owner_prose_that_starts_like_a_marker_is_not_listed(line: str) -> None:
+    """A near miss puts a colon, a digit or a ``#`` after the kind, or ends the line there.
+
+    Prose about the markers carries a word after the kind instead, and listing it would
+    report the owner's own sentences on every round.
+    """
+    board, report = run([issue(1, body=line, comments=(line,)), issue(2)])
+    assert board["planned"] == board["next"] == []
+    assert report["unread"] == report["refused"] == report["conflicts"] == []
 
 
 @pytest.mark.parametrize(
@@ -576,6 +642,20 @@ PASS = "## Plan audit, pass 2\n\nNothing changed."
         ({"comments": (PASS, "It ends here. Board verdict: build after 2 passes")}, (), True),
         ({"comments": ("```\n## Plan audit, pass 2\n```",)}, (), False),
         ({"comments": ("## Plan audit, pass 2\r\n\r\nNothing changed.",)}, (), True),
+        ({"comments": ("Picking this up.\n\n" + PASS,)}, (), True),
+        ({"comments": ("See ## Plan audit, pass 2 above.",)}, (), False),
+        ({"comments": ("Board verdict: build after 2 passes\n\n## Plan audit, pass 3",)}, (), True),
+        (
+            {
+                "comments": (
+                    "## Plan audit, pass 11, and the loop's exit\n\nIt holds.\n\n"
+                    "Board verdict: build after 11 passes",
+                )
+            },
+            (),
+            False,
+        ),
+        ({"comments": ("## Plan audit summary\n\nNothing changed.",)}, (), False),
         ({"comments": (PASS,), "labels": ("working:decompose",)}, (), False),
         ({"comments": (PASS,), "labels": ("working:build",)}, (), True),
         ({"comments": (PASS,), "sub_issues": (1, 0)}, (), False),

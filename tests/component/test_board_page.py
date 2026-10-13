@@ -42,6 +42,7 @@ from tests.support.board_github import (
     blocker,
     issue,
     load_generator,
+    pull,
 )
 from tests.support.board_page import icon_links
 
@@ -955,3 +956,69 @@ def test_the_shipped_icon_is_exactly_what_the_renderer_draws() -> None:
     A grid, an ink or a size changed without regenerating the file fails here.
     """
     assert (SKILL / "favicon.ico").read_bytes() == favicon.render_board()
+
+
+def _held_doc() -> dict[str, Any]:
+    marker = {
+        "authorAssociation": "OWNER",
+        "body": "## Review complete",
+        "createdAt": "2026-10-12T13:00:00Z",
+    }
+    green = (
+        {
+            "__typename": "CheckRun",
+            "name": "test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "checkSuite": {"app": {"slug": "github-actions"}},
+        },
+    )
+    verdict = ("## Plan audit, pass 4\n\nBoard verdict: build after 4 passes",)
+    issues = [
+        issue(30, labels=("working:build",)),
+        issue(31, labels=("working:decompose",)),
+        issue(32, labels=("working:build",), comments=verdict),
+    ]
+    pulls = [
+        pull(40, closes=(30,), comments=(marker,), contexts=green),
+        pull(41, closes=(31,), comments=(marker,), contexts=green),
+    ]
+    now = datetime(2026, 10, 12, 17, 0, tzinfo=UTC)
+    return GENERATOR.build(FakeGitHub(issues, pulls), REPO, now)[0]
+
+
+def _columns(result: dict[str, Any]) -> dict[str, set[int]]:
+    raw = result["ids"]["flow"]["html"]
+    parts = re.split(r'<div class="col f-([a-z]+)">', raw)[1:]
+    return {
+        tone: {int(n) for n in re.findall(r'data-n="(\d+)"', body)}
+        for tone, body in zip(parts[::2], parts[1::2], strict=True)
+    }
+
+
+def test_a_build_session_keeps_a_handed_over_pull_request_from_the_owner(tmp_path: Path) -> None:
+    result = run_page(tmp_path, [served(_held_doc())])
+    cols = _columns(result)
+    assert cols["owner"] == {31}
+    assert cols["mine"] == {30}
+    assert cols["building"] == {32}
+    flow = result["ids"]["flow"]["html"]
+    card = flow[flow.index('data-n="32"') :]
+    assert "plan-build" not in flow and "4 passes" not in card
+    assert "re-measuring" not in json.dumps(result["ids"])
+
+
+def test_a_session_with_no_kind_is_a_decompose_loop(tmp_path: Path) -> None:
+    doc = _generated([issue(10), issue(11)])
+    doc = copy.deepcopy(doc)
+    doc["working"] = [{"n": 10}]
+    assert _columns(run_page(tmp_path, [served(doc)]))["planning"] == {10}
+
+
+def test_a_ranking_with_no_order_sorts_as_fifty(tmp_path: Path) -> None:
+    doc = copy.deepcopy(_generated([issue(10), issue(11)]))
+    doc["next"] = [
+        {"issue": 10, "band": 0, "ready": "plan"},
+        {"issue": 11, "band": 0, "order": 10, "ready": "plan"},
+    ]
+    assert _rank_chips(run_page(tmp_path, [served(doc)])) == {11: 1, 10: 2}

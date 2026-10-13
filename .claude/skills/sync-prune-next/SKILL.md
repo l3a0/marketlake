@@ -281,12 +281,14 @@ no required reviewers, so starting it approves nothing.
 
 ```bash
 gh workflow run board.yml --repo l3a0/marketlake
-gh run list --repo l3a0/marketlake --workflow board.yml --event workflow_dispatch --limit 1 --json databaseId,status,url
+gh run list --repo l3a0/marketlake --workflow board.yml --event workflow_dispatch --limit 1 --json databaseId,status,createdAt,url
 ```
 
-The second command shows the run the first one started. `gh workflow run` may
-ask for permission each round, because no allow rule covers it yet. Say so in
-the report if it does.
+The second command shows the newest dispatched run. A new run takes a few
+seconds to appear, so a `createdAt` older than the dispatch means it printed
+the previous dispatch. Run it again until the new run shows. `gh workflow run`
+may ask for permission each round, because no allow rule covers it yet. Say so
+in the report if it does.
 
 This prints the board workflow's newest finished run that was not cancelled.
 
@@ -333,16 +335,17 @@ nobody reads the Action's own job summary. Report every row that does not read
 - **Markers that disagree.** An issue carrying both `working:` labels, read as
   `build`, or a body carrying several `Board order:` lines, read as the first.
 - **Marker lines not read.** A line of the owner's that looks meant as a
-  marker and is not read, such as `board order: 3`, `- Board order: 3`, an
-  order of more than 15 digits, or a `Board after:` line naming no issue.
-- **Marker lines refused.** A marker in text the owner did not write, or a
-  `Board after:` reference to another repository.
+  marker and is not read. The `board-markers` skill states the grammar and
+  which lines count as meant for a marker.
+- **Marker lines refused.** A marker in text the owner did not write, a
+  `Board after:` reference to another repository, or a `Board after:` link
+  whose text and address name different issues.
 - **Markers dropped.** A verdict or an order on a parent, or a verdict on a
   deferred card.
 - **Finished plans with no verdict after them.** An open issue with no
   `working:decompose` label whose newest owner `## Plan audit, pass N`
-  comment is newer than its newest owner verdict, or that has passes and no
-  verdict at all. Parents, deferred cards and cards with an open pull request
+  heading comes after its newest owner verdict, in a later comment or lower in
+  the same one, or that has passes and no verdict at all. Parents, deferred cards and cards with an open pull request
   are left out. Each is a plan loop that ended without saying so.
 
 A row names the issue and the marker's kind and never the line's text, so read
@@ -667,9 +670,10 @@ Collect candidates from three places, and give the evidence for each one.
    first.
    - Pull requests that are reviewed, green at the current head as step 3's
      `rollup` words define it, and carry no `working` entry of
-     `kind: "build"` on their card. When the card's `needs` names an issue
-     still in `tracker`, the owner can review now but not merge, so name each
-     open blocker rather than present the pull request as ready to merge.
+     `kind: "build"` on their card, other than one step 3 reported stale.
+     When the card's `needs` names an issue still in `tracker`, the owner can
+     review now but not merge, so name each open blocker rather than present
+     the pull request as ready to merge.
    - `planned` entries with `ready` of `decide`.
    - Questions a session handed back.
 2. **Plans ready to build with no builder.** These are `planned` entries with

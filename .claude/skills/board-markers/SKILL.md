@@ -45,18 +45,22 @@ Three kinds of marker carry a session's judgement.
 Each line follows the same grammar.
 
 - It starts its line, with nothing before it but spaces or tabs. A list marker
-  such as `- ` or a quote marker `> ` stops it being read. An order or verdict
+  such as `- ` or `1. `, or a quote marker `> `, stops it being read. An order or verdict
   line also has nothing after it but spaces or tabs.
 - The words are exactly as shown, in that case, with one ordinary space after
   the colon. `Board after:` takes any spacing after its colon.
-- An order is any number of up to 15 digits, negative or decimal included, so
-  `Board order: 2.5` slots a card between 2 and 3 without renumbering them. A
-  pass count is a whole number of up to 15 digits. `pass` and `passes` both
-  read, and a trailing full stop is allowed.
+- An order is an optional minus sign, then digits, then optionally a decimal
+  point followed by at least one digit, with at most 15 digits in all. So
+  `Board order: 2.5` slots a card between 2 and 3 without renumbering them,
+  while `+2`, `.5`, `2.` and `1e3` are not read. A pass count is a whole
+  number of up to 15 digits. `pass` and `passes` both read, and a trailing
+  full stop is allowed.
 - `Board after:` reads each `#N` on the line, and the link form
-  `[#N](https://github.com/l3a0/marketlake/issues/N)`. A reference to another
-  repository, written `owner/name#N` or as a link to another repository, is
-  refused rather than read as this repository's issue.
+  `[#N](https://github.com/l3a0/marketlake/issues/N)`, which may carry an
+  anchor or a query after the number, such as `#issuecomment-5`. A reference
+  to another repository, written `owner/name#N` or as a link to another
+  repository, is refused rather than read as this repository's issue. So is a
+  link whose text and address name different numbers.
 - A line inside a fenced code block is not read, so a fence is how to quote the
   format. A line inside a code span is not one either, because it does not
   start the line.
@@ -71,15 +75,21 @@ in this public repository. Sessions act as the owner, so their text counts.
 
 When an issue's comments carry several verdicts, the newest wins. When a body
 carries several order lines, the first wins. A line that looks meant as a marker
-and is not read, such as `board order: 3` or `- Board order: 3`, never stops
-the Action. The generator lists it in its summary as unread, along with
-conflicts, refused lines and dropped markers, and a sync round reports that
-list. The summary names the issue and the marker's kind, never the line.
+and is not read, such as `board order: 3`, `Board order 3` or
+`1. Board order: 3`, never stops the Action. The generator lists it in its
+summary as unread, along with conflicts, refused lines and dropped markers, and
+a sync round reports that list. The summary names the issue and the marker's
+kind, never the line. A line counts as meant for a marker when the kind ends
+it, or is followed, after optional emphasis and spaces, by a colon, a digit or
+a `#`. Prose that only starts with the words, such as "Board orders form one
+sequence", is not listed.
 
 ## When to set them
 
-Each moment below is one where the board's answer changes and nothing GitHub
-records on its own says so. `<n>` is the issue's number.
+Items 1 to 5 below are the moments where the board's answer changes and
+nothing GitHub records on its own says so. Items 6 and 7 are rules for what
+those moments set on particular cards and verdicts. `<n>` is the issue's
+number.
 
 1. **A plan loop starts.** Add `working:decompose`.
 
@@ -87,8 +97,10 @@ records on its own says so. `<n>` is the issue's number.
    gh issue edit <n> --repo l3a0/marketlake --add-label working:decompose
    ```
 
-   Each pass is a comment headed `## Plan audit, pass N`. A later loop on the
-   same issue continues the numbering, and its verdict counts its own passes. A
+   Each pass gets its own comment headed `## Plan audit, pass N`. A combined
+   heading such as `## Plan audit, passes 7 and 8` is not counted, so a sync
+   round cannot tell that pass happened. A later loop on the same issue
+   continues the numbering, and its verdict counts its own passes. A
    `working:` label already on the issue is no lock. Check it against the
    stale-label rule in step 3 of the `sync-prune-next` skill, and ask the
    session that owns it before taking over.
@@ -101,8 +113,9 @@ records on its own says so. `<n>` is the issue's number.
    ```
 
    A sync round lists an issue whose newest owner `## Plan audit, pass N`
-   comment is newer than its newest verdict, so a loop that exits without one
-   is reported.
+   heading comes after its newest verdict, in a later comment or lower in the
+   same one, so a loop that exits without a verdict is reported. An exit
+   comment headed as the last pass and ending with the verdict is not listed.
 3. **A build starts.** Add `working:build`, after the same check as a plan
    loop.
 
@@ -125,14 +138,28 @@ records on its own says so. `<n>` is the issue's number.
    A `Part of` pull request leaves its issue open. Once it merges, the card
    drops back to "Planned, no builder" with its old verdict reading "ready to
    build", because the board shows only open pull requests. So that hand-over
-   also posts a fresh verdict for the remainder. A verdict is otherwise
-   withdrawn only by a newer one, or by editing or deleting its comment.
+   also settles the verdict for the remainder. A build session runs no plan
+   passes of its own, so it does one of two things.
+
+   - If the remainder already has a plan that still holds, post
+     `Board verdict: build after N passes`, with N that plan's pass count.
+   - If it does not, edit the comment carrying the old verdict and remove its
+     `Board verdict:` line, so the card stops reading ready. Sessions act as
+     the owner, so they can edit the owner's comment.
+
+   ```bash
+   gh api --method PATCH repos/l3a0/marketlake/issues/comments/<id> -F body=@<file>
+   ```
+
+   A verdict is otherwise withdrawn only by a newer one, or by editing or
+   deleting its comment.
 5. **Ranking changes.** Write `Board order:` and `Board after:` lines in the
-   issue bodies. Once any card in a milestone carries an order, the page hides
-   that milestone's unranked cards behind "Show all". So rank a milestone's
-   open issues that are not parents in one pass, rather than one card at a
-   time. Orders form one sequence across every milestone, so do not restart
-   the numbering at 1 in each.
+   issue bodies. Once any card in a milestone that is not deferred carries an
+   order, the page hides that milestone's unranked cards behind "Show all". So
+   rank a milestone's open issues that are not parents in one pass, rather
+   than one card at a time. A deferred card's order hides nothing, because the
+   page ignores it. Orders form one sequence across every milestone, so do not
+   restart the numbering at 1 in each.
 
    ```bash
    gh issue view <n> --repo l3a0/marketlake --json body --jq .body > <file>
