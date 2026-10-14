@@ -801,3 +801,33 @@ def test_a_resync_run_again_after_a_crash_names_nothing_and_the_upload_heals(tmp
     assert again.applied
     assert again.warnings == []
     _heals(lake, lake.shadow)
+
+
+def test_a_delete_marker_is_never_read_when_no_version_matches(tmp_path):
+    # With no version to match, a lookup that read delete markers too would HEAD the marker,
+    # which S3 answers 405.
+    client = FakeS3()
+    client.store(KEY, b"no match\n")
+    marker = client.delete_marker(KEY)
+    client.store(KEY, b"current\n")
+
+    assert matching_version(client, TARGET, TRIMMED, _sha(ENTRY)) is None
+
+    assert marker not in _head_ids(client)
+
+
+def test_an_older_version_whose_bytes_rotted_is_not_taken(tmp_path):
+    # Its stored checksum names the entry, so the lookup picks it, and only its bytes can
+    # refuse it.
+    lake = _stopped(tmp_path)
+    key = TARGET.key(QUARANTINE)
+    versions = lake.client.versions(key)
+    named = _version(lake.client, QUARANTINE, lake.named[QUARANTINE])
+    index = [v.version_id for v in versions].index(named)
+    versions[index] = dataclasses.replace(versions[index], body=b"rotted at rest\n")
+
+    summary = restore_lake(tmp_path / "d", TARGET, client=lake.client, free_space=lambda _: PLENTY)
+
+    assert (QUARANTINE, "does not match its SHA-256") in summary.failures
+    assert QUARANTINE not in dict(summary.recovered)
+    assert not (tmp_path / "d" / WORK / (QUARANTINE + ".part")).exists()
