@@ -30,8 +30,11 @@ answers 405 as S3 does. ``fail_with`` makes every call raise one chosen error, w
 a test models a revoked key or a network that is down. ``deny_versioned_get`` refuses a
 ``GetObject`` or a ``HeadObject`` that names a version, the two calls ``s3:GetObjectVersion``
 covers, and ``deny_list_versions`` refuses ``ListObjectVersions``, so a test can model a role
-without those grants. ``on_put`` and ``on_get`` run before a ``PutObject`` or a ``GetObject``
-is answered, so a test can fail or time one kind of call alone.
+without those grants. ``deny_versioned_get_object`` refuses only a ``GetObject`` that names a
+version and lets a ``HeadObject`` naming one through, so a test can reach a refused read that
+follows a lookup whose requests all passed. ``on_put`` and ``on_get`` run before a
+``PutObject`` or a ``GetObject`` is answered, so a test can fail or time one kind of call
+alone.
 """
 
 from __future__ import annotations
@@ -103,6 +106,7 @@ class FakeS3:
         on_get=None,
         deny_versioned_get: bool = False,
         deny_list_versions: bool = False,
+        deny_versioned_get_object: bool = False,
     ) -> None:
         self.bucket = bucket
         self.page_size = page_size
@@ -111,6 +115,7 @@ class FakeS3:
         self.on_get = on_get
         self.deny_versioned_get = deny_versioned_get
         self.deny_list_versions = deny_list_versions
+        self.deny_versioned_get_object = deny_versioned_get_object
         self.objects: dict[str, list[Version]] = {}
         # Each key's delete markers, as ``(sequence, version id)``. The sequence orders them
         # among the key's versions, whose ids carry the same counter.
@@ -260,7 +265,7 @@ class FakeS3:
         if wanted is None:
             current = versions[-1]
             return {"Body": io.BytesIO(current.body), "VersionId": current.version_id}
-        if self.deny_versioned_get:
+        if self.deny_versioned_get or self.deny_versioned_get_object:
             raise client_error("AccessDenied", "GetObject", 403)
         for version in versions:
             if version.version_id == wanted:

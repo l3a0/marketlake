@@ -502,6 +502,28 @@ def test_a_resync_whose_lookup_is_refused_refuses_with_the_grants(tmp_path):
     assert sorted(p.name for p in lake.shadow.rglob("*")) == before
 
 
+def test_a_resync_whose_pinned_read_is_refused_refuses_with_the_grants(tmp_path):
+    # The lookup's listing and HEADs pass, and only the versioned GetObject --apply sends is
+    # refused. The trimmed ledger's named bytes go back as its current version first, so
+    # quarantine.jsonl is the one pinned download and the plan reads no older version.
+    lake = _stopped(tmp_path)
+    lake.client.store(TARGET.key(TRIMMED), lake.named[TRIMMED])
+    version = _version(lake.client, QUARANTINE, lake.named[QUARANTINE])
+    lake.client.deny_versioned_get_object = True
+    assert not _resync(lake, apply=False).applied
+    before = sorted(p.name for p in lake.shadow.rglob("*"))
+
+    with pytest.raises(bucket.ResyncRefused) as refused:
+        _resync(lake)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"the bucket refused the read of version {version} of {QUARANTINE!r} (AccessDenied). "
+    )
+    assert GRANTS in message
+    assert sorted(p.name for p in lake.shadow.rglob("*")) == before
+
+
 # -- 7. the resolver's rules -------------------------------------------------------------
 
 
