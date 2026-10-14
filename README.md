@@ -461,7 +461,7 @@ A command run by hand is not a unit the stop can see.
    restores a chosen range from the bucket into an empty directory outside the live lake, so
    a session the VM's trim removed can be read there
    ([#837](https://github.com/l3a0/marketlake/issues/837)). It takes the range `restore-range`
-   takes, selected from the bucket's own `manifest.jsonl`, and brings what a reader needs
+   takes on chains or quotes, selected from the bucket's own `manifest.jsonl`, and brings what a reader needs
    beside it: each ticker's next chains partition after the range, the same tickers' `bars/`
    on the range's days, the corporate-actions and quarantine ledgers, and everything under
    `reference/`. It downloads, verifies and moves files in as the restore, command 3, does,

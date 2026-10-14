@@ -23,11 +23,14 @@ nothing.
    ``bars/ticker=T/freq=1d/date=D.parquet``, to be in the manifest. The bars census reads a
    quotes day only while that bar has not landed, so a day whose bar never lands, such as a
    ``SnapAbsent`` outage day or a ticker whose roster carries no ``1d``, is kept for good. A bars
-   partition of either frequency also needs its ticker-day's chains partition to be gone from
-   disk, because ``settle.settlement_view`` and ``continuity.continuity_view`` read a day's bars
+   partition of either frequency also needs its ticker-day's chains partition to be gone on
+   purpose or never recorded: absent from disk, and either a designed absence or missing from
+   the manifest. ``settle.settlement_view`` and ``continuity.continuity_view`` read a day's bars
    beside its chains, and a chains partition can outlive the window edge behind its ticker's
-   checkpoint cutoff. A check of that chains partition that raises keeps the bar and writes no
-   line of its own, since the chains directory's own held line already names the fault.
+   checkpoint cutoff. A chains partition lost by accident keeps its bars too, because a chains
+   range restore brings it back without them. A check of that chains partition that raises
+   keeps the bar and writes no line of its own, since the chains directory's own held line
+   already names the fault.
 2. Its day is at or before the window edge, ``window.window_edge(calendar, tonight, W + 1)``.
    Tonight's seal has landed since the sweep, hence W + 1, and the edge is computed here from
    the window rather than read from the checkpoint, whose edge goes stale when the window

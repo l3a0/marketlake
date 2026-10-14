@@ -958,10 +958,12 @@ def _bars_sessions(
     """The sessions this ticker and frequency hold a sealed partition for, in date order.
 
     The listing comes from the filesystem rather than from the manifest, and both halves of
-    that are deliberate. Nothing else enumerates a bars surface: ``actions.surface_ticker_days``
-    reads manifest keys through ``paths.parse_partition_rel``, which returns ``None`` for every
-    bars key by design, and that walk passes over a key it cannot read rather than raising, so
-    asking it for bars answers an empty list on a lake full of them. And the filesystem is the
+    that are deliberate. Nothing in the read layer enumerates a bars surface from the manifest:
+    ``actions.surface_ticker_days`` reads manifest keys through ``paths.parse_partition_rel``,
+    which returns ``None`` for every bars key by design, and that walk passes over a key it
+    cannot read rather than raising, so asking it for bars answers an empty list on a lake full
+    of them. ``paths.parse_bars_rel`` reads bars keys for the trim and the range restore, which
+    act on the manifest rather than on what a reader can open. And the filesystem is the
     question ``_clear_partition`` already asks, through ``is_file`` and ``_spelled_exactly``, so
     enumerating from the manifest and opening from disk would answer two questions in one read.
 

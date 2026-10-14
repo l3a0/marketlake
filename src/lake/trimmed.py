@@ -8,9 +8,8 @@ partitions of both frequencies at the same edge once their day's chains are gone
 #795). The owner means every dated surface to be trimmed at one cutoff in time, so nothing here
 assumes a surface. A line is keyed by the lake-relative ``partition``, which is any path
 ``paths.parse_partition_rel`` or ``paths.parse_bars_rel`` reads, and nothing here parses it.
-Before
-anything deletes a sealed partition, the lake has to be able to say that a missing file was
-removed on purpose. Without a record, every reader that walks the manifest reads a trimmed
+Before anything deletes a sealed partition, the lake has to be able to say that a missing file
+was removed on purpose. Without a record, every reader that walks the manifest reads a trimmed
 partition as loss: the Sunday scrub withholds its ping every week, the battery's coverage check
 reports the session missing every night, and the first upload refuses to re-baseline the bucket.
 

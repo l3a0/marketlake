@@ -581,7 +581,7 @@ def test_a_present_file_that_differs_refuses_and_restores_nothing(tmp_path):
 
 
 @pytest.mark.parametrize("surface", ["actions", "reference"])
-def test_a_surface_other_than_chains_or_quotes_refuses(tmp_path, surface):
+def test_a_surface_the_range_restore_does_not_take_refuses(tmp_path, surface):
     """The refusal names the range restore, the three surfaces it takes, and the one given.
 
     Catches the range restore refusing in the reading restore's words, since the two share

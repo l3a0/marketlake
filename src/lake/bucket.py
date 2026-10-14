@@ -3727,7 +3727,7 @@ def restore_for_reading(
 ) -> ReadingRestoreSummary:
     """Restore the ``surface`` range from ``first`` to ``last`` into the empty directory ``dest``.
 
-    The range is what ``restore-range`` selects: the latest manifest entries
+    The range is what ``restore-range`` selects on chains or quotes: the latest manifest entries
     ``paths.parse_partition_rel`` reads as ``surface``, for ``ticker`` or for every ticker when
     it is ``None``, dated ``first`` to ``last`` inclusive. The selection reads the bucket's own
     ``manifest.jsonl``, never the lake's. :func:`_reading_plan` adds what a reader needs beside
