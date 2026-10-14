@@ -2139,8 +2139,8 @@ def _recovered_line(rel: str, version_id: str) -> str:
     """The line a run prints for a file it took from an older version of its key."""
     return (
         f"took {rel} from bucket version {version_id}, the one its manifest.jsonl entry names, "
-        "because the current version is newer or damaged. The primary's next nightly upload "
-        "puts the lake's matching copy back as the current version"
+        "because the current version is newer. The primary's next nightly upload puts the "
+        "lake's matching copy back as the current version"
     )
 
 
@@ -4550,12 +4550,16 @@ def _plan_resync(
                 f"names, and {_lookup_refused_line(str(exc.code))}, so the resync changed "
                 f"nothing. Run the resync again once they are granted: {target}"
             ) from None
+        # Rot at rest keeps the current version's stored checksum, which is what the nightly
+        # upload compares, so no upload replaces it, and trimmed.jsonl never expires. The repair
+        # is a matching copy put back by hand.
         raise refuse(
             f"the bucket's current {TRIMMED_FILE} is not the version its manifest.jsonl names, "
-            "and no older version matches it, so the current one is damaged or the matching "
-            "one expired, and the resync changed nothing. The other host's next nightly "
-            "upload puts its own copy back when that copy hashes to the entry. Run the resync "
-            f"again after it: {target}"
+            "and no older version matches it, so the resync changed nothing. Put a copy whose "
+            f"SHA-256 is {exc.sha256}, such as the other host's when it hashes to that, back as "
+            f"the current version with aws s3api put-object --bucket {target.bucket} --key "
+            f"{target.key(TRIMMED_FILE)} --body <copy> --checksum-algorithm SHA256, then run "
+            f"the resync again: {target}"
         ) from None
     except BucketLedgerRefused as exc:
         raise refuse(f"{exc}. The resync changed nothing") from None

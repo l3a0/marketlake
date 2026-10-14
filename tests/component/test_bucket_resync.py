@@ -1883,7 +1883,10 @@ def test_a_buckets_ledger_newer_than_its_manifest_is_taken_from_the_version_it_n
     )
 
 
-def test_a_buckets_ledger_no_version_matches_refuses_with_the_other_hosts_upload(tmp_path):
+def test_a_buckets_ledger_no_version_matches_refuses_with_the_put_by_hand(tmp_path):
+    # Rot at rest keeps the current version's stored checksum, so no nightly upload replaces
+    # it, and the repair is a copy put back by hand. trimmed.jsonl never expires, so an expired
+    # version is no cause here either.
     laptop, client, recorded = _ledger_trimmed_on_the_vm(tmp_path)
     versions = client.versions(TARGET.key(TRIMMED))
     versions[-1] = dataclasses.replace(versions[-1], body=recorded + b"rot")
@@ -1892,7 +1895,13 @@ def test_a_buckets_ledger_no_version_matches_refuses_with_the_other_hosts_upload
 
     assert f"current {TRIMMED} is not the version its manifest.jsonl names" in message
     assert "no older version matches it" in message
-    assert "next nightly upload puts its own copy back" in message
+    assert f"whose SHA-256 is {hashlib.sha256(recorded).hexdigest()}" in message
+    assert (
+        f"aws s3api put-object --bucket {TARGET.bucket} --key {TARGET.key(TRIMMED)} "
+        "--body <copy> --checksum-algorithm SHA256"
+    ) in message
+    assert "upload" not in message
+    assert "expired" not in message
     assert "refused" not in message
     assert message.endswith(str(TARGET))
 
