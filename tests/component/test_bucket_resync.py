@@ -864,15 +864,19 @@ def test_an_object_newer_than_the_buckets_manifest_is_taken_from_the_version_it_
 
     # The matched version's size, not the current one's, is what the plan downloads.
     assert dict(summary.downloads)[QUOTES_2] == len(files[QUOTES_2])
+    # A dry run reads no data file, the pinned one included, so it says what --apply takes
+    # rather than that it took anything.
     (warning,) = summary.warnings
-    assert warning.startswith(f"took {QUOTES_2} from bucket version {named.version_id}, ")
+    assert warning.startswith(f"--apply takes {QUOTES_2} from bucket version {named.version_id}, ")
     assert f"resync: warning: {warning}" in summary.lines()
-    # A dry run reads no data file, the pinned one included.
     assert _gets(client) == [MANIFEST_KEY]
 
     applied = _resync(laptop, client, apply=True)
 
     assert applied.applied
+    # The run that downloaded the version names it once, and the dry run's line is not repeated.
+    (took,) = applied.warnings
+    assert took.startswith(f"took {QUOTES_2} from bucket version {named.version_id}, ")
     assert (laptop / QUOTES_2).read_bytes() == files[QUOTES_2]
     pinned = [
         kwargs for name, kwargs in client.calls if name == "get_object" and "VersionId" in kwargs

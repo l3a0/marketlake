@@ -22,7 +22,8 @@ follow the issue's Verification list.
    bucket scrub then comes back clean, after a whole restore, a windowed rebuild, a resync, a
    takeover by a host already level, a restore resumed after a failed run, and a resync run
    again after a crash before its manifest rewrite. Only a run that downloaded an older version
-   names it.
+   says it took it. A resync dry run downloads nothing, so it says only which version
+   ``--apply`` takes.
 
 Item 4, the resync's own cases, sits in ``test_bucket_resync.py``. Item 6, the heal's own
 rules, sits in ``test_bucket_upload.py``, and item 10, the live check, in

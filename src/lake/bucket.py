@@ -2144,6 +2144,14 @@ def _recovered_line(rel: str, version_id: str) -> str:
     )
 
 
+def _pinned_line(rel: str, version_id: str) -> str:
+    """The line a resync dry run prints for a file its ``--apply`` takes from an older version."""
+    return (
+        f"--apply takes {rel} from bucket version {version_id}, the one its manifest.jsonl entry "
+        "names, because the current version is newer than that entry"
+    )
+
+
 @dataclass(frozen=True)
 class CurrentDigest:
     """What :func:`current_digest` read: the current version's SHA-256 and its id.
@@ -4766,7 +4774,6 @@ def _plan_resync(
                 )
             versions[rel] = matched.version_id
             size = matched.size
-            summary.warnings.append(_recovered_line(rel, matched.version_id))
         summary.downloads.append((rel, size))
     planned = summary.download_bytes
     busiest = runway.listing_busiest_sealed_day(listing)
@@ -4935,12 +4942,13 @@ def resync(
        free space left covers the journal reserve. A stored SHA-256 that differs means the
        other host's last upload stopped before its ``manifest.jsonl`` or is still running,
        and :func:`matching_version` then finds the older version B's entry names, whose size
-       the plan and the reserve use and which a warning names (marketlake #838). No match,
-       or a refused lookup, refuses with a line for each cause. With ``apply``, stale temp
-       files beside each target are removed under the lock, and each file then downloads
-       unlocked to ``paths.temp_write_path``'s name, the matched version by its
-       ``VersionId``, must hash to B's entry, and is flushed by :func:`_flush_fd`. A matched
-       version that does not hash refuses as rot. The guards run again before every
+       the plan and the reserve use (marketlake #838). The dry run's warning names the
+       version ``--apply`` would take. No match, or a refused lookup, refuses with a line for
+       each cause. With ``apply``, stale temp files beside each target are removed under the
+       lock, and each file then downloads unlocked to ``paths.temp_write_path``'s name, the
+       matched version by its ``VersionId``, must hash to B's entry, and is flushed by
+       :func:`_flush_fd`. A matched version that hashes gets a warning saying it was taken,
+       and one that does not hash refuses as rot. The guards run again before every
        download.
     8. Commit, under ``lake_lock``: the guards run again, L must read as it did and B's HEAD
        must answer as it did. Each download is renamed into place and flushed with its
@@ -5007,6 +5015,9 @@ def resync(
     )
     summary = plan.summary
     if not apply or summary.level:
+        # The dry run downloads nothing, so it says what --apply takes. The line saying a
+        # version was taken prints only on the run that downloaded and hashed it.
+        summary.warnings += [_pinned_line(rel, pinned) for rel, pinned in plan.versions.items()]
         return summary
 
     temps: list[Path] = []
@@ -5075,6 +5086,8 @@ def resync(
                     "resync changed nothing. Run it again, which looks for the version the entry "
                     f"names when the current one is newer, and treat a repeat as rot: {target}"
                 )
+            if pinned is not None:
+                summary.warnings.append(_recovered_line(rel, pinned))
         with lake_lock(root):
             guard()
             try:
