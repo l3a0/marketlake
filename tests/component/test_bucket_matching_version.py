@@ -12,9 +12,11 @@ follow the issue's Verification list.
    the entry names and finishes.
 2. The same with no matching version left fails each, with the line for that cause.
 3. The same on a role without the version grants fails each as before #838, with the same exit
-   code and one more line naming the grants.
-7. The resolver's own rules: paging, the exact key, delete markers, a version with no stored
-   checksum, a HEAD answering absent, the current version, and the first match ending it.
+   code and one more line naming the grants. A lookup or a read of an older version that cannot
+   reach the bucket raises as itself in each.
+7. The resolver's own rules: paging, the exact key, keys that sort before it, delete markers, a
+   version with no stored checksum, a HEAD answering absent, the current version, and the first
+   match ending it.
 8. A restore with nothing mismatched sends no version listing and names no version.
 9. An unmanifested file's mismatch never reaches the resolver.
 
@@ -51,6 +53,7 @@ from lake.bucket import (
     first_upload,
     matching_version,
     nightly_upload,
+    read_bucket_trimmed,
     restore_lake,
     resync,
 )
@@ -376,6 +379,7 @@ def test_a_restore_with_no_matching_version_fails_each_file(
     for line, rel in zip(err, failed, strict=False):
         assert line.startswith(f"{label}: does not match its SHA-256: {rel}")
     assert GRANTS not in captured.err
+    assert list((tmp_path / "d").rglob("*.part")) == []
     if label == "restore-for-reading":
         assert err[len(failed)].startswith(f"{label}: no version in the bucket matches ")
         assert str(tmp_path / "d" / WORK) in err[len(failed)]
@@ -484,6 +488,8 @@ def test_a_windowed_rebuild_whose_lookup_is_refused_refuses_with_the_grants(
     assert exc.value.code == 2
     (line,) = capsys.readouterr().err.splitlines()
     assert "refused the lookup of an older version" in line and GRANTS in line
+    # The grant sentence names the code as well as the mismatch before it.
+    assert f"matches the manifest (AccessDenied). The credentials need {GRANTS}" in line
     assert "from the console" in line
     assert _sha(lake.named[TRIMMED]) in line
     # The working directory the console repair needs is left, holding the bucket's manifest.
@@ -525,6 +531,109 @@ def test_a_resync_whose_pinned_read_is_refused_refuses_with_the_grants(tmp_path)
     assert sorted(p.name for p in lake.shadow.rglob("*")) == before
 
 
+def _unreachable_listing(client: FakeS3) -> None:
+    """``ListObjectVersions`` fails as a network that is down, and every other call passes."""
+
+    def list_object_versions(**kwargs):
+        client.calls.append(("list_object_versions", dict(kwargs)))
+        raise unreachable()
+
+    client.list_object_versions = list_object_versions
+
+
+def _unreachable_versioned_get(client: FakeS3) -> None:
+    """A ``GetObject`` naming a version fails as a network that is down, after its lookup."""
+
+    def on_get(kwargs: dict) -> None:
+        if kwargs.get("VersionId") is not None:
+            raise unreachable()
+
+    client.on_get = on_get
+
+
+def _restore_whole(tmp_path: Path, lake: Stopped) -> object:
+    return restore_lake(tmp_path / "d", TARGET, client=lake.client, free_space=lambda _: PLENTY)
+
+
+def _restore_windowed(tmp_path: Path, lake: Stopped) -> object:
+    return restore_lake(
+        tmp_path / "d",
+        TARGET,
+        client=lake.client,
+        free_space=lambda _: PLENTY,
+        skip_designed_absences=True,
+    )
+
+
+def _resync_ledger(tmp_path: Path, lake: Stopped) -> object:
+    # The trimmed ledger mismatches, so the plan's read of the bucket's ledger looks first.
+    return _resync(lake)
+
+
+def _resync_quarantine(tmp_path: Path, lake: Stopped) -> object:
+    # The trimmed ledger's named bytes go back as its current version, so quarantine.jsonl is
+    # the one file that reaches the plan's lookup before any download, and --apply's read.
+    lake.client.store(TARGET.key(TRIMMED), lake.named[TRIMMED])
+    return _resync(lake)
+
+
+@pytest.mark.parametrize(
+    "fail", [_unreachable_listing, _unreachable_versioned_get], ids=["listing", "versioned-get"]
+)
+@pytest.mark.parametrize(
+    "run",
+    [_restore_whole, _restore_windowed, _resync_ledger, _resync_quarantine],
+    ids=["restore", "windowed-rebuild", "resync-ledger", "resync-quarantine"],
+)
+def test_a_lookup_that_cannot_reach_the_bucket_raises_as_itself(tmp_path, run, fail):
+    # Read as a refused lookup or as no matching version, it would fail the file or refuse
+    # with the wrong repair, where every other unreachable bucket raises for main's one line.
+    lake = _stopped(tmp_path)
+    fail(lake.client)
+
+    with pytest.raises(BucketReadError) as raised:
+        run(tmp_path, lake)
+
+    assert raised.value.kind == "unreachable"
+
+
+def test_the_ledger_read_refuses_an_older_version_whose_bytes_rotted(tmp_path):
+    # Its stored checksum names the entry, so the lookup picks it, and only its bytes can
+    # refuse it.
+    client = FakeS3()
+    client.store(KEY, b"rotted at rest\n", checksum=_b64(ENTRY))
+    client.store(KEY, b"current\n")
+
+    with pytest.raises(bucket.BucketLedgerMismatch) as raised:
+        read_bucket_trimmed(client, TARGET, {TRIMMED: {"sha256": _sha(ENTRY)}})
+
+    assert (raised.value.refused, raised.value.code) == (False, None)
+    assert _versioned_gets(client) == [KEY]
+
+
+def test_a_local_failure_writing_the_older_version_refuses_the_restore(tmp_path):
+    # The current version's part file is removed before the lookup's HEAD, and a directory
+    # put in its place there makes the older version's write fail on the local disk.
+    lake = _stopped(tmp_path)
+    work = tmp_path / "d" / WORK
+    part = work / (QUARANTINE + ".part")
+    real_head = lake.client.head_object
+
+    def head_object(**kwargs):
+        if kwargs.get("VersionId") is not None and kwargs["Key"] == TARGET.key(QUARANTINE):
+            part.mkdir(exist_ok=True)
+        return real_head(**kwargs)
+
+    lake.client.head_object = head_object
+
+    with pytest.raises(bucket.RestoreRefused) as refused:
+        _restore_whole(tmp_path, lake)
+
+    assert str(refused.value).startswith(
+        f"writing {QUARANTINE} into {work} failed (IsADirectoryError"
+    )
+
+
 # -- 7. the resolver's rules -------------------------------------------------------------
 
 
@@ -544,12 +653,28 @@ def _ids(client: FakeS3, key: str = KEY) -> list[str]:
     return [version.version_id for version in client.versions(key)]
 
 
+def _cap_pages(client: FakeS3, pages: int) -> None:
+    """Fail the lookup once it asks for more than ``pages`` pages of the listing.
+
+    A listing whose markers never advance would otherwise loop for as long as the run lasts,
+    rather than fail.
+    """
+    real_list = client.list_object_versions
+
+    def list_object_versions(**kwargs):
+        assert len(_listings(client)) < pages, f"the lookup asked for more than {pages} page(s)"
+        return real_list(**kwargs)
+
+    client.list_object_versions = list_object_versions
+
+
 def test_a_match_past_the_first_page_is_found(tmp_path):
     client = FakeS3(page_size=2)
     client.store(KEY, ENTRY)
     for n in range(3):
         client.store(KEY, f"later {n}\n".encode())
     v1, _v2, v3, _v4 = _ids(client)
+    _cap_pages(client, 2)
 
     found = matching_version(client, TARGET, TRIMMED, _sha(ENTRY))
 
@@ -581,11 +706,27 @@ def test_the_lookup_stops_once_the_listing_moves_past_the_key(tmp_path):
     client.store(KEY, b"current\n")
     for n in range(3):
         client.store(KEY + ".x", f"sibling {n}\n".encode())
+    _cap_pages(client, 3)
 
     assert matching_version(client, TARGET, TRIMMED, _sha(ENTRY)) is None
 
     # The key's two versions, then the page that reaches the sibling and ends it.
     assert len(_listings(client)) == 3
+
+
+def test_keys_sorting_before_the_key_do_not_end_the_lookup(tmp_path):
+    # Three partitions sort before the ledger's key under the bucket's prefix. A listing that
+    # reached them would end on a page whose NextKeyMarker is not the key, before the match.
+    client = FakeS3(page_size=2)
+    for rel in (SPY_1, SPY_2, SPY_3):
+        client.store(TARGET.key(rel), b"a partition\n")
+    client.store(KEY, ENTRY)
+    client.store(KEY, b"current\n")
+    _cap_pages(client, 1)
+
+    found = matching_version(client, TARGET, TRIMMED, _sha(ENTRY))
+
+    assert found == bucket.MatchingVersion(version_id=_ids(client)[0], size=len(ENTRY))
 
 
 def test_a_delete_marker_is_never_read(tmp_path):
@@ -683,6 +824,7 @@ def test_the_first_match_ends_the_lookup(tmp_path):
     client.store(KEY, ENTRY)
     client.store(KEY, b"current\n")
     _v1, v2, _v3 = _ids(client)
+    _cap_pages(client, 1)
 
     found = matching_version(client, TARGET, TRIMMED, _sha(ENTRY))
 
@@ -818,6 +960,13 @@ def test_the_next_upload_after_a_restore_heals_the_bucket(tmp_path, windowed):
 
     assert summary.restored
     assert summary.recovered == _recovered(lake)
+    # Each recovered file counts its older version's bytes, a size its current version's
+    # differs from.
+    restored = [p.relative_to(host).as_posix() for p in host.rglob("*") if p.is_file()]
+    expected = {rel: len(lake.client.body(TARGET.key(rel))) for rel in restored}
+    expected.update({rel: len(lake.named[rel]) for rel in (QUARANTINE, TRIMMED)})
+    del expected["manifest.jsonl"]
+    assert summary.downloaded_bytes == sum(expected.values())
     _heals(lake, host)
 
 
