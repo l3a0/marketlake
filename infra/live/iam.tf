@@ -1,11 +1,13 @@
-# The hosted VM's instance role. It gets the same four S3 actions as the laptop's
+# The hosted VM's instance role. It gets the same six S3 actions as the laptop's
 # marketlake-backup role in command.tf, which are the ones src/lake/bucket.py calls:
-# PutObject, GetObject (which also authorises HEAD), ListBucket and GetBucketVersioning.
-# They are split across two policies, a read half that is always on and a write half,
-# PutObject alone, meant for a primary VM and not a shadow one. #638's cutover turns it on
-# just before the VM's role flips to primary, and the way back turns it off before the role
-# returns to shadow. Nothing deletes a version or reads an old one. The instance role also
-# reads the config parameters.
+# PutObject, GetObject (which also authorises HEAD), ListBucket, GetBucketVersioning,
+# ListBucketVersions and GetObjectVersion. They are split across two policies, a read half
+# that is always on and a write half, PutObject alone, meant for a primary VM and not a
+# shadow one. #638's cutover turns it on just before the VM's role flips to primary, and the
+# way back turns it off before the role returns to shadow. Nothing deletes a version. The
+# last two read an old one: a restore or a resync that finds a file's current version newer
+# than the bucket's manifest takes the version the manifest names (#838). The instance role
+# also reads the config parameters.
 
 # -- the instance role --------------------------------------------------------------
 
@@ -70,12 +72,12 @@ resource "aws_iam_role_policy" "instance_s3_read" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Action   = ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning"]
         Resource = "arn:aws:s3:::${var.backup_bucket}"
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:GetObject"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "arn:aws:s3:::${var.backup_bucket}/*"
       },
     ]

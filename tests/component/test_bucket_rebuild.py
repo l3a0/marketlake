@@ -30,6 +30,7 @@ written out as a literal.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -515,22 +516,25 @@ def test_a_resumed_restore_with_an_unrecorded_ledger_in_the_working_directory(tm
     first_upload(root, TARGET, client=client, clock=ManualClock(FRIDAY_19), calendar=CALENDAR)
     assert LEDGER not in _bucket_latest(client)
     client.store(f"lake/{LEDGER}", b"a ledger the manifest does not record\n")
-    good = client.body(f"lake/{SPY_1}")
-    client.store(f"lake/{SPY_1}", good + b"rot")
+    # SPY_1 rots at rest, which makes no new version, so no older version matches either.
+    versions = client.versions(f"lake/{SPY_1}")
+    good = versions[-1]
+    versions[-1] = dataclasses.replace(good, body=good.body + b"rot")
     dest = tmp_path / "restored"
 
     first = restore_lake(dest, TARGET, client=client, skip_designed_absences=True)
     assert first.restored is False
     assert first.failures == [(SPY_1, "does not match its SHA-256")]
+    assert first.recovered == []
     assert (dest / WORK / LEDGER).is_file()
-    client.store(f"lake/{SPY_1}", good)
+    versions[-1] = good
 
     second = restore_lake(dest, TARGET, client=client, skip_designed_absences=True)
 
     assert second.restored is True
     assert second.failures == []
     assert (dest / LEDGER).read_bytes() == b"a ledger the manifest does not record\n"
-    assert (dest / SPY_1).read_bytes() == good
+    assert (dest / SPY_1).read_bytes() == good.body
 
 
 @pytest.mark.parametrize(
@@ -650,14 +654,14 @@ def test_a_bad_window_key_breaks_no_command_but_the_restore(tmp_path, monkeypatc
     assert client.calls != []
 
 
-def test_a_keyless_host_never_reads_the_ledger_and_fails_on_a_mismatch_with_exit_1(
+def test_a_keyless_host_never_reads_the_ledger_and_takes_the_version_its_entry_names(
     tmp_path, monkeypatch, capsys
 ):
     # A nightly upload stopped between the ledger's PUT and the manifest's leaves the bucket's
     # current trimmed.jsonl newer than the manifest's entry, while the version the entry names
     # is still in the bucket. The whole-lake restore downloads the current version like any
-    # manifested file and fails it in the download loop. That exit 1 is marketlake #838's gap,
-    # and #838's fix, which falls back to the matching version, rewrites this assertion.
+    # manifested file, finds it does not match, and takes the older version that does. Before
+    # marketlake #838 this exited 1.
     lake = _trimmed_bucket(tmp_path)
     recorded = lake.client.body(f"lake/{LEDGER}")
     assert _sha(recorded) == _bucket_latest(lake.client)[LEDGER]["sha256"]
@@ -665,14 +669,20 @@ def test_a_keyless_host_never_reads_the_ledger_and_fails_on_a_mismatch_with_exit
     lake.client.store(
         f"lake/{LEDGER}", recorded + (json.dumps(extra, sort_keys=True) + "\n").encode()
     )
-    assert [version.body for version in lake.client.versions(f"lake/{LEDGER}")][-2] == recorded
+    older = lake.client.versions(f"lake/{LEDGER}")[-2]
+    assert older.body == recorded
+    dest = tmp_path / "restored"
 
-    code = _main(_config(tmp_path, lake.root), lake.client, monkeypatch, tmp_path / "restored")
+    code = _main(_config(tmp_path, lake.root), lake.client, monkeypatch, dest)
 
-    assert code == 1
-    err = capsys.readouterr().err.splitlines()
-    assert err[0] == f"restore: does not match its SHA-256: {LEDGER}"
-    assert len(err) == 2
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert lines[0].startswith(f"restore: took {LEDGER} from bucket version {older.version_id}, ")
+    assert lines[1].startswith("restore: restored ")
+    assert len(lines) == 2
+    assert (dest / LEDGER).read_bytes() == recorded
 
 
 # -- 5. a lost trimmed object --------------------------------------------------------

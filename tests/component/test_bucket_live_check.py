@@ -3,8 +3,9 @@
 ``python -m lake.bucket live-check`` runs by hand against the owner's real bucket, and
 the suite never reaches one. What can be checked here is that the check reads each
 answer the right way: it passes a bucket that behaves as S3 documents, and it fails each
-of the four behaviors when the bucket breaks it. It fails each of the three read grants,
-marketlake #737, when the credentials lack one. The command exits 1 when any one fails.
+of the four behaviors when the bucket breaks it. It fails each of the five read grants,
+marketlake #737 and #838, when the credentials lack one, and behavior 3's read of the old
+version when they lack ``s3:GetObjectVersion``. The command exits 1 when any one fails.
 A live check that passed everything would prove nothing on the day it runs for real.
 """
 
@@ -35,11 +36,23 @@ def _run(client: FakeS3) -> tuple[bool, list[str]]:
     return passed, lines
 
 
-def test_a_bucket_that_behaves_as_documented_passes_all_seven(tmp_path):
+def test_a_bucket_that_behaves_as_documented_passes_all_nine(tmp_path):
     passed, lines = _run(FakeS3())
     assert passed
-    for behavior in ("1", "2", "3", "4", "5", "6", "7"):
+    for behavior in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
         assert any(line.startswith(f"live-check: PASS {behavior} ") for line in lines)
+    assert not any("FAIL" in line for line in lines)
+    assert (
+        "live-check: PASS 3 GetObject by VersionId of the first version returned the first "
+        "PUT's bytes"
+    ) in lines
+    assert (
+        "live-check: PASS 8 ListObjectVersions of the probe listed 2 version(s), latest v2"
+    ) in lines
+    assert any(
+        line.startswith("live-check: PASS 9 HeadObject by VersionId of the first version ")
+        for line in lines
+    )
     assert (
         "live-check: PASS 5 ListObjectsV2 under live-check/live-check-20261005T230000Z/ "
         "listed 1 object(s)"
@@ -55,12 +68,130 @@ def test_a_bucket_that_behaves_as_documented_passes_all_seven(tmp_path):
     assert lines[-1].endswith("The bucket's credentials cannot delete")
 
 
-def test_credentials_that_cannot_read_old_versions_are_sent_to_the_console():
+def test_credentials_that_cannot_read_old_versions_fail_three_and_nine():
+    # Before marketlake #838's apply neither role holds s3:GetObjectVersion, so the old
+    # version's read-back and the versioned HEAD each print a FAIL rather than a console step.
     passed, lines = _run(FakeS3(deny_versioned_get=True))
-    assert passed
-    sent = [line for line in lines if "confirm by hand in the console" in line]
-    assert len(sent) == 1
-    assert "The bucket's credentials hold no s3:GetObjectVersion" in sent[0]
+    assert not passed
+    assert "live-check: FAIL 3 GetObject by VersionId refused with AccessDenied" in lines
+    assert "live-check: FAIL 9 HeadObject by VersionId refused with 403" in lines
+    assert any(line.startswith("live-check: PASS 8 ") for line in lines)
+    assert any(line.startswith("live-check: PASS 3 two PUTs to one key") for line in lines)
+    assert not any("console that" in line for line in lines)
+
+
+def test_credentials_that_cannot_list_versions_fail_eight():
+    passed, lines = _run(FakeS3(deny_list_versions=True))
+    assert not passed
+    assert "live-check: FAIL 8 ListObjectVersions refused with AccessDenied" in lines
+    assert [line for line in lines if " FAIL " in line] == [
+        "live-check: FAIL 8 ListObjectVersions refused with AccessDenied"
+    ]
+
+
+class _ListsOnlyTheLatest(FakeS3):
+    """A version listing that leaves out every noncurrent version."""
+
+    def list_object_versions(self, **kwargs):
+        page = super().list_object_versions(**kwargs)
+        page["Versions"] = [entry for entry in page.get("Versions", []) if entry["IsLatest"]]
+        return page
+
+
+class _ListsNoLatest(FakeS3):
+    """A version listing that marks no version latest."""
+
+    def list_object_versions(self, **kwargs):
+        page = super().list_object_versions(**kwargs)
+        page["Versions"] = [{**entry, "IsLatest": False} for entry in page.get("Versions", [])]
+        return page
+
+
+class _ListsTheOldAsLatest(FakeS3):
+    """A version listing that marks the first version latest instead of the second."""
+
+    def list_object_versions(self, **kwargs):
+        page = super().list_object_versions(**kwargs)
+        page["Versions"] = [
+            {**entry, "IsLatest": not entry["IsLatest"]} for entry in page.get("Versions", [])
+        ]
+        return page
+
+
+class _ListsUnderASibling(FakeS3):
+    """A version listing whose entries name a sibling key, which a prefix also matches."""
+
+    def list_object_versions(self, **kwargs):
+        page = super().list_object_versions(**kwargs)
+        page["Versions"] = [
+            {**entry, "Key": entry["Key"] + ".x"} for entry in page.get("Versions", [])
+        ]
+        return page
+
+
+@pytest.mark.parametrize(
+    ("fake", "shown"),
+    [
+        (_ListsOnlyTheLatest, "listed 1 version(s), latest v2"),
+        (_ListsNoLatest, "listed 2 version(s), none latest"),
+        (_ListsTheOldAsLatest, "listed 2 version(s), latest v1"),
+        (_ListsUnderASibling, "listed 0 version(s), none latest"),
+    ],
+)
+def test_a_version_listing_without_both_versions_or_the_right_latest_fails_eight(fake, shown):
+    passed, lines = _run(fake())
+    assert not passed
+    assert f"live-check: FAIL 8 ListObjectVersions of the probe {shown}" in lines
+
+
+class _HeadIgnoresVersion(FakeS3):
+    """A ``HeadObject`` that answers for the current version whatever version it names."""
+
+    def head_object(self, **kwargs):
+        kwargs.pop("VersionId", None)
+        return super().head_object(**kwargs)
+
+
+def test_a_versioned_head_answering_for_the_current_version_fails_nine():
+    passed, lines = _run(_HeadIgnoresVersion())
+    assert not passed
+    assert any(
+        line.startswith("live-check: FAIL 9 HeadObject by VersionId of the first version ")
+        for line in lines
+    )
+
+
+class _HeadWithoutChecksum(FakeS3):
+    """A versioned ``HeadObject`` that returns no stored checksum."""
+
+    def head_object(self, **kwargs):
+        response = super().head_object(**kwargs)
+        if "VersionId" in kwargs:
+            response.pop("ChecksumSHA256", None)
+        return response
+
+
+def test_a_versioned_head_without_a_checksum_fails_nine():
+    passed, lines = _run(_HeadWithoutChecksum())
+    assert not passed
+    assert (
+        "live-check: FAIL 9 HeadObject by VersionId of the first version returned "
+        "ChecksumSHA256 None"
+    ) in lines
+
+
+def test_without_two_versions_the_old_version_lines_do_not_run():
+    # With no usable old id there is nothing to name, and boto3 would refuse a None id
+    # before sending, so the three old-version lines say they did not run.
+    passed, lines = _run(_Unversioned())
+    assert not passed
+    assert not any(line.startswith(("live-check: PASS 8", "live-check: FAIL 8")) for line in lines)
+    assert not any(line.startswith(("live-check: PASS 9", "live-check: FAIL 9")) for line in lines)
+    assert not any("GetObject by VersionId" in line for line in lines)
+    assert (
+        "live-check: 3's read of the first version, 8 and 9 need two usable versions, so they "
+        "did not run"
+    ) in lines
 
 
 class _AcceptsAnything(FakeS3):
@@ -184,7 +315,9 @@ class _KeepsNoOldBytes(FakeS3):
 def test_an_old_version_holding_the_new_bytes_fails_behavior_three():
     passed, lines = _run(_KeepsNoOldBytes())
     assert not passed
-    assert "live-check: FAIL 3 the first version still holds the first PUT's bytes" in lines
+    assert (
+        "live-check: FAIL 3 GetObject by VersionId of the first version returned other bytes"
+    ) in lines
 
 
 class _DeniesList(FakeS3):

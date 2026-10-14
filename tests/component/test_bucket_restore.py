@@ -23,6 +23,7 @@ as a literal for the same reason.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import os
 import shutil
@@ -146,12 +147,17 @@ def _gets(client: FakeS3) -> list[str]:
 
 
 def _rot(client: FakeS3, rel: str, lake: Path) -> None:
-    """Replace an object's bytes and keep the checksum S3 stored for the true ones.
+    """Replace the current version's bytes and keep its id and the checksum S3 stored.
 
-    That is rot at rest: ``HeadObject`` still reports what S3 accepted at upload, and
-    only a download sees the bytes.
+    That is rot at rest: ``HeadObject`` still reports what S3 accepted at upload, only a
+    download sees the bytes, and no new version appears. ``store`` would add a version and
+    leave the good one under it, which the restore would then recover (marketlake #838). The
+    current ``Version`` is swapped for a new object rather than changed in place, because a
+    test that took it before ``_rot`` puts its bytes back as the repair.
     """
-    client.store(f"lake/{rel}", b"rotted bytes", checksum=_b64((lake / rel).read_bytes()))
+    versions = client.versions(f"lake/{rel}")
+    assert versions[-1].checksum == _b64((lake / rel).read_bytes())
+    versions[-1] = dataclasses.replace(versions[-1], body=b"rotted bytes")
 
 
 # -- 1. the round trip -----------------------------------------------------------

@@ -27,9 +27,11 @@ test's docstring names the mutation it catches.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -126,6 +128,23 @@ def _record_in_bucket(client: FakeS3, rel: str, data: bytes) -> None:
     entry = {"fetched_at": None, "partition": rel, "rows": 1, "sha256": _sha(data), "source": "x"}
     raw = client.body("lake/manifest.jsonl") + (json.dumps(entry, sort_keys=True) + "\n").encode()
     client.store("lake/manifest.jsonl", raw)
+
+
+def _rot(client: FakeS3, rel: str, body: bytes = b"rot") -> Callable[[], None]:
+    """Rot the current version of ``rel`` at rest, and return the repair that undoes it.
+
+    Rot makes no new version, so no older version matches either, and the run fails the file.
+    A new version stored over the good one would leave the good one under it, which the
+    reading restore takes in its place (marketlake #838). The repair puts the good one back.
+    """
+    versions = client.versions(f"lake/{rel}")
+    good = versions[-1]
+    versions[-1] = dataclasses.replace(good, body=body)
+
+    def repair() -> None:
+        versions[-1] = good
+
+    return repair
 
 
 def _upload(root: Path) -> FakeS3:
@@ -611,13 +630,16 @@ def test_a_bad_key_inside_the_plan_fails_the_run_and_moves_nothing(
     assert sorted(os.listdir(dest)) == [WORK]
 
 
-def test_a_mismatched_file_names_its_role_and_both_causes(tmp_path, monkeypatch, capsys):
-    """A range partition whose current version does not match its entry.
+def test_a_mismatched_file_no_version_matches_names_its_role_and_the_cause(
+    tmp_path, monkeypatch, capsys
+):
+    """A range partition whose current version rotted, with no older version that matches.
 
-    Catches a failure line that drops what the file is to the range, or the causes.
+    Catches a failure line that drops what the file is to the range, or the cause and its
+    repair, a copy from outside the bucket.
     """
     root, client = _simple(tmp_path)
-    client.store(f"lake/{_chains('SPY', D3)}", b"rot")
+    _rot(client, _chains("SPY", D3))
     dest = tmp_path / "reading"
 
     code = _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
@@ -627,9 +649,35 @@ def test_a_mismatched_file_names_its_role_and_both_causes(tmp_path, monkeypatch,
     assert err[0] == (
         f"{LABEL}: does not match its SHA-256: {_chains('SPY', D3)}, a partition in the range"
     )
-    assert "a run after the next complete nightly upload passes" in err[1]
+    assert err[1].startswith(f"{LABEL}: no version in the bucket matches the manifest.jsonl ")
+    assert "from outside the bucket" in err[1] and str(dest / WORK) in err[1]
+    assert "refused" not in err[1]
+    assert len(err) == 3
+
+
+def test_a_mismatched_file_whose_lookup_is_refused_names_the_grants(tmp_path, monkeypatch, capsys):
+    """A newer current version over a matching one, on a role without the version grants.
+
+    Catches a refused lookup escaping as the transport line, which would lose the failure line
+    and the exit 1, and a line that sends the operator to copy from outside the bucket when the
+    console still holds the matching version.
+    """
+    root, client = _simple(tmp_path)
+    client.store(f"lake/{_chains('SPY', D3)}", b"newer")
+    client.deny_list_versions = True
+    dest = tmp_path / "reading"
+
+    code = _main(tmp_path, root, client, monkeypatch, [str(dest), "--surface", "chains"])
+
+    assert code == 1
+    err = capsys.readouterr().err.splitlines()
+    assert err[0] == (
+        f"{LABEL}: does not match its SHA-256: {_chains('SPY', D3)}, a partition in the range"
+    )
+    assert err[1].startswith(f"{LABEL}: the bucket refused the lookup of an older version ")
+    assert "(AccessDenied)" in err[1]
+    assert "s3:ListBucketVersions and s3:GetObjectVersion" in err[1]
     assert '"When the lake is gone"' in err[1] and str(dest / WORK) in err[1]
-    assert "When the bucket holds an earlier good version" in err[1]
     assert len(err) == 3
 
 
@@ -1338,9 +1386,9 @@ def test_a_working_file_larger_than_its_listed_size_counts_toward_the_space_need
     dest = tmp_path / "reading"
     key = f"lake/{_chains('SPY', D3)}"
     good = client.body(key)
-    client.store(key, good + b"rot")
+    repair = _rot(client, _chains("SPY", D3), good + b"rot")
     assert _read(client, dest, root).restored is False
-    client.store(key, good)
+    repair()
     grown = dest / WORK / _chains("SPY", D2)
     grown.write_bytes(grown.read_bytes() + b"extra")
     listed = len(client.body(f"lake/{_chains('SPY', D2)}"))
@@ -1513,12 +1561,12 @@ def test_a_rerun_with_the_same_range_resumes_after_a_failed_file(tmp_path):
     root, client = _simple(tmp_path)
     dest = tmp_path / "reading"
     good = client.body(f"lake/{_chains('SPY', D3)}")
-    client.store(f"lake/{_chains('SPY', D3)}", good + b"rot")
+    repair = _rot(client, _chains("SPY", D3), good + b"rot")
 
     first = _read(client, dest, root)
     assert first.restored is False
     assert first.failures == [(_chains("SPY", D3), "does not match its SHA-256")]
-    client.store(f"lake/{_chains('SPY', D3)}", good)
+    repair()
 
     second = _read(client, dest, root)
 
@@ -1531,7 +1579,7 @@ def test_a_corrected_range_after_a_failed_run_prunes_what_it_no_longer_plans(tmp
     """Every ticker failed on QQQ, and SPY alone then restores without QQQ's leftovers."""
     root, client = _simple(tmp_path)
     dest = tmp_path / "reading"
-    client.store(f"lake/{_chains('QQQ', D2)}", b"rot")
+    _rot(client, _chains("QQQ", D2))
 
     first = _read(client, dest, root, ticker=None, first=D2, last=D2)
     assert first.restored is False

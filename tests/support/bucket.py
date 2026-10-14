@@ -1,7 +1,7 @@
 """The fake S3 client.
 
 ``FakeS3`` stands in for the ``boto3`` S3 client the bucket backup uses. It answers the
-five calls ``lake.bucket`` makes with the shapes S3 answers them, and raises the errors
+six calls ``lake.bucket`` makes with the shapes S3 answers them, and raises the errors
 S3 raises as real ``botocore`` ``ClientError`` objects, so the code under test sorts them
 the way it would sort the real ones. No socket is opened, and the suite's network guard
 would fail the test if one were.
@@ -16,15 +16,25 @@ code that depends on it untested.
    valid base64, so the value decodes, to 48 bytes. A value that decodes to the wrong 32
    bytes is refused as ``BadDigest``, HTTP 400.
 2. **Every PUT is a new version.** A key keeps a list of versions, newest last, so a test
-   can count versions to prove a second run sent nothing. ``GetObject`` answers with the
-   ``VersionId`` of the version it served, on a plain read of the current version as on a
-   read of a named one, which is what S3 does on a versioned bucket.
+   can count versions to prove a second run sent nothing. ``GetObject`` and ``HeadObject``
+   answer with the ``VersionId`` of the version they served, on a plain request for the
+   current version as on a request naming one, which is what S3 does on a versioned
+   bucket. ``ListObjectVersions`` lists every version of every key under its ``Prefix``,
+   sibling keys such as ``trimmed.jsonl.x`` included, newest first within a key, and pages
+   by ``KeyMarker`` and ``VersionIdMarker`` as S3 does (marketlake #838).
 
-``HeadObject`` on a missing key answers a bare 404, as S3 does for a key that holds
-``s3:ListBucket``, and its error carries no body. ``fail_with`` makes every call raise one
-chosen error, which is how a test models a revoked key or a network that is down.
-``on_put`` and ``on_get`` run before a ``PutObject`` or a ``GetObject`` is answered, so a
-test can fail or time one kind of call alone.
+``HeadObject`` on a missing key or a missing version answers a bare 404, as S3 does for a
+key that holds ``s3:ListBucket``, and its error carries no body. A delete marker, which
+``delete_marker`` adds, shows only in the version listing, and a ``HeadObject`` naming it
+answers 405 as S3 does. ``fail_with`` makes every call raise one chosen error, which is how
+a test models a revoked key or a network that is down. ``deny_versioned_get`` refuses a
+``GetObject`` or a ``HeadObject`` that names a version, the two calls ``s3:GetObjectVersion``
+covers, and ``deny_list_versions`` refuses ``ListObjectVersions``, so a test can model a role
+without those grants. ``deny_versioned_get_object`` refuses only a ``GetObject`` that names a
+version and lets a ``HeadObject`` naming one through, so a test can reach a refused read that
+follows a lookup whose requests all passed. ``on_put`` and ``on_get`` run before a
+``PutObject`` or a ``GetObject`` is answered, so a test can fail or time one kind of call
+alone.
 """
 
 from __future__ import annotations
@@ -95,6 +105,8 @@ class FakeS3:
         on_put=None,
         on_get=None,
         deny_versioned_get: bool = False,
+        deny_list_versions: bool = False,
+        deny_versioned_get_object: bool = False,
     ) -> None:
         self.bucket = bucket
         self.page_size = page_size
@@ -102,7 +114,12 @@ class FakeS3:
         self.on_put = on_put
         self.on_get = on_get
         self.deny_versioned_get = deny_versioned_get
+        self.deny_list_versions = deny_list_versions
+        self.deny_versioned_get_object = deny_versioned_get_object
         self.objects: dict[str, list[Version]] = {}
+        # Each key's delete markers, as ``(sequence, version id)``. The sequence orders them
+        # among the key's versions, whose ids carry the same counter.
+        self.markers: dict[str, list[tuple[int, str]]] = {}
         self.calls: list[tuple[str, dict]] = []
         self.fail_with: Exception | None = None
         self.meta = _Meta()
@@ -145,6 +162,25 @@ class FakeS3:
             else checksum
         )
         self._add(key, body, value, checksum_type, None)
+
+    def delete_marker(self, key: str) -> str:
+        """Add a delete marker to ``key`` and return its version id.
+
+        Only the version listing shows it. A test that wants the key's current version served
+        stores a version after the marker, as S3 too serves the newest version then.
+        """
+        self._next_version += 1
+        version_id = f"v{self._next_version}"
+        self.markers.setdefault(key, []).append((self._next_version, version_id))
+        return version_id
+
+    def versioned_calls(self) -> list[tuple[str, dict]]:
+        """Every call that lists versions or names one, in order."""
+        return [
+            (name, kwargs)
+            for name, kwargs in self.calls
+            if name == "list_object_versions" or "VersionId" in kwargs
+        ]
 
     # -- the client calls ------------------------------------------------------
 
@@ -193,9 +229,22 @@ class FakeS3:
     def head_object(self, **kwargs) -> dict:
         self._enter("head_object", kwargs)
         versions = self.objects.get(kwargs["Key"])
+        wanted = kwargs.get("VersionId")
+        if wanted is not None and self.deny_versioned_get:
+            raise client_error("403", "HeadObject", 403)
+        if wanted is not None and any(
+            marker == wanted for _, marker in self.markers.get(kwargs["Key"], ())
+        ):
+            raise client_error("405", "HeadObject", 405)
         if not versions:
             raise client_error("404", "HeadObject", 404)
-        current = versions[-1]
+        if wanted is None:
+            current = versions[-1]
+        else:
+            named = [version for version in versions if version.version_id == wanted]
+            if not named:
+                raise client_error("404", "HeadObject", 404)
+            current = named[0]
         response = {"ContentLength": len(current.body), "VersionId": current.version_id}
         if current.storage_class is not None:
             response["StorageClass"] = current.storage_class
@@ -216,7 +265,7 @@ class FakeS3:
         if wanted is None:
             current = versions[-1]
             return {"Body": io.BytesIO(current.body), "VersionId": current.version_id}
-        if self.deny_versioned_get:
+        if self.deny_versioned_get or self.deny_versioned_get_object:
             raise client_error("AccessDenied", "GetObject", 403)
         for version in versions:
             if version.version_id == wanted:
@@ -237,6 +286,73 @@ class FakeS3:
             response["NextContinuationToken"] = str(start + self.page_size)
         if not page:
             del response["Contents"]
+        return response
+
+    def list_object_versions(self, **kwargs) -> dict:
+        """S3's version listing: every version and delete marker under ``Prefix``, in pages.
+
+        Entries run in key order, newest first within a key, and ``IsLatest`` marks each key's
+        newest entry. ``KeyMarker`` alone starts after every entry of that key, and with
+        ``VersionIdMarker`` it starts after that one entry. A truncated page carries
+        ``NextKeyMarker`` and ``NextVersionIdMarker``, its last entry's. ``MaxKeys`` caps a
+        page, and otherwise the client's ``page_size`` does.
+        """
+        self._enter("list_object_versions", kwargs)
+        if self.deny_list_versions:
+            raise client_error("AccessDenied", "ListObjectVersions", 403)
+        prefix = kwargs.get("Prefix", "")
+        entries: list[tuple[str, int, str, Version | None]] = []
+        for key in sorted(set(self.objects) | set(self.markers)):
+            if not key.startswith(prefix):
+                continue
+            mine: list[tuple[int, str, Version | None]] = [
+                (int(version.version_id[1:]), version.version_id, version)
+                for version in self.objects.get(key, ())
+            ]
+            mine += [(seq, marker, None) for seq, marker in self.markers.get(key, ())]
+            for seq, version_id, version in sorted(mine, key=lambda item: -item[0]):
+                entries.append((key, seq, version_id, version))
+        start = 0
+        key_marker = kwargs.get("KeyMarker")
+        if key_marker is not None:
+            id_marker = kwargs.get("VersionIdMarker")
+            start = len(entries)
+            for index, (key, _seq, version_id, _version) in enumerate(entries):
+                if key > key_marker:
+                    start = index
+                    break
+                if key == key_marker and id_marker is not None and version_id == id_marker:
+                    start = index + 1
+                    break
+        size = int(kwargs.get("MaxKeys", self.page_size))
+        page = entries[start : start + size]
+        newest: dict[str, int] = {}
+        for key, seq, _version_id, _version in entries:
+            newest[key] = max(newest.get(key, seq), seq)
+        response: dict = {"IsTruncated": start + size < len(entries)}
+        versions = [
+            {
+                "Key": key,
+                "VersionId": version_id,
+                "IsLatest": seq == newest[key],
+                "Size": len(version.body),
+            }
+            for key, seq, version_id, version in page
+            if version is not None
+        ]
+        markers = [
+            {"Key": key, "VersionId": version_id, "IsLatest": seq == newest[key]}
+            for key, seq, version_id, version in page
+            if version is None
+        ]
+        if versions:
+            response["Versions"] = versions
+        if markers:
+            response["DeleteMarkers"] = markers
+        if response["IsTruncated"]:
+            last_key, _seq, last_id, _version = page[-1]
+            response["NextKeyMarker"] = last_key
+            response["NextVersionIdMarker"] = last_id
         return response
 
     def get_bucket_versioning(self, **kwargs) -> dict:

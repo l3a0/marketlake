@@ -28,6 +28,7 @@ Expected digests are read from the files the test wrote, never through the code 
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from datetime import date, datetime
@@ -47,7 +48,7 @@ from lake.bucket import (
 from lake.calendar import MARKET_TZ
 from lake.config import BucketTarget
 from lake.manifest import append_manifest, manifest_path, sha256_file
-from tests.support.bucket import FakeS3, client_error
+from tests.support.bucket import FakeS3, Version, client_error
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -842,15 +843,138 @@ def test_a_download_the_bucket_no_longer_lists_refuses(tmp_path):
     assert "no current version" in message
 
 
-def test_an_object_newer_than_the_buckets_manifest_refuses_naming_both_causes(tmp_path):
-    laptop, vm, client, _files = _switched(tmp_path)
-    client.store(TARGET.key(QUOTES_2), b"a later upload's bytes")
+def _newer_than_the_manifest(client: FakeS3, rel: str, data: bytes) -> Version:
+    """Store ``data`` as ``rel``'s current version, as an upload stopped before its manifest.
+
+    It returns the version the bucket's manifest still names, which the new one sits over.
+    """
+    named = client.versions(TARGET.key(rel))[-1]
+    client.store(TARGET.key(rel), data)
+    return named
+
+
+def test_an_object_newer_than_the_buckets_manifest_is_taken_from_the_version_it_names(tmp_path):
+    # A nightly upload on the VM PUT QUOTES_2 again and stopped before its manifest.jsonl, so
+    # the current version is newer than the entry. Before marketlake #838 this refused.
+    laptop, vm, client, files = _switched(tmp_path)
+    named = _newer_than_the_manifest(client, QUOTES_2, b"a later upload's much longer bytes")
+    client.calls.clear()
+
+    summary = _resync(laptop, client)
+
+    # The matched version's size, not the current one's, is what the plan downloads.
+    assert dict(summary.downloads)[QUOTES_2] == len(files[QUOTES_2])
+    # A dry run reads no data file, the pinned one included, so it says what --apply takes
+    # rather than that it took anything.
+    (warning,) = summary.warnings
+    assert warning.startswith(f"--apply takes {QUOTES_2} from bucket version {named.version_id}, ")
+    assert f"resync: warning: {warning}" in summary.lines()
+    assert _gets(client) == [MANIFEST_KEY]
+
+    applied = _resync(laptop, client, apply=True)
+
+    assert applied.applied
+    # The run that downloaded the version names it once, and the dry run's line is not repeated.
+    (took,) = applied.warnings
+    assert took.startswith(f"took {QUOTES_2} from bucket version {named.version_id}, ")
+    assert (laptop / QUOTES_2).read_bytes() == files[QUOTES_2]
+    pinned = [
+        kwargs for name, kwargs in client.calls if name == "get_object" and "VersionId" in kwargs
+    ]
+    assert pinned == [
+        {"Bucket": "lake-backup", "Key": TARGET.key(QUOTES_2), "VersionId": named.version_id}
+    ]
+
+
+def test_the_matched_version_s_size_is_what_the_reserve_check_needs(tmp_path):
+    # The current version is far larger than the one the entry names. Room for the matched
+    # size and the reserve passes, and one byte less refuses.
+    laptop, vm, client, files = _switched(tmp_path)
+    _newer_than_the_manifest(client, QUOTES_2, b"x" * 10_000_000)
+    summary = _resync(laptop, client)
+    planned = sum(size for _rel, size in summary.downloads)
+    assert planned == len(files[QUOTES_2]) + len(files[SPY_2]) + len(
+        client.body(TARGET.key(QUARANTINE))
+    )
+    sizes = {
+        rel: len(client.body(TARGET.key(rel)))
+        for rel in (SPY_1, "quotes/ticker=SPY/date=2026-08-24.parquet", SPY_2)
+    }
+    # The busiest sealed day is Monday's chains and quotes or Tuesday's, by the listing, which
+    # still shows the current, larger QUOTES_2.
+    busiest = max(
+        sizes[SPY_1] + sizes["quotes/ticker=SPY/date=2026-08-24.parquet"], sizes[SPY_2] + 10_000_000
+    )
+    reserve = 13 * busiest
+
+    assert _resync(laptop, client, free=planned + reserve).downloads
+    assert "journal reserve" in _refused(laptop, client, free=planned + reserve - 1)
+
+
+def test_a_pinned_version_that_does_not_hash_refuses_as_rot(tmp_path):
+    laptop, vm, client, files = _switched(tmp_path)
+    named = _newer_than_the_manifest(client, QUOTES_2, b"a later upload's bytes")
+    versions = client.versions(TARGET.key(QUOTES_2))
+    index = versions.index(named)
+    versions[index] = dataclasses.replace(named, body=b"rotted at rest")
+    before = _snapshot(laptop)
+
+    message = _refused(laptop, client, apply=True)
+
+    assert message.startswith(f"version {named.version_id} of {QUOTES_2!r}, ")
+    assert "rotted in the bucket" in message
+    assert str(laptop / QUOTES_2) in message
+    assert "upload" not in message
+    assert _snapshot(laptop) == before
+    assert _strays(laptop) == []
+
+
+def test_a_file_replaced_between_the_plan_and_its_download_still_refuses(tmp_path):
+    # The plan found QUOTES_2's current version matching, so it pinned nothing. A PUT lands
+    # before the download, and the apply refuses rather than look again.
+    laptop, vm, client, files = _switched(tmp_path)
+    before = _snapshot(laptop)
+
+    def late_put(key: str) -> None:
+        if key == TARGET.key(QUOTES_2) and client.body(key) == files[QUOTES_2]:
+            client.store(key, b"a PUT that landed after the plan")
+
+    message = _refused(laptop, _HookedS3(client, late_put), apply=True)
+
+    assert message.startswith(f"the bucket's current {QUOTES_2!r} does not hash to the SHA-256 ")
+    assert "stored SHA-256 matched when the plan ran" in message
+    assert message.endswith(str(TARGET))
+    assert not [call for call in client.calls if call[0] == "list_object_versions"]
+    assert _snapshot(laptop) == before
+
+
+def test_an_object_no_older_version_matches_refuses_with_the_hand_copy(tmp_path):
+    laptop, vm, client, files = _switched(tmp_path)
+    # Rot that changed the stored checksum too, so the current version fails step 7, and no
+    # older version exists to match.
+    versions = client.versions(TARGET.key(QUOTES_2))
+    versions[-1] = dataclasses.replace(versions[-1], checksum=None)
 
     message = _refused(laptop, client)
 
-    assert repr(QUOTES_2) in message
-    assert "stopped before its manifest.jsonl PUT, or is still running" in message
-    assert _gets(client) == [MANIFEST_KEY]
+    assert message.startswith(f"the bucket's current {QUOTES_2!r} is not the version ")
+    assert "no older version matches it" in message
+    assert str(laptop / QUOTES_2) in message
+    assert "upload finish" not in message
+
+
+def test_an_object_whose_lookup_is_refused_names_the_grants(tmp_path):
+    laptop, vm, client, files = _switched(tmp_path)
+    _newer_than_the_manifest(client, QUOTES_2, b"a later upload's bytes")
+    client.deny_list_versions = True
+
+    message = _refused(laptop, client)
+
+    assert message.startswith(f"the bucket's current {QUOTES_2!r} is not the version ")
+    assert "refused the lookup of an older version" in message
+    assert "(AccessDenied)" in message
+    assert "s3:ListBucketVersions and s3:GetObjectVersion" in message
+    assert message.endswith(str(TARGET))
 
 
 def test_a_volume_short_of_the_journal_reserve_refuses(tmp_path):
@@ -1722,7 +1846,11 @@ def test_a_designed_absence_held_with_the_trimmed_bytes_applies_and_scrubs_clean
     assert scrub(laptop).ok
 
 
-def test_a_buckets_ledger_newer_than_its_manifest_names_the_unfinished_upload(tmp_path):
+def _ledger_trimmed_on_the_vm(tmp_path: Path) -> tuple[Path, FakeS3, bytes]:
+    """The VM trims SPY_2 and uploads its ledger, and the laptop has never seen either.
+
+    It returns the laptop, the bucket, and the ledger bytes the bucket's manifest names.
+    """
     from lake.trimmed import append_trimmed, trim_line
 
     laptop, client = _laptop(tmp_path)
@@ -1733,15 +1861,63 @@ def test_a_buckets_ledger_newer_than_its_manifest_names_the_unfinished_upload(tm
     append_trimmed(vm, line, source="test-trim", fetched_at=None)
     (vm / SPY_2).unlink()
     nightly_upload(vm, TARGET, client=client, clock=ManualClock(TUESDAY_20), calendar=CALENDAR)
-    # A later upload PUT a rewritten ledger and stopped before its manifest.jsonl PUT.
-    newer = client.body(TARGET.key(TRIMMED)) + b'{"kind": "trim", "partition": "q"}\n'
-    client.store(TARGET.key(TRIMMED), newer)
+    return laptop, client, client.body(TARGET.key(TRIMMED))
+
+
+def test_a_buckets_ledger_newer_than_its_manifest_is_taken_from_the_version_it_names(tmp_path):
+    # A later upload PUT a rewritten ledger and stopped before its manifest.jsonl PUT. The plan
+    # reads the version the entry names, and --apply downloads that version. Before
+    # marketlake #838 this refused.
+    laptop, client, recorded = _ledger_trimmed_on_the_vm(tmp_path)
+    named = _newer_than_the_manifest(
+        client, TRIMMED, recorded + b'{"kind": "trim", "partition": "q"}\n'
+    )
+
+    summary = _resync(laptop, client, apply=True)
+
+    assert summary.applied
+    assert (laptop / TRIMMED).read_bytes() == recorded
+    assert any(
+        warning.startswith(f"took {TRIMMED} from bucket version {named.version_id}, ")
+        for warning in summary.warnings
+    )
+
+
+def test_a_buckets_ledger_no_version_matches_refuses_with_the_put_by_hand(tmp_path):
+    # Rot at rest keeps the current version's stored checksum, so no nightly upload replaces
+    # it, and the repair is a copy put back by hand. trimmed.jsonl never expires, so an expired
+    # version is no cause here either.
+    laptop, client, recorded = _ledger_trimmed_on_the_vm(tmp_path)
+    versions = client.versions(TARGET.key(TRIMMED))
+    versions[-1] = dataclasses.replace(versions[-1], body=recorded + b"rot")
 
     message = _refused(laptop, client)
 
-    assert "stopped before its manifest.jsonl PUT, or is still running" in message
-    assert "rotted" in message
+    assert f"current {TRIMMED} is not the version its manifest.jsonl names" in message
+    assert "no older version matches it" in message
+    assert f"whose SHA-256 is {hashlib.sha256(recorded).hexdigest()}" in message
+    assert (
+        f"aws s3api put-object --bucket {TARGET.bucket} --key {TARGET.key(TRIMMED)} "
+        "--body <copy> --checksum-algorithm SHA256"
+    ) in message
+    assert "upload" not in message
+    assert "expired" not in message
+    assert "refused" not in message
     assert message.endswith(str(TARGET))
+
+
+def test_a_buckets_ledger_whose_lookup_is_refused_names_the_grants(tmp_path):
+    laptop, client, recorded = _ledger_trimmed_on_the_vm(tmp_path)
+    _newer_than_the_manifest(client, TRIMMED, recorded + b'{"kind": "trim", "partition": "q"}\n')
+    client.deny_list_versions = True
+
+    message = _refused(laptop, client)
+
+    assert f"current {TRIMMED} is not the version its manifest.jsonl names" in message
+    assert "refused the lookup of an older version" in message
+    assert "(AccessDenied)" in message
+    assert "s3:ListBucketVersions and s3:GetObjectVersion" in message
+    assert "upload" not in message
 
 
 # -- 9. the mutation lens's additions (PR #847) -------------------------------------------

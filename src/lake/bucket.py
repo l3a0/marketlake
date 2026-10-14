@@ -23,7 +23,10 @@ Seven jobs live here.
    test then downloads the week's share of what it matched through ``bucket_reader``.
 4. **The restore**, ``python -m lake.bucket restore <dest>``, is run by hand. It
    downloads the bucket's current versions into an empty directory and verifies every
-   file before the directory is filled. ``bucket_reader`` is its download too. On a host
+   file before the directory is filled. A manifested file whose current version does not
+   match its entry is taken from the older version that does, which an upload stopped
+   before its ``manifest.jsonl`` leaves (marketlake #838). ``bucket_reader`` is its
+   download too. On a host
    whose config sets ``lake_window_sessions`` it rebuilds that host's trimmed lake, and
    leaves out each partition the bucket's ``trimmed.jsonl`` says was removed on purpose
    (marketlake #785). Elsewhere it restores the whole lake.
@@ -123,6 +126,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +190,7 @@ from lake.paths import (
     CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
     DATE_PREFIX,
+    JOURNAL_DIR,
     LOST_AND_FOUND,
     MANIFEST_FILE,
     QUARANTINE_FILE,
@@ -239,10 +244,13 @@ BUCKET_SHADOW = (
 # The error code S3 answers a PUT whose bytes do not match its ``ChecksumSHA256``.
 BAD_DIGEST = "BadDigest"
 
-# What a ``HeadObject`` on a missing key answers. The bucket's credentials hold
-# ``s3:ListBucket``, so S3 answers 404 rather than 403, and a HEAD error carries no body
-# to name a code in.
-_ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# What S3 answers for something that does not exist. A ``HeadObject`` on a missing key or
+# version answers a bare 404, because the bucket's credentials hold ``s3:ListBucket`` and a
+# HEAD error carries no body to name a code in. A plain ``GetObject`` on a missing key
+# answers ``NoSuchKey``. A ``GetObject`` naming a version that is gone, such as one expired
+# between the lookup that matched it and the read, answers ``NoSuchVersion`` (marketlake
+# #838). Only a read that names a version can meet that code.
+_ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound", "NoSuchVersion"})
 
 # The error codes that mean the credentials or their policy were turned away. These and
 # an HTTP 401 or 403 are the only answers named *refused*, whose repair is new
@@ -421,9 +429,9 @@ class BucketLedgerRefused(BucketRefusal):
 
     Without it, no partition the bucket's manifest records can be told apart as removed on
     purpose rather than lost. :func:`read_bucket_trimmed` raises it. It is a plain
-    ``BucketRefusal`` rather than a ``RestoreRefused``, because the restore reads the bucket's
-    ledger through that helper, and marketlake #832's resync, still open, is to read it the
-    same way. Each re-raises this as its own refusal with its own repair.
+    ``BucketRefusal`` rather than a ``RestoreRefused``, because the restore and the resync
+    both read the bucket's ledger through that helper. Each re-raises this as its own refusal
+    with its own repair.
     """
 
 
@@ -432,16 +440,23 @@ class BucketLedgerMissing(BucketLedgerRefused):
 
 
 class BucketLedgerMismatch(BucketLedgerRefused):
-    """The bucket's current ``trimmed.jsonl`` does not hash to its bucket manifest entry.
+    """No version of the bucket's ``trimmed.jsonl`` could be read that hashes to its entry.
 
-    ``sha256`` is the entry's SHA-256, the hash a copy has to match. A caller that can take a
-    matching copy from somewhere else catches this subclass, and a caller that cannot catches
-    :class:`BucketLedgerRefused`.
+    The current version did not hash to the bucket manifest's entry, and no older version
+    could stand in for it. ``refused`` says why. Set, the bucket refused the lookup of an older
+    version, and ``code`` is the error code it answered. Clear, the lookup ran and no version
+    matched. ``sha256`` is the entry's SHA-256, the hash a copy has to match. A caller that can
+    take a matching copy from somewhere else catches this subclass, and a caller that cannot
+    catches :class:`BucketLedgerRefused`.
     """
 
-    def __init__(self, message: str, sha256: str) -> None:
+    def __init__(
+        self, message: str, sha256: str, *, refused: bool = False, code: str | None = None
+    ) -> None:
         super().__init__(message)
         self.sha256 = sha256
+        self.refused = refused
+        self.code = code
 
 
 class ObjectTooLarge(BucketRefusal):
@@ -556,7 +571,7 @@ def _is_client_error(exc: BaseException) -> bool:
 
 
 def _is_absent(exc: BaseException) -> bool:
-    """Whether a raised error is S3 saying the key does not exist."""
+    """Whether a raised error is S3 saying the key, or the version named, does not exist."""
     return _is_client_error(exc) and _error_code(exc) in _ABSENT_CODES
 
 
@@ -1192,6 +1207,11 @@ class UploadSummary:
     started, so an entry at a lower position was already in the bucket before tonight. The
     trim after compaction (marketlake #787) reads both: it stops between partitions at the
     same deadline, and it drops only a partition whose entry sits below that watermark.
+
+    ``healed`` and ``unhealed`` are the nightly upload's heal (marketlake #838). ``healed``
+    names each file whose bucket version did not match the entry both manifests share and
+    which the upload put back from the lake, and each also counts in ``puts``. ``unhealed``
+    holds ``(rel, cause)`` for each such file the lake could not supply.
     """
 
     target: str
@@ -1203,14 +1223,34 @@ class UploadSummary:
     uploaded: list[str] = field(default_factory=list)
     deadline: datetime | None = None
     watermark: int | None = None
+    healed: list[str] = field(default_factory=list)
+    unhealed: list[tuple[str, str]] = field(default_factory=list)
 
     def render(self) -> str:
-        """One line naming what went up and how fast."""
+        """One line naming what went up and how fast.
+
+        The heal's counts show only when nonzero, so an upload with nothing to heal reads
+        exactly as it did before the heal existed. ``compact.py`` prints this as one line, so
+        each file the heal could not put back is named on the same line, with its cause.
+        """
         megabytes = self.put_bytes / 1_000_000
         rate = (self.put_bytes * 8 / 1_000_000 / self.seconds) if self.seconds > 0 else 0.0
+        healed = ""
+        if self.healed:
+            healed += (
+                f", put back {len(self.healed)} file(s) whose bucket version did not match the "
+                f"bucket's manifest.jsonl ({', '.join(self.healed)})"
+            )
+        if self.unhealed:
+            named = "; ".join(f"{rel}, {cause}" for rel, cause in self.unhealed)
+            healed += (
+                f", could not put back {len(self.unhealed)} file(s) whose bucket version does "
+                f"not match the bucket's manifest.jsonl ({named})"
+            )
         return (
             f"uploaded {self.puts} file(s), {megabytes:.1f} MB in {self.seconds:.0f} s "
-            f"({rate:.1f} Mbit/s), skipped {self.skipped} already in the bucket: {self.target}"
+            f"({rate:.1f} Mbit/s), skipped {self.skipped} already in the bucket{healed}: "
+            f"{self.target}"
         )
 
 
@@ -1243,6 +1283,8 @@ class _Uploader:
 
     ``guards`` run before every request, and each raises when the upload must stop. The
     nightly upload's deadline is one, and the first upload's Sunday window is another.
+    :meth:`heal` is the nightly upload's alone. The first upload needs none, because its
+    :meth:`manifested` pass already compares every file and PUTs one that differs.
     """
 
     def __init__(
@@ -1350,6 +1392,51 @@ class _Uploader:
             f"no manifest.jsonl goes up: {self.target}"
         )
 
+    def heal(self, rel: str, hexdigest: str) -> None:
+        """Put the lake's copy of a file back when the bucket's current version is not it.
+
+        ``rel`` is not pending, so its latest entry is the same in the lake's manifest and the
+        bucket's. A nightly upload that stopped between this file's PUT and the manifest's
+        leaves a newer current version under that entry, and so does an upload by another host
+        that was primary at the same time. A restored host's manifest equals the bucket's, so
+        it never sees this file as pending and nothing else would put it back (marketlake
+        #838). One ``HeadObject`` through :meth:`holds` decides it, and a match counts nowhere,
+        unlike :meth:`manifested`'s ``skipped``.
+
+        On a mismatch the lake's file is read and hashed, and when it hashes to the entry it is
+        PUT under that digest, counted as any PUT is and named in ``healed``. A file that is
+        missing, unreadable, past the single-PUT limit, or does not hash to its entry is
+        skipped with its cause in ``unhealed`` rather than raised, because one bad local file
+        would otherwise stop every night's backup. The Sunday job already pages on it twice:
+        the bucket scrub reports the bucket's copy, and ``manifest.scrub`` the lake's.
+        """
+        if self.holds(rel, hexdigest):
+            return
+        path = self.root / rel
+        try:
+            size = path.stat().st_size
+            if size > MAX_PUT_BYTES:
+                self.summary.unhealed.append((rel, "past the single-PUT limit"))
+                return
+            data = path.read_bytes()
+        except FileNotFoundError:
+            self.summary.unhealed.append((rel, "missing from the lake"))
+            return
+        except OSError as exc:
+            self.summary.unhealed.append((rel, f"unreadable, {type(exc).__name__}"))
+            return
+        if hashlib.sha256(data).hexdigest() != hexdigest:
+            self.summary.unhealed.append(
+                (
+                    rel,
+                    "its bytes no longer hash to its manifest entry, from rot or a write "
+                    "whose entry was never recorded",
+                )
+            )
+            return
+        self.put(rel, data, hex_to_b64(hexdigest))
+        self.summary.healed.append(rel)
+
     def unmanifested(self, rel: str, path: Path, listed_size: int | None) -> None:
         """Upload a file the manifest does not record, when its size differs from the bucket's."""
         size = path.stat().st_size
@@ -1436,6 +1523,28 @@ def first_upload_files(
         yield rel, str(ledger.latest[rel]["sha256"]), True
 
 
+# The top-level directories whose files the nightly upload's heal leaves alone. Each holds a
+# partition or a segment per ticker and day, so a HEAD per file would cost thousands of
+# requests a night, and only a recompaction by hand rewrites one. Naming what is left out,
+# rather than what is in, takes a ledger the lake grows later into the heal (marketlake #838).
+_PARTITION_DIRS = frozenset({CHAINS, QUOTES, BARS, JOURNAL_DIR})
+
+
+def _heal_files(ledger: Ledger, mark: int) -> Iterator[tuple[str, str]]:
+    """The manifested files the heal checks, as ``(rel, hex sha256)``.
+
+    Each is outside :data:`_PARTITION_DIRS`, passes the same ``rsync_excluded`` skip
+    :func:`manifested_files` applies, and is not pending, which means its latest entry sits
+    below the watermark ``mark``.
+    """
+    for rel in sorted(ledger.latest):
+        if rsync_excluded(rel, is_dir=False) or rel.split("/", 1)[0] in _PARTITION_DIRS:
+            continue
+        if ledger.last[rel] >= mark:
+            continue
+        yield rel, str(ledger.latest[rel]["sha256"])
+
+
 def _unmanifested(root: Path, ledger: Ledger) -> Iterator[tuple[str, Path]]:
     """Every file the backup copies that carries no manifest entry, ``manifest.jsonl`` aside.
 
@@ -1466,11 +1575,19 @@ def nightly_upload(
        the lake's manifest starts with, and a hand repair name the first-upload command. A
        copy where some path's latest entry is one this lake never recorded, and one that
        could not be read to tell, say not to run it.
-    2. Every manifested file whose latest entry sits past the watermark is pending and
+    2. The heal, every night whether or not the manifest moved. Each manifested file
+       outside ``chains/``, ``quotes/``, ``bars/`` and ``journal/`` that is not pending gets
+       one ``HeadObject``. When the bucket's current version does not hold the entry both
+       manifests share, which an upload stopped before its ``manifest.jsonl`` leaves, the
+       lake's copy is PUT back under that digest, or skipped with its cause when the lake
+       cannot supply it (marketlake #838). It runs before the pending files, so a deadline
+       that stops the night later never cuts it off, and a heal that fails lands outside the
+       window between a file's PUT and the manifest's.
+    3. Every manifested file whose latest entry sits past the watermark is pending and
        uploads under the manifest's digest, segments by the segment rule.
-    3. Every file with no manifest entry and no exclusion compares by size against one
+    4. Every file with no manifest entry and no exclusion compares by size against one
        listing and uploads when it differs.
-    4. ``manifest.jsonl`` goes last, so the watermark never claims a file the bucket does
+    5. ``manifest.jsonl`` goes last, so the watermark never claims a file the bucket does
        not hold. It goes up only when its length moved.
 
     Nothing is deleted from the bucket and nothing is written under the lake root. The
@@ -1514,6 +1631,8 @@ def nightly_upload(
 
     uploader.check()
     listing = list_bucket(client, target)
+    for rel, hexdigest in _heal_files(ledger, mark):
+        uploader.heal(rel, hexdigest)
     pending = [rel for rel, position in ledger.last.items() if position >= mark]
     for rel, hexdigest in manifested_files(root, ledger, pending):
         uploader.manifested(rel, hexdigest, listed=rel in listing)
@@ -1840,8 +1959,8 @@ class BucketReadError(OSError):
     ``manifest.restore_check`` catches ``OSError`` and nothing else, so the bucket's
     client errors are mapped onto it here. ``code`` keeps the S3 error code, or
     ``AssumeRole <code>`` when STS refused the role, and ``absent`` says S3 answered
-    that the key does not exist, which the restore command names as a missing file
-    rather than as a bucket it cannot reach.
+    that the key, or the version a read named, does not exist, which the restore command
+    names as a missing file rather than as a bucket it cannot reach.
     """
 
     def __init__(self, rel: str, kind: str, code: str) -> None:
@@ -1875,7 +1994,8 @@ def _read_failure(exc: BaseException) -> tuple[str, str] | None:
 
 
 def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator[bytes]]:
-    """The ``manifest.BackupReader`` for a bucket: download the current version of ``rel``.
+    """The ``manifest.BackupReader`` for a bucket: download the current version of ``rel``, or
+    the version a caller names.
 
     The body is read in an explicit loop of ``read`` calls, so every byte crosses the
     network. A client error on the request or partway through the body raises
@@ -1883,12 +2003,19 @@ def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator
     is a bug and raises as itself.
 
     The Sunday restore test and the restore command both read through this, so the
-    download the Sunday job runs every week is the one a full restore runs.
+    download the Sunday job runs every week is the one a full restore runs. Both call it as
+    ``read(rel)``, the shape ``manifest.BackupReader`` names. A caller that took an older
+    version from :func:`matching_version` passes it as ``read(rel, version=...)``, which sends
+    the ``GetObject`` with that ``VersionId``. Only such a read needs ``s3:GetObjectVersion``,
+    which S3 asks for whenever a ``VersionId`` is named, the current version's included.
     """
 
-    def read(rel: str) -> Iterator[bytes]:
+    def read(rel: str, *, version: str | None = None) -> Iterator[bytes]:
+        request: dict[str, Any] = {"Bucket": target.bucket, "Key": target.key(rel)}
+        if version is not None:
+            request["VersionId"] = version
         try:
-            body = client.get_object(Bucket=target.bucket, Key=target.key(rel))["Body"]
+            body = client.get_object(**request)["Body"]
             try:
                 while chunk := body.read(_READ_CHUNK):
                     yield chunk
@@ -1912,6 +2039,118 @@ def usable_version_id(version: object) -> bool:
     check would have failed.
     """
     return isinstance(version, str) and bool(version.strip()) and version.lower() != "null"
+
+
+# -- recovering the version a manifest names ------------------------------------
+#
+# A nightly upload PUTs each pending file and then ``manifest.jsonl`` last. One that stops in
+# between leaves a rewritten file's current version newer than the entry the bucket's manifest
+# still holds for it, and every reader that checks the current version against that entry
+# refuses. The bucket is versioned, so the version that matches the entry is still there
+# (marketlake #838). The restores and the resync ask :func:`matching_version` for it, and only
+# once a manifested file's current version has failed its check, so a run with nothing
+# mismatched sends no request the two grants below cover. The nightly upload's heal then puts
+# the matching bytes back as the current version, from the lake's own copy.
+
+# The two grants the lookup needs, named by every line a refused lookup adds.
+VERSION_GRANTS = "s3:ListBucketVersions and s3:GetObjectVersion"
+
+
+@dataclass(frozen=True)
+class MatchingVersion:
+    """An older version of a key whose stored SHA-256 equals a manifest entry's.
+
+    ``version_id`` is its ``VersionId`` and ``size`` its size in bytes, from the listing.
+    """
+
+    version_id: str
+    size: int
+
+
+def matching_version(
+    client: Any, target: BucketTarget, rel: str, sha256: str
+) -> MatchingVersion | None:
+    """The newest noncurrent version of ``rel`` whose stored SHA-256 is ``sha256``, or ``None``.
+
+    1. ``ListObjectVersions`` is paged by hand with ``Prefix`` set to the key, passing
+       ``NextKeyMarker`` and ``NextVersionIdMarker`` back while a page is truncated, and it
+       stops once a page is not truncated or ``NextKeyMarker`` has moved past the key.
+    2. Only entries whose ``Key`` is the key exactly are candidates, since the prefix also
+       matches a sibling such as ``trimmed.jsonl.x``. Delete markers are never read. The
+       ``IsLatest`` entry is skipped, because the caller asks only after the current version
+       failed its check, and so is any id :func:`usable_version_id` rejects.
+    3. Each candidate, newest first, gets ``HeadObject`` with its ``VersionId`` and checksum
+       mode, and the first whose stored SHA-256 equals ``sha256`` is the answer, which ends
+       the lookup. A version stored with no full-object SHA-256 never matches. A HEAD that
+       answers absent, such as a version expired since the listing, skips that candidate.
+
+    The stored checksum only picks the version. A caller that downloads it hashes its bytes.
+    Any other bucket failure raises ``BucketReadError`` the way :func:`_failure` sorts it, so a
+    role without :data:`VERSION_GRANTS` reads as ``refused``. Anything that is not a bucket
+    failure is a bug and raises as itself.
+    """
+    key = target.key(rel)
+
+    def failed(exc: Exception) -> BucketReadError:
+        failure = _failure(exc)
+        if failure is None:
+            raise exc
+        return BucketReadError(rel, *failure)
+
+    kwargs: dict[str, Any] = {"Bucket": target.bucket, "Prefix": key}
+    while True:
+        try:
+            page = client.list_object_versions(**kwargs)
+        except Exception as exc:
+            raise failed(exc) from exc
+        for item in page.get("Versions", ()):
+            version = item.get("VersionId")
+            if item.get("Key") != key or item.get("IsLatest") or not usable_version_id(version):
+                continue
+            try:
+                head = client.head_object(
+                    Bucket=target.bucket, Key=key, VersionId=version, ChecksumMode="ENABLED"
+                )
+            except Exception as exc:
+                if _is_absent(exc):
+                    continue
+                raise failed(exc) from exc
+            if _matches(head, sha256):
+                return MatchingVersion(version_id=str(version), size=int(item.get("Size", 0)))
+        if not page.get("IsTruncated") or page.get("NextKeyMarker") != key:
+            return None
+        kwargs["KeyMarker"] = page["NextKeyMarker"]
+        kwargs["VersionIdMarker"] = page["NextVersionIdMarker"]
+
+
+def _lookup_refused_line(code: str) -> str:
+    """The line every reader adds when the bucket refused the lookup of an older version.
+
+    The reader keeps its own failure and exit code, and this says what would have let the
+    lookup run.
+    """
+    return (
+        f"the bucket refused the lookup of an older version that matches the manifest "
+        f"({code}). The credentials need {VERSION_GRANTS}, which the infra apply of "
+        "infra/live grants to both roles"
+    )
+
+
+def _recovered_line(rel: str, version_id: str) -> str:
+    """The line a run prints for a file it took from an older version of its key."""
+    return (
+        f"took {rel} from bucket version {version_id}, the one its manifest.jsonl entry names, "
+        "because the current version is newer. The primary's next nightly upload puts the "
+        "lake's matching copy back as the current version"
+    )
+
+
+def _pinned_line(rel: str, version_id: str) -> str:
+    """The line a resync dry run prints for a file its ``--apply`` takes from an older version."""
+    return (
+        f"--apply takes {rel} from bucket version {version_id}, the one its manifest.jsonl entry "
+        "names, because the current version is newer than that entry"
+    )
 
 
 @dataclass(frozen=True)
@@ -1969,25 +2208,28 @@ def read_bucket_trimmed(
     ``bucket_latest`` is the latest entry per partition of the bucket's own ``manifest.jsonl``,
     and its entry for ``trimmed.jsonl`` decides everything here. With no entry, the bucket's
     manifest records no trim, so every trimmed partition is still in the bucket, and the answer
-    is an empty mapping with no request sent. Otherwise the current version is downloaded, its
-    SHA-256 must equal the entry's, and it is parsed by ``trimmed.parse_trimmed`` and resolved by
+    is an empty mapping with no request sent. Otherwise the current version is downloaded, and
+    when its SHA-256 differs from the entry's, :func:`matching_version` looks for the older
+    version that matches, which is downloaded and hashed in its place (marketlake #838). The
+    bytes that match are parsed by ``trimmed.parse_trimmed`` and resolved by
     ``trimmed.latest_by_partition``, the reader the lake's own copy goes through. A copy whose
     hash matches carries no torn tail, because ``trimmed`` never records an entry over one.
 
     Three things refuse, each with :class:`BucketLedgerRefused`.
 
     1. A key S3 answers as absent, as :class:`BucketLedgerMissing`.
-    2. Bytes that do not hash to the entry, as :class:`BucketLedgerMismatch` carrying the
-       entry's SHA-256.
+    2. No version whose bytes hash to the entry, as :class:`BucketLedgerMismatch` carrying the
+       entry's SHA-256. Its ``refused`` says the bucket refused the lookup of an older version,
+       and clear it says the lookup ran and none matched.
     3. Bytes that match and do not parse, naming the damage.
 
-    Every other bucket failure, such as a refused role, a 403 or a 5xx, raises as itself, so the
-    command names it as it names every transport failure rather than as a damaged ledger. The
-    download is joined inside the ``try``, because ``bucket_reader`` sends the request on the
-    first iteration rather than when it is called.
+    Every other bucket failure, such as a refused role on the current version, a 403 or a 5xx,
+    raises as itself, so the command names it as it names every transport failure rather than
+    as a damaged ledger. Each download is joined inside its ``try``, because ``bucket_reader``
+    sends the request on the first iteration rather than when it is called.
 
-    The restore calls this, and marketlake #832's resync, still open, is to call it too, so the
-    bucket's ledger is judged one way wherever a designed absence is decided against it.
+    The restore and the resync call this, so the bucket's ledger is judged one way wherever a
+    designed absence is decided against it.
     """
     entry = bucket_latest.get(TRIMMED_FILE)
     if entry is None:
@@ -2005,12 +2247,30 @@ def read_bucket_trimmed(
             f"{target}"
         ) from None
     if hashlib.sha256(raw).hexdigest() != expected:
-        raise BucketLedgerMismatch(
-            f"the bucket's current {TRIMMED_FILE} does not match the SHA-256 its manifest.jsonl "
-            f"records, {expected}, so no partition trimmed on purpose can be told from one lost: "
-            f"{target}",
-            expected,
-        )
+        refused: str | None = None
+        try:
+            matched = matching_version(client, target, TRIMMED_FILE, expected)
+            if matched is not None:
+                raw = b"".join(read(TRIMMED_FILE, version=matched.version_id))
+        except BucketReadError as exc:
+            if exc.kind != "refused" and not exc.absent:
+                raise
+            refused = exc.code if exc.kind == "refused" else None
+            matched = None
+        if matched is None or hashlib.sha256(raw).hexdigest() != expected:
+            why = (
+                f"the bucket refused the lookup of an older version ({refused})"
+                if refused is not None
+                else "no older version matches it"
+            )
+            raise BucketLedgerMismatch(
+                f"the bucket's current {TRIMMED_FILE} does not match the SHA-256 its "
+                f"manifest.jsonl records, {expected}, and {why}, so no partition trimmed on "
+                f"purpose can be told from one lost: {target}",
+                expected,
+                refused=refused is not None,
+                code=refused,
+            )
     try:
         return latest_by_partition(parse_trimmed(raw, TRIMMED_FILE), TRIMMED_FILE)
     except ManifestError as exc:
@@ -2101,6 +2361,13 @@ class RestoreSummary:
     names is on or before the newest trimmed day (marketlake #796). Like ``trimmed_left_out``,
     it counts keys the plan leaves out, never files a resumed run prunes from its working
     directory.
+
+    Two fields come from the lookup of an older version (marketlake #838). ``recovered`` holds
+    ``(rel, version id)`` for each file this run took from an older version of its key, because
+    the current one did not hash to its entry. It never enters ``failures``. A resumed run
+    finds the file already verified and sends no request for it, so only the run that
+    downloaded it names it. ``lookup_refused`` holds ``(rel, code)`` for each file whose lookup
+    the bucket refused. That file stays in ``failures`` as not matching.
     """
 
     target: str
@@ -2115,6 +2382,8 @@ class RestoreSummary:
     trimmed_lost: list[str] = field(default_factory=list)
     reports_left_out: int = 0
     unrecorded: list[str] = field(default_factory=list)
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    lookup_refused: list[tuple[str, str]] = field(default_factory=list)
     failures: list[tuple[str, str]] = field(default_factory=list)
     restored: bool = False
     finished_move: bool = False
@@ -2489,16 +2758,19 @@ def _restore_trimmed(
 
     A ``trimmed.jsonl`` already in the working directory whose hash matches the bucket
     manifest's entry is parsed in place of the bucket's, and no request is sent, as a matching
-    working file is resumed for every other download. That is the repair for a bucket whose
-    current ledger is newer than its manifest's entry, which a nightly upload stopped between
-    the two leaves. A working copy that does not match is ignored.
+    working file is resumed for every other download. That is the repair a hand copy makes when
+    no version in the bucket matches the entry. A working copy that does not match is ignored.
 
-    Otherwise :func:`read_bucket_trimmed` reads the bucket's, and each of its refusals becomes a
+    Otherwise :func:`read_bucket_trimmed` reads the bucket's, taking the older version that
+    matches when the current one is newer than its manifest's entry, which a nightly upload
+    stopped between the two leaves (marketlake #838). Each of its refusals becomes a
     ``RestoreRefused`` naming the repair. A mismatch first creates the marked working directory
     and writes the bucket's ``manifest.jsonl`` into it, so the operator has the entry to check
-    a download against and the next run finds a working directory a restore made. The call
-    sits outside the download loop's ``except OSError``, which would read a ``BucketReadError``
-    as the local disk's.
+    a download against and the next run finds a working directory a restore made. Its line
+    says which cause it was: a refused lookup, whose repair is the grant or the console, or no
+    matching version, whose repair is a copy from outside the bucket. The call sits outside the
+    download loop's ``except OSError``, which would read a ``BucketReadError`` as the local
+    disk's.
     """
     entry = latest.get(TRIMMED_FILE)
     working = work / TRIMMED_FILE
@@ -2532,10 +2804,18 @@ def _restore_trimmed(
             raise RestoreRefused(
                 _local(f"writing manifest.jsonl into {work}", failed) + ", so nothing was restored"
             ) from None
+        if exc.refused:
+            raise RestoreRefused(
+                f"{exc}. Nothing was restored. {_lookup_refused_line(str(exc.code))}. Until "
+                f"then, download the version of {TRIMMED_FILE} whose SHA-256 is {exc.sha256} "
+                f"from the console, put it at {working}, and run the restore again, as the "
+                'README\'s "When the lake is gone" steps describe'
+            ) from None
         raise RestoreRefused(
-            f"{exc}. Nothing was restored. Download the version of {TRIMMED_FILE} whose SHA-256 "
-            f"is {exc.sha256} from the console, put it at {working}, and run the restore again, "
-            'as the README\'s "When the lake is gone" steps describe'
+            f"{exc}. Nothing was restored. The console shows the same versions, so copy a "
+            f"{TRIMMED_FILE} whose SHA-256 is {exc.sha256} from outside the bucket, such as the "
+            f"other host's when it hashes to that, put it at {working}, and run the restore "
+            'again, as the README\'s "When the lake is gone" steps describe'
         ) from None
     except BucketLedgerMissing as exc:
         raise RestoreRefused(
@@ -2610,10 +2890,55 @@ def _bucket_manifest(
     return listing, raw, latest
 
 
+def _download_older(
+    client: Any,
+    target: BucketTarget,
+    read: Callable[..., Iterator[bytes]],
+    rel: str,
+    expected: str,
+    path: Path,
+    dest: Path,
+    work: Path,
+    summary: RestoreSummary | ReadingRestoreSummary,
+) -> tuple[str, int] | None:
+    """Download the older version of ``rel`` that hashes to ``expected`` into its part file.
+
+    It returns the version's id and size with the part file in place, or ``None`` with no part
+    file left, when :func:`matching_version` finds no version, the version is gone by the time
+    it is read, or its bytes do not hash to ``expected``. A refused lookup or read returns
+    ``None`` too, and records the code in ``summary.lookup_refused`` so the command adds its
+    one line. Any other bucket failure raises for ``main``, and a local write failure refuses,
+    as the plain download's do.
+    """
+    part = _part(path)
+    try:
+        matched = matching_version(client, target, rel, expected)
+        if matched is None:
+            return None
+        actual, size = _download_to(partial(read, version=matched.version_id), rel, part)
+    except BucketReadError as exc:
+        part.unlink(missing_ok=True)
+        if exc.kind == "refused":
+            summary.lookup_refused.append((rel, exc.code))
+            return None
+        if exc.absent:
+            return None
+        raise
+    except OSError as exc:
+        raise RestoreRefused(
+            _local(f"writing {rel} into {work}", exc)
+            + f". Nothing was moved into {dest}, and a re-run resumes in {work}"
+        ) from None
+    if actual != expected:
+        part.unlink()
+        return None
+    return matched.version_id, size
+
+
 def _download_plan(
     client: Any,
     target: BucketTarget,
-    read: Callable[[str], Iterator[bytes]],
+    read: Callable[..., Iterator[bytes]],
     plan: Mapping[str, str | None],
     raw: bytes,
     dest: Path,
@@ -2625,8 +2950,14 @@ def _download_plan(
     ``plan`` maps each path to its latest manifest sha, or to ``None`` for a file the manifest
     does not record, which is checked against the SHA-256 S3 stored at upload instead. A file
     already in the working directory with the right hash is resumed rather than downloaded.
-    A file that is missing or does not match is a failure in ``summary`` and stops nothing. A
-    local filesystem failure stops the run with a ``RestoreRefused``.
+    A manifested file whose current version does not match its entry is looked for among the
+    key's older versions by :func:`matching_version`, and a version whose bytes match is taken
+    in its place and named in ``summary.recovered`` (marketlake #838). An unmanifested file
+    has no older version to look for, since its check is its current version's own stored
+    SHA-256. A file that is missing, or that no version matches, is a failure in ``summary``
+    and stops nothing. A refused lookup keeps that failure and is named in
+    ``summary.lookup_refused`` too. A local filesystem failure stops the run with a
+    ``RestoreRefused``.
 
     The manifest is written even when a file failed, so the operator can read the entry a
     failing file was checked against. It is still only in the working directory, so the
@@ -2674,8 +3005,18 @@ def _download_plan(
             ) from None
         if actual != expected:
             _part(path).unlink()
-            summary.failures.append((rel, "does not match its SHA-256"))
-            continue
+            # Only a manifested file has an older version worth looking for. An unmanifested
+            # one was checked against its current version's own stored SHA-256.
+            older = (
+                _download_older(client, target, read, rel, expected, path, dest, work, summary)
+                if entry_sha is not None
+                else None
+            )
+            if older is None:
+                summary.failures.append((rel, "does not match its SHA-256"))
+                continue
+            version, size = older
+            summary.recovered.append((rel, version))
         os.replace(_part(path), path)
         summary.downloaded += 1
         summary.downloaded_bytes += size
@@ -2715,7 +3056,7 @@ def restore_lake(
     free_space: Callable[[Path], int] = _free_bytes,
     skip_designed_absences: bool = False,
 ) -> RestoreSummary:
-    """Restore the bucket's current versions into the empty directory ``dest``.
+    """Restore the bucket's lake, as its ``manifest.jsonl`` records it, into the empty ``dest``.
 
     ``skip_designed_absences`` chooses what comes back. Left false, the default, the whole
     lake is restored. Set, the restore rebuilds a lake that keeps only a window of sessions,
@@ -2735,9 +3076,11 @@ def restore_lake(
        torn last line discarded the way every reader discards one. When skipping designed
        absences, the bucket's ``trimmed.jsonl`` is read too, by :func:`read_bucket_trimmed`,
        unless a copy matching its manifest entry already waits in the working directory.
-       A missing, damaged or mismatched ledger refuses before any data file. A mismatch
-       first leaves a marked working directory holding the bucket's ``manifest.jsonl``, and
-       its refusal names the SHA-256 a copy put there by hand has to match.
+       A current ledger newer than its entry is read from the older version that matches.
+       A missing or damaged ledger refuses before any data file, and so does one no version
+       matches or whose lookup the bucket refused. A mismatch first leaves a marked working
+       directory holding the bucket's ``manifest.jsonl``, and its refusal names the SHA-256 a
+       copy put there by hand has to match.
     3. The plan is every object under the target, less each journal segment whose
        compacted partition the manifest records, and less S3's zero-byte folder
        markers. The bucket never deletes, so it can hold the segments of a day
@@ -2759,8 +3102,11 @@ def restore_lake(
        listing, or the command refuses the same way. The next session's journal lands on
        this filesystem, and a lake that cannot seal its next close loses captured minutes.
     5. Each planned file streams into ``<dest>/.marketlake-restoring`` and is hashed as
-       it arrives. A manifested file must match its latest entry. Any other file must
-       match the SHA-256 S3 stored at upload, since the manifest has no entry for it. A
+       it arrives. A manifested file must match its latest entry. When its current version
+       does not, :func:`matching_version` looks for the older version whose stored SHA-256
+       does, which is downloaded by ``VersionId`` and hashed in its place, and the file is
+       named in ``recovered`` (marketlake #838). Any other file must match the SHA-256 S3
+       stored at upload on its current version, since the manifest has no entry for it. A
        file already there with the right hash is not downloaded again.
     6. Any failure stops here, names the file, and leaves no ``manifest.jsonl`` at
        ``dest``.
@@ -2769,9 +3115,10 @@ def restore_lake(
 
     Nothing takes the lake-root lock. ``lake_lock`` creates ``manifest.jsonl`` under the
     root it is handed, and a restore writes into a directory nothing else uses. A client
-    error other than a missing key stops the run and raises, and a local filesystem
-    failure stops it with a ``RestoreRefused``. Either way the working directory keeps
-    every file that verified for the next run.
+    error other than a missing key, or than a refused lookup of an older version, stops the
+    run and raises, and a local filesystem failure stops it with a ``RestoreRefused``. A
+    refused lookup keeps the file's failure and is named in ``lookup_refused``. Either way
+    the working directory keeps every file that verified for the next run.
     """
     dest = Path(os.path.abspath(Path(dest).expanduser()))
     work = dest / RESTORE_WORK_DIR
@@ -3539,8 +3886,9 @@ class ReadingRestoreSummary:
     ``roles`` maps each planned file to what it is to the range: in it, the next chains
     partition after it, a bars partition of its tickers and days, or a file a reader needs
     beside it. ``range_by_ticker`` counts the range's partitions per ticker. ``failures``,
-    ``downloaded``, ``downloaded_bytes``, ``resumed``, ``restored`` and ``finished_move`` mean
-    what :class:`RestoreSummary`'s fields of those names mean.
+    ``downloaded``, ``downloaded_bytes``, ``resumed``, ``recovered``, ``lookup_refused``,
+    ``restored`` and ``finished_move`` mean what :class:`RestoreSummary`'s fields of those names
+    mean.
     """
 
     target: str
@@ -3551,6 +3899,8 @@ class ReadingRestoreSummary:
     downloaded: int = 0
     downloaded_bytes: int = 0
     resumed: int = 0
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    lookup_refused: list[tuple[str, str]] = field(default_factory=list)
     failures: list[tuple[str, str]] = field(default_factory=list)
     restored: bool = False
     finished_move: bool = False
@@ -3851,9 +4201,11 @@ def restore_for_reading(
 # the lake's ``manifest.jsonl`` equal to the bucket's bytes, so the next nightly upload finds
 # a prefix again. The design's Backup section carries the reasoning.
 #
-# It sends only ``ListObjectsV2``, ``HeadObject`` and ``GetObject``, which both hosts' roles
-# grant, so it runs under either role. A dry run is the default, because the command deletes
-# and reverts files.
+# It sends ``ListObjectsV2``, ``HeadObject`` and ``GetObject``, which both hosts' roles grant,
+# so it runs under either role. Only a file whose current version is newer than the bucket's
+# manifest entry sends more: ``ListObjectVersions``, and a ``HeadObject`` and ``GetObject``
+# naming a ``VersionId``, which need ``s3:ListBucketVersions`` and ``s3:GetObjectVersion``
+# (marketlake #838). A dry run is the default, because the command deletes and reverts files.
 
 
 class ResyncRefused(BucketRefusal):
@@ -4051,7 +4403,11 @@ class _ResyncPlan:
     ``lake_raw`` and ``copy`` are what the commit requires unchanged. ``keep`` is the length
     of the shared bytes the manifest is cut back to, and ``bucket_raw`` is what it must equal
     once the bucket's tail is appended. ``downloads`` maps each path to download to the
-    SHA-256 its latest entry in the bucket's manifest records.
+    SHA-256 its latest entry in the bucket's manifest records. ``versions`` maps each path
+    among them whose current version's stored SHA-256 differed from that entry to the older
+    version :func:`matching_version` found for it, which the commit downloads by ``VersionId``
+    (marketlake #838). Every other download reads the current version, since naming a
+    ``VersionId`` needs ``s3:GetObjectVersion`` even for the current one.
     """
 
     lake_raw: bytes
@@ -4061,6 +4417,7 @@ class _ResyncPlan:
     downloads: Mapping[str, str]
     summary: ResyncSummary
     entries: int = 0
+    versions: Mapping[str, str] = field(default_factory=dict)
 
 
 def _plan_resync(
@@ -4183,15 +4540,27 @@ def _plan_resync(
         )
     try:
         trimmed_latest = read_bucket_trimmed(client, target, bucket_latest)
-    except BucketLedgerMismatch:
-        # The cause step 7 names for a newer data file, reached here first because the
-        # ledger is read before the plan. marketlake #838 is the upload's half.
+    except BucketLedgerMismatch as exc:
+        # The ledger is read before the plan, so a current version newer than its entry is met
+        # here before step 7, and :func:`read_bucket_trimmed` has already looked for the older
+        # version that matches (marketlake #838). Reaching here means it found none, or the
+        # bucket refused the lookup.
+        if exc.refused:
+            raise refuse(
+                f"the bucket's current {TRIMMED_FILE} is not the version its manifest.jsonl "
+                f"names, and {_lookup_refused_line(str(exc.code))}, so the resync changed "
+                f"nothing. Run the resync again once they are granted: {target}"
+            ) from None
+        # Rot at rest keeps the current version's stored checksum, which is what the nightly
+        # upload compares, so no upload replaces it, and trimmed.jsonl never expires. The repair
+        # is a matching copy put back by hand.
         raise refuse(
-            f"the bucket's current {TRIMMED_FILE} is not the version its manifest.jsonl names. "
-            "The other host's last nightly upload stopped before its manifest.jsonl PUT, or is "
-            "still running, or the object rotted, so the resync changed nothing. Let that "
-            "upload finish, or run it again on the other host, then run the resync again: "
-            f"{target}"
+            f"the bucket's current {TRIMMED_FILE} is not the version its manifest.jsonl names, "
+            "and no older version matches it, so the resync changed nothing. Put a copy whose "
+            f"SHA-256 is {exc.sha256}, such as the other host's when it hashes to that, back as "
+            f"the current version with aws s3api put-object --bucket {target.bucket} --key "
+            f"{target.key(TRIMMED_FILE)} --body <copy> --checksum-algorithm SHA256, then run "
+            f"the resync again: {target}"
         ) from None
     except BucketLedgerRefused as exc:
         raise refuse(f"{exc}. The resync changed nothing") from None
@@ -4366,8 +4735,8 @@ def _plan_resync(
         )
 
     # Step 7's checks, before the first download: every planned file is in the listing, its
-    # current version is the one the bucket's manifest names, and the free space left after
-    # the downloads covers the journal reserve.
+    # current version is the one the bucket's manifest names or an older version is, and the
+    # free space left after the downloads covers the journal reserve.
     listing = list_bucket(client, target)
     missing = [rel for rel in downloads if rel not in listing]
     if missing:
@@ -4375,6 +4744,7 @@ def _plan_resync(
             f"the bucket's manifest.jsonl names {_quoted(missing)}, and the bucket holds no "
             f"current version of it, so the resync changed nothing: {target}"
         )
+    versions: dict[str, str] = {}
     for rel, sha in downloads.items():
         try:
             stored = _stored_hex(client, target, rel)
@@ -4383,14 +4753,33 @@ def _plan_resync(
                 f"the bucket's manifest.jsonl names {rel!r}, and the bucket holds no current "
                 f"version of it, so the resync changed nothing: {target}"
             ) from None
+        size = listing[rel]
         if stored != sha:
-            raise refuse(
-                f"the bucket's current {rel!r} is not the version its manifest.jsonl names. The "
-                "other host's last nightly upload stopped before its manifest.jsonl PUT, or is "
-                "still running, so the resync changed nothing. Let that upload finish, or run "
-                f"it again on the other host, then run the resync again: {target}"
-            )
-        summary.downloads.append((rel, listing[rel]))
+            # A nightly upload stopped between this file's PUT and its manifest.jsonl's leaves
+            # the current version newer than the entry, and the version the entry names is
+            # still in the bucket (marketlake #838). It is taken on its stored SHA-256 here, as
+            # the current one is, and ``--apply`` hashes its bytes.
+            try:
+                matched = matching_version(client, target, rel, sha)
+            except BucketReadError as exc:
+                if exc.kind != "refused":
+                    raise
+                raise refuse(
+                    f"the bucket's current {rel!r} is not the version its manifest.jsonl names, "
+                    f"and {_lookup_refused_line(exc.code)}, so the resync changed nothing. Run "
+                    f"the resync again once they are granted: {target}"
+                ) from None
+            if matched is None:
+                raise refuse(
+                    f"the bucket's current {rel!r} is not the version its manifest.jsonl names, "
+                    "and no older version matches it, so the current one is damaged or the "
+                    "matching one expired, and the resync changed nothing. Put a copy that "
+                    f"hashes to the entry, such as the other host's, at {root / rel} by hand, "
+                    "then run the resync again"
+                )
+            versions[rel] = matched.version_id
+            size = matched.size
+        summary.downloads.append((rel, size))
     planned = summary.download_bytes
     busiest = runway.listing_busiest_sealed_day(listing)
     try:
@@ -4421,7 +4810,14 @@ def _plan_resync(
         if size != listing[rel]:
             summary.unrecorded.append(rel)
     return _ResyncPlan(
-        lake_raw, copy, bucket_raw, keep, downloads, summary, entries=len(bucket_entries)
+        lake_raw,
+        copy,
+        bucket_raw,
+        keep,
+        downloads,
+        summary,
+        entries=len(bucket_entries),
+        versions=versions,
     )
 
 
@@ -4531,7 +4927,8 @@ def resync(
        A partition this lake's own ``trimmed.jsonl`` calls trimmed, absent on disk, named
        by B and not trimmed by B's ledger is downloaded at B's sha, because the close+15
        uploads before it trims and B lacks the last night's trim lines. A B ledger newer
-       than B's entry refuses with the cause step 7 names for a newer object. A path only
+       than B's entry is read from the older version that matches, and refuses as step 7
+       does when none matches or the lookup is refused. A path only
        this lake's tail names is judged in step 5. Every path passes the restore's safety
        checks first.
     5. Refusals on this lake's tail. A file only this lake's tail names, on disk and outside
@@ -4548,10 +4945,15 @@ def resync(
        ``trimmed.jsonl`` B names none of, whatever its bytes.
     7. Checks: every download is in the listing, its stored SHA-256 equals B's entry, and the
        free space left covers the journal reserve. A stored SHA-256 that differs means the
-       other host's last upload stopped before its ``manifest.jsonl`` or is still running.
-       With ``apply``, stale temp files beside each target are removed under the lock, and
-       each file then downloads unlocked to ``paths.temp_write_path``'s name, must hash to
-       B's entry, and is flushed by :func:`_flush_fd`. The guards run again before every
+       other host's last upload stopped before its ``manifest.jsonl`` or is still running,
+       and :func:`matching_version` then finds the older version B's entry names, whose size
+       the plan and the reserve use (marketlake #838). The dry run's warning names the
+       version ``--apply`` would take. No match, or a refused lookup, refuses with a line for
+       each cause. With ``apply``, stale temp files beside each target are removed under the
+       lock, and each file then downloads unlocked to ``paths.temp_write_path``'s name, the
+       matched version by its ``VersionId``, must hash to B's entry, and is flushed by
+       :func:`_flush_fd`. A matched version that hashes gets a warning saying it was taken,
+       and one that does not hash refuses as rot. The guards run again before every
        download.
     8. Commit, under ``lake_lock``: the guards run again, L must read as it did and B's HEAD
        must answer as it did. Each download is renamed into place and flushed with its
@@ -4618,6 +5020,9 @@ def resync(
     )
     summary = plan.summary
     if not apply or summary.level:
+        # The dry run downloads nothing, so it says what --apply takes. The line saying a
+        # version was taken prints only on the run that downloaded and hashed it.
+        summary.warnings += [_pinned_line(rel, pinned) for rel, pinned in plan.versions.items()]
         return summary
 
     temps: list[Path] = []
@@ -4640,28 +5045,54 @@ def resync(
             temp = temp_write_path(root / rel, os.getpid())
             created.update(_missing_dirs(root, temp))
             temps.append(temp)
+            # Only a version the plan's lookup found is named. A file replaced between the
+            # plan and here is never looked up again, so it refuses below as before.
+            pinned = plan.versions.get(rel)
+            source: Callable[[str], Iterator[bytes]] = (
+                read if pinned is None else partial(read, version=pinned)
+            )
             try:
-                actual, _size = _download_to(read, rel, temp)
+                actual, _size = _download_to(source, rel, temp)
                 if actual == sha:
                     _flush_file(temp)
             except BucketReadError as exc:
+                if pinned is not None and exc.kind == "refused":
+                    raise refuse(
+                        f"the bucket refused the read of version {pinned} of {rel!r} ({exc.code})"
+                        f". The credentials need {VERSION_GRANTS}, which the infra apply of "
+                        "infra/live grants to both roles, so the resync changed nothing. Run "
+                        f"the resync again once they are granted: {target}"
+                    ) from None
                 if not exc.absent:
                     raise
+                which = "no current version" if pinned is None else f"no version {pinned}"
                 raise refuse(
-                    f"the bucket holds no current version of {rel!r}, which its manifest.jsonl "
-                    f"names, so the resync changed nothing: {target}"
+                    f"the bucket holds {which} of {rel!r}, which its manifest.jsonl names, so the "
+                    f"resync changed nothing: {target}"
                 ) from None
             except OSError as exc:
                 raise refuse(
                     _local(f"writing {temp.relative_to(root).as_posix()}", exc)
                     + ", so the resync changed nothing"
                 ) from None
+            if actual != sha and pinned is not None:
+                raise refuse(
+                    f"version {pinned} of {rel!r}, whose stored SHA-256 matched the entry its "
+                    "manifest.jsonl names, does not hash to it, so that version rotted in the "
+                    "bucket and the resync changed nothing. Put a copy that hashes to the entry, "
+                    f"such as the other host's, at {root / rel} by hand, then run the resync "
+                    "again"
+                )
             if actual != sha:
                 raise refuse(
                     f"the bucket's current {rel!r} does not hash to the SHA-256 its "
-                    "manifest.jsonl names, so another host may be uploading now and the resync "
-                    f"changed nothing. Run it again once that upload ends: {target}"
+                    "manifest.jsonl names, though its stored SHA-256 matched when the plan ran. "
+                    "Another host may have uploaded a newer one since, or it rotted, and the "
+                    "resync changed nothing. Run it again, which looks for the version the entry "
+                    f"names when the current one is newer, and treat a repeat as rot: {target}"
                 )
+            if pinned is not None:
+                summary.warnings.append(_recovered_line(rel, pinned))
         with lake_lock(root):
             guard()
             try:
@@ -4752,7 +5183,12 @@ def live_check(
        the old one.
     4. ``put_object`` sends one request and never splits into parts.
 
-    Three more lines prove the read grants the scrub and the restore need, which nothing
+    Behavior 3 reads the first version back with ``GetObject`` and its ``VersionId``, which
+    needs ``s3:GetObjectVersion``, so a refusal there prints a ``FAIL`` like any missing grant.
+    That read and lines 8 and 9 run only when the two PUTs returned two usable, distinct ids,
+    since otherwise there is no old version to name.
+
+    Five more lines prove the read grants the scrub and the restores need, which nothing
     else calls while ``backup_target`` is still a path (marketlake #737).
 
     5. ``ListObjectsV2`` under the check's own prefix lists the probe.
@@ -4760,6 +5196,15 @@ def live_check(
     7. A plain ``GetObject`` of the probe returns the bytes of its current version, and the
        ``VersionId`` of that version. The trim records that id on its trim line
        (marketlake #787), and a response without it would stop every trim.
+    8. ``ListObjectVersions`` with the probe's key as its prefix lists both versions of that
+       exact key, the second one as latest.
+    9. ``HeadObject`` naming the first version, with checksum mode, returns the probe's
+       SHA-256.
+
+    Lines 8 and 9 are the two calls :func:`matching_version` sends, and behavior 3's read is
+    the download a restore then makes of the version it found (marketlake #838). Each needs
+    ``s3:ListBucketVersions`` or ``s3:GetObjectVersion``, so before the infra apply that grants
+    them the check exits 1.
 
     On the assume-role path the first request is where the role is assumed. A refusal
     there is STS's and not S3's verdict on behavior 1, so it is raised for ``main`` to
@@ -4830,16 +5275,6 @@ def live_check(
     old_id, new_id = first.get("VersionId"), second.get("VersionId")
     distinct = usable_version_id(old_id) and usable_version_id(new_id) and old_id != new_id
     report(distinct, f"3 two PUTs to one key returned versions {old_id} and {new_id}")
-    try:
-        kept = client.get_object(Bucket=target.bucket, Key=key, VersionId=old_id)["Body"].read()
-    except Exception as exc:
-        out(
-            f"live-check: the old version could not be read back ({_error_code(exc)}). The "
-            "bucket's credentials hold no s3:GetObjectVersion, so confirm by hand in the "
-            f"console that {key} shows two versions"
-        )
-    else:
-        report(kept == probe, "3 the first version still holds the first PUT's bytes")
 
     def grant(number: int, call: str, read: Callable[[], tuple[bool, str]]) -> None:
         try:
@@ -4851,6 +5286,16 @@ def live_check(
             report(False, f"{number} {call} {failure[0]} with {failure[1]}")
         else:
             report(passed, f"{number} {call} {shown}")
+
+    def kept() -> tuple[bool, str]:
+        body = client.get_object(Bucket=target.bucket, Key=key, VersionId=old_id)["Body"].read()
+        held = "the first PUT's bytes" if body == probe else "other bytes"
+        return body == probe, f"of the first version returned {held}"
+
+    # Without two usable ids there is no old version to name, and boto3 refuses a None id
+    # before sending anything.
+    if distinct:
+        grant(3, "GetObject by VersionId", kept)
 
     # 5, 6 and 7. The read grants, each by the call the scrub or the restore makes.
     listed_prefix = f"{target.key(base)}/"
@@ -4873,9 +5318,39 @@ def live_check(
         shown = f"VersionId {version}" if named else f"VersionId {version}, not {new_id}"
         return body == replacement and named, f"of the probe returned {held} with {shown}"
 
+    def versions() -> tuple[bool, str]:
+        found = client.list_object_versions(Bucket=target.bucket, Prefix=key)
+        mine = [entry for entry in found.get("Versions", []) if entry.get("Key") == key]
+        ids = {entry.get("VersionId") for entry in mine}
+        latest = [entry.get("VersionId") for entry in mine if entry.get("IsLatest")]
+        passed = {old_id, new_id} <= ids and latest == [new_id]
+        return passed, (
+            f"of the probe listed {len(mine)} version(s), latest {', '.join(map(str, latest))}"
+            if latest
+            else f"of the probe listed {len(mine)} version(s), none latest"
+        )
+
+    def versioned_head() -> tuple[bool, str]:
+        head = client.head_object(
+            Bucket=target.bucket, Key=key, VersionId=old_id, ChecksumMode="ENABLED"
+        )
+        stored = stored_sha256(head)
+        return (
+            stored == hashlib.sha256(probe).digest(),
+            f"of the first version returned ChecksumSHA256 {head.get('ChecksumSHA256')}",
+        )
+
     grant(5, "ListObjectsV2", listing)
     grant(6, "GetBucketVersioning", versioning)
     grant(7, "GetObject", current)
+    if distinct:
+        grant(8, "ListObjectVersions", versions)
+        grant(9, "HeadObject by VersionId", versioned_head)
+    else:
+        out(
+            "live-check: 3's read of the first version, 8 and 9 need two usable versions, so "
+            "they did not run"
+        )
 
     out(
         f"live-check: delete {target.key(base)}/ and every version under it in the console. "
@@ -4893,7 +5368,9 @@ def _restore_command(
     """Run the restore and print its lines. A refusal raises, for ``main`` to print.
 
     A designed absence the bucket no longer holds gets its own line on stdout, because the run
-    still exits 0 without it.
+    still exits 0 without it. So does each file taken from an older version, printed before
+    the failure branch so a run that then exits 1 still names it. A refused lookup of an older
+    version adds one line to the failures, naming the grants it needs.
     """
     summary = restore_lake(
         dest, target, client=client, skip_designed_absences=skip_designed_absences
@@ -4908,9 +5385,16 @@ def _restore_command(
             "restore: trimmed on purpose and missing from the bucket, so it was left out. "
             f"The bucket holds no current version of it: {rel}"
         )
+    for rel, version in summary.recovered:
+        print(f"restore: {_recovered_line(rel, version)}")
     if not summary.restored:
         for rel, why in summary.failures:
             print(f"restore: {why}: {rel}", file=sys.stderr)
+        if summary.lookup_refused:
+            print(
+                f"restore: {_lookup_refused_line(summary.lookup_refused[0][1])}",
+                file=sys.stderr,
+            )
         print(
             f"restore: {len(summary.failures)} file(s) failed, so {summary.dest} holds no "
             f"lake. Every file that verified stays in {summary.work}, and a re-run resumes "
@@ -4994,9 +5478,11 @@ def _read_restore_command(
 ) -> int:
     """Run the reading restore and print its lines. A refusal raises, for ``main`` to print.
 
-    A failed file gets a line naming what it is to the range. A file that does not match its
-    SHA-256 adds one line naming the two causes and their repairs, and the last line names the
-    target once and says the destination holds no reading set.
+    Each file taken from an older version gets a line on stdout first, whatever the outcome. A
+    failed file gets a line naming what it is to the range. A file that does not match its
+    SHA-256 adds one line for its cause: the bucket refused the lookup of an older version, or
+    no version matches. The last line names the target once and says the destination holds no
+    reading set.
     """
     summary = restore_for_reading(
         dest,
@@ -5008,22 +5494,34 @@ def _read_restore_command(
         first=first,
         last=last,
     )
+    for rel, version in summary.recovered:
+        print(f"{READING_MODE}: {_recovered_line(rel, version)}")
     if summary.restored:
         print(f"{READING_MODE}: {summary.render()}")
         return 0
     for rel, why in summary.failures:
         role = _ROLE_TEXT.get(summary.roles.get(rel, ""), "a planned file")
         print(f"{READING_MODE}: {why}: {rel}, {role}", file=sys.stderr)
-    if any(why == "does not match its SHA-256" for _rel, why in summary.failures):
+    refused = dict(summary.lookup_refused)
+    mismatched = [rel for rel, why in summary.failures if why == "does not match its SHA-256"]
+    codes = [refused[rel] for rel in mismatched if rel in refused]
+    if codes:
         print(
-            f"{READING_MODE}: a file that does not match its SHA-256 has one of two causes. An "
-            "upload is running or stopped part-way, so the bucket's current version is newer "
-            "than its manifest.jsonl, and a run after the next complete nightly upload passes. "
-            "Or the current version is damaged. When the bucket holds an earlier good version, "
-            'the README\'s "When the lake is gone" console steps put it into '
+            f"{READING_MODE}: {_lookup_refused_line(codes[0])}. Until then, the README's "
+            '"When the lake is gone" console steps put the version that matches into '
             f"{summary.work}. They write nothing to the bucket, so they work from a shadow host "
-            "too. A partition the trim removed usually has a single bucket version, so it has "
-            "none to recover",
+            "too",
+            file=sys.stderr,
+        )
+    if any(rel not in refused for rel in mismatched):
+        print(
+            f"{READING_MODE}: no version in the bucket matches the manifest.jsonl entry of a "
+            "file above that does not match its SHA-256, so its current version is damaged or "
+            "the matching one expired, and the console shows nothing to recover. Copy a file "
+            "that hashes to that entry from outside the bucket, such as the other host's, into "
+            f"{summary.work}. A quarantine.jsonl or actions ledger version is kept 30 days "
+            "after it is replaced, and a partition the trim removed usually has a single "
+            "bucket version",
             file=sys.stderr,
         )
     print(
@@ -5059,7 +5557,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live = sub.add_parser(
         "live-check",
-        help="Confirm the four provider behaviors and three read grants against the real bucket.",
+        help="Confirm the four provider behaviors and five read grants against the real bucket.",
     )
     live.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     live.add_argument(
@@ -5070,7 +5568,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser(
         "restore",
         help=(
-            "Download the bucket's current versions into an empty directory and verify them. "
+            "Download the bucket's lake into an empty directory and verify every file, taking "
+            "the older version its manifest names when the current one is newer. "
             "On a host whose config sets lake_window_sessions, leave out each partition the "
             "bucket's trimmed.jsonl says was removed on purpose, and each report dated by the "
             "lake's own run on or before the newest such day."
@@ -5359,6 +5858,7 @@ __all__ = [
     "RESTORE_WORK_DIR",
     "RESYNC_COMMAND",
     "VERIFIED_MARKER",
+    "VERSION_GRANTS",
     "BucketBackup",
     "BucketLedgerMismatch",
     "BucketLedgerMissing",
@@ -5375,6 +5875,7 @@ __all__ = [
     "FirstUploadRefused",
     "Ledger",
     "ManifestedFileMissing",
+    "MatchingVersion",
     "TrimmedNotInBucket",
     "ObjectTooLarge",
     "RANGE_RESTORE_SHADOW",
@@ -5408,6 +5909,7 @@ __all__ = [
     "live_check",
     "main",
     "manifested_files",
+    "matching_version",
     "nightly_upload",
     "read_bucket_trimmed",
     "read_copy_state",

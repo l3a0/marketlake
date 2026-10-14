@@ -639,7 +639,7 @@ These need the real world. They run by hand, off CI.
 
    1. S3 refuses a PUT whose `ChecksumSHA256` does not match the bytes, with `BadDigest`.
    2. `HeadObject` in checksum mode returns the stored SHA-256 of a single PUT, typed `FULL_OBJECT`.
-   3. A PUT to an existing key on the versioned bucket creates a new version and keeps the old one. The bucket's credentials hold no `s3:GetObjectVersion`, so the check prints the two version ids and asks for the old version to be confirmed in the console.
+   3. A PUT to an existing key on the versioned bucket creates a new version and keeps the old one. The check reads the old version back by its `VersionId`, which needs `s3:GetObjectVersion`. Both roles hold it since [#838](https://github.com/l3a0/marketlake/issues/838), so a refusal prints a FAIL line like any other missing grant.
    4. `put_object` of a 9 MiB body, past the 8 MiB point where `upload_file` and `aws s3 cp` switch to parts, sends one request.
 
    The bucket's credentials cannot delete, so the check ends by naming the probe prefix to delete by hand.
