@@ -644,6 +644,29 @@ def test_a_bars_range_for_every_ticker_takes_each_tickers_bars_and_no_other_surf
     assert not (root / QUOTES_1).exists()
 
 
+def test_a_bars_range_starts_on_its_first_day(tmp_path):
+    """Mutation this catches: a bars range that ignores its first day. A bar before the range
+    stays absent while the one inside it comes back."""
+    root, client, originals = _lake(tmp_path, bars=True)
+    for rel in (SPY_1D_1, SPY_1D_2):
+        (root / rel).unlink()
+    summary = _run(root, client, surface="bars", first=D2)
+    assert (summary.selected, summary.restored) == (2, 1)
+    assert not (root / SPY_1D_1).exists()
+    assert (root / SPY_1D_2).read_bytes() == originals[SPY_1D_2]
+
+
+def test_the_restore_range_help_names_bars(capsys):
+    """The command's help is what an operator reads before a rollback, so it names bars."""
+    parser = bucket.build_parser()
+    for argv in (["--help"], ["restore-range", "--help"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Put chosen chains, quotes or bars partitions" in text
+    assert "chains, quotes or bars. On bars it restores both frequencies" in text
+
+
 def test_a_chains_range_leaves_its_days_bars_where_they_are(tmp_path):
     """A chains restore does not take bars, which is why the rollback runbook runs the range
     restore once for each surface."""

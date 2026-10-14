@@ -698,19 +698,6 @@ def test_a_bar_whose_chain_was_lost_stays_for_the_restored_chain(lake_root):
         assert rel not in trimmed.latest_trimmed(lake_root)
 
 
-def test_a_bar_with_no_chain_in_the_manifest_goes_at_the_edge(lake_root):
-    """Mutation this catches: the chains clause keeping a bar whose chain was never in the
-    manifest. A ticker with bars and no chains has nothing for its bars to wait on, so they go
-    on the first run, at the window edge."""
-    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS, bars_only=("IWM",))
-
-    result = _trim(lake_root, client)
-
-    iwm = _expected_bars(tickers=("IWM",))
-    assert sorted(rel for rel in result.trimmed if rel.startswith("bars/")) == sorted(iwm)
-    assert not any((lake_root / rel).exists() for rel in iwm)
-
-
 def test_an_unsearchable_bars_ticker_directory_names_itself_in_the_repair(lake_root):
     """A bars key sits one level below its ticker directory, so ``bars/ticker=SPY/`` can be the
     directory at fault. Each held line's repair names that directory, recursively, rather than
@@ -730,6 +717,90 @@ def test_an_unsearchable_bars_ticker_directory_names_itself_in_the_repair(lake_r
     for held in result.held:
         assert "chown -R <lake owner> <lake_root>/bars/ticker=SPY and " in held
         assert "chmod -R u+rwX <lake_root>/bars/ticker=SPY" in held
+
+
+@pytest.mark.parametrize("clause", ["quarantine", "missing-key", "unwritable"])
+def test_a_bar_whose_chain_went_still_meets_the_later_clauses(lake_root, clause):
+    """Mutations this catches: the bars branch skipping the quarantine clause, the access check
+    skipped for bars or asked of ``bars/ticker=T`` rather than the frequency directory. Once a
+    bar's chains are gone, the quarantine clause, the bucket read and the access check still
+    apply to it, and the day's other frequency still goes."""
+    rel = _brel("SPY", "1d", SESSIONS[0])
+    quarantine = (rel,) if clause == "quarantine" else ()
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS, quarantine=quarantine)
+    _trim(lake_root, client)
+    client.calls.clear()
+    if clause == "missing-key":
+        del client.objects[TARGET.key(rel)]
+    directory = lake_root / "bars" / "ticker=SPY" / "freq=1d"
+    if clause == "unwritable":
+        directory.chmod(0o500)
+    try:
+        result = _trim(lake_root, client)
+    finally:
+        directory.chmod(0o755)
+    assert rel not in result.trimmed
+    assert (lake_root / rel).exists()
+    assert rel not in trimmed.latest_trimmed(lake_root)
+    assert _brel("SPY", "1m", SESSIONS[0]) in result.trimmed
+    if clause == "unwritable":
+        (held,) = result.held
+        assert held.startswith("bars/ticker=SPY/freq=1d/: the directory is not writable")
+        assert rel not in _gets(client)
+
+
+def test_recovery_of_a_bar_missing_from_the_bucket_writes_a_restore_line(lake_root):
+    """Mutation this catches: the absent-in-bucket recovery skipped for bars. A trim line beside
+    a bar the bucket no longer holds is superseded, so the lake's only copy is kept and counted
+    present."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS)
+    _trim(lake_root, client)
+    rel = _brel("SPY", "1d", SESSIONS[0])
+    _crashed_before_unlink(lake_root, rel)
+    del client.objects[TARGET.key(rel)]
+    result = _trim(lake_root, client)
+    assert rel in result.restored
+    assert (lake_root / rel).exists()
+    assert trimmed.latest_trimmed(lake_root)[rel]["kind"] == trimmed.RESTORE_KIND
+
+
+@pytest.mark.parametrize("iwm_cutoff", [date.min, None])
+def test_a_bar_with_no_chain_goes_at_the_edge_whatever_its_tickers_cutoff(lake_root, iwm_cutoff):
+    """Mutations this catches: the chains clause keeping a bar whose chain was never in the
+    manifest, and the checkpoint cutoff applied to bars. The cutoff keeps chains alone, so a
+    ticker with bars and no chains has nothing for its bars to wait on, and they go on the first
+    run at the window edge, whether its cutoff keeps every day or it has none."""
+    cutoffs = dict.fromkeys(TICKERS, EDGE) | ({} if iwm_cutoff is None else {"IWM": iwm_cutoff})
+    client = _build(
+        lake_root, quotes=True, bar_freqs=BOTH_FREQS, bars_only=("IWM",), cutoffs=cutoffs
+    )
+
+    result = _trim(lake_root, client)
+
+    iwm = _expected_bars(tickers=("IWM",))
+    assert sorted(rel for rel in result.trimmed if rel.startswith("bars/")) == sorted(iwm)
+    assert not any((lake_root / rel).exists() for rel in iwm)
+
+
+def test_a_chains_check_failing_with_any_os_error_keeps_its_bars(lake_root, monkeypatch):
+    """Mutation this catches: the chains check's catch narrowed to ``PermissionError``. An I/O
+    error on the check keeps the bar too, rather than stopping the whole night."""
+    client = _build(
+        lake_root, quotes=True, bar_freqs=BOTH_FREQS, cutoffs={"QQQ": EDGE, "SPY": date.min}
+    )
+    _trim(lake_root, client)
+    real = trim_module._present
+
+    def failing(path):
+        if "chains/ticker=SPY/" in Path(path).as_posix():
+            raise OSError(errno.EIO, "Input/output error")
+        return real(path)
+
+    monkeypatch.setattr(trim_module, "_present", failing)
+    result = _trim(lake_root, client)
+    assert result.stopped is None
+    assert sorted(result.trimmed) == sorted(_expected_bars(tickers=("QQQ",)))
+    assert all((lake_root / rel).exists() for rel in _expected_bars(tickers=("SPY",)))
 
 
 # -- refusals before any partition -----------------------------------------------------------

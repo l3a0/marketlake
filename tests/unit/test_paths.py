@@ -344,6 +344,14 @@ def test_a_built_bars_path_parses_back_to_the_parts_it_was_built_from(paths: Lak
         "bars/ticker=SPY/freq=1d/2026-09-14.parquet",
         # The suffix is matched too.
         "bars/ticker=SPY/freq=1d/date=2026-09-14.arrows",
+        # A wrong ticker key long enough to leave a ticker behind a length slice.
+        "bars/symbol=SPY/freq=1d/date=2026-09-14.parquet",
+        # A wrong suffix of ``.parquet``'s own length.
+        "bars/ticker=SPY/freq=1d/date=2026-09-14.csv.bak",
+        # A frequency whose leading letters fall in the prefix's character set.
+        "bars/ticker=SPY/freq=q1d/date=2026-09-14.parquet",
+        # A dotted stem.
+        "bars/ticker=SPY/freq=1d/date=2026-09-14.x.parquet",
     ],
 )
 def test_a_malformed_bars_path_parses_to_none(rel: str):
