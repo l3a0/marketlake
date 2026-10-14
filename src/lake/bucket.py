@@ -244,10 +244,13 @@ BUCKET_SHADOW = (
 # The error code S3 answers a PUT whose bytes do not match its ``ChecksumSHA256``.
 BAD_DIGEST = "BadDigest"
 
-# What a ``HeadObject`` on a missing key answers. The bucket's credentials hold
-# ``s3:ListBucket``, so S3 answers 404 rather than 403, and a HEAD error carries no body
-# to name a code in.
-_ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+# What S3 answers for something that does not exist. A ``HeadObject`` on a missing key or
+# version answers a bare 404, because the bucket's credentials hold ``s3:ListBucket`` and a
+# HEAD error carries no body to name a code in. A plain ``GetObject`` on a missing key
+# answers ``NoSuchKey``. A ``GetObject`` naming a version that is gone, such as one expired
+# between the lookup that matched it and the read, answers ``NoSuchVersion`` (marketlake
+# #838). Only a read that names a version can meet that code.
+_ABSENT_CODES = frozenset({"404", "NoSuchKey", "NotFound", "NoSuchVersion"})
 
 # The error codes that mean the credentials or their policy were turned away. These and
 # an HTTP 401 or 403 are the only answers named *refused*, whose repair is new
@@ -568,7 +571,7 @@ def _is_client_error(exc: BaseException) -> bool:
 
 
 def _is_absent(exc: BaseException) -> bool:
-    """Whether a raised error is S3 saying the key does not exist."""
+    """Whether a raised error is S3 saying the key, or the version named, does not exist."""
     return _is_client_error(exc) and _error_code(exc) in _ABSENT_CODES
 
 
@@ -1956,8 +1959,8 @@ class BucketReadError(OSError):
     ``manifest.restore_check`` catches ``OSError`` and nothing else, so the bucket's
     client errors are mapped onto it here. ``code`` keeps the S3 error code, or
     ``AssumeRole <code>`` when STS refused the role, and ``absent`` says S3 answered
-    that the key does not exist, which the restore command names as a missing file
-    rather than as a bucket it cannot reach.
+    that the key, or the version a read named, does not exist, which the restore command
+    names as a missing file rather than as a bucket it cannot reach.
     """
 
     def __init__(self, rel: str, kind: str, code: str) -> None:

@@ -204,6 +204,27 @@ def _expire(client: FakeS3, *rels: str) -> None:
         client.objects[key] = client.objects[key][-1:]
 
 
+def _vanish(client: FakeS3, *rels: str) -> None:
+    """Delete a version of each path once a read names it, after the lookup matched it.
+
+    A version that expires between the lookup's HEAD and the read makes S3 answer the
+    ``GetObject`` with ``NoSuchVersion`` and a 404, which no version left to read means too.
+    """
+    keys = {TARGET.key(rel) for rel in rels}
+
+    def on_get(kwargs: dict) -> None:
+        key, wanted = kwargs["Key"], kwargs.get("VersionId")
+        if key in keys and wanted is not None:
+            client.objects[key] = [v for v in client.versions(key) if v.version_id != wanted]
+
+    client.on_get = on_get
+
+
+def _versioned_gets(client: FakeS3) -> list[str]:
+    """The key of every ``GetObject`` that named a version, in order."""
+    return [kwargs["Key"] for name, kwargs in client.versioned_calls() if name == "get_object"]
+
+
 def _deny(client: FakeS3) -> None:
     """The role as it was before marketlake #838's apply: neither version grant."""
     client.deny_list_versions = True
@@ -327,6 +348,7 @@ def test_a_resync_after_a_stopped_upload_takes_the_versions_the_manifest_names(t
 # -- 2. no version matches -------------------------------------------------------------
 
 
+@pytest.mark.parametrize("gone", [_expire, _vanish], ids=["expired", "gone-before-the-read"])
 @pytest.mark.parametrize(
     ("run", "label", "failed"),
     [
@@ -335,12 +357,16 @@ def test_a_resync_after_a_stopped_upload_takes_the_versions_the_manifest_names(t
     ],
 )
 def test_a_restore_with_no_matching_version_fails_each_file(
-    tmp_path, monkeypatch, capsys, run, label, failed
+    tmp_path, monkeypatch, capsys, run, label, failed, gone
 ):
     lake = _stopped(tmp_path)
-    _expire(lake.client, QUARANTINE, TRIMMED)
+    gone(lake.client, QUARANTINE, TRIMMED)
 
     code = run(tmp_path, lake, monkeypatch)
+
+    if gone is _vanish:
+        # The lookup matched each file, and its read found the version gone.
+        assert _versioned_gets(lake.client) == [TARGET.key(rel) for rel in failed]
 
     assert code == 1
     captured = capsys.readouterr()
@@ -355,14 +381,18 @@ def test_a_restore_with_no_matching_version_fails_each_file(
     assert len(err) == len(failed) + (2 if label == "restore-for-reading" else 1)
 
 
+@pytest.mark.parametrize("gone", [_expire, _vanish], ids=["expired", "gone-before-the-read"])
 def test_a_windowed_rebuild_with_no_matching_ledger_refuses_with_the_hand_copy(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, gone
 ):
     lake = _stopped(tmp_path)
-    _expire(lake.client, TRIMMED)
+    gone(lake.client, TRIMMED)
 
     with pytest.raises(SystemExit) as exc:
         _windowed(tmp_path, lake, monkeypatch)
+
+    if gone is _vanish:
+        assert _versioned_gets(lake.client) == [TARGET.key(TRIMMED)]
 
     assert exc.value.code == 2
     (line,) = capsys.readouterr().err.splitlines()
@@ -373,9 +403,10 @@ def test_a_windowed_rebuild_with_no_matching_ledger_refuses_with_the_hand_copy(
     assert GRANTS not in line
 
 
-def test_a_resync_with_no_matching_ledger_refuses_naming_the_cause(tmp_path):
+@pytest.mark.parametrize("gone", [_expire, _vanish], ids=["expired", "gone-before-the-read"])
+def test_a_resync_with_no_matching_ledger_refuses_naming_the_cause(tmp_path, gone):
     lake = _stopped(tmp_path)
-    _expire(lake.client, TRIMMED)
+    gone(lake.client, TRIMMED)
 
     with pytest.raises(bucket.ResyncRefused) as refused:
         _resync(lake)
@@ -383,6 +414,28 @@ def test_a_resync_with_no_matching_ledger_refuses_naming_the_cause(tmp_path):
     message = str(refused.value)
     assert "no older version matches it" in message
     assert GRANTS not in message
+    if gone is _vanish:
+        assert _versioned_gets(lake.client) == [TARGET.key(TRIMMED)]
+
+
+def test_a_resync_whose_matched_version_is_gone_at_apply_refuses_naming_it(tmp_path):
+    # The plan matched quarantine.jsonl's older version on its stored checksum, and the
+    # version is gone by the time --apply reads it.
+    lake = _stopped(tmp_path)
+    version = _version(lake.client, QUARANTINE, lake.named[QUARANTINE])
+    _vanish(lake.client, QUARANTINE)
+    before = sorted(p.name for p in lake.shadow.rglob("*"))
+
+    with pytest.raises(bucket.ResyncRefused) as refused:
+        _resync(lake)
+
+    message = str(refused.value)
+    assert message.startswith(
+        f"the bucket holds no version {version} of {QUARANTINE!r}, which its manifest.jsonl "
+        "names, so the resync changed nothing: "
+    )
+    assert _versioned_gets(lake.client)[-1] == TARGET.key(QUARANTINE)
+    assert sorted(p.name for p in lake.shadow.rglob("*")) == before
 
 
 # -- 3. the version calls refused --------------------------------------------------------
