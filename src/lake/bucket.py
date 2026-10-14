@@ -1994,7 +1994,8 @@ def _read_failure(exc: BaseException) -> tuple[str, str] | None:
 
 
 def bucket_reader(client: Any, target: BucketTarget) -> Callable[[str], Iterator[bytes]]:
-    """The ``manifest.BackupReader`` for a bucket: download the current version of ``rel``.
+    """The ``manifest.BackupReader`` for a bucket: download the current version of ``rel``, or
+    the version a caller names.
 
     The body is read in an explicit loop of ``read`` calls, so every byte crosses the
     network. A client error on the request or partway through the body raises
