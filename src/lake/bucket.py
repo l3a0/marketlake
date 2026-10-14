@@ -5162,7 +5162,12 @@ def live_check(
        the old one.
     4. ``put_object`` sends one request and never splits into parts.
 
-    Three more lines prove the read grants the scrub and the restore need, which nothing
+    Behavior 3 reads the first version back with ``GetObject`` and its ``VersionId``, which
+    needs ``s3:GetObjectVersion``, so a refusal there prints a ``FAIL`` like any missing grant.
+    That read and lines 8 and 9 run only when the two PUTs returned two usable, distinct ids,
+    since otherwise there is no old version to name.
+
+    Five more lines prove the read grants the scrub and the restores need, which nothing
     else calls while ``backup_target`` is still a path (marketlake #737).
 
     5. ``ListObjectsV2`` under the check's own prefix lists the probe.
@@ -5170,6 +5175,15 @@ def live_check(
     7. A plain ``GetObject`` of the probe returns the bytes of its current version, and the
        ``VersionId`` of that version. The trim records that id on its trim line
        (marketlake #787), and a response without it would stop every trim.
+    8. ``ListObjectVersions`` with the probe's key as its prefix lists both versions of that
+       exact key, the second one as latest.
+    9. ``HeadObject`` naming the first version, with checksum mode, returns the probe's
+       SHA-256.
+
+    Lines 8 and 9 are the two calls :func:`matching_version` sends, and behavior 3's read is
+    the download a restore then makes of the version it found (marketlake #838). Each needs
+    ``s3:ListBucketVersions`` or ``s3:GetObjectVersion``, so before the infra apply that grants
+    them the check exits 1.
 
     On the assume-role path the first request is where the role is assumed. A refusal
     there is STS's and not S3's verdict on behavior 1, so it is raised for ``main`` to
@@ -5240,16 +5254,6 @@ def live_check(
     old_id, new_id = first.get("VersionId"), second.get("VersionId")
     distinct = usable_version_id(old_id) and usable_version_id(new_id) and old_id != new_id
     report(distinct, f"3 two PUTs to one key returned versions {old_id} and {new_id}")
-    try:
-        kept = client.get_object(Bucket=target.bucket, Key=key, VersionId=old_id)["Body"].read()
-    except Exception as exc:
-        out(
-            f"live-check: the old version could not be read back ({_error_code(exc)}). The "
-            "bucket's credentials hold no s3:GetObjectVersion, so confirm by hand in the "
-            f"console that {key} shows two versions"
-        )
-    else:
-        report(kept == probe, "3 the first version still holds the first PUT's bytes")
 
     def grant(number: int, call: str, read: Callable[[], tuple[bool, str]]) -> None:
         try:
@@ -5261,6 +5265,16 @@ def live_check(
             report(False, f"{number} {call} {failure[0]} with {failure[1]}")
         else:
             report(passed, f"{number} {call} {shown}")
+
+    def kept() -> tuple[bool, str]:
+        body = client.get_object(Bucket=target.bucket, Key=key, VersionId=old_id)["Body"].read()
+        held = "the first PUT's bytes" if body == probe else "other bytes"
+        return body == probe, f"of the first version returned {held}"
+
+    # Without two usable ids there is no old version to name, and boto3 refuses a None id
+    # before sending anything.
+    if distinct:
+        grant(3, "GetObject by VersionId", kept)
 
     # 5, 6 and 7. The read grants, each by the call the scrub or the restore makes.
     listed_prefix = f"{target.key(base)}/"
@@ -5283,9 +5297,39 @@ def live_check(
         shown = f"VersionId {version}" if named else f"VersionId {version}, not {new_id}"
         return body == replacement and named, f"of the probe returned {held} with {shown}"
 
+    def versions() -> tuple[bool, str]:
+        found = client.list_object_versions(Bucket=target.bucket, Prefix=key)
+        mine = [entry for entry in found.get("Versions", []) if entry.get("Key") == key]
+        ids = {entry.get("VersionId") for entry in mine}
+        latest = [entry.get("VersionId") for entry in mine if entry.get("IsLatest")]
+        passed = {old_id, new_id} <= ids and latest == [new_id]
+        return passed, (
+            f"of the probe listed {len(mine)} version(s), latest {', '.join(map(str, latest))}"
+            if latest
+            else f"of the probe listed {len(mine)} version(s), none latest"
+        )
+
+    def versioned_head() -> tuple[bool, str]:
+        head = client.head_object(
+            Bucket=target.bucket, Key=key, VersionId=old_id, ChecksumMode="ENABLED"
+        )
+        stored = stored_sha256(head)
+        return (
+            stored == hashlib.sha256(probe).digest(),
+            f"of the first version returned ChecksumSHA256 {head.get('ChecksumSHA256')}",
+        )
+
     grant(5, "ListObjectsV2", listing)
     grant(6, "GetBucketVersioning", versioning)
     grant(7, "GetObject", current)
+    if distinct:
+        grant(8, "ListObjectVersions", versions)
+        grant(9, "HeadObject by VersionId", versioned_head)
+    else:
+        out(
+            "live-check: 3's read of the first version, 8 and 9 need two usable versions, so "
+            "they did not run"
+        )
 
     out(
         f"live-check: delete {target.key(base)}/ and every version under it in the console. "
@@ -5492,7 +5536,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live = sub.add_parser(
         "live-check",
-        help="Confirm the four provider behaviors and three read grants against the real bucket.",
+        help="Confirm the four provider behaviors and five read grants against the real bucket.",
     )
     live.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     live.add_argument(
