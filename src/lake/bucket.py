@@ -190,6 +190,7 @@ from lake.paths import (
     CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
     DATE_PREFIX,
+    JOURNAL_DIR,
     LOST_AND_FOUND,
     MANIFEST_FILE,
     QUARANTINE_FILE,
@@ -1203,6 +1204,11 @@ class UploadSummary:
     started, so an entry at a lower position was already in the bucket before tonight. The
     trim after compaction (marketlake #787) reads both: it stops between partitions at the
     same deadline, and it drops only a partition whose entry sits below that watermark.
+
+    ``healed`` and ``unhealed`` are the nightly upload's heal (marketlake #838). ``healed``
+    names each file whose bucket version did not match the entry both manifests share and
+    which the upload put back from the lake, and each also counts in ``puts``. ``unhealed``
+    holds ``(rel, cause)`` for each such file the lake could not supply.
     """
 
     target: str
@@ -1214,14 +1220,34 @@ class UploadSummary:
     uploaded: list[str] = field(default_factory=list)
     deadline: datetime | None = None
     watermark: int | None = None
+    healed: list[str] = field(default_factory=list)
+    unhealed: list[tuple[str, str]] = field(default_factory=list)
 
     def render(self) -> str:
-        """One line naming what went up and how fast."""
+        """One line naming what went up and how fast.
+
+        The heal's counts show only when nonzero, so an upload with nothing to heal reads
+        exactly as it did before the heal existed. ``compact.py`` prints this as one line, so
+        each file the heal could not put back is named on the same line, with its cause.
+        """
         megabytes = self.put_bytes / 1_000_000
         rate = (self.put_bytes * 8 / 1_000_000 / self.seconds) if self.seconds > 0 else 0.0
+        healed = ""
+        if self.healed:
+            healed += (
+                f", put back {len(self.healed)} file(s) whose bucket version did not match the "
+                f"bucket's manifest.jsonl ({', '.join(self.healed)})"
+            )
+        if self.unhealed:
+            named = "; ".join(f"{rel}, {cause}" for rel, cause in self.unhealed)
+            healed += (
+                f", could not put back {len(self.unhealed)} file(s) whose bucket version does "
+                f"not match the bucket's manifest.jsonl ({named})"
+            )
         return (
             f"uploaded {self.puts} file(s), {megabytes:.1f} MB in {self.seconds:.0f} s "
-            f"({rate:.1f} Mbit/s), skipped {self.skipped} already in the bucket: {self.target}"
+            f"({rate:.1f} Mbit/s), skipped {self.skipped} already in the bucket{healed}: "
+            f"{self.target}"
         )
 
 
@@ -1254,6 +1280,8 @@ class _Uploader:
 
     ``guards`` run before every request, and each raises when the upload must stop. The
     nightly upload's deadline is one, and the first upload's Sunday window is another.
+    :meth:`heal` is the nightly upload's alone. The first upload needs none, because its
+    :meth:`manifested` pass already compares every file and PUTs one that differs.
     """
 
     def __init__(
@@ -1361,6 +1389,51 @@ class _Uploader:
             f"no manifest.jsonl goes up: {self.target}"
         )
 
+    def heal(self, rel: str, hexdigest: str) -> None:
+        """Put the lake's copy of a file back when the bucket's current version is not it.
+
+        ``rel`` is not pending, so its latest entry is the same in the lake's manifest and the
+        bucket's. A nightly upload that stopped between this file's PUT and the manifest's
+        leaves a newer current version under that entry, and so does an upload by another host
+        that was primary at the same time. A restored host's manifest equals the bucket's, so
+        it never sees this file as pending and nothing else would put it back (marketlake
+        #838). One ``HeadObject`` through :meth:`holds` decides it, and a match counts nowhere,
+        unlike :meth:`manifested`'s ``skipped``.
+
+        On a mismatch the lake's file is read and hashed, and when it hashes to the entry it is
+        PUT under that digest, counted as any PUT is and named in ``healed``. A file that is
+        missing, unreadable, past the single-PUT limit, or does not hash to its entry is
+        skipped with its cause in ``unhealed`` rather than raised, because one bad local file
+        would otherwise stop every night's backup. The Sunday job already pages on it twice:
+        the bucket scrub reports the bucket's copy, and ``manifest.scrub`` the lake's.
+        """
+        if self.holds(rel, hexdigest):
+            return
+        path = self.root / rel
+        try:
+            size = path.stat().st_size
+            if size > MAX_PUT_BYTES:
+                self.summary.unhealed.append((rel, "past the single-PUT limit"))
+                return
+            data = path.read_bytes()
+        except FileNotFoundError:
+            self.summary.unhealed.append((rel, "missing from the lake"))
+            return
+        except OSError as exc:
+            self.summary.unhealed.append((rel, f"unreadable, {type(exc).__name__}"))
+            return
+        if hashlib.sha256(data).hexdigest() != hexdigest:
+            self.summary.unhealed.append(
+                (
+                    rel,
+                    "its bytes no longer hash to its manifest entry, from rot or a write "
+                    "whose entry was never recorded",
+                )
+            )
+            return
+        self.put(rel, data, hex_to_b64(hexdigest))
+        self.summary.healed.append(rel)
+
     def unmanifested(self, rel: str, path: Path, listed_size: int | None) -> None:
         """Upload a file the manifest does not record, when its size differs from the bucket's."""
         size = path.stat().st_size
@@ -1447,6 +1520,28 @@ def first_upload_files(
         yield rel, str(ledger.latest[rel]["sha256"]), True
 
 
+# The top-level directories whose files the nightly upload's heal leaves alone. Each holds a
+# partition or a segment per ticker and day, so a HEAD per file would cost thousands of
+# requests a night, and only a recompaction by hand rewrites one. Naming what is left out,
+# rather than what is in, takes a ledger the lake grows later into the heal (marketlake #838).
+_PARTITION_DIRS = frozenset({CHAINS, QUOTES, BARS, JOURNAL_DIR})
+
+
+def _heal_files(ledger: Ledger, mark: int) -> Iterator[tuple[str, str]]:
+    """The manifested files the heal checks, as ``(rel, hex sha256)``.
+
+    Each is outside :data:`_PARTITION_DIRS`, passes the same ``rsync_excluded`` skip
+    :func:`manifested_files` applies, and is not pending, which means its latest entry sits
+    below the watermark ``mark``.
+    """
+    for rel in sorted(ledger.latest):
+        if rsync_excluded(rel, is_dir=False) or rel.split("/", 1)[0] in _PARTITION_DIRS:
+            continue
+        if ledger.last[rel] >= mark:
+            continue
+        yield rel, str(ledger.latest[rel]["sha256"])
+
+
 def _unmanifested(root: Path, ledger: Ledger) -> Iterator[tuple[str, Path]]:
     """Every file the backup copies that carries no manifest entry, ``manifest.jsonl`` aside.
 
@@ -1477,11 +1572,19 @@ def nightly_upload(
        the lake's manifest starts with, and a hand repair name the first-upload command. A
        copy where some path's latest entry is one this lake never recorded, and one that
        could not be read to tell, say not to run it.
-    2. Every manifested file whose latest entry sits past the watermark is pending and
+    2. The heal, every night whether or not the manifest moved. Each manifested file
+       outside ``chains/``, ``quotes/``, ``bars/`` and ``journal/`` that is not pending gets
+       one ``HeadObject``. When the bucket's current version does not hold the entry both
+       manifests share, which an upload stopped before its ``manifest.jsonl`` leaves, the
+       lake's copy is PUT back under that digest, or skipped with its cause when the lake
+       cannot supply it (marketlake #838). It runs before the pending files, so a deadline
+       that stops the night later never cuts it off, and a heal that fails lands outside the
+       window between a file's PUT and the manifest's.
+    3. Every manifested file whose latest entry sits past the watermark is pending and
        uploads under the manifest's digest, segments by the segment rule.
-    3. Every file with no manifest entry and no exclusion compares by size against one
+    4. Every file with no manifest entry and no exclusion compares by size against one
        listing and uploads when it differs.
-    4. ``manifest.jsonl`` goes last, so the watermark never claims a file the bucket does
+    5. ``manifest.jsonl`` goes last, so the watermark never claims a file the bucket does
        not hold. It goes up only when its length moved.
 
     Nothing is deleted from the bucket and nothing is written under the lake root. The
@@ -1525,6 +1628,8 @@ def nightly_upload(
 
     uploader.check()
     listing = list_bucket(client, target)
+    for rel, hexdigest in _heal_files(ledger, mark):
+        uploader.heal(rel, hexdigest)
     pending = [rel for rel, position in ledger.last.items() if position >= mark]
     for rel, hexdigest in manifested_files(root, ledger, pending):
         uploader.manifested(rel, hexdigest, listed=rel in listing)

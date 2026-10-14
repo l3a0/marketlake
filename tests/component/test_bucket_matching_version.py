@@ -18,8 +18,15 @@ follow the issue's Verification list.
 8. A restore with nothing mismatched sends no version listing and names no version.
 9. An unmanifested file's mismatch never reaches the resolver.
 
-Item 4, the resync's own cases, sits in ``test_bucket_resync.py``. Items 5 and 6, the nightly
-upload's heal, and item 10, the live check, sit beside their code's other tests. Expected bytes
+5. The next nightly upload on whichever host uploads next puts the named bytes back, and the
+   bucket scrub then comes back clean, after a whole restore, a windowed rebuild, a resync, a
+   takeover by a host already level, a restore resumed after a failed run, and a resync run
+   again after a crash before its manifest rewrite. Only a run that downloaded an older version
+   names it.
+
+Item 4, the resync's own cases, sits in ``test_bucket_resync.py``. Item 6, the heal's own
+rules, sits in ``test_bucket_upload.py``, and item 10, the live check, in
+``test_bucket_live_check.py``. Expected bytes
 are read from the lake or the fake bucket's store, never through the code under test.
 """
 
@@ -29,6 +36,7 @@ import base64
 import dataclasses
 import hashlib
 import json
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 
@@ -38,6 +46,7 @@ from lake import bucket
 from lake.bucket import (
     BucketReadError,
     UploadDeadline,
+    bucket_scrub,
     first_upload,
     matching_version,
     nightly_upload,
@@ -71,6 +80,7 @@ MONDAY_19 = datetime(2026, 8, 24, 19, 0, tzinfo=MARKET_TZ)
 TUESDAY_19 = datetime(2026, 8, 25, 19, 0, tzinfo=MARKET_TZ)
 WEDNESDAY_19 = datetime(2026, 8, 26, 19, 0, tzinfo=MARKET_TZ)
 WEDNESDAY_20 = datetime(2026, 8, 26, 20, 0, tzinfo=MARKET_TZ)
+THURSDAY_19 = datetime(2026, 8, 27, 19, 0, tzinfo=MARKET_TZ)
 STAMP = "2026-08-25T19:00:00-04:00"
 PLENTY = 10**12
 GRANTS = "s3:ListBucketVersions and s3:GetObjectVersion"
@@ -93,7 +103,8 @@ class Stopped:
 
     ``named`` holds the bytes the bucket's manifest names for each rewritten ledger, which the
     primary's first night uploaded whole. ``newer`` holds what the second night PUT before it
-    stopped.
+    stopped. ``level`` is a copy of the primary taken after its first night, a host already
+    level with the bucket that can take over with no restore.
     """
 
     primary: Path
@@ -101,6 +112,7 @@ class Stopped:
     client: FakeS3
     named: dict[str, bytes]
     newer: dict[str, bytes]
+    level: Path
 
 
 def _verdict(root: Path, partition: str) -> None:
@@ -159,6 +171,8 @@ def _stopped(tmp_path: Path, *, stop: bool = True) -> Stopped:
     _trim(primary, client, SPY_1)
     nightly_upload(primary, TARGET, client=client, clock=ManualClock(TUESDAY_19), calendar=CALENDAR)
     named = {rel: (primary / rel).read_bytes() for rel in (QUARANTINE, TRIMMED)}
+    level = tmp_path / "level"
+    shutil.copytree(primary, level)
 
     _verdict(primary, SPY_3)
     _trim(primary, client, SPY_2)
@@ -180,7 +194,7 @@ def _stopped(tmp_path: Path, *, stop: bool = True) -> Stopped:
     else:
         nightly_upload(primary, TARGET, client=client, clock=clock, calendar=CALENDAR)
     client.calls.clear()
-    return Stopped(primary, shadow, client, named, newer)
+    return Stopped(primary, shadow, client, named, newer, level)
 
 
 def _expire(client: FakeS3, *rels: str) -> None:
@@ -681,3 +695,109 @@ def test_an_unmanifested_file_s_mismatch_never_reaches_the_resolver(tmp_path):
     assert summary.failures == [(REPORT, "does not match its SHA-256")]
     assert summary.recovered == []
     assert lake.client.versioned_calls() == []
+
+
+# -- 5. the next nightly upload heals the bucket -----------------------------------------
+
+
+class Crash(Exception):
+    """A process death injected before the resync's manifest rewrite. Nothing catches it."""
+
+
+def _heals(lake: Stopped, host: Path) -> None:
+    """The bucket scrub pages on the two ledgers, the host's next upload heals, and it is clean."""
+    before = bucket_scrub(host, TARGET, lake.client)
+    assert sorted(before.sha_mismatches) == [QUARANTINE, TRIMMED]
+    lake.client.calls.clear()
+
+    summary = nightly_upload(
+        host, TARGET, client=lake.client, clock=ManualClock(THURSDAY_19), calendar=CALENDAR
+    )
+
+    assert summary.healed == [QUARANTINE, TRIMMED]
+    assert summary.unhealed == []
+    assert lake.client.put_keys() == [TARGET.key(QUARANTINE), TARGET.key(TRIMMED)]
+    for rel in (QUARANTINE, TRIMMED):
+        assert lake.client.body(TARGET.key(rel)) == lake.named[rel]
+    after = bucket_scrub(host, TARGET, lake.client)
+    assert after.sha_mismatches == () and after.ok
+
+
+def _recovered(lake: Stopped) -> list[tuple[str, str]]:
+    return [(rel, _version(lake.client, rel, lake.named[rel])) for rel in (QUARANTINE, TRIMMED)]
+
+
+@pytest.mark.parametrize("windowed", [False, True], ids=["whole", "windowed"])
+def test_the_next_upload_after_a_restore_heals_the_bucket(tmp_path, windowed):
+    lake = _stopped(tmp_path)
+    host = tmp_path / "host"
+
+    summary = restore_lake(
+        host,
+        TARGET,
+        client=lake.client,
+        free_space=lambda _: PLENTY,
+        skip_designed_absences=windowed,
+    )
+
+    assert summary.restored
+    assert summary.recovered == _recovered(lake)
+    _heals(lake, host)
+
+
+def test_the_next_upload_after_a_resync_heals_the_bucket(tmp_path):
+    lake = _stopped(tmp_path)
+
+    assert _resync(lake).applied
+
+    _heals(lake, lake.shadow)
+
+
+def test_a_level_host_that_takes_over_heals_the_bucket_with_no_restore(tmp_path):
+    lake = _stopped(tmp_path)
+
+    _heals(lake, lake.level)
+
+
+def test_a_resumed_restore_names_the_older_versions_only_on_the_run_that_took_them(
+    tmp_path, monkeypatch, capsys
+):
+    lake = _stopped(tmp_path)
+    versions = lake.client.versions(TARGET.key(SPY_3))
+    good = versions[-1]
+    versions[-1] = dataclasses.replace(good, body=b"rotted at rest")
+    argv = ["restore", str(tmp_path / "d")]
+
+    assert _main(tmp_path, lake.primary, lake.client, monkeypatch, argv) == 1
+    first = capsys.readouterr()
+    for rel, version in _recovered(lake):
+        assert _took("restore", rel, version) in first.out
+    assert f"restore: does not match its SHA-256: {SPY_3}" in first.err
+
+    versions[-1] = good
+    assert _main(tmp_path, lake.primary, lake.client, monkeypatch, argv) == 0
+    second = capsys.readouterr()
+    assert "took " not in second.out
+    assert second.err == ""
+
+    _heals(lake, tmp_path / "d")
+
+
+def test_a_resync_run_again_after_a_crash_names_nothing_and_the_upload_heals(tmp_path, monkeypatch):
+    lake = _stopped(tmp_path)
+
+    def crash(*args, **kwargs):
+        raise Crash
+
+    monkeypatch.setattr(bucket, "_rewrite_manifest", crash)
+    with pytest.raises(Crash):
+        _resync(lake)
+    monkeypatch.undo()
+    for rel in (QUARANTINE, TRIMMED):
+        assert (lake.shadow / rel).read_bytes() == lake.named[rel]
+
+    again = _resync(lake)
+
+    assert again.applied
+    assert again.warnings == []
+    _heals(lake, lake.shadow)

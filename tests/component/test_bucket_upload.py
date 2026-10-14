@@ -20,6 +20,11 @@ that can fail has a test here.
 7. Nothing is ever deleted.
 8. A deadline stops the upload and the lock is released.
 9. Nothing is written under the lake root.
+11. The heal (marketlake #838). Every night, before the pending files, each manifested file
+    outside ``chains/``, ``quotes/``, ``bars/`` and ``journal/`` that is not pending gets one
+    HEAD, and the lake's copy goes back up when the bucket's current version is not the entry
+    both manifests share. A local copy that is missing, unreadable, too large or rotted is
+    skipped with its cause on the summary's one line, and the upload goes on.
 
 The exclusion list, rule 10, has its own file, ``tests/unit/test_bucket_exclusions.py``.
 """
@@ -1369,3 +1374,275 @@ def test_a_partition_refused_at_upload_names_no_ledger_repair(tmp_path):
     assert message.startswith(f"S3 refused {rel}: ")
     assert "fourth cause" not in message
     assert message.endswith("Run the job again, and treat a repeat as rot")
+
+
+# -- 11. the heal (marketlake #838) ---------------------------------------------------
+
+QUARANTINE = "quarantine.jsonl"
+MASTER = "reference/security_master.parquet"
+
+
+def _ahead(client: FakeS3, rel: str) -> None:
+    """Leave the bucket's current version of ``rel`` ahead of its manifest entry.
+
+    That is what an upload stopped between this file's PUT and the manifest's leaves, here as
+    bytes the lake never held.
+    """
+    client.store(_key(rel), b"a version newer than the bucket's manifest entry\n")
+    client.calls.clear()
+
+
+def _heads(client: FakeS3) -> list[str]:
+    return [kwargs["Key"] for name, kwargs in client.calls if name == "head_object"]
+
+
+def test_an_upload_with_nothing_ahead_sends_only_the_heal_s_heads(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert client.puts() == []
+    # The manifest's own HEAD, then one per file outside the partition directories.
+    assert _heads(client) == [_key("manifest.jsonl"), _key(QUARANTINE), _key(MASTER)]
+    assert summary.healed == [] and summary.unhealed == []
+    # A matching HEAD counts nowhere, so the line reads as it did before the heal.
+    assert summary.skipped == 2
+    assert summary.render().endswith("skipped 2 already in the bucket: s3://lake-backup/lake")
+
+
+def test_the_heal_puts_the_lake_s_copy_back_and_the_scrub_comes_back_clean(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    assert bucket.bucket_scrub(lake, TARGET, client).sha_mismatches == (QUARANTINE,)
+    client.calls.clear()
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert client.put_keys() == [_key(QUARANTINE)]
+    digest = hashlib.sha256((lake / QUARANTINE).read_bytes()).digest()
+    assert client.puts()[0]["ChecksumSHA256"] == base64.b64encode(digest).decode()
+    assert client.body(_key(QUARANTINE)) == (lake / QUARANTINE).read_bytes()
+    assert summary.healed == [QUARANTINE]
+    assert summary.uploaded == [QUARANTINE]
+    assert summary.puts == 1
+    assert summary.put_bytes == (lake / QUARANTINE).stat().st_size
+    line = summary.render()
+    assert "\n" not in line
+    assert ", put back 1 file(s) whose bucket version did not match the bucket's " in line
+    assert f"({QUARANTINE}): s3://lake-backup/lake" in line
+    result = bucket.bucket_scrub(lake, TARGET, client)
+    assert result.sha_mismatches == () and result.ok
+
+
+def test_the_heal_runs_before_the_pending_files_so_a_deadline_cannot_cut_it_off(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    pending = _seal_another_day(lake)
+    clock = _clock()
+    # The heal's PUT takes the whole budget, so the pending file's request is past it.
+    client.on_put = lambda kwargs, data: clock.advance(NIGHTLY_UPLOAD_BUDGET.total_seconds())
+
+    with pytest.raises(UploadDeadline):
+        nightly_upload(lake, TARGET, client=client, clock=clock, calendar=CALENDAR)
+
+    assert client.put_keys() == [_key(QUARANTINE)]
+    assert _key(pending) not in _heads(client)
+    result = bucket.bucket_scrub(lake, TARGET, client)
+    assert result.sha_mismatches == () and result.ok
+
+
+def test_the_heal_runs_on_a_night_the_manifest_did_not_move(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, MASTER)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert summary.healed == [MASTER]
+    assert client.put_keys() == [_key(MASTER)]
+
+
+def test_a_pending_file_is_left_to_the_pending_pass(tmp_path):
+    # The rewritten ledger is pending, so the heal never asks about it. It goes up once, under
+    # its new entry, through the pass that counts it.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    with (lake / QUARANTINE).open("a") as handle:
+        handle.write('{"partition": "chains/ticker=SPY/date=2026-08-25.parquet"}\n')
+    append_manifest(
+        lake,
+        partition=QUARANTINE,
+        source="battery",
+        sha256=sha256_file(lake / QUARANTINE),
+        rows=1,
+        fetched_at=None,
+    )
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _heads(client).count(_key(QUARANTINE)) == 1
+    assert summary.healed == []
+    assert summary.uploaded == [QUARANTINE, "manifest.jsonl"]
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "chains/ticker=SPY/date=2026-08-24.parquet",
+        "quotes/ticker=SPY/date=2026-08-24.parquet",
+    ],
+)
+def test_a_partition_ahead_of_its_entry_is_never_healed(tmp_path, rel):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, rel)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _key(rel) not in _heads(client)
+    assert client.puts() == []
+    assert summary.healed == []
+
+
+@pytest.mark.parametrize("top", ["bars", "journal"])
+def test_a_bars_partition_or_a_segment_ahead_of_its_entry_is_never_healed(tmp_path, top):
+    lake = _lake(tmp_path / "lake")
+    rel = (
+        "bars/ticker=SPY/freq=1d/date=2026-08-24.parquet"
+        if top == "bars"
+        else "journal/date=2026-08-31/surface=chains/ticker=SPY/seg-20260831T133000Z-1.arrows"
+    )
+    (lake / rel).parent.mkdir(parents=True, exist_ok=True)
+    (lake / rel).write_bytes(b"written once")
+    append_manifest(
+        lake, partition=rel, source="x", sha256=sha256_file(lake / rel), rows=1, fetched_at=None
+    )
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, rel)
+
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _key(rel) not in _heads(client)
+    assert client.puts() == []
+
+
+def test_a_manifested_file_the_backup_excludes_is_never_healed(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    rel = "reference/notes.tmp-41.parquet"
+    (lake / rel).write_bytes(b"a temp file someone recorded")
+    append_manifest(
+        lake, partition=rel, source="x", sha256=sha256_file(lake / rel), rows=1, fetched_at=None
+    )
+    client = FakeS3()
+    _seed(lake, client)
+
+    nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _key(rel) not in _heads(client)
+    assert client.puts() == []
+
+
+def _skipped(lake: Path, client: FakeS3) -> bucket.UploadSummary:
+    """The night after ``_ahead`` with a pending partition, which must still go up."""
+    pending = _seal_another_day(lake)
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+    assert client.put_keys() == [_key(pending), _key("manifest.jsonl")]
+    assert summary.healed == []
+    line = summary.render()
+    assert "\n" not in line
+    assert ", could not put back 1 file(s) whose bucket version does not match the " in line
+    return summary
+
+
+def test_a_rotted_local_copy_is_skipped_with_one_line_and_the_upload_goes_on(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    (lake / QUARANTINE).write_bytes(b"rotted on the lake's disk too\n")
+
+    summary = _skipped(lake, client)
+
+    ((rel, cause),) = summary.unhealed
+    assert rel == QUARANTINE
+    assert cause.startswith("its bytes no longer hash to its manifest entry, from rot or a write")
+    assert f"({QUARANTINE}, {cause}): s3://lake-backup/lake" in summary.render()
+
+
+def test_a_missing_local_copy_is_skipped_with_one_line_and_the_upload_goes_on(tmp_path):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    (lake / QUARANTINE).unlink()
+
+    assert _skipped(lake, client).unhealed == [(QUARANTINE, "missing from the lake")]
+
+
+def test_an_unreadable_local_copy_is_skipped_with_one_line_and_the_upload_goes_on(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes, so chmod cannot make the local failure")
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    (lake / QUARANTINE).chmod(0)
+    try:
+        summary = _skipped(lake, client)
+    finally:
+        (lake / QUARANTINE).chmod(0o644)
+
+    assert summary.unhealed == [(QUARANTINE, "unreadable, PermissionError")]
+
+
+def test_a_local_copy_past_the_put_limit_is_skipped_with_one_line(tmp_path, monkeypatch):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    monkeypatch.setattr(bucket, "MAX_PUT_BYTES", (lake / QUARANTINE).stat().st_size - 1)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert summary.unhealed == [(QUARANTINE, "past the single-PUT limit")]
+    assert client.puts() == []
+
+
+def test_a_local_copy_exactly_at_the_put_limit_is_healed(tmp_path, monkeypatch):
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    monkeypatch.setattr(bucket, "MAX_PUT_BYTES", (lake / QUARANTINE).stat().st_size)
+
+    summary = nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert summary.healed == [QUARANTINE]
+
+
+def test_a_diverged_bucket_copy_refuses_before_the_heal_sends_anything(tmp_path):
+    # Every refusal a moved bucket manifest raises fires before the heal, so the heal never
+    # runs against a manifest it has not proved a prefix.
+    lake = _lake(tmp_path / "lake")
+    client = FakeS3()
+    _seed(lake, client)
+    _ahead(client, QUARANTINE)
+    lines = client.body(_key("manifest.jsonl")).splitlines(keepends=True)
+    client.store(_key("manifest.jsonl"), b"".join(lines[1:]))
+    client.calls.clear()
+
+    with pytest.raises(WatermarkMissing):
+        nightly_upload(lake, TARGET, client=client, clock=_clock(), calendar=CALENDAR)
+
+    assert _key(QUARANTINE) not in _heads(client)
+    assert client.puts() == []
