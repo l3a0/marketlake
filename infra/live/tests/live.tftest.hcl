@@ -58,16 +58,16 @@ run "instance_s3_write_half_is_on_by_default" {
     condition = jsondecode(aws_iam_role_policy.instance_s3_read.policy).Statement == [
       {
         Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Action   = ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning"]
         Resource = "arn:aws:s3:::example-lake-backup"
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:GetObject"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "arn:aws:s3:::example-lake-backup/*"
       },
     ]
-    error_message = "marketlake-instance's read half is not exactly ListBucket and GetBucketVersioning on the bucket and GetObject on its objects."
+    error_message = "marketlake-instance's read half is not exactly ListBucket, ListBucketVersions and GetBucketVersioning on the bucket and GetObject and GetObjectVersion on its objects."
   }
 
   assert {
@@ -211,7 +211,7 @@ run "an_empty_bucket_name_fails_validation" {
 # Each policy is compared with its own literal rather than with the other, because
 # #638's cutover drops s3:PutObject from the backup role alone. The instance role's two
 # halves have their own runs above.
-run "backup_role_gets_the_four_actions" {
+run "backup_role_gets_the_six_actions" {
   command = plan
 
   variables {
@@ -222,16 +222,16 @@ run "backup_role_gets_the_four_actions" {
     condition = jsondecode(aws_iam_role_policy.backup.policy).Statement == [
       {
         Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Action   = ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning"]
         Resource = "arn:aws:s3:::example-lake-backup"
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:GetObject"]
+        Action   = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"]
         Resource = "arn:aws:s3:::example-lake-backup/*"
       },
     ]
-    error_message = "The marketlake-backup role's policy is not exactly the four actions src/lake/bucket.py needs."
+    error_message = "The marketlake-backup role's policy is not exactly the six actions src/lake/bucket.py needs."
   }
 
   # The apply role may write only the roles named marketlake-backup and
