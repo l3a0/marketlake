@@ -119,11 +119,14 @@ def _build(
     quotes: bool = False,
     bar_freqs: tuple[str, ...] = ("1d",),
     no_bar: tuple[tuple[str, date], ...] = (),
+    bars_only: tuple[str, ...] = (),
 ) -> FakeS3:
     """A lake of tiny chains partitions, each stored in the bucket, and a checkpoint.
 
     ``quotes`` adds a quotes partition beside each chains one, and a bar at each of
     ``bar_freqs`` for each ticker-day but those ``no_bar`` names, each also in the bucket.
+    ``bars_only`` names tickers that get bars at ``bar_freqs`` on each day and no chains or
+    quotes at all.
     """
     lake = FixtureLake(root)
     for day in days:
@@ -138,6 +141,9 @@ def _build(
             )
             if (ticker, day) in no_bar:
                 continue
+            for freq in bar_freqs:
+                lake.with_bars(ticker, freq, day, BAR)
+        for ticker in bars_only:
             for freq in bar_freqs:
                 lake.with_bars(ticker, freq, day, BAR)
     for rel in quarantine:
@@ -158,6 +164,10 @@ def _build(
                 if (ticker, day) not in no_bar:
                     rels.extend(_brel(ticker, freq, day) for freq in bar_freqs)
             for rel in rels:
+                client.store(TARGET.key(rel), (root / rel).read_bytes())
+        for ticker in bars_only:
+            for freq in bar_freqs:
+                rel = _brel(ticker, freq, day)
                 client.store(TARGET.key(rel), (root / rel).read_bytes())
     return client
 
@@ -665,6 +675,61 @@ def test_a_bars_directory_holds_only_itself(lake_root, monkeypatch):
     assert not any(rel.startswith("bars/ticker=QQQ/freq=1d/") for rel in result.trimmed)
     qqq_minute = [rel for rel in _expected_bars(tickers=("QQQ",)) if "freq=1m" in rel]
     assert [rel for rel in result.trimmed if rel.startswith("bars/ticker=QQQ/")] == qqq_minute
+
+
+def test_a_bar_whose_chain_was_lost_stays_for_the_restored_chain(lake_root):
+    """Mutation this catches: the chains clause reading disk alone. A chain manifested and gone
+    with no trim line was lost, and a chains range restore brings it back, so its bars stay for
+    ``settle.settlement_view`` to read beside it. SPY's cutoff keeps its chains, and one of them
+    is then lost by hand."""
+    client = _build(
+        lake_root, quotes=True, bar_freqs=BOTH_FREQS, cutoffs={"QQQ": EDGE, "SPY": date.min}
+    )
+    _trim(lake_root, client)
+    lost = SESSIONS[0]
+    (lake_root / _rel("SPY", lost)).unlink()
+
+    result = _trim(lake_root, client)
+
+    assert sorted(result.trimmed) == sorted(_expected_bars(tickers=("QQQ",)))
+    for freq in BOTH_FREQS:
+        rel = _brel("SPY", freq, lost)
+        assert (lake_root / rel).exists()
+        assert rel not in trimmed.latest_trimmed(lake_root)
+
+
+def test_a_bar_with_no_chain_in_the_manifest_goes_at_the_edge(lake_root):
+    """Mutation this catches: the chains clause keeping a bar whose chain was never in the
+    manifest. A ticker with bars and no chains has nothing for its bars to wait on, so they go
+    on the first run, at the window edge."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS, bars_only=("IWM",))
+
+    result = _trim(lake_root, client)
+
+    iwm = _expected_bars(tickers=("IWM",))
+    assert sorted(rel for rel in result.trimmed if rel.startswith("bars/")) == sorted(iwm)
+    assert not any((lake_root / rel).exists() for rel in iwm)
+
+
+def test_an_unsearchable_bars_ticker_directory_names_itself_in_the_repair(lake_root):
+    """A bars key sits one level below its ticker directory, so ``bars/ticker=SPY/`` can be the
+    directory at fault. Each held line's repair names that directory, recursively, rather than
+    only the frequency directory the key sits in, and the run goes on for QQQ."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS)
+    _trim(lake_root, client)
+    bars_dir = lake_root / "bars" / "ticker=SPY"
+    bars_dir.chmod(0o000)
+    try:
+        result = _trim(lake_root, client)
+    finally:
+        bars_dir.chmod(0o755)
+
+    assert result.stopped is None
+    assert sorted(result.trimmed) == sorted(_expected_bars(tickers=("QQQ",)))
+    assert len(result.held) == len(BOTH_FREQS)
+    for held in result.held:
+        assert "chown -R <lake owner> <lake_root>/bars/ticker=SPY and " in held
+        assert "chmod -R u+rwX <lake_root>/bars/ticker=SPY" in held
 
 
 # -- refusals before any partition -----------------------------------------------------------

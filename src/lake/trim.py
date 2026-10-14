@@ -340,6 +340,14 @@ def _ticker_repair(ticker_dir: str) -> str:
     )
 
 
+def _bars_ticker_repair(ticker_dir: str) -> str:
+    """The hand repair for a bars ticker directory, such as ``bars/ticker=SPY``, and below it."""
+    return (
+        f"Give the directory and its frequency directories back to the lake's owner, as in chown "
+        f"-R <lake owner> <lake_root>/{ticker_dir} and chmod -R u+rwX <lake_root>/{ticker_dir}"
+    )
+
+
 # -- the run -----------------------------------------------------------------------
 
 
@@ -509,18 +517,32 @@ def _daily_bar_rel(paths: LakePaths, ref: PartitionRef) -> str:
     return path.relative_to(paths.root).as_posix()
 
 
-def _chains_remain(paths: LakePaths, ref: BarsRef) -> bool:
-    """Whether the bar's ticker-day still has a chains partition on disk. Fails toward keeping.
+def _chains_remain(
+    paths: LakePaths,
+    ref: BarsRef,
+    latest: Mapping[str, Mapping],
+    trimmed_latest: Mapping[str, Mapping],
+) -> bool:
+    """Whether the bar's ticker-day has a chains partition or lost one. Fails toward keeping.
 
-    A check that raises answers yes, so the bar stays. It writes no line, because the chains
-    directory's own presence check meets the same fault and holds that directory with a line
-    naming the repair. Letting it raise would stop the whole run, and holding the bars directory
-    would print a repair for a directory that is not at fault.
+    A bar goes only once its chain is gone on purpose or never existed: absent from disk, and
+    either never in the manifest or a designed absence by ``trimmed.is_designed_absence``. A chain
+    that is manifested and absent with no trim line was lost, and a range restore will bring it
+    back, so its bars stay for that chain to be read beside.
+
+    A presence check that raises answers yes, so the bar stays. It writes no line, because the
+    chains directory's own presence check meets the same fault and holds that directory with a
+    line naming the repair. Letting it raise would stop the whole run, and holding the bars
+    directory would print a repair for a directory that is not at fault.
     """
+    chain = paths.chains_partition_path(ref.ticker, ref.day)
     try:
-        return _present(paths.chains_partition_path(ref.ticker, ref.day))
+        if _present(chain):
+            return True
     except OSError:
         return True
+    rel = chain.relative_to(paths.root).as_posix()
+    return rel in latest and not trimmed.is_designed_absence(rel, latest, trimmed_latest)
 
 
 def _select(
@@ -599,10 +621,10 @@ def _select(
             # The bars census reads a quotes day only while its daily bar has not landed, so
             # a quotes day goes only once that bar is in the manifest (marketlake #794).
             kept_by = "no daily bar has landed for its day"
-        elif isinstance(ref, BarsRef) and _chains_remain(paths, ref):
+        elif isinstance(ref, BarsRef) and _chains_remain(paths, ref, latest, trimmed_latest):
             # The settlement and continuity views read a day's bars beside its chains, and the
             # checkpoint cutoff can keep chains past the edge, so a bar waits for its chains.
-            kept_by = "its day's chains partition is still on disk"
+            kept_by = "its day's chains partition is still on disk or was lost"
         elif is_quarantined(quarantine.get(rel)):
             kept_by = "withheld by the quarantine ledger"
         recovering = kind == trimmed.TRIM_KIND
@@ -629,7 +651,13 @@ def _unsearchable(rel: str, exc: OSError) -> str:
     ticker_dir = _ticker_dir(rel)
     code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
     if exc.errno in _TICKER_ERRNOS:
-        repair = _ticker_repair(ticker_dir)
+        # A bars key sits one level deeper, so the fault can be ``bars/ticker=T/`` rather than its
+        # frequency directory, and the repair names the ticker directory and everything under it.
+        repair = (
+            _ticker_repair(ticker_dir)
+            if parse_bars_rel(rel) is None
+            else _bars_ticker_repair(PurePosixPath(ticker_dir).parent.as_posix())
+        )
     else:
         repair = "Check the volume, and the next close+15 carries on"
     return f"{ticker_dir}/: {rel} could not be checked ({code}), so {ticker_dir}/ waits. {repair}"
