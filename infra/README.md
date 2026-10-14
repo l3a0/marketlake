@@ -1130,8 +1130,10 @@ aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --para
 ### Recover from a leaked `marketlake-command` key
 
 The laptop's one key reaches both roles, so a leaked key can write the token and read and
-overwrite objects in the bucket. Versioning keeps the copy each overwrite replaced, so the
-bucket's recovery is the version recovery by hand that `README.md` describes. The token
+overwrite objects in the bucket. It can also read every old version, since
+`marketlake-backup` holds `s3:GetObjectVersion` and `s3:ListBucketVersions`
+([#838](https://github.com/l3a0/marketlake/issues/838)). Versioning keeps the copy each overwrite replaced, so the bucket's recovery
+is the version recovery by hand that `README.md` describes. The token
 needs more. A put can change more than the value. It can move the parameter to the
 Advanced tier, attach a parameter policy, set an allowed pattern, or store a forged token
 that the VM's pull accepts. So recovery deletes the parameter whatever its listing shows,
@@ -1725,9 +1727,11 @@ after it have ended. Four facts hold for any restore onto the VM.
    volume. A failed render writes nothing. On a new instance that leaves no `config.yaml`,
    and the restore exits 2 on the missing file rather than falling back to a whole-lake
    restore. On a kept instance the restore reads the file the last good render wrote, which
-   sets the key too. The "When the lake is gone" steps in
-   [README.md](../README.md) say how to repair a refusal over the bucket's
-   `trimmed.jsonl`. A one-off whole-lake restore passes `--config` naming a copy of
+   sets the key too. A bucket `trimmed.jsonl` newer than its manifest entry, which an
+   upload stopped part-way leaves, is read from the version the entry names
+   ([#838](https://github.com/l3a0/marketlake/issues/838)). The "When the lake is gone" steps in [README.md](../README.md) say how
+   to repair a refusal over it, when no version matches or the bucket refused the lookup.
+   A one-off whole-lake restore passes `--config` naming a copy of
    `config.yaml` with the `lake_window_sessions` line deleted, not blanked, since a blank
    value refuses, and passes `--target` naming the bucket. The VM reaches the bucket
    through its instance profile, so the copy can hold placeholder values for the four

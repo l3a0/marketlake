@@ -188,8 +188,10 @@ files rewritten every night. `lake/trimmed.jsonl`, the ledger of partitions remo
 purpose, takes no rule, so the bucket keeps every version of it, the same as `lake/reference/`.
 Partitions keep every version, because with no Object Lock an overwritten
 partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
-which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` and
-`s3:GetBucketVersioning`, and nothing that deletes a version or changes the bucket.
+which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:GetObjectVersion`, `s3:ListBucket`,
+`s3:ListBucketVersions` and `s3:GetBucketVersioning`, and nothing that deletes a version or
+changes the bucket. The two version actions let a restore read the older version a stopped
+upload leaves under a newer one ([#838](https://github.com/l3a0/marketlake/issues/838)).
 
 The laptop holds one AWS key, the IAM user `marketlake-command`'s, which can do nothing but
 assume two roles: `marketlake-backup` for the bucket, and `marketlake-token-writer` for the
@@ -252,9 +254,10 @@ instance profile, an IAM role attached to the instance, so no long-lived key sit
 two steps change as follows.
 
 1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
-   profile `marketlake-instance`, whose S3 policies carry the same four actions as the
-   laptop's role, split in two. The read half, `s3:ListBucket`, `s3:GetBucketVersioning`
-   and `s3:GetObject`, is always on, so a restore runs on the VM with no stored key. The
+   profile `marketlake-instance`, whose S3 policies carry the same six actions as the
+   laptop's role, split in two. The read half, `s3:ListBucket`, `s3:ListBucketVersions`,
+   `s3:GetBucketVersioning`, `s3:GetObject` and `s3:GetObjectVersion`, is always on, so a
+   restore runs on the VM with no stored key. The
    write half, `s3:PutObject` alone, is for a primary VM. The cutover turns it on as the
    VM becomes primary, and a shadow VM holds no write credential to the primary's bucket
    ([#686](https://github.com/l3a0/marketlake/issues/686)). The VM also requires
@@ -281,7 +284,9 @@ two steps change as follows.
    a switch, since replacing the copy would drop them from the bucket's record. After a
    switch, `resync`, command 5 below, brings the lake level instead. Run `live-check` in the
    same order, after the IAM role's write half is turned on, since the check writes probe
-   objects.
+   objects. Run it again after the `infra` apply that grants `s3:ListBucketVersions` and
+   `s3:GetObjectVersion` ([#838](https://github.com/l3a0/marketlake/issues/838)), since
+   before that apply it fails lines 3, 8 and 9.
 
 The client asks the instance metadata service for credentials only when `config.yaml`
 says `bucket_credentials: instance_profile`. It then takes them from that service alone,
@@ -304,14 +309,21 @@ A command run by hand is not a unit the stop can see.
 1. `uv run python -m lake.bucket live-check --target s3://example-lake-backup/live-check`
    confirms the four S3 behaviors the design rests on, and is live check 8 in the build
    plan. It writes three probe objects and names the prefix to delete by hand, since the
-   bucket's credentials cannot delete. They also cannot read an old version, so behavior
-   3's read-back of the first version fails with them, and the check says to confirm in
-   the console that the probe key shows two versions. Three more lines prove the read
-   grants the scrub and the restore need: a `ListObjectsV2` under the probe's prefix,
-   `GetBucketVersioning`, and a plain `GetObject` of the probe, which has to name the
-   current version's `VersionId` as well as return its bytes, because the trim records that
-   id. So one run covers all four of the role's S3 actions, even while `backup_target` is
-   still a path.
+   bucket's credentials cannot delete. Behavior 3 reads the first version back by its
+   `VersionId`. Five more lines prove the read grants the scrub and the restores need.
+
+   1. Line 5, a `ListObjectsV2` under the probe's prefix.
+   2. Line 6, `GetBucketVersioning`.
+   3. Line 7, a plain `GetObject` of the probe, which has to name the current version's
+      `VersionId` as well as return its bytes, because the trim records that id.
+   4. Line 8, a `ListObjectVersions` that lists both of the probe's versions, the second as
+      latest.
+   5. Line 9, a `HeadObject` of the first version that returns the probe's SHA-256.
+
+   Lines 8 and 9, and behavior 3's read, are the calls a restore sends to take an older
+   version ([#838](https://github.com/l3a0/marketlake/issues/838)). So one run covers all
+   six of the role's S3 actions, even while `backup_target` is still a path.
+
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
    an evening after the 18:30 sweep, once the evening upload that follows it has
@@ -333,10 +345,16 @@ A command run by hand is not a unit the stop can see.
    is in the lake's own `manifest.jsonl`, the fix is to repair that line, not the resync.
    `networkQuality -s`, built into macOS, measures upload capacity beforehand.
 3. `uv run python -m lake.bucket restore <dest> --target s3://example-lake-backup/lake`
-   downloads the current version of every object into `<dest>`, less what the next
-   sentences leave out. `<dest>` must be empty or not exist yet, and the restore verifies
-   each file before it fills `<dest>`. A file the manifest records must match its latest
-   entry, and any other file must match the SHA-256 S3 stored when it was uploaded. A
+   downloads every object into `<dest>`, less what the next sentences leave out. `<dest>`
+   must be empty or not exist yet, and the restore verifies each file before it fills
+   `<dest>`. A file the manifest records must match its latest entry. When its current
+   version does not, which a nightly upload stopped part-way leaves, the restore takes the
+   older version that matches and prints one line naming it
+   ([#838](https://github.com/l3a0/marketlake/issues/838)). The primary's next nightly
+   upload then puts that version's bytes back as the current one. When the
+   bucket refuses that lookup, because the role lacks `s3:ListBucketVersions` or
+   `s3:GetObjectVersion`, the file fails as before and one more line names the two grants.
+   Any other file must match the SHA-256 S3 stored when it was uploaded. A
    journal segment whose day the manifest records as compacted stays out, so the restore
    brings back no segment the lake already compacted. On a host whose config sets no
    `lake_window_sessions`, such as the laptop, the restored lake holds every file the
@@ -377,9 +395,9 @@ A command run by hand is not a unit the stop can see.
    free. On the hosted VM it also names the fix: raise `lake_volume_gib`, apply, and rerun
    the bootstrap, as [infra/README.md](infra/README.md) says. On a host that keeps a
    window, the restore also refuses with exit 2, before any data file downloads, when the
-   bucket's manifest records a `trimmed.jsonl` the bucket lacks, or one that is damaged or
-   does not match the manifest's entry. A bucket whose manifest records no `trimmed.jsonl`
-   does not refuse. Two keys that differ only by case are named as failures, because on
+   bucket's manifest records a `trimmed.jsonl` the bucket lacks, one that is damaged, or one
+   with no version that matches the manifest's entry. A bucket whose manifest records no
+   `trimmed.jsonl` does not refuse. Two keys that differ only by case are named as failures, because on
    macOS one would overwrite the other. A year-end lake is about 154 GB. `<dest>` may be a
    volume's mount point, which is how a new host's empty `lake_root` is seeded. This
    restore uploads nothing and takes no lock, which is why a shadow host may run it.
@@ -430,11 +448,13 @@ A command run by hand is not a unit the stop can see.
    that is not a whole entry, other than a torn last line, and names that line for a repair
    by hand. A damaged line among the shared entries refuses nothing, since both copies hold
    it. It also refuses when the two copies differ only by a hand repair, which
-   `first-upload` is for, when they share no whole line, since the rewrite would empty this
-   lake's `manifest.jsonl` before writing the bucket's, and when the bucket's current
+   `first-upload` is for, and when they share no whole line, since the rewrite would empty
+   this lake's `manifest.jsonl` before writing the bucket's. When the bucket's current
    version of a file is newer than its `manifest.jsonl` names, which the other host's
-   unfinished upload leaves. A bucket `trimmed.jsonl` newer than its manifest entry refuses
-   with the same cause. It refuses, too, when this lake holds a file the bucket's copy would
+   unfinished upload leaves, the resync takes the older version the entry names and prints a
+   warning naming it. It refuses there only when no version matches or the bucket refuses
+   that lookup. A bucket `trimmed.jsonl` newer than its manifest entry is read the same way.
+   It refuses, too, when this lake holds a file the bucket's copy would
    lose or leave unrecorded. That covers a chains or quotes partition or a journal segment
    the bucket does not hold, and any other file only this lake's own entries name, whatever
    bytes it holds now, except the covered segments and `bars/` partitions it deletes. It
@@ -474,13 +494,15 @@ A command run by hand is not a unit the stop can see.
    filesystem, which on the laptop every directory is, it must leave the journal reserve
    free. On any other filesystem it must leave 1 GB free, so a read on the VM's root volume
    keeps room for `token.json` and the other files a session writes there.
-   A file that fails is named with what it is to the range, `<dir>` holds no reading set, and
-   the command exits 1. A file that does not match its SHA-256 means either an upload is
-   running or stopped part-way, so run it again after the next complete nightly upload, or
-   the bucket's current version is damaged. When the bucket holds an earlier good version,
-   the "When the lake is gone" steps below put it into `<dir>/.marketlake-restoring` with no
-   write to the bucket. A partition the trim removed usually has a single bucket version,
-   so it has none to recover.
+   A file whose current version is newer than its entry, which an upload running or stopped
+   part-way leaves, is taken from the older version that matches. A file that fails is named
+   with what it is to the range, `<dir>` holds no reading set, and the command exits 1. A
+   file that still does not match its SHA-256 adds one line for its cause. When the bucket
+   refused the lookup, the "When the lake is gone" steps below put the matching version into
+   `<dir>/.marketlake-restoring` with no write to the bucket. When no version matches, copy
+   a file that hashes to its entry from outside the bucket, such as the other host's. A
+   partition the trim removed usually has a single bucket version, so it has none to
+   recover.
    A reading set is as current as the last complete nightly upload, so a quarantine verdict
    written after that upload does not reach `<dir>`. The directory is for reading only. Its
    `manifest.jsonl` names partitions it does not hold, so never make it a daemon's or a
@@ -531,8 +553,9 @@ present beside its trim line, and the scrub passes. A partition the VM both seal
 trimmed while it was the primary is not downloaded, since the bucket's trimmed ledger
 explains its absence. The key stays unset either way, for the reason above.
 
-The restore brings back current versions only, so a file that fails it is repaired by
-hand. Which repair fits depends on whether the lake still holds a good copy.
+The restore takes the version a file's manifest entry names, current or older, so a file
+that still fails it has no version that matches, or the bucket refused the lookup. Either
+is repaired by hand. Which repair fits depends on whether the lake still holds a good copy.
 
 While the lake is alive and still holds the file, the repair is the lake's own copy. A
 partition the VM's trim removed has no lake copy. Its single bucket version is its only
@@ -547,27 +570,31 @@ credentials, as a single PUT carrying its SHA-256:
 aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256
 ```
 
-When the lake is gone, an earlier version is recovered by hand in the S3 console. That
-works only for a file the manifest records whose later version overwrote a good one,
-such as a nightly file rewritten or a partition recompacted. The bucket's credentials hold
-no `s3:GetObjectVersion`, so this is a console step.
+When the lake is gone, a file the manifest records that the restore still fails gets its copy
+from one of two places, chosen by the line the failure printed.
 
-1. Open the bucket, turn on **Show versions**, and go to the file's key under the lake's
-   prefix.
-2. Pick the latest version uploaded before the damage, and download it.
-3. Check `shasum -a 256` of the download against the file's latest entry in
-   `<dest>/.marketlake-restoring/manifest.jsonl`, which a failed restore leaves there.
-4. Put the download at the file's path under `<dest>/.marketlake-restoring` and run the
-   restore again. It finds the manifest's hash there and does not download the damaged
-   current version. A file the manifest does not record is checked against the current
-   version's stored checksum instead, so an earlier version of one never verifies.
+1. **The bucket refused the lookup.** The role lacks `s3:ListBucketVersions` or
+   `s3:GetObjectVersion`, which the `infra` apply grants. The owner's admin session can still
+   read the version in the S3 console: open the bucket, turn on **Show versions**, go to the
+   file's key under the lake's prefix, and download the latest version uploaded before the
+   damage.
+2. **No version matches.** The console shows the same versions the lookup saw, so the copy
+   has to come from outside the bucket, such as the other host's file when it hashes right.
+   The usual cause is a `quarantine.jsonl` or actions ledger version past its 30 days.
+
+Then check `shasum -a 256` of the copy against the file's latest entry in
+`<dest>/.marketlake-restoring/manifest.jsonl`, which a failed restore leaves there. Put the
+copy at the file's path under `<dest>/.marketlake-restoring` and run the restore again. It
+finds the manifest's hash there and downloads nothing for that file. A file the manifest does
+not record is checked against the current version's stored checksum instead, so an earlier
+version of one never verifies.
 
 On a host that keeps a window, the restore reads the bucket's `trimmed.jsonl` before any data
-file, and the same repair covers it. A nightly upload stopped between the ledger's PUT and the
-manifest's leaves the ledger newer than the bucket manifest's entry. The restore then refuses,
-names the entry's SHA-256, and leaves `<dest>/.marketlake-restoring` holding the bucket's
-`manifest.jsonl`. Recover the version with that SHA-256 by steps 1 to 3 and put it at
-`<dest>/.marketlake-restoring/trimmed.jsonl`. The next run reads it there and sends no
+file, and takes the older version when a stopped upload left the current one newer than its
+entry. When no version matches, or the bucket refused the lookup, the restore refuses, names
+the entry's SHA-256, and leaves `<dest>/.marketlake-restoring` holding the bucket's
+`manifest.jsonl`. Get a copy with that SHA-256 from the place its line names, check it, and put
+it at `<dest>/.marketlake-restoring/trimmed.jsonl`. The next run reads it there and sends no
 request for the bucket's copy. When the bucket holds no current `trimmed.jsonl` at all, put
 the matching version back as the current one, as the next procedure describes, checking the
 download against the SHA-256 the refusal names.
