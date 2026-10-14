@@ -1,10 +1,11 @@
 """Lake paths, built from values alone, and read back apart the same way.
 
-The builders match the fixture-lake builder exactly. The three parsers invert them.
+The builders match the fixture-lake builder exactly. The four parsers invert them.
 ``parse_segment_rel`` takes a journal segment path apart, ``parse_partition_rel`` takes a
-sealed date-partitioned partition path apart, and ``parse_date_dir`` reads the ``date=``
-key a partition path carries. All three are pure functions over strings, so every test
-here decides from values alone and the tier is unit.
+sealed date-partitioned partition path apart, ``parse_bars_rel`` takes a bars partition path
+apart, and ``parse_date_dir`` reads the ``date=`` key a partition path carries. All four are
+pure functions over strings, so every test here decides from values alone and the tier is
+unit.
 """
 
 from __future__ import annotations
@@ -33,11 +34,13 @@ from lake.paths import (
     SURFACES,
     TICKERS_FILE,
     TOKEN_FILE,
+    BarsRef,
     LakePaths,
     PartitionRef,
     SegmentRef,
     config_dir,
     default_token_path,
+    parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
     parse_segment_rel,
@@ -293,6 +296,76 @@ def test_a_built_partition_path_parses_back_to_the_parts_it_was_built_from(paths
 )
 def test_a_malformed_partition_path_parses_to_none(rel: str):
     assert parse_partition_rel(rel) is None
+
+
+def test_a_well_formed_bars_path_splits_into_its_three_parts():
+    ref = parse_bars_rel("bars/ticker=SPY/freq=1d/date=2026-09-14.parquet")
+    assert ref == BarsRef(ticker="SPY", freq="1d", day=date(2026, 9, 14))
+    # It answers which surface it names the way a ``PartitionRef`` does, so the trim and the
+    # range restore read either kind of ref through one attribute.
+    assert ref.surface == BARS
+
+
+@pytest.mark.parametrize("freq", ["1m", "1d"])
+def test_a_built_bars_path_parses_back_to_the_parts_it_was_built_from(paths: LakePaths, freq):
+    """Marketlake #795. The trim and the range restore select bars through this parser, and
+    each passes over a key it cannot read, so a parser that drifted from its builder would
+    trim and restore no bar at all rather than fail."""
+    built = paths.bars_partition_path("BRK.B", freq, DAY)
+    ref = parse_bars_rel(built.relative_to(ROOT).as_posix())
+    assert ref == BarsRef(ticker="BRK.B", freq=freq, day=DAY)
+    assert paths.bars_partition_path(ref.ticker, ref.freq, ref.day) == built
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        # The part count is exact. Three parts is the flat shape, five is one long.
+        "bars/ticker=SPY/date=2026-09-14.parquet",
+        "bars/ticker=SPY/freq=1d/extra/date=2026-09-14.parquet",
+        # Only ``bars`` takes this shape.
+        "chains/ticker=SPY/freq=1d/date=2026-09-14.parquet",
+        "quotes/ticker=SPY/date=2026-09-14.parquet",
+        # A frequency no vendor call fetches is never written, so it is not a bars partition.
+        "bars/ticker=SPY/freq=5m/date=2026-09-14.parquet",
+        "bars/ticker=SPY/freq=/date=2026-09-14.parquet",
+        # Each key is matched as a literal prefix.
+        "bars/SPY/freq=1d/date=2026-09-14.parquet",
+        "bars/ticker=SPY/1d/date=2026-09-14.parquet",
+        "bars/ticker=SPY/frequency=1d/date=2026-09-14.parquet",
+        # A wrong key of the prefix's own length, so a parser slicing by length alone would
+        # read ``1d`` out of it.
+        "bars/ticker=SPY/frex=1d/date=2026-09-14.parquet",
+        # An empty ticker is not a ticker.
+        "bars/ticker=/freq=1d/date=2026-09-14.parquet",
+        # The date is read by ``parse_date_dir``, so the same strictness applies.
+        "bars/ticker=SPY/freq=1d/date=20260914.parquet",
+        "bars/ticker=SPY/freq=1d/date=2026-09-14.parquet.tmp-1",
+        "bars/ticker=SPY/freq=1d/2026-09-14.parquet",
+        # The suffix is matched too.
+        "bars/ticker=SPY/freq=1d/date=2026-09-14.arrows",
+    ],
+)
+def test_a_malformed_bars_path_parses_to_none(rel: str):
+    assert parse_bars_rel(rel) is None
+
+
+def test_the_bars_parser_takes_exactly_the_frequencies_the_vendor_fetches(paths: LakePaths):
+    """One set decides it. A bars key at any frequency in ``vendor.BAR_FREQS`` parses, so a
+    frequency added there is trimmed and restored with no second list to update."""
+    from lake.vendor import BAR_FREQS
+
+    assert BAR_FREQS
+    for freq in BAR_FREQS:
+        built = paths.bars_partition_path("SPY", freq, DAY).relative_to(ROOT).as_posix()
+        assert parse_bars_rel(built) == BarsRef(ticker="SPY", freq=freq, day=DAY)
+
+
+def test_a_bars_path_still_never_parses_as_a_date_partition(paths: LakePaths):
+    # The bars parser is separate so this stays true. Readers of ``parse_partition_rel``,
+    # such as ``actions.surface_ticker_days``, rely on it answering None for a bars key.
+    built = paths.bars_partition_path("SPY", "1d", DAY).relative_to(ROOT).as_posix()
+    assert parse_partition_rel(built) is None
 
 
 def test_a_journal_segment_never_parses_as_a_partition():

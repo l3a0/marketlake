@@ -805,7 +805,8 @@ def test_the_real_trim_feeds_the_rebuild_and_a_whole_restore_brings_it_back(lake
 
 def test_the_real_trim_of_quotes_feeds_the_rebuild(lake_root, tmp_path):
     """Marketlake #794. The rebuild leaves out each quotes day the trim removed, as it does for
-    chains, and keeps the daily bars the trim judged by."""
+    chains. It keeps every bar, because this one run met each bar's chains on disk, and since
+    marketlake #795 a bar is trimmed only on a run after its chains are gone."""
     tickers = ("QQQ", "SPY")
     client = _lake(lake_root, tickers=tickers, quotes=True)
     result = _job(lake_root, client, [])
@@ -828,3 +829,37 @@ def test_the_real_trim_of_quotes_feeds_the_rebuild(lake_root, tmp_path):
     assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
     assert _chains_files(tmp_path / "windowed", "quotes") == kept
     assert _chains_files(tmp_path / "windowed", "bars") == _chains_files(lake_root, "bars")
+
+
+def test_the_real_trim_of_bars_feeds_the_rebuild(lake_root, tmp_path):
+    """Marketlake #795. The first compaction trims the old chains and quotes and keeps their
+    days' bars, since it met those chains on disk. The next run trims the bars, and the rebuild
+    leaves them out as it does the chains, while the bar of a day inside the window comes
+    back."""
+    tickers = ("QQQ", "SPY")
+    client = _lake(lake_root, tickers=tickers, quotes=True)
+    bars = {
+        f"bars/ticker={ticker}/freq=1d/date={day.isoformat()}.parquet"
+        for ticker in tickers
+        for day in OLD
+    }
+    first = _job(lake_root, client, [])
+    assert first.trim is not None and not bars & set(first.trim.trimmed)
+    second = _job(lake_root, client, [], clock=ManualClock(_et(TONIGHT, 16, 45)))
+    assert second.trim is not None
+    assert set(second.trim.trimmed) == bars
+    with lake_lock(lake_root):
+        nightly_upload(
+            lake_root,
+            TARGET,
+            client=client,
+            clock=ManualClock(_et(TONIGHT, 19, 0)),
+            calendar=CALENDAR,
+        )
+    kept = _chains_files(lake_root, "bars")
+    assert kept and not bars & set(kept)
+    windowed = restore_lake(
+        tmp_path / "windowed", TARGET, client=client, skip_designed_absences=True
+    )
+    assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
+    assert _chains_files(tmp_path / "windowed", "bars") == kept

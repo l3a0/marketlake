@@ -7,17 +7,20 @@ and restores the whole lake from the bucket, which is the laptop today. Besides 
 ``lake.vm_config``, which checks it, three jobs act on it.
 
 1. The 18:30 sweep writes the split checkpoint, which marketlake #786 added with the key.
-2. The trim removes what falls outside the window: chains since marketlake #787, and quotes
-   under a landed daily bar since marketlake #794.
+2. The trim removes what falls outside the window: chains since marketlake #787, quotes
+   under a landed daily bar since marketlake #794, and bars once their day's chains are gone
+   since marketlake #795.
 3. ``lake.bucket``'s restore rebuilds the trimmed lake rather than the whole one, leaving out
    each partition the bucket's ``trimmed.jsonl`` says was removed on purpose (marketlake
    #785).
 
 The key is named for the lake rather than for chains. The owner decided on 2026-10-07
 (decision 9 on #755) that every dated surface is trimmed at one snapshot cutoff, and
-marketlake #794 reuses this key for ``quotes/``. A quotes day goes only under a landed daily
-bar, so a day whose bar never lands outlives the cutoff for good. The quotes readers need no
-more history than the chains readers, so the floor below serves both.
+marketlake #794 reuses this key for ``quotes/`` and marketlake #795 for ``bars/``. A quotes
+day goes only under a landed daily bar, so a day whose bar never lands outlives the cutoff for
+good. A bar goes only once its day's chains are gone, so it never leaves before the chains it
+is read beside. The quotes and bars readers need no more history than the chains readers, so
+the floor below serves all three.
 
 **Loading never judges the value.** ``config.load_config`` runs every capture cycle, so a
 refusal there would stop capture on a typo. Loading stores an integer as read and any other

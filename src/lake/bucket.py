@@ -28,9 +28,9 @@ Seven jobs live here.
    leaves out each partition the bucket's ``trimmed.jsonl`` says was removed on purpose
    (marketlake #785). Elsewhere it restores the whole lake.
 5. **The range restore**, ``python -m lake.bucket restore-range``, is run by hand. It puts
-   chosen chains or quotes partitions back into the live lake, verified against the lake's
-   own manifest, for a partition lost by accident or a rollback of trimming (marketlake
-   #784). While the host's config sets ``lake_window_sessions``, a rollback lasts only until
+   chosen chains, quotes or bars partitions back into the live lake, verified against the
+   lake's own manifest, for a partition lost by accident or a rollback of trimming (marketlake
+   #784, #795). While the host's config sets ``lake_window_sessions``, a rollback lasts only until
    the trim runs with a split checkpoint from a session after the restore's day, which drops
    each restored partition outside the window again. A lasting rollback also removes the key.
 6. **The resync**, ``python -m lake.bucket resync``, is run by hand on a host about to
@@ -74,9 +74,9 @@ directory, and refuses one inside ``lake_root``. The range restore writes only p
 lake's own manifest already records, a restore line in the trimmed ledger, and that
 ledger's manifest entry, which are what any lake writer leaves, so switching back to a path
 stays free. The resync leaves the lake's files and its ``manifest.jsonl`` as the bucket's
-copy records them. The trim that deletes old chains and quotes partitions lives in ``lake.trim``
-for that reason (marketlake #787, #794), and ``current_digest``, the read it checks a partition's
-bucket copy with, writes nothing.
+copy records them. The trim that deletes old chains, quotes and bars partitions lives in
+``lake.trim`` for that reason (marketlake #787, #794, #795), and ``current_digest``, the read
+it checks a partition's bucket copy with, writes nothing.
 
 **The client is built from ``config.yaml`` alone, with one exception.** On the
 instance-profile path its credentials come from the EC2 instance metadata service, and
@@ -181,6 +181,7 @@ from lake.manifest import (
 from lake.paths import (
     ACTIONS,
     ALERTS_DIR,
+    BARS,
     CHAINS,
     CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
@@ -188,12 +189,15 @@ from lake.paths import (
     LOST_AND_FOUND,
     MANIFEST_FILE,
     QUARANTINE_FILE,
+    QUOTES,
     REFERENCE_DIR,
     REPORTS_DIR,
     TEMP_MARKER,
     TRIMMED_FILE,
+    BarsRef,
     LakePaths,
     PartitionRef,
+    parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
     temp_write_path,
@@ -2962,11 +2966,11 @@ def _needed_bytes(work: Path, raw: bytes, plan: Iterable[str], listing: Mapping[
 
 # -- the range restore --------------------------------------------------------
 #
-# ``python -m lake.bucket restore-range`` puts chosen chains or quotes partitions back into the
-# live lake: a partition lost by accident, or every partition trimmed on purpose when the lake
-# rolls back to keeping everything (marketlake #784, #755). The ``restore`` command above stays
-# off a live lake on purpose. This one writes into it, so it keeps the rules every lake writer
-# keeps, and the design's Backup section carries the reasoning.
+# ``python -m lake.bucket restore-range`` puts chosen chains, quotes or bars partitions back into
+# the live lake: a partition lost by accident, or every partition trimmed on purpose when the
+# lake rolls back to keeping everything (marketlake #784, #755, #795). The ``restore`` command
+# above stays off a live lake on purpose. This one writes into it, so it keeps the rules every
+# lake writer keeps, and the design's Backup section carries the reasoning.
 
 # The writer the trimmed ledger's manifest entry names when the range restore records it.
 RANGE_RESTORE_SOURCE = "range-restore"
@@ -2996,13 +3000,29 @@ def _range_scope(surface: object, ticker: object, first: object, last: object) -
     )
 
 
-def _surface_refusal(surface: str, command: str) -> str | None:
-    """Why ``command`` refuses ``surface``, or ``None`` for a surface it takes."""
-    if surface in DATE_PARTITIONED:
+# The surfaces the range restore puts back into the live lake. Bars joined chains and quotes
+# when the trim began taking them (marketlake #795), since a trimmed partition with no live
+# restore has no undo. The reading restore takes ``paths.DATE_PARTITIONED`` alone, because
+# a range's bars come along with it there.
+RANGE_SURFACES = frozenset({CHAINS, QUOTES, BARS})
+
+
+def _surface_words(accepted: frozenset[str]) -> str:
+    """Two or more surfaces as a list a person reads, such as ``bars, chains or quotes``.
+
+    ``' or '.join`` would print ``bars or chains or quotes`` once the list holds three.
+    """
+    names = sorted(accepted)
+    return f"{', '.join(names[:-1])} or {names[-1]}"
+
+
+def _surface_refusal(surface: str, command: str, accepted: frozenset[str]) -> str | None:
+    """Why ``command`` refuses ``surface``, or ``None`` for a surface in ``accepted``."""
+    if surface in accepted:
         return None
     return (
-        f"{command} takes {' or '.join(sorted(DATE_PARTITIONED))} partitions, not "
-        f"{surface!r}, so nothing was restored. Restore any other file by hand from the bucket"
+        f"{command} takes {_surface_words(accepted)} partitions, not {surface!r}, so nothing "
+        "was restored. Restore any other file by hand from the bucket"
     )
 
 
@@ -3018,13 +3038,16 @@ def _reversed_refusal(first: date, last: date) -> str | None:
 
 def _in_range(
     rel: str, *, surface: str, ticker: str | None, first: date, last: date
-) -> PartitionRef | None:
+) -> PartitionRef | BarsRef | None:
     """The partition ``rel`` names when the range selects it, and ``None`` otherwise.
 
     The range is every path ``paths.parse_partition_rel`` reads as ``surface``, for ``ticker``
-    or for every ticker when it is ``None``, dated ``first`` to ``last`` inclusive.
+    or for every ticker when it is ``None``, dated ``first`` to ``last`` inclusive. On
+    ``bars`` it is every path ``paths.parse_bars_rel`` reads, at both frequencies.
     """
-    ref = parse_partition_rel(rel)
+    ref: PartitionRef | BarsRef | None = (
+        parse_bars_rel(rel) if surface == BARS else parse_partition_rel(rel)
+    )
     if (
         ref is not None
         and ref.surface == surface
@@ -3120,16 +3143,17 @@ def restore_range(
 
     The selector is every latest manifest entry that ``paths.parse_partition_rel`` reads as
     ``surface``, for ``ticker`` or for every ticker when it is ``None``, dated ``first`` to
-    ``last`` inclusive. Each selected partition is either present with its manifest sha,
-    which is left as it is, or absent, which is downloaded. Both a partition trimmed on purpose
-    and one lost by accident are served. A restore line goes to ``trimmed.jsonl`` only when the
-    partition's latest trimmed line is a trim line, since a lost partition has nothing there to
-    supersede.
+    ``last`` inclusive. On ``bars`` it is what ``paths.parse_bars_rel`` reads, at both
+    frequencies, by :func:`_in_range`. Each selected partition is either present with its
+    manifest sha, which is left as it is, or absent, which is downloaded. Both a partition
+    trimmed on purpose and one lost by accident are served. A restore line goes to
+    ``trimmed.jsonl`` only when the partition's latest trimmed line is a trim line, since a lost
+    partition has nothing there to supersede.
 
     The steps, in order.
 
-    1. Refusals that need no lock: a surface other than ``chains`` or ``quotes``, a range that
-       ends before it starts, the Sunday scrub window, a ``now`` inside a session or its
+    1. Refusals that need no lock: a surface other than ``bars``, ``chains`` or ``quotes``, a
+       range that ends before it starts, the Sunday scrub window, a ``now`` inside a session or its
        pre-open margin by ``session_bound``, and a lake root holding no ``manifest.jsonl``,
        since ``lake_lock`` would create one under a wrong ``lake_root``.
     2. The repairs of what a crashed earlier run left. Under ``lake_lock``,
@@ -3227,7 +3251,8 @@ def restore_range(
             )
         return refuse(f"{rel}: {why}, so it was not restored. {recovery}")
 
-    wrong = _surface_refusal(surface, "the range restore") or _reversed_refusal(first, last)
+    wrong = _surface_refusal(surface, "the range restore", RANGE_SURFACES)
+    wrong = wrong or _reversed_refusal(first, last)
     if wrong is not None:
         raise refuse(wrong)
     guard()
@@ -3641,8 +3666,9 @@ def _reading_plan(
        sealed partition makes ``oi_view``'s gap answer ``absent``, as on the full lake.
     3. The bars of the same tickers on each calendar day in the range, at each frequency in
        ``vendor.BAR_FREQS``. Each key is built with ``LakePaths.bars_partition_path`` and kept
-       when the manifest records it, since ``paths`` has no parser for a bars key and
-       ``lake.bars`` decided that the manifested skip is built, never parsed.
+       when the manifest records it, the way ``lake.bars`` builds its manifested skip rather
+       than parsing it. ``paths.parse_bars_rel`` would select the same keys from the manifest,
+       but building them keeps this role to the tickers and days the range selected.
     4. ``actions/corporate_actions.jsonl`` and ``quarantine.jsonl``, and every file under
        ``reference/``: the security master, the capture spans, the schema-version ledger and
        the split checkpoint.
@@ -3740,7 +3766,8 @@ def restore_for_reading(
     written ``manifest.jsonl`` come from the bytes read once. Two runs into one destination
     at once are unsupported, as for ``restore``.
     """
-    wrong = _surface_refusal(surface, "the reading restore") or _reversed_refusal(first, last)
+    wrong = _surface_refusal(surface, "the reading restore", DATE_PARTITIONED)
+    wrong = wrong or _reversed_refusal(first, last)
     if wrong is not None:
         raise RestoreRefused(wrong)
     dest = Path(os.path.abspath(Path(dest).expanduser()))
@@ -5060,11 +5087,15 @@ def build_parser() -> argparse.ArgumentParser:
     ranged = sub.add_parser(
         "restore-range",
         help=(
-            "Put chosen chains or quotes partitions back into the live lake from the bucket, "
-            "for a lost partition or a rollback."
+            "Put chosen chains, quotes or bars partitions back into the live lake from the "
+            "bucket, for a lost partition or a rollback."
         ),
     )
-    ranged.add_argument("--surface", required=True, help="chains or quotes.")
+    ranged.add_argument(
+        "--surface",
+        required=True,
+        help="chains, quotes or bars. On bars it restores both frequencies, 1m and 1d.",
+    )
     ranged.add_argument("--ticker", help="One ticker. Every ticker when left out.")
     ranged.add_argument(
         "--from", dest="first", required=True, type=_day_arg, help="The first day, YYYY-MM-DD."

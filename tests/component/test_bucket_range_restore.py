@@ -1,9 +1,9 @@
 """The range restore, ``python -m lake.bucket restore-range``, against the fake S3 client.
 
-Marketlake #784. The command puts chosen chains or quotes partitions back into the live lake,
-for a partition trimmed on purpose or one lost by accident. Each test builds a lake, stores its
-partitions in the fake bucket the way the nightly upload would, removes some, and restores them.
-The cases follow the issue's Verification list.
+Marketlake #784 and #795. The command puts chosen chains, quotes or bars partitions back into
+the live lake, for a partition trimmed on purpose or one lost by accident. Each test builds a
+lake, stores its partitions in the fake bucket the way the nightly upload would, removes some, and
+restores them. The cases follow #784's Verification list, and the bars cases close the file.
 
 1. The commit's order: a crash after each step leaves a state the next run repairs, and never
    an absence nothing explains.
@@ -13,7 +13,7 @@ The cases follow the issue's Verification list.
 4. A lost partition comes back with no restore line.
 5. A leftover temp file is removed, and no ``.part`` file is ever left in the lake.
 6. The refusals: the Sunday window, a session, a present file that differs, a surface other
-   than chains or quotes, a lake walk that cannot read every path, and a shadow host.
+   than bars, chains or quotes, a lake walk that cannot read every path, and a shadow host.
 7. The reserve's arithmetic is in ``tests/unit/test_runway.py``. A component case here proves
    the command refuses on it.
 8. A bucket version that cannot serve the partition names the trim line's ``version_id``.
@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from lake import bucket, trimmed
@@ -65,6 +66,14 @@ SPY_2 = "chains/ticker=SPY/date=2026-08-25.parquet"
 SPY_3 = "chains/ticker=SPY/date=2026-08-26.parquet"
 QQQ_1 = "chains/ticker=QQQ/date=2026-08-24.parquet"
 QUOTES_1 = "quotes/ticker=SPY/date=2026-08-24.parquet"
+# The bars ``_lake(bars=True)`` adds: SPY at both frequencies on the first two days, and QQQ's
+# daily bar on the first.
+SPY_1M_1 = "bars/ticker=SPY/freq=1m/date=2026-08-24.parquet"
+SPY_1D_1 = "bars/ticker=SPY/freq=1d/date=2026-08-24.parquet"
+SPY_1M_2 = "bars/ticker=SPY/freq=1m/date=2026-08-25.parquet"
+SPY_1D_2 = "bars/ticker=SPY/freq=1d/date=2026-08-25.parquet"
+QQQ_1D_1 = "bars/ticker=QQQ/freq=1d/date=2026-08-24.parquet"
+BARS_RELS = (SPY_1M_1, SPY_1D_1, SPY_1M_2, SPY_1D_2, QQQ_1D_1)
 # A Monday evening after the sweep, a Sunday inside the scrub window, and a Monday inside the
 # session. The next session after the Monday evening opens on Tuesday.
 MONDAY_19 = datetime(2026, 8, 31, 19, 0, tzinfo=MARKET_TZ)
@@ -87,20 +96,36 @@ class Crash(Exception):
     """A process death injected between two steps. No branch of the command catches it."""
 
 
-def _lake(tmp_path: Path) -> tuple[Path, FakeS3, dict[str, bytes]]:
-    """A lake of five partitions, each stored in the fake bucket as the nightly upload would."""
-    root = (
+def _lake(tmp_path: Path, *, bars: bool = False) -> tuple[Path, FakeS3, dict[str, bytes]]:
+    """A lake of five partitions, each stored in the fake bucket as the nightly upload would.
+
+    ``bars`` adds the five bars partitions in ``BARS_RELS``, stored the same way.
+    """
+    lake = (
         FixtureLake(tmp_path / "lake")
         .with_chains("SPY", D1)
         .with_chains("SPY", D2)
         .with_chains("SPY", D3)
         .with_chains("QQQ", D1)
         .with_quotes("SPY", D1)
-        .build()
     )
+    rels: tuple[str, ...] = (SPY_1, SPY_2, SPY_3, QQQ_1, QUOTES_1)
+    if bars:
+        for ticker, freq, day, close in (
+            ("SPY", "1m", D1, 1.0),
+            ("SPY", "1d", D1, 2.0),
+            ("SPY", "1m", D2, 3.0),
+            ("SPY", "1d", D2, 4.0),
+            ("QQQ", "1d", D1, 5.0),
+        ):
+            # A distinct close per partition, so no two share bytes and a restore that put one
+            # partition's bytes at another's path would fail its comparison.
+            lake.with_bars(ticker, freq, day, pa.table({"close": [close]}))
+        rels += BARS_RELS
+    root = lake.build()
     client = FakeS3()
     originals: dict[str, bytes] = {}
-    for rel in (SPY_1, SPY_2, SPY_3, QQQ_1, QUOTES_1):
+    for rel in rels:
         data = (root / rel).read_bytes()
         originals[rel] = data
         client.store(TARGET.key(rel), data)
@@ -555,12 +580,13 @@ def test_a_present_file_that_differs_refuses_and_restores_nothing(tmp_path):
     assert not (root / SPY_1).exists()
 
 
-@pytest.mark.parametrize("surface", ["bars", "actions"])
+@pytest.mark.parametrize("surface", ["actions", "reference"])
 def test_a_surface_other_than_chains_or_quotes_refuses(tmp_path, surface):
-    """The refusal names the range restore, the two surfaces it takes, and the one given.
+    """The refusal names the range restore, the three surfaces it takes, and the one given.
 
     Catches the range restore refusing in the reading restore's words, since the two share
-    the refusal's text.
+    the refusal's text, and a list joined with "or" alone. Bars are restored since marketlake
+    #795, in the tests below.
     """
     root, client, _originals = _lake(tmp_path)
     client.calls.clear()
@@ -568,10 +594,68 @@ def test_a_surface_other_than_chains_or_quotes_refuses(tmp_path, surface):
     line = _refuses(root, client, surface=surface)
 
     assert line == (
-        f"the range restore takes chains or quotes partitions, not {surface!r}, so nothing was "
-        "restored. Restore any other file by hand from the bucket."
+        f"the range restore takes bars, chains or quotes partitions, not {surface!r}, so "
+        "nothing was restored. Restore any other file by hand from the bucket."
     )
     assert client.calls == []
+
+
+# -- bars, marketlake #795 ---------------------------------------------------------
+
+
+def test_trimmed_bars_of_both_frequencies_come_back_and_a_second_run_restores_nothing(tmp_path):
+    """Mutation this catches: ``_in_range`` reading bars through ``parse_partition_rel``, which
+    answers None for every bars key, so the range selects nothing and refuses. The trimmed
+    chains partition of the same day stays out, and so does QQQ's bar."""
+    root, client, originals = _lake(tmp_path, bars=True)
+    for rel in (SPY_1M_1, SPY_1D_1, SPY_1D_2, SPY_1, QQQ_1D_1):
+        _trim_away(root, client, rel)
+
+    summary = _run(root, client, surface="bars")
+
+    assert (summary.selected, summary.restored, summary.present) == (4, 3, 1)
+    assert summary.restore_lines == 3
+    for rel in (SPY_1M_1, SPY_1D_1, SPY_1D_2):
+        assert (root / rel).read_bytes() == originals[rel]
+        assert _kind(root, rel) == "restore"
+    assert not (root / SPY_1).exists() and _kind(root, SPY_1) == "trim"
+    assert not (root / QQQ_1D_1).exists() and _kind(root, QQQ_1D_1) == "trim"
+    assert _strays(root) == []
+
+    ledger = trimmed_path(root).read_bytes()
+    manifest = (root / "manifest.jsonl").read_bytes()
+    again = _run(root, client, surface="bars")
+
+    assert (again.selected, again.restored, again.present, again.restore_lines) == (4, 0, 4, 0)
+    assert trimmed_path(root).read_bytes() == ledger
+    assert (root / "manifest.jsonl").read_bytes() == manifest
+
+
+def test_a_bars_range_for_every_ticker_takes_each_tickers_bars_and_no_other_surface(tmp_path):
+    root, client, originals = _lake(tmp_path, bars=True)
+    for rel in (SPY_1D_1, QQQ_1D_1, QUOTES_1):
+        (root / rel).unlink()
+
+    summary = _run(root, client, surface="bars", ticker=None, last=D1)
+
+    assert (summary.selected, summary.restored) == (3, 2)
+    assert (root / SPY_1D_1).read_bytes() == originals[SPY_1D_1]
+    assert (root / QQQ_1D_1).read_bytes() == originals[QQQ_1D_1]
+    assert not (root / QUOTES_1).exists()
+
+
+def test_a_chains_range_leaves_its_days_bars_where_they_are(tmp_path):
+    """A chains restore does not take bars, which is why the rollback runbook runs the range
+    restore once for each surface."""
+    root, client, originals = _lake(tmp_path, bars=True)
+    _trim_away(root, client, SPY_1)
+    _trim_away(root, client, SPY_1D_1)
+
+    summary = _run(root, client, last=D1)
+
+    assert (summary.selected, summary.restored) == (1, 1)
+    assert (root / SPY_1).read_bytes() == originals[SPY_1]
+    assert not (root / SPY_1D_1).exists() and _kind(root, SPY_1D_1) == "trim"
 
 
 def test_a_selector_matching_nothing_refuses_rather_than_report_success(tmp_path):

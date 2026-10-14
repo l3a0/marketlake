@@ -900,6 +900,20 @@ def load_bars(
     This is the first door here that stitches, so it names ``promote_options='permissive'``,
     which unions by name. Unreachable at the one recorded version the live lake holds and
     reachable the first time a bars column is promoted.
+
+    **On a trimmed lake** (marketlake #795) a session the VM's trim removed drops out of a range
+    with no error, because the read lists sessions from disk, and a range the trim emptied
+    raises ``BarsAbsent``, the same answer as a range never fetched. The trim takes a bar only
+    once its day's chains partition is gone, so a bar never leaves before the chain it is read
+    beside. The ``'total'`` view needs the last ``1d`` close before each ex-date, so an ex-date on
+    the oldest session the lake keeps finds none and raises ``AdjustmentIncomplete``, as an
+    ex-date on the lake's first session does. A read with no ex-date at its oldest session is
+    unchanged. Nothing nightly calls this door. Reading a trimmed session means restoring it
+    into a directory outside the live lake, which ``python -m lake.bucket restore-for-reading``
+    does for a chains or quotes range, bringing that range's bars with it (marketlake #837).
+    That restore brings no ``1d`` bar from before an ex-date that falls after the range, so a
+    ``'total'`` view over it divides by the range's own last close where the live lake held a
+    later one. Marketlake #905 holds that limit.
     """
     if adjust not in ADJUSTMENTS:
         raise AdjustUnknown(f"adjust {adjust!r} is not one of {list(ADJUSTMENTS)}")
@@ -1256,6 +1270,10 @@ def _prior_close(
     The price of the lake's own reading is named: a hole in the ``1d`` surface immediately before
     an ex-date moves the denominator to an older close, which moves the factor by a fraction of
     the drift over those sessions rather than making it wrong by the dividend.
+
+    **On a trimmed lake** (marketlake #795) the trim removes the oldest ``1d`` partitions, so an
+    ex-date on the oldest session the lake keeps finds no session before it and raises
+    ``AdjustmentIncomplete``. ``load_bars`` names the limit this leaves on a reading restore.
     """
     key = (instrument, ex_date)
     if key in closes:
