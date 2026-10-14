@@ -1579,6 +1579,24 @@ def test_a_rotted_local_copy_is_skipped_with_one_line_and_the_upload_goes_on(tmp
     assert f"({QUARANTINE}, {cause}): s3://lake-backup/lake" in summary.render()
 
 
+def test_one_line_names_every_healed_and_unhealed_file_on_one_night():
+    summary = bucket.UploadSummary(
+        target="s3://lake-backup/lake",
+        healed=[QUARANTINE],
+        unhealed=[(MASTER, "missing from the lake"), ("a.jsonl", "past the single-PUT limit")],
+    )
+
+    line = summary.render()
+
+    assert "\n" not in line
+    assert line.endswith(
+        f", put back 1 file(s) whose bucket version did not match the bucket's manifest.jsonl "
+        f"({QUARANTINE}), could not put back 2 file(s) whose bucket version does not match the "
+        f"bucket's manifest.jsonl ({MASTER}, missing from the lake; a.jsonl, past the single-PUT "
+        "limit): s3://lake-backup/lake"
+    )
+
+
 def test_a_missing_local_copy_is_skipped_with_one_line_and_the_upload_goes_on(tmp_path):
     lake = _lake(tmp_path / "lake")
     client = FakeS3()
