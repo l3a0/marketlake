@@ -51,12 +51,14 @@ from lake.cassette import Cassette
 from lake.config import GuardConstants
 from lake.extra_projection import ExtraProjection, ExtraProjectionError
 from lake.loader import ADJUST_TOTAL, LoadError, PartialRead, PartitionAbsent, SnapAbsent, load_bars
-from lake.manifest import ManifestError, read_manifest
+from lake.lock import lake_lock
+from lake.manifest import ManifestError, latest_entries, read_manifest
 from lake.paths import LakePaths
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.schwab import VendorAuthError
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster, master_path
 from lake.tickers import Roster
+from lake.trimmed import append_trimmed, trim_line
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ, VendorError
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
@@ -611,6 +613,49 @@ def test_a_second_run_lands_nothing_and_reaches_no_vendor(fixture_lake: FixtureL
     assert second.attempted == 0
     assert second.skipped == len(SESSIONS)
     assert second_vendor.calls == []
+
+
+def test_a_walk_after_the_trim_took_bars_and_quotes_reaches_no_vendor(fixture_lake: FixtureLake):
+    """Marketlake #795. The trim removes old bars of both frequencies and the quotes beside them,
+    and the walk skips a manifested key before any read, so it fetches none of them back.
+    ``plan_backfill`` reads no lake and plans those keys anyway, which is why this drives
+    ``backfill_bars``. The trim is stood in for by its own ledger write and unlink, in its
+    order, the way the range restore's tests do it."""
+    root = _lake(fixture_lake)
+    roster = _roster({"SPY": [MINUTE_FREQ, DAILY_FREQ]})
+    first = _run(root, RecordingVendor(_cassette()), roster=roster)
+    landed = {(item.freq, item.session) for item in first.landed}
+    assert {(freq, day) for freq in (MINUTE_FREQ, DAILY_FREQ) for day in SESSIONS[:3]} <= landed
+
+    entries = latest_entries(root)
+    paths = LakePaths(root)
+    gone = []
+    for day in SESSIONS[:3]:
+        for path in (
+            paths.bars_partition_path("SPY", MINUTE_FREQ, day),
+            paths.bars_partition_path("SPY", DAILY_FREQ, day),
+            paths.quotes_partition_path("SPY", day),
+        ):
+            rel = path.relative_to(root).as_posix()
+            line = trim_line(
+                rel,
+                sha256=entries[rel]["sha256"],
+                version_id="v-1",
+                verified_at="2026-09-16T18:15:00-04:00",
+                trimmed_at="2026-09-16T18:15:00-04:00",
+            )
+            with lake_lock(root):
+                append_trimmed(root, line, source="trim", fetched_at=None)
+            path.unlink()
+            gone.append(rel)
+    assert all(not (root / rel).exists() for rel in gone)
+
+    vendor = RecordingVendor(_cassette())
+    second = _run(root, vendor, roster=roster)
+    assert vendor.calls == []
+    assert second.landed == () and second.attempted == 0
+    assert second.held == () and second.unsettled == () and second.abandoned == ()
+    assert all(not (root / rel).exists() for rel in gone)
 
 
 # -- 7 and 8. the days the gate cannot judge -------------------------------------------

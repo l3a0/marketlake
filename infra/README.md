@@ -1783,10 +1783,12 @@ lines between 08:25 and 18:45 ET. `bucket restore` refuses a lake holding any of
 4. Rerun the bootstrap. Its install starts the stopped units.
 
 `deploy/vm-empty-shadow-lake.sh` is the only deliberate delete of a whole lake. The
-close+15 compaction's trim deletes too, one chains or quotes partition at a time and only
-after the bucket's copy is verified, recording each in `trimmed.jsonl`
+close+15 compaction's trim deletes too, one chains, quotes or bars partition at a time and
+only after the bucket's copy is verified, recording each in `trimmed.jsonl`
 ([#787](https://github.com/l3a0/marketlake/issues/787)). A quotes partition goes only under a
-landed daily bar ([#794](https://github.com/l3a0/marketlake/issues/794)). The
+landed daily bar ([#794](https://github.com/l3a0/marketlake/issues/794)), and a bars partition
+only once its day's chains partition is gone
+([#795](https://github.com/l3a0/marketlake/issues/795)). The
 resync's `--apply` deletes on purpose as well, only the covered journal segments and `bars/`
 partitions that the resuming host alone recorded
 ([#832](https://github.com/l3a0/marketlake/issues/832)). After the

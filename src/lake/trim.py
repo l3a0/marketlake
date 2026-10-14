@@ -1,11 +1,12 @@
-"""The trim: drop chains and quotes partitions past the window once each is verified in the bucket.
+"""The trim: drop dated partitions past the window once each is verified in the bucket.
 
 The hosted VM keeps its lake on a 30 GiB volume, and sealed chains partitions grow it by about 0.585
 GB a session. Every sealed partition is already in the backup bucket, so the VM keeps a window of
 recent sessions and drops older partitions once the bucket's copy is proven. This module is the job
-that drops them: chains since marketlake #787, and quotes under a landed daily bar since marketlake
-#794. Quotes are a few KB a day, so trimming them buys a restore bounded to the same window as
-chains rather than disk. It runs inside the close+15 compaction, after the upload and the ping,
+that drops them: chains since marketlake #787, quotes under a landed daily bar since marketlake
+#794, and bars of both frequencies once their day's chains are gone since marketlake #795. Quotes
+and bars are a few KB a day, so trimming them buys a restore bounded to the same window as chains
+rather than disk. It runs inside the close+15 compaction, after the upload and the ping,
 under the lock hold the ping sits in, so it needs no lock of its own. ``lake.compact`` decides
 whether it runs at all and hands it an integer window. This module decides which partitions go.
 
@@ -15,12 +16,21 @@ nothing.
 
 **A partition is dropped only when all seven clauses hold.**
 
-1. It is a chains or quotes partition, ``chains/ticker=T/date=D.parquet`` or
-   ``quotes/ticker=T/date=D.parquet``, present on disk. One already absent is done or lost, and
-   either way no ``GetObject`` is sent for it. A quotes partition also needs its ticker-day's
-   daily bar, ``bars/ticker=T/freq=1d/date=D.parquet``, to be in the manifest. The bars census
-   reads a quotes day only while that bar has not landed, so a day whose bar never lands, such
-   as a ``SnapAbsent`` outage day or a ticker whose roster carries no ``1d``, is kept for good.
+1. It is a chains, quotes or bars partition, ``chains/ticker=T/date=D.parquet``,
+   ``quotes/ticker=T/date=D.parquet`` or ``bars/ticker=T/freq=F/date=D.parquet``, present on
+   disk. One already absent is done or lost, and either way no ``GetObject`` is sent for it. A
+   quotes partition also needs its ticker-day's daily bar,
+   ``bars/ticker=T/freq=1d/date=D.parquet``, to be in the manifest. The bars census reads a
+   quotes day only while that bar has not landed, so a day whose bar never lands, such as a
+   ``SnapAbsent`` outage day or a ticker whose roster carries no ``1d``, is kept for good. A bars
+   partition of either frequency also needs its ticker-day's chains partition to be gone on
+   purpose or never recorded: absent from disk, and either a designed absence or missing from
+   the manifest. ``settle.settlement_view`` and ``continuity.continuity_view`` read a day's bars
+   beside its chains, and a chains partition can outlive the window edge behind its ticker's
+   checkpoint cutoff. A chains partition lost by accident keeps its bars too, because a chains
+   range restore brings it back without them. A check of that chains partition that raises
+   keeps the bar and writes no line of its own, since the chains directory's own held line
+   already names the fault.
 2. Its day is at or before the window edge, ``window.window_edge(calendar, tonight, W + 1)``.
    Tonight's seal has landed since the sweep, hence W + 1, and the edge is computed here from
    the window rather than read from the checkpoint, whose edge goes stale when the window
@@ -29,7 +39,9 @@ nothing.
    bucket held it before tonight.
 4. Its ticker-day's journal directory holds no segments. ``compact._recover`` raises on a
    missing partition with leftover segments, so one such trim would stop every later seal. A
-   directory that cannot be listed counts as holding segments.
+   directory that cannot be listed counts as holding segments. Bars never pass through the
+   journal, since ``bars._land`` writes each partition whole, so a bars partition skips this
+   clause.
 5. A ``GetObject`` of the current version hashes to the manifest's sha. The response's
    ``VersionId`` is what the trim line records.
 6. Tonight is a session strictly after the latest checkpoint's own session day whose
@@ -52,16 +64,16 @@ line that supersedes the trim line.
 **Failures.** One that would repeat on every partition stops the run: a bucket that refuses or
 cannot be reached, a ``GetObject`` with no usable ``VersionId``, any exception from the ledger step,
 and an unlink error other than a missing file or a permission refusal. A permission refusal on the
-unlink stops only that ticker directory, such as ``chains/ticker=SPY/``, and leaves the same
-ticker's other surface going. So does a partition whose presence cannot be checked, which an
-unsearchable ticker directory causes, and so does a ticker directory the trim cannot write and
-search, which it checks before the ``GetObject``. That check writes no line, so a directory left
-unwritable does not gain a fresh trim line every night, and the unlink's refusal stays as the
-backstop. Each of those lines names the directory relative to the lake root and the ``chown`` and
-``chmod`` that repair it, and no line the trim prints names an absolute path. A hash mismatch is
-rot: the partition is kept, the lake's own copy is hashed so the page can say which copy is good,
-and nothing is ever written to the bucket. Anything else skips only its partition. The deadline the
-upload ran under is checked between partitions.
+unlink stops only the directory the partition sits in, such as ``chains/ticker=SPY/`` or
+``bars/ticker=SPY/freq=1d/``, and leaves the same ticker's other directories going. So does a
+partition whose presence cannot be checked, which an unsearchable directory causes, and so does a
+directory the trim cannot write and search, which it checks before the ``GetObject``. That check
+writes no line, so a directory left unwritable does not gain a fresh trim line every night, and
+the unlink's refusal stays as the backstop. Each of those lines names the directory relative to
+the lake root and the ``chown`` and ``chmod`` that repair it, and no line the trim prints names an
+absolute path. A hash mismatch is rot: the partition is kept, the lake's own copy is hashed so the
+page can say which copy is good, and nothing is ever written to the bucket. Anything else skips
+only its partition. The deadline the upload ran under is checked between partitions.
 
 **This never raises.** ``compact.main`` prints the night's result only when ``compact``
 returns, so a raise here would lose the night's sealed lines. Every outcome is a field of
@@ -92,7 +104,16 @@ from lake.calendar import MARKET_TZ, Calendar
 from lake.clock import Clock
 from lake.config import BucketTarget
 from lake.manifest import is_quarantined, latest_entries, latest_quarantine, sha256_file
-from lake.paths import CHAINS, QUOTES, SEGMENT_GLOB, LakePaths, PartitionRef, parse_partition_rel
+from lake.paths import (
+    CHAINS,
+    QUOTES,
+    SEGMENT_GLOB,
+    BarsRef,
+    LakePaths,
+    PartitionRef,
+    parse_bars_rel,
+    parse_partition_rel,
+)
 from lake.session import SessionClock
 from lake.split_checkpoint import (
     CHECKPOINT_PARTITION,
@@ -108,11 +129,11 @@ from lake.window import EdgeNotFound, window_edge
 TRIM_SOURCE = "trim"
 
 # How many partitions the rot page names before it says how many are left. A page body stays
-# under 1,000 bytes, and a lake-relative chains or quotes path runs to about 45 bytes plus its
-# notes.
+# under 1,000 bytes. A lake-relative chains or quotes path runs to about 45 bytes plus its notes,
+# and a bars path to 47 to 49, which still fits.
 ROT_PAGE_CAP = 4
 
-# The unlink errors that stop only one ticker directory, such as ``chains/ticker=SPY``.
+# The unlink errors that stop only one directory, such as ``chains/ticker=SPY``.
 # Unlinking needs write permission on that directory, which a range restore run with ``sudo``
 # can leave owned by root.
 _TICKER_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
@@ -146,9 +167,9 @@ class TrimResult:
     refused. ``restored`` lists the partitions recovery wrote a restore line for. ``skipped``
     names each partition skipped for a reason worth reading, such as a key missing from the
     bucket. ``rot`` holds each rotted bucket copy, which ``compact`` pages once for the run.
-    ``held`` names each ticker directory a refusal stopped, such as ``quotes/ticker=SPY``, with
-    its repair. An unlink refusal lands one there, and so does a directory the run could not
-    search or write.
+    ``held`` names each directory a refusal stopped, such as ``quotes/ticker=SPY`` or
+    ``bars/ticker=SPY/freq=1d``, with its repair. An unlink refusal lands one there, and so does
+    a directory the run could not search or write.
 
     ``refused`` is set when a gate refused before any partition was looked at. ``stopped`` is
     set when a failure that would repeat on every partition ended the run. ``deadline`` is
@@ -315,10 +336,18 @@ def describe(root: Path, exc: BaseException) -> str:
 
 
 def _ticker_repair(ticker_dir: str) -> str:
-    """The hand repair for a ticker directory the trim cannot search or write."""
+    """The hand repair for a directory the trim cannot search or write."""
     return (
         f"Give the directory back to the lake's owner, as in chown <lake owner> "
         f"<lake_root>/{ticker_dir} and chmod u+rwx <lake_root>/{ticker_dir}"
+    )
+
+
+def _bars_ticker_repair(ticker_dir: str) -> str:
+    """The hand repair for a bars ticker directory, such as ``bars/ticker=SPY``, and below it."""
+    return (
+        f"Give the directory and its frequency directories back to the lake's owner, as in chown "
+        f"-R <lake owner> <lake_root>/{ticker_dir} and chmod -R u+rwX <lake_root>/{ticker_dir}"
     )
 
 
@@ -341,8 +370,8 @@ class _Run:
     skipped: list[str] = field(default_factory=list)
     rot: list[RotFinding] = field(default_factory=list)
     held: list[str] = field(default_factory=list)
-    # Each held ticker directory, such as ``chains/ticker=SPY``. The directory rather than the
-    # ticker, because a fault in ``chains/ticker=SPY/`` says nothing about ``quotes/ticker=SPY/``.
+    # Each held directory, such as ``chains/ticker=SPY``. The directory rather than the ticker,
+    # because a fault in ``chains/ticker=SPY/`` says nothing about ``quotes/ticker=SPY/``.
     held_dirs: set[str] = field(default_factory=set)
 
     def stamp(self) -> str:
@@ -371,7 +400,7 @@ class _Run:
             ) from exc
 
     def hold(self, directory: str, line: str) -> None:
-        """Hold the rest of one ticker directory for this run, naming why and the repair."""
+        """Hold the rest of one directory for this run, naming why and the repair."""
         self.held_dirs.add(directory)
         self.held.append(line)
 
@@ -391,7 +420,7 @@ def trim(
     clock: Clock,
     calendar: Calendar,
 ) -> TrimResult:
-    """Drop every chains and quotes partition the seven clauses allow, oldest first. Never raises.
+    """Drop every chains, quotes and bars partition the clauses allow, oldest first. Never raises.
 
     ``window`` is the judged window key. ``upload`` is the nightly upload's summary, whose
     ``deadline`` the run stops at and whose ``watermark`` clause 3 compares with. The caller
@@ -449,10 +478,10 @@ def trim(
 
 @dataclass(frozen=True)
 class _Candidate:
-    """A present chains or quotes partition the trim looks at, with what decides it."""
+    """A present chains, quotes or bars partition the trim looks at, with what decides it."""
 
     rel: str
-    ref: PartitionRef
+    ref: PartitionRef | BarsRef
     sha256: str
     # Whether its latest trimmed line is a trim line, which a crash before the unlink leaves.
     recovering: bool
@@ -461,7 +490,10 @@ class _Candidate:
 
     @property
     def directory(self) -> str:
-        """The ticker directory the partition sits in, such as ``quotes/ticker=SPY``."""
+        """The directory the partition sits in, such as ``quotes/ticker=SPY``.
+
+        For a bars partition it is the frequency's directory, such as ``bars/ticker=SPY/freq=1d``.
+        """
         return _ticker_dir(self.rel)
 
 
@@ -470,12 +502,15 @@ class _Selection:
     edge: date
     candidates: tuple[_Candidate, ...]
     paths: LakePaths
-    # Each ticker directory that could not be checked, with the line that names its repair.
+    # Each directory that could not be checked, with the line that names its repair.
     held: tuple[tuple[str, str], ...] = ()
 
 
 def _ticker_dir(rel: str) -> str:
-    """The lake-relative ticker directory of a partition key, such as ``chains/ticker=SPY``."""
+    """The lake-relative directory of a partition key, such as ``chains/ticker=SPY``.
+
+    A bars key's is its frequency directory, such as ``bars/ticker=SPY/freq=1d``.
+    """
     return PurePosixPath(rel).parent.as_posix()
 
 
@@ -483,6 +518,34 @@ def _daily_bar_rel(paths: LakePaths, ref: PartitionRef) -> str:
     """The manifest key of the ``1d`` bar for a quotes partition's ticker-day."""
     path = paths.bars_partition_path(ref.ticker, DAILY_FREQ, ref.day)
     return path.relative_to(paths.root).as_posix()
+
+
+def _chains_remain(
+    paths: LakePaths,
+    ref: BarsRef,
+    latest: Mapping[str, Mapping],
+    trimmed_latest: Mapping[str, Mapping],
+) -> bool:
+    """Whether the bar's ticker-day has a chains partition or lost one. Fails toward keeping.
+
+    A bar goes only once its chain is gone on purpose or never existed: absent from disk, and
+    either never in the manifest or a designed absence by ``trimmed.is_designed_absence``. A chain
+    that is manifested and absent with no trim line was lost, and a range restore will bring it
+    back, so its bars stay for that chain to be read beside.
+
+    A presence check that raises answers yes, so the bar stays. It writes no line, because the
+    chains directory's own presence check meets the same fault and holds that directory with a
+    line naming the repair. Letting it raise would stop the whole run, and holding the bars
+    directory would print a repair for a directory that is not at fault.
+    """
+    chain = paths.chains_partition_path(ref.ticker, ref.day)
+    try:
+        if _present(chain):
+            return True
+    except OSError:
+        return True
+    rel = chain.relative_to(paths.root).as_posix()
+    return rel in latest and not trimmed.is_designed_absence(rel, latest, trimmed_latest)
 
 
 def _select(
@@ -527,14 +590,14 @@ def _select(
     candidates: list[_Candidate] = []
     held: dict[str, str] = {}
     for rel, entry in latest.items():
-        ref = parse_partition_rel(rel)
-        if ref is None or ref.surface not in (CHAINS, QUOTES) or _ticker_dir(rel) in held:
+        ref: PartitionRef | BarsRef | None = parse_partition_rel(rel) or parse_bars_rel(rel)
+        if ref is None or _ticker_dir(rel) in held:
             continue
         try:
             present = _present(root / rel)
         except OSError as exc:
-            # The fault is the ticker directory, so it holds that directory and no other, the
-            # way a refused unlink does. The ticker's other surface is a different directory.
+            # The fault is the partition's directory, so it holds that directory and no other,
+            # the way a refused unlink does. The ticker's other surfaces are other directories.
             held[_ticker_dir(rel)] = _unsearchable(rel, exc)
             continue
         if not present:
@@ -561,6 +624,10 @@ def _select(
             # The bars census reads a quotes day only while its daily bar has not landed, so
             # a quotes day goes only once that bar is in the manifest (marketlake #794).
             kept_by = "no daily bar has landed for its day"
+        elif isinstance(ref, BarsRef) and _chains_remain(paths, ref, latest, trimmed_latest):
+            # The settlement and continuity views read a day's bars beside its chains, and the
+            # checkpoint cutoff can keep chains past the edge, so a bar waits for its chains.
+            kept_by = "its day's chains partition is still on disk or was lost"
         elif is_quarantined(quarantine.get(rel)):
             kept_by = "withheld by the quarantine ledger"
         recovering = kind == trimmed.TRIM_KIND
@@ -583,11 +650,17 @@ def _select(
 
 
 def _unsearchable(rel: str, exc: OSError) -> str:
-    """The held line for a ticker directory whose partition could not be checked for presence."""
+    """The held line for a directory whose partition could not be checked for presence."""
     ticker_dir = _ticker_dir(rel)
     code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
     if exc.errno in _TICKER_ERRNOS:
-        repair = _ticker_repair(ticker_dir)
+        # A bars key sits one level deeper, so the fault can be ``bars/ticker=T/`` rather than its
+        # frequency directory, and the repair names the ticker directory and everything under it.
+        repair = (
+            _ticker_repair(ticker_dir)
+            if parse_bars_rel(rel) is None
+            else _bars_ticker_repair(PurePosixPath(ticker_dir).parent.as_posix())
+        )
     else:
         repair = "Check the volume, and the next close+15 carries on"
     return f"{ticker_dir}/: {rel} could not be checked ({code}), so {ticker_dir}/ waits. {repair}"
@@ -632,7 +705,9 @@ def _one(
     """Decide and act on one candidate. Raises ``_Stop`` for a failure that would repeat."""
     rel = candidate.rel
     kept_by = candidate.kept_by
-    if kept_by is None and segments_remain(selection.paths, candidate.ref):
+    # Bars never pass through the journal, so only a chains or quotes partition is asked.
+    ref = candidate.ref
+    if kept_by is None and isinstance(ref, PartitionRef) and segments_remain(selection.paths, ref):
         kept_by = "its journal still holds segments"
     if kept_by is not None:
         # A recovery supersedes its trim line with a restore line. Any other candidate has no

@@ -57,8 +57,8 @@ segment path and a ``date=YYYY-MM-DD`` directory name are both parsed by more th
 module. A second reader that re-implements the split can drift from the builder that
 made the path, and nothing would catch it. So each parser sits beside the builder it
 inverts. ``parse_segment_rel`` inverts ``segment_path``. ``parse_partition_rel`` inverts
-``LakePaths.partition_path``. ``parse_date_dir`` reads the ``date=`` key that every
-partition path carries.
+``LakePaths.partition_path``. ``parse_bars_rel`` inverts ``LakePaths.bars_partition_path``.
+``parse_date_dir`` reads the ``date=`` key that every partition path carries.
 """
 
 from __future__ import annotations
@@ -69,6 +69,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+
+from lake.vendor import BAR_FREQS
 
 # Surface names: the top-level measurement directories.
 CHAINS = "chains"
@@ -172,6 +174,9 @@ SURFACE_PREFIX = "surface="
 # The key prefix on a ticker directory, as in ``ticker=SPY``.
 TICKER_PREFIX = "ticker="
 
+# The key prefix on a bars frequency directory, as in ``freq=1d``.
+FREQ_PREFIX = "freq="
+
 # The marker an atomic write hangs on its target while the write is in flight. An
 # atomic write puts the bytes in a temp file beside the target, flushes, then renames
 # over the target in one step. So a crash leaves the temp rather than a torn target.
@@ -269,7 +274,7 @@ class LakePaths:
             self.root
             / BARS
             / f"{TICKER_PREFIX}{ticker}"
-            / f"freq={freq}"
+            / f"{FREQ_PREFIX}{freq}"
             / f"{DATE_PREFIX}{_day_str(day)}.parquet"
         )
 
@@ -459,6 +464,57 @@ def parse_partition_rel(rel: str) -> PartitionRef | None:
     return PartitionRef(surface=surface, ticker=ticker, day=day)
 
 
+@dataclass(frozen=True)
+class BarsRef:
+    """One bars partition's path, parsed into its parts.
+
+    ``surface`` is always ``bars``, so a reader holding either this or a
+    :class:`PartitionRef` can ask which surface it names the same way.
+    """
+
+    ticker: str
+    freq: str
+    day: date
+
+    @property
+    def surface(self) -> str:
+        return BARS
+
+
+def parse_bars_rel(rel: str) -> BarsRef | None:
+    """Parse a lake-relative bars partition path, or return None.
+
+    The inverse of :meth:`LakePaths.bars_partition_path`. The shape is
+    ``bars/ticker=T/freq=F/date=YYYY-MM-DD.parquet``, with ``F`` one of ``vendor.BAR_FREQS``.
+    Anything else is None, including a frequency no vendor call fetches, since no bars
+    partition of one is ever written. The date is parsed by :func:`parse_date_dir`, as in
+    :func:`parse_partition_rel`, and the separator is always "/".
+
+    It is a parser of its own rather than a wider :func:`parse_partition_rel`, because readers
+    of that one rely on it answering None for a bars key.
+    """
+    parts = rel.split("/")
+    if len(parts) != 4 or parts[0] != BARS:
+        return None
+    _, ticker_part, freq_part, filename = parts
+    if (
+        not ticker_part.startswith(TICKER_PREFIX)
+        or not freq_part.startswith(FREQ_PREFIX)
+        or not filename.endswith(PARQUET_SUFFIX)
+    ):
+        return None
+    freq = freq_part[len(FREQ_PREFIX) :]
+    if freq not in BAR_FREQS:
+        return None
+    day = parse_date_dir(filename[: -len(PARQUET_SUFFIX)])
+    if day is None:
+        return None
+    ticker = ticker_part[len(TICKER_PREFIX) :]
+    if not ticker:
+        return None
+    return BarsRef(ticker=ticker, freq=freq, day=day)
+
+
 # A strict ``YYYY-MM-DD``: four digits, two, two, joined by hyphens and nothing else.
 _DATE_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -586,6 +642,7 @@ __all__ = [
     "CORPORATE_ACTIONS_FILE",
     "DATE_PARTITIONED",
     "DATE_PREFIX",
+    "FREQ_PREFIX",
     "JOURNAL_DIR",
     "JOURNAL_METADATA_FILE",
     "JSONL_SUFFIX",
@@ -610,11 +667,13 @@ __all__ = [
     "TIMING_DIR",
     "TOKEN_FILE",
     "TRIMMED_FILE",
+    "BarsRef",
     "LakePaths",
     "PartitionRef",
     "SegmentRef",
     "config_dir",
     "default_token_path",
+    "parse_bars_rel",
     "parse_date_dir",
     "parse_partition_rel",
     "parse_segment_rel",

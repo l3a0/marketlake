@@ -421,7 +421,9 @@ def continuity_view(
     This view adds the three under ``ContinuityError``.
 
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed drops out of a range
-    with no error, because the read lists sessions from disk. Nothing nightly calls this door.
+    with no error, because the read lists sessions from disk. Since marketlake #795 the trim takes
+    old ``1d`` bars too, each only once its day's chains partition is gone, so the closes under
+    any chain span the lake holds stay with it. Nothing nightly calls this door.
     Reading a trimmed session means restoring it into a directory outside the live lake, which
     ``python -m lake.bucket restore-for-reading`` does (marketlake #837). Call this with
     ``lake_root`` at that directory and ``end`` at the range's last day, because the restore
