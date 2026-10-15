@@ -88,8 +88,8 @@ resource "aws_iam_role" "backup" {
   }
 }
 
-# The five S3 reads src/lake/bucket.py calls, so the laptop can restore from the bucket
-# and resync from it. Step 8 of #638's cutover dropped s3:PutObject from this role, once
+# The five S3 reads src/lake/bucket.py calls, so the laptop can run the restore, the
+# reading restore and the resync. Step 8 of #638's cutover dropped s3:PutObject from this role, once
 # the VM's instance role was uploading as the primary. The laptop runs role: shadow,
 # which refuses every bucket write in code, and this makes IAM refuse them too. The
 # literal is this role's own rather than shared with the instance role's, which keeps

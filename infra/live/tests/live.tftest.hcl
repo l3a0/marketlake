@@ -234,9 +234,10 @@ run "backup_role_only_reads_the_bucket" {
     error_message = "The marketlake-backup role's policy is not exactly the five reads a restore and a resync need."
   }
 
-  # The two roles differ in the put alone. The laptop's role holds none, and the primary
-  # VM's write half holds it. Making the laptop primary again changes this assert in the
-  # same pull request that puts s3:PutObject back on the laptop's role.
+  # The two roles differ in the put alone. The laptop's role holds none, and the instance
+  # role's write half, which this run enables, holds it. Making the laptop primary again
+  # changes this assert in the same pull request that puts s3:PutObject back on the
+  # laptop's role.
   assert {
     condition = (
       !contains(flatten([for s in jsondecode(aws_iam_role_policy.backup.policy).Statement : s.Action]), "s3:PutObject")

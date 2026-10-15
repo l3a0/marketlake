@@ -1134,9 +1134,9 @@ objects in the bucket. It can also read every old version, since
 `marketlake-backup` holds `s3:GetObjectVersion` and `s3:ListBucketVersions`
 ([#838](https://github.com/l3a0/marketlake/issues/838)). It cannot overwrite an object,
 because step 8 of [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover dropped
-the role's `s3:PutObject`. While the laptop is the primary, the role holds that action
-again. Versioning then keeps the copy each overwrite replaced, so the bucket's recovery is
-the version recovery by hand that `README.md` describes. The token needs more. A put can
+the role's `s3:PutObject`. If the laptop becomes the primary again, the role holds that
+action again, and versioning then keeps the copy each overwrite replaced, so the bucket's
+recovery is the version recovery by hand that `README.md` describes. The token needs more. A put can
 change more than the value. It can move the parameter to the
 Advanced tier, attach a parameter policy, set an allowed pattern, or store a forged token
 that the VM's pull accepts. So recovery deletes the parameter whatever its listing shows,
