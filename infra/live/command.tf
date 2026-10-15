@@ -1,9 +1,8 @@
 # The laptop's one AWS identity (#737). The user marketlake-command holds the laptop's
 # only long-lived key, and that key can do nothing but assume two roles. The role
-# marketlake-backup carries the bucket's six S3 actions, and the role
-# marketlake-token-writer can only overwrite the Schwab token. Each call then signs with
-# a session that lasts an hour, and CloudTrail records it under the role and the
-# session name.
+# marketlake-backup can only read the bucket, and the role marketlake-token-writer can
+# only overwrite the Schwab token. Each call then signs with a session that lasts an
+# hour, and CloudTrail records it under the role and the session name.
 #
 # Every ARN here is a literal built from local.account_id, never a resource reference.
 # The mock provider returns a random string for a reference, so no test could read the
@@ -89,10 +88,16 @@ resource "aws_iam_role" "backup" {
   }
 }
 
-# The six S3 actions src/lake/bucket.py calls, written as their own literal rather than
-# shared with the instance role's, because #638's cutover drops s3:PutObject from this
-# role alone. s3:ListBucketVersions and s3:GetObjectVersion let a restore or a resync take
+# The five S3 reads src/lake/bucket.py calls, so the laptop can run the restore, the
+# reading restore and the resync. Step 8 of #638's cutover dropped s3:PutObject from this role, once
+# the VM's instance role was uploading as the primary. The laptop runs role: shadow,
+# which refuses every bucket write in code, and this makes IAM refuse them too. The
+# literal is this role's own rather than shared with the instance role's, which keeps
+# the put. s3:ListBucketVersions and s3:GetObjectVersion let a restore or a resync take
 # the version the bucket's manifest names when the current one is newer (#838).
+#
+# Making the laptop primary again first puts s3:PutObject back here, in a reviewed pull
+# request whose infra apply the owner approves, before the laptop's role changes.
 resource "aws_iam_role_policy" "backup" {
   name = "backup-bucket"
   role = aws_iam_role.backup.name
@@ -107,7 +112,7 @@ resource "aws_iam_role_policy" "backup" {
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "arn:aws:s3:::${var.backup_bucket}/*"
       },
     ]

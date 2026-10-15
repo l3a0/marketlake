@@ -53,7 +53,7 @@ run "instance_s3_write_half_is_on_by_default" {
   }
 
   # The read half is compared whole, so a write action moved into it fails here even
-  # though the two halves together still equal marketlake-backup's policy.
+  # though the two halves together still hold the same six actions.
   assert {
     condition = jsondecode(aws_iam_role_policy.instance_s3_read.policy).Statement == [
       {
@@ -208,10 +208,10 @@ run "an_empty_bucket_name_fails_validation" {
   expect_failures = [var.backup_bucket]
 }
 
-# Each policy is compared with its own literal rather than with the other, because
-# #638's cutover drops s3:PutObject from the backup role alone. The instance role's two
-# halves have their own runs above.
-run "backup_role_gets_the_six_actions" {
+# Each policy is compared with its own literal rather than with the other, because step 8
+# of #638's cutover dropped s3:PutObject from the backup role alone. The instance role's
+# two halves have their own runs above.
+run "backup_role_only_reads_the_bucket" {
   command = plan
 
   variables {
@@ -227,11 +227,23 @@ run "backup_role_gets_the_six_actions" {
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "arn:aws:s3:::example-lake-backup/*"
       },
     ]
-    error_message = "The marketlake-backup role's policy is not exactly the six actions src/lake/bucket.py needs."
+    error_message = "The marketlake-backup role's policy is not exactly the five reads a restore and a resync need."
+  }
+
+  # The two roles differ in the put alone. The laptop's role holds none, and the instance
+  # role's write half, which this run enables, holds it. Making the laptop primary again
+  # changes this assert in the same pull request that puts s3:PutObject back on the
+  # laptop's role.
+  assert {
+    condition = (
+      !contains(flatten([for s in jsondecode(aws_iam_role_policy.backup.policy).Statement : s.Action]), "s3:PutObject")
+      && contains(flatten([for s in jsondecode(aws_iam_role_policy.instance_s3[0].policy).Statement : s.Action]), "s3:PutObject")
+    )
+    error_message = "marketlake-backup holds s3:PutObject, or marketlake-instance's write half does not, so the laptop could write the primary VM's bucket or the VM could not."
   }
 
   # The apply role may write only the roles named marketlake-backup and

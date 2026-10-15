@@ -25,7 +25,7 @@ deploys `main` to the VM ([#676](https://github.com/l3a0/marketlake/issues/676))
 two schedules that start the VM at 07:30 on weekdays and 19:30 on Sundays
 ([#867](https://github.com/l3a0/marketlake/issues/867)), which matter once
 [#868](https://github.com/l3a0/marketlake/issues/868)'s stop is switched on. The role
-`marketlake-backup` reaches the bucket, and the role `marketlake-token-writer` writes the
+`marketlake-backup` reads the bucket, and the role `marketlake-token-writer` writes the
 Schwab token to the VM's config parameters. cloud-init takes a new VM from nothing to a
 running daemon with no login, through `deploy/vm-bootstrap.sh`. The VM ran as a shadow
 beside the laptop until the cutover in
@@ -188,13 +188,17 @@ files rewritten every night. `lake/trimmed.jsonl`, the ledger of partitions remo
 purpose, takes no rule, so the bucket keeps every version of it, the same as `lake/reference/`.
 Partitions keep every version, because with no Object Lock an overwritten
 partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
-which grants exactly `s3:PutObject`, `s3:GetObject`, `s3:GetObjectVersion`, `s3:ListBucket`,
-`s3:ListBucketVersions` and `s3:GetBucketVersioning`, and nothing that deletes a version or
-changes the bucket. The two version actions let a restore read the older version a stopped
-upload leaves under a newer one ([#838](https://github.com/l3a0/marketlake/issues/838)).
+which grants exactly `s3:GetObject`, `s3:GetObjectVersion`, `s3:ListBucket`,
+`s3:ListBucketVersions` and `s3:GetBucketVersioning`, and nothing that writes, deletes a
+version or changes the bucket. The two version actions let a restore read the older version
+a stopped upload leaves under a newer one ([#838](https://github.com/l3a0/marketlake/issues/838)).
+The role also held `s3:PutObject` while the laptop was the primary, and step 8 of
+[#638](https://github.com/l3a0/marketlake/issues/638)'s cutover dropped it once the VM
+uploaded as the primary. Making the laptop primary again first puts that action back
+through a reviewed pull request and an `infra` apply the owner approves.
 
 The laptop holds one AWS key, the IAM user `marketlake-command`'s, which can do nothing but
-assume two roles: `marketlake-backup` for the bucket, and `marketlake-token-writer` for the
+assume two roles: `marketlake-backup` to read the bucket, and `marketlake-token-writer` for the
 token put below ([#737](https://github.com/l3a0/marketlake/issues/737)). The bucket client signs as `marketlake-backup`, with credentials
 that last an hour and refresh on their own. Two steps stay by hand, and nothing here names
 a real account, bucket, or key. A hosted VM takes its credentials from an instance profile
@@ -254,8 +258,8 @@ instance profile, an IAM role attached to the instance, so no long-lived key sit
 two steps change as follows.
 
 1. Step 1 has no key to create. `infra/live/iam.tf` describes the IAM role and instance
-   profile `marketlake-instance`, whose S3 policies carry the same six actions as the
-   laptop's role, split in two. The read half, `s3:ListBucket`, `s3:ListBucketVersions`,
+   profile `marketlake-instance`, whose S3 policies carry the six actions the bucket
+   client calls, split in two. The read half, `s3:ListBucket`, `s3:ListBucketVersions`,
    `s3:GetBucketVersioning`, `s3:GetObject` and `s3:GetObjectVersion`, is always on, so a
    restore runs on the VM with no stored key. The
    write half, `s3:PutObject` alone, is for a primary VM. The cutover turns it on as the
@@ -322,7 +326,9 @@ A command run by hand is not a unit the stop can see.
 
    Lines 8 and 9, and behavior 3's read, are the calls a restore sends to take an older
    version ([#838](https://github.com/l3a0/marketlake/issues/838)). So one run covers all
-   six of the role's S3 actions, even while `backup_target` is still a path.
+   six of the role's S3 actions, even while `backup_target` is still a path. Run it on the
+   primary, the VM, whose instance role holds all six. A shadow refuses it, and the laptop's
+   role holds no `s3:PutObject`.
 
 2. `uv run python -m lake.bucket first-upload --target s3://example-lake-backup/lake`
    uploads the whole lake, comparing every object, and prints its throughput. Run it on
@@ -563,12 +569,21 @@ copy, so rot in it has no repair here. The Sunday job's sample reads only object
 stored SHA-256 the scrub matched, so a sample mismatch is rot at rest in an object whose
 stored checksum is right. A sealed partition is written once, so its rotted current version
 is usually its only version, and neither upload replaces an object whose stored checksum
-matches. Once the Sunday lake scrub passes on the file, put it back with the bucket's
-credentials, as a single PUT carrying its SHA-256:
+matches. Once the Sunday lake scrub passes on the file, put the primary's copy back as a
+single PUT carrying its SHA-256, in three steps. The VM has no `aws` command, and the
+laptop's own lake is the shadow's, whose bytes can differ from the primary's entry. The
+laptop's role `marketlake-backup` holds no put either, so the put runs in the owner's admin
+session.
 
-```bash
-aws s3api put-object --bucket example-lake-backup --key lake/<path> --body <lake_root>/<path> --checksum-algorithm SHA256
-```
+1. Copy the file from the primary's lake, the VM's `/srv/marketlake/<path>`, to the laptop,
+   for example with `scp`.
+2. Check that `shasum -a 256` of the copy equals the path's latest entry in the bucket's
+   `manifest.jsonl`.
+3. Put the copy back.
+
+   ```bash
+   aws s3api put-object --bucket example-lake-backup --key lake/<path> --body "<the copied file>" --checksum-algorithm SHA256 --profile marketlake-admin
+   ```
 
 When the lake is gone, a file the manifest records that the restore still fails gets its copy
 from one of two places, chosen by the line the failure printed.
@@ -742,7 +757,15 @@ To rotate the command key:
 
 1. Create a second access key for `marketlake-command`.
 2. Put it in `command_access_key_id` and `command_secret_access_key`.
-3. Run `reauth.sh` and the bucket's `live-check`, and see both succeed.
+3. Run `reauth.sh` and restore one day for reading into a new empty directory, and see
+   both succeed. The read assumes `marketlake-backup` with the new key.
+
+   ```bash
+   uv run python -m lake.bucket restore-for-reading "<new dir>" --surface chains --ticker SPY --from "<day>" --to "<day>" --target s3://example-lake-backup/lake
+   ```
+
+   Do not run `live-check` here. It writes probe objects, so it runs only on the primary
+   VM, and the laptop refuses it as a shadow.
 4. Deactivate the old key. A role session the old key already started stays valid until
    it expires, within the hour.
 
