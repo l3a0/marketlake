@@ -1,5 +1,4 @@
-# The hosted VM's instance role. It gets the same six S3 actions as the laptop's
-# marketlake-backup role in command.tf, which are the ones src/lake/bucket.py calls:
+# The hosted VM's instance role. It gets the six S3 actions src/lake/bucket.py calls:
 # PutObject, GetObject (which also authorises HEAD), ListBucket, GetBucketVersioning,
 # ListBucketVersions and GetObjectVersion. They are split across two policies, a read half
 # that is always on and a write half, PutObject alone, meant for a primary VM and not a
@@ -7,7 +6,8 @@
 # way back turns it off before the role returns to shadow. Nothing deletes a version. The
 # last two read an old one: a restore or a resync that finds a file's current version newer
 # than the bucket's manifest takes the version the manifest names (#838). The instance role
-# also reads the config parameters.
+# also reads the config parameters. The laptop's marketlake-backup role in command.tf holds
+# the five reads alone, since step 8 of #638's cutover dropped its PutObject.
 
 # -- the instance role --------------------------------------------------------------
 

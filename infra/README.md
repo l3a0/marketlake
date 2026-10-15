@@ -28,7 +28,7 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    hosted VM with its security group, key pair and lake volume, the SSM document
    `marketlake-deploy` that [Deploy from CI](#deploy-from-ci) sends to the VM, and the
    two schedules in [The start schedule](#the-start-schedule) that start the VM. That user
-   can only assume two roles: `marketlake-backup`, which reaches the bucket, and
+   can only assume two roles: `marketlake-backup`, which reads the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
    applies it after a merge to `main` once the owner approves the run. Either starts on
@@ -1129,12 +1129,15 @@ aws ssm describe-parameters --profile marketlake-admin --region us-east-1 --para
 
 ### Recover from a leaked `marketlake-command` key
 
-The laptop's one key reaches both roles, so a leaked key can write the token and read and
-overwrite objects in the bucket. It can also read every old version, since
+The laptop's one key reaches both roles, so a leaked key can write the token and read
+objects in the bucket. It can also read every old version, since
 `marketlake-backup` holds `s3:GetObjectVersion` and `s3:ListBucketVersions`
-([#838](https://github.com/l3a0/marketlake/issues/838)). Versioning keeps the copy each overwrite replaced, so the bucket's recovery
-is the version recovery by hand that `README.md` describes. The token
-needs more. A put can change more than the value. It can move the parameter to the
+([#838](https://github.com/l3a0/marketlake/issues/838)). It cannot overwrite an object,
+because step 8 of [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover dropped
+the role's `s3:PutObject`. While the laptop is the primary, the role holds that action
+again. Versioning then keeps the copy each overwrite replaced, so the bucket's recovery is
+the version recovery by hand that `README.md` describes. The token needs more. A put can
+change more than the value. It can move the parameter to the
 Advanced tier, attach a parameter policy, set an allowed pattern, or store a forged token
 that the VM's pull accepts. So recovery deletes the parameter whatever its listing shows,
 and a fresh re-auth puts the real token back.

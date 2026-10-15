@@ -290,8 +290,8 @@ resource "aws_iam_role_policy" "apply" {
         # CreateRole, and each role sets only its name and trust, so no iam:UpdateRole or
         # tagging action is needed. No iam:DeleteRole, so no plan can replace a role and
         # write a new trust through CreateRole. No iam:DeleteRolePolicy, because a deleted
-        # backup policy stops the nightly upload. No iam:PassRole, since no service takes
-        # either role.
+        # backup policy takes away the laptop's restore from the bucket. No iam:PassRole,
+        # since no service takes either role.
         Sid    = "CommandRolesWrite"
         Effect = "Allow"
         Action = ["iam:CreateRole", "iam:PutRolePolicy"]
