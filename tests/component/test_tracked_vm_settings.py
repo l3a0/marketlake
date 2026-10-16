@@ -1,8 +1,8 @@
 """The tracked VM settings, ``config/vm.yaml``, say what the hosted VM runs as.
 
 ``python -m lake.vm_config render < config/vm.yaml`` merges this file with four SSM
-parameters and the instance's ``marketlake:backup-target`` tag into the VM's
-``config.yaml``, marketlake #686. cloud-init's first boot and
+parameters, the instance's ``marketlake:backup-target`` tag and its optional
+``marketlake:cost-export`` tag into the VM's ``config.yaml``, marketlake #686 and #913. cloud-init's first boot and
 #676's deploy both read it, so a change here reaches the VM through a reviewed pull
 request and nowhere else.
 """

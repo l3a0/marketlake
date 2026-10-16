@@ -1,8 +1,9 @@
 """The VM's config render: ``config.yaml`` from a tracked file, four SSM parameters and two tags.
 
 The hosted VM has to go from nothing to capturing with no login, marketlake #686, and its
-daemon cannot start without ``config.yaml``. That file holds four secrets and the backup
-target, so no tracked file can carry it whole. The owner's decision of 2026-10-06 splits
+daemon cannot start without ``config.yaml``. That file holds four secrets, the backup
+target and, where the instance carries its tag, ``cost_export``, so no tracked file can
+carry it whole. The owner's decision of 2026-10-06 splits
 it. The settings that are not secret live in the tracked ``config/vm.yaml``, which a
 reviewed pull request changes. The four secrets live in SSM Parameter Store, and the
 backup target is an instance tag. This module joins the three and writes the file, with
@@ -34,13 +35,18 @@ path answers only when the instance has ``instance_metadata_tags`` enabled, whic
 **The cost export comes from the optional ``marketlake:cost-export`` tag**, marketlake #913.
 It fills ``cost_export``, the ``s3://`` location the sweep's nightly cost read lists, and
 marketlake #912 writes it in ``infra/live/vm.tf``. It is optional because a host can run
-with no export, and a deploy can land before the infra apply that writes the tag. So a 404
-on this tag leaves the key out rather than failing the render. The backup target's tag is
-read first, so a first boot whose tags are not served yet still exits 3 on that tag before
-a 404 on this one can be read as an absent export. Every other failure of the lookup is
-handled as the backup target's is, and its value is checked the same way. The render does
-not judge the value as a bucket target. ``lake.aws_cost`` does that when it reads, so a bad
-value fails the cost read alone.
+with no export, and a deploy can land before the infra apply that writes the tag. **No
+outcome of this tag's lookup fails the render.** Only a clean value, checked as the backup
+target's is, fills the key. Every other outcome leaves the key out and the render goes on.
+A 404, the expected answer on a host with no export, says nothing. Any other outcome, a
+value that is empty, padded or not UTF-8, metadata that does not answer, an HTTP error or
+anything unexpected, prints one warning line naming the tag and the outcome's class, never
+the value and never an exception's message. Failing the render would cost capture, since
+the first boot retries only exit 1 and 3, and a fresh VM whose render failed has no
+``config.yaml`` for the daemon to load. The backup target's tag is read first, so a first
+boot whose tags are not served yet still exits 3 on that tag. The render does not judge the
+value as a bucket target. ``lake.aws_cost`` does that when it reads, so a bad value fails
+the cost read alone.
 
 **The render refuses, exits 2 and keeps any existing file**, in each of these cases.
 
@@ -57,11 +63,11 @@ value fails the cost read alone.
 6. ``bucket_credentials`` is not exactly ``instance_profile``. The render always signs
    with the instance profile, so a file saying ``keys`` would make every bucket job sign
    one way while the render that wrote it signed another.
-7. A tag's value is unusable: it is not UTF-8, is empty, or has whitespace at either
-   end. A target with a trailing newline gives the prefix ``lake\\n``, which no later
-   check catches. This runs before any credential is fetched. A tag the metadata service
-   does not serve at all is not a refusal, as the paragraph on exit 3 below says, and for
-   the cost export's tag it is not a failure either.
+7. The backup target's tag value is unusable: it is not UTF-8, is empty, or has
+   whitespace at either end. A target with a trailing newline gives the prefix
+   ``lake\\n``, which no later check catches. This runs before any credential is fetched.
+   A tag the metadata service does not serve at all is not a refusal, as the paragraph on
+   exit 3 below says. The cost export's tag never refuses, as the paragraph above says.
 8. ``InvalidParameters`` names any parameter. ``GetParameters`` answers HTTP 200 with a
    missing name listed there, and a render that read only ``Parameters`` would write a
    file missing a key, which #699's pass 3 found. A wrong region shows up here too, as
@@ -100,13 +106,14 @@ for the ``aws`` CLI on the VM: there the IAM role's policy bounds what a process
 Off the VM the metadata service does not answer, and the render exits 3. The tag lookup
 exits 3 the same way when the service does not answer, or serves no token or a token
 that is not printable ASCII without whitespace. It also exits 3 on a 404 for the backup
-target's tag, and leaves ``cost_export`` out on a 404 for the cost export's. AWS does not
+target's tag. Each of these is the backup target's tag alone, since any outcome but a clean
+value on the cost export's tag only leaves ``cost_export`` out. AWS does not
 document whether a tag given at launch is served from the first moment of
 the first boot, so a 404 may only mean the tag is not served yet, and the first boot
 retries exit 3 a bounded number of times. A 404 that lasts means the instance has no
 ``marketlake:backup-target`` tag or its ``instance_metadata_tags`` is disabled, so the
-line names both causes and the fix in ``infra/live/vm.tf``. Any other HTTP error on either
-tag exits 1, and so does a redirect, which the lookup never follows.
+line names both causes and the fix in ``infra/live/vm.tf``. Any other HTTP error on the
+backup target's tag exits 1, and so does a redirect, which the lookup never follows.
 
 **The write is atomic and private.** The temp file sits beside the target and is created
 at mode 0600 with ``O_EXCL``, rather than chmodded after the secrets land. It is fsynced
@@ -198,8 +205,8 @@ BACKUP_TARGET_TAG = "marketlake:backup-target"
 BACKUP_TARGET_KEY = "backup_target"
 
 # The optional instance tag that carries ``cost_export``, the cost export's ``s3://``
-# location, marketlake #913. ``infra/live/vm.tf`` writes it, marketlake #912, and a tag the
-# metadata service does not serve leaves the key out.
+# location, marketlake #913. ``infra/live/vm.tf`` writes it, marketlake #912, and any outcome
+# of its lookup but a clean value leaves the key out rather than failing the render.
 COST_EXPORT_TAG = "marketlake:cost-export"
 
 # Every key the render fills, which the tracked settings therefore must not set.
@@ -235,9 +242,9 @@ NO_TAG_YET = "no tag yet"
 FAILED = "failed"
 
 # The exit code each outcome gives. A refusal raises ``RenderRefused`` instead, which
-# ``main`` turns into exit 2. A tag the metadata service does not serve gives 3 rather
-# than 2, because at first boot it may only be not served yet, and 3 is what the first
-# boot retries.
+# ``main`` turns into exit 2. A backup target's tag the metadata service does not serve
+# gives 3 rather than 2, because at first boot it may only be not served yet, and 3 is
+# what the first boot retries.
 EXIT_CODES = {
     WROTE: 0,
     UNCHANGED: 0,
@@ -631,11 +638,12 @@ def render(
     The refusals and their order are the module docstring's, and each raises
     ``RenderRefused`` before anything is written. ``tag_reader`` is called with a tag's name
     once the settings pass, before any credential is fetched, and returns that tag's raw
-    value. It is called for the backup target's tag first and the cost export's second. It
-    raises ``MetadataUnavailable``, which becomes ``no credentials``, ``TagNotServed``,
-    which becomes ``no tag yet`` for the backup target's tag and an absent ``cost_export``
-    for the cost export's, ``TagLookupFailed``, which becomes ``failed``, or
-    ``RenderRefused``. ``client_factory`` is called next with
+    value. It is called for the backup target's tag first and the cost export's second. For
+    the backup target's tag it raises ``MetadataUnavailable``, which becomes
+    ``no credentials``, ``TagNotServed``, which becomes ``no tag yet``,
+    ``TagLookupFailed``, which becomes ``failed``, or ``RenderRefused``. For the cost
+    export's, any outcome but a clean value leaves ``cost_export`` out, and every one but
+    ``TagNotServed`` prints a warning line. ``client_factory`` is called next with
     the settings' ``bucket_region``, so a metadata service with no credentials yet becomes
     ``no credentials``. An AWS failure becomes ``failed``, named by its code or type.
     ``config_path`` defaults to ``config.default_config_path()``, resolved when this runs.
@@ -687,26 +695,9 @@ def render(
     if refusal is not None:
         raise _refused(target, refusal)
 
-    # The cost export's tag is optional, so a 404 leaves ``cost_export`` out. Every other
-    # outcome is the backup target's, named for this tag.
-    cost_export: str | None = None
-    try:
-        cost_export = _check_tag(tag_reader(COST_EXPORT_TAG), COST_EXPORT_TAG)
-    except TagNotServed:
-        cost_export = None
-    except MetadataUnavailable as exc:
-        return RenderResult(
-            NO_CREDENTIALS,
-            f"no credentials: the instance metadata service did not answer the "
-            f"{COST_EXPORT_TAG} tag lookup ({exc.detail}), so no parameter was read and "
-            f"{target} was left as it was. Retry once the metadata service answers",
-        )
-    except TagLookupFailed as exc:
-        return _failed(target, f"the {COST_EXPORT_TAG} tag could not be read (HTTP {exc.status})")
-    except RenderRefused as exc:
-        refusal = str(exc)
-    if refusal is not None:
-        raise _refused(target, refusal)
+    # The cost export's tag is optional, and no outcome of its lookup fails the render. Only
+    # a clean value fills ``cost_export``.
+    cost_export = _optional_cost_export(tag_reader)
 
     try:
         client = client_factory(region)
@@ -752,6 +743,39 @@ def render(
         )
     _write(target, yaml.safe_dump(merged, sort_keys=True))
     return RenderResult(WROTE, _wrote_line(target, state, previous, merged))
+
+
+def _optional_cost_export(tag_reader: Callable[[str], object]) -> str | None:
+    """The cost export's tag value, or ``None`` when it does not read cleanly.
+
+    A 404 is a host with no export, or a deploy that landed before the infra apply wrote the
+    tag, so it leaves the key out and says nothing. Every other outcome leaves the key out
+    too, and prints one warning line naming the tag and the outcome's class, never the value
+    and never an exception's message. Failing the render instead would cost capture on a
+    fresh VM, because the first boot retries only exit 1 and 3 and a failed render leaves no
+    ``config.yaml`` for the daemon to load. A bad export costs only the nightly cost read,
+    marketlake #913.
+    """
+    outcome = None
+    try:
+        return _check_tag(tag_reader(COST_EXPORT_TAG), COST_EXPORT_TAG)
+    except TagNotServed:
+        return None
+    except MetadataUnavailable:
+        outcome = "lookup got no answer from the instance metadata service"
+    except TagLookupFailed as exc:
+        outcome = f"lookup answered HTTP {exc.status}"
+    except RenderRefused:
+        outcome = "value is empty, padded with whitespace or not UTF-8 text"
+    except Exception as exc:  # noqa: BLE001 - an optional tag must never fail the render
+        outcome = f"lookup raised {type(exc).__name__}"
+    print(
+        f"vm_config: warning: {COST_EXPORT_KEY} was left out, because the {COST_EXPORT_TAG} "
+        f"tag's {outcome}. The render went on, and the sweep runs no cost read until the tag "
+        "reads cleanly",
+        file=sys.stderr,
+    )
+    return None
 
 
 def _refused(target: Path, why: str) -> RenderRefused:

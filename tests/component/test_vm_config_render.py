@@ -1075,7 +1075,8 @@ def test_a_cost_tag_the_service_does_not_serve_leaves_the_key_out(
 ):
     """A 404 on the cost tag is a host with no export, or a deploy that landed before the
     infra apply wrote the tag. The render writes the rest and exits 0, and the backup
-    target's tag is asked for first, so its own 404 still exits 3 before this one is read."""
+    target's tag is asked for first, so its own 404 still exits 3 before this one is read.
+    A 404 is the expected answer on a host with no export, so it prints no warning."""
     SsmHook().install(monkeypatch)
 
     assert _render(monkeypatch, _settings_bytes()) == 0
@@ -1083,6 +1084,7 @@ def test_a_cost_tag_the_service_does_not_serve_leaves_the_key_out(
     written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
     assert written == EXPECTED
     assert "cost_export" not in written
+    assert _one_line(capsys).startswith("vm_config: wrote ")
     reads = [path for method, path, _ in metadata.requests if "/tags/instance/" in path]
     assert reads == [TAG_PATH, COST_TAG_PATH]
 
@@ -1101,28 +1103,49 @@ def test_the_backup_tags_404_exits_three_before_the_cost_tag_is_asked_for(
     assert reads == [TAG_PATH]
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("", "the marketlake:cost-export tag is empty or not text"),
-        (f"{COST_TARGET}\n", "the marketlake:cost-export tag has whitespace at its start or end"),
-        (b"\xff", "the marketlake:cost-export tag is not UTF-8 text"),
-    ],
-    ids=["empty", "a trailing newline", "bytes that are not UTF-8"],
+# The warning a cost tag the render cannot use prints, up to the outcome it names.
+COST_WARNING = (
+    "vm_config: warning: cost_export was left out, because the marketlake:cost-export tag's "
 )
-def test_a_cost_tag_the_render_cannot_use_refuses_and_is_never_printed(
-    monkeypatch, capsys, metadata, config_dir, not_root, value, expected
+COST_WARNING_END = (
+    ". The render went on, and the sweep runs no cost read until the tag reads cleanly"
+)
+UNUSABLE = "value is empty, padded with whitespace or not UTF-8 text"
+
+
+def _lines(capsys) -> list[str]:
+    """Every line the render printed, after the checks ``_one_line`` makes on its one."""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    for sentinel in (*SENTINELS, "sentinel-billing"):
+        assert sentinel not in captured.err
+    assert "Traceback" not in captured.err
+    return captured.err.strip().splitlines()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", f"{COST_TARGET}\n", f" {COST_TARGET}", b"\xff"],
+    ids=["empty", "a trailing newline", "a leading space", "bytes that are not UTF-8"],
+)
+def test_a_cost_tag_the_render_cannot_use_is_left_out_with_a_warning_and_never_printed(
+    monkeypatch, capsys, metadata, config_dir, not_root, value
 ):
+    """A bad optional tag must never fail the render, marketlake #913. A refusal would exit
+    2, which the first boot does not retry, and leave a fresh VM with no ``config.yaml`` and
+    so no capture. The render writes everything else, leaves ``cost_export`` out, and prints
+    one warning that names the tag and the outcome's class but never the value."""
     hook = SsmHook().install(monkeypatch)
     metadata.tags[COST_TAG] = value
-    before = _existing(config_dir)
 
-    assert _render(monkeypatch, _settings_bytes()) == 2
+    assert _render(monkeypatch, _settings_bytes()) == 0
 
-    line = _assert_refused(capsys, config_dir, before)
-    assert expected in line
-    assert "sentinel-billing" not in line
-    assert hook.requests == []
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written == EXPECTED
+    assert len(hook.requests) == 1
+    warning, wrote = _lines(capsys)
+    assert warning == f"{COST_WARNING}{UNUSABLE}{COST_WARNING_END}"
+    assert wrote.startswith("vm_config: wrote ")
 
 
 def _cost_tag_raises(error):
@@ -1134,37 +1157,82 @@ def _cost_tag_raises(error):
     return reader
 
 
+class _Unexpected(Exception):
+    pass
+
+
 @pytest.mark.parametrize(
-    ("error", "outcome", "expected"),
+    ("error", "outcome"),
     [
         (
             vm_config.MetadataUnavailable("URLError"),
-            vm_config.NO_CREDENTIALS,
-            "did not answer the marketlake:cost-export tag lookup (URLError)",
+            "lookup got no answer from the instance metadata service",
         ),
-        (
-            vm_config.TagLookupFailed(500),
-            vm_config.FAILED,
-            "the marketlake:cost-export tag could not be read (HTTP 500)",
-        ),
+        (vm_config.TagLookupFailed(500), "lookup answered HTTP 500"),
+        (vm_config.TagLookupFailed(302), "lookup answered HTTP 302"),
+        (vm_config.RenderRefused("the marketlake:cost-export tag is not UTF-8 text"), UNUSABLE),
+        (_Unexpected(ERROR_MESSAGE), "lookup raised _Unexpected"),
     ],
-    ids=["no answer", "an HTTP error"],
+    ids=["no answer", "an HTTP error", "a redirect", "a refused value", "anything else"],
 )
-def test_a_cost_tag_lookup_that_fails_reads_no_parameter(tmp_path, error, outcome, expected):
-    """Only a 404 means an absent export. Any other failure of the lookup is the backup
-    target's, named for this tag, and the render reads no parameter and writes nothing."""
+def test_a_cost_tag_lookup_that_fails_leaves_the_key_out_and_still_writes(
+    tmp_path, capsys, error, outcome
+):
+    """Only a clean value fills ``cost_export``. Every other outcome of the lookup leaves the
+    key out and the render goes on to write the file with the backup target and the
+    parameters, saying what happened in one line that carries no exception's message."""
+    path = tmp_path / CONFIG_FILE
     result = vm_config.render(
         _settings_bytes(),
-        client_factory=_no_client_wanted,
+        client_factory=lambda region: _OneParameterStore(),
         tag_reader=_cost_tag_raises(error),
-        config_path=tmp_path / CONFIG_FILE,
+        config_path=path,
         geteuid=lambda: 1000,
     )
 
-    assert result.outcome == outcome
-    assert expected in result.line
+    assert result.outcome == vm_config.WROTE
+    assert yaml.safe_load(path.read_text()) == EXPECTED
+    assert _lines(capsys) == [f"{COST_WARNING}{outcome}{COST_WARNING_END}"]
+
+
+def test_a_cost_tag_that_reads_cleanly_prints_no_warning(tmp_path, capsys):
+    path = tmp_path / CONFIG_FILE
+
+    def reader(tag):
+        return TARGET if tag == TAG else COST_TARGET
+
+    result = vm_config.render(
+        _settings_bytes(),
+        client_factory=lambda region: _OneParameterStore(),
+        tag_reader=reader,
+        config_path=path,
+        geteuid=lambda: 1000,
+    )
+
+    assert result.outcome == vm_config.WROTE
+    assert yaml.safe_load(path.read_text()) == {**EXPECTED, "cost_export": COST_TARGET}
+    assert capsys.readouterr().err == ""
+
+
+def test_a_bad_backup_tag_still_refuses_before_the_cost_tag_is_asked_for(tmp_path):
+    """The backup tag's own rules do not move: an unusable value refuses with exit 2, and
+    the cost tag is never read."""
+    asked: list[str] = []
+
+    def reader(tag):
+        asked.append(tag)
+        return "" if tag == TAG else COST_TARGET
+
+    with pytest.raises(vm_config.RenderRefused, match="marketlake:backup-target tag is empty"):
+        vm_config.render(
+            _settings_bytes(),
+            client_factory=_no_client_wanted,
+            tag_reader=reader,
+            config_path=tmp_path / CONFIG_FILE,
+            geteuid=lambda: 1000,
+        )
+    assert asked == [TAG]
     assert not (tmp_path / CONFIG_FILE).exists()
-    assert vm_config.EXIT_CODES[outcome] == (3 if outcome == vm_config.NO_CREDENTIALS else 1)
 
 
 def test_a_tag_that_appears_on_a_later_try_is_written(

@@ -827,14 +827,17 @@ the VM with the apply that changes the tag in place.
 `python -m lake.vm_config render < config/vm.yaml` writes the VM's `config.yaml`. It
 joins the four secret parameters and the tag with the tracked `config/vm.yaml`, which
 holds the settings that are not secret. The token goes to `token.json` through its own
-pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A tag the metadata
-service does not serve gives exit 3, which the first boot retries, because AWS does
-not document that a tag given at launch is served from the first moment of the
-first boot. The line names both causes. Either the tag is not served yet, or the
-instance has no tag or has `instance_metadata_tags` disabled, which the owner fixes in
+pull ([#636](https://github.com/l3a0/marketlake/issues/636)). A backup target's tag
+the metadata service does not serve gives exit 3, which the first boot retries,
+because AWS does not document that a tag given at launch is served from the first
+moment of the first boot. The line names both causes. Either the tag is not served
+yet, or the instance has no tag or has `instance_metadata_tags` disabled, which the owner fixes in
 `vm.tf`. Metadata that does not answer also gives exit 3. Any other HTTP error from
 it gives exit 1, and so does a redirect, which the render never follows. A tag value
-that is empty, padded or not UTF-8 makes the render refuse with exit 2.
+that is empty, padded or not UTF-8 makes the render refuse with exit 2. The optional
+`marketlake:cost-export` tag never fails the render, since any outcome of its lookup
+but a clean value only leaves `cost_export` out
+([#913](https://github.com/l3a0/marketlake/issues/913)).
 
 The code manages no parameter and names only the path. A parameter resource needs its
 value at apply time, so CI would hold every secret, and a data source writes the decrypted
