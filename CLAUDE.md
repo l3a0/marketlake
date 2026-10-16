@@ -187,6 +187,14 @@ Branch before the first edit, not just before the commit. The moment a task will
 
 When a deployment waits on approval, the session tells the owner which run is waiting, as a link to the run per the writing-style rule above, and leaves it waiting. `gh run view <id>` shows the waiting job without touching the approval.
 
+**Give the owner the command that approves each waiting run (owner directive, 2026-10-16).** Beside each run's link, the session writes the command that approves it, in its own `bash` fence, for the owner to copy and run. The session never runs the command itself, by any route, and that includes a terminal tool that types into the owner's own terminal. The command posts to the run's `pending_deployments` path with the id of the environment the run waits in, and resolves that id from the environment's name:
+
+```bash
+gh api --method POST repos/l3a0/marketlake/actions/runs/<run>/pending_deployments -F "environment_ids[]=$(gh api repos/l3a0/marketlake/environments --jq '.environments[] | select(.name == "<environment>") | .id')" -f state=approved -f comment='Approved by the owner'
+```
+
+Fill in the run's id and the environment's name, such as `infra` or `deploy`. GitHub requires the comment. A run queued behind another in the same concurrency group shows `pending` in `gh run view` rather than `waiting`, so give its command once it reaches `waiting`. When the order of approvals matters, as with an infra apply that must land before a deploy renders its tags, list the commands in that order and say why. On 2026-10-16 a report linked three waiting runs, and the owner asked for the commands rather than approving each one in the browser.
+
 Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. The approval is the human check on what a session wrote, and a session that approves its own change removes that check.
 
 A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the directive up. It refuses a `gh api` or `curl` command that names any of these REST paths or GraphQL mutations:
