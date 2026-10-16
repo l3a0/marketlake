@@ -257,6 +257,16 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
         assert marker not in rest
 
 
+def test_an_error_drawing_the_cost_panel_is_caught_on_its_own_chain():
+    """A throw inside ``renderCost`` must land in ``costFailed``. Passed as ``then``'s second
+    argument, ``costFailed`` catches only a failed fetch, so a render error would reject the
+    ``Promise.all`` that resets ``inFlight``, and every panel would stop refreshing. Nothing
+    in the repository runs the page's JavaScript, so the chain is read off the source."""
+    page = dashboard.load_status_page().decode()
+    statements = re.findall(r"var cost = ([^;]*);", page)
+    assert statements == ['getJSON("/api/cost").then(renderCost).catch(costFailed)']
+
+
 def test_the_declared_icon_sizes_match_the_sizes_the_icon_carries():
     # The ``sizes`` attribute is a claim about a binary the HTML cannot see. Checking it
     # here means a size added to the renderer without updating the page fails a test

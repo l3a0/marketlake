@@ -84,8 +84,9 @@ run including a holiday no-op, for the close+5 guard's reason, since an absent f
 told from a run that never happened.
 
 It sits at the root because nothing else does. Six named subdirectories sit under it, so a
-reader globbing ``reports/*.json`` picks up the nightly files and nothing else, and the six
-counting globs each name their own directory.
+reader globbing ``reports/*.json`` picks up the nightly files and nothing else. Five of them
+hold a producer's findings, and the counting glob for each names its own directory. The
+sixth, ``aws_cost/``, has no counting glob, and the dashboard's Cost panel scans it.
 
 The vendor sweep writes a second file of its own, in a subdirectory: on a host whose
 ``config.yaml`` names a cost export, ``lake.aws_cost`` files the night's summary of the AWS

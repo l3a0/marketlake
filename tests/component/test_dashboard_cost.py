@@ -364,6 +364,45 @@ def test_nothing_in_a_file_of_the_wrong_types_raises(root: Path):
 # -- the trend -----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("bare", ["NaN", "Infinity", "-Infinity"])
+def test_a_number_that_is_not_finite_never_reaches_the_page(root: Path, bare: str):
+    """Python's ``json`` reads a bare ``NaN`` and would write it back out, and the page's
+    ``JSON.parse`` refuses it, which would leave the whole Cost panel unreadable."""
+    current = october(total="__total__")
+    current["projection"]["month_end"] = "__month_end__"
+    text = json.dumps(entry("2026-10-16", "2026-10", "delivery", current=current))
+    text = text.replace('"__total__"', bare).replace('"__month_end__"', bare)
+    file(root, "2026-10-16", text)
+
+    payload = cost(root)
+
+    assert payload["current"]["total"] is None
+    assert payload["current"]["projection"]["month_end"] is None
+    json.dumps(payload, allow_nan=False)
+
+
+def test_a_previous_error_field_is_tolerated(root: Path):
+    """The writer names a failed read of the closed month in ``previous_error``, beside a
+    current block that still reads."""
+    file(
+        root,
+        "2026-10-16",
+        entry(
+            "2026-10-16",
+            "2026-10",
+            "delivery",
+            current=october(),
+            previous_error="a data file's Parquet footer could not be read",
+        ),
+    )
+
+    payload = cost(root)
+
+    assert payload["state"] == "delivery"
+    assert payload["current"]["total"] == pytest.approx(13.65)
+    assert payload["previous"] is None
+
+
 def test_the_trend_is_thirty_calendar_days_from_both_series(root: Path):
     previous = september(daily={"2026-09-16": {"AmazonEC2": 0.5}, "2026-09-15": {"AmazonEC2": 9.9}})
     current = october(

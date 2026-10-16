@@ -40,9 +40,11 @@ Every stored version carries a ``LastModified``, which ``ListObjectsV2``, ``Head
 ``GetObject`` answer with, as S3 does. ``store`` takes one, and a version stored without one
 gets the fake's own clock, which starts at ``EPOCH`` and moves one second per version, so a
 later write is always newer. ``deny_prefixes`` refuses a ``ListObjectsV2`` whose ``Prefix``,
-or a ``HeadObject`` whose ``Key``, starts with one of them, as AccessDenied, which is how a
-test models a list grant conditioned on ``s3:prefix`` that no longer covers a path. The cost
-read's manifest barrier and its removed grant are tested through these (marketlake #913).
+or a ``HeadObject`` whose ``Key``, starts with one of them, as S3 refuses a denied request:
+AccessDenied for the list, and a bare ``403`` for the head, whose answer carries no body to
+name a code. That is how a test models a list grant conditioned on ``s3:prefix`` that no
+longer covers a path. The cost read's manifest barrier and its removed grant are tested
+through these (marketlake #913).
 """
 
 from __future__ import annotations

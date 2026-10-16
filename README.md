@@ -105,7 +105,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
   keeping the old file when any input is wrong. An optional `marketlake:cost-export` tag
-  fills `cost_export`, and a tag the instance does not carry leaves the key out.
+  fills `cost_export` when its value reads cleanly, and any other outcome leaves the key
+  out without failing the render.
 - `src/lake/aws_cost.py` is the 18:30 sweep's read of the AWS cost and usage export. It
   lists the export behind its manifest, aggregates the Parquet with pyarrow in a temp
   directory outside the lake, and writes one summary per run under

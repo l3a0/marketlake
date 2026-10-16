@@ -1,9 +1,11 @@
-"""The four named queries over a real fixture lake.
+"""The five named queries over a real fixture lake.
 
 These lay down journal segments in the pinned capture schemas and sealed partitions in
-the fixture schema, then run the Now, Today, History and Lake queries against them through the real
-sandboxed connection. The clock and the calendar are fakes, so the one real boundary is
-the filesystem and the tier is component.
+the fixture schema, then run the Now, Today, History and Lake queries against them through
+the real sandboxed connection. The clock and the calendar are fakes, so the one real
+boundary is the filesystem and the tier is component. The Cost query reads no segment and
+no partition, so its own tests are in ``test_dashboard_cost.py``, and here it joins only the
+test that the panels leave the lake byte-identical.
 
 The fixture is a small, known Monday with every row kind the panels distinguish, plus a
 prior Friday and Thursday so the Now query has a gap-only latest day to walk back past

@@ -42,8 +42,10 @@ A bucket name cannot hold ``:``, so the ARN rule never touches one, and the seco
 covers a bucket named after the account.
 
 **The figures**, each defined so two builders compute the same number. N is the newest
-usage day in the period's delivery, which is partial, so the complete window runs from the
-period's first day through N − 1, counted in calendar days.
+usage day in the period's delivery, taken from the usage lines alone, since a tax or credit
+line can be dated the period's last day. N is partial, so the complete window runs from the
+period's first day through N − 1, counted in calendar days. A period whose delivery holds
+no usage line has no N, and both figures read ``too_early``.
 
 1. The projection scales the usage lines, ``Usage``, ``DiscountedUsage`` and
    ``SavingsPlanCoveredUsage``, from that window to the whole month, and adds every other
@@ -76,13 +78,22 @@ The field is ``error`` and never ``problems``, which in the nightly files means 
 the ping". A ``previous`` block rides along whenever the previous period reads, whatever the
 current state, so the closed month still shows on the 1st. A previous period with no
 delivery, which is every night of the export's first month, or one whose barrier refused,
-omits the block and never changes the state.
+omits the block and never changes the state. So does a previous period whose read fails,
+and the file then names the failure in a top-level ``previous_error``, as ``error`` names
+one, because AWS re-delivers a closed month for up to two weeks and a corrupt chunk there
+must not blank the current month's figures for as long.
+
+**Every number the file holds is finite.** A period whose cost or usage amount sums to NaN
+or an infinity is refused as ``failed``, and the writer encodes with ``allow_nan`` off, since
+a bare ``NaN`` in the file would reach ``/api/cost`` and the page's ``JSON.parse`` refuses
+it.
 """
 
 from __future__ import annotations
 
 import calendar as month_calendar
 import json
+import math
 import os
 import re
 import tempfile
@@ -371,6 +382,10 @@ def _read_period(client: Any, target: BucketTarget, period: str, workdir: Path) 
     currencies = {value for value in pc.unique(table["currency"]).to_pylist() if value}
     if len(currencies) > 1:
         raise CostReadRefused("a billing period holds more than one currency")
+    if not math.isfinite(_sum(table)):
+        raise CostReadRefused("a billing period's cost sums to a number that is not finite")
+    if not math.isfinite(_sum(table, "amount")):
+        raise CostReadRefused("a billing period's usage amount sums to a number that is not finite")
     accounts = {
         value
         for value in pc.unique(table["account"]).to_pylist()
@@ -531,7 +546,12 @@ def current_figures(read: _Period, *, sessions: set[date], accounts: set[str]) -
     first = period_start(period)
     month_days = days_in_period(period)
     usage = _usage_mask(table)
-    newest = pc.max(table["day"]).as_py() if table.num_rows else None
+    # N is the newest usage day. A tax, credit or fee line can be dated the period's last day
+    # while usage runs only to the 15th, so a day taken over every line would move N, and the
+    # projection and cost per session with it. A period with no usage line has no N, which
+    # reads as too early.
+    usage_days = table.filter(usage)["day"]
+    newest = pc.max(usage_days).as_py() if len(usage_days) else None
     complete = newest - timedelta(days=1) if newest is not None else None
     too_early = complete is None or complete < first
 
@@ -656,7 +676,15 @@ def read_cost(source: ClientSource, lake_root: Path | str, *, now: datetime) -> 
             if not page.get("Contents"):
                 entry["state"] = NO_EXPORT
                 return entry
-        previous = _read_period(client, target, previous_period(period), workdir)
+        # The previous period fails apart from the current one. AWS re-delivers a closed
+        # month for up to two weeks, so a corrupt chunk there would otherwise blank this
+        # month's figures for as long.
+        previous_name = previous_period(period)
+        previous = _Period(previous_name, NO_DELIVERY)
+        try:
+            previous = _read_period(client, target, previous_name, workdir)
+        except Exception as exc:  # noqa: BLE001 - the closed month never fails the current one
+            entry["previous_error"] = _error_of(exc)
     entry["state"] = current.state
     if current.state != DELIVERY and previous.state != DELIVERY:
         return entry
@@ -666,8 +694,16 @@ def read_cost(source: ClientSource, lake_root: Path | str, *, now: datetime) -> 
     if current.state == DELIVERY:
         entry["current"] = current_figures(current, sessions=sessions, accounts=accounts)
     if previous.state == DELIVERY:
-        entry["previous"] = previous_figures(previous, sessions=sessions, accounts=accounts)
+        try:
+            entry["previous"] = previous_figures(previous, sessions=sessions, accounts=accounts)
+        except Exception as exc:  # noqa: BLE001 - the closed month never fails the current one
+            entry["previous_error"] = _error_of(exc)
     return entry
+
+
+def _error_of(exc: BaseException) -> str:
+    """What a file says of a failure: a refusal's fixed reason, or the exception's type."""
+    return exc.reason if isinstance(exc, CostReadRefused) else type(exc).__name__
 
 
 def _entry(now: datetime, period: str) -> dict[str, Any]:
@@ -691,10 +727,8 @@ def run(source: ClientSource, lake_root: Path | str, *, now: datetime) -> dict[s
     """
     try:
         return read_cost(source, lake_root, now=now)
-    except CostReadRefused as exc:
-        error = exc.reason
     except Exception as exc:  # noqa: BLE001 - every failure is a failed file, never a crash
-        error = type(exc).__name__
+        error = _error_of(exc)
     entry = _entry(now, period_of(now.astimezone(UTC).date()))
     entry["error"] = error
     return entry
@@ -741,7 +775,8 @@ def write_cost_report(
     and the pid, opened in mode ``"x"``. A fixed name would refuse a second sweep on one
     night, and the nightly upload compares by size, so a same-size rewrite would never reach
     the backup. A missing lake root is refused, as ``report.write_nightly`` refuses it,
-    because ``parents=True`` would otherwise create the lake itself.
+    because ``parents=True`` would otherwise create the lake itself. A number that is not
+    finite raises ``ValueError`` before the file is created.
     """
     pid = os.getpid() if pid is None else pid
     eastern = now.astimezone(MARKET_TZ)
@@ -751,8 +786,12 @@ def write_cost_report(
     directory = cost_report_dir(root, eastern.date())
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{eastern.strftime('%H%M%S%f')}-{pid}.json"
+    # Encoded before the file opens, with ``allow_nan`` off, so a number JSON cannot hold
+    # raises here and leaves no torn file behind, rather than writing a bare ``NaN`` the
+    # page's ``JSON.parse`` refuses.
+    text = json.dumps(entry, sort_keys=True, allow_nan=False)
     with open(path, "x", encoding="utf-8") as handle:
-        json.dump(entry, handle, sort_keys=True)
+        handle.write(text)
         handle.write("\n")
     return path
 

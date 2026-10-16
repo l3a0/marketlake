@@ -548,12 +548,13 @@ def test_an_ordinary_evening_runs_every_walk_pings_files_and_sends_one_digest(
 def test_the_report_file_lands_at_the_reports_root_and_no_existing_reader_picks_it_up(
     fixture_lake: FixtureLake,
 ):
-    """The four named subdirectories are what the counting globs read, and this is not one.
+    """The six named subdirectories are what the producers' readers glob, and this is not one.
 
-    ``alert.undelivered`` counts ``reports/alerts/date=D/``, and the three writers in
-    ``lake.report`` each build a named subdirectory. A nightly file placed inside any of them
-    would inflate that producer's count. A flat file at the root is picked up by
-    ``reports/*.json`` and by nothing else.
+    ``alert.undelivered`` counts ``reports/alerts/date=D/``, the writers in ``lake.report``
+    each build a named subdirectory, and ``lake.aws_cost`` builds ``reports/aws_cost/``. A
+    nightly file placed inside any of them would inflate that producer's count, or reach the
+    Cost panel's scan. A flat file at the root is picked up by ``reports/*.json`` and by
+    nothing else.
     """
     root = _lake(fixture_lake)
     _run(root)
@@ -4419,6 +4420,37 @@ def test_a_cost_file_that_cannot_be_written_is_a_line_and_not_a_lost_run(
     assert "aws cost report not written: NotADirectoryError" in outcome.nightly.report
     assert kind_of(outcome.nightly, "aws cost report not written") == ACTION
     assert len(_filed(root)) == 1
+
+
+def test_anything_the_cost_step_did_not_expect_is_a_line_and_not_a_lost_run(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The step's outer catch is the backstop for whatever ``run`` and the writer's own catch
+    do not cover. A raise from building the report line reaches it, and the run still pings,
+    files its nightly report and hands off, with an action line naming the type."""
+
+    class _Unexpected(Exception):
+        pass
+
+    def raises(entry):
+        raise _Unexpected("a message that names example-billing")
+
+    monkeypatch.setattr(sweep.aws_cost, "report_line", raises)
+    root = _lake(fixture_lake)
+
+    outcome, pinger, _ = _run(
+        root, cost_client=lambda: (COST_TARGET, FakeS3("example-billing", versioning=None))
+    )
+
+    assert outcome.ok is True
+    assert pinger.urls == [PING_URL]
+    assert outcome.nightly.problems == ()
+    assert "aws cost read failed: _Unexpected" in outcome.nightly.report
+    assert kind_of(outcome.nightly, "aws cost read failed") == ACTION
+    assert not any("example-billing" in line for line in outcome.nightly.report)
+    [filed] = _filed(root)
+    assert "aws cost read failed: _Unexpected" in filed["report"]
+    assert outcome.hand_off is True
 
 
 def test_a_failed_cost_read_still_exits_zero_and_hands_off_from_the_command(

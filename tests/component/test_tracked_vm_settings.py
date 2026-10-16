@@ -2,9 +2,9 @@
 
 ``python -m lake.vm_config render < config/vm.yaml`` merges this file with four SSM
 parameters, the instance's ``marketlake:backup-target`` tag and its optional
-``marketlake:cost-export`` tag into the VM's ``config.yaml``, marketlake #686 and #913. cloud-init's first boot and
-#676's deploy both read it, so a change here reaches the VM through a reviewed pull
-request and nowhere else.
+``marketlake:cost-export`` tag into the VM's ``config.yaml``, marketlake #686 and #913.
+cloud-init's first boot and #676's deploy both read it, so a change here reaches the VM
+through a reviewed pull request and nowhere else.
 """
 
 from __future__ import annotations

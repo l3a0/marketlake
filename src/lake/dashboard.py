@@ -105,6 +105,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -2973,10 +2974,16 @@ def billed_size(gb_months: float, day: date) -> float:
 
 
 def _cost_number(value: object) -> float | None:
-    """A number from a cost file, or ``None`` for anything that is not one. A bool is not."""
+    """A finite number from a cost file, or ``None`` for anything that is not one.
+
+    A bool is not one. Nor is NaN or an infinity, which Python's ``json`` reads from a bare
+    ``NaN`` or ``Infinity`` and would write back out the same way, and the page's
+    ``JSON.parse`` refuses both, which would leave the Cost panel unreadable.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _cost_text(value: object) -> str | None:

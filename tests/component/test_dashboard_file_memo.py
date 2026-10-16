@@ -52,12 +52,14 @@ TICKERS = ("SPY", "QQQ")
 SURFACES = ("chains", "quotes")
 SEGMENTS_PER_TICKER_SURFACE = 3
 
-# The order ``status.html``'s ``refresh`` fires them: history, lake and now together, then
-# today once now has answered.
-REFRESH_ORDER = ("history", "lake", "now", "today")
+# The order ``status.html``'s ``refresh`` fires them: history, lake, cost and now together,
+# then today once now has answered. Cost reads the sweep's report files and no segment or
+# partition, so it belongs here to show that it reads none and runs beside the rest.
+REFRESH_ORDER = ("history", "lake", "cost", "now", "today")
 
 # The panels that read segments and partitions. Lake reads only sizes, and its free-space
-# figure is the real device's, which moves between two calls, so it is not compared.
+# figure is the real device's, which moves between two calls, so it is not compared. Cost
+# reads neither.
 READS_FILES = ("history", "now", "today")
 
 
@@ -226,7 +228,7 @@ def service_over(
 
 
 def refresh(service: DashboardService) -> dict[str, dict[str, object]]:
-    """One page refresh: the four queries, in the order the page fires them."""
+    """One page refresh: the five queries, in the order the page fires them."""
     return {name: service.run_query(name, {}) for name in REFRESH_ORDER}
 
 
@@ -274,11 +276,11 @@ def test_one_refresh_reads_each_segment_and_each_partition_once(
         before = Counter(segment_reads)
         service.run_query(name, {})
         per_query[name] = segment_reads - before
-    # History runs first and reads every segment. Lake opens none, and Now and Today
-    # find every segment already counted. Before the memo each of the three read all.
+    # History runs first and reads every segment. Lake and Cost open none, and Now and
+    # Today find every segment already counted. Before the memo each of the three read all.
     assert segment_reads == Counter(dict.fromkeys(segments, 1))
     assert per_query["history"] == Counter(dict.fromkeys(segments, 1))
-    for name in ("lake", "now", "today"):
+    for name in ("lake", "cost", "now", "today"):
         assert per_query[name] == Counter(), name
     # Every sealed partition is read once too, including IWM's Friday, which History's
     # bulk read counts and Now's walk then finds remembered.
@@ -777,7 +779,7 @@ def test_no_access_to_the_memo_runs_inside_a_write(second: str):
 def test_panels_refreshing_together_answer_as_they_do_one_at_a_time(
     fixture_lake: FixtureLake, partition_reads: Counter
 ):
-    # ``status.html`` fires History, Lake and Now at once, and a second tab fires its own
+    # ``status.html`` fires History, Lake, Cost and Now at once, and a second tab fires its own
     # set beside them. Every one of them must read the shared memo as if it were alone.
     root, _, _ = build_lake(fixture_lake)
     expected = refresh(service_over(root, Counter()))

@@ -1630,8 +1630,11 @@
     // reach the two panels reading this minute.
     var lake = getJSON("/api/lake").then(renderLake, lakeFailed);
     // On its own chain for the same reason. It reads the sweep's cost files, which say
-    // nothing about this minute, so its failure paints only its own section.
-    var cost = getJSON("/api/cost").then(renderCost, costFailed);
+    // nothing about this minute, so its failure paints only its own section. The catch
+    // follows the render rather than sitting beside it, so an error thrown while drawing
+    // the panel lands in costFailed too. Beside it, that error would reject Promise.all
+    // below, inFlight would never reset, and every panel would stop refreshing.
+    var cost = getJSON("/api/cost").then(renderCost).catch(costFailed);
     getJSON("/api/now").then(function (now) {
       pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));

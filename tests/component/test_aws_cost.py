@@ -342,6 +342,76 @@ def test_the_closed_month_uses_all_of_its_days(root: Path):
     assert previous["delivered_at"] == MANIFEST_AT.isoformat()
 
 
+def test_a_non_usage_line_dated_the_last_day_does_not_move_n(root: Path):
+    """N is the newest usage day. A $0 tax line dated 31 October would move N to the 31st,
+    the window to 30 days and the projection with it, were N taken over every line."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    rows = october() + [line(at(31), "AmazonEC2", "", 0.0, line_type="Tax")]
+    deliver(s3, "2026-10", parquet(rows))
+
+    current = read(s3, root)["current"]
+
+    assert current["newest_day"] == "2026-10-15"
+    assert current["complete_through"] == "2026-10-14"
+    assert current["projection"]["window_days"] == 14
+    assert current["projection"]["month_end"] == pytest.approx(25.20)
+    assert current["cost_per_session"]["value"] == pytest.approx(0.98)
+    assert current["sessions"] == 10
+
+
+def test_a_period_with_no_usage_line_is_too_early_for_either_figure(root: Path):
+    """A delivery holding only a fee and a credit has no usage day, so it has no N."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    rows = [
+        line(at(1), "AmazonEC2", "", 3.00, line_type="Fee"),
+        line(at(5), "AmazonEC2", "", -0.50, line_type="Credit"),
+    ]
+    deliver(s3, "2026-10", parquet(rows))
+
+    current = read(s3, root)["current"]
+
+    assert current["newest_day"] is None
+    assert current["complete_through"] is None
+    assert current["projection"] == {"status": "too_early"}
+    assert current["cost_per_session"] == {"status": "too_early"}
+    assert current["total"] == pytest.approx(2.50)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "reason"),
+    [
+        ("cost", float("nan"), "a billing period's cost sums to a number that is not finite"),
+        ("cost", float("inf"), "a billing period's cost sums to a number that is not finite"),
+        (
+            "amount",
+            float("nan"),
+            "a billing period's usage amount sums to a number that is not finite",
+        ),
+    ],
+    ids=["a NaN cost", "an infinite cost", "a NaN amount"],
+)
+def test_a_period_whose_sums_are_not_finite_fails_the_read(
+    root: Path, column: str, value: float, reason: str
+):
+    """A NaN in the file would reach ``/api/cost`` as a bare ``NaN``, which the page's
+    ``JSON.parse`` refuses, so the read refuses it first, and the file still writes."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    bad = (
+        line(at(5), "AmazonEC2", "BoxUsage:t4g.small", value)
+        if column == "cost"
+        else line(at(5), "AmazonS3", "TimedStorage-ByteHrs", 0.01, amount=value)
+    )
+    deliver(s3, "2026-10", parquet([*october(), bad]))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "failed"
+    assert entry["error"] == reason
+    assert "current" not in entry
+    path = aws_cost.write_cost_report(root, entry, now=NOW, pid=4242)
+    assert json.loads(path.read_text()) == entry
+
+
 def test_s3_is_split_per_bucket_by_raw_usage_type_and_storage_is_carried_per_day(root: Path):
     rows = october()
     for day in (13, 14):
@@ -594,6 +664,56 @@ def test_a_refreshing_previous_period_omits_its_block_and_keeps_the_state(root: 
     assert "previous" not in entry
 
 
+@pytest.mark.parametrize(
+    ("current", "state"),
+    [(True, "delivery"), (False, "no_delivery")],
+    ids=["beside a delivery", "beside no delivery"],
+)
+def test_a_previous_period_that_fails_to_read_omits_its_block_and_keeps_the_state(
+    root: Path, current: bool, state: str
+):
+    """A corrupt chunk in last month's re-delivery must not blank this month's figures for
+    the two weeks AWS keeps re-delivering it. The file names the failure apart."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(september()), b"PAR1 this is not a footer")
+    if current:
+        deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == state
+    assert entry["error"] is None
+    assert "previous" not in entry
+    assert entry["previous_error"] == "a data file's Parquet footer could not be read"
+    assert ("current" in entry) is current
+    if current:
+        assert entry["current"]["projection"]["month_end"] == pytest.approx(25.20)
+
+
+def test_a_previous_period_the_grant_refuses_is_named_by_type(root: Path):
+    s3 = FakeS3(
+        BUCKET, versioning=None, deny_prefixes=(f"{PREFIX}/metadata/BILLING_PERIOD=2026-09/",)
+    )
+    deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "delivery"
+    assert entry["previous_error"] == "ClientError"
+    assert entry["current"]["total"] == pytest.approx(13.65)
+
+
+def test_a_previous_period_that_reads_carries_no_error_field(root: Path):
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(september()))
+    deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    assert "previous_error" not in entry
+    assert entry["previous"]["period"] == "2026-09"
+
+
 def test_the_manifest_is_listed_and_never_asked_for_by_key(root: Path):
     s3 = FakeS3(BUCKET, versioning=None)
     deliver(s3, "2026-09", parquet(september()))
@@ -730,6 +850,16 @@ def test_the_writer_refuses_a_missing_lake_root(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         aws_cost.write_cost_report(missing, {"state": "no_export"}, now=NOW)
     assert not missing.exists()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_the_writer_refuses_a_number_json_cannot_hold_and_leaves_no_file(root: Path, value: float):
+    entry = {"state": "delivery", "current": {"total": value}}
+
+    with pytest.raises(ValueError):
+        aws_cost.write_cost_report(root, entry, now=NOW, pid=4242)
+
+    assert list((root / "reports" / "aws_cost").rglob("*.json")) == []
 
 
 def test_a_failed_entry_carries_error_and_never_problems(root: Path):
