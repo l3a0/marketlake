@@ -103,8 +103,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   and the proxy pool that measures a read's peak Arrow memory.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, the plan, apply and
-  deploy roles, and the scheduler role the start schedules pass. The owner applies it
-  from the laptop.
+  deploy roles, and the scheduler role the start schedules pass. The plan and apply roles
+  carry the grants that create and read the cost and usage export and deny reads of its
+  objects. The owner applies it from the laptop.
 - `infra/live` is the configuration CI applies: the backup bucket, the instance role,
   the laptop's IAM user `marketlake-command` with the two roles it assumes, one for the
   bucket and one that writes the Schwab token, and the hosted VM. `infra/live/vm.tf`
@@ -113,7 +114,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `infra/live/deploy.tf` holds the SSM document that deploys `main` to the VM, and
   `infra/live/deploy-step.sh` is the one shell step it runs there.
   `infra/live/schedule.tf` holds the two schedules that start the VM at 07:30 on weekdays
-  and 19:30 on Sundays.
+  and 19:30 on Sundays. `infra/live/billing.tf` holds the AWS cost and usage export and
+  the billing bucket it delivers to, which the instance role may read under `cur/`.
 - `infra/ci` holds the two scripts `.github/workflows/infra.yml` runs. Each configuration
   keeps its own OpenTofu tests under `tests/`.
 - `infra/README.md` is the owner's runbook for applying both configurations.
@@ -1028,8 +1030,9 @@ tofu -chdir=infra/live test
 Eight things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups, captured minutes or
-   the infrastructure's state, and on the laptop's user, its two roles and their
-   policies, which CI cannot delete.
+   the infrastructure's state, on the laptop's user, its two roles and their policies,
+   which CI cannot delete, and on the billing bucket and its export, which keep every
+   month's raw cost record.
 2. The exact set of policies each bootstrap role and each live IAM user and role carries,
    distinct names for the inline policies on one role, and no permissions boundary or
    path on a bootstrap role.

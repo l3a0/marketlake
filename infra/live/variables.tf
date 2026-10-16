@@ -11,6 +11,21 @@ variable "backup_bucket" {
   }
 }
 
+variable "billing_bucket" {
+  # Required, with no default, like backup_bucket. A default would let a missing secret
+  # plan no billing bucket, no export and no read grant. The validation refuses a name
+  # that the VM's config render would refuse as a tag, so a bad secret fails the plan
+  # rather than the first boot.
+  description = "The bucket the cost and usage export delivers to. CI reads it from the BILLING_BUCKET secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.billing_bucket))
+    error_message = "billing_bucket must be an S3 bucket name."
+  }
+}
+
 variable "adopt_existing" {
   description = "Import the existing bucket and its settings. The tests set it to false, because an import crashes tofu test."
   type        = bool

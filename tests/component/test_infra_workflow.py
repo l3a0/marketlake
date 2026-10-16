@@ -245,7 +245,7 @@ def _required_live_variables() -> set[str]:
 
 def test_every_required_variable_reaches_both_plans_and_both_refusals() -> None:
     required = _required_live_variables()
-    assert {"backup_bucket", "owner_ssh_cidr", "ssh_public_key"} <= required
+    assert {"backup_bucket", "billing_bucket", "owner_ssh_cidr", "ssh_public_key"} <= required
     jobs = _workflow()["jobs"]
     for job_name in ("plan", "apply"):
         job = jobs[job_name]
@@ -261,6 +261,10 @@ def test_every_required_variable_reaches_both_plans_and_both_refusals() -> None:
             source = plan_env[f"TF_VAR_{name}"]
             match = re.fullmatch(r"\$\{\{ (?:secrets|vars)\.(\w+) \}\}", source)
             assert match, f"{job_name}: TF_VAR_{name} is {source!r}"
+            # Each variable reads the secret named after it. Without this, billing_bucket
+            # wired to BACKUP_BUCKET passes every check here, since that secret is refused
+            # when empty too, and the billing bucket's policy would land on the backup bucket.
+            assert match.group(1) == name.upper(), f"{job_name}: TF_VAR_{name} is {source!r}"
             assert refusal["env"].get(match.group(1)) == source, f"{job_name}: {name}"
             assert match.group(1) in checked, f"{job_name}: {name}"
 

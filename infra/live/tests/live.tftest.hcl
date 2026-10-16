@@ -37,6 +37,7 @@ mock_provider "aws" {
 # a key.
 variables {
   backup_bucket  = "example-lake-backup"
+  billing_bucket = "example-billing"
   adopt_existing = false
   owner_ssh_cidr = "203.0.113.7/32"
   ssh_public_key = "ssh-ed25519 AAAAexamplenotakey"
@@ -202,10 +203,11 @@ run "an_empty_bucket_name_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket = ""
+    backup_bucket  = ""
+    billing_bucket = ""
   }
 
-  expect_failures = [var.backup_bucket]
+  expect_failures = [var.backup_bucket, var.billing_bucket]
 }
 
 # Each policy is compared with its own literal rather than with the other, because step 8
@@ -454,30 +456,69 @@ run "an_arn_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket = "arn:aws:s3:::example-state"
+    backup_bucket  = "arn:aws:s3:::example-state"
+    billing_bucket = "arn:aws:s3:::example-state"
   }
 
-  expect_failures = [var.backup_bucket]
+  expect_failures = [var.backup_bucket, var.billing_bucket]
 }
 
 run "a_two_character_bucket_name_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket = "ab"
+    backup_bucket  = "ab"
+    billing_bucket = "ab"
   }
 
-  expect_failures = [var.backup_bucket]
+  expect_failures = [var.backup_bucket, var.billing_bucket]
 }
 
 run "a_name_with_a_space_fails_validation" {
   command = plan
 
   variables {
-    backup_bucket = "has space"
+    backup_bucket  = "has space"
+    billing_bucket = "has space"
   }
 
-  expect_failures = [var.backup_bucket]
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
+# A capital or a slash passes a name S3 refuses and the VM's render cannot use as a tag,
+# and 64 characters is one past S3's limit. The two runs above leave the regex's
+# character class and its length bound to nothing.
+run "a_bucket_name_with_a_capital_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "exAmple-bucket"
+    billing_bucket = "exAmple-bucket"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
+run "a_bucket_name_with_a_slash_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "example/bucket"
+    billing_bucket = "example/bucket"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
+run "a_sixty_four_character_bucket_name_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    billing_bucket = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
 }
 
 # The mock account id is also what a hard-coded ARN would carry, so plan once under a
@@ -636,15 +677,17 @@ run "instance_is_built_as_the_issue_describes" {
     error_message = "The instance's shutdown behavior is not stop, so a poweroff from inside could terminate it."
   }
 
-  # The bucket is the file-level variable's, written out here so the test does not
-  # rebuild the tag the way vm.tf builds it.
+  # The buckets are the file-level variables', written out here so the test does not
+  # rebuild the tags the way vm.tf and billing.tf build them. #911's "The contract
+  # between the halves" fixes marketlake:cost-export's key and value.
   assert {
     condition = aws_instance.vm.tags == tomap({
       Name                       = "marketlake"
       "marketlake:host"          = "capture"
       "marketlake:backup-target" = "s3://example-lake-backup/lake"
+      "marketlake:cost-export"   = "s3://example-billing/cur/marketlake-cost"
     })
-    error_message = "The instance's tags are not exactly Name, marketlake:host and marketlake:backup-target = s3://example-lake-backup/lake."
+    error_message = "The instance's tags are not exactly Name, marketlake:host, marketlake:backup-target = s3://example-lake-backup/lake and marketlake:cost-export = s3://example-billing/cur/marketlake-cost."
   }
 
   assert {
@@ -1022,5 +1065,196 @@ run "a_slash_thirty_two_passes_validation" {
   assert {
     condition     = [for r in aws_security_group.vm.ingress : tolist(r.cidr_blocks)] == [tolist(["203.0.113.7/32"])]
     error_message = "A /32 does not reach the ingress rule."
+  }
+}
+
+# -- the cost and usage export (#912) ---------------------------------------------
+
+# A mock provider never runs the provider's replace logic, so no run here can tell an
+# update from a replacement. These runs compare the arguments with the literals #911
+# fixes. The pull request that added them carries an offline real-provider plan as the
+# evidence that only a query change applies in place, and the first plan after the
+# apply shows whether GetExport reads the table configurations back unchanged.
+run "cost_export_is_the_export_the_contract_names" {
+  command = plan
+
+  assert {
+    condition = [
+      aws_bcmdataexports_export.cost.export[0].name,
+      aws_bcmdataexports_export.cost.export[0].refresh_cadence[0].frequency,
+    ] == ["marketlake-cost", "SYNCHRONOUS"]
+    error_message = "The export is not marketlake-cost refreshed SYNCHRONOUSLY."
+  }
+
+  assert {
+    condition = [
+      for d in aws_bcmdataexports_export.cost.export[0].destination_configurations[0].s3_destination :
+      [d.s3_bucket, d.s3_prefix, d.s3_region, [
+        for o in d.s3_output_configurations : [o.output_type, o.format, o.compression, o.overwrite]
+      ]]
+      ] == [
+      ["example-billing", "cur", "us-east-1", [["CUSTOM", "PARQUET", "PARQUET", "OVERWRITE_REPORT"]]],
+    ]
+    error_message = "The export does not deliver Parquet to cur in the billing bucket, overwriting each period's report."
+  }
+
+  # Every key the provider's acceptance tests read back, and no other. A key GetExport
+  # does not return, or a value it returns differently, would plan a replacement on
+  # every run.
+  assert {
+    condition = aws_bcmdataexports_export.cost.export[0].data_query[0].table_configurations == tomap({
+      COST_AND_USAGE_REPORT = tomap({
+        TIME_GRANULARITY                      = "DAILY"
+        INCLUDE_RESOURCES                     = "TRUE"
+        INCLUDE_SPLIT_COST_ALLOCATION_DATA    = "FALSE"
+        INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY = "FALSE"
+        BILLING_VIEW_ARN                      = "arn:aws:billing::000000000000:billingview/primary"
+      })
+    })
+    error_message = "The export's table configurations are not exactly the five keys, daily with resource ids, on the primary billing view."
+  }
+
+  # The first nine columns are the ones #913's figures read. The rest are kept for later
+  # questions, and a change here applies in place.
+  assert {
+    condition = aws_bcmdataexports_export.cost.export[0].data_query[0].query_statement == join("", [
+      "SELECT line_item_usage_start_date, line_item_product_code, line_item_usage_type, ",
+      "line_item_resource_id, line_item_line_item_type, line_item_unblended_cost, ",
+      "line_item_usage_amount, line_item_currency_code, line_item_usage_account_id, ",
+      "identity_line_item_id, identity_time_interval, bill_billing_period_start_date, ",
+      "line_item_usage_end_date, line_item_operation, line_item_line_item_description, ",
+      "line_item_unblended_rate, pricing_unit, product_servicecode, product_region_code, ",
+      "product, resource_tags FROM COST_AND_USAGE_REPORT",
+    ])
+    error_message = "The export's query is not exactly the 21 columns #913 and #911 list, from COST_AND_USAGE_REPORT."
+  }
+
+  assert {
+    condition     = aws_bcmdataexports_export.cost.tags == null
+    error_message = "The export carries tags, which the apply role has no bcm-data-exports:TagResource to write."
+  }
+}
+
+# AWS's own policy for an export's bucket, compared whole, so a widened principal, an
+# added read or a loosened condition fails here.
+run "billing_bucket_lets_only_this_accounts_exports_write" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket.billing.bucket == "example-billing"
+    error_message = "The billing bucket is not named billing_bucket."
+  }
+
+  assert {
+    condition     = aws_s3_bucket_policy.billing.bucket == aws_s3_bucket.billing.id
+    error_message = "The export's policy is not on the billing bucket."
+  }
+
+  assert {
+    condition = jsondecode(aws_s3_bucket_policy.billing.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid       = "EnableAWSDataExportsToWriteToS3"
+          Effect    = "Allow"
+          Principal = { Service = ["bcm-data-exports.amazonaws.com"] }
+          Action    = ["s3:PutObject"]
+          Resource  = "arn:aws:s3:::example-billing/*"
+          Condition = {
+            ArnLike      = { "aws:SourceArn" = "arn:aws:bcm-data-exports:us-east-1:000000000000:export/*" }
+            StringEquals = { "aws:SourceAccount" = "000000000000" }
+          }
+        },
+      ]
+    }
+    error_message = "The billing bucket's policy is not exactly AWS's: PutObject for bcm-data-exports, for this account's exports alone."
+  }
+}
+
+# The sweep lists and reads under cur/ and nowhere else in the billing bucket.
+run "instance_reads_only_the_cost_export" {
+  command = plan
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.instance_cost_read.policy).Statement == [
+      {
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = "arn:aws:s3:::example-billing"
+        Condition = { StringLike = { "s3:prefix" = ["cur/*"] } }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::example-billing/cur/*"
+      },
+    ]
+    error_message = "marketlake-instance's cost read is not exactly ListBucket under cur/ and GetObject on cur/*."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_cost_read.role == aws_iam_role.instance.name
+    error_message = "The cost read is not on marketlake-instance."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.instance_cost_read.name == "cost-export-read"
+    error_message = "The cost read is not named cost-export-read."
+  }
+}
+
+# Every other run uses one billing bucket name, so a policy or a tag that typed it would
+# pass them all.
+run "billing_names_follow_the_billing_variable" {
+  command = plan
+
+  variables {
+    billing_bucket = "other-billing"
+  }
+
+  assert {
+    condition = [
+      aws_s3_bucket.billing.bucket,
+      aws_bcmdataexports_export.cost.export[0].destination_configurations[0].s3_destination[0].s3_bucket,
+      jsondecode(aws_s3_bucket_policy.billing.policy).Statement[0].Resource,
+      jsondecode(aws_iam_role_policy.instance_cost_read.policy).Statement[0].Resource,
+      jsondecode(aws_iam_role_policy.instance_cost_read.policy).Statement[1].Resource,
+      aws_instance.vm.tags["marketlake:cost-export"],
+      ] == [
+      "other-billing",
+      "other-billing",
+      "arn:aws:s3:::other-billing/*",
+      "arn:aws:s3:::other-billing",
+      "arn:aws:s3:::other-billing/cur/*",
+      "s3://other-billing/cur/marketlake-cost",
+    ]
+    error_message = "The billing bucket, the export's destination, a policy or the cost-export tag does not follow billing_bucket."
+  }
+}
+
+# The mock account id is also what a hard-coded ARN would carry, so plan once under a
+# second account. An export or billing view in another account names nothing here.
+run "billing_arns_follow_the_callers_account" {
+  command = plan
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "111111111111"
+    }
+  }
+
+  assert {
+    condition = [
+      aws_bcmdataexports_export.cost.export[0].data_query[0].table_configurations["COST_AND_USAGE_REPORT"]["BILLING_VIEW_ARN"],
+      jsondecode(aws_s3_bucket_policy.billing.policy).Statement[0].Condition,
+      ] == [
+      "arn:aws:billing::111111111111:billingview/primary",
+      {
+        ArnLike      = { "aws:SourceArn" = "arn:aws:bcm-data-exports:us-east-1:111111111111:export/*" }
+        StringEquals = { "aws:SourceAccount" = "111111111111" }
+      },
+    ]
+    error_message = "The billing view or the bucket policy's condition does not name the caller's account."
   }
 }

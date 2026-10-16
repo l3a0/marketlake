@@ -7,7 +7,9 @@
 # last two read an old one: a restore or a resync that finds a file's current version newer
 # than the bucket's manifest takes the version the manifest names (#838). The instance role
 # also reads the config parameters. The laptop's marketlake-backup role in command.tf holds
-# the five reads alone, since step 8 of #638's cutover dropped its PutObject.
+# the five reads alone, since step 8 of #638's cutover dropped its PutObject. A fourth
+# policy lets the instance role read the cost and usage export under cur/ in the billing
+# bucket that billing.tf declares (#912).
 
 # -- the instance role --------------------------------------------------------------
 
@@ -109,6 +111,37 @@ resource "aws_iam_role_policy" "instance_config_read" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:GetParameters"]
         Resource = "arn:aws:ssm:us-east-1:${local.account_id}:parameter/marketlake/config/*"
+      },
+    ]
+  })
+}
+
+# The sweep's read of the cost and usage export (#912, part of #911). It lists and gets
+# under cur/ in the billing bucket and nothing else. s3:ListBucket takes no object
+# resource, so a condition on s3:prefix narrows it. StringLike's * also matches the
+# empty string, so "cur/*" covers a list of cur/ itself, and a list with no prefix is
+# refused. It is a policy of its own rather than a statement in the read half, because
+# the read half is tested as exactly the backup bucket's reads. The VM's first boot does
+# not read the export, so the instance waits for none of this.
+resource "aws_iam_role_policy" "instance_cost_read" {
+  name = "cost-export-read"
+  role = aws_iam_role.instance.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::${var.billing_bucket}"
+        Condition = {
+          StringLike = { "s3:prefix" = ["cur/*"] }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::${var.billing_bucket}/cur/*"
       },
     ]
   })

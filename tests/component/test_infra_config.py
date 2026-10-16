@@ -124,6 +124,10 @@ _OPTIONS = hcl2.SerializationOptions(
 # Price 4 of issue #664: every resource whose loss would lose backups or stop them. The
 # laptop's user, its two roles and their policies are here too (#737). CI cannot delete
 # any of them, so a pull request that renames one fails at plan rather than at apply.
+# The billing bucket holds every month of the raw cost export, which the owner keeps
+# indefinitely, and the export itself would be deleted and recreated by any change but
+# its query's, so both are here too (#912). This roster is the only check that the line
+# is present.
 PREVENT_DESTROY = [
     "bootstrap/aws_s3_bucket.state",
     "bootstrap/aws_s3_bucket_versioning.state",
@@ -140,6 +144,8 @@ PREVENT_DESTROY = [
     "live/aws_iam_role_policy.token_writer",
     # The lake volume holds every minute captured since the last nightly upload (#686).
     "live/aws_ebs_volume.lake",
+    "live/aws_s3_bucket.billing",
+    "live/aws_bcmdataexports_export.cost",
 ]
 
 # The roles marketlake-command assumes, which the apply role may create and never delete.
@@ -177,6 +183,8 @@ LIVE_TYPES = {
     "aws_volume_attachment",
     "aws_ssm_document",
     "aws_scheduler_schedule",
+    "aws_s3_bucket_policy",
+    "aws_bcmdataexports_export",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -306,6 +314,7 @@ def test_live_role_carries_exactly_its_inline_policies() -> None:
     assert policies == [
         ("backup", "backup"),
         ("instance", "instance_config_read"),
+        ("instance", "instance_cost_read"),
         ("instance", "instance_s3"),
         ("instance", "instance_s3_read"),
         ("token_writer", "token_writer"),
@@ -391,6 +400,48 @@ def test_live_holds_only_known_resource_types() -> None:
     assert types == LIVE_TYPES
 
 
+def test_live_holds_one_bucket_policy_and_one_export() -> None:
+    """``LIVE_TYPES`` admits a type, not a count, and the exact-compare runs in
+    ``live.tftest.hcl`` read ``aws_s3_bucket_policy.billing`` and
+    ``aws_bcmdataexports_export.cost`` by name. A second bucket policy aimed at the billing
+    bucket would apply under the apply role's ``s3:PutBucketPolicy`` and replace AWS's own
+    policy, and a second export with no ``prevent_destroy`` would apply under
+    ``CreateExport`` on ``export/*``. Neither named run would see either one."""
+    addresses = set(_resources("live"))
+    for rtype, only in (
+        ("aws_s3_bucket_policy", "billing"),
+        ("aws_bcmdataexports_export", "cost"),
+    ):
+        declared = {a for a in addresses if a.split(".")[0] == rtype}
+        assert declared == {f"{rtype}.{only}"}, declared
+
+
+def test_the_export_waits_for_the_billing_bucket_policy() -> None:
+    """Creating the export checks its destination, and the bucket policy is what lets the
+    service write there. Without the ordering a first apply can call ``CreateExport``
+    before ``PutBucketPolicy`` lands. The mock provider plans the two in any order, so no
+    ``tofu test`` run can see it, as ``test_vm_waits_for_the_ssm_attachment_and_the_config_read``
+    says of the VM."""
+    body = _resources("live")["aws_bcmdataexports_export.cost"]
+    assert body.get("depends_on") == ["${aws_s3_bucket_policy.billing}"], body
+
+
+def test_bootstrap_bucket_variables_have_no_default() -> None:
+    """The bootstrap is applied by hand from ``bootstrap.tfvars``, so no workflow check
+    reaches its variables. A default on a bucket's name would let a forgotten tfvars line
+    plan clean, granting on and denying reads of a bucket that is not the real one."""
+    found = []
+    for path in sorted((INFRA / "bootstrap").glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        for block in parsed.get("variable", []):
+            for name, body in block.items():
+                if name.endswith("_bucket"):
+                    found.append(name)
+                    assert "default" not in body, name
+    assert sorted(found) == ["backup_bucket", "billing_bucket", "state_bucket"], found
+
+
 def test_live_roles_leave_their_policies_to_separate_resources() -> None:
     """``managed_policy_arns`` and ``inline_policy`` on a role manage its policies
     exclusively, so on every apply they detach a managed policy or delete an inline one
@@ -442,10 +493,26 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     assert sorted(inline) == ["apply", "deploy", "plan", "scheduler"]
     assert len(inline["apply"]) == 1
     assert len(inline["deploy"]) == 1
-    assert len(inline["plan"]) == 1
     assert len(inline["scheduler"]) == 1
-    plan_effects = [statement["Effect"] for statement in inline["plan"][0]]
-    assert plan_effects and set(plan_effects) == {"Deny"}
+    # The plan role holds one policy of Denies, and one Allow that reads the cost export's
+    # definition, which every plan's refresh needs and ReadOnlyAccess lacks (#912). Any
+    # other Allow would reach a pull request from an unreviewed branch.
+    assert len(inline["plan"]) == 2
+    denies = [p for p in inline["plan"] if {s["Effect"] for s in p} == {"Deny"}]
+    allows = [p for p in inline["plan"] if p not in denies]
+    assert len(denies) == 1 and denies[0]
+    assert allows == [
+        [
+            {
+                "Sid": "ReadTheCostExport",
+                "Effect": "Allow",
+                "Action": ["bcm-data-exports:GetExport", "bcm-data-exports:ListTagsForResource"],
+                "Resource": [
+                    "arn:aws:bcm-data-exports:us-east-1:${local.account_id}:export/*",
+                ],
+            }
+        ]
+    ]
     deploy_effects = [statement["Effect"] for statement in inline["deploy"][0]]
     assert deploy_effects and set(deploy_effects) == {"Allow"}
     # The case for keeping this role in the bootstrap rests on this one grant (#865).
@@ -824,6 +891,7 @@ def test_instance_tag_keys_are_ones_instance_metadata_can_serve() -> None:
     breaks the endpoint stops the first boot's render. A mock provider plans any key."""
     tags = _resources("live")["aws_instance.vm"]["tags"]
     assert "marketlake:backup-target" in tags
+    assert "marketlake:cost-export" in tags
     for key in tags:
         assert _METADATA_TAG_KEY.fullmatch(key), f"the instance tag key {key!r} has a / or space"
 

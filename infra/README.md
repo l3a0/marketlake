@@ -27,8 +27,10 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    `marketlake-command` ([#737](https://github.com/l3a0/marketlake/issues/737)), the
    hosted VM with its security group, key pair and lake volume, the SSM document
    `marketlake-deploy` that [Deploy from CI](#deploy-from-ci) sends to the VM, and the
-   two schedules in [The start schedule](#the-start-schedule) that start the VM. That user
-   can only assume two roles: `marketlake-backup`, which reads the bucket, and
+   two schedules in [The start schedule](#the-start-schedule) that start the VM, and the
+   cost and usage export with its billing bucket, which
+   [The cost and usage export](#the-cost-and-usage-export) describes. That user can only
+   assume two roles: `marketlake-backup`, which reads the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
    applies it after a merge to `main` once the owner approves the run. Either starts on
@@ -40,13 +42,16 @@ The laptop also applies any change the apply role may not make, such as the back
 bucket's versioning or a role's trust policy. A trust policy says who may assume the
 role, that is, take on its permissions.
 
-This repository is public, so every value below appears as a placeholder. Four values
+This repository is public, so every value below appears as a placeholder. Five values
 stay out of every tracked file, every issue and every comment.
 
 1. The account id, which step 2 prints and no command below needs.
 2. `<state-bucket>`, the state bucket's name.
 3. `<backup-bucket>`, the backup bucket's name.
-4. The owner's home address, which may SSH to the VM. The commands below read it from
+4. `<billing-bucket>`, the name of the bucket the cost and usage export delivers to,
+   which the owner chooses
+   ([#912](https://github.com/l3a0/marketlake/issues/912)).
+5. The owner's home address, which may SSH to the VM. The commands below read it from
    the network and never print it.
 
 The rest are read when they are needed.
@@ -65,6 +70,9 @@ The rest are read when they are needed.
   command prints, named where each one appears.
 - `<instance-id>` and `<vm-address>` are the VM's instance id and public address, which
   [Find the VM's address](#find-the-vms-address) prints.
+- `<export-arn>` is the cost and usage export's ARN, which
+  [Recover an export the apply left outside state](#recover-an-export-the-apply-left-outside-state)
+  reads.
 
 Every placeholder on a command line sits inside double quotes, because a bare `<x>` left
 unreplaced is a redirection in zsh.
@@ -211,13 +219,17 @@ are unique across all of AWS, so a common name may be taken.
 printf 'bucket = "%s"\n' "<state-bucket>" > ~/.config/marketlake/infra/bootstrap.tfbackend
 ```
 
-`bootstrap.tfvars` holds the three values the bootstrap needs.
+`bootstrap.tfvars` holds the four values the bootstrap needs. The recorded run wrote
+the first three, and [#912](https://github.com/l3a0/marketlake/issues/912) added
+`billing_bucket`, the last line. Choose a new name for `<billing-bucket>`, as for the
+state bucket.
 
 ```bash
 cat > ~/.config/marketlake/infra/bootstrap.tfvars <<'EOF'
 state_bucket               = "<state-bucket>"
 backup_bucket              = "<backup-bucket>"
 adopt_github_oidc_provider = false
+billing_bucket             = "<billing-bucket>"
 EOF
 ```
 
@@ -227,12 +239,16 @@ EOF
 printf 'bucket = "%s"\n' "<state-bucket>" > ~/.config/marketlake/infra/live.tfbackend
 ```
 
-`live.tfvars` holds the backup bucket's name. The recorded run also wrote
-`backup_policy_name`, which [#741](https://github.com/l3a0/marketlake/issues/741) removed.
+`live.tfvars` holds the two buckets' names. The recorded run wrote the backup bucket's
+alone, with `backup_policy_name`, which
+[#741](https://github.com/l3a0/marketlake/issues/741) removed.
+[#912](https://github.com/l3a0/marketlake/issues/912) added `billing_bucket`, with the
+same name as in `bootstrap.tfvars`.
 
 ```bash
 cat > ~/.config/marketlake/infra/live.tfvars <<'EOF'
-backup_bucket = "<backup-bucket>"
+backup_bucket  = "<backup-bucket>"
+billing_bucket = "<billing-bucket>"
 EOF
 ```
 
@@ -310,22 +326,27 @@ Plan it, and read the plan before applying anything.
 AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-<n>/infra/bootstrap" plan -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
 ```
 
-On a first run today the plan imports the state bucket and creates ten resources.
+On a first run today the plan imports the state bucket and creates thirteen resources.
 
 1. The state bucket's versioning.
 2. The GitHub OIDC provider.
 3. The plan role.
 4. The plan role's attachment of AWS's `ReadOnlyAccess`.
 5. The plan role's inline policy.
-6. The apply role.
-7. The apply role's attachment of `ReadOnlyAccess`.
-8. The apply role's inline policy.
-9. The deploy role, `marketlake-deploy`, which
-   [#676](https://github.com/l3a0/marketlake/issues/676) added after the recorded run.
-10. The deploy role's inline policy.
+6. The plan role's second inline policy, `read-cost-export`, which
+   [#912](https://github.com/l3a0/marketlake/issues/912) added.
+7. The apply role.
+8. The apply role's attachment of `ReadOnlyAccess`.
+9. The apply role's inline policy.
+10. The deploy role, `marketlake-deploy`, which
+    [#676](https://github.com/l3a0/marketlake/issues/676) added after the recorded run.
+11. The deploy role's inline policy.
+12. The scheduler role, which [#867](https://github.com/l3a0/marketlake/issues/867)
+    added.
+13. The scheduler role's inline policy.
 
 When step 3 found an existing provider, the plan imports the provider instead of creating
-it, so it shows two imports and nine creates. The plan destroys nothing. A later run,
+it, so it shows two imports and twelve creates. The plan destroys nothing. A later run,
 against state that already exists, plans only what the pull request changes. Treat a plan
 that destroys anything as coming from a stale checkout until shown otherwise.
 
@@ -410,7 +431,7 @@ its commands.
 ### 9. Set the secrets and the variables
 
 Nothing tracked names the account, the buckets, the owner's address or the VM's key, so
-the workflow reads them from six settings.
+the workflow reads them from seven settings.
 
 1. The secret `AWS_APPLY_ROLE_ARN`, the apply role's ARN, the identifier AWS gives each
    resource. It sits on the `infra` environment, so the apply job can read it only after
@@ -418,14 +439,18 @@ the workflow reads them from six settings.
 2. The secret `AWS_PLAN_ROLE_ARN`, the plan role's ARN, on the repository.
 3. The secret `TF_STATE_BUCKET`, the state bucket's name, on the repository.
 4. The secret `BACKUP_BUCKET`, the backup bucket's name, on the repository.
-5. The secret `OWNER_SSH_CIDR`, the owner's address as a `/32`, the one address that may
+5. The secret `BILLING_BUCKET`, the billing bucket's name, on the repository.
+6. The secret `OWNER_SSH_CIDR`, the owner's address as a `/32`, the one address that may
    SSH to the VM, on the repository.
-6. The variable `SSH_PUBLIC_KEY`, the public half of the VM's SSH key, on the
+7. The variable `SSH_PUBLIC_KEY`, the public half of the VM's SSH key, on the
    repository.
 
 The last two arrived with the VM in [#686](https://github.com/l3a0/marketlake/issues/686),
-after the recorded run. Every setting but the first sits on the repository, because the
-pull request's `plan` job runs in no environment and reads only repository values.
+and `BILLING_BUCKET` with the cost and usage export in
+[#912](https://github.com/l3a0/marketlake/issues/912), all after the recorded run. Every
+setting but the first sits on the repository, because the pull request's `plan` job runs
+in no environment and reads only repository values. The plan and the apply both refuse
+an empty `BILLING_BUCKET`, so every infra run fails until it exists.
 
 Each command below takes its value from AWS or from a placeholder, so no value lands in a
 tracked file.
@@ -444,6 +469,10 @@ printf '%s' "<state-bucket>" | gh secret set TF_STATE_BUCKET --repo l3a0/marketl
 
 ```bash
 printf '%s' "<backup-bucket>" | gh secret set BACKUP_BUCKET --repo l3a0/marketlake
+```
+
+```bash
+printf '%s' "<billing-bucket>" | gh secret set BILLING_BUCKET --repo l3a0/marketlake
 ```
 
 The owner's address comes from AWS's address echo service, which answers with the
@@ -477,8 +506,13 @@ variable `infra.yml` names.
 grep -oE '(secrets|vars)\.[A-Z_]+' "$HOME/marketlake-infra-<n>/.github/workflows/infra.yml" | sort -u
 ```
 
-The repository's secrets should include the four repository-scoped names,
-`AWS_PLAN_ROLE_ARN`, `TF_STATE_BUCKET`, `BACKUP_BUCKET` and `OWNER_SSH_CIDR`.
+The repository's secrets should include the five repository-scoped names.
+
+1. `AWS_PLAN_ROLE_ARN`
+2. `TF_STATE_BUCKET`
+3. `BACKUP_BUCKET`
+4. `BILLING_BUCKET`
+5. `OWNER_SSH_CIDR`
 
 ```bash
 gh secret list --repo l3a0/marketlake
@@ -699,7 +733,10 @@ code or revert it. A manual run of `infra.yml` from `main` reverts it behind the
 approval, with no code change.
 
 A failed apply keeps the state of what it changed and releases its lock, so the next run
-plans only what is left. When a runner, the GitHub machine that runs the job, dies in the
+plans only what is left. The cost and usage export is the one exception, because an
+apply can create it in AWS and still fail before it reaches the state.
+[Recover an export the apply left outside state](#recover-an-export-the-apply-left-outside-state)
+covers that case. When a runner, the GitHub machine that runs the job, dies in the
 middle of an apply, its lock file, `live/terraform.tfstate.tflock`, stays behind, and the
 next run's error prints the lock's id. Clear it from an admin session, in a worktree at
 `main`'s head made as in the section above. Initialize that worktree against
@@ -2420,6 +2457,142 @@ first deploy takes seven steps, in order.
    The trust's `ref` condition is proven only by the live run in step 5, as it is for
    the apply role.
 
+## The cost and usage export
+
+The hosted lake runs on AWS, and until this export nothing showed what it costs
+([#911](https://github.com/l3a0/marketlake/issues/911)).
+[#912](https://github.com/l3a0/marketlake/issues/912) adds AWS Data Exports' cost and
+usage report, in its CUR 2.0 form, delivered as Parquet to a bucket of its own. The
+export is named `marketlake-cost` and writes under the prefix `cur`, so its data lands at
+`cur/marketlake-cost/data/BILLING_PERIOD=YYYY-MM/`. It refreshes up to three times a day
+and rewrites the month's files in place. The VM's instance role may list and read under
+`cur/`, and the instance carries the tag `marketlake:cost-export`, valued
+`s3://<billing-bucket>/cur/marketlake-cost`, which
+[#913](https://github.com/l3a0/marketlake/issues/913)'s nightly read uses.
+
+The owner keeps every month of the raw export indefinitely, so the bucket keeps
+versioning off and no rule expires its objects. The bucket and the export carry
+`prevent_destroy`. Every argument of the export except its query forces a replacement,
+so a change that would delete and recreate the export fails the plan instead.
+
+### The owner's steps, in order
+
+1. Create the `BILLING_BUCKET` repository secret with the billing bucket's name, as
+   [step 9](#9-set-the-secrets-and-the-variables) shows. The plan job refuses an empty
+   secret, so the pull request's plan fails until it exists.
+2. Add a `billing_bucket` line to `bootstrap.tfvars` and to `live.tfvars`. A rebuild
+   that writes both files with [step 4](#4-write-the-four-input-files) has the line
+   already. On the laptop that wrote them before
+   [#912](https://github.com/l3a0/marketlake/issues/912), each command below appends the
+   line, so run each once. A second run adds a second line for the same name, which
+   OpenTofu refuses.
+
+   ```bash
+   printf 'billing_bucket = "%s"\n' "<billing-bucket>" >> ~/.config/marketlake/infra/bootstrap.tfvars
+   ```
+
+   ```bash
+   printf 'billing_bucket = "%s"\n' "<billing-bucket>" >> ~/.config/marketlake/infra/live.tfvars
+   ```
+
+3. Apply the bootstrap change from an admin session, as
+   [Changing the bootstrap](#changing-the-bootstrap) says. Its plan changes the plan
+   role's and the apply role's inline policies in place, and adds the plan role's second
+   policy, `read-cost-export`. The apply role cannot create the bucket or the export
+   until this lands.
+4. The infra pull request's merge starts two runs, the infra apply and a deploy, each
+   waiting on approval. Approve the run in
+   [the `infra` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)
+   first, outside 09:25 to 16:15 ET. It creates the bucket, its policy, the export, the
+   read grant and the tag. Approve the run in
+   [the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy)
+   after the apply finishes, inside the deploy hours that
+   [The owner's first deploy](#the-owners-first-deploy) lists, so the deploy's render
+   reads the new tag. A deploy that runs first renders no `cost_export` key, and the key
+   then waits for the next deploy.
+5. If the apply fails after the export exists in AWS, follow
+   [Recover an export the apply left outside state](#recover-an-export-the-apply-left-outside-state)
+   before running anything else.
+6. Confirm that the next infra plan shows no change to the export. Start a manual run.
+
+   ```bash
+   gh workflow run infra.yml --repo l3a0/marketlake --ref main
+   ```
+
+   Its job summary must not list `aws_bcmdataexports_export.cost`. A plan that fails
+   with "Resource instance cannot be destroyed" on the export means `GetExport` returned
+   a table configuration other than the code's. Read what it returned, as in
+   [Recover an export the apply left outside state](#recover-an-export-the-apply-left-outside-state),
+   and change `table_configurations` in `infra/live/billing.tf` to match it in a pull
+   request. Leave the run waiting, or let it fail, rather than approve a replacement.
+7. Once [#913](https://github.com/l3a0/marketlake/issues/913) is deployed, confirm that
+   the VM's `config.yaml` carries the key. On the VM, this prints one line.
+
+   ```bash
+   grep '^cost_export:' ~/.config/marketlake/config.yaml
+   ```
+
+   AWS documents no delay for a new tag to reach instance metadata, so a deploy soon
+   after the apply can read no tag and leave the key out. The next deploy adds it.
+8. Wait for the first delivery, which can take up to 24 hours after the export is
+   created. From an admin session, this lists what the export has written.
+
+   ```bash
+   aws s3 ls "s3://<billing-bucket>/cur/marketlake-cost/" --recursive --profile marketlake-admin
+   ```
+
+### Recover an export the apply left outside state
+
+The provider records the export in the state only after AWS reports it healthy. A
+create whose wait fails, on a refused `GetExport`, a 30-minute timeout or an unhealthy
+status, leaves the export in AWS and outside the state. The next apply then calls
+`CreateExport` again with the same name, and AWS refuses it, because export names are
+unique. So do not just re-run the workflow. Either adopt the export into the state or
+delete it, both from an admin session.
+
+Read the export's ARN first. It carries the account id, so never paste it into an issue
+or a comment. It is `<export-arn>` below.
+
+```bash
+aws bcm-data-exports list-exports --query "Exports[?ExportName=='marketlake-cost'].ExportArn" --output text --profile marketlake-admin --region us-east-1
+```
+
+To see what AWS holds, including the table configurations `GetExport` returns, read
+the export whole.
+
+```bash
+aws bcm-data-exports get-export --export-arn "<export-arn>" --profile marketlake-admin --region us-east-1
+```
+
+To adopt it, make a worktree at `main`'s head and initialize it, as
+[Apply `infra/live/` from the laptop](#apply-infralive-from-the-laptop) does, then
+import the export by its ARN.
+
+```bash
+AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live" import -var-file="$HOME/.config/marketlake/infra/live.tfvars" aws_bcmdataexports_export.cost "<export-arn>"
+```
+
+To delete it instead, run this. The apply role holds no `DeleteExport`, since the export
+carries `prevent_destroy`.
+
+```bash
+aws bcm-data-exports delete-export --export-arn "<export-arn>" --profile marketlake-admin --region us-east-1
+```
+
+Either way, start a new run with step 11's
+`gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and approve it as in
+[step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change).
+
+One failure lands in state rather than outside it. `billing.tf` sets the five table
+configuration keys the provider's own tests read back. AWS's table dictionary now
+documents two more, `INCLUDE_CAPACITY_RESERVATION_DATA` and
+`INCLUDE_IAM_PRINCIPAL_DATA`. If `GetExport` returns either, the apply ends with
+"Provider produced inconsistent result after apply", the export is in state, and the next
+plan wants to replace it, which `prevent_destroy` refuses. Read the export whole with the
+`get-export` command above, add each key it returns to `table_configurations` with the
+value AWS returned, and open a pull request. Nothing is lost, because the export never
+left AWS.
+
 ## Bootstrap changes already known
 
 [#867](https://github.com/l3a0/marketlake/issues/867) added the role `marketlake-scheduler`, the
@@ -2427,6 +2600,22 @@ apply role's two statements that let it write the start schedules and pass that 
 a third that passes `marketlake-instance` only to EC2, in place of the unconditioned
 `iam:PassRole` that `InstanceRoleWrite` carried. No other open issue on the MVP 2 path
 changes `infra/bootstrap/`.
+
+[#912](https://github.com/l3a0/marketlake/issues/912), on the MVP 3 path, adds the
+variable `billing_bucket` and changes both CI roles.
+
+1. The apply role gains five statements, appended after the last one: a Deny on the
+   billing bucket's objects, `s3:CreateBucket` and `s3:PutBucketPolicy` on the billing
+   bucket, `CreateExport` and `UpdateExport` on the cost and usage table, the primary
+   billing view and the account's exports, `GetExport` and `ListTagsForResource` on the
+   exports, and `cur:PutReportDefinition`, which any CUR 2.0 export needs.
+2. The plan role gains the same Deny, appended to `deny-sensitive-reads`, and a second
+   inline policy, `read-cost-export`, which allows `GetExport` and
+   `ListTagsForResource` on the exports. `ReadOnlyAccess` holds no `bcm-data-exports:`
+   action, so without it every plan after the export exists fails at refresh.
+
+[The cost and usage export](#the-cost-and-usage-export) gives the order of its steps.
+
 [#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
 changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to accept a
 second environment, and its body gives the order for that change.
