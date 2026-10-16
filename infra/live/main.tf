@@ -3,8 +3,8 @@
 # bucket and marketlake-token-writer for the Schwab token, the hosted VM with its lake
 # volume, the SSM document that deploys main to the VM, the two schedules that start
 # the VM once #868's stop is switched on, and the cost and usage export with its billing
-# bucket (#912). The apply role in infra/bootstrap/roles.tf
-# grants writes on exactly these. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
+# bucket (#912). The apply role in infra/bootstrap/roles.tf grants writes on exactly
+# these. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
 # defined" carries the reasoning.
 
 terraform {

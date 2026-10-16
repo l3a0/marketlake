@@ -400,6 +400,22 @@ def test_live_holds_only_known_resource_types() -> None:
     assert types == LIVE_TYPES
 
 
+def test_live_holds_one_bucket_policy_and_one_export() -> None:
+    """``LIVE_TYPES`` admits a type, not a count, and the exact-compare runs in
+    ``live.tftest.hcl`` read ``aws_s3_bucket_policy.billing`` and
+    ``aws_bcmdataexports_export.cost`` by name. A second bucket policy aimed at the billing
+    bucket would apply under the apply role's ``s3:PutBucketPolicy`` and replace AWS's own
+    policy, and a second export with no ``prevent_destroy`` would apply under
+    ``CreateExport`` on ``export/*``. Neither named run would see either one."""
+    addresses = set(_resources("live"))
+    for rtype, only in (
+        ("aws_s3_bucket_policy", "billing"),
+        ("aws_bcmdataexports_export", "cost"),
+    ):
+        declared = {a for a in addresses if a.split(".")[0] == rtype}
+        assert declared == {f"{rtype}.{only}"}, declared
+
+
 def test_live_roles_leave_their_policies_to_separate_resources() -> None:
     """``managed_policy_arns`` and ``inline_policy`` on a role manage its policies
     exclusively, so on every apply they detach a managed policy or delete an inline one

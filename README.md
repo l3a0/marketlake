@@ -1030,8 +1030,9 @@ tofu -chdir=infra/live test
 Eight things those checks cannot see are covered by `uv run pytest` instead.
 
 1. `prevent_destroy` on each resource whose loss would lose backups, captured minutes or
-   the infrastructure's state, and on the laptop's user, its two roles and their
-   policies, which CI cannot delete.
+   the infrastructure's state, on the laptop's user, its two roles and their policies,
+   which CI cannot delete, and on the billing bucket and its export, which keep every
+   month's raw cost record.
 2. The exact set of policies each bootstrap role and each live IAM user and role carries,
    distinct names for the inline policies on one role, and no permissions boundary or
    path on a bootstrap role.

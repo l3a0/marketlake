@@ -221,14 +221,15 @@ printf 'bucket = "%s"\n' "<state-bucket>" > ~/.config/marketlake/infra/bootstrap
 
 `bootstrap.tfvars` holds the four values the bootstrap needs. The recorded run wrote
 the first three, and [#912](https://github.com/l3a0/marketlake/issues/912) added
-`billing_bucket`. Choose a new name for `<billing-bucket>`, as for the state bucket.
+`billing_bucket`, the last line. Choose a new name for `<billing-bucket>`, as for the
+state bucket.
 
 ```bash
 cat > ~/.config/marketlake/infra/bootstrap.tfvars <<'EOF'
 state_bucket               = "<state-bucket>"
 backup_bucket              = "<backup-bucket>"
-billing_bucket             = "<billing-bucket>"
 adopt_github_oidc_provider = false
+billing_bucket             = "<billing-bucket>"
 EOF
 ```
 
@@ -325,22 +326,27 @@ Plan it, and read the plan before applying anything.
 AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-<n>/infra/bootstrap" plan -var-file="$HOME/.config/marketlake/infra/bootstrap.tfvars"
 ```
 
-On a first run today the plan imports the state bucket and creates ten resources.
+On a first run today the plan imports the state bucket and creates thirteen resources.
 
 1. The state bucket's versioning.
 2. The GitHub OIDC provider.
 3. The plan role.
 4. The plan role's attachment of AWS's `ReadOnlyAccess`.
 5. The plan role's inline policy.
-6. The apply role.
-7. The apply role's attachment of `ReadOnlyAccess`.
-8. The apply role's inline policy.
-9. The deploy role, `marketlake-deploy`, which
-   [#676](https://github.com/l3a0/marketlake/issues/676) added after the recorded run.
-10. The deploy role's inline policy.
+6. The plan role's second inline policy, `read-cost-export`, which
+   [#912](https://github.com/l3a0/marketlake/issues/912) added.
+7. The apply role.
+8. The apply role's attachment of `ReadOnlyAccess`.
+9. The apply role's inline policy.
+10. The deploy role, `marketlake-deploy`, which
+    [#676](https://github.com/l3a0/marketlake/issues/676) added after the recorded run.
+11. The deploy role's inline policy.
+12. The scheduler role, which [#867](https://github.com/l3a0/marketlake/issues/867)
+    added.
+13. The scheduler role's inline policy.
 
 When step 3 found an existing provider, the plan imports the provider instead of creating
-it, so it shows two imports and nine creates. The plan destroys nothing. A later run,
+it, so it shows two imports and twelve creates. The plan destroys nothing. A later run,
 against state that already exists, plans only what the pull request changes. Treat a plan
 that destroys anything as coming from a stale checkout until shown otherwise.
 
@@ -2577,6 +2583,16 @@ Either way, start a new run with step 11's
 `gh workflow run infra.yml --repo l3a0/marketlake --ref main`, and approve it as in
 [step 11](#11-merge-approve-and-confirm-nothing-is-left-to-change).
 
+One failure lands in state rather than outside it. `billing.tf` sets the five table
+configuration keys the provider's own tests read back. AWS's table dictionary now
+documents two more, `INCLUDE_CAPACITY_RESERVATION_DATA` and
+`INCLUDE_IAM_PRINCIPAL_DATA`. If `GetExport` returns either, the apply ends with
+"Provider produced inconsistent result after apply", the export is in state, and the next
+plan wants to replace it, which `prevent_destroy` refuses. Read the export whole with the
+`get-export` command above, add each key it returns to `table_configurations` with the
+value AWS returned, and open a pull request. Nothing is lost, because the export never
+left AWS.
+
 ## Bootstrap changes already known
 
 [#867](https://github.com/l3a0/marketlake/issues/867) added the role `marketlake-scheduler`, the
@@ -2599,6 +2615,7 @@ variable `billing_bucket` and changes both CI roles.
    action, so without it every plan after the export exists fails at refresh.
 
 [The cost and usage export](#the-cost-and-usage-export) gives the order of its steps.
+
 [#704](https://github.com/l3a0/marketlake/issues/704) is deferred. If it is taken up, it
 changes `infra/bootstrap/`, where the apply role's trust in `roles.tf` grows to accept a
 second environment, and its body gives the order for that change.

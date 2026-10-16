@@ -165,8 +165,8 @@ resource "aws_instance" "vm" {
   # VM from the variable OpenTofu already holds rather than from a parameter put by hand.
   # A bucket change updates the tag in place. marketlake:cost-export tells the nightly
   # sweep where the cost and usage export lands (#912). Once #913 reads it, a host whose
-  # render finds no such tag runs no cost read. #911's "The contract between the halves" fixes its key and
-  # value, and billing.tf builds the value from the export itself. The render reads tags
+  # render finds no such tag runs no cost read. #911's "The contract between the halves"
+  # fixes its key and value, and billing.tf builds the value from the export itself. The render reads tags
   # at first boot and at each deploy, so a deploy after the apply carries a new value to
   # the VM.
   #
