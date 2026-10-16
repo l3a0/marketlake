@@ -342,6 +342,145 @@ def test_the_closed_month_uses_all_of_its_days(root: Path):
     assert previous["delivered_at"] == MANIFEST_AT.isoformat()
 
 
+def test_the_closed_month_counts_a_session_on_its_last_day(root: Path):
+    """A session captured on 30 September is September's, so the closed month divides by
+    twenty-one sessions, not the twenty before its last day."""
+    write_manifest(root, ("chains", "SPY", "2026-09-30"))
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(september()))
+    deliver(s3, "2026-10", parquet(october()))
+
+    previous = read(s3, root)["previous"]
+
+    assert previous["sessions"] == 21
+    assert previous["cost_per_session"]["sessions"] == 21
+    assert previous["cost_per_session"]["value"] == pytest.approx(18.00 / 21)
+
+
+def test_the_second_of_the_month_has_a_one_day_window(root: Path):
+    """On the 2nd, N is the 2nd and the 1st is complete, so both figures read from a window of
+    one day rather than waiting a day longer."""
+    rows = [
+        line(at(1), "AmazonEC2", "BoxUsage:t4g.small", 0.70),
+        line(at(2), "AmazonEC2", "BoxUsage:t4g.small", 0.30),
+    ]
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(rows))
+
+    current = read(s3, root, now=datetime(2026, 10, 2, 22, 30, tzinfo=UTC))["current"]
+
+    assert current["complete_through"] == "2026-10-01"
+    projection = current["projection"]
+    assert projection["status"] == "estimate"
+    assert projection["window_days"] == 1
+    # 0.70 over one day, scaled to October's 31.
+    assert projection["month_end"] == pytest.approx(21.70)
+    assert current["cost_per_session"] == {
+        "status": "ok",
+        "sessions": 1,
+        "usage_cost": pytest.approx(0.70),
+        "value": pytest.approx(0.70),
+        "through": "2026-10-01",
+    }
+
+
+def test_one_captured_session_is_a_figure(tmp_path: Path):
+    """A window holding a single chains session divides by one, and only a window with none
+    has no figure."""
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    write_manifest(lake, ("chains", "SPY", "2026-10-05"))
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(october()))
+
+    per_session = read(s3, lake)["current"]["cost_per_session"]
+
+    assert per_session["status"] == "ok"
+    assert per_session["sessions"] == 1
+    assert per_session["value"] == pytest.approx(9.80)
+
+
+@pytest.mark.parametrize("line_type", ["DiscountedUsage", "SavingsPlanCoveredUsage"])
+def test_discounted_and_savings_plan_lines_are_usage(root: Path, line_type: str):
+    """A line a reservation or a Savings Plan covers is still usage, so it is scaled with the
+    rest. Read as an other line it would be added once, unscaled, and the projection would
+    fall."""
+    rows = october()
+    # Two of the $0.70 days, the 3rd and the 4th, billed under the covered line type.
+    for row in rows[3:5]:
+        row["line_item_line_item_type"] = line_type
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(rows))
+
+    current = read(s3, root)["current"]
+
+    projection = current["projection"]
+    assert projection["usage_through"] == pytest.approx(9.80)
+    assert projection["other"] == pytest.approx(3.50)
+    assert projection["month_end"] == pytest.approx(25.20)
+    assert current["mtd"]["service"]["AmazonEC2"]["usage"] == pytest.approx(10.15)
+
+
+def test_a_null_currency_credit_beside_dollars_is_one_currency(root: Path):
+    """AWS leaves the currency empty on some lines. An empty currency is not a second one, so
+    it must not refuse the period, and the period's currency is the one its lines name."""
+    rows = october() + [line(at(5), "AmazonEC2", "", 0.0, line_type="Credit", currency=None)]
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(rows))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "delivery"
+    assert entry["error"] is None
+    assert entry["currency"] == "USD"
+
+
+def test_a_delivery_records_its_currency(root: Path):
+    """The page labels every figure with the currency the export bills in."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(october()))
+
+    assert read(s3, root)["currency"] == "USD"
+
+
+def test_an_s3_line_with_no_resource_is_no_bucket(root: Path):
+    """A tax line under the S3 product names no bucket. It counts in the month's total and
+    stays out of the per-bucket split, where it would show as a bucket with no name."""
+    rows = october() + [line(at(5), "AmazonS3", "", 0.20, line_type="Tax")]
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet(rows))
+
+    current = read(s3, root)["current"]
+
+    assert current["mtd"]["s3"] == {}
+    assert current["total"] == pytest.approx(13.85)
+
+
+def test_an_account_only_the_closed_month_names_is_masked(root: Path):
+    """The mask takes its account ids from both periods. An account that billed in September
+    and not in October would otherwise reach the file in the closed month's bucket names."""
+    other = "111111111111"
+    rows = september() + [
+        line(
+            at(10, 12, 9),
+            "AmazonS3",
+            "TimedStorage-ByteHrs",
+            0.10,
+            resource=f"example-lake-{other}",
+            amount=1.0,
+            account=other,
+        )
+    ]
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(rows))
+    deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    assert set(entry["previous"]["storage_daily"]) == {"example-lake-<account>"}
+    assert other not in json.dumps(entry)
+
+
 def test_a_non_usage_line_dated_the_last_day_does_not_move_n(root: Path):
     """N is the newest usage day. A $0 tax line dated 31 October would move N to the 31st,
     the window to 30 days and the projection with it, were N taken over every line."""
@@ -557,6 +696,34 @@ def test_zero_row_and_empty_schema_chunks_are_dropped(root: Path):
     assert chunked == alone
 
 
+def test_a_delivery_of_only_empty_chunks_is_a_delivery_of_nothing(root: Path):
+    """AWS delivers an empty file for a period with no lines yet. The manifest says the
+    delivery is whole, so the period reads as a delivery that cost nothing, not as no
+    delivery at all."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-10", parquet([]))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "delivery"
+    assert entry["current"]["total"] == 0.0
+    assert entry["current"]["projection"] == {"status": "too_early"}
+
+
+def test_a_listing_longer_than_one_page_is_read_whole(root: Path):
+    """S3 lists a thousand keys a page. A read that took only the first page would drop every
+    later chunk and report a smaller month."""
+    rows = october()
+    s3 = FakeS3(BUCKET, versioning=None, page_size=1)
+    deliver(s3, "2026-10", parquet(rows[:8]), parquet(rows[8:]))
+
+    current = read(s3, root)["current"]
+
+    assert current["total"] == pytest.approx(13.65)
+    gets = [kwargs["Key"] for name, kwargs in s3.calls if name == "get_object"]
+    assert gets == [data_key("2026-10", 1), data_key("2026-10", 2)]
+
+
 def test_a_chunk_whose_footer_cannot_be_read_fails_the_read(root: Path):
     s3 = FakeS3(BUCKET, versioning=None)
     deliver(s3, "2026-10", parquet(october()), b"PAR1 this is not a footer")
@@ -637,6 +804,38 @@ def test_a_manifest_that_changes_during_the_download_is_refreshing(root: Path):
     deliver(s3, "2026-10", parquet(october()))
 
     assert read(s3, root)["state"] == "refreshing"
+
+
+def test_a_manifest_rewritten_at_the_same_size_during_the_download_is_refreshing(root: Path):
+    """A manifest rewritten with the same bytes changes only its ``LastModified``, so the
+    barrier compares the time too, or the rewrite goes unseen."""
+
+    def refresh(kwargs):
+        if kwargs["Key"].startswith(f"{PREFIX}/data/BILLING_PERIOD=2026-10/"):
+            s3.store(
+                manifest_key("2026-10"),
+                b'{"not": "parsed"}',
+                last_modified=datetime(2026, 10, 16, 6, 1, 1, tzinfo=UTC),
+            )
+
+    s3 = FakeS3(BUCKET, versioning=None, on_get=refresh)
+    deliver(s3, "2026-10", parquet(october()))
+
+    assert read(s3, root)["state"] == "refreshing"
+
+
+def test_data_written_in_the_manifests_own_second_is_a_delivery(root: Path):
+    """S3 stamps ``LastModified`` to the second, so a data file and the manifest written
+    after it can share one. Only data strictly newer than the manifest is a refresh, or
+    such a delivery would read as refreshing every night."""
+    s3 = FakeS3(BUCKET, versioning=None)
+    same_second = datetime(2026, 10, 16, 6, 1, tzinfo=UTC)
+    deliver(s3, "2026-10", parquet(october()), data_at=same_second, manifest_at=same_second)
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "delivery"
+    assert entry["current"]["total"] == pytest.approx(13.65)
 
 
 def test_a_data_file_served_newer_than_the_manifest_is_refreshing(root: Path):
@@ -866,6 +1065,31 @@ def test_the_report_file_is_written_once_under_the_eastern_night(root: Path):
         aws_cost.write_cost_report(root, entry, now=NOW, pid=4242)
     second = aws_cost.write_cost_report(root, entry, now=NOW + timedelta(microseconds=1), pid=4242)
     assert re.fullmatch(r"183000000001-4242\.json", second.name)
+
+
+def test_a_file_written_after_utc_midnight_lands_under_the_eastern_night(root: Path):
+    """00:30 UTC on 1 November is 20:30 EDT on 31 October, the night the sweep ran, so the
+    file's directory is the 31st's, where the UTC date would put it a day ahead."""
+    late = datetime(2026, 11, 1, 0, 30, tzinfo=UTC)
+
+    path = aws_cost.write_cost_report(root, {"state": "failed"}, now=late, pid=4242)
+
+    assert path == root / "reports" / "aws_cost" / "date=2026-10-31" / "203000000000-4242.json"
+
+
+def test_a_failed_read_after_utc_midnight_names_the_utc_period(root: Path):
+    """A failed entry names the period the read would have read, which is the UTC month, so
+    at 20:30 EDT on 31 October it is November, as a read that worked would say."""
+
+    def broken():
+        raise RuntimeError("the source could not be built")
+
+    entry = aws_cost.run(broken, root, now=datetime(2026, 11, 1, 0, 30, tzinfo=UTC))
+
+    assert entry["state"] == "failed"
+    assert entry["error"] == "RuntimeError"
+    assert entry["period"] == "2026-11"
+    assert entry["day"] == "2026-10-31"
 
 
 def test_the_writer_refuses_a_missing_lake_root(tmp_path: Path):

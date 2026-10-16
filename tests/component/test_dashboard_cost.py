@@ -312,6 +312,90 @@ def test_the_scan_stops_a_day_before_the_current_period_starts(root: Path):
     assert payload["current"]["from_day"] == "2026-09-30"
 
 
+def test_the_later_file_of_one_night_is_the_newest(root: Path):
+    """A second sweep on one night writes a second file, and its stamp sorts later. The
+    later file is the night's answer, so a retry that worked replaces a failure."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "failed"), stamp="183000000000")
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"), stamp="210000000000")
+
+    assert cost(root)["state"] == "no_export"
+
+
+def test_an_unreadable_newest_night_does_not_hide_the_night_before(root: Path):
+    """The scan's first bound is the day before the newest night's month starts, so a night
+    whose only file is unreadable still lets the night before it answer."""
+    file(root, "2026-10-16", "{not json")
+    file(root, "2026-10-15", entry("2026-10-15", "2026-10", "delivery", current=october()))
+
+    payload = cost(root)
+
+    assert payload["condition"] is None
+    assert payload["unparseable"] == 1
+    assert payload["state"] == "delivery"
+    assert payload["current"]["from_day"] == "2026-10-15"
+
+
+def test_no_readable_file_still_bounds_the_scan(root: Path):
+    """With no readable file, the bound from the newest night's month is all that stops the
+    scan, and an August night is outside it."""
+    file(root, "2026-10-16", "{not json")
+    file(root, "2026-08-03", "{not json")
+
+    payload = cost(root)
+
+    assert payload["condition"] == "no_file"
+    assert payload["nights_scanned"] == 1
+    assert payload["unparseable"] == 1
+
+
+def test_a_late_file_bounds_the_scan_by_its_own_period(root: Path):
+    """A file written late on 31 October Eastern names November. Its period moves the bound
+    to 31 October, so the scan opens no October night before it."""
+    file(root, "2026-10-31", entry("2026-10-31", "2026-11", "no_delivery"))
+    file(root, "2026-10-20", "{not json")
+
+    payload = cost(root)
+
+    assert payload["period"] == "2026-11"
+    assert payload["nights_scanned"] == 1
+    assert payload["unparseable"] == 0
+
+
+def test_the_currency_comes_from_the_file_with_the_figures(root: Path):
+    """A failed read carries no currency. The figures shown are the earlier delivery's, so
+    the currency is that file's too."""
+    file(root, "2026-10-15", entry("2026-10-15", "2026-10", "delivery", current=october()))
+    file(root, "2026-10-16", {**entry("2026-10-16", "2026-10", "failed"), "currency": None})
+
+    payload = cost(root)
+
+    assert payload["state"] == "failed"
+    assert payload["currency"] == "USD"
+
+
+def test_stale_compares_against_the_newest_nightly_report(root: Path):
+    """An older nightly report beside a newer one must not make a cost file look current."""
+    file(root, "2026-10-15", entry("2026-10-15", "2026-10", "delivery", current=october()))
+    (root / "reports" / "2026-10-14-183000000000-4242.json").write_text("{}")
+    (root / "reports" / "2026-10-16-183000000000-4242.json").write_text("{}")
+
+    payload = cost(root)
+
+    assert payload["newest_nightly"] == "2026-10-16"
+    assert payload["stale"] is True
+
+
+def test_an_impossible_period_reaches_the_backstop_and_does_not_raise(root: Path):
+    """A period of ``0001-01`` has no month before it, so the scan raises ``OverflowError``.
+    The query's catch turns that into a ``failed`` condition rather than a 500."""
+    file(root, "2026-10-16", entry("2026-10-16", "0001-01", "failed"))
+
+    payload = cost(root)
+
+    assert payload["condition"] == "failed"
+    assert payload["error"] == "OverflowError"
+
+
 def test_nothing_in_a_file_of_the_wrong_types_raises(root: Path):
     file(
         root,
@@ -425,6 +509,21 @@ def test_the_trend_is_thirty_calendar_days_from_both_series(root: Path):
     # A day neither series carries has no figure rather than a zero.
     assert by_day["2026-10-02"] == {"day": "2026-10-02", "total": None, "by_service": {}}
     assert "2026-09-15" not in by_day
+
+
+def test_the_current_series_wins_a_day_both_carry(root: Path):
+    """The current period's series is the newer reading of a day both blocks carry."""
+    previous = september(daily={"2026-10-01": {"AmazonEC2": 9.9}})
+    current = october(daily={"2026-10-01": {"AmazonEC2": 0.7}})
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=current, previous=previous),
+    )
+
+    by_day = {row["day"]: row for row in cost(root)["trend"]}
+
+    assert by_day["2026-10-01"]["total"] == 0.7
 
 
 # -- the S3 split and the billed size ------------------------------------------------------
@@ -573,3 +672,38 @@ def test_a_size_with_no_storage_line_on_the_newest_complete_day_is_not_yet_avail
     [bucket] = cost(root)["s3"]
 
     assert bucket["size_gb"] is None and bucket["growth"] is None and bucket["classes"] == []
+
+
+def test_a_bucket_with_storage_only_on_the_size_day_has_no_growth(root: Path):
+    """Growth needs a day before the size day. With none, the growth is absent, and the
+    panel still reads rather than dividing by a span of zero days."""
+    current = october(storage_daily={"example-lake": {"TimedStorage-ByteHrs": {"2026-10-14": 3.0}}})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    payload = cost(root)
+
+    assert payload["condition"] is None
+    [bucket] = payload["s3"]
+    assert bucket["size_gb"] == pytest.approx(93.0)
+    assert bucket["growth"] is None
+
+
+def test_growth_can_start_on_the_trends_first_day(root: Path):
+    """The trend's first day is inside its window, so storage on 16 September, the first of
+    the thirty days ending on the 15th, is where the growth starts."""
+    previous = september(
+        storage_daily={"example-lake": {"TimedStorage-ByteHrs": {"2026-09-16": 3.0}}}
+    )
+    current = october(storage_daily={"example-lake": {"TimedStorage-ByteHrs": {"2026-10-14": 3.1}}})
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=current, previous=previous),
+    )
+
+    payload = cost(root)
+
+    assert payload["trend"][0]["day"] == "2026-09-16"
+    [bucket] = payload["s3"]
+    assert bucket["growth"]["from"] == "2026-09-16"
+    assert bucket["growth"]["days"] == 28
