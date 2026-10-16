@@ -319,6 +319,13 @@ run "policies_are_exactly_the_reviewed_statements" {
     error_message = "The cost export read is not on marketlake-plan."
   }
 
+  # A rename deletes the inline policy and puts a new one, and test_infra_config.py reads
+  # the plan role's policies by their resources, not their names.
+  assert {
+    condition     = aws_iam_role_policy.plan_cost_export_read.name == "read-cost-export"
+    error_message = "The plan role's cost export read is not named read-cost-export."
+  }
+
   assert {
     condition = jsondecode(aws_iam_role_policy.apply.policy) == {
       Version = "2012-10-17"
@@ -671,6 +678,45 @@ run "a_bucket_name_with_a_space_fails_validation" {
     state_bucket   = "has space"
     backup_bucket  = "has space"
     billing_bucket = "has space"
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
+}
+
+# A capital or a slash passes a name S3 refuses and the VM's render cannot use as a tag,
+# and 64 characters is one past S3's limit. The two runs above leave the regex's
+# character class and its length bound to nothing.
+run "a_bucket_name_with_a_capital_fails_validation" {
+  command = plan
+
+  variables {
+    state_bucket   = "exAmple-bucket"
+    backup_bucket  = "exAmple-bucket"
+    billing_bucket = "exAmple-bucket"
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
+}
+
+run "a_bucket_name_with_a_slash_fails_validation" {
+  command = plan
+
+  variables {
+    state_bucket   = "example/bucket"
+    backup_bucket  = "example/bucket"
+    billing_bucket = "example/bucket"
+  }
+
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
+}
+
+run "a_sixty_four_character_bucket_name_fails_validation" {
+  command = plan
+
+  variables {
+    state_bucket   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    backup_bucket  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    billing_bucket = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 
   expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]

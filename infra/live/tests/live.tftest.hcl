@@ -485,6 +485,42 @@ run "a_name_with_a_space_fails_validation" {
   expect_failures = [var.backup_bucket, var.billing_bucket]
 }
 
+# A capital or a slash passes a name S3 refuses and the VM's render cannot use as a tag,
+# and 64 characters is one past S3's limit. The two runs above leave the regex's
+# character class and its length bound to nothing.
+run "a_bucket_name_with_a_capital_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "exAmple-bucket"
+    billing_bucket = "exAmple-bucket"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
+run "a_bucket_name_with_a_slash_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "example/bucket"
+    billing_bucket = "example/bucket"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
+run "a_sixty_four_character_bucket_name_fails_validation" {
+  command = plan
+
+  variables {
+    backup_bucket  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    billing_bucket = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+
+  expect_failures = [var.backup_bucket, var.billing_bucket]
+}
+
 # The mock account id is also what a hard-coded ARN would carry, so plan once under a
 # second account. An ARN that does not follow the caller's account names nobody's
 # parameter or role, and the VM's read, the token's write and both assumes would be

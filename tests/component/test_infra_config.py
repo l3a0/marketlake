@@ -416,6 +416,32 @@ def test_live_holds_one_bucket_policy_and_one_export() -> None:
         assert declared == {f"{rtype}.{only}"}, declared
 
 
+def test_the_export_waits_for_the_billing_bucket_policy() -> None:
+    """Creating the export checks its destination, and the bucket policy is what lets the
+    service write there. Without the ordering a first apply can call ``CreateExport``
+    before ``PutBucketPolicy`` lands. The mock provider plans the two in any order, so no
+    ``tofu test`` run can see it, as ``test_vm_waits_for_the_ssm_attachment_and_the_config_read``
+    says of the VM."""
+    body = _resources("live")["aws_bcmdataexports_export.cost"]
+    assert body.get("depends_on") == ["${aws_s3_bucket_policy.billing}"], body
+
+
+def test_bootstrap_bucket_variables_have_no_default() -> None:
+    """The bootstrap is applied by hand from ``bootstrap.tfvars``, so no workflow check
+    reaches its variables. A default on a bucket's name would let a forgotten tfvars line
+    plan clean, granting on and denying reads of a bucket that is not the real one."""
+    found = []
+    for path in sorted((INFRA / "bootstrap").glob("*.tf")):
+        with path.open() as f:
+            parsed = hcl2.load(f, serialization_options=_OPTIONS)
+        for block in parsed.get("variable", []):
+            for name, body in block.items():
+                if name.endswith("_bucket"):
+                    found.append(name)
+                    assert "default" not in body, name
+    assert sorted(found) == ["backup_bucket", "billing_bucket", "state_bucket"], found
+
+
 def test_live_roles_leave_their_policies_to_separate_resources() -> None:
     """``managed_policy_arns`` and ``inline_policy`` on a role manage its policies
     exclusively, so on every apply they detach a managed policy or delete an inline one
