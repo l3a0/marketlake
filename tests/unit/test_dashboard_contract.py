@@ -141,8 +141,8 @@ def test_host_allowed(host: str | None, allowed: bool):
 # -- the registry and the routes ---------------------------------------------
 
 
-def test_the_registry_is_exactly_the_four_panels():
-    assert set(NAMED_QUERIES) == {"now", "today", "history", "lake"}
+def test_the_registry_is_exactly_the_five_panels():
+    assert set(NAMED_QUERIES) == {"now", "today", "history", "lake", "cost"}
     assert NAMED_QUERIES["now"].parameters == frozenset()
     assert NAMED_QUERIES["today"].parameters == frozenset({"date", "ticker"})
     # History takes none. The module docstring's rule 2 allows a request a ticker and a
@@ -153,6 +153,9 @@ def test_the_registry_is_exactly_the_four_panels():
     # Lake takes none for the same reason, and it has a second one: the panel is about the
     # whole lake rather than one ticker-day, so there is nothing a request could narrow.
     assert NAMED_QUERIES["lake"].parameters == frozenset()
+    # Cost takes none either. It reads the sweep's nightly cost files, and which file
+    # answers what is decided by the files' own periods, never by a request (marketlake #913).
+    assert NAMED_QUERIES["cost"].parameters == frozenset()
     for name, query in NAMED_QUERIES.items():
         assert query.name == name
         assert callable(query.run)
@@ -164,6 +167,7 @@ def test_every_route_maps_to_a_registered_query():
         "/api/today": "today",
         "/api/history": "history",
         "/api/lake": "lake",
+        "/api/cost": "cost",
     }
     assert set(ROUTES.values()) <= set(NAMED_QUERIES)
 
@@ -251,6 +255,16 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
     # second ``<link``, an ``<img``, or any absolute URL still fails.
     for marker in (b"http://", b"https://", b"<link", b"<img", b"src="):
         assert marker not in rest
+
+
+def test_an_error_drawing_the_cost_panel_is_caught_on_its_own_chain():
+    """A throw inside ``renderCost`` must land in ``costFailed``. Passed as ``then``'s second
+    argument, ``costFailed`` catches only a failed fetch, so a render error would reject the
+    ``Promise.all`` that resets ``inFlight``, and every panel would stop refreshing. Nothing
+    in the repository runs the page's JavaScript, so the chain is read off the source."""
+    page = dashboard.load_status_page().decode()
+    statements = re.findall(r"var cost = ([^;]*);", page)
+    assert statements == ['getJSON("/api/cost").then(renderCost).catch(costFailed)']
 
 
 def test_the_declared_icon_sizes_match_the_sizes_the_icon_carries():

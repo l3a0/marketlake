@@ -89,6 +89,11 @@ and an absent key is ``None``. A host without the key never trims, and its
 ``lake.bucket restore`` brings back the whole lake rather than rebuilding a trimmed one,
 marketlake #785. ``lake.window`` judges it in each job that reads it, for the same reason.
 
+A fifth is ``cost_export``, the ``s3://`` location of the AWS cost and usage export, which
+``lake.vm_config`` renders from an instance tag on the VM, marketlake #913. It is stored as
+read, and an absent key is ``None``, which means the host runs no cost read. The sweep's
+cost read parses it when it runs, and a value it cannot use fails that read alone.
+
 A *guard constant* is a tunable threshold the failure machinery reads, like the
 watchdog's page-after count or the suspect-snapshot ratio. The defaults here are the
 values the design pins. Slice 1 measures the real distributions and recalibrates them.
@@ -209,6 +214,10 @@ ROLE_KEY = "role"
 # The lake window key, marketlake #786: how many recent sessions this host keeps on its lake
 # volume, and the opt-in to trimming. ``lake.window`` judges it and says why loading does not.
 LAKE_WINDOW_SESSIONS_KEY = "lake_window_sessions"
+
+# The cost export key, marketlake #913: where the AWS cost and usage export lands, as an
+# ``s3://`` location. Optional, and only the sweep's cost read judges it.
+COST_EXPORT_KEY = "cost_export"
 
 
 class _Absent(Enum):
@@ -750,6 +759,9 @@ class Config:
     # The ``lake_window_sessions`` integer as the file held it, the ``repr`` of any other
     # value, or ``None`` when the key is absent. ``lake.window.window_sessions`` judges it.
     lake_window_sessions: int | str | None = None
+    # The ``cost_export`` text as the file held it, or ``None`` when the key is absent or
+    # empty. Only ``lake.aws_cost`` reads it, and loading never refuses it.
+    cost_export: str | None = None
     # The command key, which signs only STS's ``AssumeRole``, marketlake #737.
     command_access_key_id: Secret | None = None
     command_secret_access_key: Secret | None = None
@@ -837,6 +849,7 @@ class Config:
             ),
             token_store_region=_optional_text(mapping.get(TOKEN_STORE_REGION_KEY)),
             lake_window_sessions=_window_value(mapping),
+            cost_export=_optional_text(mapping.get(COST_EXPORT_KEY)),
             command_access_key_id=None if command_key_id is None else Secret(command_key_id),
             command_secret_access_key=(
                 None if command_secret_key is None else Secret(command_secret_key)

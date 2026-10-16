@@ -139,6 +139,13 @@
      History section is not greyed out because the minute above it went stale, and a
      failed one says so in its own words rather than borrowing that banner. */
   body.degraded #history-panel { opacity: 1; filter: none; }
+  body.degraded #cost-panel { opacity: 1; filter: none; }
+  /* The Cost panel's trend is a table with a bar per day, drawn as a span's width, because
+     the page draws no SVG and loads nothing from anywhere else. */
+  .cost-bar {
+    display: inline-block; height: 10px; vertical-align: middle;
+    background: var(--out-of-scope);
+  }
   body.degraded #asof { opacity: .5; }
 </style>
 </head>
@@ -210,6 +217,21 @@
     <div id="lake-entries"></div>
     <h3 class="muted">Growth <span id="growth-note" class="muted"></span></h3>
     <div id="growth"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Cost <span id="cost-period" class="muted"></span></h2>
+  <div class="panel" id="cost-panel">
+    <div id="cost-state"></div>
+    <h3 class="muted">Month to date by service</h3>
+    <div id="cost-services"></div>
+    <h3 class="muted">Cost per captured session</h3>
+    <div id="cost-sessions"></div>
+    <h3 class="muted">Trend <span id="cost-trend-note" class="muted"></span></h3>
+    <div id="cost-trend"></div>
+    <h3 class="muted">S3 by bucket</h3>
+    <div id="cost-s3"></div>
   </div>
 </section>
 
@@ -1345,6 +1367,247 @@
       ". Nothing in this section is live. The panels above it are.", "alarm"));
   }
 
+  // -- the Cost panel -------------------------------------------------------
+
+  // Every decision here was made by the query, which unit tests reach. This draws the
+  // fields it is given and nothing else, so each branch below is a sentence per state
+  // rather than a rule.
+  var COST_SECTIONS = ["cost-state", "cost-services", "cost-sessions", "cost-trend", "cost-s3"];
+
+  function money(n, currency) {
+    if (n === null || n === undefined) { return DASH; }
+    return (currency && currency !== "USD" ? currency + " " : "$") + n.toFixed(2);
+  }
+
+  function costCleared() {
+    COST_SECTIONS.forEach(function (id) { clear(byId(id)); });
+    byId("cost-period").textContent = "";
+    byId("cost-trend-note").textContent = "";
+  }
+
+  // The state line, and whether there is anything below it to draw.
+  function costState(cost) {
+    var box = byId("cost-state");
+    if (cost.condition === "no_directory") {
+      box.appendChild(el("p", "No cost report has been filed. This host runs no cost " +
+        "read: its config.yaml names no cost_export.", "muted"));
+      return false;
+    }
+    if (cost.condition === "unreadable_directory" || cost.condition === "failed") {
+      box.appendChild(el("p", (cost.condition === "failed"
+        ? "The cost query failed: " : "The cost reports directory would not list: ") +
+        cost.error + ". Nothing in this section is live.", "alarm"));
+      return false;
+    }
+    if (cost.condition === "no_file") {
+      box.appendChild(el("p", "No cost report would read: " +
+        plural(cost.oversize, "file", "files") + " over the size bound and " +
+        plural(cost.unparseable, "file", "files") + " that would not parse.", "alarm"));
+      return false;
+    }
+    var newest = cost.newest || {};
+    var lines = {
+      no_export: ["No export has arrived yet. AWS delivers the first one up to a day " +
+        "after the export is created. The sweep last read on " + newest.day + ".", "note"],
+      no_delivery: ["The export has not delivered " + cost.period + " yet, as of the " +
+        "sweep's read on " + newest.day + ".", "note"],
+      refreshing: ["The export was refreshing when the sweep read it on " + newest.day +
+        ", so that night read nothing new. The next night reads again.", "note"],
+      failed: ["The cost read on " + newest.day + " failed: " + newest.error +
+        ". The figures below are from the last read that worked.", "alarm"],
+      delivery: ["Read on " + newest.day + ".", "muted"]
+    };
+    var line = lines[cost.state] || ["The newest cost report names a state this page " +
+      "does not know: " + cost.state + ".", "alarm"];
+    box.appendChild(el("p", line[0], line[1]));
+    if (cost.stale) {
+      box.appendChild(el("p", "The newest cost report is from " + newest.day +
+        ", older than the newest nightly report, from " + cost.newest_nightly +
+        ". The cost read did not run that night.", "alarm"));
+    }
+    var skipped = cost.oversize + cost.unparseable;
+    if (skipped) {
+      box.appendChild(el("p", plural(skipped, "cost report", "cost reports") +
+        " would not read and " + (skipped === 1 ? "was" : "were") + " skipped.", "note"));
+    }
+    if (cost.no_current_delivery && cost.state !== "no_export") {
+      box.appendChild(el("p", "There is no delivery for " + cost.period +
+        " yet, so there are no month-to-date figures.", "note"));
+    }
+    box.appendChild(el("p", "The export lags about a day, and every figure is an " +
+      "estimate until the month closes. AWS can restate a closed month for up to two " +
+      "weeks after it ends.", "muted"));
+    return true;
+  }
+
+  function costServices(cost) {
+    var box = byId("cost-services");
+    var current = cost.current;
+    if (!current) {
+      box.appendChild(el("p", "No month-to-date figures.", "empty"));
+      return;
+    }
+    box.appendChild(el("p", money(current.total, cost.currency) + " for " + current.period +
+      " through " + current.newest_day + ", from the delivery of " + current.delivered_at +
+      ", read on " + current.from_day + ". The newest day is partial."));
+    var wrap = el("div", null, "table-wrap");
+    var table = el("table");
+    var head = el("tr");
+    ["Service", "Usage", "Other lines", "Total"].forEach(function (name) {
+      head.appendChild(el("th", name));
+    });
+    table.appendChild(head);
+    current.services.forEach(function (row) {
+      var tr = el("tr");
+      tr.appendChild(el("td", row.product));
+      tr.appendChild(el("td", money(row.usage, cost.currency), "num"));
+      tr.appendChild(el("td", money(row.other, cost.currency), "num"));
+      tr.appendChild(el("td", money(row.total, cost.currency), "num"));
+      table.appendChild(tr);
+    });
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+    var projection = current.projection || {};
+    if (projection.status === "estimate") {
+      box.appendChild(el("p", "Projected month end: " +
+        money(projection.month_end, cost.currency) + ". An estimate: usage through " +
+        projection.through + " scaled to the whole month, plus tax, fees, credits and " +
+        "other lines as they stand."));
+    } else {
+      box.appendChild(el("p", "Too early to project the month: no complete day in " +
+        current.period + " yet.", "muted"));
+    }
+  }
+
+  function sessionText(label, figure, currency) {
+    if (!figure) { return label + ": not yet available."; }
+    if (figure.status === "ok") {
+      return label + ": " + money(figure.value, currency) + " a session, " +
+        money(figure.usage_cost, currency) + " of usage over " +
+        plural(figure.sessions, "captured session", "captured sessions") + " through " +
+        figure.through + ".";
+    }
+    if (figure.status === "no_sessions") {
+      return label + ": no captured session through " + figure.through + ".";
+    }
+    return label + ": too early, no complete day yet.";
+  }
+
+  function costSessions(cost) {
+    var box = byId("cost-sessions");
+    var current = cost.current;
+    box.appendChild(el("p", sessionText("This month",
+      current ? current.cost_per_session : null, cost.currency)));
+    var previous = cost.previous;
+    box.appendChild(previous
+      ? el("p", sessionText(previous.period + ", closed", previous.cost_per_session,
+        cost.currency) + " Its total was " + money(previous.total, cost.currency) + ".")
+      : el("p", "The closed month's figures are not available yet. The export delivers " +
+        "the current month only, so its first month has no closed month to show.", "muted"));
+  }
+
+  function costTrend(cost) {
+    var box = byId("cost-trend");
+    if (!cost.trend.length) {
+      box.appendChild(el("p", "No daily figures yet.", "empty"));
+      return;
+    }
+    byId("cost-trend-note").textContent = cost.trend[0].day + " to " +
+      cost.trend[cost.trend.length - 1].day;
+    var max = 0;
+    cost.trend.forEach(function (day) { if (day.total > max) { max = day.total; } });
+    var wrap = el("div", null, "table-wrap");
+    var table = el("table");
+    var head = el("tr");
+    ["Day", "Total", ""].forEach(function (name) { head.appendChild(el("th", name)); });
+    table.appendChild(head);
+    cost.trend.forEach(function (day) {
+      var tr = el("tr");
+      tr.appendChild(el("td", day.day));
+      tr.appendChild(el("td", day.total === null
+        ? "no figure yet" : money(day.total, cost.currency), "num"));
+      var cell = el("td");
+      if (day.total !== null && max > 0) {
+        var bar = el("span", null, "cost-bar");
+        bar.style.width = Math.max(1, Math.round(200 * day.total / max)) + "px";
+        bar.title = Object.keys(day.by_service).map(function (name) {
+          return name + " " + money(day.by_service[name], cost.currency);
+        }).join(", ");
+        cell.appendChild(bar);
+      }
+      tr.appendChild(cell);
+      table.appendChild(tr);
+    });
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+  }
+
+  function bucketSize(bucket) {
+    if (bucket.size_gb === null) {
+      return "Billed size: not yet available for the newest complete day.";
+    }
+    var text = "Billed size on " + bucket.size_day + ": " + bucket.size_gb.toFixed(2) + " GB";
+    if (bucket.growth) {
+      text += ", " + (bucket.growth.gb >= 0 ? "up " : "down ") +
+        Math.abs(bucket.growth.gb).toFixed(2) + " GB since " + bucket.growth.from +
+        ", " + bucket.growth.gb_per_day.toFixed(3) + " GB a day";
+    }
+    return text + ". It includes noncurrent versions and incomplete multipart parts.";
+  }
+
+  function costS3(cost) {
+    var box = byId("cost-s3");
+    if (!cost.s3.length) {
+      box.appendChild(el("p", "No S3 line in this month's delivery yet.", "empty"));
+      return;
+    }
+    cost.s3.forEach(function (bucket) {
+      box.appendChild(el("h4", bucket.bucket));
+      box.appendChild(el("p", bucketSize(bucket)));
+      if (bucket.classes.length) {
+        box.appendChild(el("p", "By storage class: " + bucket.classes.map(function (row) {
+          return row.label + " " + row.gb.toFixed(2) + " GB";
+        }).join(", ") + ".", "muted"));
+      }
+      var wrap = el("div", null, "table-wrap");
+      var table = el("table");
+      var head = el("tr");
+      ["Kind", "What", "Usage type", "Month to date"].forEach(function (name) {
+        head.appendChild(el("th", name));
+      });
+      table.appendChild(head);
+      bucket.split.forEach(function (row) {
+        var tr = el("tr");
+        tr.appendChild(el("td", row.group));
+        tr.appendChild(el("td", row.label));
+        tr.appendChild(el("td", row.usage_type, "muted"));
+        tr.appendChild(el("td", money(row.cost, cost.currency), "num"));
+        table.appendChild(tr);
+      });
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    });
+  }
+
+  function renderCost(cost) {
+    costCleared();
+    byId("cost-period").textContent = cost.period || "";
+    if (!costState(cost)) { return; }
+    costServices(cost);
+    costSessions(cost);
+    costTrend(cost);
+    costS3(cost);
+  }
+
+  // The Cost section saying its own load failed, on its own chain like History's and
+  // Lake's, so the panels above it stay live.
+  function costFailed(err) {
+    costCleared();
+    byId("cost-state").appendChild(el("p",
+      "The cost query is failing: " + err.message +
+      ". Nothing in this section is live. The panels above it are.", "alarm"));
+  }
+
   // -- the refresh cycle ----------------------------------------------------
 
   // Now and Today are fetched together and painted together. A partial failure would
@@ -1366,6 +1629,12 @@
     // walks the whole tree and reads the device, so a slow or refused filesystem must not
     // reach the two panels reading this minute.
     var lake = getJSON("/api/lake").then(renderLake, lakeFailed);
+    // On its own chain for the same reason. It reads the sweep's cost files, which say
+    // nothing about this minute, so its failure paints only its own section. The catch
+    // follows the render rather than sitting beside it, so an error thrown while drawing
+    // the panel lands in costFailed too. Beside it, that error would reject Promise.all
+    // below, inFlight would never reset, and every panel would stop refreshing.
+    var cost = getJSON("/api/cost").then(renderCost).catch(costFailed);
     getJSON("/api/now").then(function (now) {
       pending = now;
       return getJSON("/api/today?date=" + encodeURIComponent(now.session_date));
@@ -1376,7 +1645,7 @@
     }).catch(function (err) {
       markStale(err.message);
     }).then(function () {
-      return Promise.all([history, lake]);
+      return Promise.all([history, lake, cost]);
     }).then(function () {
       inFlight = false;
     });

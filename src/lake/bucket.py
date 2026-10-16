@@ -3235,6 +3235,11 @@ def _newest_trimmed_day(
 # on: the session day the close guard ran for, and the Eastern date a page failed to send.
 # ``withheld/``, ``schema_drift/`` and ``damaged_segments/`` name the ticker-day whose rows
 # produced the finding instead, which can precede the lake's first session by months.
+#
+# ``aws_cost/`` is left out on purpose, although its ``date=D`` is a night the sweep ran
+# (marketlake #913). Its files describe the AWS bill rather than the lake's rows, so a trimmed
+# day says nothing about them, and each carries both billing periods' daily series, which is
+# what the Cost panel's 30-day trend reads. A rebuild that left them out would empty the trend.
 _NIGHT_KEYED_REPORT_DIRS = frozenset({CLOSE_GUARD_DIR, ALERTS_DIR})
 
 

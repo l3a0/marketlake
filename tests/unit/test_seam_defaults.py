@@ -36,7 +36,13 @@ client also assumes a role through an STS client private to the build, which no 
 the SSM client reaches, so a test of the put answers that at an STS server on loopback,
 through the ``aws_session.STS_ENDPOINT_URL`` seam. ``vm_config.render`` takes a factory
 for its own SSM client and a reader for its instance tag too, and ``vm_config.main``
-builds both.
+builds both. That reader takes a tag's name, because the render reads two tags, the backup
+target's and the optional cost export's (marketlake #913).
+
+``sweep.sweep`` requires the cost export's client source for the same reason it requires
+the schedule seams. Its production value builds an S3 client that reaches AWS, and
+``sweep.main`` builds it from the config itself, through ``aws_cost.client_source``, so the
+``main`` accepts none.
 
 ``probe_calendar.main`` already took none. ``compact.main``, ``control_plane.main`` and
 ``daemon.main`` now build ``rsync``, the ntfy POST, the healthchecks GET, the vendor
@@ -96,6 +102,7 @@ REQUIRED = [
     (sweep.sweep, "schedule_reader"),
     (sweep._friday_wake, "schedule_setter"),
     (sweep._friday_wake, "schedule_reader"),
+    (sweep.sweep, "cost_client"),
     (reauth.reauth, "login_flow"),
     (reauth.reauth_from_config, "login_flow"),
     (reauth.reauth_from_config, "store_client_factory"),
@@ -149,6 +156,7 @@ FORBIDDEN = [
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),
     (sweep.main, "execv"),
+    (sweep.main, "cost_client"),
 ]
 
 

@@ -1,9 +1,11 @@
-"""The four named queries over a real fixture lake.
+"""The five named queries over a real fixture lake.
 
 These lay down journal segments in the pinned capture schemas and sealed partitions in
-the fixture schema, then run the Now, Today, History and Lake queries against them through the real
-sandboxed connection. The clock and the calendar are fakes, so the one real boundary is
-the filesystem and the tier is component.
+the fixture schema, then run the Now, Today, History and Lake queries against them through
+the real sandboxed connection. The clock and the calendar are fakes, so the one real
+boundary is the filesystem and the tier is component. The Cost query reads no segment and
+no partition, so its own tests are in ``test_dashboard_cost.py``, and here it joins only the
+test that the panels leave the lake byte-identical.
 
 The fixture is a small, known Monday with every row kind the panels distinguish, plus a
 prior Friday and Thursday so the Now query has a gap-only latest day to walk back past
@@ -1366,12 +1368,39 @@ def _tree_digest(root: Path) -> dict[str, str]:
 
 
 def test_the_panels_leave_the_lake_byte_identical(service: DashboardService, root: Path):
+    # A cost file, so the Cost panel reads something rather than an absent directory
+    # (marketlake #913). Written as literal JSON, the shape ``lake.aws_cost`` files.
+    night = root / "reports" / "aws_cost" / "date=2026-08-21"
+    night.mkdir(parents=True)
+    (night / "183000000000-4242.json").write_text(
+        json.dumps(
+            {
+                "at": "2026-08-21T18:30:00-04:00",
+                "day": "2026-08-21",
+                "period": "2026-08",
+                "state": "delivery",
+                "error": None,
+                "currency": "USD",
+                "current": {
+                    "period": "2026-08",
+                    "delivered_at": "2026-08-21T06:00:00+00:00",
+                    "newest_day": "2026-08-20",
+                    "complete_through": "2026-08-19",
+                    "total": 14.0,
+                    "mtd": {"service": {"AmazonEC2": {"usage": 14.0, "other": 0.0}}},
+                    "daily": {"2026-08-19": {"AmazonEC2": 0.7}},
+                },
+            }
+        )
+    )
     before = _tree_digest(root)
     service.run_query("now", {})
     service.run_query("today", {})
     service.run_query("today", {"date": "2026-08-21", "ticker": "QQQ"})
     service.run_query("history", {})
     service.run_query("lake", {})
+    cost = service.run_query("cost", {})
+    assert cost["state"] == "delivery" and cost["current"]["total"] == 14.0
     assert _tree_digest(root) == before
 
 

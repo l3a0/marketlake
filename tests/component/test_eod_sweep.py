@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
+import yaml
 
 from lake import journal, report, runway, sweep
 from lake.actions import ActionsError, actions_path
@@ -42,7 +43,7 @@ from lake.battery import BatteryReport
 from lake.calendar import Calendar, NotASession
 from lake.capture_spans import SPANS_SCHEMA_VERSION, CaptureSpan, CaptureSpans
 from lake.cassette import Cassette
-from lake.config import GuardConstants
+from lake.config import BucketTarget, GuardConstants
 from lake.control_plane import EOD_SWEEP_SLUG, SUNDAY_WAKE, pmset_schedule_args
 from lake.manifest import LedgerNotUtf8, append_quarantine, record_partition
 from lake.paths import CHAINS, QUOTES, REPORTS_DIR, LakePaths
@@ -65,6 +66,7 @@ from lake.security_master import (
 from lake.sweep import DIGEST_BYTE_CAP, HOLIDAY_BODY, NIGHTLY_EVENT, NIGHTLY_PRIORITY
 from lake.tickers import Roster
 from lake.vendor import DAILY_FREQ, MINUTE_FREQ
+from tests.support.bucket import FakeS3
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.lake import FixtureLake, sample_chains_table
@@ -456,8 +458,12 @@ def _run(
     holidays: tuple[date, ...] = (),
     guards: GuardConstants | None = None,
     calendar: Calendar | None = None,
+    cost_client=None,
 ):
     """One sweep run with every seam injected, returning the outcome and the fakes.
+
+    ``cost_client`` stays ``None`` by default, a host with no cost export, because a test below
+    asserts that a default run leaves no subdirectory under ``reports/`` (marketlake #913).
 
     ``calendar`` replaces the two-week default, which leaves nine sessions after ``EVENING``
     and answers False past them. A disk-runway test that needs a runway longer than that
@@ -489,6 +495,7 @@ def _run(
         publisher=publisher,
         schedule_reader=reader if reader is not None else (lambda: _schedule_text()),
         schedule_setter=setter if setter is not None else _RecordingSetter(),
+        cost_client=cost_client,
         guards=guards,
     )
     return outcome, pinger, transport
@@ -541,12 +548,13 @@ def test_an_ordinary_evening_runs_every_walk_pings_files_and_sends_one_digest(
 def test_the_report_file_lands_at_the_reports_root_and_no_existing_reader_picks_it_up(
     fixture_lake: FixtureLake,
 ):
-    """The four named subdirectories are what the counting globs read, and this is not one.
+    """The six named subdirectories are what the producers' readers glob, and this is not one.
 
-    ``alert.undelivered`` counts ``reports/alerts/date=D/``, and the three writers in
-    ``lake.report`` each build a named subdirectory. A nightly file placed inside any of them
-    would inflate that producer's count. A flat file at the root is picked up by
-    ``reports/*.json`` and by nothing else.
+    ``alert.undelivered`` counts ``reports/alerts/date=D/``, the writers in ``lake.report``
+    each build a named subdirectory, and ``lake.aws_cost`` builds ``reports/aws_cost/``. A
+    nightly file placed inside any of them would inflate that producer's count, or reach the
+    Cost panel's scan. A flat file at the root is picked up by ``reports/*.json`` and by
+    nothing else.
     """
     root = _lake(fixture_lake)
     _run(root)
@@ -1832,6 +1840,7 @@ def test_a_friday_with_no_reader_sets_the_wake_and_reads_nothing_back(fixture_la
         publisher=None,
         schedule_reader=None,
         schedule_setter=setter,
+        cost_client=None,
     )
     assert setter.sundays == [SUNDAY]
     assert not any("pmset" in line for line in outcome.nightly.report)
@@ -1858,6 +1867,7 @@ def test_a_friday_with_no_setter_skips_the_whole_branch(fixture_lake: FixtureLak
         publisher=None,
         schedule_reader=reader,
         schedule_setter=None,
+        cost_client=None,
     )
     assert reads == []
     assert not any("one-shot" in line for line in outcome.nightly.report)
@@ -2974,6 +2984,7 @@ def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLa
         publisher=None,
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
+        cost_client=None,
     )
 
     assert seen == [calendar], "the split walk did not get the calendar the run was given"
@@ -3434,6 +3445,7 @@ def _operator_night(
         publisher=Publisher(lake_root=root, transport=FakeTransport(), secrets=("secret-key",)),
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
+        cost_client=None,
         guards=None,
     )
     return root, outcome
@@ -3759,6 +3771,7 @@ def test_a_run_with_no_publisher_files_the_line_and_sends_no_page(
         publisher=None,
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
+        cost_client=None,
     )
     (line,) = _runway_lines(outcome)
     assert line.startswith("disk runway short: 0 capture days left")
@@ -4291,3 +4304,209 @@ def test_an_unpatched_hand_off_reaches_the_suites_exec_guard(
             schedule_reader=lambda: _schedule_text(),
         )
     capsys.readouterr()
+
+
+# -- the AWS cost read, marketlake #913 -----------------------------------------------------
+
+COST_TARGET = BucketTarget("example-billing", "cur/marketlake-cost")
+
+
+def _cost_files(root: Path) -> list[dict]:
+    """Every cost file the run wrote, read back off disk."""
+    directory = root / REPORTS_DIR / "aws_cost"
+    return [json.loads(path.read_text()) for path in sorted(directory.rglob("*.json"))]
+
+
+def _denied_s3() -> FakeS3:
+    """The export's bucket with the VM's list grant removed."""
+    return FakeS3("example-billing", versioning=None, deny_prefixes=("cur/marketlake-cost/",))
+
+
+def test_a_failed_cost_read_writes_a_failed_file_and_the_run_still_pings(
+    fixture_lake: FixtureLake,
+):
+    root = _lake(fixture_lake)
+    s3 = _denied_s3()
+
+    outcome, pinger, _ = _run(root, cost_client=lambda: (COST_TARGET, s3))
+
+    assert outcome.ok is True
+    assert pinger.urls == [PING_URL]
+    assert outcome.nightly.problems == ()
+    assert [(entry["state"], entry["error"]) for entry in _cost_files(root)] == [
+        ("failed", "ClientError")
+    ]
+    assert "aws cost read failed: ClientError" in outcome.nightly.report
+    assert kind_of(outcome.nightly, "aws cost read") == ACTION
+    assert "aws cost read failed: ClientError" in _filed(root)[0]["report"]
+    assert outcome.hand_off is True
+
+
+def test_a_cost_client_that_cannot_be_built_is_a_failed_file_after_the_ping(
+    fixture_lake: FixtureLake,
+):
+    """``bucket.connect`` refuses a bad setting as ``BucketSettingsInvalid``. Called inside the
+    step, after the ping, that is a failed file rather than a run that never started."""
+    from lake.bucket import BucketSettingsInvalid
+
+    root = _lake(fixture_lake)
+    pinger = FakePinger()
+    pinged_first = []
+
+    def refused():
+        pinged_first.append(list(pinger.urls))
+        raise BucketSettingsInvalid("bucket_region is not set")
+
+    outcome, _, _ = _run(root, pinger=pinger, cost_client=refused)
+
+    assert pinged_first == [[PING_URL]]
+    assert outcome.ok is True
+    assert [entry["error"] for entry in _cost_files(root)] == ["BucketSettingsInvalid"]
+
+
+def test_the_cost_read_begins_after_the_ping_has_landed(fixture_lake: FixtureLake):
+    from tests.component.test_aws_cost import deliver, line, parquet
+
+    root = _lake(fixture_lake)
+    pinger = FakePinger()
+    seen: list[list[str]] = []
+    s3 = FakeS3(
+        "example-billing", versioning=None, on_get=lambda kwargs: seen.append(list(pinger.urls))
+    )
+    rows = [
+        line(datetime(2026, 9, day, 12, tzinfo=UTC), "AmazonEC2", "BoxUsage", 0.7)
+        for day in (1, 2, 3)
+    ]
+    deliver(s3, "2026-09", parquet(rows))
+
+    outcome, _, _ = _run(root, pinger=pinger, cost_client=lambda: (COST_TARGET, s3))
+
+    assert seen == [[PING_URL]]
+    assert outcome.ok is True
+    [entry] = _cost_files(root)
+    assert entry["state"] == "delivery"
+    assert entry["current"]["complete_through"] == "2026-09-02"
+    # A delivery adds no line, so a healthy night costs the digest nothing.
+    assert not any("aws cost" in line for line in outcome.nightly.report)
+
+
+def test_a_holiday_reads_the_cost_export_too(fixture_lake: FixtureLake):
+    root = _lake(fixture_lake)
+    s3 = FakeS3("example-billing", versioning=None)
+
+    outcome, pinger, _ = _run(root, holidays=(SESSION,), cost_client=lambda: (COST_TARGET, s3))
+
+    assert outcome.nightly.session is False
+    assert pinger.urls == [PING_URL]
+    assert [entry["state"] for entry in _cost_files(root)] == ["no_export"]
+    assert kind_of(outcome.nightly, "aws cost read") == INFO
+    assert "aws cost read: no export has been delivered yet" in _filed(root)[0]["report"]
+
+
+def test_a_cost_file_that_cannot_be_written_is_a_line_and_not_a_lost_run(
+    fixture_lake: FixtureLake,
+):
+    root = _lake(fixture_lake)
+    (root / REPORTS_DIR).mkdir(exist_ok=True)
+    (root / REPORTS_DIR / "aws_cost").write_text("a file where the directory goes")
+
+    outcome, pinger, _ = _run(
+        root, cost_client=lambda: (COST_TARGET, FakeS3("example-billing", versioning=None))
+    )
+
+    assert outcome.ok is True
+    assert pinger.urls == [PING_URL]
+    # ``NotADirectoryError`` on both hosts, since ``mkdir`` meets a file where a directory goes.
+    assert "aws cost report not written: NotADirectoryError" in outcome.nightly.report
+    assert kind_of(outcome.nightly, "aws cost report not written") == ACTION
+    assert len(_filed(root)) == 1
+
+
+def test_anything_the_cost_step_did_not_expect_is_a_line_and_not_a_lost_run(
+    fixture_lake: FixtureLake, monkeypatch
+):
+    """The step's outer catch is the backstop for whatever ``run`` and the writer's own catch
+    do not cover. A raise from building the report line reaches it, and the run still pings,
+    files its nightly report and hands off, with an action line naming the type."""
+
+    class _Unexpected(Exception):
+        pass
+
+    def raises(entry):
+        raise _Unexpected("a message that names example-billing")
+
+    monkeypatch.setattr(sweep.aws_cost, "report_line", raises)
+    root = _lake(fixture_lake)
+
+    outcome, pinger, _ = _run(
+        root, cost_client=lambda: (COST_TARGET, FakeS3("example-billing", versioning=None))
+    )
+
+    assert outcome.ok is True
+    assert pinger.urls == [PING_URL]
+    assert outcome.nightly.problems == ()
+    assert "aws cost read failed: _Unexpected" in outcome.nightly.report
+    assert kind_of(outcome.nightly, "aws cost read failed") == ACTION
+    assert not any("example-billing" in line for line in outcome.nightly.report)
+    [filed] = _filed(root)
+    assert "aws cost read failed: _Unexpected" in filed["report"]
+    assert outcome.hand_off is True
+
+
+def test_a_failed_cost_read_still_exits_zero_and_hands_off_from_the_command(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    """Done-when 1 at command level. The config names the export, and ``bucket.connect``
+    answers with a bucket whose list grant was removed. The run exits 0, hands off, and files
+    a failed cost report beside its nightly one."""
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+    with open(config, "a", encoding="utf-8") as handle:
+        handle.write("cost_export: s3://example-billing/cur/marketlake-cost\n")
+    targets = []
+
+    def connect(loaded, target):
+        targets.append(target)
+        return target, _denied_s3()
+
+    monkeypatch.setattr("lake.bucket.connect", connect)
+    execs = _record_execs(monkeypatch)
+
+    code = sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    printed = capsys.readouterr().out
+
+    assert code == 0, printed
+    assert execs.calls == _handed_off(config)
+    assert targets == [COST_TARGET]
+    root = Path(yaml.safe_load(config.read_text())["lake_root"])
+    assert [entry["state"] for entry in _cost_files(root)] == ["failed"]
+    assert "report: aws cost read failed: ClientError" in printed
+
+
+def test_a_config_with_no_cost_export_never_connects_and_writes_no_cost_file(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path
+):
+    config, tickers = _command_setup(fixture_lake, monkeypatch, tmp_path)
+
+    def no_connect(*args, **kwargs):
+        raise AssertionError("connect was called on a host with no cost_export")
+
+    monkeypatch.setattr("lake.bucket.connect", no_connect)
+    _record_execs(monkeypatch)
+
+    code = sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+
+    assert code == 0, capsys.readouterr().out
+    root = Path(yaml.safe_load(config.read_text())["lake_root"])
+    assert not (root / REPORTS_DIR / "aws_cost").exists()

@@ -749,6 +749,7 @@ def _sweep(
         publisher=Publisher(lake_root=root, transport=transport, secrets=("secret-key",)),
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
+        cost_client=None,
         window_sessions=window,
         guards=guards,
     )

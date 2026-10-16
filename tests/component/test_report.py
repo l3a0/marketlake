@@ -535,7 +535,7 @@ def _nightly_entries(root: Path) -> list[dict]:
 
 
 def test_the_nightly_file_lands_at_the_tree_root_and_no_glob_of_a_producer_finds_it(lake_root):
-    """The four named subdirectories are what the counting globs read, and this is not one.
+    """The six named subdirectories are what the producers' readers glob, and this is not one.
 
     ``undelivered`` counts ``reports/alerts/``, and a nightly file placed inside any
     producer's directory would inflate that producer's count. A flat file at the root is

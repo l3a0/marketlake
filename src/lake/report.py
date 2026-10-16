@@ -83,9 +83,17 @@ it, and the report-tier findings the design says send no message at all. It writ
 run including a holiday no-op, for the close+5 guard's reason, since an absent file cannot be
 told from a run that never happened.
 
-It sits at the root because nothing else does. Five named subdirectories sit under it, so a
-reader globbing ``reports/*.json`` picks up the nightly files and nothing else, and the five
-counting globs each name their own directory.
+It sits at the root because nothing else does. Six named subdirectories sit under it, so a
+reader globbing ``reports/*.json`` picks up the nightly files and nothing else. Five of them
+hold a producer's findings, and the counting glob for each names its own directory. The
+sixth, ``aws_cost/``, has no counting glob, and the dashboard's Cost panel scans it.
+
+The vendor sweep writes a second file of its own, in a subdirectory: on a host whose
+``config.yaml`` names a cost export, ``lake.aws_cost`` files the night's summary of the AWS
+cost and usage export under ``reports/aws_cost/date=D/`` (marketlake #913). It is the
+sweep's second subdirectory rather than a fifth producer, and it follows rule 3: one file per
+run, named by stamp and pid, written once. A failed read files too, saying so, for the close+5
+guard's reason.
 
 A held finding recurs every night, because nothing settles it, and nothing under
 ``reports/`` is ever pruned. So one unresolved disagreement is thirty files in one
