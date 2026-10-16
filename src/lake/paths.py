@@ -95,7 +95,7 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 # and the three lake-root ledgers. ``reports/`` holds one dated file per vendor-sweep run,
 # written by ``lake.sweep`` and named by the day it is about, then by the stamp and the
 # writing process's id. Two runs on one night are two verdicts rather than a correction,
-# because nothing here resolves one file against another. Five more trees sit under it,
+# because nothing here resolves one file against another. Six more trees sit under it,
 # each in a subdirectory of its own so a reader counting one never picks up another, and
 # a flat file at the root is reached by ``reports/*.json`` and by none of their globs.
 #
@@ -116,9 +116,12 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #    sha256 its manifest entry recorded when it closed, or its read proved it damaged, under
 #    `reports/damaged_segments/date=D/`. It files on every run the damage survives, for
 #    the refused merge's reason, and it is not drift, so it stays out of item 3's tree.
+# 6. One file per vendor-sweep run on a host with a cost export, under
+#    `reports/aws_cost/date=D/`, written by ``lake.aws_cost``. It is the night's summary of
+#    the AWS cost and usage export, keyed on the Eastern date of the run (marketlake #913).
 #
 # The tree sits inside the backup sync root, so a restore carries the reports with the
-# data, and outside the manifest, because none of the six is a measurement.
+# data, and outside the manifest, because none of the seven is a measurement.
 JOURNAL_DIR = "journal"
 REFERENCE_DIR = "reference"
 REPORTS_DIR = "reports"
@@ -126,6 +129,11 @@ REPORTS_DIR = "reports"
 # ``reports/alerts/date=D/`` keyed on the Eastern date the page failed. A rebuild of a trimmed
 # lake reads the name too, to date what it leaves out (marketlake #796).
 ALERTS_DIR = "alerts"
+# The subdirectory of ``reports/`` that ``lake.aws_cost`` files the sweep's nightly cost
+# summary under, as ``reports/aws_cost/date=D/`` keyed on the Eastern date of the run. The
+# dashboard's Cost panel reads it, and a rebuild keeps all of it, which ``bucket.py`` says
+# beside ``_NIGHT_KEYED_REPORT_DIRS`` (marketlake #913).
+AWS_COST_DIR = "aws_cost"
 MANIFEST_FILE = "manifest.jsonl"
 QUARANTINE_FILE = "quarantine.jsonl"
 
@@ -632,6 +640,7 @@ def default_token_path(home: str | Path | None = None) -> Path:
 __all__ = [
     "ACTIONS",
     "ALERTS_DIR",
+    "AWS_COST_DIR",
     "BARS",
     "CHAINS",
     "CHAIN_PLAN_FILE",

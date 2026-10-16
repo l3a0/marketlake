@@ -35,6 +35,14 @@ version and lets a ``HeadObject`` naming one through, so a test can reach a refu
 follows a lookup whose requests all passed. ``on_put`` and ``on_get`` run before a
 ``PutObject`` or a ``GetObject`` is answered, so a test can fail or time one kind of call
 alone.
+
+Every stored version carries a ``LastModified``, which ``ListObjectsV2``, ``HeadObject`` and
+``GetObject`` answer with, as S3 does. ``store`` takes one, and a version stored without one
+gets the fake's own clock, which starts at ``EPOCH`` and moves one second per version, so a
+later write is always newer. ``deny_prefixes`` refuses a ``ListObjectsV2`` whose ``Prefix``,
+or a ``HeadObject`` whose ``Key``, starts with one of them, as AccessDenied, which is how a
+test models a list grant conditioned on ``s3:prefix`` that no longer covers a path. The cost
+read's manifest barrier and its removed grant are tested through these (marketlake #913).
 """
 
 from __future__ import annotations
@@ -44,10 +52,15 @@ import binascii
 import hashlib
 import io
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 FULL_OBJECT = "FULL_OBJECT"
+
+# Where the fake's clock starts. A version stored without a ``last_modified`` gets this plus
+# one second per version stored before it.
+EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def client_error(code: str, operation: str, status: int = 400) -> ClientError:
@@ -72,6 +85,7 @@ class Version:
     checksum: str | None
     checksum_type: str | None = FULL_OBJECT
     storage_class: str | None = None
+    last_modified: datetime = EPOCH
 
 
 class _Events:
@@ -107,6 +121,7 @@ class FakeS3:
         deny_versioned_get: bool = False,
         deny_list_versions: bool = False,
         deny_versioned_get_object: bool = False,
+        deny_prefixes: tuple[str, ...] = (),
     ) -> None:
         self.bucket = bucket
         self.page_size = page_size
@@ -116,6 +131,7 @@ class FakeS3:
         self.deny_versioned_get = deny_versioned_get
         self.deny_list_versions = deny_list_versions
         self.deny_versioned_get_object = deny_versioned_get_object
+        self.deny_prefixes = tuple(deny_prefixes)
         self.objects: dict[str, list[Version]] = {}
         # Each key's delete markers, as ``(sequence, version id)``. The sequence orders them
         # among the key's versions, whose ids carry the same counter.
@@ -150,18 +166,20 @@ class FakeS3:
         *,
         checksum: str | None = "auto",
         checksum_type: str | None = FULL_OBJECT,
+        last_modified: datetime | None = None,
     ) -> None:
         """Put an object straight into the store, the way another tool would have.
 
         ``checksum="auto"`` stores the true SHA-256, ``None`` stores none, and any other
         value is stored as given, which is how a test models a composite checksum.
+        ``last_modified`` defaults to the fake's clock.
         """
         value = (
             base64.b64encode(hashlib.sha256(body).digest()).decode()
             if checksum == "auto"
             else checksum
         )
-        self._add(key, body, value, checksum_type, None)
+        self._add(key, body, value, checksum_type, None, last_modified)
 
     def delete_marker(self, key: str) -> str:
         """Add a delete marker to ``key`` and return its version id.
@@ -191,9 +209,15 @@ class FakeS3:
         if kwargs.get("Bucket", self.bucket) != self.bucket:
             raise client_error("NoSuchBucket", name, 404)
 
-    def _add(self, key, body, checksum, checksum_type, storage_class) -> Version:
+    def _add(
+        self, key, body, checksum, checksum_type, storage_class, last_modified=None
+    ) -> Version:
         self._next_version += 1
-        version = Version(f"v{self._next_version}", body, checksum, checksum_type, storage_class)
+        if last_modified is None:
+            last_modified = EPOCH + timedelta(seconds=self._next_version)
+        version = Version(
+            f"v{self._next_version}", body, checksum, checksum_type, storage_class, last_modified
+        )
         self.objects.setdefault(key, []).append(version)
         return version
 
@@ -226,8 +250,13 @@ class FakeS3:
             response["ChecksumSHA256"] = supplied
         return response
 
+    def _denied(self, path: str) -> bool:
+        return any(path.startswith(prefix) for prefix in self.deny_prefixes)
+
     def head_object(self, **kwargs) -> dict:
         self._enter("head_object", kwargs)
+        if self._denied(kwargs["Key"]):
+            raise client_error("403", "HeadObject", 403)
         versions = self.objects.get(kwargs["Key"])
         wanted = kwargs.get("VersionId")
         if wanted is not None and self.deny_versioned_get:
@@ -245,7 +274,11 @@ class FakeS3:
             if not named:
                 raise client_error("404", "HeadObject", 404)
             current = named[0]
-        response = {"ContentLength": len(current.body), "VersionId": current.version_id}
+        response = {
+            "ContentLength": len(current.body),
+            "VersionId": current.version_id,
+            "LastModified": current.last_modified,
+        }
         if current.storage_class is not None:
             response["StorageClass"] = current.storage_class
         if kwargs.get("ChecksumMode") == "ENABLED" and current.checksum is not None:
@@ -264,26 +297,44 @@ class FakeS3:
         wanted = kwargs.get("VersionId")
         if wanted is None:
             current = versions[-1]
-            return {"Body": io.BytesIO(current.body), "VersionId": current.version_id}
+            return {
+                "Body": io.BytesIO(current.body),
+                "VersionId": current.version_id,
+                "LastModified": current.last_modified,
+            }
         if self.deny_versioned_get or self.deny_versioned_get_object:
             raise client_error("AccessDenied", "GetObject", 403)
         for version in versions:
             if version.version_id == wanted:
-                return {"Body": io.BytesIO(version.body), "VersionId": version.version_id}
+                return {
+                    "Body": io.BytesIO(version.body),
+                    "VersionId": version.version_id,
+                    "LastModified": version.last_modified,
+                }
         raise client_error("NoSuchVersion", "GetObject", 404)
 
     def list_objects_v2(self, **kwargs) -> dict:
         self._enter("list_objects_v2", kwargs)
         prefix = kwargs.get("Prefix", "")
+        if self._denied(prefix):
+            raise client_error("AccessDenied", "ListObjectsV2", 403)
         keys = [key for key in sorted(self.objects) if key.startswith(prefix)]
         start = int(kwargs.get("ContinuationToken", 0))
-        page = keys[start : start + self.page_size]
+        size = min(self.page_size, int(kwargs.get("MaxKeys", self.page_size)))
+        page = keys[start : start + size]
         response: dict = {
-            "Contents": [{"Key": key, "Size": len(self.objects[key][-1].body)} for key in page],
-            "IsTruncated": start + self.page_size < len(keys),
+            "Contents": [
+                {
+                    "Key": key,
+                    "Size": len(self.objects[key][-1].body),
+                    "LastModified": self.objects[key][-1].last_modified,
+                }
+                for key in page
+            ],
+            "IsTruncated": start + size < len(keys),
         }
         if response["IsTruncated"]:
-            response["NextContinuationToken"] = str(start + self.page_size)
+            response["NextContinuationToken"] = str(start + size)
         if not page:
             del response["Contents"]
         return response

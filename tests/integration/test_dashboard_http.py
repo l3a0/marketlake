@@ -139,6 +139,7 @@ def test_the_server_binds_the_loopback_address(served):
         "/api/today?date=2026-08-24",
         "/api/history",
         "/api/lake",
+        "/api/cost",
         "/nope",
     ],
 )
@@ -284,6 +285,7 @@ def test_a_bad_parameter_is_a_400(served, query: str):
         "/api/now/",
         "/api/history/",
         "/api/lake/",
+        "/api/cost/",
         "/api",
         "/status.html",
         # The icon path is matched whole. A prefix, a trailing slash or a different
@@ -330,6 +332,7 @@ def test_no_response_carries_the_lake_path(served):
         "/api/today?ticker=NOPE",
         "/api/history",
         "/api/lake",
+        "/api/cost",
         "/nope",
         "/",
         "/favicon.ico",
@@ -383,6 +386,8 @@ def test_the_page_carries_the_whole_content_security_policy(served):
         ("/api/history?date=2026-08-24", "localhost", 400),
         ("/api/lake", "localhost", 200),
         ("/api/lake?date=2026-08-24", "localhost", 400),
+        ("/api/cost", "localhost", 200),
+        ("/api/cost?date=2026-08-24", "localhost", 400),
         ("/api/now", "dashboard.evil.example", 403),
         ("/nope", "localhost", 404),
     ],
@@ -478,7 +483,14 @@ def served_broken(fixture_lake: FixtureLake) -> Iterator[tuple[ThreadingHTTPServ
 
 
 @pytest.mark.parametrize(
-    "path", ["/api/now", "/api/today?date=2026-08-24&ticker=SPY", "/api/history", "/api/lake"]
+    "path",
+    [
+        "/api/now",
+        "/api/today?date=2026-08-24&ticker=SPY",
+        "/api/history",
+        "/api/lake",
+        "/api/cost",
+    ],
 )
 def test_a_failed_query_is_a_500_that_leaks_nothing(served_broken, path: str, caplog):
     server, root = served_broken

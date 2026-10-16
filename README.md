@@ -45,6 +45,13 @@ once the owner creates its switch file
 ([#868](https://github.com/l3a0/marketlake/issues/868)). The schedule that starts it again
 each morning is [#867](https://github.com/l3a0/marketlake/issues/867).
 
+[MVP 3](https://github.com/l3a0/marketlake/milestone/6), see what the lake costs, is open
+beside it. On a host whose `config.yaml` names `cost_export`, the 18:30 sweep reads the AWS
+cost and usage export each night and files a summary under `reports/aws_cost/`, and the
+dashboard's Cost panel shows it ([#913](https://github.com/l3a0/marketlake/issues/913)).
+The export and its billing bucket are [#912](https://github.com/l3a0/marketlake/issues/912).
+A host without the key runs no cost read, and the panel says so.
+
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.
 
@@ -84,7 +91,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `AWS_*` variable or `~/.aws/`. It builds the bucket's client and the token parameter's
   from `config.yaml` alone. Three clients can sign with the VM's instance profile: the
   bucket's, the token pull's, and the config render's, which takes its settings from the
-  tracked `config/vm.yaml` because it writes `config.yaml`.
+  tracked `config/vm.yaml` because it writes `config.yaml`. The sweep's cost read builds
+  its client the bucket's way, through `bucket.connect`.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
 - `src/lake/trim.py` is the only code that deletes a sealed partition on its own, and
@@ -96,7 +104,13 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   either frequency once that ticker-day's chains partition is gone.
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
-  keeping the old file when any input is wrong.
+  keeping the old file when any input is wrong. An optional `marketlake:cost-export` tag
+  fills `cost_export`, and a tag the instance does not carry leaves the key out.
+- `src/lake/aws_cost.py` is the 18:30 sweep's read of the AWS cost and usage export. It
+  lists the export behind its manifest, aggregates the Parquet with pyarrow in a temp
+  directory outside the lake, and writes one summary per run under
+  `reports/aws_cost/date=D/`, which the dashboard's Cost panel reads. The raw export never
+  enters the lake.
 - `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
   the hours the scheduled jobs run in.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,

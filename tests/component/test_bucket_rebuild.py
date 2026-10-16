@@ -1015,11 +1015,15 @@ def test_the_newest_of_two_designed_absences_sets_the_day(tmp_path):
 def test_reports_dated_by_ticker_day_and_names_that_do_not_parse_are_kept(tmp_path):
     # Each is dated on or before the newest trimmed day. The three subtrees name the ticker-day
     # a finding was about, and the root name starts with a real date but is not a nightly name.
+    # The cost read's files are kept on purpose although their ``date=`` is a night the sweep
+    # ran: each carries both billing periods' daily series, so the Cost panel's 30-day trend
+    # survives a rebuild only if they do (marketlake #913).
     lake = _trimmed_bucket(tmp_path)
     kept = (
         "reports/withheld/date=2026-08-20/093000000000-4242-SPY-0.json",
         "reports/schema_drift/date=2026-08-24/093000000000-4242.json",
         "reports/damaged_segments/date=2026-08-24/093000000000-4242.json",
+        "reports/aws_cost/date=2026-08-20/183000000000-4242.json",
         "reports/2026-08-24-notes.json",
     )
     bodies = _stored(lake.client, *kept)

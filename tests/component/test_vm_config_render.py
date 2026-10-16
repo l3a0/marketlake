@@ -57,6 +57,13 @@ VALUES = {
 # The tag that carries the backup target, and the path the metadata service serves it at.
 TAG = "marketlake:backup-target"
 TAG_PATH = f"/latest/meta-data/tags/instance/{TAG}"
+
+# The optional tag that carries the cost export, marketlake #913, written out rather than
+# read from ``vm_config`` so a renamed tag fails here. The value is the contract's shape,
+# ``s3://<billing bucket>/cur/marketlake-cost``, with a sentinel bucket.
+COST_TAG = "marketlake:cost-export"
+COST_TAG_PATH = f"/latest/meta-data/tags/instance/{COST_TAG}"
+COST_TARGET = "s3://sentinel-billing-7a8b/cur/marketlake-cost"
 TOKEN_PATH = "/latest/api/token"
 
 SETTINGS = {
@@ -792,6 +799,8 @@ SETTINGS_REFUSALS = {
     ),
     # The tag fills backup_target, so the settings may not set it either.
     "the tag's key": (_settings_bytes(backup_target=TARGET), "set ['backup_target']"),
+    # The optional tag fills cost_export, so the settings may not set it, tag or no tag.
+    "the cost tag's key": (_settings_bytes(cost_export=COST_TARGET), "set ['cost_export']"),
     "no role": (_settings_bytes(role=_DROP), "role must be exactly"),
     "a capitalised role": (_settings_bytes(role="Shadow"), "role must be exactly"),
     "a role with a space": (_settings_bytes(role="primary "), "role must be exactly"),
@@ -1044,6 +1053,120 @@ def test_a_tag_the_metadata_service_does_not_serve_exits_three_naming_both_cause
     assert hook.regions == [] and hook.requests == []
 
 
+# -- the optional cost export tag, marketlake #913 ----------------------------------------
+
+
+def test_the_cost_export_comes_from_its_optional_tag(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    SsmHook().install(monkeypatch)
+    metadata.tags[COST_TAG] = COST_TARGET
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written == {**EXPECTED, "cost_export": COST_TARGET}
+    assert load_config(config_dir / CONFIG_FILE).cost_export == COST_TARGET
+    assert "sentinel-billing" not in capsys.readouterr().err
+
+
+def test_a_cost_tag_the_service_does_not_serve_leaves_the_key_out(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    """A 404 on the cost tag is a host with no export, or a deploy that landed before the
+    infra apply wrote the tag. The render writes the rest and exits 0, and the backup
+    target's tag is asked for first, so its own 404 still exits 3 before this one is read."""
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes()) == 0
+
+    written = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert written == EXPECTED
+    assert "cost_export" not in written
+    reads = [path for method, path, _ in metadata.requests if "/tags/instance/" in path]
+    assert reads == [TAG_PATH, COST_TAG_PATH]
+
+
+def test_the_backup_tags_404_exits_three_before_the_cost_tag_is_asked_for(
+    monkeypatch, capsys, metadata, config_dir, not_root
+):
+    SsmHook().install(monkeypatch)
+    del metadata.tags[TAG]
+    metadata.tags[COST_TAG] = COST_TARGET
+
+    assert _render(monkeypatch, _settings_bytes()) == 3
+
+    assert "no tag yet" in _one_line(capsys)
+    reads = [path for method, path, _ in metadata.requests if "/tags/instance/" in path]
+    assert reads == [TAG_PATH]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", "the marketlake:cost-export tag is empty or not text"),
+        (f"{COST_TARGET}\n", "the marketlake:cost-export tag has whitespace at its start or end"),
+        (b"\xff", "the marketlake:cost-export tag is not UTF-8 text"),
+    ],
+    ids=["empty", "a trailing newline", "bytes that are not UTF-8"],
+)
+def test_a_cost_tag_the_render_cannot_use_refuses_and_is_never_printed(
+    monkeypatch, capsys, metadata, config_dir, not_root, value, expected
+):
+    hook = SsmHook().install(monkeypatch)
+    metadata.tags[COST_TAG] = value
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes()) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    assert expected in line
+    assert "sentinel-billing" not in line
+    assert hook.requests == []
+
+
+def _cost_tag_raises(error):
+    def reader(tag):
+        if tag == TAG:
+            return TARGET
+        raise error
+
+    return reader
+
+
+@pytest.mark.parametrize(
+    ("error", "outcome", "expected"),
+    [
+        (
+            vm_config.MetadataUnavailable("URLError"),
+            vm_config.NO_CREDENTIALS,
+            "did not answer the marketlake:cost-export tag lookup (URLError)",
+        ),
+        (
+            vm_config.TagLookupFailed(500),
+            vm_config.FAILED,
+            "the marketlake:cost-export tag could not be read (HTTP 500)",
+        ),
+    ],
+    ids=["no answer", "an HTTP error"],
+)
+def test_a_cost_tag_lookup_that_fails_reads_no_parameter(tmp_path, error, outcome, expected):
+    """Only a 404 means an absent export. Any other failure of the lookup is the backup
+    target's, named for this tag, and the render reads no parameter and writes nothing."""
+    result = vm_config.render(
+        _settings_bytes(),
+        client_factory=_no_client_wanted,
+        tag_reader=_cost_tag_raises(error),
+        config_path=tmp_path / CONFIG_FILE,
+        geteuid=lambda: 1000,
+    )
+
+    assert result.outcome == outcome
+    assert expected in result.line
+    assert not (tmp_path / CONFIG_FILE).exists()
+    assert vm_config.EXIT_CODES[outcome] == (3 if outcome == vm_config.NO_CREDENTIALS else 1)
+
+
 def test_a_tag_that_appears_on_a_later_try_is_written(
     monkeypatch, capsys, metadata, config_dir, not_root
 ):
@@ -1129,7 +1252,7 @@ def test_a_malformed_token_is_raised_with_no_context_and_no_token(monkeypatch, t
         server.token_body = token
         monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
         with pytest.raises(vm_config.MetadataUnavailable) as unavailable:
-            vm_config.read_backup_target_tag()
+            vm_config.read_instance_tag(TAG)
 
     assert _chain(unavailable.value) == [unavailable.value]
     assert TOKEN_SENTINEL.decode() not in f"{unavailable.value!s} {unavailable.value!r}"
@@ -1414,8 +1537,15 @@ def _chain(exc: BaseException) -> list[BaseException]:
     return seen
 
 
-def _no_tag_wanted():
+def _no_tag_wanted(tag):
     pytest.fail("the render read the tag after a refusal that should have come first")
+
+
+def _backup_tag_only(tag):
+    """Serves the backup target's tag, and answers a 404 for the cost export's."""
+    if tag == TAG:
+        return TARGET
+    raise vm_config.TagNotServed()
 
 
 def _no_client_wanted(region):
@@ -1461,7 +1591,7 @@ def test_a_merged_config_that_raises_on_load_is_refused_with_no_context(tmp_path
         vm_config.render(
             payload,
             client_factory=lambda region: _OneParameterStore(),
-            tag_reader=lambda: TARGET,
+            tag_reader=_backup_tag_only,
             config_path=tmp_path / CONFIG_FILE,
             geteuid=lambda: 1000,
         )
@@ -1497,7 +1627,7 @@ def test_a_merged_config_error_is_refused_with_no_context(tmp_path):
         vm_config.render(
             payload,
             client_factory=lambda region: _OneParameterStore(),
-            tag_reader=lambda: TARGET,
+            tag_reader=_backup_tag_only,
             config_path=tmp_path / CONFIG_FILE,
             geteuid=lambda: 1000,
         )
@@ -1515,7 +1645,7 @@ def test_a_tag_failure_is_raised_with_no_context(monkeypatch, tags, raised):
     with _TagServer(METADATA, tags) as server:
         monkeypatch.setattr(aws_session, "METADATA_BASE_URL", server.url)
         with pytest.raises(raised) as failure:
-            vm_config.read_backup_target_tag()
+            vm_config.read_instance_tag(TAG)
 
     assert _chain(failure.value) == [failure.value]
 

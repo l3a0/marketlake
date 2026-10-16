@@ -505,7 +505,7 @@ def test_a_forgotten_config_render_is_caught():
         render(
             settings,
             client_factory=lambda region: _ParameterStore(),
-            tag_reader=lambda: "s3://probe-bucket/lake",
+            tag_reader=lambda tag: "s3://probe-bucket/lake",
             config_path=PROBE,
             geteuid=lambda: 1000,
         )

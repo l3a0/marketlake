@@ -993,7 +993,8 @@ def eod_sweep_job(host: Host) -> Job:
     """The 18:30 weekday vendor sweep, whose health check is the ``eod-sweep`` slug.
 
     It runs ``python -m lake.sweep``: the corporate-actions walks, the bar fetch, the
-    nightly report file, the ping, and the digest. On a Friday on the Mac it also sets
+    ping, the AWS cost read on a host whose ``config.yaml`` names a ``cost_export``, the
+    nightly report file, and the digest. On a Friday on the Mac it also sets
     the Sunday one-shot wake and reads it back, which is why install step 6 no longer
     asks the operator to do that by hand. On a weekday whose ``eod-sweep`` ping landed, it
     then replaces itself with ``python -m lake.compact --after-vendor-sweep``, which

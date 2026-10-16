@@ -1,4 +1,4 @@
-"""The read-only query service: the dashboard's Now, Today, History and Lake panels.
+"""The read-only query service: the dashboard's Now, Today, History, Lake and Cost panels.
 
 Failures push alerts. Progress needs a pull surface. This module is that surface. It is
 a small read-only query service on localhost that answers a fixed set of named queries
@@ -64,6 +64,12 @@ integers, the device's free bytes and its capacity, and no path outside the root
 opened. A refused path is named relative to the root for the same reason, so a reader who
 cannot read the filesystem does not learn where the lake sits on disk.
 
+The Cost panel reads the sweep's nightly cost files under ``reports/aws_cost/``, off the
+filesystem with no SQL, the way History reads the nightly reports. Those files summarize the
+AWS cost and usage export, which stays in its billing bucket and never enters the lake
+(marketlake #913). The panel adds what a port-reacher can learn: spend figures, resource IDs
+with the account id masked, and bucket names.
+
 Three terms recur, glossed at first use.
 
 1. A *surface* is one kind of measurement with its own pinned schema. Now, Today and
@@ -103,6 +109,7 @@ import os
 import re
 import sys
 import threading
+from calendar import monthrange
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -117,7 +124,7 @@ from urllib.parse import parse_qs, urlsplit
 import duckdb
 import pyarrow as pa
 
-from lake import journal
+from lake import aws_cost, journal
 from lake.alert import undelivered
 from lake.battery import PROVENANCE_BATTERY, held_line_partition, is_wrote_line
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
@@ -135,6 +142,7 @@ from lake.manifest import (
 )
 from lake.metadata import read_metadata
 from lake.paths import (
+    AWS_COST_DIR,
     CHAINS,
     DATE_PREFIX,
     QUOTES,
@@ -146,7 +154,7 @@ from lake.paths import (
     LakePaths,
     parse_date_dir,
 )
-from lake.report import ACTION, INFO, kinds_fit
+from lake.report import ACTION, INFO, kinds_fit, parse_nightly_name
 from lake.runway import GROWTH_WINDOW_DAYS, HEADROOM_WEEKS, assess
 from lake.runway import Usage as RunwayUsage
 from lake.security_master import (
@@ -2202,8 +2210,9 @@ def _nightly_reports(
     ``nightly_path`` names a file ``{day}-{stamp}-{pid}.json``, so the day sorts first
     and the newest files are the tail of a name sort. Only ``limit`` of them are opened,
     and none over ``HISTORY_REPORT_MAX_BYTES`` is opened at all.
-    The glob is on the ``reports/`` root, so the four producers' own subdirectories are
-    not matched, which is the naming rule ``report.py`` chose a reader for.
+    The glob is on the ``reports/`` root, so the subdirectories under it, the cost read's
+    ``aws_cost/`` among them, are not matched, which is the naming rule ``report.py`` chose a
+    reader for.
 
     Every field is read with ``.get``. The lake's own report tree already carries two key
     sets from one writer at two versions, so a reader spelling a key outright would break
@@ -2891,6 +2900,525 @@ def query_lake(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     }
 
 
+# -- the Cost panel ----------------------------------------------------------
+
+# How many calendar days the Cost panel's trend covers, ending at the newest usage day.
+COST_TREND_DAYS = 30
+
+# What the panel says about S3 usage types it knows, as (group, label). The raw type is the
+# key, with any region prefix stripped first. A type not listed here keeps its own name under
+# the group its prefix names, or under ``other``, so a type nobody expected still shows and a
+# fix to this table lands at the next deploy with nothing lost, since the file keeps raw types.
+_S3_LABELS: Mapping[str, tuple[str, str]] = {
+    "TimedStorage-ByteHrs": ("storage", "Standard"),
+    "TimedStorage-SIA-ByteHrs": ("storage", "Standard-IA"),
+    "TimedStorage-ZIA-ByteHrs": ("storage", "One Zone-IA"),
+    "TimedStorage-GIR-ByteHrs": ("storage", "Glacier Instant Retrieval"),
+    "TimedStorage-GlacierByteHrs": ("storage", "Glacier Flexible Retrieval"),
+    "TimedStorage-GDA-ByteHrs": ("storage", "Glacier Deep Archive"),
+    "TimedStorage-INT-FA-ByteHrs": ("storage", "Intelligent-Tiering, frequent access"),
+    "TimedStorage-INT-IA-ByteHrs": ("storage", "Intelligent-Tiering, infrequent access"),
+    "Requests-Tier1": ("requests", "PUT, COPY, POST and LIST requests"),
+    "Requests-Tier2": ("requests", "GET and other requests"),
+}
+
+# The groups a usage type's own prefix names when ``_S3_LABELS`` does not list it.
+_S3_PREFIX_GROUPS = (
+    ("TimedStorage-", "storage"),
+    ("Requests-", "requests"),
+    ("DataTransfer-", "transfer"),
+    ("EarlyDelete-", "early delete"),
+    ("Retrieval-", "retrieval"),
+)
+
+# A region prefix on a usage type, such as ``USE2-``. ``us-east-1`` carries none.
+_REGION_PREFIX = re.compile(r"^[A-Z]{2,4}[0-9]?-(?=[A-Z])")
+
+
+def classify_s3_usage(usage_type: str) -> tuple[str, str]:
+    """An S3 usage type's group and the label the panel shows for it.
+
+    A pure function, so a unit test reaches every branch. The group is ``storage``,
+    ``requests``, ``transfer``, ``early delete``, ``retrieval`` or ``other``. A type
+    ``_S3_LABELS`` names gets its label, and any other keeps its raw name, so the panel shows
+    a type nobody expected under its own name rather than folding it away.
+    """
+    bare = _REGION_PREFIX.sub("", usage_type, count=1)
+    known = _S3_LABELS.get(bare)
+    if known is not None:
+        return known
+    for prefix, group in _S3_PREFIX_GROUPS:
+        if bare.startswith(prefix):
+            return group, usage_type
+    return "other", usage_type
+
+
+def is_timed_storage(usage_type: str) -> bool:
+    """Whether a usage type is a ``TimedStorage-*`` line, in GB-months, region prefix allowed.
+
+    ``EarlyDelete-*`` is in GB-hours, so a match on the storage class alone would add the
+    wrong unit. Only these lines make a billed size.
+    """
+    return aws_cost.TIMED_STORAGE.match(usage_type) is not None
+
+
+def billed_size(gb_months: float, day: date) -> float:
+    """A day's billed size in GB: its ``TimedStorage-*`` amount times its month's days.
+
+    The export bills storage in GB-months charged daily, so one day's amount is the bucket's
+    average size that day over the month's length: 50 GB held all of 14 October is
+    50 / 31 = 1.6129 GB-months, and 1.6129 × 31 = 50.
+    """
+    return gb_months * monthrange(day.year, day.month)[1]
+
+
+def _cost_number(value: object) -> float | None:
+    """A number from a cost file, or ``None`` for anything that is not one. A bool is not."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _cost_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _cost_mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _cost_day(value: object) -> date | None:
+    if not isinstance(value, str) or not _DATE_PATTERN.fullmatch(value):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _period_start(value: object) -> date | None:
+    """The first day of a ``YYYY-MM`` period named in a cost file, or ``None``."""
+    if not isinstance(value, str) or not _PERIOD_PATTERN.fullmatch(value):
+        return None
+    try:
+        return date(int(value[:4]), int(value[5:]), 1)
+    except ValueError:
+        return None
+
+
+# The shape of a billing period's name in a cost file.
+_PERIOD_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}")
+
+
+def _rounded6(value: float) -> float:
+    return round(value, 6)
+
+
+@dataclass
+class _CostScan:
+    """What the bounded scan of ``reports/aws_cost/`` found, newest first."""
+
+    newest: Mapping[str, Any] | None = None
+    current: Mapping[str, Any] | None = None
+    previous: Mapping[str, Any] | None = None
+    files: int = 0
+    oversize: int = 0
+    unparseable: int = 0
+    directories: int = 0
+
+
+def _cost_scan(directory: Path, names: list[str]) -> _CostScan:
+    """Read the night directories newest first until the current period's are behind.
+
+    The scan stops at the first directory dated before the current period starts, less a
+    day, because a directory is named by the Eastern date of its run while a period is a UTC
+    month, so a run late on a month's last Eastern day files the next period. Before any
+    file has been read, the bound comes from the newest directory's own month. That caps the
+    scan at about 23 directories, which matters because the page refreshes every panel every
+    minute and a year of failed reads would otherwise be hundreds of files opened each time.
+
+    ``current`` is the newest ``delivery`` file whose period is the newest file's period, so
+    on the 1st last month never shows as month to date. ``previous`` is the newest file that
+    carries the block for the period before it.
+    """
+    scan = _CostScan()
+    nights = sorted(
+        ((day, name) for name in names if (day := parse_date_dir(name)) is not None),
+        reverse=True,
+    )
+    if not nights:
+        return scan
+    bound = nights[0][0].replace(day=1) - timedelta(days=1)
+    period: str | None = None
+    previous_period: str | None = None
+    for day, name in nights:
+        if day < bound:
+            break
+        scan.directories += 1
+        try:
+            files = sorted(
+                (entry for entry in os.listdir(directory / name) if entry.endswith(".json")),
+                reverse=True,
+            )
+        except OSError:
+            # ``os.listdir`` for the reason ``_nightly_reports`` gives: ``Path.glob`` would
+            # swallow the error and read an unreadable night as an empty one.
+            scan.unparseable += 1
+            continue
+        for file_name in files:
+            path = directory / name / file_name
+            try:
+                if path.stat().st_size > HISTORY_REPORT_MAX_BYTES:
+                    scan.oversize += 1
+                    continue
+                entry = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - one bad file must not cost the others
+                scan.unparseable += 1
+                continue
+            if not isinstance(entry, Mapping):
+                scan.unparseable += 1
+                continue
+            scan.files += 1
+            if scan.newest is None:
+                scan.newest = entry
+                start = _period_start(entry.get("period"))
+                if start is not None:
+                    period = entry["period"]
+                    previous_period = aws_cost.previous_period(period)
+                    bound = start - timedelta(days=1)
+            if (
+                scan.current is None
+                and period is not None
+                and entry.get("state") == aws_cost.DELIVERY
+                and entry.get("period") == period
+                and isinstance(entry.get("current"), Mapping)
+            ):
+                scan.current = entry
+            block = entry.get("previous")
+            if (
+                scan.previous is None
+                and previous_period is not None
+                and isinstance(block, Mapping)
+                and block.get("period") == previous_period
+            ):
+                scan.previous = entry
+            if scan.current is not None and scan.previous is not None:
+                return scan
+    return scan
+
+
+def _newest_nightly_day(root: Path) -> date | None:
+    """The day of the newest nightly report file, or ``None`` when none can be listed."""
+    try:
+        names = os.listdir(root / REPORTS_DIR)
+    except OSError:
+        return None
+    days = [day for name in names if (day := parse_nightly_name(name)) is not None]
+    return max(days) if days else None
+
+
+def _figure(value: object) -> dict[str, object] | None:
+    """A projection or a cost-per-session block, its fields checked, or ``None``."""
+    block = _cost_mapping(value)
+    status = _cost_text(block.get("status"))
+    if status is None:
+        return None
+    figure: dict[str, object] = {"status": status}
+    for key in (
+        "month_end",
+        "usage_through",
+        "other",
+        "usage_cost",
+        "value",
+        "window_days",
+        "sessions",
+    ):
+        if key in block:
+            figure[key] = _cost_number(block.get(key))
+    if "through" in block:
+        figure["through"] = _cost_text(block.get("through"))
+    return figure
+
+
+def _services(current: Mapping[str, Any]) -> list[dict[str, object]]:
+    """Month to date by product code, biggest first, with usage and other lines apart."""
+    rows = []
+    for product, split in _cost_mapping(_cost_mapping(current.get("mtd")).get("service")).items():
+        split = _cost_mapping(split)
+        usage = _cost_number(split.get("usage")) or 0.0
+        other = _cost_number(split.get("other")) or 0.0
+        rows.append(
+            {
+                "product": product or "(no product code)",
+                "usage": _rounded6(usage),
+                "other": _rounded6(other),
+                "total": _rounded6(usage + other),
+            }
+        )
+    return sorted(rows, key=lambda row: (-row["total"], row["product"]))
+
+
+def _daily_totals(block: Mapping[str, Any]) -> dict[date, tuple[float, dict[str, float]]]:
+    """A block's daily series as each day's total and its products."""
+    totals: dict[date, tuple[float, dict[str, float]]] = {}
+    for key, products in _cost_mapping(block.get("daily")).items():
+        day = _cost_day(key)
+        if day is None:
+            continue
+        by_product = {
+            str(product): number
+            for product, value in _cost_mapping(products).items()
+            if (number := _cost_number(value)) is not None
+        }
+        totals[day] = (_rounded6(sum(by_product.values())), by_product)
+    return totals
+
+
+def _cost_trend(
+    current: Mapping[str, Any] | None, previous: Mapping[str, Any] | None
+) -> list[dict[str, object]]:
+    """The 30 calendar days ending at the newest usage day, from both daily series.
+
+    The current period's series wins a day both carry, since it is the newer reading. A day
+    neither carries has no total, which is the export's lag rather than a day that cost zero.
+    """
+    days: dict[date, tuple[float, dict[str, float]]] = {}
+    if previous is not None:
+        days.update(_daily_totals(previous))
+    if current is not None:
+        days.update(_daily_totals(current))
+    end = _cost_day(current.get("newest_day")) if current is not None else None
+    if end is None and days:
+        end = max(days)
+    if end is None:
+        return []
+    trend = []
+    for offset in range(COST_TREND_DAYS - 1, -1, -1):
+        day = end - timedelta(days=offset)
+        total, products = days.get(day, (None, {}))
+        trend.append(
+            {
+                "day": day.isoformat(),
+                "total": total,
+                "by_service": {key: _rounded6(value) for key, value in sorted(products.items())},
+            }
+        )
+    return trend
+
+
+def _storage_by_day(block: Mapping[str, Any], bucket: str) -> dict[date, dict[str, float]]:
+    """One bucket's ``TimedStorage-*`` amounts per day, keyed by usage type, in GB-months."""
+    series: dict[date, dict[str, float]] = {}
+    by_type = _cost_mapping(_cost_mapping(block.get("storage_daily")).get(bucket))
+    for usage_type, days in by_type.items():
+        if not is_timed_storage(str(usage_type)):
+            continue
+        for key, value in _cost_mapping(days).items():
+            day = _cost_day(key)
+            amount = _cost_number(value)
+            if day is None or amount is None:
+                continue
+            series.setdefault(day, {})[str(usage_type)] = amount
+    return series
+
+
+def _s3_buckets(
+    current: Mapping[str, Any], previous: Mapping[str, Any] | None, trend_start: date | None
+) -> list[dict[str, object]]:
+    """Each bucket's S3 split by storage class and request type, beside its billed size.
+
+    The size is taken on N − 1, the newest complete day, and the growth runs from the
+    earliest day in the trend window whose storage the two series carry. Both include
+    noncurrent versions and incomplete multipart parts, which the export cannot separate.
+    """
+    split_by_bucket = _cost_mapping(_cost_mapping(current.get("mtd")).get("s3"))
+    storage = _cost_mapping(current.get("storage_daily"))
+    complete = _cost_day(current.get("complete_through"))
+    buckets = []
+    for bucket in sorted(set(split_by_bucket) | set(storage)):
+        split = []
+        groups: dict[str, float] = {}
+        for usage_type, value in _cost_mapping(split_by_bucket.get(bucket)).items():
+            cost = _cost_number(value)
+            if cost is None:
+                continue
+            group, label = classify_s3_usage(str(usage_type))
+            split.append({"usage_type": usage_type, "group": group, "label": label, "cost": cost})
+            groups[group] = groups.get(group, 0.0) + cost
+        split.sort(key=lambda row: (-row["cost"], row["usage_type"]))
+        series = _storage_by_day(previous, bucket) if previous is not None else {}
+        for day, amounts in _storage_by_day(current, bucket).items():
+            series[day] = amounts
+        size = None
+        classes: list[dict[str, object]] = []
+        if complete is not None and complete in series:
+            amounts = series[complete]
+            size = _rounded6(billed_size(sum(amounts.values()), complete))
+            classes = [
+                {
+                    "usage_type": usage_type,
+                    "label": classify_s3_usage(usage_type)[1],
+                    "gb": _rounded6(billed_size(amount, complete)),
+                }
+                for usage_type, amount in sorted(amounts.items())
+            ]
+        growth = None
+        if size is not None and complete is not None:
+            earlier = sorted(
+                day
+                for day in series
+                if day < complete and (trend_start is None or day >= trend_start)
+            )
+            if earlier:
+                start = earlier[0]
+                start_size = billed_size(sum(series[start].values()), start)
+                span = (complete - start).days
+                growth = {
+                    "from": start.isoformat(),
+                    "days": span,
+                    "gb": _rounded6(size - start_size),
+                    "gb_per_day": _rounded6((size - start_size) / span),
+                }
+        buckets.append(
+            {
+                "bucket": bucket,
+                "split": split,
+                "groups": {key: _rounded6(value) for key, value in sorted(groups.items())},
+                "size_day": complete.isoformat() if size is not None and complete else None,
+                "size_gb": size,
+                "classes": classes,
+                "growth": growth,
+            }
+        )
+    return buckets
+
+
+def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
+    """The Cost panel: what the hosted lake costs in AWS, from the sweep's nightly cost files.
+
+    It runs no SQL. Report files never go through SQL, for the reason ``_nightly_reports``
+    gives, and the connection is untouched here. The files are ``lake.aws_cost``'s, under
+    ``reports/aws_cost/date=D/``, and the raw export never enters the lake.
+
+    **Every decision the panel shows is made here**, where a unit test reaches it, because
+    nothing in this repository runs the page's JavaScript. The page draws only the fields
+    this returns: which file answers what, the S3 classification, the billed sizes, the trend
+    and whether the newest file is stale.
+
+    ``condition`` names a whole-directory state: ``no_directory`` on a host that runs no
+    cost read, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
+    file in the scanned nights would read, or ``None`` when one did. ``oversize`` and
+    ``unparseable`` count the files the scan skipped. ``state`` is the newest readable file's
+    state, one of the five ``lake.aws_cost`` writes. ``no_current_delivery`` says no
+    ``delivery`` file for the newest file's period was found, so the month-to-date figures
+    are absent rather than last month's. ``stale`` says the newest cost file is older than
+    the newest nightly report, so the read did not run that night.
+
+    **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
+    contained where it happens and reported as a value, and the catch below is the backstop.
+    """
+    as_of = _iso(ctx.now)
+    try:
+        return _cost_payload(ctx.paths.root, as_of)
+    except Exception as exc:  # noqa: BLE001 - a 500 would throw away what did read
+        log.exception("the cost panel failed, so it reports the failure instead")
+        return {"as_of": as_of, "condition": "failed", "error": type(exc).__name__}
+
+
+def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
+    """The Cost panel's payload, every failure a value. :func:`query_cost` says what each is."""
+    payload: dict[str, object] = {
+        "as_of": as_of,
+        "condition": None,
+        "error": None,
+        "oversize": 0,
+        "unparseable": 0,
+        "files_read": 0,
+        "nights_scanned": 0,
+        "state": None,
+        "period": None,
+        "newest": None,
+        "stale": False,
+        "newest_nightly": None,
+        "no_current_delivery": False,
+        "currency": None,
+        "current": None,
+        "previous": None,
+        "trend": [],
+        "s3": [],
+    }
+    directory = root / REPORTS_DIR / AWS_COST_DIR
+    if not directory.is_dir():
+        payload["condition"] = "no_directory"
+        return payload
+    try:
+        names = os.listdir(directory)
+    except OSError as exc:
+        log.warning("cost reports directory unlistable: %s", type(exc).__name__)
+        payload["condition"] = "unreadable_directory"
+        payload["error"] = type(exc).__name__
+        return payload
+    scan = _cost_scan(directory, names)
+    payload.update(
+        oversize=scan.oversize,
+        unparseable=scan.unparseable,
+        files_read=scan.files,
+        nights_scanned=scan.directories,
+    )
+    newest = scan.newest
+    if newest is None:
+        payload["condition"] = "no_file"
+        return payload
+    state = _cost_text(newest.get("state"))
+    payload["state"] = state if state in aws_cost.STATES else "unknown"
+    payload["period"] = _cost_text(newest.get("period"))
+    payload["newest"] = {
+        "day": _cost_text(newest.get("day")),
+        "at": _cost_text(newest.get("at")),
+        "error": _cost_text(newest.get("error")),
+    }
+    nightly_day = _newest_nightly_day(root)
+    newest_day = _cost_day(newest.get("day"))
+    payload["newest_nightly"] = nightly_day.isoformat() if nightly_day is not None else None
+    payload["stale"] = bool(
+        nightly_day is not None and newest_day is not None and newest_day < nightly_day
+    )
+
+    current_entry = scan.current
+    previous_entry = scan.previous
+    current = _cost_mapping(current_entry.get("current")) if current_entry is not None else None
+    previous = _cost_mapping(previous_entry.get("previous")) if previous_entry is not None else None
+    payload["no_current_delivery"] = current is None
+    payload["currency"] = _cost_text((current_entry or previous_entry or newest).get("currency"))
+    if current is not None and current_entry is not None:
+        payload["current"] = {
+            "from_day": _cost_text(current_entry.get("day")),
+            "from_at": _cost_text(current_entry.get("at")),
+            "period": _cost_text(current.get("period")),
+            "delivered_at": _cost_text(current.get("delivered_at")),
+            "newest_day": _cost_text(current.get("newest_day")),
+            "complete_through": _cost_text(current.get("complete_through")),
+            "total": _cost_number(current.get("total")),
+            "services": _services(current),
+            "projection": _figure(current.get("projection")),
+            "cost_per_session": _figure(current.get("cost_per_session")),
+        }
+    if previous is not None and previous_entry is not None:
+        payload["previous"] = {
+            "from_day": _cost_text(previous_entry.get("day")),
+            "period": _cost_text(previous.get("period")),
+            "delivered_at": _cost_text(previous.get("delivered_at")),
+            "total": _cost_number(previous.get("total")),
+            "cost_per_session": _figure(previous.get("cost_per_session")),
+        }
+    trend = _cost_trend(current, previous)
+    payload["trend"] = trend
+    if current is not None:
+        trend_start = _cost_day(trend[0]["day"]) if trend else None
+        payload["s3"] = _s3_buckets(current, previous, trend_start)
+    return payload
+
+
 @dataclass(frozen=True)
 class NamedQuery:
     """One entry in the fixed-query registry.
@@ -2912,6 +3440,7 @@ NAMED_QUERIES: Mapping[str, NamedQuery] = {
     "today": NamedQuery("today", query_today, frozenset({"date", "ticker"})),
     "history": NamedQuery("history", query_history, frozenset()),
     "lake": NamedQuery("lake", query_lake, frozenset()),
+    "cost": NamedQuery("cost", query_cost, frozenset()),
 }
 
 # The route table: request path to query name. A path not here is a 404.
@@ -2920,6 +3449,7 @@ ROUTES: Mapping[str, str] = {
     "/api/today": "today",
     "/api/history": "history",
     "/api/lake": "lake",
+    "/api/cost": "cost",
 }
 
 

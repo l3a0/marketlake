@@ -1,11 +1,12 @@
-"""The VM's config render: ``config.yaml`` from a tracked file, four SSM parameters and a tag.
+"""The VM's config render: ``config.yaml`` from a tracked file, four SSM parameters and two tags.
 
 The hosted VM has to go from nothing to capturing with no login, marketlake #686, and its
 daemon cannot start without ``config.yaml``. That file holds four secrets and the backup
 target, so no tracked file can carry it whole. The owner's decision of 2026-10-06 splits
 it. The settings that are not secret live in the tracked ``config/vm.yaml``, which a
 reviewed pull request changes. The four secrets live in SSM Parameter Store, and the
-backup target is an instance tag. This module joins the three and writes the file::
+backup target is an instance tag. This module joins the three and writes the file, with
+a second, optional tag that names the cost export::
 
     python -m lake.vm_config render < config/vm.yaml
 
@@ -30,12 +31,23 @@ and then a ``GET`` of ``latest/meta-data/tags/instance/marketlake:backup-target`
 path answers only when the instance has ``instance_metadata_tags`` enabled, which
 ``vm.tf`` sets too.
 
+**The cost export comes from the optional ``marketlake:cost-export`` tag**, marketlake #913.
+It fills ``cost_export``, the ``s3://`` location the sweep's nightly cost read lists, and
+marketlake #912 writes it in ``infra/live/vm.tf``. It is optional because a host can run
+with no export, and a deploy can land before the infra apply that writes the tag. So a 404
+on this tag leaves the key out rather than failing the render. The backup target's tag is
+read first, so a first boot whose tags are not served yet still exits 3 on that tag before
+a 404 on this one can be read as an absent export. Every other failure of the lookup is
+handled as the backup target's is, and its value is checked the same way. The render does
+not judge the value as a bucket target. ``lake.aws_cost`` does that when it reads, so a bad
+value fails the cost read alone.
+
 **The render refuses, exits 2 and keeps any existing file**, in each of these cases.
 
 1. It runs as root. ``os.replace`` keeps the temp file's owner, so a root-owned
    ``config.yaml`` would be one the daemon cannot read.
 2. The settings are not a YAML mapping, or are larger than ``SETTINGS_MAX_BYTES``.
-3. The settings set a key a parameter or the tag fills. Two sources for one key leave a
+3. The settings set a key a parameter or a tag fills. Two sources for one key leave a
    reader unsure which one won, and a secret pasted into the tracked file is already a
    leak.
 4. The settings' ``role`` is not exactly ``shadow`` or ``primary``. An absent ``role``
@@ -45,10 +57,11 @@ path answers only when the instance has ``instance_metadata_tags`` enabled, whic
 6. ``bucket_credentials`` is not exactly ``instance_profile``. The render always signs
    with the instance profile, so a file saying ``keys`` would make every bucket job sign
    one way while the render that wrote it signed another.
-7. The tag's value is unusable: it is not UTF-8, is empty, or has whitespace at either
+7. A tag's value is unusable: it is not UTF-8, is empty, or has whitespace at either
    end. A target with a trailing newline gives the prefix ``lake\\n``, which no later
    check catches. This runs before any credential is fetched. A tag the metadata service
-   does not serve at all is not a refusal, as the paragraph on exit 3 below says.
+   does not serve at all is not a refusal, as the paragraph on exit 3 below says, and for
+   the cost export's tag it is not a failure either.
 8. ``InvalidParameters`` names any parameter. ``GetParameters`` answers HTTP 200 with a
    missing name listed there, and a render that read only ``Parameters`` would write a
    file missing a key, which #699's pass 3 found. A wrong region shows up here too, as
@@ -86,12 +99,13 @@ from the tracked settings instead. That is acceptable for the reason the design 
 for the ``aws`` CLI on the VM: there the IAM role's policy bounds what a process can do.
 Off the VM the metadata service does not answer, and the render exits 3. The tag lookup
 exits 3 the same way when the service does not answer, or serves no token or a token
-that is not printable ASCII without whitespace. It also exits 3 on a 404 for the tag.
-AWS does not document whether a tag given at launch is served from the first moment of
+that is not printable ASCII without whitespace. It also exits 3 on a 404 for the backup
+target's tag, and leaves ``cost_export`` out on a 404 for the cost export's. AWS does not
+document whether a tag given at launch is served from the first moment of
 the first boot, so a 404 may only mean the tag is not served yet, and the first boot
 retries exit 3 a bounded number of times. A 404 that lasts means the instance has no
 ``marketlake:backup-target`` tag or its ``instance_metadata_tags`` is disabled, so the
-line names both causes and the fix in ``infra/live/vm.tf``. Any other HTTP error on the
+line names both causes and the fix in ``infra/live/vm.tf``. Any other HTTP error on either
 tag exits 1, and so does a redirect, which the lookup never follows.
 
 **The write is atomic and private.** The temp file sits beside the target and is created
@@ -126,7 +140,7 @@ written, unchanged or tightened, 3 no credentials or no tag served yet, 2 a refu
 The client and the tag lookup are seams. ``render`` takes a required ``client_factory``,
 which it calls with the settings' region, so a metadata service with no credentials yet
 becomes the ``no credentials`` outcome inside it. It also takes a required
-``tag_reader``, which it calls with no arguments for the tag's raw value. ``main`` builds
+``tag_reader``, which it calls with a tag's name for that tag's raw value. ``main`` builds
 the real ones and accepts neither, the rule ``tests/unit/test_seam_defaults`` states for
 every entry in this package.
 """
@@ -151,6 +165,7 @@ from lake.aws_session import INSTANCE_PROFILE, _MetadataLookupFailed, build_clie
 from lake.config import (
     BUCKET_CREDENTIALS_KEY,
     BUCKET_REGION_KEY,
+    COST_EXPORT_KEY,
     CREDENTIALS_FROM_INSTANCE_PROFILE,
     ROLE_KEY,
     BucketTarget,
@@ -182,13 +197,18 @@ PARAMETER_KEYS = frozenset(key for _, key in PARAMETERS)
 BACKUP_TARGET_TAG = "marketlake:backup-target"
 BACKUP_TARGET_KEY = "backup_target"
 
+# The optional instance tag that carries ``cost_export``, the cost export's ``s3://``
+# location, marketlake #913. ``infra/live/vm.tf`` writes it, marketlake #912, and a tag the
+# metadata service does not serve leaves the key out.
+COST_EXPORT_TAG = "marketlake:cost-export"
+
 # Every key the render fills, which the tracked settings therefore must not set.
-FILLED_KEYS = PARAMETER_KEYS | {BACKUP_TARGET_KEY}
+FILLED_KEYS = PARAMETER_KEYS | {BACKUP_TARGET_KEY, COST_EXPORT_KEY}
 
 # The two IMDSv2 paths, relative to ``aws_session.METADATA_BASE_URL``, and how long the
-# token lives, in seconds. The render asks for the tag once, so a minute is plenty.
+# token lives, in seconds. The render asks for each tag once, so a minute is plenty.
 _TOKEN_PATH = "latest/api/token"
-_TAG_PATH = f"latest/meta-data/tags/instance/{BACKUP_TARGET_TAG}"
+_TAG_PATH = "latest/meta-data/tags/instance/"
 _TOKEN_TTL_S = 60
 
 # The largest settings file the render reads, in bytes. ``config/vm.yaml`` is under one
@@ -312,8 +332,10 @@ def _usable_token(token: bytes) -> bool:
     return bool(token) and all(0x21 <= byte <= 0x7E for byte in token)
 
 
-def read_backup_target_tag() -> str:
-    """The ``marketlake:backup-target`` tag's raw value, read from instance metadata.
+def read_instance_tag(tag: str) -> str:
+    """The raw value of the instance tag ``tag``, read from instance metadata.
+
+    ``tag`` is one of this module's two tag constants, never input.
 
     It asks with IMDSv2: a ``PUT`` for a session token, then a ``GET`` of the tag with
     that token. The base address is ``aws_session.METADATA_BASE_URL``, read at call time
@@ -361,7 +383,7 @@ def read_backup_target_tag() -> str:
     body = b""
     try:
         request = urllib.request.Request(
-            base + _TAG_PATH,
+            base + _TAG_PATH + tag,
             method="GET",
             headers={"X-aws-ec2-metadata-token": token.decode("ascii")},
         )
@@ -384,7 +406,7 @@ def read_backup_target_tag() -> str:
     except UnicodeDecodeError:
         pass
     if decoded is None:
-        raise RenderRefused(f"the {BACKUP_TARGET_TAG} tag is not UTF-8 text")
+        raise RenderRefused(f"the {tag} tag is not UTF-8 text")
     return decoded
 
 
@@ -481,12 +503,12 @@ def _parameter_values(response: object) -> dict[str, str]:
     return values
 
 
-def _check_tag(value: object) -> str:
+def _check_tag(value: object, tag: str = BACKUP_TARGET_TAG) -> str:
     """The tag's value, or a refusal naming the tag and never the value."""
     if not isinstance(value, str) or not value:
-        raise RenderRefused(f"the {BACKUP_TARGET_TAG} tag is empty or not text")
+        raise RenderRefused(f"the {tag} tag is empty or not text")
     if value != value.strip():
-        raise RenderRefused(f"the {BACKUP_TARGET_TAG} tag has whitespace at its start or end")
+        raise RenderRefused(f"the {tag} tag has whitespace at its start or end")
     return value
 
 
@@ -600,17 +622,19 @@ def render(
     payload: bytes,
     *,
     client_factory: Callable[[str], Any],
-    tag_reader: Callable[[], object],
+    tag_reader: Callable[[str], object],
     config_path: str | Path | None = None,
     geteuid: Callable[[], int] | None = None,
 ) -> RenderResult:
-    """Render ``config.yaml`` from the settings in ``payload``, four parameters and the tag.
+    """Render ``config.yaml`` from the settings in ``payload``, four parameters and the tags.
 
     The refusals and their order are the module docstring's, and each raises
-    ``RenderRefused`` before anything is written. ``tag_reader`` is called once the
-    settings pass, before any credential is fetched, and returns the tag's raw value. It
+    ``RenderRefused`` before anything is written. ``tag_reader`` is called with a tag's name
+    once the settings pass, before any credential is fetched, and returns that tag's raw
+    value. It is called for the backup target's tag first and the cost export's second. It
     raises ``MetadataUnavailable``, which becomes ``no credentials``, ``TagNotServed``,
-    which becomes ``no tag yet``, ``TagLookupFailed``, which becomes ``failed``, or
+    which becomes ``no tag yet`` for the backup target's tag and an absent ``cost_export``
+    for the cost export's, ``TagLookupFailed``, which becomes ``failed``, or
     ``RenderRefused``. ``client_factory`` is called next with
     the settings' ``bucket_region``, so a metadata service with no credentials yet becomes
     ``no credentials``. An AWS failure becomes ``failed``, named by its code or type.
@@ -640,7 +664,7 @@ def render(
         raise _refused(target, refusal)
 
     try:
-        backup_target = _check_tag(tag_reader())
+        backup_target = _check_tag(tag_reader(BACKUP_TARGET_TAG))
     except MetadataUnavailable as exc:
         return RenderResult(
             NO_CREDENTIALS,
@@ -658,6 +682,27 @@ def render(
         )
     except TagLookupFailed as exc:
         return _failed(target, f"the {BACKUP_TARGET_TAG} tag could not be read (HTTP {exc.status})")
+    except RenderRefused as exc:
+        refusal = str(exc)
+    if refusal is not None:
+        raise _refused(target, refusal)
+
+    # The cost export's tag is optional, so a 404 leaves ``cost_export`` out. Every other
+    # outcome is the backup target's, named for this tag.
+    cost_export: str | None = None
+    try:
+        cost_export = _check_tag(tag_reader(COST_EXPORT_TAG), COST_EXPORT_TAG)
+    except TagNotServed:
+        cost_export = None
+    except MetadataUnavailable as exc:
+        return RenderResult(
+            NO_CREDENTIALS,
+            f"no credentials: the instance metadata service did not answer the "
+            f"{COST_EXPORT_TAG} tag lookup ({exc.detail}), so no parameter was read and "
+            f"{target} was left as it was. Retry once the metadata service answers",
+        )
+    except TagLookupFailed as exc:
+        return _failed(target, f"the {COST_EXPORT_TAG} tag could not be read (HTTP {exc.status})")
     except RenderRefused as exc:
         refusal = str(exc)
     if refusal is not None:
@@ -685,6 +730,8 @@ def render(
 
     try:
         merged = {**settings, **_parameter_values(response), BACKUP_TARGET_KEY: backup_target}
+        if cost_export is not None:
+            merged[COST_EXPORT_KEY] = cost_export
         _check_config(merged)
     except RenderRefused as exc:
         refusal = str(exc)
@@ -763,10 +810,11 @@ def _build_parser():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser(
         "render",
-        help="Write config.yaml from the settings on stdin, four SSM parameters and a tag.",
+        help="Write config.yaml from the settings on stdin, four SSM parameters and two tags.",
         description=(
-            "Write config.yaml from the settings read on stdin, four SSM parameters and "
-            "the instance's marketlake:backup-target tag, as in "
+            "Write config.yaml from the settings read on stdin, four SSM parameters, "
+            "the instance's marketlake:backup-target tag and its optional "
+            "marketlake:cost-export tag, as in "
             "'python -m lake.vm_config render < config/vm.yaml'."
         ),
     )
@@ -808,7 +856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     with input_errors_exit("vm_config", RenderRefused):
         try:
             result = render(
-                _read_stdin(), client_factory=render_client, tag_reader=read_backup_target_tag
+                _read_stdin(), client_factory=render_client, tag_reader=read_instance_tag
             )
         except OSError as exc:
             print(
@@ -824,6 +872,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "BACKUP_TARGET_KEY",
     "BACKUP_TARGET_TAG",
+    "COST_EXPORT_TAG",
     "EXIT_CODES",
     "FAILED",
     "FILLED_KEYS",
@@ -841,7 +890,7 @@ __all__ = [
     "TagLookupFailed",
     "TagNotServed",
     "main",
-    "read_backup_target_tag",
+    "read_instance_tag",
     "render",
     "render_client",
 ]

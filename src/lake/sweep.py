@@ -30,9 +30,12 @@ What one run does, in the design's own order.
 4. The Friday branch, which sets the Sunday one-shot wake and reads it back. It runs on macOS
    only. A Linux VM never sleeps, so it sets no wake and never calls ``sudo``.
 5. The ping.
-6. The dated report file under ``reports/``.
-7. The digest, at priority 2.
-8. The hand-off. ``main`` replaces this process with ``python -m lake.compact
+6. The AWS cost read, ``aws_cost.run``, on a host whose ``config.yaml`` names the cost export
+   in ``cost_export``. It writes its own file under ``reports/aws_cost/`` and a line in the
+   nightly report. Marketlake #913, and the paragraph on it below.
+7. The dated report file under ``reports/``.
+8. The digest, at priority 2.
+9. The hand-off. ``main`` replaces this process with ``python -m lake.compact
    --after-vendor-sweep``, which uploads what the steps above wrote and pings the
    ``evening-upload`` check. Marketlake #833.
 
@@ -43,6 +46,19 @@ files an ``action`` line, and under ``runway.PAGE_FLOOR_WEEKS`` it also pages, o
 and every night it stays that short, with no state kept between runs. Running first means
 the page goes out even when a later raise loses the report file, and it puts the line at
 the top of the digest, which is truncated at ``DIGEST_BYTE_CAP``. Marketlake #438.
+
+**The cost read runs after the ping and outside the session's walks**, on a holiday too,
+because it reads AWS's export rather than the lake's own data. After the ping, so its S3
+timeouts cannot delay it, and before the nightly file is built, so its line still reaches
+that file. The whole step, its writer included, sits inside one ``except Exception``. A
+failed read is an ``action`` line, and ``no_export``, ``no_delivery`` and ``refreshing`` are
+``info`` lines, since ``no_export`` is expected every night before the first delivery. The
+line carries the exception's type, never its message, because the digest reaches ntfy.sh.
+It never reaches ``problems``, so it never withholds the ping, and it sends no page, because
+cost cannot lose a captured minute. The digest can drop the line, since a holiday's carries
+none and a session's is cut at ``DIGEST_BYTE_CAP``, so the dashboard's Cost panel is where
+the operator meets the cost state. A scheduled job of its own is the kind of machinery the
+design has rejected before, so the read joins this one.
 
 The battery is ``lake.battery``, at step 3 above. Marketlake #406 built its spine and the
 real-time entitlement check, and marketlake #407 added the other three to the same module. The
@@ -133,12 +149,17 @@ compaction's.
 
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
-effect. So :func:`sweep` requires seven and defaults none: the clock, the calendar, the vendor
-source, the pinger, the publisher, the schedule reader and the schedule setter. Required
-means a caller must say, not that the answer cannot be ``None``. The schedule setter and
-reader may each be ``None`` on a host with no wake to set or read back, which is Linux, and
-``sweep_from_config`` picks that from ``control_plane.is_macos``. A ``None`` setter skips
-the Friday branch, and a ``None`` reader skips only its read-back. The whole module runs
+effect. So :func:`sweep` requires eight and defaults none: the clock, the calendar, the vendor
+source, the pinger, the publisher, the schedule reader, the schedule setter and the cost
+export's client source. Required means a caller must say, not that the answer cannot be
+``None``. The schedule setter and reader may each be ``None`` on a host with no wake to set
+or read back, which is Linux, and ``sweep_from_config`` picks that from
+``control_plane.is_macos``. A ``None`` setter skips the Friday branch, and a ``None`` reader
+skips only its read-back. The cost source is ``None`` on a host with no ``cost_export``, and
+``sweep_from_config`` then never calls ``bucket.connect``. Otherwise it is a thunk, like the
+vendor source, called inside the cost step's containment. Built in ``sweep_from_config``
+instead, a refused bucket setting would end the run inside ``input_errors_exit`` with no
+ping, no nightly file and no hand-off. The whole module runs
 offline in a test, with no network and no shelling out.
 
 The ``exec`` is not a seam ``main`` accepts either. ``main`` builds the argument list itself
@@ -160,7 +181,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from lake import control_plane, outbox
+from lake import aws_cost, control_plane, outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
 from lake.alert import REFUSED, Message, Publisher, undelivered
 from lake.bars import (
@@ -1086,6 +1107,36 @@ def _friday_wake(
     return problems, report
 
 
+def _read_aws_cost(
+    cost_client: aws_cost.ClientSource | None,
+    root: Path,
+    *,
+    now: datetime,
+    report: ReportLines,
+) -> None:
+    """Read the cost export, file its report and add its line, all inside one containment.
+
+    ``None`` is a host with no export, which runs no read and writes no file. ``aws_cost.run``
+    turns a failed read into a ``failed`` entry, so a failure still writes a file that says
+    so, and a missing file means the read never ran. The catch below is the backstop for the
+    writer and anything ``run`` did not expect. Nothing here touches ``problems``, so nothing
+    here can withhold the ping, which has already been sent.
+    """
+    if cost_client is None:
+        return
+    try:
+        entry = aws_cost.run(cost_client, root, now=now)
+        line = aws_cost.report_line(entry)
+        if line is not None:
+            report.add(*line)
+        try:
+            aws_cost.write_cost_report(root, entry, now=now)
+        except Exception as exc:  # noqa: BLE001 - a lost cost file must not cost the record
+            report.add(f"aws cost report not written: {type(exc).__name__}", ACTION)
+    except Exception as exc:  # noqa: BLE001 - cost cannot lose a captured minute
+        report.add(f"aws cost read failed: {type(exc).__name__}", ACTION)
+
+
 def _held_back(*, pinged: bool, compacted: bool, day: date) -> str | None:
     """What stops tonight's hand-off to the evening upload, or ``None`` when nothing does.
 
@@ -1115,6 +1166,7 @@ def sweep(
     publisher: Publisher | None,
     schedule_reader: ScheduleReader | None,
     schedule_setter: ScheduleSetter | None,
+    cost_client: aws_cost.ClientSource | None,
     guards: GuardConstants | None = None,
     window_sessions: int | str | None = None,
 ) -> SweepOutcome:
@@ -1127,7 +1179,7 @@ def sweep(
     That is what lets a test drive the run without a page reaching anywhere, and it is the
     same allowance ``escalate_ping_failure`` already makes. ``schedule_setter`` and
     ``schedule_reader`` may be ``None`` on a host with no wake, and the module docstring
-    says what each skips.
+    says what each skips. ``cost_client`` is ``None`` on a host with no cost export.
 
     The order below is the design's, and two placements in it were decided rather than
     inherited. The ping comes before the report file, because ``pinged`` is part of what the
@@ -1516,6 +1568,11 @@ def sweep(
         # half a line is.
         report.add(wrote_line(len(battery.appended)), ACTION)
 
+    # Step 6, the cost read (marketlake #913): after the ping, so its S3 timeouts cannot delay
+    # it, and before ``Nightly`` is built, so its line reaches the file. It reads the ``now``
+    # this run already read, so a late run on a month's last day stays in its own period.
+    _read_aws_cost(cost_client, root, now=now, report=report)
+
     nightly = Nightly(
         day=day,
         session=session,
@@ -1614,6 +1671,8 @@ def sweep_from_config(
         ),
         schedule_reader=schedule_reader if schedule_reader is not None else default_reader,
         schedule_setter=schedule_setter if schedule_setter is not None else default_setter,
+        # ``None`` when ``cost_export`` is absent, so ``bucket.connect`` is never called.
+        cost_client=aws_cost.client_source(config),
         guards=config.guards,
         window_sessions=config.lake_window_sessions,
     )
@@ -1643,8 +1702,9 @@ def _build_parser():
         prog="python -m lake.sweep",
         description=(
             "The evening vendor sweep: poll corporate actions, fetch the session's bars, "
-            "set the Sunday wake on a Friday on macOS, ping, file the nightly report and "
-            "send its digest. It fetches the session the clock is in. On a weekday whose "
+            "set the Sunday wake on a Friday on macOS, ping, read the AWS cost export when "
+            "config.yaml names one, file the nightly report and send its digest. It "
+            "fetches the session the clock is in. On a weekday whose "
             "ping landed it then replaces itself with python -m lake.compact "
             "--after-vendor-sweep, which uploads what it wrote."
         ),
