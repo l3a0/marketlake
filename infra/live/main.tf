@@ -1,8 +1,9 @@
 # What CI applies: the backup bucket, the instance role, the laptop's identity, the
 # user marketlake-command with the two roles it assumes, marketlake-backup to read the
 # bucket and marketlake-token-writer for the Schwab token, the hosted VM with its lake
-# volume, the SSM document that deploys main to the VM, and the two schedules that start
-# the VM once #868's stop is switched on. The apply role in infra/bootstrap/roles.tf
+# volume, the SSM document that deploys main to the VM, the two schedules that start
+# the VM once #868's stop is switched on, and the cost and usage export with its billing
+# bucket (#912). The apply role in infra/bootstrap/roles.tf
 # grants writes on exactly these. infra/README.md carries the runbook, and docs/design.md's "Infrastructure,
 # defined" carries the reasoning.
 
@@ -33,8 +34,8 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# The ARNs in iam.tf, command.tf and schedule.tf name the account, which no tracked file
-# may name.
+# The ARNs in iam.tf, command.tf, schedule.tf and billing.tf name the account, which no
+# tracked file may name.
 data "aws_caller_identity" "current" {}
 
 locals {

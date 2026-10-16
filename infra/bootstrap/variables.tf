@@ -20,6 +20,17 @@ variable "backup_bucket" {
   }
 }
 
+variable "billing_bucket" {
+  description = "The bucket the cost and usage export delivers to, which the apply role may create and the plan and apply roles may not read objects from."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.billing_bucket))
+    error_message = "billing_bucket must be an S3 bucket name."
+  }
+}
+
 variable "adopt_existing" {
   description = "Import the existing state bucket. The tests set it to false, because an import crashes tofu test."
   type        = bool

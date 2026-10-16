@@ -130,7 +130,8 @@ resource "aws_instance" "vm" {
 
   # IMDSv2 only (#663). A hop limit of 1 keeps the metadata service's answers, the
   # role's credentials among them, from crossing a further network hop. The tags are
-  # served too, because the config render reads marketlake:backup-target from them.
+  # served too, because the config render reads marketlake:backup-target from them, and
+  # #913 reads marketlake:cost-export there.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -162,7 +163,12 @@ resource "aws_instance" "vm" {
   # the VM by the same tag. The config render reads marketlake:backup-target through
   # instance metadata, by the owner's decision of 2026-10-07, so the bucket reaches the
   # VM from the variable OpenTofu already holds rather than from a parameter put by hand.
-  # A bucket change updates the tag in place.
+  # A bucket change updates the tag in place. marketlake:cost-export tells the nightly
+  # sweep where the cost and usage export lands (#912). Once #913 reads it, a host whose
+  # render finds no such tag runs no cost read. #911's "The contract between the halves" fixes its key and
+  # value, and billing.tf builds the value from the export itself. The render reads tags
+  # at first boot and at each deploy, so a deploy after the apply carries a new value to
+  # the VM.
   #
   # With instance_metadata_tags enabled, EC2 refuses a tag key holding a / or a space,
   # because the metadata service serves each key as a path. Every key here complies, and
@@ -171,6 +177,7 @@ resource "aws_instance" "vm" {
     Name                       = "marketlake"
     "marketlake:host"          = "capture"
     "marketlake:backup-target" = "s3://${var.backup_bucket}/lake"
+    "marketlake:cost-export"   = local.cost_export_target
   }
 
   # The first boot's SSM agent and config render need both grants in place.

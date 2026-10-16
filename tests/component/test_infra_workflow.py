@@ -245,7 +245,7 @@ def _required_live_variables() -> set[str]:
 
 def test_every_required_variable_reaches_both_plans_and_both_refusals() -> None:
     required = _required_live_variables()
-    assert {"backup_bucket", "owner_ssh_cidr", "ssh_public_key"} <= required
+    assert {"backup_bucket", "billing_bucket", "owner_ssh_cidr", "ssh_public_key"} <= required
     jobs = _workflow()["jobs"]
     for job_name in ("plan", "apply"):
         job = jobs[job_name]

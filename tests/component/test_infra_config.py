@@ -124,6 +124,10 @@ _OPTIONS = hcl2.SerializationOptions(
 # Price 4 of issue #664: every resource whose loss would lose backups or stop them. The
 # laptop's user, its two roles and their policies are here too (#737). CI cannot delete
 # any of them, so a pull request that renames one fails at plan rather than at apply.
+# The billing bucket holds every month of the raw cost export, which the owner keeps
+# indefinitely, and the export itself would be deleted and recreated by any change but
+# its query's, so both are here too (#912). This roster is the only check that the line
+# is present.
 PREVENT_DESTROY = [
     "bootstrap/aws_s3_bucket.state",
     "bootstrap/aws_s3_bucket_versioning.state",
@@ -140,6 +144,8 @@ PREVENT_DESTROY = [
     "live/aws_iam_role_policy.token_writer",
     # The lake volume holds every minute captured since the last nightly upload (#686).
     "live/aws_ebs_volume.lake",
+    "live/aws_s3_bucket.billing",
+    "live/aws_bcmdataexports_export.cost",
 ]
 
 # The roles marketlake-command assumes, which the apply role may create and never delete.
@@ -177,6 +183,8 @@ LIVE_TYPES = {
     "aws_volume_attachment",
     "aws_ssm_document",
     "aws_scheduler_schedule",
+    "aws_s3_bucket_policy",
+    "aws_bcmdataexports_export",
 }
 
 READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
@@ -306,6 +314,7 @@ def test_live_role_carries_exactly_its_inline_policies() -> None:
     assert policies == [
         ("backup", "backup"),
         ("instance", "instance_config_read"),
+        ("instance", "instance_cost_read"),
         ("instance", "instance_s3"),
         ("instance", "instance_s3_read"),
         ("token_writer", "token_writer"),
@@ -442,10 +451,26 @@ def test_bootstrap_roles_carry_exactly_their_policies() -> None:
     assert sorted(inline) == ["apply", "deploy", "plan", "scheduler"]
     assert len(inline["apply"]) == 1
     assert len(inline["deploy"]) == 1
-    assert len(inline["plan"]) == 1
     assert len(inline["scheduler"]) == 1
-    plan_effects = [statement["Effect"] for statement in inline["plan"][0]]
-    assert plan_effects and set(plan_effects) == {"Deny"}
+    # The plan role holds one policy of Denies, and one Allow that reads the cost export's
+    # definition, which every plan's refresh needs and ReadOnlyAccess lacks (#912). Any
+    # other Allow would reach a pull request from an unreviewed branch.
+    assert len(inline["plan"]) == 2
+    denies = [p for p in inline["plan"] if {s["Effect"] for s in p} == {"Deny"}]
+    allows = [p for p in inline["plan"] if p not in denies]
+    assert len(denies) == 1 and denies[0]
+    assert allows == [
+        [
+            {
+                "Sid": "ReadTheCostExport",
+                "Effect": "Allow",
+                "Action": ["bcm-data-exports:GetExport", "bcm-data-exports:ListTagsForResource"],
+                "Resource": [
+                    "arn:aws:bcm-data-exports:us-east-1:${local.account_id}:export/*",
+                ],
+            }
+        ]
+    ]
     deploy_effects = [statement["Effect"] for statement in inline["deploy"][0]]
     assert deploy_effects and set(deploy_effects) == {"Allow"}
     # The case for keeping this role in the bootstrap rests on this one grant (#865).
@@ -824,6 +849,7 @@ def test_instance_tag_keys_are_ones_instance_metadata_can_serve() -> None:
     breaks the endpoint stops the first boot's render. A mock provider plans any key."""
     tags = _resources("live")["aws_instance.vm"]["tags"]
     assert "marketlake:backup-target" in tags
+    assert "marketlake:cost-export" in tags
     for key in tags:
         assert _METADATA_TAG_KEY.fullmatch(key), f"the instance tag key {key!r} has a / or space"
 

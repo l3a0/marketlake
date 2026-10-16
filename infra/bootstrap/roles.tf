@@ -94,6 +94,40 @@ resource "aws_iam_role_policy" "plan" {
         Action   = ["ssm:GetParametersByPath"]
         Resource = ["*"]
       },
+      {
+        # The cost and usage export's objects carry resource ids and ARNs, which a pull
+        # request's plan could print to the public log (#912). Appended after the last
+        # statement, per infra/README.md's "Reading a statement inserted into a policy".
+        Sid      = "DenyBillingObjectReads"
+        Effect   = "Deny"
+        Action   = ["s3:GetObject*"]
+        Resource = ["arn:aws:s3:::${var.billing_bucket}/*"]
+      },
+    ]
+  })
+}
+
+# Every plan after the export's first apply refreshes it, which calls GetExport and
+# ListTagsForResource. ReadOnlyAccess, at v190, holds no bcm-data-exports: action, so
+# without this every later plan fails at refresh (#912). It is a policy of its own, because
+# deny-sensitive-reads holds Denies only, and both actions only read the export's
+# definition, never the cost data it delivers.
+resource "aws_iam_role_policy" "plan_cost_export_read" {
+  name = "read-cost-export"
+  role = aws_iam_role.plan.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadTheCostExport"
+        Effect = "Allow"
+        Action = [
+          "bcm-data-exports:GetExport",
+          "bcm-data-exports:ListTagsForResource",
+        ]
+        Resource = ["arn:aws:bcm-data-exports:us-east-1:${local.account_id}:export/*"]
+      },
     ]
   })
 }
@@ -129,7 +163,8 @@ resource "aws_iam_role_policy_attachment" "apply_read_only" {
   policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
 }
 
-# Narrow writes on what infra/live/ manages. Every read comes from ReadOnlyAccess.
+# Narrow writes on what infra/live/ manages. Every read comes from ReadOnlyAccess, except
+# the cost export's, which CostExportRead grants because ReadOnlyAccess holds none.
 resource "aws_iam_role_policy" "apply" {
   name = "apply-infra-live"
   role = aws_iam_role.apply.name
@@ -367,6 +402,58 @@ resource "aws_iam_role_policy" "apply" {
         Condition = {
           StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
         }
+      },
+      # The five statements below arrived with the cost and usage export (#912), appended
+      # after the last statement, per infra/README.md's "Reading a statement inserted into
+      # a policy".
+      {
+        # The export's objects carry resource ids and ARNs, and an apply never reads them.
+        Sid      = "DenyBillingObjectReads"
+        Effect   = "Deny"
+        Action   = ["s3:GetObject*"]
+        Resource = ["arn:aws:s3:::${var.billing_bucket}/*"]
+      },
+      {
+        # The billing bucket and AWS's policy for it. No s3:PutBucketVersioning, so
+        # versioning stays off as the owner decided, and no object writes.
+        Sid      = "BillingBucketWrite"
+        Effect   = "Allow"
+        Action   = ["s3:CreateBucket", "s3:PutBucketPolicy"]
+        Resource = ["arn:aws:s3:::${var.billing_bucket}"]
+      },
+      {
+        # CreateExport needs the table and may name the billing view. UpdateExport needs
+        # the export and the table too. No DeleteExport, since the export carries
+        # prevent_destroy, and no TagResource, since it carries no tags.
+        Sid    = "CostExportWrite"
+        Effect = "Allow"
+        Action = [
+          "bcm-data-exports:CreateExport",
+          "bcm-data-exports:UpdateExport",
+        ]
+        Resource = [
+          "arn:aws:bcm-data-exports:us-east-1:${local.account_id}:table/COST_AND_USAGE_REPORT",
+          "arn:aws:billing::${local.account_id}:billingview/primary",
+          "arn:aws:bcm-data-exports:us-east-1:${local.account_id}:export/*",
+        ]
+      },
+      {
+        # The provider reads the export back after each write and at every refresh, and
+        # ReadOnlyAccess holds no bcm-data-exports: action.
+        Sid    = "CostExportRead"
+        Effect = "Allow"
+        Action = [
+          "bcm-data-exports:GetExport",
+          "bcm-data-exports:ListTagsForResource",
+        ]
+        Resource = ["arn:aws:bcm-data-exports:us-east-1:${local.account_id}:export/*"]
+      },
+      {
+        # Any export of the CUR 2.0 table needs this, and it takes no resource.
+        Sid      = "CostExportReportDefinition"
+        Effect   = "Allow"
+        Action   = ["cur:PutReportDefinition"]
+        Resource = ["*"]
       },
     ]
   })

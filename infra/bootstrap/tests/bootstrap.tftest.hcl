@@ -14,6 +14,7 @@ mock_provider "aws" {
 variables {
   state_bucket   = "example-state"
   backup_bucket  = "example-lake-backup"
+  billing_bucket = "example-billing"
   adopt_existing = false
 }
 
@@ -123,13 +124,14 @@ run "every_deny_is_present" {
         ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config"],
         ["ssm:GetParameterHistory", "arn:aws:ssm:us-east-1:000000000000:parameter/marketlake/config/*"],
         ["ssm:GetParametersByPath", "*"],
+        ["s3:GetObject*", "arn:aws:s3:::example-billing/*"],
         ] : anytrue([
           for s in jsondecode(aws_iam_role_policy.plan.policy).Statement :
           s.Effect == "Deny" && try(s.Condition, null) == null
           && contains(flatten([s.Action]), pair[0]) && contains(flatten([s.Resource]), pair[1])
       ])
     ])
-    error_message = "The plan role is missing a Deny on backup objects, console output, Run Command output or config parameters."
+    error_message = "The plan role is missing a Deny on backup objects, console output, Run Command output, config parameters or billing objects."
   }
 
   assert {
@@ -156,6 +158,7 @@ run "every_deny_is_present" {
         ["ec2:DeleteVolume", "*"],
         ["ec2:ModifySnapshotAttribute", "*"],
         ["ec2:ModifyImageAttribute", "*"],
+        ["s3:GetObject*", "arn:aws:s3:::example-billing/*"],
         ] : anytrue([
           for s in jsondecode(aws_iam_role_policy.apply.policy).Statement :
           s.Effect == "Deny" && try(s.Condition, null) == null
@@ -176,6 +179,7 @@ run "no_allow_grants_a_forbidden_action" {
     condition = !anytrue([
       for s in concat(
         jsondecode(aws_iam_role_policy.plan.policy).Statement,
+        jsondecode(aws_iam_role_policy.plan_cost_export_read.policy).Statement,
         jsondecode(aws_iam_role_policy.apply.policy).Statement,
         jsondecode(aws_iam_role_policy.deploy.policy).Statement,
         jsondecode(aws_iam_role_policy.scheduler.policy).Statement,
@@ -229,6 +233,17 @@ run "no_allow_grants_a_forbidden_action" {
     ])
     error_message = "The plan role's inline policy allows something. Its writes would reach an unreviewed branch."
   }
+
+  # The plan role's one Allow outside ReadOnlyAccess reads an export's definition, and
+  # nothing else (#912).
+  assert {
+    condition = alltrue([
+      for s in jsondecode(aws_iam_role_policy.plan_cost_export_read.policy).Statement :
+      s.Effect == "Allow" && try(s.Condition, null) == null
+      && length(setsubtract(toset(flatten([s.Action])), toset(["bcm-data-exports:GetExport", "bcm-data-exports:ListTagsForResource"]))) == 0
+    ])
+    error_message = "The plan role's cost export policy allows more than reading an export."
+  }
 }
 
 # The presence checks above say why each statement exists. These say that nothing else
@@ -273,9 +288,35 @@ run "policies_are_exactly_the_reviewed_statements" {
           Action   = ["ssm:GetParametersByPath"]
           Resource = ["*"]
         },
+        {
+          Sid      = "DenyBillingObjectReads"
+          Effect   = "Deny"
+          Action   = ["s3:GetObject*"]
+          Resource = ["arn:aws:s3:::example-billing/*"]
+        },
       ]
     }
-    error_message = "The plan role's inline policy is not exactly the reviewed four Denies."
+    error_message = "The plan role's inline policy is not exactly the reviewed five Denies."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.plan_cost_export_read.policy) == {
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "ReadTheCostExport"
+          Effect   = "Allow"
+          Action   = ["bcm-data-exports:GetExport", "bcm-data-exports:ListTagsForResource"]
+          Resource = ["arn:aws:bcm-data-exports:us-east-1:000000000000:export/*"]
+        },
+      ]
+    }
+    error_message = "The plan role's cost export policy is not exactly GetExport and ListTagsForResource on this account's exports."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.plan_cost_export_read.role == aws_iam_role.plan.name
+    error_message = "The cost export read is not on marketlake-plan."
   }
 
   assert {
@@ -463,6 +504,40 @@ run "policies_are_exactly_the_reviewed_statements" {
             StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
           }
         },
+        {
+          Sid      = "DenyBillingObjectReads"
+          Effect   = "Deny"
+          Action   = ["s3:GetObject*"]
+          Resource = ["arn:aws:s3:::example-billing/*"]
+        },
+        {
+          Sid      = "BillingBucketWrite"
+          Effect   = "Allow"
+          Action   = ["s3:CreateBucket", "s3:PutBucketPolicy"]
+          Resource = ["arn:aws:s3:::example-billing"]
+        },
+        {
+          Sid    = "CostExportWrite"
+          Effect = "Allow"
+          Action = ["bcm-data-exports:CreateExport", "bcm-data-exports:UpdateExport"]
+          Resource = [
+            "arn:aws:bcm-data-exports:us-east-1:000000000000:table/COST_AND_USAGE_REPORT",
+            "arn:aws:billing::000000000000:billingview/primary",
+            "arn:aws:bcm-data-exports:us-east-1:000000000000:export/*",
+          ]
+        },
+        {
+          Sid      = "CostExportRead"
+          Effect   = "Allow"
+          Action   = ["bcm-data-exports:GetExport", "bcm-data-exports:ListTagsForResource"]
+          Resource = ["arn:aws:bcm-data-exports:us-east-1:000000000000:export/*"]
+        },
+        {
+          Sid      = "CostExportReportDefinition"
+          Effect   = "Allow"
+          Action   = ["cur:PutReportDefinition"]
+          Resource = ["*"]
+        },
       ]
     }
     error_message = "The apply role's inline policy is not exactly the reviewed Denies and Allows."
@@ -555,11 +630,12 @@ run "empty_bucket_names_fail_validation" {
   command = plan
 
   variables {
-    state_bucket  = ""
-    backup_bucket = ""
+    state_bucket   = ""
+    backup_bucket  = ""
+    billing_bucket = ""
   }
 
-  expect_failures = [var.state_bucket, var.backup_bucket]
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
 }
 
 # An ARN or a name with a space would match an unanchored pattern, and "ab" is one
@@ -568,33 +644,36 @@ run "an_arn_is_not_a_bucket_name" {
   command = plan
 
   variables {
-    state_bucket  = "arn:aws:s3:::example-state"
-    backup_bucket = "arn:aws:s3:::example-state"
+    state_bucket   = "arn:aws:s3:::example-state"
+    backup_bucket  = "arn:aws:s3:::example-state"
+    billing_bucket = "arn:aws:s3:::example-state"
   }
 
-  expect_failures = [var.state_bucket, var.backup_bucket]
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
 }
 
 run "a_two_character_bucket_name_fails_validation" {
   command = plan
 
   variables {
-    state_bucket  = "ab"
-    backup_bucket = "ab"
+    state_bucket   = "ab"
+    backup_bucket  = "ab"
+    billing_bucket = "ab"
   }
 
-  expect_failures = [var.state_bucket, var.backup_bucket]
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
 }
 
 run "a_bucket_name_with_a_space_fails_validation" {
   command = plan
 
   variables {
-    state_bucket  = "has space"
-    backup_bucket = "has space"
+    state_bucket   = "has space"
+    backup_bucket  = "has space"
+    billing_bucket = "has space"
   }
 
-  expect_failures = [var.state_bucket, var.backup_bucket]
+  expect_failures = [var.state_bucket, var.backup_bucket, var.billing_bucket]
 }
 
 # A Deny naming a hard-coded account id is a Deny on nobody's parameters.
@@ -667,5 +746,51 @@ run "config_denies_follow_the_callers_account" {
       ["arn:aws:ec2:us-east-1:111111111111:instance/*"],
     ]
     error_message = "The scheduler role's trust or grant does not name the caller's account."
+  }
+
+  # A grant naming a hard-coded account id names nobody's export, table or billing view,
+  # and the apply that creates the export, or every plan after it, is refused.
+  assert {
+    condition = [
+      for s in concat(
+        jsondecode(aws_iam_role_policy.apply.policy).Statement,
+        jsondecode(aws_iam_role_policy.plan_cost_export_read.policy).Statement,
+      ) : s.Resource
+      if contains(["CostExportWrite", "CostExportRead", "ReadTheCostExport"], try(s.Sid, ""))
+      ] == [
+      [
+        "arn:aws:bcm-data-exports:us-east-1:111111111111:table/COST_AND_USAGE_REPORT",
+        "arn:aws:billing::111111111111:billingview/primary",
+        "arn:aws:bcm-data-exports:us-east-1:111111111111:export/*",
+      ],
+      ["arn:aws:bcm-data-exports:us-east-1:111111111111:export/*"],
+      ["arn:aws:bcm-data-exports:us-east-1:111111111111:export/*"],
+    ]
+    error_message = "A cost export grant does not name the caller's account."
+  }
+}
+
+# Every other run uses one billing bucket name, so a statement that typed it would pass
+# them all.
+run "billing_statements_follow_the_billing_variable" {
+  command = plan
+
+  variables {
+    billing_bucket = "other-billing"
+  }
+
+  assert {
+    condition = [
+      for s in concat(
+        jsondecode(aws_iam_role_policy.plan.policy).Statement,
+        jsondecode(aws_iam_role_policy.apply.policy).Statement,
+      ) : s.Resource
+      if contains(["DenyBillingObjectReads", "BillingBucketWrite"], try(s.Sid, ""))
+      ] == [
+      ["arn:aws:s3:::other-billing/*"],
+      ["arn:aws:s3:::other-billing/*"],
+      ["arn:aws:s3:::other-billing"],
+    ]
+    error_message = "A billing bucket Deny or grant does not name the bucket billing_bucket names."
   }
 }
