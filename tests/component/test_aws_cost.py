@@ -703,6 +703,29 @@ def test_a_previous_period_the_grant_refuses_is_named_by_type(root: Path):
     assert entry["current"]["total"] == pytest.approx(13.65)
 
 
+def test_a_previous_period_whose_figures_fail_omits_its_block_too(root: Path, monkeypatch):
+    """The closed month's figures are part of reading it, so a raise while computing them is
+    contained the same way, and the current month's figures still land."""
+
+    class _Unexpected(Exception):
+        pass
+
+    def raises(read, *, sessions, accounts):
+        raise _Unexpected("a message that names example-billing")
+
+    monkeypatch.setattr(aws_cost, "previous_figures", raises)
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(september()))
+    deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    assert entry["state"] == "delivery"
+    assert entry["previous_error"] == "_Unexpected"
+    assert "previous" not in entry
+    assert entry["current"]["total"] == pytest.approx(13.65)
+
+
 def test_a_previous_period_that_reads_carries_no_error_field(root: Path):
     s3 = FakeS3(BUCKET, versioning=None)
     deliver(s3, "2026-09", parquet(september()))
