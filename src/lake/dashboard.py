@@ -3351,8 +3351,9 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
        ``cost_export_configured``.
     2. ``stale_text`` is the sentence for ``stale``.
     3. ``previous_text`` says why there are no closed-month figures. It names the newest
-       file's ``previous_error`` when one is recorded, and otherwise says the export's first
-       month has no closed month to show.
+       file's ``previous_error`` when one is recorded. Otherwise it names both causes that leave
+       no error, the export's first month and a closed month whose delivery has not finished,
+       without claiming which holds.
 
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
@@ -3398,14 +3399,16 @@ def cost_previous_text(previous_error: str | None) -> str:
     """The Cost panel's sentence when it has no closed-month figures to show.
 
     ``previous_error`` is the newest cost file's own, which ``lake.aws_cost`` writes when the
-    closed month's read failed. Only without one does the sentence fall back to the
-    first-month explanation.
+    closed month's read failed. Without one, the block is also missing in the export's first
+    month and while a closed month's delivery has not finished, which ``lake.aws_cost``
+    records no differently, so the sentence names both rather than choosing.
     """
     if previous_error is not None:
         return f"The closed month's read failed: {previous_error}. Its figures are not available."
     return (
-        "The closed month's figures are not available yet. The export delivers the current "
-        "month only, so its first month has no closed month to show."
+        "The closed month's figures are not available yet. The export's first month has no "
+        "closed month, and a closed month that AWS is still delivering is read once its "
+        "delivery finishes."
     )
 
 

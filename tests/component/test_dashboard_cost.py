@@ -600,8 +600,9 @@ def test_no_previous_block_and_no_error_reads_as_the_export_first_month(root: Pa
     assert payload["previous"] is None
     assert payload["newest"]["previous_error"] is None
     assert payload["previous_text"] == (
-        "The closed month's figures are not available yet. The export delivers the current "
-        "month only, so its first month has no closed month to show."
+        "The closed month's figures are not available yet. The export's first month has no "
+        "closed month, and a closed month that AWS is still delivering is read once its "
+        "delivery finishes."
     )
 
 
