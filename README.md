@@ -50,9 +50,11 @@ beside it. On a host whose `config.yaml` names `cost_export`, the 18:30 sweep re
 cost and usage export each night and files a summary under `reports/aws_cost/`, and the
 dashboard's Cost panel shows it ([#913](https://github.com/l3a0/marketlake/issues/913)).
 The export and its billing bucket are [#912](https://github.com/l3a0/marketlake/issues/912).
-A host without the key runs no cost read, and the panel says so. A host with the key that
-no sweep has read yet says that instead, and a dashboard serving `--lake-root` reads no
-`config.yaml`, so it names no cause ([#911](https://github.com/l3a0/marketlake/issues/911)).
+A host without the key runs no cost read. Until a cost report is filed, the panel names
+the reason from the `config.yaml` the dashboard read when it started. With the key, the
+panel says no sweep has filed a report yet. Without it, the panel says the host runs no
+cost read. A dashboard serving `--lake-root` reads no `config.yaml`, so its panel names no
+reason ([#911](https://github.com/l3a0/marketlake/issues/911)).
 
 The control plane renders for both hosts: launchd jobs for the Mac, installed by hand, and
 systemd units for a Linux VM, installed by `deploy/linux-install.sh`.

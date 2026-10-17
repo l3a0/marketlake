@@ -132,7 +132,7 @@ from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
-from lake.control_plane import assertion_window, sunday_canary_due
+from lake.control_plane import VENDOR_SWEEP, assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
 from lake.manifest import (
     VERDICT_FIELD,
@@ -1525,10 +1525,12 @@ class QueryContext:
     has read is not read again by the next. A context built without one reads every file
     on every request.
 
-    ``cost_export_configured`` says whether the machine's ``config.yaml`` names a
-    ``cost_export``, read once at startup the way ``guards`` are. It is ``None`` when no
-    config was read, as when the service serves a lake root directly, so the Cost panel
-    never claims a cause it did not check.
+    ``cost_export_configured`` says whether the machine's ``config.yaml`` named a
+    ``cost_export`` when the service started. It is read once at startup, the way ``guards``
+    are, so a later edit to the file does not reach it until the service restarts. The Cost
+    panel words its sentence as that startup snapshot for this reason. It is ``None`` when
+    no config was read, as when the service serves a lake root directly, and the panel then
+    names no cause.
     """
 
     paths: LakePaths
@@ -3322,18 +3324,35 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
     file in the scanned nights would read, or ``None`` when one did. ``oversize`` and
     ``unparseable`` count the files the scan skipped. ``state`` is the newest readable file's
-    state, one of the five ``lake.aws_cost`` writes. ``no_current_delivery`` says no
-    ``delivery`` file for the newest file's period was found, so the month-to-date figures
-    are absent rather than last month's. ``stale`` says the newest cost file is older than
-    the newest nightly report, so the read did not run that night.
+    state, one of the five ``lake.aws_cost`` writes. ``newest`` carries that file's ``day``,
+    ``at``, ``error`` and ``previous_error``, the last naming a failed read of the closed
+    month. ``no_current_delivery`` says no ``delivery`` file for the newest file's period was
+    found, so the month-to-date figures are absent rather than last month's. ``stale`` says
+    the newest readable cost file is older than the newest nightly report, so no readable
+    cost report was filed that night. Either the read never ran, or it ran and its file was
+    not written, and the nightly report names the second.
 
-    ``cost_export_configured`` is the context's field of the same name, on every payload, the
-    backstop's included. It is what tells the page why ``no_directory`` holds. ``True`` means
-    the config names a ``cost_export`` and no sweep has filed a report yet, ``False`` means
-    the config names none, so this host runs no cost read, and ``None`` means no config was
-    read, so the cause is unknown. It rides on every payload rather than only on
-    ``no_directory``, because it describes the host rather than the directory, and every
-    other field is present on every path too.
+    ``cost_export_configured`` is the context's field of the same name, a snapshot of the
+    config taken when the service started. It takes one of three values.
+
+    1. ``True``: the config named a ``cost_export``. Beside ``no_directory`` that means no
+       sweep has filed a report yet.
+    2. ``False``: the config named none, and a host without one runs no cost read.
+    3. ``None``: no config was read, so the cause is unknown.
+
+    It rides on every payload, the backstop's included, rather than only on ``no_directory``,
+    because it describes the host rather than the directory.
+
+    The panel's three sentences that name a cause are written here, so a test asserts the
+    exact text, and the page draws each one as given, the way it draws an S3 row's
+    ``label``. Each is ``None`` where it does not apply.
+
+    1. ``no_report_text`` is the sentence for ``no_directory``, chosen by
+       ``cost_export_configured``.
+    2. ``stale_text`` is the sentence for ``stale``.
+    3. ``previous_text`` says why there are no closed-month figures. It names the newest
+       file's ``previous_error`` when one is recorded, and otherwise says the export's first
+       month has no closed month to show.
 
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
@@ -3350,6 +3369,44 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
             "error": type(exc).__name__,
             "cost_export_configured": configured,
         }
+
+
+def cost_no_report_text(configured: bool | None) -> str:
+    """The Cost panel's sentence when no cost report has been filed.
+
+    ``configured`` is the config as it stood when the service started, so the sentence says
+    "when the dashboard started" rather than describing the file as it stands now. It names
+    where a failure would show rather than promising a report, because a sweep can run the
+    read and fail to write its file, and a sweep that stops early never reaches the read.
+    """
+    sentence = "No cost report has been filed."
+    if configured is True:
+        return (
+            f"{sentence} This host's config.yaml named a cost_export when the dashboard "
+            "started, and no sweep has filed a report yet. The cost read runs in the weekday "
+            f"{VENDOR_SWEEP.hms[:5]} sweep, whose nightly report names any failure."
+        )
+    if configured is False:
+        return (
+            f"{sentence} This host's config.yaml named no cost_export when the dashboard "
+            "started, and a host without one runs no cost read."
+        )
+    return sentence
+
+
+def cost_previous_text(previous_error: str | None) -> str:
+    """The Cost panel's sentence when it has no closed-month figures to show.
+
+    ``previous_error`` is the newest cost file's own, which ``lake.aws_cost`` writes when the
+    closed month's read failed. Only without one does the sentence fall back to the
+    first-month explanation.
+    """
+    if previous_error is not None:
+        return f"The closed month's read failed: {previous_error}. Its figures are not available."
+    return (
+        "The closed month's figures are not available yet. The export delivers the current "
+        "month only, so its first month has no closed month to show."
+    )
 
 
 def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, object]:
@@ -3374,10 +3431,14 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
         "previous": None,
         "trend": [],
         "s3": [],
+        "no_report_text": None,
+        "stale_text": None,
+        "previous_text": None,
     }
     directory = root / REPORTS_DIR / AWS_COST_DIR
     if not directory.is_dir():
         payload["condition"] = "no_directory"
+        payload["no_report_text"] = cost_no_report_text(configured)
         return payload
     try:
         names = os.listdir(directory)
@@ -3400,17 +3461,23 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
     state = _cost_text(newest.get("state"))
     payload["state"] = state if state in aws_cost.STATES else "unknown"
     payload["period"] = _cost_text(newest.get("period"))
+    previous_error = _cost_text(newest.get("previous_error"))
     payload["newest"] = {
         "day": _cost_text(newest.get("day")),
         "at": _cost_text(newest.get("at")),
         "error": _cost_text(newest.get("error")),
+        "previous_error": previous_error,
     }
     nightly_day = _newest_nightly_day(root)
     newest_day = _cost_day(newest.get("day"))
     payload["newest_nightly"] = nightly_day.isoformat() if nightly_day is not None else None
-    payload["stale"] = bool(
-        nightly_day is not None and newest_day is not None and newest_day < nightly_day
-    )
+    if nightly_day is not None and newest_day is not None and newest_day < nightly_day:
+        payload["stale"] = True
+        payload["stale_text"] = (
+            f"The newest cost report is from {newest_day.isoformat()}, older than the newest "
+            f"nightly report, from {nightly_day.isoformat()}. No readable cost report was "
+            "filed that night."
+        )
 
     current_entry = scan.current
     previous_entry = scan.previous
@@ -3439,6 +3506,8 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
             "total": _cost_number(previous.get("total")),
             "cost_per_session": _figure(previous.get("cost_per_session")),
         }
+    else:
+        payload["previous_text"] = cost_previous_text(previous_error)
     trend = _cost_trend(current, previous)
     payload["trend"] = trend
     if current is not None:

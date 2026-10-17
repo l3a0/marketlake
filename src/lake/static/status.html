@@ -1371,7 +1371,8 @@
 
   // Every decision here was made by the query, which unit tests reach. This draws the
   // fields it is given and nothing else, so each branch below is a sentence per state
-  // rather than a rule.
+  // rather than a rule. A sentence that names a cause arrives whole in the payload, as
+  // no_report_text, stale_text or previous_text, so a test reads its exact words.
   var COST_SECTIONS = ["cost-state", "cost-services", "cost-sessions", "cost-trend", "cost-s3"];
 
   function money(n, currency) {
@@ -1389,13 +1390,7 @@
   function costState(cost) {
     var box = byId("cost-state");
     if (cost.condition === "no_directory") {
-      var why = {
-        "true": " The cost export is configured, and no sweep has filed a report yet. " +
-          "The next weekday sweep files the first one.",
-        "false": " This host runs no cost read: its config.yaml names no cost_export.",
-        "null": ""
-      }[String(cost.cost_export_configured)] || "";
-      box.appendChild(el("p", "No cost report has been filed." + why, "muted"));
+      box.appendChild(el("p", cost.no_report_text, "muted"));
       return false;
     }
     if (cost.condition === "unreadable_directory" || cost.condition === "failed") {
@@ -1425,10 +1420,8 @@
     var line = lines[cost.state] || ["The newest cost report names a state this page " +
       "does not know: " + cost.state + ".", "alarm"];
     box.appendChild(el("p", line[0], line[1]));
-    if (cost.stale) {
-      box.appendChild(el("p", "The newest cost report is from " + newest.day +
-        ", older than the newest nightly report, from " + cost.newest_nightly +
-        ". The cost read did not run that night.", "alarm"));
+    if (cost.stale_text) {
+      box.appendChild(el("p", cost.stale_text, "alarm"));
     }
     var skipped = cost.oversize + cost.unparseable;
     if (skipped) {
@@ -1507,8 +1500,8 @@
     box.appendChild(previous
       ? el("p", sessionText(previous.period + ", closed", previous.cost_per_session,
         cost.currency) + " Its total was " + money(previous.total, cost.currency) + ".")
-      : el("p", "The closed month's figures are not available yet. The export delivers " +
-        "the current month only, so its first month has no closed month to show.", "muted"));
+      : el("p", cost.previous_text,
+        (cost.newest || {}).previous_error ? "alarm" : "muted"));
   }
 
   function costTrend(cost) {
