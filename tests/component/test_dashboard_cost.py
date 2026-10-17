@@ -23,18 +23,19 @@ from tests.support.clock import ManualClock
 NOW = datetime(2026, 10, 19, 14, 0, tzinfo=UTC)
 
 
-def service(root: Path) -> DashboardService:
+def service(root: Path, *, configured: bool | None = None) -> DashboardService:
     return DashboardService(
         root,
         clock=ManualClock(NOW),
         calendar=weekday_sessions(date(2026, 10, 12), date(2026, 10, 26)),
+        cost_export_configured=configured,
         page=b"<!doctype html>",
         icon=b"",
     )
 
 
-def cost(root: Path) -> dict:
-    return service(root).run_query("cost", {})
+def cost(root: Path, *, configured: bool | None = None) -> dict:
+    return service(root, configured=configured).run_query("cost", {})
 
 
 def file(root: Path, night: str, entry: dict | str, *, stamp: str = "183000000000") -> Path:
@@ -129,11 +130,100 @@ def root(tmp_path: Path) -> Path:
 # -- the conditions ------------------------------------------------------------------------
 
 
-def test_a_host_with_no_cost_files_says_it_runs_no_read(root: Path):
+def test_a_host_with_no_cost_files_has_no_directory(root: Path):
     payload = cost(root)
 
     assert payload["condition"] == "no_directory"
     assert payload["state"] is None and payload["current"] is None
+
+
+# The config, not the directory, says why ``no_directory`` holds, marketlake #911. On
+# 2026-10-16 the VM's config named an export, no sweep had run since the deploy, and the
+# panel blamed config.yaml. The flag is asserted with ``is``, so ``False`` and ``None``
+# cannot pass for each other. The sentences are literals here rather than built from
+# ``VENDOR_SWEEP``, so a change to the schedule shows up as a changed sentence.
+
+
+def test_no_directory_beside_a_configured_export_says_it_is_configured(root: Path):
+    payload = cost(root, configured=True)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is True
+    assert payload["no_report_text"] == (
+        "No cost report has been filed. This host's config.yaml named a cost_export when the "
+        "dashboard started, and no sweep has filed a report yet. The cost read runs in the "
+        "weekday 18:30 sweep, whose nightly report names any failure."
+    )
+
+
+def test_no_directory_beside_a_config_with_no_export_says_it_names_none(root: Path):
+    payload = cost(root, configured=False)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is False
+    assert payload["no_report_text"] == (
+        "No cost report has been filed. This host's config.yaml named no cost_export when the "
+        "dashboard started, and a host without one runs no cost read."
+    )
+
+
+def test_no_directory_on_a_service_that_read_no_config_claims_no_cause(root: Path):
+    """``--lake-root`` serves a lake directly and never reads config.yaml."""
+    payload = cost(root)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is None
+    assert payload["no_report_text"] == "No cost report has been filed."
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_the_configured_fact_rides_on_an_empty_directory(root: Path, configured: bool):
+    (root / "reports" / "aws_cost").mkdir(parents=True)
+
+    payload = cost(root, configured=configured)
+
+    assert payload["condition"] == "no_file"
+    assert payload["cost_export_configured"] is configured
+    assert payload["no_report_text"] is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory whatever its mode")
+@pytest.mark.parametrize("configured", [True, False])
+def test_the_configured_fact_rides_on_an_unreadable_directory(root: Path, configured: bool):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"))
+    directory = root / "reports" / "aws_cost"
+    directory.chmod(0)
+    try:
+        payload = cost(root, configured=configured)
+    finally:
+        directory.chmod(0o755)
+
+    assert payload["condition"] == "unreadable_directory"
+    assert payload["cost_export_configured"] is configured
+    assert payload["no_report_text"] is None
+
+
+@pytest.mark.parametrize("configured", [True, False, None])
+def test_the_configured_fact_rides_on_a_payload_that_read_a_file(
+    root: Path, configured: bool | None
+):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"))
+
+    payload = cost(root, configured=configured)
+
+    assert payload["condition"] is None
+    assert payload["cost_export_configured"] is configured
+    assert payload["no_report_text"] is None
+
+
+@pytest.mark.parametrize("configured", [True, False, None])
+def test_the_configured_fact_rides_on_the_backstop_too(root: Path, configured: bool | None):
+    file(root, "2026-10-16", entry("2026-10-16", "0001-01", "failed"))
+
+    payload = cost(root, configured=configured)
+
+    assert payload["condition"] == "failed"
+    assert payload["cost_export_configured"] is configured
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory whatever its mode")
@@ -187,6 +277,7 @@ def test_each_state_the_newest_file_names_is_returned(root: Path, state: str):
         "day": "2026-10-16",
         "at": "2026-10-16T18:30:00-04:00",
         "error": error,
+        "previous_error": None,
     }
     assert payload["no_current_delivery"] is True
     assert payload["current"] is None
@@ -288,13 +379,21 @@ def test_the_newest_file_is_stale_when_a_newer_nightly_report_exists(root: Path)
 
     assert payload["stale"] is True
     assert payload["newest_nightly"] == "2026-10-16"
+    # The read can run and its file fail to write, so the sentence says what the files show.
+    assert payload["stale_text"] == (
+        "The newest cost report is from 2026-10-15, older than the newest nightly report, "
+        "from 2026-10-16. No readable cost report was filed that night."
+    )
 
 
 def test_the_newest_file_is_not_stale_beside_its_own_night(root: Path):
     file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=october()))
     (root / "reports" / "2026-10-16-183000000000-4242.json").write_text("{}")
 
-    assert cost(root)["stale"] is False
+    payload = cost(root)
+
+    assert payload["stale"] is False
+    assert payload["stale_text"] is None
 
 
 def test_the_scan_stops_a_day_before_the_current_period_starts(root: Path):
@@ -465,9 +564,10 @@ def test_a_number_that_is_not_finite_never_reaches_the_page(root: Path, bare: st
     json.dumps(payload, allow_nan=False)
 
 
-def test_a_previous_error_field_is_tolerated(root: Path):
+def test_a_previous_error_is_named_rather_than_read_as_a_first_month(root: Path):
     """The writer names a failed read of the closed month in ``previous_error``, beside a
-    current block that still reads."""
+    current block that still reads. The panel names that failure, because the first-month
+    explanation would state a cause nothing checked."""
     file(
         root,
         "2026-10-16",
@@ -485,6 +585,38 @@ def test_a_previous_error_field_is_tolerated(root: Path):
     assert payload["state"] == "delivery"
     assert payload["current"]["total"] == pytest.approx(13.65)
     assert payload["previous"] is None
+    assert payload["newest"]["previous_error"] == "a data file's Parquet footer could not be read"
+    assert payload["previous_text"] == (
+        "The closed month's read failed: a data file's Parquet footer could not be read. "
+        "Its figures are not available."
+    )
+
+
+def test_no_previous_block_and_no_error_reads_as_the_export_first_month(root: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=october()))
+
+    payload = cost(root)
+
+    assert payload["previous"] is None
+    assert payload["newest"]["previous_error"] is None
+    assert payload["previous_text"] == (
+        "The closed month's figures are not available yet. The export's first month has no "
+        "closed month, and a closed month that AWS is still delivering is read once its "
+        "delivery finishes."
+    )
+
+
+def test_a_previous_block_leaves_no_closed_month_sentence(root: Path):
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=october(), previous=september()),
+    )
+
+    payload = cost(root)
+
+    assert payload["previous"]["period"] == "2026-09"
+    assert payload["previous_text"] is None
 
 
 def test_the_trend_is_thirty_calendar_days_from_both_series(root: Path):

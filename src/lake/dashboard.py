@@ -132,7 +132,7 @@ from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpan, CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
-from lake.control_plane import assertion_window, sunday_canary_due
+from lake.control_plane import VENDOR_SWEEP, assertion_window, sunday_canary_due
 from lake.deadman import in_envelope
 from lake.manifest import (
     VERDICT_FIELD,
@@ -1524,6 +1524,13 @@ class QueryContext:
     ``memo`` is the service's ``FileMemo``, shared by every request, so a file one panel
     has read is not read again by the next. A context built without one reads every file
     on every request.
+
+    ``cost_export_configured`` says whether the machine's ``config.yaml`` named a
+    ``cost_export`` when the service started. It is read once at startup, the way ``guards``
+    are, so a later edit to the file does not reach it until the service restarts. The Cost
+    panel words its sentence as that startup snapshot for this reason. It is ``None`` when
+    no config was read, as when the service serves a lake root directly, and the panel then
+    names no cause.
     """
 
     paths: LakePaths
@@ -1533,6 +1540,7 @@ class QueryContext:
     calendar: Calendar
     guards: GuardConstants = field(default_factory=GuardConstants)
     memo: FileMemo | None = None
+    cost_export_configured: bool | None = None
 
 
 def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
@@ -3312,30 +3320,103 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     this returns: which file answers what, the S3 classification, the billed sizes, the trend
     and whether the newest file is stale.
 
-    ``condition`` names a whole-directory state: ``no_directory`` on a host that runs no
-    cost read, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
+    ``condition`` names a whole-directory state: ``no_directory`` when no cost read has filed
+    a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
     file in the scanned nights would read, or ``None`` when one did. ``oversize`` and
     ``unparseable`` count the files the scan skipped. ``state`` is the newest readable file's
-    state, one of the five ``lake.aws_cost`` writes. ``no_current_delivery`` says no
-    ``delivery`` file for the newest file's period was found, so the month-to-date figures
-    are absent rather than last month's. ``stale`` says the newest cost file is older than
-    the newest nightly report, so the read did not run that night.
+    state, one of the five ``lake.aws_cost`` writes. ``newest`` carries that file's ``day``,
+    ``at``, ``error`` and ``previous_error``, the last naming a failed read of the closed
+    month. ``no_current_delivery`` says no ``delivery`` file for the newest file's period was
+    found, so the month-to-date figures are absent rather than last month's. ``stale`` says
+    the newest readable cost file is older than the newest nightly report, so no readable
+    cost report was filed that night. Either the read never ran, or it ran and its file was
+    not written, and the nightly report names the second.
+
+    ``cost_export_configured`` is the context's field of the same name, a snapshot of the
+    config taken when the service started. It takes one of three values.
+
+    1. ``True``: the config named a ``cost_export``. Beside ``no_directory`` that means no
+       sweep has filed a report yet.
+    2. ``False``: the config named none, and a host without one runs no cost read.
+    3. ``None``: no config was read, so the cause is unknown.
+
+    It rides on every payload, the backstop's included, rather than only on ``no_directory``,
+    because it describes the host rather than the directory.
+
+    The panel's three sentences that name a cause are written here, so a test asserts the
+    exact text, and the page draws each one as given, the way it draws an S3 row's
+    ``label``. Each is ``None`` where it does not apply.
+
+    1. ``no_report_text`` is the sentence for ``no_directory``, chosen by
+       ``cost_export_configured``.
+    2. ``stale_text`` is the sentence for ``stale``.
+    3. ``previous_text`` says why there are no closed-month figures. It names the newest
+       file's ``previous_error`` when one is recorded. Otherwise it names both causes that leave
+       no error, the export's first month and a closed month whose delivery has not finished,
+       without claiming which holds.
 
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
     """
     as_of = _iso(ctx.now)
+    configured = ctx.cost_export_configured
     try:
-        return _cost_payload(ctx.paths.root, as_of)
+        return _cost_payload(ctx.paths.root, as_of, configured)
     except Exception as exc:  # noqa: BLE001 - a 500 would throw away what did read
         log.exception("the cost panel failed, so it reports the failure instead")
-        return {"as_of": as_of, "condition": "failed", "error": type(exc).__name__}
+        return {
+            "as_of": as_of,
+            "condition": "failed",
+            "error": type(exc).__name__,
+            "cost_export_configured": configured,
+        }
 
 
-def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
+def cost_no_report_text(configured: bool | None) -> str:
+    """The Cost panel's sentence when no cost report has been filed.
+
+    ``configured`` is the config as it stood when the service started, so the sentence says
+    "when the dashboard started" rather than describing the file as it stands now. It names
+    where a failure would show rather than promising a report, because a sweep can run the
+    read and fail to write its file, and a sweep that stops early never reaches the read.
+    """
+    sentence = "No cost report has been filed."
+    if configured is True:
+        return (
+            f"{sentence} This host's config.yaml named a cost_export when the dashboard "
+            "started, and no sweep has filed a report yet. The cost read runs in the weekday "
+            f"{VENDOR_SWEEP.hms[:5]} sweep, whose nightly report names any failure."
+        )
+    if configured is False:
+        return (
+            f"{sentence} This host's config.yaml named no cost_export when the dashboard "
+            "started, and a host without one runs no cost read."
+        )
+    return sentence
+
+
+def cost_previous_text(previous_error: str | None) -> str:
+    """The Cost panel's sentence when it has no closed-month figures to show.
+
+    ``previous_error`` is the newest cost file's own, which ``lake.aws_cost`` writes when the
+    closed month's read failed. Without one, the block is also missing in the export's first
+    month and while a closed month's delivery has not finished, which ``lake.aws_cost``
+    records no differently, so the sentence names both rather than choosing.
+    """
+    if previous_error is not None:
+        return f"The closed month's read failed: {previous_error}. Its figures are not available."
+    return (
+        "The closed month's figures are not available yet. The export's first month has no "
+        "closed month, and a closed month that AWS is still delivering is read once its "
+        "delivery finishes."
+    )
+
+
+def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, object]:
     """The Cost panel's payload, every failure a value. :func:`query_cost` says what each is."""
     payload: dict[str, object] = {
         "as_of": as_of,
+        "cost_export_configured": configured,
         "condition": None,
         "error": None,
         "oversize": 0,
@@ -3353,10 +3434,14 @@ def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
         "previous": None,
         "trend": [],
         "s3": [],
+        "no_report_text": None,
+        "stale_text": None,
+        "previous_text": None,
     }
     directory = root / REPORTS_DIR / AWS_COST_DIR
     if not directory.is_dir():
         payload["condition"] = "no_directory"
+        payload["no_report_text"] = cost_no_report_text(configured)
         return payload
     try:
         names = os.listdir(directory)
@@ -3379,17 +3464,23 @@ def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
     state = _cost_text(newest.get("state"))
     payload["state"] = state if state in aws_cost.STATES else "unknown"
     payload["period"] = _cost_text(newest.get("period"))
+    previous_error = _cost_text(newest.get("previous_error"))
     payload["newest"] = {
         "day": _cost_text(newest.get("day")),
         "at": _cost_text(newest.get("at")),
         "error": _cost_text(newest.get("error")),
+        "previous_error": previous_error,
     }
     nightly_day = _newest_nightly_day(root)
     newest_day = _cost_day(newest.get("day"))
     payload["newest_nightly"] = nightly_day.isoformat() if nightly_day is not None else None
-    payload["stale"] = bool(
-        nightly_day is not None and newest_day is not None and newest_day < nightly_day
-    )
+    if nightly_day is not None and newest_day is not None and newest_day < nightly_day:
+        payload["stale"] = True
+        payload["stale_text"] = (
+            f"The newest cost report is from {newest_day.isoformat()}, older than the newest "
+            f"nightly report, from {nightly_day.isoformat()}. No readable cost report was "
+            "filed that night."
+        )
 
     current_entry = scan.current
     previous_entry = scan.previous
@@ -3418,6 +3509,8 @@ def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
             "total": _cost_number(previous.get("total")),
             "cost_per_session": _figure(previous.get("cost_per_session")),
         }
+    else:
+        payload["previous_text"] = cost_previous_text(previous_error)
     trend = _cost_trend(current, previous)
     payload["trend"] = trend
     if current is not None:
@@ -3500,9 +3593,11 @@ class DashboardService:
     state, and every cursor inherits the locked sandbox. The clock and calendar are
     injected, so a test decides what time it is and which days are sessions. The guard
     constants are injected too, so the panel reports the machine's own staleness
-    threshold rather than the pinned default it may have been recalibrated away from. The
-    page and the tab icon are injected on the same terms. Each defaults to the bytes
-    shipped in the package, and a test that wants neither passes its own.
+    threshold rather than the pinned default it may have been recalibrated away from.
+    Whether the config names a ``cost_export`` is injected on the same terms, and its
+    ``None`` default says no config was read. The page and the tab icon are injected too.
+    Each defaults to the bytes shipped in the package, and a test that wants neither passes
+    its own.
 
     The service holds one ``FileMemo`` for its life and hands it to every request, so a
     file one panel has read is not read again until it changes. The memo times its idle
@@ -3516,6 +3611,7 @@ class DashboardService:
         clock: Clock,
         calendar: Calendar,
         guards: GuardConstants | None = None,
+        cost_export_configured: bool | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
         icon: bytes | None = None,
@@ -3524,6 +3620,7 @@ class DashboardService:
         self._clock = clock
         self._calendar = calendar
         self._guards = guards if guards is not None else GuardConstants()
+        self._cost_export_configured = cost_export_configured
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
         self._icon = icon if icon is not None else load_favicon()
@@ -3564,6 +3661,7 @@ class DashboardService:
             calendar=self._calendar,
             guards=self._guards,
             memo=self._memo,
+            cost_export_configured=self._cost_export_configured,
         )
         cursor = self._con.cursor()
         try:
@@ -3776,7 +3874,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         help="Path to config.yaml (defaults to the standard location). Read once at "
-        "startup, for the lake root and the guard constants.",
+        "startup, for the lake root, the guard constants and whether it names a cost_export.",
     )
     parser.add_argument(
         "--lake-root",
@@ -3790,8 +3888,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The lake root comes from ``--lake-root`` or, failing that, from the machine-local
     config. The config is read once here, before the connection opens, and only its
-    ``lake_root`` and its guard constants are kept. Serving a lake root directly means
-    no config is read, so the guards are the design's pinned defaults. The service holds
+    ``lake_root``, its guard constants and whether it names a ``cost_export`` are kept.
+    Serving a lake root directly means no config is read, so the guards are the design's
+    pinned defaults and whether a cost export is configured is unknown. The service holds
     no secret, and the connection it opens can reach nothing outside the lake tree. The
     real clock and the real calendar are wired here and nowhere else in this module.
 
@@ -3801,16 +3900,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     traceback becomes a restart loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
+    cost_export_configured: bool | None
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
         guards = GuardConstants()
+        cost_export_configured = None
     else:
         with input_errors_exit("dashboard"):
             config = load_config(args.config)
         lake_root = config.lake_root
         guards = config.guards
+        cost_export_configured = config.cost_export is not None
     service = DashboardService(
-        lake_root, clock=SystemClock(), calendar=ExchangeCalendar(), guards=guards
+        lake_root,
+        clock=SystemClock(),
+        calendar=ExchangeCalendar(),
+        guards=guards,
+        cost_export_configured=cost_export_configured,
     )
     try:
         server = make_server(service, args.port)

@@ -474,9 +474,15 @@ class _ServiceRecorder:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def __call__(self, lake_root, *, clock, calendar, guards):
+    def __call__(self, lake_root, *, clock, calendar, guards, cost_export_configured):
         self.calls.append(
-            {"lake_root": lake_root, "clock": clock, "calendar": calendar, "guards": guards}
+            {
+                "lake_root": lake_root,
+                "clock": clock,
+                "calendar": calendar,
+                "guards": guards,
+                "cost_export_configured": cost_export_configured,
+            }
         )
         return object()
 
@@ -509,9 +515,11 @@ def test_main_serves_the_lake_root_flag_and_never_reads_the_config(monkeypatch, 
             "clock": "the system clock",
             "calendar": "the exchange calendar",
             "guards": GuardConstants(),
+            "cost_export_configured": None,
         }
     ]
-    # Serving a lake root directly reads no config, so the guards are the pinned defaults.
+    # Serving a lake root directly reads no config, so the guards are the pinned defaults
+    # and whether a cost export is configured is unknown rather than false.
     assert "9001" in capsys.readouterr().err
 
 
@@ -521,13 +529,32 @@ def test_main_reads_the_lake_root_and_the_guards_from_the_config(monkeypatch, ca
 
     def load_config(path=None):
         seen.append(path)
-        return SimpleNamespace(lake_root=Path("/configured/lake"), guards=recalibrated)
+        return SimpleNamespace(
+            lake_root=Path("/configured/lake"), guards=recalibrated, cost_export=None
+        )
 
     recorder = _wire_main(monkeypatch, load_config=load_config)
     assert dashboard.main(["--config", "machine.yaml"]) == 2
     assert seen == ["machine.yaml"]
     assert recorder.calls[0]["lake_root"] == Path("/configured/lake")
     assert recorder.calls[0]["guards"] is recalibrated
+    assert recorder.calls[0]["cost_export_configured"] is False
+    capsys.readouterr()
+
+
+def test_main_says_the_config_names_a_cost_export_when_it_does(monkeypatch, capsys):
+    """Marketlake #911: the Cost panel's no-report message picks its cause from this."""
+
+    def load_config(path=None):
+        return SimpleNamespace(
+            lake_root=Path("/configured/lake"),
+            guards=GuardConstants(),
+            cost_export="s3://example-billing/cur/marketlake-cost",
+        )
+
+    recorder = _wire_main(monkeypatch, load_config=load_config)
+    assert dashboard.main(["--config", "machine.yaml"]) == 2
+    assert recorder.calls[0]["cost_export_configured"] is True
     capsys.readouterr()
 
 
@@ -537,7 +564,9 @@ def test_main_falls_back_to_the_default_config_location(monkeypatch):
 
     def load_config(path=None):
         seen.append(path)
-        return SimpleNamespace(lake_root=Path("/configured/lake"), guards=recalibrated)
+        return SimpleNamespace(
+            lake_root=Path("/configured/lake"), guards=recalibrated, cost_export=None
+        )
 
     recorder = _wire_main(monkeypatch, load_config=load_config)
     assert dashboard.main([]) == 2

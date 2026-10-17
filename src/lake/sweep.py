@@ -1118,8 +1118,9 @@ def _read_aws_cost(
 
     ``None`` is a host with no export, which runs no read and writes no file. ``aws_cost.run``
     turns a failed read into a ``failed`` entry, so a failure still writes a file that says
-    so, and a missing file means the read never ran. The catch below is the backstop for the
-    writer and anything ``run`` did not expect. Nothing here touches ``problems``, so nothing
+    so. A missing file means the read never ran or its file was not written, and a write that
+    failed adds its own ``ACTION`` line to the nightly report. The outer catch is the backstop
+    for anything ``run`` did not expect. Nothing here touches ``problems``, so nothing
     here can withhold the ping, which has already been sent.
     """
     if cost_client is None:
