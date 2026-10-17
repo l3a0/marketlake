@@ -1524,6 +1524,11 @@ class QueryContext:
     ``memo`` is the service's ``FileMemo``, shared by every request, so a file one panel
     has read is not read again by the next. A context built without one reads every file
     on every request.
+
+    ``cost_export_configured`` says whether the machine's ``config.yaml`` names a
+    ``cost_export``, read once at startup the way ``guards`` are. It is ``None`` when no
+    config was read, as when the service serves a lake root directly, so the Cost panel
+    never claims a cause it did not check.
     """
 
     paths: LakePaths
@@ -1533,6 +1538,7 @@ class QueryContext:
     calendar: Calendar
     guards: GuardConstants = field(default_factory=GuardConstants)
     memo: FileMemo | None = None
+    cost_export_configured: bool | None = None
 
 
 def query_now(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, object]:
@@ -3312,8 +3318,8 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     this returns: which file answers what, the S3 classification, the billed sizes, the trend
     and whether the newest file is stale.
 
-    ``condition`` names a whole-directory state: ``no_directory`` on a host that runs no
-    cost read, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
+    ``condition`` names a whole-directory state: ``no_directory`` when no cost read has filed
+    a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
     file in the scanned nights would read, or ``None`` when one did. ``oversize`` and
     ``unparseable`` count the files the scan skipped. ``state`` is the newest readable file's
     state, one of the five ``lake.aws_cost`` writes. ``no_current_delivery`` says no
@@ -3321,21 +3327,36 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     are absent rather than last month's. ``stale`` says the newest cost file is older than
     the newest nightly report, so the read did not run that night.
 
+    ``cost_export_configured`` is the context's field of the same name, on every payload, the
+    backstop's included. It is what tells the page why ``no_directory`` holds. ``True`` means
+    the config names a ``cost_export`` and no sweep has filed a report yet, ``False`` means
+    the config names none, so this host runs no cost read, and ``None`` means no config was
+    read, so the cause is unknown. It rides on every payload rather than only on
+    ``no_directory``, because it describes the host rather than the directory, and every
+    other field is present on every path too.
+
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
     """
     as_of = _iso(ctx.now)
+    configured = ctx.cost_export_configured
     try:
-        return _cost_payload(ctx.paths.root, as_of)
+        return _cost_payload(ctx.paths.root, as_of, configured)
     except Exception as exc:  # noqa: BLE001 - a 500 would throw away what did read
         log.exception("the cost panel failed, so it reports the failure instead")
-        return {"as_of": as_of, "condition": "failed", "error": type(exc).__name__}
+        return {
+            "as_of": as_of,
+            "condition": "failed",
+            "error": type(exc).__name__,
+            "cost_export_configured": configured,
+        }
 
 
-def _cost_payload(root: Path, as_of: str) -> dict[str, object]:
+def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, object]:
     """The Cost panel's payload, every failure a value. :func:`query_cost` says what each is."""
     payload: dict[str, object] = {
         "as_of": as_of,
+        "cost_export_configured": configured,
         "condition": None,
         "error": None,
         "oversize": 0,
@@ -3500,9 +3521,11 @@ class DashboardService:
     state, and every cursor inherits the locked sandbox. The clock and calendar are
     injected, so a test decides what time it is and which days are sessions. The guard
     constants are injected too, so the panel reports the machine's own staleness
-    threshold rather than the pinned default it may have been recalibrated away from. The
-    page and the tab icon are injected on the same terms. Each defaults to the bytes
-    shipped in the package, and a test that wants neither passes its own.
+    threshold rather than the pinned default it may have been recalibrated away from.
+    Whether the config names a ``cost_export`` is injected on the same terms, and its
+    ``None`` default says no config was read. The page and the tab icon are injected too.
+    Each defaults to the bytes shipped in the package, and a test that wants neither passes
+    its own.
 
     The service holds one ``FileMemo`` for its life and hands it to every request, so a
     file one panel has read is not read again until it changes. The memo times its idle
@@ -3516,6 +3539,7 @@ class DashboardService:
         clock: Clock,
         calendar: Calendar,
         guards: GuardConstants | None = None,
+        cost_export_configured: bool | None = None,
         connection: duckdb.DuckDBPyConnection | None = None,
         page: bytes | None = None,
         icon: bytes | None = None,
@@ -3524,6 +3548,7 @@ class DashboardService:
         self._clock = clock
         self._calendar = calendar
         self._guards = guards if guards is not None else GuardConstants()
+        self._cost_export_configured = cost_export_configured
         self._con = connection if connection is not None else open_lake_connection(self._paths.root)
         self._page = page if page is not None else load_status_page()
         self._icon = icon if icon is not None else load_favicon()
@@ -3564,6 +3589,7 @@ class DashboardService:
             calendar=self._calendar,
             guards=self._guards,
             memo=self._memo,
+            cost_export_configured=self._cost_export_configured,
         )
         cursor = self._con.cursor()
         try:
@@ -3776,7 +3802,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         help="Path to config.yaml (defaults to the standard location). Read once at "
-        "startup, for the lake root and the guard constants.",
+        "startup, for the lake root, the guard constants and whether it names a cost_export.",
     )
     parser.add_argument(
         "--lake-root",
@@ -3790,8 +3816,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The lake root comes from ``--lake-root`` or, failing that, from the machine-local
     config. The config is read once here, before the connection opens, and only its
-    ``lake_root`` and its guard constants are kept. Serving a lake root directly means
-    no config is read, so the guards are the design's pinned defaults. The service holds
+    ``lake_root``, its guard constants and whether it names a ``cost_export`` are kept.
+    Serving a lake root directly means no config is read, so the guards are the design's
+    pinned defaults and whether a cost export is configured is unknown. The service holds
     no secret, and the connection it opens can reach nothing outside the lake tree. The
     real clock and the real calendar are wired here and nowhere else in this module.
 
@@ -3801,16 +3828,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     traceback becomes a restart loop instead of a readable complaint.
     """
     args = build_parser().parse_args(argv)
+    cost_export_configured: bool | None
     if args.lake_root is not None:
         lake_root = Path(args.lake_root)
         guards = GuardConstants()
+        cost_export_configured = None
     else:
         with input_errors_exit("dashboard"):
             config = load_config(args.config)
         lake_root = config.lake_root
         guards = config.guards
+        cost_export_configured = config.cost_export is not None
     service = DashboardService(
-        lake_root, clock=SystemClock(), calendar=ExchangeCalendar(), guards=guards
+        lake_root,
+        clock=SystemClock(),
+        calendar=ExchangeCalendar(),
+        guards=guards,
+        cost_export_configured=cost_export_configured,
     )
     try:
         server = make_server(service, args.port)

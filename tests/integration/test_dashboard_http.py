@@ -248,6 +248,30 @@ def test_api_history_returns_json(served):
     assert history["reports"] == []
 
 
+def test_api_cost_says_whether_the_config_names_an_export(fixture_lake: FixtureLake):
+    """The fixture lake has no ``reports/aws_cost/``. A service told the config names an
+    export says so over the wire, and the ordinary service, which read no config, says it
+    does not know. Marketlake #911."""
+    root = _build_lake(fixture_lake)
+    configured = DashboardService(
+        root,
+        clock=ManualClock(NOW.astimezone(UTC)),
+        calendar=CALENDAR,
+        cost_export_configured=True,
+    )
+    unread = DashboardService(root, clock=ManualClock(NOW.astimezone(UTC)), calendar=CALENDAR)
+    answers = {}
+    for name, service in (("configured", configured), ("unread", unread)):
+        for server in _serve(service):
+            status, _headers, body = _request(server, "/api/cost", host="localhost")
+            assert status == 200
+            answers[name] = json.loads(body)
+    assert answers["configured"]["condition"] == "no_directory"
+    assert answers["configured"]["cost_export_configured"] is True
+    assert answers["unread"]["condition"] == "no_directory"
+    assert answers["unread"]["cost_export_configured"] is None
+
+
 @pytest.mark.parametrize("query", ["date=2026-08-24", "ticker=SPY", "sql=SELECT+1"])
 def test_history_takes_no_parameter_at_all(served, query: str):
     # It is registered with an empty parameter set, so every field is unknown to it.

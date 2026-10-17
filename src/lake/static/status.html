@@ -1389,8 +1389,13 @@
   function costState(cost) {
     var box = byId("cost-state");
     if (cost.condition === "no_directory") {
-      box.appendChild(el("p", "No cost report has been filed. This host runs no cost " +
-        "read: its config.yaml names no cost_export.", "muted"));
+      var why = {
+        "true": " The cost export is configured, and no sweep has filed a report yet. " +
+          "The next weekday sweep files the first one.",
+        "false": " This host runs no cost read: its config.yaml names no cost_export.",
+        "null": ""
+      }[String(cost.cost_export_configured)] || "";
+      box.appendChild(el("p", "No cost report has been filed." + why, "muted"));
       return false;
     }
     if (cost.condition === "unreadable_directory" || cost.condition === "failed") {

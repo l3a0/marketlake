@@ -23,18 +23,19 @@ from tests.support.clock import ManualClock
 NOW = datetime(2026, 10, 19, 14, 0, tzinfo=UTC)
 
 
-def service(root: Path) -> DashboardService:
+def service(root: Path, *, configured: bool | None = None) -> DashboardService:
     return DashboardService(
         root,
         clock=ManualClock(NOW),
         calendar=weekday_sessions(date(2026, 10, 12), date(2026, 10, 26)),
+        cost_export_configured=configured,
         page=b"<!doctype html>",
         icon=b"",
     )
 
 
-def cost(root: Path) -> dict:
-    return service(root).run_query("cost", {})
+def cost(root: Path, *, configured: bool | None = None) -> dict:
+    return service(root, configured=configured).run_query("cost", {})
 
 
 def file(root: Path, night: str, entry: dict | str, *, stamp: str = "183000000000") -> Path:
@@ -129,11 +130,61 @@ def root(tmp_path: Path) -> Path:
 # -- the conditions ------------------------------------------------------------------------
 
 
-def test_a_host_with_no_cost_files_says_it_runs_no_read(root: Path):
+def test_a_host_with_no_cost_files_has_no_directory(root: Path):
     payload = cost(root)
 
     assert payload["condition"] == "no_directory"
     assert payload["state"] is None and payload["current"] is None
+
+
+# Why ``no_directory`` holds is the config's fact, not the directory's, marketlake #911. On
+# 2026-10-16 the VM's config named an export, the deploy landed after that evening's sweep,
+# and the panel blamed config.yaml. Each case is asserted with ``is``, so ``False`` and
+# ``None`` cannot stand in for each other.
+
+
+def test_no_directory_beside_a_configured_export_says_it_is_configured(root: Path):
+    payload = cost(root, configured=True)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is True
+
+
+def test_no_directory_beside_a_config_with_no_export_says_it_names_none(root: Path):
+    payload = cost(root, configured=False)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is False
+
+
+def test_no_directory_on_a_service_that_read_no_config_claims_no_cause(root: Path):
+    """``--lake-root`` serves a lake directly and never reads config.yaml."""
+    payload = cost(root)
+
+    assert payload["condition"] == "no_directory"
+    assert payload["cost_export_configured"] is None
+
+
+@pytest.mark.parametrize("configured", [True, False, None])
+def test_the_configured_fact_rides_on_a_payload_that_read_a_file(
+    root: Path, configured: bool | None
+):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"))
+
+    payload = cost(root, configured=configured)
+
+    assert payload["condition"] is None
+    assert payload["cost_export_configured"] is configured
+
+
+@pytest.mark.parametrize("configured", [True, False, None])
+def test_the_configured_fact_rides_on_the_backstop_too(root: Path, configured: bool | None):
+    file(root, "2026-10-16", entry("2026-10-16", "0001-01", "failed"))
+
+    payload = cost(root, configured=configured)
+
+    assert payload["condition"] == "failed"
+    assert payload["cost_export_configured"] is configured
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a directory whatever its mode")
