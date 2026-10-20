@@ -200,9 +200,7 @@ def root(tmp_path: Path) -> Path:
 # -- the trend -------------------------------------------------------------------------------
 
 
-def test_the_trend_draws_usage_above_the_baseline_and_credits_below_it(
-    root: Path, tmp_path: Path
-):
+def test_the_trend_draws_usage_above_the_baseline_and_credits_below_it(root: Path, tmp_path: Path):
     file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
     payload = cost(root)
 
@@ -411,8 +409,11 @@ def test_each_bucket_draws_its_billed_size_as_a_line(root: Path, tmp_path: Path)
     assert texts[-2:] == ["Sep 20", "Oct 14"]
     assert all(re.fullmatch(r"[0-9.]+ GB", t) for t in texts if t.endswith("GB")), texts
     tables_found = tables(s3)
-    assert tables_found[0] == [["Day", "Billed size"], ["2026-09-20", "90.00 GB"],
-                               ["2026-10-14", "93.10 GB"]]
+    assert tables_found[0] == [
+        ["Day", "Billed size"],
+        ["2026-09-20", "90.00 GB"],
+        ["2026-10-14", "93.10 GB"],
+    ]
 
 
 def test_a_bucket_with_one_sized_day_draws_no_line(root: Path, tmp_path: Path):
