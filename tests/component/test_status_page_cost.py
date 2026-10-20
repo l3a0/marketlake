@@ -391,6 +391,39 @@ def test_a_window_with_no_figure_draws_no_column(root: Path, tmp_path: Path):
     assert dashboard.TREND_SPLIT_TEXT not in text_of(trend)
 
 
+def test_a_window_with_figures_all_zero_draws_its_table_alone(root: Path, tmp_path: Path):
+    current = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_other={"2026-10-15": {}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+    payload = cost(root)
+
+    trend = run_page(tmp_path, payload)["cost-trend"]
+
+    assert payload["trend_split"] is True and payload["trend_series"] == []
+    assert find(trend, "svg") == [] and find(trend, "div", "chart-legend") == []
+    assert len(find(trend, "details")) == 1
+
+
+def test_axis_ticks_never_step_finer_than_a_cent(root: Path, tmp_path: Path):
+    """A window of fractions of a cent would otherwise tick every tenth of one, and every
+    tick would print $0.00."""
+    current = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-15": {"AmazonS3": 0.004}},
+        daily_other={"2026-10-15": {"Credit": -0.004}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    trend = run_page(tmp_path, cost(root))["cost-trend"]
+
+    [chart] = find(trend, "svg")
+    ticks = [text_of(n) for n in find(chart, "text", "axis") if "$" in text_of(n)]
+    assert len(ticks) == len(set(ticks)), ticks
+
+
 # -- month to date -------------------------------------------------------------------------
 
 

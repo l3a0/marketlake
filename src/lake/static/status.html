@@ -1540,13 +1540,15 @@
   }
 
   // Round ticks covering lo..hi, always including zero when the range crosses it.
-  function niceTicks(lo, hi, count) {
+  function niceTicks(lo, hi, count, minStep) {
     if (hi === lo) { hi = lo + 1; }
     var raw = (hi - lo) / count;
     var power = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10));
     // No 2.5 step: a tick at 0.025 would print as $0.03 at two places.
     var step = [1, 2, 5, 10].map(function (m) { return m * power; })
       .filter(function (s) { return s >= raw; })[0];
+    // A tick finer than the axis prints is a row of identical labels.
+    if (step < minStep) { step = minStep; }
     var ticks = [];
     for (var v = Math.floor(lo / step) * step; v <= hi + step * 1e-9; v += step) {
       ticks.push(Math.round(v / step) * step);
@@ -1760,7 +1762,8 @@
       if (down < lo) { lo = down; }
       return parts;
     });
-    var ticks = niceTicks(lo, hi, 4);
+    // Cents are the finest the money axis prints.
+    var ticks = niceTicks(lo, hi, 4, 0.01);
     var top = ticks[ticks.length - 1];
     var bottom = Math.min(0, ticks[0]);
     function y(value) { return height - (value - bottom) / (top - bottom) * height; }
@@ -1830,7 +1833,7 @@
     // A flat line sits mid-axis at its own scale, so a bucket of a few megabytes is not
     // pinned to the floor of an axis a gigabyte tall.
     var pad = hi !== lo ? (hi - lo) * 0.1 : hi > 0 ? hi * 0.1 : 1;
-    var ticks = niceTicks(Math.max(0, lo - pad), hi + pad, 3);
+    var ticks = niceTicks(Math.max(0, lo - pad), hi + pad, 3, 0);
     var bottom = ticks[0];
     var top = ticks[ticks.length - 1];
     var first = Date.parse(points[0].day + "T00:00:00Z");
@@ -2007,6 +2010,12 @@
     }
     if (cost.trend_offset_text) {
       box.appendChild(el("p", cost.trend_offset_text, "muted"));
+    }
+    // A window whose every figure is zero has no series, and a chart of it would be an
+    // empty axis, so the table says it alone.
+    if (!cost.trend_series.length) {
+      box.appendChild(trendTable(cost));
+      return;
     }
     box.appendChild(legend(cost.trend_series, true));
     box.appendChild(trendChart(cost, chartWidth(box)));

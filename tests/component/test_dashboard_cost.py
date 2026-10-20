@@ -358,9 +358,10 @@ def test_on_the_first_last_month_never_shows_as_month_to_date(root: Path):
     assert payload["current"] is None
     assert payload["previous"]["period"] == "2026-10"
     assert payload["previous"]["total"] == 21.1
-    # The closed month's last day is complete, so nothing in the trend is partial.
-    assert payload["trend"][-1] == unsplit("2026-10-31", 0.7, {"AmazonEC2": 0.7})
-    assert not any(row["partial"] for row in payload["trend"])
+    # With no current figures the closed month's newest day ends the trend, and it is as
+    # partial as any export's newest day, since the export lags a day.
+    assert payload["trend"][-1] == unsplit("2026-10-31", 0.7, {"AmazonEC2": 0.7}, partial=True)
+    assert [row["day"] for row in payload["trend"] if row["partial"]] == ["2026-10-31"]
     assert payload["s3"] == []
 
 
@@ -751,6 +752,23 @@ def test_a_trend_day_carries_its_usage_by_series_apart_from_its_credits(root: Pa
     assert newest["other_lines"] == 0.0
     # A day the split block does not carry has no figure, split or net.
     assert by_day["2026-10-13"]["total"] is None and by_day["2026-10-13"]["usage"] is None
+
+
+def test_on_the_first_the_closed_months_newest_usage_day_is_partial(root: Path):
+    """The closed month carries no ``newest_day``, so its newest usage day comes from its
+    split. A tax line dated the month's last day does not move it, as it cannot move N."""
+    previous = september(
+        period="2026-10",
+        daily={"2026-10-30": {"AmazonEC2": 0.0}, "2026-10-31": {"AmazonEC2": 0.25}},
+        daily_usage={"2026-10-30": {"AmazonEC2": 0.2}},
+        daily_other={"2026-10-30": {"Credit": -0.2}, "2026-10-31": {"Tax": 0.25}},
+    )
+    file(root, "2026-11-01", entry("2026-11-01", "2026-11", "no_delivery", previous=previous))
+
+    trend = cost(root)["trend"]
+
+    assert trend[-1]["day"] == "2026-10-30"
+    assert [row["day"] for row in trend if row["partial"]] == ["2026-10-30"]
 
 
 def test_credits_that_offset_every_day_are_said_once(root: Path):

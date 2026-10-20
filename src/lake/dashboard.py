@@ -3249,6 +3249,14 @@ def _daily_series(block: Mapping[str, Any]) -> dict[date, _CostDay]:
     return days
 
 
+def _newest_usage_day(block: Mapping[str, Any]) -> date | None:
+    """A closed month's newest usage day, from its split when it carries one."""
+    usage = block.get("daily_usage")
+    series = usage if isinstance(usage, Mapping) else _cost_mapping(block.get("daily"))
+    days = [day for key in series if (day := _cost_day(key)) is not None]
+    return max(days) if days else None
+
+
 def _trend_row(day: date, found: _CostDay | None, partial: bool) -> dict[str, object]:
     """One day of the trend. Every split field is ``None`` on a day without the split."""
     row: dict[str, object] = {
@@ -3293,8 +3301,11 @@ def _cost_trend(
 
     The current period's series wins a day both carry, since it is the newer reading. A day
     neither carries has no total, which is the export's lag rather than a day that cost zero.
-    The newest usage day is ``partial``, as the export's newest day always is. Only the
-    current period has one, since the closed month's last day is complete.
+    The newest usage day is ``partial``, as the export's newest day always is: the current
+    period's ``newest_day``, or, on a night with no current figures such as the 1st, the
+    closed month's newest usage day, since the export lags a day there too. That block
+    carries no ``newest_day``, so it is the latest day of its ``daily_usage``, or of its
+    ``daily`` when it predates the split.
     """
     days: dict[date, _CostDay] = {}
     if previous is not None:
@@ -3302,6 +3313,8 @@ def _cost_trend(
     if current is not None:
         days.update(_daily_series(current))
     newest = _cost_day(current.get("newest_day")) if current is not None else None
+    if current is None and previous is not None:
+        newest = _newest_usage_day(previous)
     end = newest
     if end is None and days:
         end = max(days)

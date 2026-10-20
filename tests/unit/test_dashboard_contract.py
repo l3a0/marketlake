@@ -265,6 +265,24 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
         assert marker not in rest
 
 
+def test_every_id_the_script_asks_for_is_in_the_markup():
+    """``tests/component/test_status_page_cost.py`` runs the script against a DOM stub that
+    makes any element it is asked for, so a mistyped id passes there. In a browser
+    ``byId`` would return null, and a call made at load, such as the Cost panel's
+    ``ResizeObserver``, would stop the whole script."""
+    page = dashboard.load_status_page().decode()
+    start = page.index("<script>")
+    markup, script = page[:start], page[start:]
+    asked = set(re.findall(r'byId\("([^"]+)"\)', script))
+    asked |= {
+        name
+        for group in re.findall(r"var COST_SECTIONS = \[([^\]]*)\]", script)
+        for name in re.findall(r'"([^"]+)"', group)
+    }
+    declared = set(re.findall(r'\bid="([^"]+)"', markup))
+    assert asked and not asked - declared, sorted(asked - declared)
+
+
 def test_an_error_drawing_the_cost_panel_is_caught_on_its_own_chain():
     """A throw inside ``renderCost`` must land in ``costFailed``. Passed as ``then``'s second
     argument, ``costFailed`` catches only a failed fetch, so a render error would reject the
