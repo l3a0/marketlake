@@ -753,6 +753,40 @@ def test_a_trend_day_carries_its_usage_by_series_apart_from_its_credits(root: Pa
     assert by_day["2026-10-13"]["total"] is None and by_day["2026-10-13"]["usage"] is None
 
 
+def test_credits_that_offset_every_day_are_said_once(root: Path):
+    """A day's net within half a cent of zero counts as offset, and one day it does not
+    offset, or a window with no usage, says nothing."""
+    zero = split_october(
+        daily={"2026-10-14": {"AmazonEC2": 0.004}, "2026-10-15": {"AmazonEC2": -0.004}},
+        daily_usage={"2026-10-14": {"AmazonEC2": 0.2}, "2026-10-15": {"AmazonEC2": 0.1}},
+        daily_other={"2026-10-14": {"Credit": -0.196}, "2026-10-15": {"Credit": -0.104}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=zero))
+    assert cost(root)["trend_offset_text"] == dashboard.TREND_OFFSET_TEXT
+
+    one_day = split_october()
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=one_day),
+        stamp="183000000001",
+    )
+    assert cost(root)["trend_offset_text"] is None
+
+    idle = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-15": {}},
+        daily_other={"2026-10-15": {}},
+    )
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=idle),
+        stamp="183000000002",
+    )
+    assert cost(root)["trend_offset_text"] is None
+
+
 def test_the_series_keep_their_slots_whichever_are_present(root: Path):
     """A color follows its service, so a missing series moves no other one's slot."""
     current = split_october(
@@ -819,6 +853,17 @@ def test_one_old_block_in_the_window_turns_the_split_off(root: Path):
     assert payload["trend_split_text"] == dashboard.TREND_SPLIT_TEXT
 
 
+def test_a_window_with_no_figure_names_no_old_report(root: Path):
+    current = split_october(daily={})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    payload = cost(root)
+
+    assert len(payload["trend"]) == 30
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] is None
+
+
 def test_no_trend_says_nothing_about_the_split(root: Path):
     file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"))
 
@@ -827,6 +872,7 @@ def test_no_trend_says_nothing_about_the_split(root: Path):
     assert payload["trend"] == []
     assert payload["trend_split"] is False
     assert payload["trend_split_text"] is None
+    assert payload["trend_offset_text"] is None
 
 
 def test_the_projection_carries_the_usage_alone_beside_the_net(root: Path):

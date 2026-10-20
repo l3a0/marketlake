@@ -3317,7 +3317,12 @@ def _cost_trend(
 def trend_split(trend: Sequence[Mapping[str, object]]) -> bool:
     """Whether every trend day with a figure carries the usage split, and one day does."""
     figured = [row for row in trend if row["total"] is not None]
-    return bool(figured) and all(row["usage"] is not None for row in figured)
+    return bool(figured) and not trend_unsplit(trend)
+
+
+def trend_unsplit(trend: Sequence[Mapping[str, object]]) -> bool:
+    """Whether a report written before the split answers a figured day in the trend."""
+    return any(row["total"] is not None and row["usage"] is None for row in trend)
 
 
 def trend_series(trend: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
@@ -3340,6 +3345,23 @@ TREND_SPLIT_TEXT = (
     "A cost report written before the daily usage split answers a day in this window, so "
     "the chart shows each day's net, credits included, rather than usage and credits apart."
 )
+
+
+# The sentence the trend draws when credits bring every figured day's net to zero. Each
+# day's net tick then sits on the zero line, where it reads as no tick at all.
+TREND_OFFSET_TEXT = (
+    "Credits offset all of each day's usage in this window, so every day's net is zero."
+)
+
+
+def trend_offset(trend: Sequence[Mapping[str, object]]) -> bool:
+    """Whether a split window has usage and every figured day's net rounds to zero."""
+    figured = [row for row in trend if row["total"] is not None]
+    return (
+        trend_split(trend)
+        and any(row["usage"] for row in figured)
+        and all(abs(float(row["total"])) < 0.005 for row in figured)  # type: ignore[arg-type]
+    )
 
 
 def _month_lines(current: Mapping[str, Any]) -> dict[str, float] | None:
@@ -3544,7 +3566,7 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     It rides on every payload, the backstop's included, rather than only on ``no_directory``,
     because it describes the host rather than the directory.
 
-    The panel's four sentences that name a cause are written here, so a test asserts the
+    The panel's five sentences that name a cause are written here, so a test asserts the
     exact text, and the page draws each one as given, the way it draws an S3 row's
     ``label``. Each is ``None`` where it does not apply.
 
@@ -3558,6 +3580,8 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     4. ``trend_split_text`` says a report written before the daily usage split answers a day
        in the trend's window, so the chart draws each day's net. It names no end, because
        ``_cost_scan`` can take the current and the closed month from different files.
+    5. ``trend_offset_text`` says credits bring every figured day's net to zero, where the
+       chart's net ticks lie on its zero line.
 
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
@@ -3639,6 +3663,7 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
         "trend": [],
         "trend_split": False,
         "trend_split_text": None,
+        "trend_offset_text": None,
         "trend_series": [],
         "s3": [],
         "no_report_text": None,
@@ -3727,8 +3752,10 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
     payload["trend"] = trend
     payload["trend_split"] = trend_split(trend)
     payload["trend_series"] = trend_series(trend)
-    if trend and not payload["trend_split"]:
+    if trend_unsplit(trend):
         payload["trend_split_text"] = TREND_SPLIT_TEXT
+    if trend_offset(trend):
+        payload["trend_offset_text"] = TREND_OFFSET_TEXT
     if current is not None:
         trend_start = _cost_day(trend[0]["day"]) if trend else None
         payload["s3"] = _s3_buckets(current, previous, trend_start)

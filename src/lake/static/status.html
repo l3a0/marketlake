@@ -1421,7 +1421,7 @@
   // fields it is given and nothing else, so each branch below is a sentence per state
   // rather than a rule, and each chart computes only where its marks go. A sentence that
   // names a cause arrives whole in the payload, as no_report_text, stale_text,
-  // previous_text or trend_split_text, so a test reads its exact words.
+  // previous_text, trend_split_text or trend_offset_text, so a test reads its exact words.
   var COST_SECTIONS = ["cost-state", "cost-services", "cost-sessions", "cost-trend", "cost-s3"];
 
   // A figure in its currency, with a minus sign ahead of the symbol, so a credit reads
@@ -1544,7 +1544,8 @@
     if (hi === lo) { hi = lo + 1; }
     var raw = (hi - lo) / count;
     var power = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10));
-    var step = [1, 2, 2.5, 5, 10].map(function (m) { return m * power; })
+    // No 2.5 step: a tick at 0.025 would print as $0.03 at two places.
+    var step = [1, 2, 5, 10].map(function (m) { return m * power; })
       .filter(function (s) { return s >= raw; })[0];
     var ticks = [];
     for (var v = Math.floor(lo / step) * step; v <= hi + step * 1e-9; v += step) {
@@ -1573,21 +1574,25 @@
       "h" + (2 * r - w) + "q" + (-r) + ",0 " + (-r) + "," + (-r) + "Z";
   }
 
-  // The chart's box, with the one tooltip its marks share.
-  function chartBox(label) {
+  // The chart's box, with the one tooltip its marks share. The tooltip is for a mouse. A
+  // keyboard, a screen reader and a phone read the same figures in the table toggle below
+  // each chart, so the marks take no focus, as the History heatmap's cells take none.
+  function chartBox() {
     var wrap = el("div", null, "chart");
     var tip = el("div", null, "chart-tip");
-    tip.setAttribute("role", "status");
+    tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(tip);
-    wrap.setAttribute("aria-label", label);
     return {wrap: wrap, tip: tip};
   }
 
-  // Give a mark a tooltip of ``rows``, each [text, slot or null, strong], shown on hover and
-  // on keyboard focus, and the same words as its accessible name.
+  // The chart itself, one image to assistive technology, named by ``label``.
+  function chartSvg(width, height, label) {
+    return svg("svg", {width: width, height: height, viewBox: "0 0 " + width + " " + height,
+      role: "img", "aria-label": label + " The figures are in the table below."});
+  }
+
+  // Give a mark a tooltip of ``rows``, each [text, slot or null, strong], shown on hover.
   function withTip(box, mark, x, rows, width) {
-    mark.setAttribute("tabindex", "0");
-    mark.setAttribute("aria-label", rows.map(function (row) { return row[0]; }).join(". "));
     function show() {
       clear(box.tip);
       rows.forEach(function (row) {
@@ -1610,9 +1615,7 @@
     }
     function hide() { box.tip.classList.remove("shown"); }
     mark.addEventListener("mouseenter", show);
-    mark.addEventListener("focus", show);
     mark.addEventListener("mouseleave", hide);
-    mark.addEventListener("blur", hide);
   }
 
   function legend(series, withNet) {
@@ -1642,6 +1645,11 @@
     details.open = openTables[name] === true;
     details.addEventListener("toggle", function () { openTables[name] = details.open; });
     details.appendChild(el("summary", "Show the figures as a table"));
+    details.appendChild(figureTable(headings, rows));
+    return details;
+  }
+
+  function figureTable(headings, rows) {
     var wrap = el("div", null, "table-wrap");
     var table = el("table");
     var head = el("tr");
@@ -1655,13 +1663,12 @@
       table.appendChild(tr);
     });
     wrap.appendChild(table);
-    details.appendChild(wrap);
-    return details;
+    return wrap;
   }
 
   // Month to date as horizontal bars of usage, one per series, each value at its tip.
   function usageBars(rows, currency, width) {
-    var box = chartBox("Month-to-date usage by service");
+    var box = chartBox();
     // A narrow chart puts each label on its own line above its bar, since a label column
     // beside the bars would leave them no room or cut the label off.
     var narrow = width < NARROW_CHART;
@@ -1674,8 +1681,7 @@
     var labelY = narrow ? 12 : rowHeight / 2 + 4;
     var max = 0;
     rows.forEach(function (row) { if (row.usage > max) { max = row.usage; } });
-    var chart = svg("svg", {width: width, height: rows.length * rowHeight,
-      viewBox: "0 0 " + width + " " + rows.length * rowHeight, role: "img"});
+    var chart = chartSvg(width, rows.length * rowHeight, "Month-to-date usage by service.");
     rows.forEach(function (row, index) {
       var y = index * rowHeight;
       var w = max > 0 ? Math.max(1, plot * Math.max(0, row.usage) / max) : 1;
@@ -1696,11 +1702,7 @@
   }
 
   // One trend day's marks as [series, value] pairs above and below the baseline.
-  function daySegments(day, series, split) {
-    if (!split) {
-      return {up: day.total > 0 ? [[{slot: 1, label: "Net"}, day.total]] : [],
-        down: day.total < 0 ? [[{slot: 1, label: "Net"}, day.total]] : []};
-    }
+  function daySegments(day, series) {
     var up = [];
     var down = [];
     series.forEach(function (one) {
@@ -1712,38 +1714,36 @@
     return {up: up, down: down};
   }
 
-  function dayTipRows(day, series, split, currency) {
+  function dayTipRows(day, series, currency) {
     var rows = [[shortDay(day.day) + (day.partial ? ", a partial day" : ""), null, true]];
     if (day.total === null) {
       rows.push(["No figure yet. The export has not delivered this day.", null, false]);
       return rows;
     }
-    if (split) {
-      rows.push(["Usage " + money(day.usage, currency), null, false]);
-      series.forEach(function (one) {
-        if (one.kind !== "usage") { return; }
-        var value = (day.usage_by_series || {})[one.key];
-        if (value) { rows.push([one.label + " " + money(value, currency), one.slot, false]); }
-      });
-      if (day.credits) { rows.push(["Credits " + money(day.credits, currency), 6, false]); }
-      Object.keys(day.other_by_type || {}).forEach(function (type) {
-        if (type === "Credit" || !day.other_by_type[type]) { return; }
-        rows.push([(type || "No line type") + " " + money(day.other_by_type[type], currency),
-          5, false]);
-      });
-    }
+    rows.push(["Usage " + money(day.usage, currency), null, false]);
+    series.forEach(function (one) {
+      if (one.kind !== "usage") { return; }
+      var value = (day.usage_by_series || {})[one.key];
+      if (value) { rows.push([one.label + " " + money(value, currency), one.slot, false]); }
+    });
+    if (day.credits) { rows.push(["Credits " + money(day.credits, currency), 6, false]); }
+    Object.keys(day.other_by_type || {}).forEach(function (type) {
+      if (type === "Credit" || !day.other_by_type[type]) { return; }
+      rows.push([(type || "No line type") + " " + money(day.other_by_type[type], currency),
+        5, false]);
+    });
     rows.push(["Net " + money(day.total, currency), null, false]);
     return rows;
   }
 
   // The trend: a column per day, usage stacked up from zero by series and credits stacked
-  // down from it, with a tick at each day's net. One dollar axis.
+  // down from it, with a tick at each day's net. One dollar axis. It draws only a window
+  // whose every figured day carries the split, which the query's trend_split says.
   function trendChart(cost, width) {
-    var split = cost.trend_split;
     var series = cost.trend_series || [];
     var currency = cost.currency;
     var days = cost.trend;
-    var box = chartBox("Daily cost, " + days[0].day + " to " + days[days.length - 1].day);
+    var box = chartBox();
     var left = 52;
     var height = 180;
     var axis = 22;
@@ -1751,7 +1751,7 @@
     var hi = 0;
     var lo = 0;
     var stacks = days.map(function (day) {
-      var parts = daySegments(day, series, split);
+      var parts = daySegments(day, series);
       var up = 0;
       var down = 0;
       parts.up.forEach(function (part) { up += part[1]; });
@@ -1766,12 +1766,15 @@
     function y(value) { return height - (value - bottom) / (top - bottom) * height; }
     var band = plot / days.length;
     var thick = Math.max(1, Math.min(BAR_MAX, band - GAP));
-    var chart = svg("svg", {width: width, height: height + axis,
-      viewBox: "0 0 " + width + " " + (height + axis), role: "img"});
+    var chart = chartSvg(width, height + axis, "Daily usage by service and the credits " +
+      "against it, " + days[0].day + " to " + days[days.length - 1].day + ".");
     ticks.forEach(function (tick) {
       chart.appendChild(svg("line", {x1: left, x2: width, y1: y(tick), y2: y(tick)}, "grid"));
       chart.appendChild(svgText(left - 6, y(tick) + 4, money(tick, currency), "end", "axis"));
     });
+    // The zero line goes under the columns, so a day whose net is zero keeps its tick in
+    // sight on top of it.
+    chart.appendChild(svg("line", {x1: left, x2: width, y1: y(0), y2: y(0)}, "baseline"));
     days.forEach(function (day, index) {
       var x = left + index * band + (band - thick) / 2;
       var group = svg("g", null, day.partial ? "partial" : null);
@@ -1786,22 +1789,20 @@
           var h = Math.abs(to - from) - GAP;
           if (h <= 0) { h = 1; }
           var end = at === parts.length - 1 ? (side[1] > 0 ? "top" : "bottom") : null;
-          var mark = svg("path", {d: barPath(x, side[1] > 0 ? y0 + GAP : y0, thick, h, end),
-            "data-series": part[0].key || "net", "data-value": part[1]}, "s" + part[0].slot);
-          group.appendChild(mark);
+          group.appendChild(svg("path", {d: barPath(x, side[1] > 0 ? y0 + GAP : y0, thick, h,
+            end), "data-series": part[0].key, "data-value": part[1]}, "s" + part[0].slot));
         });
       });
-      if (split && day.total !== null) {
+      if (day.total !== null) {
         group.appendChild(svg("line", {x1: x - 2, x2: x + thick + 2, y1: y(day.total),
           y2: y(day.total), stroke: "currentColor", "stroke-width": 2, "data-net": day.total}));
       }
       chart.appendChild(group);
       var hit = svg("rect", {x: left + index * band, y: 0, width: band, height: height}, "hit");
-      withTip(box, hit, left + index * band + band / 2, dayTipRows(day, series, split, currency),
+      withTip(box, hit, left + index * band + band / 2, dayTipRows(day, series, currency),
         width);
       chart.appendChild(hit);
     });
-    chart.appendChild(svg("line", {x1: left, x2: width, y1: y(0), y2: y(0)}, "baseline"));
     var labelled = width >= 420 ? [0, Math.floor((days.length - 1) / 2), days.length - 1]
       : [0, days.length - 1];
     labelled.forEach(function (index, at) {
@@ -1817,7 +1818,7 @@
   // One bucket's billed size per day as a line, with a dot and a label at its end.
   function sizeChart(bucket, width) {
     var points = bucket.size_series;
-    var box = chartBox("Billed size of " + bucket.bucket);
+    var box = chartBox();
     var left = 52;
     var right = 76;
     var height = 110;
@@ -1826,7 +1827,9 @@
     var lo = points[0].gb;
     var hi = points[0].gb;
     points.forEach(function (p) { if (p.gb < lo) { lo = p.gb; } if (p.gb > hi) { hi = p.gb; } });
-    var pad = hi === lo ? Math.max(1, hi * 0.05) : (hi - lo) * 0.1;
+    // A flat line sits mid-axis at its own scale, so a bucket of a few megabytes is not
+    // pinned to the floor of an axis a gigabyte tall.
+    var pad = hi !== lo ? (hi - lo) * 0.1 : hi > 0 ? hi * 0.1 : 1;
     var ticks = niceTicks(Math.max(0, lo - pad), hi + pad, 3);
     var bottom = ticks[0];
     var top = ticks[ticks.length - 1];
@@ -1835,8 +1838,8 @@
       86400000);
     function x(p) { return left + (Date.parse(p.day + "T00:00:00Z") - first) / 86400000 / span * plot; }
     function y(gb) { return height - (gb - bottom) / (top - bottom) * height; }
-    var chart = svg("svg", {width: width, height: height + axis,
-      viewBox: "0 0 " + width + " " + (height + axis), role: "img"});
+    var chart = chartSvg(width, height + axis, "Billed size of " + bucket.bucket + ", " +
+      points[0].day + " to " + points[points.length - 1].day + ".");
     ticks.forEach(function (tick) {
       chart.appendChild(svg("line", {x1: left, x2: left + plot, y1: y(tick), y2: y(tick)},
         "grid"));
@@ -1871,6 +1874,24 @@
     node.appendChild(el("span", label));
     node.appendChild(el("strong", value));
     return node;
+  }
+
+  // The projection leads with usage, which is what the lake costs. The report's month_end
+  // adds the credits and other lines to date unscaled, while usage is scaled to the whole
+  // month, so on a month whose credits accrue daily against usage it overstates the net.
+  // It is given as it stands and says so.
+  function projectionText(projection, currency) {
+    var usageEnd = projection.usage_month_end;
+    if (usageEnd === null || usageEnd === undefined) {
+      return "Projected month end: " + money(projection.month_end, currency) +
+        ". An estimate: usage through " + projection.through + " scaled to the whole " +
+        "month, plus tax, fees, credits and other lines as they stand.";
+    }
+    return "Projected usage by month end: " + money(usageEnd, currency) + ". An estimate: " +
+      "usage through " + projection.through + " scaled to the whole month. With the " +
+      "credits, tax, fees and other lines to date added unscaled, " +
+      money(projection.other, currency) + ", it is " + money(projection.month_end, currency) +
+      ". Credits that keep pace with usage leave the month's real net lower than that.";
   }
 
   function serviceTable(current, currency) {
@@ -1910,12 +1931,7 @@
     box.appendChild(serviceTable(current, cost.currency));
     var projection = current.projection || {};
     if (projection.status === "estimate") {
-      var usageEnd = projection.usage_month_end;
-      box.appendChild(el("p", "Projected month end: " +
-        money(projection.month_end, cost.currency) + (usageEnd === null ||
-        usageEnd === undefined ? "" : ", from " + money(usageEnd, cost.currency) +
-        " of usage") + ". An estimate: usage through " + projection.through +
-        " scaled to the whole month, plus tax, fees, credits and other lines as they stand."));
+      box.appendChild(el("p", projectionText(projection, cost.currency)));
     } else {
       box.appendChild(el("p", "Too early to project the month: no complete day in " +
         current.period + " yet.", "muted"));
@@ -1951,11 +1967,8 @@
 
   function trendTable(cost) {
     var currency = cost.currency;
-    var series = cost.trend_series || [];
-    var label = {};
-    series.forEach(function (one) { label[one.key] = one.label; });
     if (!cost.trend_split) {
-      return tableToggle("trend", ["Day", "Net", "By service"], cost.trend.map(function (day) {
+      return figureTable(["Day", "Net", "By service"], cost.trend.map(function (day) {
         return [day.day, day.total === null ? "no figure yet" : money(day.total, currency),
           Object.keys(day.by_service).map(function (name) {
             return name + " " + money(day.by_service[name], currency);
@@ -1982,12 +1995,20 @@
     }
     byId("cost-trend-note").textContent = cost.trend[0].day + " to " +
       cost.trend[cost.trend.length - 1].day;
-    if (cost.trend_split_text) {
-      box.appendChild(el("p", cost.trend_split_text, "note"));
+    // A window with a report written before the split draws its net as a table, without a
+    // chart. On an account whose credits offset every dollar a chart of the net is empty,
+    // which is the failure the split exists to end.
+    if (!cost.trend_split) {
+      if (cost.trend_split_text) {
+        box.appendChild(el("p", cost.trend_split_text, "note"));
+      }
+      box.appendChild(trendTable(cost));
+      return;
     }
-    if (cost.trend_split) {
-      box.appendChild(legend(cost.trend_series, true));
+    if (cost.trend_offset_text) {
+      box.appendChild(el("p", cost.trend_offset_text, "muted"));
     }
+    box.appendChild(legend(cost.trend_series, true));
     box.appendChild(trendChart(cost, chartWidth(box)));
     box.appendChild(trendTable(cost));
   }
@@ -2061,12 +2082,14 @@
     costS3(cost);
   }
 
-  // A resize redraws the charts at the new width. A phone fires one whenever its address
-  // bar shows or hides, so a resize that leaves the width alone draws nothing. The redraw
-  // runs outside the refresh's promise chain, so it catches its own error the way that
-  // chain does.
+  // A change in the panel's width redraws the charts at the new one. The panel's own size
+  // is watched where the browser can, because a scrollbar that appears once History fills
+  // the page narrows the panel and fires no window resize. A phone fires a resize whenever
+  // its address bar shows or hides, so a change that leaves the width alone draws nothing.
+  // The redraw runs outside the refresh's promise chain, so it catches its own error the
+  // way that chain does.
   var resizeTimer = null;
-  window.addEventListener("resize", function () {
+  function costResized() {
     if (resizeTimer !== null) { clearTimeout(resizeTimer); }
     resizeTimer = setTimeout(function () {
       resizeTimer = null;
@@ -2077,7 +2100,12 @@
         costFailed(err);
       }
     }, 150);
-  });
+  }
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(costResized).observe(byId("cost-panel"));
+  } else {
+    window.addEventListener("resize", costResized);
+  }
 
   // The Cost section saying its own load failed, on its own chain like History's and
   // Lake's, so the panels above it stay live.
