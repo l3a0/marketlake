@@ -2943,6 +2943,39 @@ _S3_PREFIX_GROUPS = (
 # A region prefix on a usage type, such as ``USE2-``. ``us-east-1`` carries none.
 _REGION_PREFIX = re.compile(r"^[A-Z]{2,4}[0-9]?-(?=[A-Z])")
 
+# The Cost panel's chart series, each with a fixed color slot, so a color follows its
+# service from night to night rather than its rank (#921). The first three are the product
+# codes the hosted lake's own resources bill under: the VM and its volumes, the bucket, and
+# the VM's public address. Every other product's usage folds into ``other_services``, whose
+# tooltip and table rows still name each product. A product added here lands at the next
+# deploy with nothing lost, since the report keeps raw product codes, as ``_S3_LABELS`` does.
+_USAGE_SERIES: tuple[tuple[str, str], ...] = (
+    ("AmazonEC2", "EC2, the VM and its volumes"),
+    ("AmazonS3", "S3"),
+    ("AmazonVPC", "VPC, the VM's public address"),
+)
+OTHER_SERVICES = "other_services"
+# The non-usage series. ``Credit`` is the line item type a promotional credit carries, and
+# ``other_lines`` is every other line that is not usage, such as tax and fees.
+CREDITS = "credits"
+OTHER_LINES = "other_lines"
+CREDIT_LINE_TYPE = "Credit"
+COST_SERIES: tuple[dict[str, object], ...] = (
+    *(
+        {"key": key, "label": label, "slot": slot, "kind": "usage"}
+        for slot, (key, label) in enumerate(_USAGE_SERIES, start=1)
+    ),
+    {"key": OTHER_SERVICES, "label": "Other services", "slot": 4, "kind": "usage"},
+    {"key": OTHER_LINES, "label": "Tax, fees and other lines", "slot": 5, "kind": "other"},
+    {"key": CREDITS, "label": "Credits", "slot": 6, "kind": "credit"},
+)
+_USAGE_KEYS = frozenset(key for key, _ in _USAGE_SERIES)
+
+
+def usage_series_of(product: str) -> str:
+    """The chart series a product code's usage draws in: its own, or ``other_services``."""
+    return product if product in _USAGE_KEYS else OTHER_SERVICES
+
 
 def classify_s3_usage(usage_type: str) -> tuple[str, str]:
     """An S3 usage type's group and the label the panel shows for it.
@@ -3173,20 +3206,84 @@ def _services(current: Mapping[str, Any]) -> list[dict[str, object]]:
     return sorted(rows, key=lambda row: (-row["total"], row["product"]))
 
 
-def _daily_totals(block: Mapping[str, Any]) -> dict[date, tuple[float, dict[str, float]]]:
-    """A block's daily series as each day's total and its products."""
-    totals: dict[date, tuple[float, dict[str, float]]] = {}
+def _cost_numbers(value: object) -> dict[str, float]:
+    """A mapping of names to finite numbers from a cost file, anything else dropped."""
+    return {
+        str(name): number
+        for name, item in _cost_mapping(value).items()
+        if (number := _cost_number(item)) is not None
+    }
+
+
+@dataclass(frozen=True)
+class _CostDay:
+    """One day of one block's daily series. ``usage`` is ``None`` when the block has no split."""
+
+    by_service: dict[str, float]
+    usage: dict[str, float] | None
+    other: dict[str, float] | None
+
+
+def _daily_series(block: Mapping[str, Any]) -> dict[date, _CostDay]:
+    """A block's daily series by day: the net per product, and the split when it carries one.
+
+    A block written before #921 has no ``daily_usage``, and then every day's split is
+    ``None``, which is the old report's absence rather than a day with no usage. A block that
+    has the split and lacks a day in one half of it had no line of that kind that day.
+    """
+    split = isinstance(block.get("daily_usage"), Mapping) and isinstance(
+        block.get("daily_other"), Mapping
+    )
+    usage_days = _cost_mapping(block.get("daily_usage"))
+    other_days = _cost_mapping(block.get("daily_other"))
+    days: dict[date, _CostDay] = {}
     for key, products in _cost_mapping(block.get("daily")).items():
         day = _cost_day(key)
         if day is None:
             continue
-        by_product = {
-            str(product): number
-            for product, value in _cost_mapping(products).items()
-            if (number := _cost_number(value)) is not None
-        }
-        totals[day] = (_rounded6(sum(by_product.values())), by_product)
-    return totals
+        days[day] = _CostDay(
+            by_service=_cost_numbers(products),
+            usage=_cost_numbers(usage_days.get(key)) if split else None,
+            other=_cost_numbers(other_days.get(key)) if split else None,
+        )
+    return days
+
+
+def _trend_row(day: date, found: _CostDay | None, partial: bool) -> dict[str, object]:
+    """One day of the trend. Every split field is ``None`` on a day without the split."""
+    row: dict[str, object] = {
+        "day": day.isoformat(),
+        "partial": partial,
+        "total": None,
+        "by_service": {},
+        "usage": None,
+        "usage_by_series": None,
+        "usage_by_service": None,
+        "credits": None,
+        "other_lines": None,
+        "other_by_type": None,
+    }
+    if found is None:
+        return row
+    row["total"] = _rounded6(sum(found.by_service.values()))
+    row["by_service"] = {key: _rounded6(value) for key, value in sorted(found.by_service.items())}
+    if found.usage is None or found.other is None:
+        return row
+    by_series: dict[str, float] = {}
+    for product, value in found.usage.items():
+        series = usage_series_of(product)
+        by_series[series] = by_series.get(series, 0.0) + value
+    credits = sum(value for name, value in found.other.items() if name == CREDIT_LINE_TYPE)
+    other = sum(value for name, value in found.other.items() if name != CREDIT_LINE_TYPE)
+    row.update(
+        usage=_rounded6(sum(found.usage.values())),
+        usage_by_series={key: _rounded6(value) for key, value in sorted(by_series.items())},
+        usage_by_service={key: _rounded6(value) for key, value in sorted(found.usage.items())},
+        credits=_rounded6(credits),
+        other_lines=_rounded6(other),
+        other_by_type={key: _rounded6(value) for key, value in sorted(found.other.items())},
+    )
+    return row
 
 
 def _cost_trend(
@@ -3196,13 +3293,16 @@ def _cost_trend(
 
     The current period's series wins a day both carry, since it is the newer reading. A day
     neither carries has no total, which is the export's lag rather than a day that cost zero.
+    The newest usage day is ``partial``, as the export's newest day always is. Only the
+    current period has one, since the closed month's last day is complete.
     """
-    days: dict[date, tuple[float, dict[str, float]]] = {}
+    days: dict[date, _CostDay] = {}
     if previous is not None:
-        days.update(_daily_totals(previous))
+        days.update(_daily_series(previous))
     if current is not None:
-        days.update(_daily_totals(current))
-    end = _cost_day(current.get("newest_day")) if current is not None else None
+        days.update(_daily_series(current))
+    newest = _cost_day(current.get("newest_day")) if current is not None else None
+    end = newest
     if end is None and days:
         end = max(days)
     if end is None:
@@ -3210,15 +3310,84 @@ def _cost_trend(
     trend = []
     for offset in range(COST_TREND_DAYS - 1, -1, -1):
         day = end - timedelta(days=offset)
-        total, products = days.get(day, (None, {}))
-        trend.append(
+        trend.append(_trend_row(day, days.get(day), day == newest))
+    return trend
+
+
+def trend_split(trend: Sequence[Mapping[str, object]]) -> bool:
+    """Whether every trend day with a figure carries the usage split, and one day does."""
+    figured = [row for row in trend if row["total"] is not None]
+    return bool(figured) and all(row["usage"] is not None for row in figured)
+
+
+def trend_series(trend: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    """The chart series with a nonzero figure somewhere in the trend, in slot order."""
+    present: set[str] = set()
+    for row in trend:
+        for key, value in _cost_mapping(row.get("usage_by_series")).items():
+            if value:
+                present.add(key)
+        if row.get("credits"):
+            present.add(CREDITS)
+        if row.get("other_lines"):
+            present.add(OTHER_LINES)
+    return [dict(series) for series in COST_SERIES if series["key"] in present]
+
+
+# The sentence the trend draws when a report written before #921 answers a day in it. It
+# names no end, for the reason ``query_cost``'s docstring gives under its fourth sentence.
+TREND_SPLIT_TEXT = (
+    "A cost report written before the daily usage split answers a day in this window, so "
+    "the chart shows each day's net, credits included, rather than usage and credits apart."
+)
+
+
+def _month_lines(current: Mapping[str, Any]) -> dict[str, float] | None:
+    """The month to date as usage, credits, other lines and net, or ``None`` before #921."""
+    raw = _cost_mapping(current.get("mtd")).get("line_type")
+    if not isinstance(raw, Mapping):
+        return None
+    lines = _cost_numbers(raw)
+    usage = sum(value for name, value in lines.items() if name in aws_cost.USAGE_LINE_TYPES)
+    credits = sum(value for name, value in lines.items() if name == CREDIT_LINE_TYPE)
+    other = sum(
+        value
+        for name, value in lines.items()
+        if name not in aws_cost.USAGE_LINE_TYPES and name != CREDIT_LINE_TYPE
+    )
+    return {
+        "usage": _rounded6(usage),
+        "credits": _rounded6(credits),
+        "other": _rounded6(other),
+        "net": _rounded6(usage + credits + other),
+    }
+
+
+def _usage_by_series(services: Sequence[Mapping[str, Any]]) -> list[dict[str, object]]:
+    """Month-to-date usage per chart series, in slot order, each naming its products."""
+    found: dict[str, list[Mapping[str, Any]]] = {}
+    for row in services:
+        product = str(row["product"])
+        found.setdefault(usage_series_of(product), []).append(row)
+    out = []
+    for series in COST_SERIES:
+        rows = found.get(str(series["key"]))
+        if not rows:
+            continue
+        usage = sum(float(row["usage"]) for row in rows)
+        if not usage:
+            continue
+        out.append(
             {
-                "day": day.isoformat(),
-                "total": total,
-                "by_service": {key: _rounded6(value) for key, value in sorted(products.items())},
+                **series,
+                "usage": _rounded6(usage),
+                "products": [
+                    {"product": row["product"], "usage": row["usage"]}
+                    for row in sorted(rows, key=lambda row: (-float(row["usage"]), row["product"]))
+                ],
             }
         )
-    return trend
+    return out
 
 
 def _storage_by_day(block: Mapping[str, Any], bucket: str) -> dict[date, dict[str, float]]:
@@ -3277,6 +3446,13 @@ def _s3_buckets(
                 }
                 for usage_type, amount in sorted(amounts.items())
             ]
+        size_series = [
+            {"day": day.isoformat(), "gb": _rounded6(billed_size(sum(series[day].values()), day))}
+            for day in sorted(series)
+            if complete is not None
+            and day <= complete
+            and (trend_start is None or day >= trend_start)
+        ]
         growth = None
         if size is not None and complete is not None:
             earlier = sorted(
@@ -3303,6 +3479,7 @@ def _s3_buckets(
                 "size_gb": size,
                 "classes": classes,
                 "growth": growth,
+                "size_series": size_series,
             }
         )
     return buckets
@@ -3315,10 +3492,14 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     gives, and the connection is untouched here. The files are ``lake.aws_cost``'s, under
     ``reports/aws_cost/date=D/``, and the raw export never enters the lake.
 
-    **Every decision the panel shows is made here**, where a unit test reaches it, because
-    nothing in this repository runs the page's JavaScript. The page draws only the fields
-    this returns: which file answers what, the S3 classification, the billed sizes, the trend
-    and whether the newest file is stale.
+    **Every decision the panel shows is made here**, where a unit test reaches it. The page
+    draws only the fields this returns and computes only where its marks go:
+    ``tests/component/test_status_page_cost.py`` runs it against this payload. The decisions
+    are which file answers what, the S3 classification, the billed sizes, the trend, whether
+    the newest file is stale, and, since #921, the chart series. Those are each series' slot,
+    fixed by product code in ``COST_SERIES``, the fold of every other product into
+    ``other_services``, which trend day is ``partial``, and ``trend_split``, whether every
+    figured day in the window carries the daily usage split.
 
     ``condition`` names a whole-directory state: ``no_directory`` when no cost read has filed
     a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
@@ -3343,7 +3524,7 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     It rides on every payload, the backstop's included, rather than only on ``no_directory``,
     because it describes the host rather than the directory.
 
-    The panel's three sentences that name a cause are written here, so a test asserts the
+    The panel's four sentences that name a cause are written here, so a test asserts the
     exact text, and the page draws each one as given, the way it draws an S3 row's
     ``label``. Each is ``None`` where it does not apply.
 
@@ -3354,6 +3535,9 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
        file's ``previous_error`` when one is recorded. Otherwise it names both causes that leave
        no error, the export's first month and a closed month whose delivery has not finished,
        without claiming which holds.
+    4. ``trend_split_text`` says a report written before the daily usage split answers a day
+       in the trend's window, so the chart draws each day's net. It names no end, because
+       ``_cost_scan`` can take the current and the closed month from different files.
 
     **Nothing here may raise**, for the reason ``query_history`` gives. Every read is
     contained where it happens and reported as a value, and the catch below is the backstop.
@@ -3433,6 +3617,9 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
         "current": None,
         "previous": None,
         "trend": [],
+        "trend_split": False,
+        "trend_split_text": None,
+        "trend_series": [],
         "s3": [],
         "no_report_text": None,
         "stale_text": None,
@@ -3489,6 +3676,7 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
     payload["no_current_delivery"] = current is None
     payload["currency"] = _cost_text((current_entry or previous_entry or newest).get("currency"))
     if current is not None and current_entry is not None:
+        services = _services(current)
         payload["current"] = {
             "from_day": _cost_text(current_entry.get("day")),
             "from_at": _cost_text(current_entry.get("at")),
@@ -3497,7 +3685,9 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
             "newest_day": _cost_text(current.get("newest_day")),
             "complete_through": _cost_text(current.get("complete_through")),
             "total": _cost_number(current.get("total")),
-            "services": _services(current),
+            "services": services,
+            "lines": _month_lines(current),
+            "usage_by_series": _usage_by_series(services),
             "projection": _figure(current.get("projection")),
             "cost_per_session": _figure(current.get("cost_per_session")),
         }
@@ -3513,6 +3703,10 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
         payload["previous_text"] = cost_previous_text(previous_error)
     trend = _cost_trend(current, previous)
     payload["trend"] = trend
+    payload["trend_split"] = trend_split(trend)
+    payload["trend_series"] = trend_series(trend)
+    if trend and not payload["trend_split"]:
+        payload["trend_split_text"] = TREND_SPLIT_TEXT
     if current is not None:
         trend_start = _cost_day(trend[0]["day"]) if trend else None
         payload["s3"] = _s3_buckets(current, previous, trend_start)

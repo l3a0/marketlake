@@ -238,6 +238,12 @@ ICON_LINK = re.compile(
     rb'^<link rel="icon" href="/favicon\.ico" sizes="(?P<sizes>[0-9x ]*)">\n', re.MULTILINE
 )
 
+# The one other line allowed an absolute URL: the SVG namespace the Cost panel's charts pass
+# to ``createElementNS`` (#921). A namespace is a name, and nothing fetches it. The pattern
+# is the whole line, so a second URL on it, or the constant pointed anywhere else, leaves it
+# unmatched for the marker sweep to catch.
+SVG_NAMESPACE = re.compile(rb'^  var SVG_NS = "http://www\.w3\.org/2000/svg";\n', re.MULTILINE)
+
 
 def test_the_status_page_ships_in_the_package_and_is_self_contained():
     page = dashboard.load_status_page()
@@ -249,10 +255,12 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
     # The page declares exactly one resource: its own tab icon, on its own origin.
     rest, found = ICON_LINK.subn(b"", page)
     assert found == 1, "the page declares the tab icon exactly once"
+    rest, found = SVG_NAMESPACE.subn(b"", rest)
+    assert found == 1, "the page names the SVG namespace exactly once"
     # No external resource: the page must work offline and inside the same-origin policy.
-    # Every marker still runs, over everything except that one matched line. Removing the
-    # line rather than relaxing the markers is what keeps this guard from going slack: a
-    # second ``<link``, an ``<img``, or any absolute URL still fails.
+    # Every marker still runs, over everything except those two matched lines. Removing the
+    # lines rather than relaxing the markers is what keeps this guard from going slack: a
+    # second ``<link``, an ``<img``, or any other absolute URL still fails.
     for marker in (b"http://", b"https://", b"<link", b"<img", b"src="):
         assert marker not in rest
 
@@ -260,8 +268,9 @@ def test_the_status_page_ships_in_the_package_and_is_self_contained():
 def test_an_error_drawing_the_cost_panel_is_caught_on_its_own_chain():
     """A throw inside ``renderCost`` must land in ``costFailed``. Passed as ``then``'s second
     argument, ``costFailed`` catches only a failed fetch, so a render error would reject the
-    ``Promise.all`` that resets ``inFlight``, and every panel would stop refreshing. Nothing
-    in the repository runs the page's JavaScript, so the chain is read off the source."""
+    ``Promise.all`` that resets ``inFlight``, and every panel would stop refreshing. The chain
+    is read off the source, because ``tests/component/test_status_page_cost.py`` runs the
+    page only with a fetch that never rejects ``/api/cost``."""
     page = dashboard.load_status_page().decode()
     statements = re.findall(r"var cost = ([^;]*);", page)
     assert statements == ['getJSON("/api/cost").then(renderCost).catch(costFailed)']

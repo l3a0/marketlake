@@ -282,6 +282,47 @@ def test_the_projection_and_cost_per_session_are_pass_sevens_worked_examples(
     assert current["total"] == pytest.approx(13.65)
 
 
+def test_the_daily_series_split_usage_from_every_other_line(root: Path):
+    """``daily_usage`` and ``daily_other`` keep apart what ``daily`` nets (#921).
+
+    The 1st carries $0.70 of usage beside $1.00 of tax and a $3.00 fee, and the 3rd carries
+    $0.70 of usage beside a $0.50 credit, so the net alone would hide all four.
+    """
+    s3 = FakeS3(BUCKET, versioning=None)
+    deliver(s3, "2026-09", parquet(september()))
+    deliver(s3, "2026-10", parquet(october()))
+
+    entry = read(s3, root)
+
+    current = entry["current"]
+    assert current["daily_usage"]["2026-10-01"] == {"AmazonEC2": pytest.approx(0.70)}
+    assert current["daily_other"]["2026-10-01"] == {
+        "Tax": pytest.approx(1.00),
+        "Fee": pytest.approx(3.00),
+    }
+    assert current["daily_usage"]["2026-10-03"] == {"AmazonEC2": pytest.approx(0.70)}
+    assert current["daily_other"]["2026-10-03"] == {"Credit": pytest.approx(-0.50)}
+    # A day with only usage has no other line at all, rather than a zero.
+    assert "2026-10-02" not in current["daily_other"]
+    assert current["mtd"]["line_type"] == {
+        "Usage": pytest.approx(10.15),
+        "Tax": pytest.approx(1.00),
+        "Fee": pytest.approx(3.00),
+        "Credit": pytest.approx(-0.50),
+    }
+    previous = entry["previous"]
+    assert previous["daily_usage"]["2026-09-30"] == {"AmazonEC2": pytest.approx(0.60)}
+    assert previous["daily_other"] == {"2026-09-30": {"Tax": pytest.approx(0.25)}}
+    # For every day of both blocks, usage plus the other lines is the net ``daily`` gives.
+    for block in (current, previous):
+        assert set(block["daily_usage"]) | set(block["daily_other"]) == set(block["daily"])
+        for day, products in block["daily"].items():
+            split = sum(block["daily_usage"].get(day, {}).values()) + sum(
+                block["daily_other"].get(day, {}).values()
+            )
+            assert split == pytest.approx(sum(products.values())), day
+
+
 def test_a_usage_start_that_is_not_a_timestamp_fails_the_read(root: Path):
     s3 = FakeS3(BUCKET, versioning=None)
     deliver(s3, "2026-10", parquet(october(), start_type=pa.string()))
