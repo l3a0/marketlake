@@ -1350,3 +1350,108 @@ def test_growth_can_start_on_the_trends_first_day(root: Path):
     [bucket] = payload["s3"]
     assert bucket["growth"]["from"] == "2026-09-16"
     assert bucket["growth"]["days"] == 28
+
+
+# -- what the mutation lens on PR #922 found no test for -----------------------------------
+# Each test below fails under a mutant the earlier tests let through: where a mark lands,
+# how long a bar is, whether segments stack, and the edges of the query's new fields.
+
+
+def _delivered(root: Path, current: dict, **extra) -> None:
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current, **extra))
+
+
+def test_two_folded_products_add_into_other_services(root: Path):
+    current = split_october()
+    current["daily_usage"]["2026-10-14"]["AWSCostExplorer"] = 0.01
+    _delivered(root, current)
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert day["usage_by_series"]["other_services"] == pytest.approx(0.04)
+
+
+def test_usage_by_service_is_usage_not_net(root: Path):
+    _delivered(root, split_october())
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert day["usage_by_service"]["AmazonEC2"] == pytest.approx(0.2)
+
+
+def test_half_a_split_is_no_split(root: Path):
+    current = split_october()
+    del current["daily_other"]
+    _delivered(root, current)
+    payload = cost(root)
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] == dashboard.TREND_SPLIT_TEXT
+
+
+def test_no_offset_sentence_without_the_split(root: Path):
+    previous = september(daily={"2026-09-30": {"AmazonEC2": 0.0}})
+    current = split_october(
+        daily={"2026-10-14": {"AmazonEC2": 0.0}, "2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-14": {"AmazonEC2": 0.2}, "2026-10-15": {"AmazonEC2": 0.1}},
+        daily_other={"2026-10-14": {"Credit": -0.2}, "2026-10-15": {"Credit": -0.1}},
+    )
+    _delivered(root, current, previous=previous)
+    payload = cost(root)
+    assert payload["trend_split"] is False
+    assert payload["trend_offset_text"] is None
+
+
+def test_a_line_type_map_of_the_wrong_type_is_no_lines(root: Path):
+    current = split_october()
+    current["mtd"]["line_type"] = ["Usage"]
+    _delivered(root, current)
+    assert cost(root)["current"]["lines"] is None
+
+
+def test_a_block_without_days_in_month_does_not_raise(root: Path):
+    current = split_october(days_in_month=None)
+    _delivered(root, current)
+    payload = cost(root)
+    assert payload["current"] is not None
+    assert payload["current"]["projection"]["usage_month_end"] is None
+
+
+def test_folded_products_list_biggest_first_against_name_order(root: Path):
+    current = split_october()
+    current["mtd"] = {
+        **current["mtd"],
+        "service": {
+            "AmazonCloudWatch": {"usage": 0.5, "other": 0.0},
+            "AWSCostExplorer": {"usage": 0.3, "other": 0.0},
+        },
+    }
+    _delivered(root, current)
+    [row] = cost(root)["current"]["usage_by_series"]
+    assert [p["product"] for p in row["products"]] == ["AmazonCloudWatch", "AWSCostExplorer"]
+
+
+def test_the_size_series_starts_on_the_trends_first_day(root: Path):
+    previous = september(
+        storage_daily={
+            "example-lake": {"TimedStorage-ByteHrs": {"2026-09-15": 3.0, "2026-09-16": 3.0}}
+        }
+    )
+    current = split_october(
+        storage_daily={"example-lake": {"TimedStorage-ByteHrs": {"2026-10-14": 3.0}}}
+    )
+    _delivered(root, current, previous=previous)
+    payload = cost(root)
+    assert payload["trend"][0]["day"] == "2026-09-16"
+    [bucket] = payload["s3"]
+    assert [p["day"] for p in bucket["size_series"]] == ["2026-09-16", "2026-10-14"]
+
+
+def test_a_payload_with_no_directory_has_empty_trend_fields(root: Path):
+    payload = cost(root)
+    assert payload["condition"] == "no_directory"
+    assert payload["trend_split"] is False
+    assert payload["trend_series"] == []
+    assert payload["trend_after"] == []
+
+
+def test_net_by_service_is_sorted_and_rounded(root: Path):
+    _delivered(root, split_october())
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert list(day["by_service"]) == sorted(day["by_service"])
+    assert day["by_service"]["AmazonEC2"] == -0.16

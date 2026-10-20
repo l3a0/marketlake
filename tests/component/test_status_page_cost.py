@@ -751,3 +751,259 @@ def test_a_resize_that_keeps_the_width_draws_nothing_new(root: Path, tmp_path: P
 
     [chart] = find(sections["cost-trend"], "svg")
     assert chart["attrs"]["data-first-draw"] == "1"
+
+
+# -- what the mutation lens on PR #922 found no test for -----------------------------------
+# Each test below fails under a mutant the earlier tests let through: where a mark lands,
+# how long a bar is, whether segments stack, and the edges of the query's new fields.
+
+
+def _deliver(root: Path, current: dict, **extra) -> None:
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current, **extra))
+
+
+def _trend_chart(tmp_path: Path, payload: dict, width: int = 640) -> dict:
+    [chart] = find(run_page(tmp_path, payload, width=width)["cost-trend"], "svg")
+    return chart
+
+
+def _s3(root: Path, tmp_path: Path, days: dict) -> dict:
+    current = split_october(storage_daily={"example-lake": {"TimedStorage-ByteHrs": days}})
+    _deliver(root, current)
+    return run_page(tmp_path, cost(root))
+
+
+def test_the_tax_line_is_drawn(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    chart = _trend_chart(tmp_path, cost(root))
+    other = [n for n in segments(chart) if n["attrs"]["data-series"] == "other_lines"]
+    assert [float(n["attrs"]["data-value"]) for n in other] == [pytest.approx(0.02)]
+
+
+def test_trend_marks_stay_inside_the_plot_and_stack(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    chart = _trend_chart(tmp_path, cost(root))
+    for node in segments(chart):
+        top, bottom = path_top_bottom(node["attrs"]["d"])
+        assert top >= -1e-6 and bottom <= 180 + 1e-6, node
+    groups = [g for g in find(chart, "g") if segments(g)]
+    day14 = groups[0]
+    ups = [
+        path_top_bottom(n["attrs"]["d"])
+        for n in segments(day14)
+        if float(n["attrs"]["data-value"]) > 0
+    ]
+    downs = [
+        path_top_bottom(n["attrs"]["d"])
+        for n in segments(day14)
+        if float(n["attrs"]["data-value"]) < 0
+    ]
+    [line] = find(chart, "line", "baseline")
+    base = float(line["attrs"]["y1"])
+    # The 14th stacks $0.40 up (usage and tax) against a $0.38 credit down. Each stack
+    # loses one GAP of 2px at its far end, so both extents follow one dollar scale.
+    scale = (max(b for _, b in downs) - base + 2) / 0.38
+    assert base - min(t for t, _ in ups) == pytest.approx(0.40 * scale - 2, abs=0.5)
+    ups.sort()
+    for (_, b1), (t2, _) in zip(ups, ups[1:], strict=False):
+        assert b1 <= t2 + 1e-6
+
+
+def test_only_a_stacks_outermost_segment_is_rounded(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    chart = _trend_chart(tmp_path, cost(root))
+    groups = [g for g in find(chart, "g") if segments(g)]
+    day14 = segments(groups[0])
+    usage = [n for n in day14 if float(n["attrs"]["data-value"]) > 0]
+    assert all("q" not in n["attrs"]["d"] for n in usage[:-1])
+    assert re.match(r"M[-0-9.e]+,[-0-9.e]+v", usage[-1]["attrs"]["d"])
+    [credit] = [n for n in day14 if n["attrs"]["data-series"] == "credits"]
+    assert re.match(r"M[-0-9.e]+,[-0-9.e]+h", credit["attrs"]["d"]) and "q" in credit["attrs"]["d"]
+
+
+def test_a_segment_under_its_gap_is_one_pixel_tall(root: Path, tmp_path: Path):
+    current = split_october()
+    current["daily_usage"]["2026-10-15"]["AmazonS3"] = 0.005
+    _deliver(root, current)
+    chart = _trend_chart(tmp_path, cost(root))
+    [tiny] = [n for n in segments(chart) if float(n["attrs"]["data-value"]) == 0.005]
+    top, bottom = path_top_bottom(tiny["attrs"]["d"])
+    assert bottom - top == pytest.approx(1.0)
+
+
+def test_columns_are_never_thicker_than_24_pixels(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    chart = _trend_chart(tmp_path, cost(root), width=1068)
+    plain = [n for n in segments(chart) if "q" not in n["attrs"]["d"]]
+    assert plain
+    for node in plain:
+        width = float(re.search(r"h([-0-9.e]+)", node["attrs"]["d"]).group(1))
+        assert width <= 24
+
+
+def test_a_narrow_trend_has_two_day_labels(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    chart = _trend_chart(tmp_path, cost(root), width=343)
+    days = [text_of(n) for n in find(chart, "text", "axis") if "$" not in text_of(n)]
+    assert days == ["Sep 16", "Oct 15"]
+
+
+def test_axis_ticks_are_evenly_spaced_in_cents(root: Path, tmp_path: Path):
+    current = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.09}},
+        daily_usage={"2026-10-15": {"AmazonEC2": 0.09}},
+        daily_other={"2026-10-15": {}},
+    )
+    _deliver(root, current)
+    chart = _trend_chart(tmp_path, cost(root))
+    values = [
+        float(text_of(n).replace("$", "")) for n in find(chart, "text", "axis") if "$" in text_of(n)
+    ]
+    steps = {round(b - a, 4) for a, b in zip(values, values[1:], strict=False)}
+    assert len(steps) == 1, values
+
+
+def test_a_credit_that_rounds_to_zero_carries_no_sign(root: Path, tmp_path: Path):
+    current = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-15": {"AmazonS3": 0.004}},
+        daily_other={"2026-10-15": {"Credit": -0.004}},
+    )
+    _deliver(root, current)
+    trend = run_page(tmp_path, cost(root))["cost-trend"]
+    [rows] = tables(trend)
+    row = [r for r in rows if r[0].startswith("2026-10-15")][0]
+    assert row[2] == "$0.00"
+
+
+def test_a_currency_other_than_usd_is_named(root: Path, tmp_path: Path):
+    file(
+        root,
+        "2026-10-16",
+        {**entry("2026-10-16", "2026-10", "delivery", current=split_october()), "currency": "EUR"},
+    )
+    services = run_page(tmp_path, cost(root))["cost-services"]
+    assert "EUR 10.55" in text_of(services)
+
+
+@pytest.mark.parametrize(("width", "drawn"), [(200, "260"), (0, "640")])
+def test_a_chart_width_has_a_floor_and_a_fallback(
+    root: Path, tmp_path: Path, width: int, drawn: str
+):
+    _deliver(root, split_october())
+    sections = run_page(tmp_path, cost(root), width=width)
+    [chart] = find(sections["cost-trend"], "svg")
+    assert chart["attrs"]["width"] == drawn
+
+
+def test_bars_fit_the_chart_and_a_tiny_bar_still_shows(root: Path, tmp_path: Path):
+    current = split_october()
+    current["mtd"]["service"]["AmazonVPC"] = {"usage": 0.001, "other": 0.0}
+    _deliver(root, current)
+    services = run_page(tmp_path, cost(root))["cost-services"]
+    [chart] = find(services, "svg")
+    for bar in find(chart, "path"):
+        m = re.match(
+            r"M([-0-9.e]+),[-0-9.e]+h([-0-9.e]+)q([-0-9.e]+),0 ([-0-9.e]+),", bar["attrs"]["d"]
+        )
+        assert m, bar["attrs"]["d"]
+        width = float(m.group(2)) + float(m.group(4))
+        assert width >= 1 - 1e-9
+        assert float(m.group(1)) + width <= 640 - 64 + 1e-6
+
+
+def test_a_bars_tooltip_names_each_products_amount(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    tips = run_page(tmp_path, cost(root))["tips"]["cost-services"]
+    assert "AmazonEC2 $10.15" in tips[0]["lines"]
+
+
+def test_a_days_tooltip_lists_only_its_own_series(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    tips = run_page(tmp_path, cost(root))["tips"]["cost-trend"]
+    assert tips[-1]["lines"] == [
+        "Oct 15, a partial day",
+        "Usage $0.10",
+        "EC2, the VM and its volumes $0.10",
+        "Credits −$0.10",
+        "Net $0.00",
+    ]
+
+
+def test_the_tooltip_is_hidden_from_assistive_technology(root: Path, tmp_path: Path):
+    _deliver(root, split_october())
+    trend = run_page(tmp_path, cost(root))["cost-trend"]
+    [tip] = find(trend, "div", "chart-tip")
+    assert tip["attrs"]["aria-hidden"] == "true"
+
+
+def test_the_size_line_has_an_end_dot_and_a_tooltip_per_day(root: Path, tmp_path: Path):
+    sections = _s3(root, tmp_path, {"2026-10-01": 90 / 31, "2026-10-14": 93.1 / 31})
+    [chart] = find(sections["cost-s3"], "svg")
+    assert len(find(chart, "circle")) == 1
+    assert sections["tips"]["cost-s3"][-1]["lines"] == ["93.10 GB", "Oct 14"]
+
+
+def test_a_flat_tiny_bucket_sits_mid_axis(root: Path, tmp_path: Path):
+    sections = _s3(root, tmp_path, {"2026-10-13": 0.0036 / 31, "2026-10-14": 0.0036 / 31})
+    [chart] = find(sections["cost-s3"], "svg")
+    [line] = find(chart, "path", "line-s1")
+    ys = [float(y) for y in re.findall(r",([-0-9.]+)", line["attrs"]["d"])]
+    assert all(10 < y < 100 for y in ys), ys
+
+
+def test_the_size_axis_never_goes_negative(root: Path, tmp_path: Path):
+    sections = _s3(root, tmp_path, {"2026-10-13": 0.5 / 31, "2026-10-14": 10.0 / 31})
+    [chart] = find(sections["cost-s3"], "svg")
+    labels = [text_of(n) for n in find(chart, "text", "axis") if text_of(n).endswith("GB")]
+    assert labels and not [t for t in labels if t.startswith("-")], labels
+
+
+def test_the_size_line_spaces_points_by_date(root: Path, tmp_path: Path):
+    sections = _s3(
+        root, tmp_path, {"2026-10-01": 3.0 / 31, "2026-10-02": 3.0 / 31, "2026-10-14": 3.1 / 31}
+    )
+    [chart] = find(sections["cost-s3"], "svg")
+    [line] = find(chart, "path", "line-s1")
+    xs = [float(x) for x in re.findall(r"[ML]([-0-9.]+),", line["attrs"]["d"])]
+    assert (xs[1] - xs[0]) / (xs[2] - xs[0]) == pytest.approx(1 / 13, abs=0.01)
+
+
+def test_no_other_lines_figure_when_there_are_none(root: Path, tmp_path: Path):
+    current = split_october()
+    current["mtd"]["line_type"] = {"Usage": 10.55, "Credit": -10.55}
+    _deliver(root, current)
+    services = run_page(tmp_path, cost(root))["cost-services"]
+    [figures] = find(services, "div", "figures")
+    assert [text_of(item) for item in figures["children"]] == [
+        "Usage$10.55",
+        "Credits−$10.55",
+        "Net$0.00",
+    ]
+
+
+def test_a_month_with_no_usage_says_so_and_draws_no_bars(root: Path, tmp_path: Path):
+    current = split_october()
+    current["mtd"] = {
+        **current["mtd"],
+        "service": {"AmazonEC2": {"usage": 0.0, "other": 3.0}},
+        "line_type": {"Tax": 3.0},
+    }
+    _deliver(root, current)
+    services = run_page(tmp_path, cost(root))["cost-services"]
+    assert find(services, "svg") == []
+    assert "No usage this month yet." in text_of(services)
+
+
+def test_a_month_with_no_usage_day_claims_no_partial_day(root: Path, tmp_path: Path):
+    current = split_october(newest_day=None, complete_through=None)
+    _deliver(root, current)
+    services = run_page(tmp_path, cost(root))["cost-services"]
+    assert "The newest day is partial." not in text_of(services)
+
+
+def test_a_resize_redraw_catches_its_own_error():
+    page = dashboard.load_status_page().decode()
+    assert re.search(
+        r"try \{\s*renderCost\(lastCost\);\s*\} catch \(err\) \{\s*costFailed\(err\);\s*\}", page
+    )
