@@ -349,6 +349,21 @@ def test_a_chart_is_one_named_image_and_its_marks_take_no_focus(root: Path, tmp_
         assert not [n for n in walk(chart) if "tabindex" in n.get("attrs", {})]
 
 
+def test_a_line_dated_after_the_window_is_named_beside_the_chart(root: Path, tmp_path: Path):
+    """Tax can be dated the period's last day while usage runs only to the 15th, so the
+    window would leave it out without a word, while the month to date counts it."""
+    current = split_october()
+    current["daily"]["2026-10-31"] = {"AmazonEC2": 0.25}
+    current["daily_other"]["2026-10-31"] = {"Tax": 0.25}
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    trend = run_page(tmp_path, cost(root))["cost-trend"]
+
+    assert (
+        "Dated after 2026-10-15, the export's newest usage day, and not drawn: 2026-10-31 $0.25."
+    ) in text_of(trend)
+
+
 def test_the_partial_day_is_drawn_lighter(root: Path, tmp_path: Path):
     file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
 

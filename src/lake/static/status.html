@@ -1999,6 +1999,15 @@
     }
     byId("cost-trend-note").textContent = cost.trend[0].day + " to " +
       cost.trend[cost.trend.length - 1].day;
+    // A line dated after the window's last day, such as tax dated the month's last day,
+    // is named here, so the month to date above never disagrees with the window unsaid.
+    if (cost.trend_after && cost.trend_after.length) {
+      box.appendChild(el("p", "Dated after " + cost.trend[cost.trend.length - 1].day +
+        ", the export's newest usage day, and not drawn: " +
+        cost.trend_after.map(function (day) {
+          return day.day + " " + money(day.total, cost.currency);
+        }).join(", ") + ".", "muted"));
+    }
     // A window with a report written before the split draws its net as a table, without a
     // chart. On an account whose credits offset every dollar a chart of the net is empty,
     // which is the failure the split exists to end.

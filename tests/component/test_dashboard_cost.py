@@ -808,6 +808,102 @@ def test_a_current_month_with_no_usage_day_leaves_the_closed_months_day_partial(
     assert trend[-1]["day"] == ("2026-11-01" if november["daily"] else "2026-10-30")
 
 
+# The cases of #921's pass 6: every shape the current block and the closed month's block can
+# take, crossed, so the window's end and its partial day are covered as a class rather than
+# one case at a time. November's newest usage day is the 3rd, and a tax line is dated its
+# last day, the 30th, as the writer says a non-usage line can be.
+CURRENT_SHAPES = {
+    "no current block": None,
+    "usage through the 3rd": {
+        "newest_day": "2026-11-03",
+        "daily": {
+            "2026-11-02": {"AmazonEC2": 0.0},
+            "2026-11-03": {"AmazonEC2": 0.0},
+            "2026-11-30": {"AmazonEC2": 0.25},
+        },
+        "daily_usage": {"2026-11-02": {"AmazonEC2": 0.2}, "2026-11-03": {"AmazonEC2": 0.1}},
+        "daily_other": {
+            "2026-11-02": {"Credit": -0.2},
+            "2026-11-03": {"Credit": -0.1},
+            "2026-11-30": {"Tax": 0.25},
+        },
+    },
+    "empty files": {"newest_day": None, "daily": {}, "daily_usage": {}, "daily_other": {}},
+    "a fee alone": {
+        "newest_day": None,
+        "daily": {"2026-11-01": {"AmazonEC2": 29.0}},
+        "daily_usage": {},
+        "daily_other": {"2026-11-01": {"Fee": 29.0}},
+    },
+}
+PREVIOUS_SHAPES = {
+    "no closed month": None,
+    "written before the split": {
+        "daily": {"2026-10-30": {"AmazonEC2": 0.2}, "2026-10-31": {"AmazonEC2": 0.25}},
+    },
+    "split": {
+        "daily": {"2026-10-30": {"AmazonEC2": 0.0}, "2026-10-31": {"AmazonEC2": 0.25}},
+        "daily_usage": {"2026-10-30": {"AmazonEC2": 0.2}},
+        "daily_other": {"2026-10-30": {"Credit": -0.2}, "2026-10-31": {"Tax": 0.25}},
+    },
+    "split with no usage": {
+        "daily": {"2026-10-31": {"AmazonEC2": 0.25}},
+        "daily_usage": {},
+        "daily_other": {"2026-10-31": {"Tax": 0.25}},
+    },
+}
+
+
+@pytest.mark.parametrize("previous_shape", list(PREVIOUS_SHAPES))
+@pytest.mark.parametrize("current_shape", list(CURRENT_SHAPES))
+def test_every_figured_day_is_in_the_window_or_named_and_one_day_at_most_is_partial(
+    root: Path, current_shape: str, previous_shape: str
+):
+    changes = CURRENT_SHAPES[current_shape]
+    current = None
+    if changes is not None:
+        current = october(period="2026-11", complete_through=None, **changes)
+    closed = PREVIOUS_SHAPES[previous_shape]
+    previous = september(period="2026-10", **closed) if closed is not None else None
+    extra = {}
+    if current is not None:
+        extra["current"] = current
+    if previous is not None:
+        extra["previous"] = previous
+    state = "delivery" if current is not None else "no_delivery"
+    file(root, "2026-11-04", entry("2026-11-04", "2026-11", state, **extra))
+
+    payload = cost(root)
+
+    trend = payload["trend"]
+    figured = set()
+    for block in (current, previous):
+        if block is not None:
+            figured |= set(block["daily"])
+    if not trend:
+        assert not figured and payload["trend_after"] == []
+        return
+    drawn = {row["day"] for row in trend if row["total"] is not None}
+    after = {row["day"] for row in payload["trend_after"]}
+    # Every figured day inside or after the window is drawn or named, never both.
+    assert {day for day in figured if day >= trend[0]["day"]} == drawn | after
+    assert not drawn & after
+    assert all(day > trend[-1]["day"] for day in after)
+    # The partial day is the export's newest usage day wherever that can be known.
+    partial = [row["day"] for row in trend if row["partial"]]
+    assert len(partial) <= 1
+    newest = None
+    if current is not None and current["newest_day"]:
+        newest = current["newest_day"]
+    elif previous is not None and "daily_usage" in previous:
+        newest = max(previous["daily_usage"], default=None)
+    elif previous is not None:
+        # A block written before the split cannot tell a tax day from a usage day, so its
+        # newest figured day stands in, which no chart draws, since its window is a table.
+        newest = max(previous["daily"])
+    assert partial == ([newest] if newest is not None else [])
+
+
 def test_credits_that_offset_every_day_are_said_once(root: Path):
     """A day's net within half a cent of zero counts as offset, and one day it does not
     offset, or a window with no usage, says nothing."""

@@ -3331,6 +3331,33 @@ def _cost_trend(
     return trend
 
 
+def trend_after(
+    current: Mapping[str, Any] | None,
+    previous: Mapping[str, Any] | None,
+    trend: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Each figured day dated after the trend's last day, with its net, oldest first.
+
+    The window ends at the export's newest usage day while the current period has one, and
+    a tax, credit or fee line can be dated later, up to the period's last day. So every
+    figured day is either inside the window or named here, and the page names each one
+    beside the chart rather than leaving it out without a word.
+    """
+    if not trend:
+        return []
+    end = _cost_day(trend[-1]["day"])
+    days: dict[date, _CostDay] = {}
+    if previous is not None:
+        days.update(_daily_series(previous))
+    if current is not None:
+        days.update(_daily_series(current))
+    return [
+        {"day": day.isoformat(), "total": _rounded6(sum(found.by_service.values()))}
+        for day, found in sorted(days.items())
+        if end is not None and day > end
+    ]
+
+
 def trend_split(trend: Sequence[Mapping[str, object]]) -> bool:
     """Whether every trend day with a figure carries the usage split, and one day does."""
     figured = [row for row in trend if row["total"] is not None]
@@ -3557,8 +3584,9 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     are which file answers what, the S3 classification, the billed sizes, the trend, whether
     the newest file is stale, and, since #921, the chart series. Those are each series' slot,
     fixed by product code in ``COST_SERIES``, the fold of every other product into
-    ``other_services``, which trend day is ``partial``, and ``trend_split``, whether every
-    figured day in the window carries the daily usage split.
+    ``other_services``, which trend day is ``partial``, ``trend_split``, whether every
+    figured day in the window carries the daily usage split, and ``trend_after``, each
+    figured day dated after the window's last day, which the page names beside the chart.
 
     ``condition`` names a whole-directory state: ``no_directory`` when no cost read has filed
     a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
@@ -3682,6 +3710,7 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
         "trend_split_text": None,
         "trend_offset_text": None,
         "trend_series": [],
+        "trend_after": [],
         "s3": [],
         "no_report_text": None,
         "stale_text": None,
@@ -3769,6 +3798,7 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
     payload["trend"] = trend
     payload["trend_split"] = trend_split(trend)
     payload["trend_series"] = trend_series(trend)
+    payload["trend_after"] = trend_after(current, previous, trend)
     if trend_unsplit(trend):
         payload["trend_split_text"] = TREND_SPLIT_TEXT
     if trend_offset(trend):
