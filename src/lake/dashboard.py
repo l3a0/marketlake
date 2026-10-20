@@ -3301,11 +3301,14 @@ def _cost_trend(
 
     The current period's series wins a day both carry, since it is the newer reading. A day
     neither carries has no total, which is the export's lag rather than a day that cost zero.
-    The newest usage day is ``partial``, as the export's newest day always is: the current
-    period's ``newest_day``, or, on a night with no current figures such as the 1st, the
-    closed month's newest usage day, since the export lags a day there too. That block
-    carries no ``newest_day``, so it is the latest day of its ``daily_usage``, or of its
-    ``daily`` when it predates the split.
+    The window ends at the current period's ``newest_day``, or at the newest day either
+    series carries when the current period has no usage day, so a fee or a tax line on the
+    1st still shows. The export's newest usage day is ``partial``, as its newest day always
+    is: the current period's ``newest_day``, or, when the current period has no usage day,
+    as on the 1st or after a delivery of empty files, the closed month's newest usage day,
+    since the export lags a day there too. The closed month's block carries no
+    ``newest_day``, so that is the latest day of its ``daily_usage``, or of its ``daily``
+    when it predates the split.
     """
     days: dict[date, _CostDay] = {}
     if previous is not None:
@@ -3313,17 +3316,18 @@ def _cost_trend(
     if current is not None:
         days.update(_daily_series(current))
     newest = _cost_day(current.get("newest_day")) if current is not None else None
-    if current is None and previous is not None:
-        newest = _newest_usage_day(previous)
     end = newest
     if end is None and days:
         end = max(days)
     if end is None:
         return []
+    partial = newest
+    if partial is None and previous is not None:
+        partial = _newest_usage_day(previous)
     trend = []
     for offset in range(COST_TREND_DAYS - 1, -1, -1):
         day = end - timedelta(days=offset)
-        trend.append(_trend_row(day, days.get(day), day == newest))
+        trend.append(_trend_row(day, days.get(day), day == partial))
     return trend
 
 

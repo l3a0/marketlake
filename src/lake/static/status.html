@@ -166,7 +166,7 @@
   .chart .grid { stroke: var(--grid); stroke-width: 1; }
   .chart .baseline { stroke: currentColor; stroke-width: 1; opacity: .55; }
   .chart .hit { fill: transparent; cursor: default; outline: none; }
-  .chart .hit:hover, .chart .hit:focus { fill: rgba(127, 127, 127, 0.12); }
+  .chart .hit:hover { fill: rgba(127, 127, 127, 0.12); }
   .chart .partial { opacity: .45; }
   .chart-tip {
     position: absolute; z-index: 2; pointer-events: none; display: none;
@@ -1496,7 +1496,7 @@
   // The charts are inline SVG the page draws itself (#921). The query names every series,
   // its slot and its label, so a chart never invents one, and the page decides only where
   // a mark goes. Each chart keeps its figures in a table behind a toggle, so no figure is
-  // reachable only by hovering, and a tooltip repeats a mark's figures on hover or focus.
+  // reachable only by hovering, and a tooltip repeats a mark's figures on hover.
   var SVG_NS = "http://www.w3.org/2000/svg";
   var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
     "Dec"];
@@ -1913,8 +1913,9 @@
       return;
     }
     box.appendChild(el("p", money(current.total, cost.currency) + " for " + current.period +
-      " through " + current.newest_day + ", from the delivery of " + current.delivered_at +
-      ", read on " + current.from_day + ". The newest day is partial."));
+      (current.newest_day ? " through " + current.newest_day : ", with no usage day yet") +
+      ", from the delivery of " + current.delivered_at + ", read on " + current.from_day +
+      "." + (current.newest_day ? " The newest day is partial." : "")));
     var lines = current.lines;
     if (lines) {
       var figures = el("div", null, "figures");

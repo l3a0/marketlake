@@ -528,6 +528,16 @@ def test_a_narrow_bar_chart_puts_each_label_above_its_bar(root: Path, tmp_path: 
             assert all(start > 0 for start in starts)
 
 
+def test_a_month_with_no_usage_day_says_so_rather_than_null(root: Path, tmp_path: Path):
+    current = split_october(newest_day=None, complete_through=None)
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    services = run_page(tmp_path, cost(root))["cost-services"]
+
+    assert "for 2026-10, with no usage day yet, from the delivery of" in text_of(services)
+    assert "null" not in text_of(services)
+
+
 # -- S3 ----------------------------------------------------------------------------------
 
 

@@ -1012,8 +1012,9 @@ request's suite with `-n auto`, one worker per physical core on its runner, and 
 one process on every push to `main`. A worker that crashes after its last test leaves a
 parallel run green, and the serial run on `main` is what catches that crash.
 
-The build board's page tests in `tests/component/test_board_page.py` run the page's
-script under `node` where it is installed, as on CI's runner. Otherwise they run it under
+The page tests run a page's script under `node` where it is installed, as on CI's runner.
+They are the build board's, in `tests/component/test_board_page.py`, and the dashboard's
+Cost panel's, in `tests/component/test_status_page_cost.py`. Otherwise they run it under
 `osascript -l JavaScript`, which ships with macOS, so they run on a Mac without `node`.
 With neither, they skip. To build the board's `board.json` from GitHub by hand, run the
 generator with the project's Python rather than the system `python3`, which on macOS is

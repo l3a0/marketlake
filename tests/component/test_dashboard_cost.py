@@ -756,7 +756,8 @@ def test_a_trend_day_carries_its_usage_by_series_apart_from_its_credits(root: Pa
 
 def test_on_the_first_the_closed_months_newest_usage_day_is_partial(root: Path):
     """The closed month carries no ``newest_day``, so its newest usage day comes from its
-    split. A tax line dated the month's last day does not move it, as it cannot move N."""
+    split. A tax line dated the month's last day does not move it, as it cannot move N, and
+    the window still ends on that tax line's day, so the tax shows."""
     previous = september(
         period="2026-10",
         daily={"2026-10-30": {"AmazonEC2": 0.0}, "2026-10-31": {"AmazonEC2": 0.25}},
@@ -767,8 +768,44 @@ def test_on_the_first_the_closed_months_newest_usage_day_is_partial(root: Path):
 
     trend = cost(root)["trend"]
 
-    assert trend[-1]["day"] == "2026-10-30"
+    assert trend[-1]["day"] == "2026-10-31" and trend[-1]["other_lines"] == 0.25
     assert [row["day"] for row in trend if row["partial"]] == ["2026-10-30"]
+
+
+@pytest.mark.parametrize(
+    "november",
+    [
+        {"daily": {}, "daily_usage": {}, "daily_other": {}},
+        {
+            "daily": {"2026-11-01": {"AmazonEC2": 29.0}},
+            "daily_usage": {},
+            "daily_other": {"2026-11-01": {"Fee": 29.0}},
+        },
+    ],
+    ids=["a delivery of empty files", "a fee alone on the 1st"],
+)
+def test_a_current_month_with_no_usage_day_leaves_the_closed_months_day_partial(
+    root: Path, november: dict
+):
+    """The current period's ``newest_day`` is null with no usage line, so the export's
+    newest usage day is still the closed month's, and the fee still ends the window."""
+    previous = september(
+        period="2026-10",
+        daily={"2026-10-30": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-30": {"AmazonEC2": 0.2}},
+        daily_other={"2026-10-30": {"Credit": -0.2}},
+    )
+    current = october(period="2026-11", newest_day=None, complete_through=None, **november)
+    file(
+        root,
+        "2026-11-02",
+        entry("2026-11-02", "2026-11", "delivery", current=current, previous=previous),
+    )
+
+    trend = cost(root)["trend"]
+
+    assert [row["day"] for row in trend if row["partial"]] == ["2026-10-30"]
+    assert trend[-1]["day"] == ("2026-11-01" if november["daily"] else "2026-10-30")
 
 
 def test_credits_that_offset_every_day_are_said_once(root: Path):
