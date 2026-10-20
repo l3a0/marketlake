@@ -1506,6 +1506,8 @@
   // A column or a bar is never thicker than this, whatever the width.
   var BAR_MAX = 24;
   var GAP = 2;
+  // Below this width the bar chart stacks each label above its bar.
+  var NARROW_CHART = 480;
 
   function svg(tag, attrs, className) {
     var node = document.createElementNS(SVG_NS, tag);
@@ -1523,6 +1525,13 @@
   function chartWidth(box) {
     var width = box.clientWidth || CHART_FALLBACK_WIDTH;
     return Math.max(CHART_MIN_WIDTH, Math.floor(width));
+  }
+
+  // A size in GB at the precision its scale needs: two places from 1 GB up, and two
+  // significant figures below it, so a bucket of a few megabytes does not read 0.00 GB.
+  function gbText(gb) {
+    if (gb === 0) { return "0 GB"; }
+    return (Math.abs(gb) >= 1 ? gb.toFixed(2) : String(Number(gb.toPrecision(2)))) + " GB";
   }
 
   function shortDay(iso) {
@@ -1576,7 +1585,7 @@
 
   // Give a mark a tooltip of ``rows``, each [text, slot or null, strong], shown on hover and
   // on keyboard focus, and the same words as its accessible name.
-  function withTip(box, mark, x, rows) {
+  function withTip(box, mark, x, rows, width) {
     mark.setAttribute("tabindex", "0");
     mark.setAttribute("aria-label", rows.map(function (row) { return row[0]; }).join(". "));
     function show() {
@@ -1587,7 +1596,15 @@
         line.appendChild(document.createTextNode(row[0]));
         box.tip.appendChild(line);
       });
-      box.tip.style.left = Math.max(0, x - 80) + "px";
+      // Beside the mark rather than over it: to its right in the chart's left part, and to
+      // its left in the rest, so the tip never covers what it describes or leaves the box.
+      if (x < width * 0.55) {
+        box.tip.style.left = Math.round(x + 14) + "px";
+        box.tip.style.right = "";
+      } else {
+        box.tip.style.left = "";
+        box.tip.style.right = Math.round(width - x + 14) + "px";
+      }
       box.tip.style.top = "0px";
       box.tip.classList.add("shown");
     }
@@ -1645,11 +1662,16 @@
   // Month to date as horizontal bars of usage, one per series, each value at its tip.
   function usageBars(rows, currency, width) {
     var box = chartBox("Month-to-date usage by service");
-    var label = Math.min(190, Math.round(width * 0.38));
+    // A narrow chart puts each label on its own line above its bar, since a label column
+    // beside the bars would leave them no room or cut the label off.
+    var narrow = width < NARROW_CHART;
+    var label = narrow ? 0 : Math.min(190, Math.round(width * 0.38));
     var valueRoom = 64;
-    var rowHeight = 26;
+    var rowHeight = narrow ? 40 : 26;
     var thick = Math.min(BAR_MAX, 16);
     var plot = Math.max(40, width - label - valueRoom);
+    var barTop = narrow ? 18 : (rowHeight - thick) / 2;
+    var labelY = narrow ? 12 : rowHeight / 2 + 4;
     var max = 0;
     rows.forEach(function (row) { if (row.usage > max) { max = row.usage; } });
     var chart = svg("svg", {width: width, height: rows.length * rowHeight,
@@ -1657,16 +1679,16 @@
     rows.forEach(function (row, index) {
       var y = index * rowHeight;
       var w = max > 0 ? Math.max(1, plot * Math.max(0, row.usage) / max) : 1;
-      chart.appendChild(svgText(0, y + rowHeight / 2 + 4, row.label));
-      chart.appendChild(svg("path", {d: barPath(label, y + (rowHeight - thick) / 2, w, thick,
-        "right")}, "s" + row.slot));
-      chart.appendChild(svgText(label + w + 6, y + rowHeight / 2 + 4,
+      chart.appendChild(svgText(0, y + labelY, row.label));
+      chart.appendChild(svg("path", {d: barPath(label, y + barTop, w, thick, "right")},
+        "s" + row.slot));
+      chart.appendChild(svgText(label + w + 6, y + barTop + thick / 2 + 4,
         money(row.usage, currency), "start", "axis"));
       var hit = svg("rect", {x: 0, y: y, width: width, height: rowHeight}, "hit");
       withTip(box, hit, label + w, [[money(row.usage, currency) + " of usage", null, true],
         [row.label, row.slot, false]].concat(row.products.map(function (product) {
         return [product.product + " " + money(product.usage, currency), null, false];
-      })));
+      })), width);
       chart.appendChild(hit);
     });
     box.wrap.appendChild(chart);
@@ -1775,7 +1797,8 @@
       }
       chart.appendChild(group);
       var hit = svg("rect", {x: left + index * band, y: 0, width: band, height: height}, "hit");
-      withTip(box, hit, left + index * band, dayTipRows(day, series, split, currency));
+      withTip(box, hit, left + index * band + band / 2, dayTipRows(day, series, split, currency),
+        width);
       chart.appendChild(hit);
     });
     chart.appendChild(svg("line", {x1: left, x2: width, y1: y(0), y2: y(0)}, "baseline"));
@@ -1817,21 +1840,22 @@
     ticks.forEach(function (tick) {
       chart.appendChild(svg("line", {x1: left, x2: left + plot, y1: y(tick), y2: y(tick)},
         "grid"));
-      chart.appendChild(svgText(left - 6, y(tick) + 4, tick + " GB", "end", "axis"));
+      chart.appendChild(svgText(left - 6, y(tick) + 4, String(Number(tick.toPrecision(6))) +
+        " GB", "end", "axis"));
     });
     chart.appendChild(svg("path", {d: points.map(function (p, i) {
       return (i ? "L" : "M") + x(p).toFixed(1) + "," + y(p.gb).toFixed(1);
     }).join("")}, "line-s1"));
     var last = points[points.length - 1];
     chart.appendChild(svg("circle", {cx: x(last), cy: y(last.gb), r: 4}, "s1"));
-    chart.appendChild(svgText(x(last) + 8, y(last.gb) + 4, last.gb.toFixed(2) + " GB"));
+    chart.appendChild(svgText(x(last) + 8, y(last.gb) + 4, gbText(last.gb)));
     points.forEach(function (p, i) {
       var from = i ? (x(points[i - 1]) + x(p)) / 2 : left;
       var to = i < points.length - 1 ? (x(p) + x(points[i + 1])) / 2 : left + plot;
       var hit = svg("rect", {x: from, y: 0, width: Math.max(1, to - from), height: height},
         "hit");
-      withTip(box, hit, x(p), [[p.gb.toFixed(2) + " GB", null, true],
-        [shortDay(p.day), null, false]]);
+      withTip(box, hit, x(p), [[gbText(p.gb), null, true], [shortDay(p.day), null, false]],
+        width);
       chart.appendChild(hit);
     });
     chart.appendChild(svgText(left, height + 16, shortDay(points[0].day), "start", "axis"));
@@ -1886,10 +1910,12 @@
     box.appendChild(serviceTable(current, cost.currency));
     var projection = current.projection || {};
     if (projection.status === "estimate") {
+      var usageEnd = projection.usage_month_end;
       box.appendChild(el("p", "Projected month end: " +
-        money(projection.month_end, cost.currency) + ". An estimate: usage through " +
-        projection.through + " scaled to the whole month, plus tax, fees, credits and " +
-        "other lines as they stand."));
+        money(projection.month_end, cost.currency) + (usageEnd === null ||
+        usageEnd === undefined ? "" : ", from " + money(usageEnd, cost.currency) +
+        " of usage") + ". An estimate: usage through " + projection.through +
+        " scaled to the whole month, plus tax, fees, credits and other lines as they stand."));
     } else {
       box.appendChild(el("p", "Too early to project the month: no complete day in " +
         current.period + " yet.", "muted"));
@@ -1997,7 +2023,7 @@
       if (points.length >= 2) {
         box.appendChild(sizeChart(bucket, chartWidth(box)));
         box.appendChild(tableToggle("size " + bucket.bucket, ["Day", "Billed size"],
-          points.map(function (p) { return [p.day, p.gb.toFixed(2) + " GB"]; })));
+          points.map(function (p) { return [p.day, gbText(p.gb)]; })));
       }
       var wrap = el("div", null, "table-wrap");
       var table = el("table");

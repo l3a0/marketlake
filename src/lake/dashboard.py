@@ -3363,6 +3363,26 @@ def _month_lines(current: Mapping[str, Any]) -> dict[str, float] | None:
     }
 
 
+def _usage_projected(
+    projection: dict[str, object] | None, month_days: float | None
+) -> dict[str, object] | None:
+    """The projection with ``usage_month_end`` beside it, the usage alone scaled to the month.
+
+    ``month_end`` adds every other line, credits included, so on a month whose credits offset
+    every dollar of usage it reads zero while usage runs (#921). The usage part is the
+    projection's own window scaled the same way, before the other lines are added.
+    """
+    if projection is None or projection.get("status") != aws_cost.ESTIMATE:
+        return projection
+    usage = projection.get("usage_through")
+    days = projection.get("window_days")
+    if not isinstance(usage, float) or not isinstance(days, float) or not days or not month_days:
+        projection["usage_month_end"] = None
+        return projection
+    projection["usage_month_end"] = _rounded6(usage / days * month_days)
+    return projection
+
+
 def _usage_by_series(services: Sequence[Mapping[str, Any]]) -> list[dict[str, object]]:
     """Month-to-date usage per chart series, in slot order, each naming its products."""
     found: dict[str, list[Mapping[str, Any]]] = {}
@@ -3688,7 +3708,9 @@ def _cost_payload(root: Path, as_of: str, configured: bool | None) -> dict[str, 
             "services": services,
             "lines": _month_lines(current),
             "usage_by_series": _usage_by_series(services),
-            "projection": _figure(current.get("projection")),
+            "projection": _usage_projected(
+                _figure(current.get("projection")), _cost_number(current.get("days_in_month"))
+            ),
             "cost_per_session": _figure(current.get("cost_per_session")),
         }
     if previous is not None and previous_entry is not None:

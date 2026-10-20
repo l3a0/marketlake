@@ -829,6 +829,39 @@ def test_no_trend_says_nothing_about_the_split(root: Path):
     assert payload["trend_split_text"] is None
 
 
+def test_the_projection_carries_the_usage_alone_beside_the_net(root: Path):
+    """$9.80 of usage over the 14-day window, scaled to October's 31 days, is $21.70 of
+    usage by month end, while ``month_end`` adds $3.50 of other lines to it."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=october()))
+
+    projection = cost(root)["current"]["projection"]
+
+    assert projection["month_end"] == 25.2
+    assert projection["usage_month_end"] == pytest.approx(21.7)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"window_days": 0}, {"window_days": "x"}, {"usage_through": None}],
+    ids=["zero days", "days not a number", "no usage figure"],
+)
+def test_a_projection_it_cannot_scale_has_no_usage_figure(root: Path, change: dict):
+    current = october()
+    current["projection"].update(change)
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    projection = cost(root)["current"]["projection"]
+
+    assert projection["usage_month_end"] is None
+
+
+def test_a_projection_too_early_to_make_has_no_usage_figure(root: Path):
+    current = october(projection={"status": "too_early"})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    assert cost(root)["current"]["projection"] == {"status": "too_early"}
+
+
 def test_the_month_to_date_lines_put_usage_credits_and_net_apart(root: Path):
     file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
 

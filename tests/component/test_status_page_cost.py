@@ -357,6 +357,34 @@ def test_month_to_date_of_an_old_report_keeps_its_table(root: Path, tmp_path: Pa
     assert rows[0] == ["Service", "Usage", "Other lines", "Total"]
 
 
+def test_the_projection_names_the_usage_beside_the_net(root: Path, tmp_path: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    services = run_page(tmp_path, cost(root))["cost-services"]
+
+    assert "Projected month end: $25.20, from $21.70 of usage." in text_of(services)
+
+
+def test_a_narrow_bar_chart_puts_each_label_above_its_bar(root: Path, tmp_path: Path):
+    """At phone width a label column would leave the bars no room, so each label takes the
+    line above its bar and starts where the bar does."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    for width, label_left in ((343, True), (640, False)):
+        services = run_page(tmp_path, cost(root), width=width)["cost-services"]
+        [chart] = find(services, "svg")
+        bars = find(chart, "path")
+        labels = [n for n in find(chart, "text") if text_of(n).startswith(("EC2", "S3"))]
+        starts = [float(re.match(r"M([-0-9.]+),", bar["attrs"]["d"]).group(1)) for bar in bars]
+        if label_left:
+            assert starts == [0.0, 0.0]
+            for label, bar in zip(labels, bars, strict=True):
+                top, _ = path_top_bottom(bar["attrs"]["d"])
+                assert float(label["attrs"]["y"]) < top
+        else:
+            assert all(start > 0 for start in starts)
+
+
 # -- S3 ----------------------------------------------------------------------------------
 
 
@@ -381,6 +409,7 @@ def test_each_bucket_draws_its_billed_size_as_a_line(root: Path, tmp_path: Path)
     texts = [text_of(n) for n in find(chart, "text")]
     assert "93.10 GB" in texts
     assert texts[-2:] == ["Sep 20", "Oct 14"]
+    assert all(re.fullmatch(r"[0-9.]+ GB", t) for t in texts if t.endswith("GB")), texts
     tables_found = tables(s3)
     assert tables_found[0] == [["Day", "Billed size"], ["2026-09-20", "90.00 GB"],
                                ["2026-10-14", "93.10 GB"]]
@@ -396,6 +425,23 @@ def test_a_bucket_with_one_sized_day_draws_no_line(root: Path, tmp_path: Path):
 
     assert find(s3, "svg") == []
     assert "Billed size on 2026-10-14: 93.00 GB" in text_of(s3)
+
+
+def test_a_bucket_of_a_few_megabytes_reads_in_significant_figures(root: Path, tmp_path: Path):
+    current = split_october(
+        storage_daily={
+            "example-billing": {
+                "TimedStorage-ByteHrs": {"2026-10-13": 0.0034 / 31, "2026-10-14": 0.0036 / 31}
+            }
+        }
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    s3 = run_page(tmp_path, cost(root))["cost-s3"]
+
+    [chart] = find(s3, "svg")
+    assert "0.0036 GB" in [text_of(n) for n in find(chart, "text")]
+    assert ["2026-10-14", "0.0036 GB"] in tables(s3)[0]
 
 
 # -- width ---------------------------------------------------------------------------------
