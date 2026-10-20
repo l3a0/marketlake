@@ -1561,7 +1561,8 @@
 
   // A rectangle whose end away from the baseline is rounded, as a path.
   function barPath(x, y, w, h, roundEnd) {
-    var r = Math.min(4, w / 2, h);
+    // A rounded end takes half the bar's thickness at most, across it.
+    var r = roundEnd === "right" ? Math.min(4, w, h / 2) : Math.min(4, w / 2, h);
     if (!roundEnd || r <= 0) {
       return "M" + x + "," + y + "h" + w + "v" + h + "h" + (-w) + "Z";
     }
@@ -1719,6 +1720,9 @@
 
   function dayTipRows(day, series, currency) {
     var rows = [[shortDay(day.day) + (day.partial ? ", a partial day" : ""), null, true]];
+    // Each kind's slot comes from the query's series, so the tooltip's keys match the marks.
+    var slotOf = {};
+    series.forEach(function (one) { slotOf[one.kind] = one.slot; });
     if (day.total === null) {
       rows.push(["No figure yet. The export has not delivered this day.", null, false]);
       return rows;
@@ -1729,11 +1733,13 @@
       var value = (day.usage_by_series || {})[one.key];
       if (value) { rows.push([one.label + " " + money(value, currency), one.slot, false]); }
     });
-    if (day.credits) { rows.push(["Credits " + money(day.credits, currency), 6, false]); }
+    if (day.credits) {
+      rows.push(["Credits " + money(day.credits, currency), slotOf.credit || null, false]);
+    }
     Object.keys(day.other_by_type || {}).forEach(function (type) {
-      if (type === "Credit" || !day.other_by_type[type]) { return; }
-      rows.push([(type || "No line type") + " " + money(day.other_by_type[type], currency),
-        5, false]);
+      if (!day.other_by_type[type]) { return; }
+      rows.push([type + " " + money(day.other_by_type[type], currency), slotOf.other || null,
+        false]);
     });
     rows.push(["Net " + money(day.total, currency), null, false]);
     return rows;
@@ -1789,11 +1795,12 @@
           var from = y(level);
           level += part[1];
           var to = y(level);
-          var y0 = Math.min(from, to);
-          var h = Math.abs(to - from) - GAP;
-          if (h <= 0) { h = 1; }
+          // Each segment keeps its gap on the side away from the zero line and is anchored
+          // at the side toward it, so a segment too small to show its gap still sits on its
+          // own side of the line, at a height of one pixel.
+          var h = Math.max(1, Math.abs(to - from) - GAP);
           var end = at === parts.length - 1 ? (side[1] > 0 ? "top" : "bottom") : null;
-          group.appendChild(svg("path", {d: barPath(x, side[1] > 0 ? y0 + GAP : y0, thick, h,
+          group.appendChild(svg("path", {d: barPath(x, side[1] > 0 ? from - h : from, thick, h,
             end), "data-series": part[0].key, "data-value": part[1]}, "s" + part[0].slot));
         });
       });
@@ -1831,10 +1838,13 @@
     var lo = points[0].gb;
     var hi = points[0].gb;
     points.forEach(function (p) { if (p.gb < lo) { lo = p.gb; } if (p.gb > hi) { hi = p.gb; } });
-    // A flat line sits mid-axis at its own scale, so a bucket of a few megabytes is not
-    // pinned to the floor of an axis a gigabyte tall.
-    var pad = hi !== lo ? (hi - lo) * 0.1 : hi > 0 ? hi * 0.1 : 1;
-    var ticks = niceTicks(Math.max(0, lo - pad), hi + pad, 3, 0);
+    // The axis spans at least 2% of the size, centred on the line, so a flat or nearly
+    // flat bucket sits mid-axis at its own scale under distinct labels, rather than
+    // swinging the plot's full height over a kilobyte, and a bucket of a few megabytes is
+    // not pinned to the floor of an axis a gigabyte tall.
+    var span = Math.max(hi - lo, hi > 0 ? hi * 0.02 : 1) * 1.2;
+    var mid = (hi + lo) / 2;
+    var ticks = niceTicks(Math.max(0, mid - span / 2), mid + span / 2, 3, 0);
     var bottom = ticks[0];
     var top = ticks[ticks.length - 1];
     var first = Date.parse(points[0].day + "T00:00:00Z");
@@ -1883,7 +1893,7 @@
   // The projection leads with usage, which is what the lake costs. The report's month_end
   // adds the credits and other lines to date unscaled, while usage is scaled to the whole
   // month, so on a month whose credits accrue daily against usage it overstates the net.
-  // It is given as it stands and says so.
+  // It is given as it stands, with what it adds, and the query's docstring says why.
   function projectionText(projection, currency) {
     var usageEnd = projection.usage_month_end;
     if (usageEnd === null || usageEnd === undefined) {
@@ -1895,7 +1905,7 @@
       "usage through " + projection.through + " scaled to the whole month. With the " +
       "credits, tax, fees and other lines to date added unscaled, " +
       money(projection.other, currency) + ", it is " + money(projection.month_end, currency) +
-      ". Credits that keep pace with usage leave the month's real net lower than that.";
+      ".";
   }
 
   function serviceTable(current, currency) {
@@ -1980,7 +1990,8 @@
           }).join(", ")];
       }));
     }
-    return tableToggle("trend", ["Day", "Usage", "Credits", "Other lines", "Net", "Usage by service"],
+    return tableToggle("trend", ["Day", "Usage", "Credits", "Other lines", "Net",
+      "Usage by service, then other lines by type"],
       cost.trend.map(function (day) {
         if (day.total === null) { return [day.day, "no figure yet", "", "", "", ""]; }
         return [day.day + (day.partial ? ", partial" : ""), money(day.usage, currency),
@@ -1988,7 +1999,9 @@
           money(day.total, currency),
           Object.keys(day.usage_by_service).map(function (name) {
             return name + " " + money(day.usage_by_service[name], currency);
-          }).join(", ")];
+          }).concat(Object.keys(day.other_by_type).map(function (type) {
+            return type + " " + money(day.other_by_type[type], currency);
+          })).join(", ")];
       }));
   }
 
@@ -2037,11 +2050,11 @@
     if (bucket.size_gb === null) {
       return "Billed size: not yet available for the newest complete day.";
     }
-    var text = "Billed size on " + bucket.size_day + ": " + bucket.size_gb.toFixed(2) + " GB";
+    var text = "Billed size on " + bucket.size_day + ": " + gbText(bucket.size_gb);
     if (bucket.growth) {
       text += ", " + (bucket.growth.gb >= 0 ? "up " : "down ") +
-        Math.abs(bucket.growth.gb).toFixed(2) + " GB since " + bucket.growth.from +
-        ", " + bucket.growth.gb_per_day.toFixed(3) + " GB a day";
+        gbText(Math.abs(bucket.growth.gb)) + " since " + bucket.growth.from +
+        ", " + gbText(Math.abs(bucket.growth.gb_per_day)) + " a day";
     }
     return text + ". It includes noncurrent versions and incomplete multipart parts.";
   }
@@ -2057,7 +2070,7 @@
       box.appendChild(el("p", bucketSize(bucket)));
       if (bucket.classes.length) {
         box.appendChild(el("p", "By storage class: " + bucket.classes.map(function (row) {
-          return row.label + " " + row.gb.toFixed(2) + " GB";
+          return row.label + " " + gbText(row.gb);
         }).join(", ") + ".", "muted"));
       }
       var points = bucket.size_series || [];
@@ -2133,6 +2146,8 @@
   // The Cost section saying its own load failed, on its own chain like History's and
   // Lake's, so the panels above it stay live.
   function costFailed(err) {
+    // The last payload is no longer live, so a resize must not draw it over this sentence.
+    lastCost = null;
     costCleared();
     byId("cost-state").appendChild(el("p",
       "The cost query is failing: " + err.message +

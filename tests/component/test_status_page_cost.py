@@ -72,9 +72,12 @@ var __FETCHES = [];
 var setInterval = function () { return 0; };
 var setTimeout = function (fn, ms) { __TIMERS.push(fn); return __TIMERS.length; };
 var clearTimeout = function (id) { __TIMERS[id - 1] = null; };
+var __COST_CALLS = 0;
 var fetch = function (url) {
   __FETCHES.push(url);
   if (url !== "/api/cost") { return Promise.reject(new Error("offline")); }
+  __COST_CALLS += 1;
+  if (__FAIL_SECOND && __COST_CALLS > 1) { return Promise.reject(new Error("offline")); }
   return Promise.resolve({ ok: true, status: 200,
     json: function () { return Promise.resolve(JSON.parse(__COST)); } });
 };
@@ -88,6 +91,10 @@ var __flush = async function () { for (var i = 0; i < 50; i++) { await null; } }
   var out = { error: null, sections: {}, fetches: __FETCHES, observed: __OBSERVED };
   try {
     await __flush();
+    if (__FAIL_SECOND) {
+      document.getElementById("refresh").dispatch("click");
+      await __flush();
+    }
     if (__RESIZE_TO) {
       // Mark what the first draw made, and open every table toggle as a reader would, so
       // a test can tell a redraw from none and see whether an open table stays open.
@@ -151,6 +158,7 @@ def run_page(
     resize_to: int = 0,
     observer: bool = False,
     widths: dict[str, int] | None = None,
+    fail_second: bool = False,
 ) -> dict:
     """Execute the page against ``payload`` and return the tree of each Cost section.
 
@@ -166,6 +174,7 @@ def run_page(
         + f"var __COST = {json.dumps(json.dumps(payload))};\n"
         + f"var __SECTIONS = {json.dumps(list(SECTIONS))};\n"
         + f"var __RESIZE_TO = {resize_to};\n"
+        + f"var __FAIL_SECOND = {json.dumps(fail_second)};\n"
         + _script()
         + DRIVER
     )
@@ -182,7 +191,8 @@ def run_page(
     assert result["error"] is None, result["error"]
     assert "/api/cost" in result["fetches"]
     sections = result["sections"]
-    assert FAILED not in text_of(sections["cost-state"]), text_of(sections["cost-state"])
+    if not fail_second:
+        assert FAILED not in text_of(sections["cost-state"]), text_of(sections["cost-state"])
     sections["tips"] = result["tips"]
     sections["observed"] = result["observed"]
     return sections
@@ -306,10 +316,19 @@ def test_the_trend_has_a_legend_and_its_figures_in_a_table(root: Path, tmp_path:
     [details] = find(trend, "details")
     assert details["open"] is False
     [rows] = tables(details)
-    assert rows[0] == ["Day", "Usage", "Credits", "Other lines", "Net", "Usage by service"]
+    assert rows[0] == [
+        "Day",
+        "Usage",
+        "Credits",
+        "Other lines",
+        "Net",
+        "Usage by service, then other lines by type",
+    ]
     by_day = {row[0]: row for row in rows[1:]}
     assert by_day["2026-10-14"][1:5] == ["$0.38", "−$0.38", "$0.02", "$0.02"]
-    assert "AmazonCloudWatch $0.03" in by_day["2026-10-14"][5]
+    # Usage by service, then each other line by its type.
+    assert by_day["2026-10-14"][5].startswith("AmazonCloudWatch $0.03, ")
+    assert by_day["2026-10-14"][5].endswith(", Tax $0.02")
     assert by_day["2026-10-15, partial"][1:5] == ["$0.10", "−$0.10", "$0.00", "$0.00"]
     assert by_day["2026-10-13"][1] == "no figure yet"
     assert len(rows) == 31
@@ -366,6 +385,43 @@ def test_a_line_dated_after_the_window_is_named_beside_the_chart(root: Path, tmp
     assert (
         "Dated after 2026-10-15, the export's newest usage day, and not drawn: 2026-10-31 $0.25."
     ) in text_of(trend)
+
+
+def test_a_segment_too_small_for_its_gap_stays_on_its_own_side(root: Path, tmp_path: Path):
+    """At the scale the 14th's $0.38 sets, a tenth of a cent is under a pixel. It still
+    draws above the zero line as usage, and its credit below it."""
+    current = split_october()
+    current["daily"]["2026-10-15"] = {"AmazonEC2": 0.0}
+    current["daily_usage"]["2026-10-15"] = {"AmazonEC2": 0.001}
+    current["daily_other"]["2026-10-15"] = {"Credit": -0.001}
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    trend = run_page(tmp_path, cost(root))["cost-trend"]
+
+    [chart] = find(trend, "svg")
+    base = baseline_y(chart)
+    [partial] = find(chart, "g", "partial")
+    usage, credit = segments(partial)
+    assert usage["attrs"]["data-series"] == "AmazonEC2"
+    assert path_top_bottom(usage["attrs"]["d"])[1] <= base
+    assert path_top_bottom(credit["attrs"]["d"])[0] >= base
+
+
+def test_a_nearly_flat_bucket_reads_flat_under_distinct_labels(root: Path, tmp_path: Path):
+    days = {"2026-10-12": 12.345678, "2026-10-13": 12.345679, "2026-10-14": 12.345679}
+    storage = {day: gb / 31 for day, gb in days.items()}
+    current = split_october(storage_daily={"example-lake": {"TimedStorage-ByteHrs": storage}})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    s3 = run_page(tmp_path, cost(root))["cost-s3"]
+
+    [chart] = find(s3, "svg")
+    ticks = [text_of(n) for n in find(chart, "text", "axis") if n["attrs"]["text-anchor"] == "end"]
+    assert len(ticks) == len(set(ticks)) >= 2, ticks
+    [line] = find(chart, "path", "line-s1")
+    ys = [float(y) for y in re.findall(r"[ML][-0-9.]+,([-0-9.]+)", line["attrs"]["d"])]
+    # A difference of a kilobyte in twelve gigabytes moves the line under a pixel.
+    assert max(ys) - min(ys) < 1
 
 
 def test_the_partial_day_is_drawn_lighter(root: Path, tmp_path: Path):
@@ -617,6 +673,11 @@ def test_a_bucket_of_a_few_megabytes_reads_in_significant_figures(root: Path, tm
     [chart] = find(s3, "svg")
     assert "0.0036 GB" in [text_of(n) for n in find(chart, "text")]
     assert ["2026-10-14", "0.0036 GB"] in tables(s3)[0]
+    # The sentences beside the chart read the same size the chart does.
+    assert (
+        "Billed size on 2026-10-14: 0.0036 GB, up 0.0002 GB since 2026-10-13, 0.0002 GB a day."
+    ) in text_of(s3)
+    assert "By storage class: Standard 0.0036 GB." in text_of(s3)
 
 
 # -- width ---------------------------------------------------------------------------------
@@ -663,6 +724,22 @@ def test_a_resize_redraws_at_the_new_width(root: Path, tmp_path: Path, observer:
     # Where the host has an observer, the page watches the Cost panel itself, which a
     # scrollbar narrows without any window resize.
     assert sections["observed"] == (["cost-panel"] if observer else [])
+
+
+@pytest.mark.parametrize("observer", [True, False], ids=["ResizeObserver", "window resize"])
+def test_a_resize_after_a_failed_load_keeps_the_failure_in_sight(
+    root: Path, tmp_path: Path, observer: bool
+):
+    """The resize redraws the last payload drawn. After a failed load that payload is old,
+    and redrawing it would replace the failure's sentence with figures that read as live."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    sections = run_page(
+        tmp_path, cost(root), width=900, resize_to=343, observer=observer, fail_second=True
+    )
+
+    assert text_of(sections["cost-state"]).startswith(FAILED)
+    assert find(sections["cost-trend"], "svg") == []
 
 
 def test_a_resize_that_keeps_the_width_draws_nothing_new(root: Path, tmp_path: Path):

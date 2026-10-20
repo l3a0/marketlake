@@ -119,7 +119,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
   the hours the scheduled jobs run in.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
-  and the proxy pool that measures a read's peak Arrow memory.
+  the proxy pool that measures a read's peak Arrow memory, and `status_dom.js`, the DOM
+  stub the Cost panel's page test runs the dashboard's script against.
 - `infra/bootstrap` is the OpenTofu configuration CI needs before it can run: the bucket
   that holds the infrastructure's state, GitHub's OIDC provider, the plan, apply and
   deploy roles, and the scheduler role the start schedules pass. The plan and apply roles

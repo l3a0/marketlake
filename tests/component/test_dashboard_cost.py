@@ -744,7 +744,8 @@ def test_a_trend_day_carries_its_usage_by_series_apart_from_its_credits(root: Pa
     assert day["usage_by_service"]["AmazonCloudWatch"] == pytest.approx(0.03)
     assert day["credits"] == pytest.approx(-0.38)
     assert day["other_lines"] == pytest.approx(0.02)
-    assert day["other_by_type"] == {"Credit": pytest.approx(-0.38), "Tax": pytest.approx(0.02)}
+    # Credits ride in ``credits``, so the other lines by type leave them out.
+    assert day["other_by_type"] == {"Tax": pytest.approx(0.02)}
     assert day["partial"] is False
     newest = by_day["2026-10-15"]
     assert newest["partial"] is True
@@ -902,6 +903,40 @@ def test_every_figured_day_is_in_the_window_or_named_and_one_day_at_most_is_part
         # newest figured day stands in, which no chart draws, since its window is a table.
         newest = max(previous["daily"])
     assert partial == ([newest] if newest is not None else [])
+
+
+@pytest.mark.parametrize(
+    "other",
+    [{}, {"Refund": -0.003}],
+    ids=["usage too small to print", "a refund that cancels it"],
+)
+def test_a_zero_net_without_a_credit_is_not_said_to_be_offset(root: Path, other: dict):
+    """Credits offset nothing on a day with no credit, whatever its net reads."""
+    usage = {"2026-10-15": {"AmazonS3": 0.003}}
+    net = 0.003 + sum(other.values())
+    current = split_october(
+        daily={"2026-10-15": {"AmazonS3": net}},
+        daily_usage=usage,
+        daily_other={"2026-10-15": other} if other else {},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    assert cost(root)["trend_offset_text"] is None
+
+
+def test_an_empty_product_code_or_line_type_is_named(root: Path):
+    current = split_october(
+        daily={"2026-10-15": {"": 0.3}},
+        daily_usage={"2026-10-15": {"": 0.1}},
+        daily_other={"2026-10-15": {"": 0.2}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    newest = cost(root)["trend"][-1]
+
+    assert newest["usage_by_service"] == {dashboard.NO_PRODUCT_CODE: 0.1}
+    assert newest["other_by_type"] == {dashboard.NO_LINE_TYPE: 0.2}
+    assert newest["credits"] == 0.0 and isinstance(newest["credits"], float)
 
 
 def test_credits_that_offset_every_day_are_said_once(root: Path):

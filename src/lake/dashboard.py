@@ -2960,6 +2960,10 @@ OTHER_SERVICES = "other_services"
 CREDITS = "credits"
 OTHER_LINES = "other_lines"
 CREDIT_LINE_TYPE = "Credit"
+# What the panel calls an empty product code or line item type, which a null in the export
+# becomes. ``_services`` names an empty product code the same way.
+NO_PRODUCT_CODE = "(no product code)"
+NO_LINE_TYPE = "(no line type)"
 COST_SERIES: tuple[dict[str, object], ...] = (
     *(
         {"key": key, "label": label, "slot": slot, "kind": "usage"}
@@ -3197,7 +3201,7 @@ def _services(current: Mapping[str, Any]) -> list[dict[str, object]]:
         other = _cost_number(split.get("other")) or 0.0
         rows.append(
             {
-                "product": product or "(no product code)",
+                "product": product or NO_PRODUCT_CODE,
                 "usage": _rounded6(usage),
                 "other": _rounded6(other),
                 "total": _rounded6(usage + other),
@@ -3281,15 +3285,22 @@ def _trend_row(day: date, found: _CostDay | None, partial: bool) -> dict[str, ob
     for product, value in found.usage.items():
         series = usage_series_of(product)
         by_series[series] = by_series.get(series, 0.0) + value
-    credits = sum(value for name, value in found.other.items() if name == CREDIT_LINE_TYPE)
-    other = sum(value for name, value in found.other.items() if name != CREDIT_LINE_TYPE)
+    credits = float(sum(value for name, value in found.other.items() if name == CREDIT_LINE_TYPE))
+    other = float(sum(value for name, value in found.other.items() if name != CREDIT_LINE_TYPE))
     row.update(
         usage=_rounded6(sum(found.usage.values())),
         usage_by_series={key: _rounded6(value) for key, value in sorted(by_series.items())},
-        usage_by_service={key: _rounded6(value) for key, value in sorted(found.usage.items())},
+        usage_by_service={
+            key or NO_PRODUCT_CODE: _rounded6(value) for key, value in sorted(found.usage.items())
+        },
         credits=_rounded6(credits),
         other_lines=_rounded6(other),
-        other_by_type={key: _rounded6(value) for key, value in sorted(found.other.items())},
+        # The other lines by type, credits apart, since ``credits`` carries them.
+        other_by_type={
+            key or NO_LINE_TYPE: _rounded6(value)
+            for key, value in sorted(found.other.items())
+            if key != CREDIT_LINE_TYPE
+        },
     )
     return row
 
@@ -3340,8 +3351,9 @@ def trend_after(
 
     The window ends at the export's newest usage day while the current period has one, and
     a tax, credit or fee line can be dated later, up to the period's last day. So every
-    figured day is either inside the window or named here, and the page names each one
-    beside the chart rather than leaving it out without a word.
+    figured day from the window's first day on is either inside the window or named here,
+    and the page names each one beside the chart rather than leaving it out without a word.
+    A day before the window's first is the 30-day window's own cut, as it always was.
     """
     if not trend:
         return []
@@ -3387,7 +3399,8 @@ def trend_series(trend: Sequence[Mapping[str, object]]) -> list[dict[str, object
 # names no end, for the reason ``query_cost``'s docstring gives under its fourth sentence.
 TREND_SPLIT_TEXT = (
     "A cost report written before the daily usage split answers a day in this window, so "
-    "the chart shows each day's net, credits included, rather than usage and credits apart."
+    "the table below shows each day's net, credits included, rather than a chart of usage "
+    "and credits apart."
 )
 
 
@@ -3399,12 +3412,18 @@ TREND_OFFSET_TEXT = (
 
 
 def trend_offset(trend: Sequence[Mapping[str, object]]) -> bool:
-    """Whether a split window has usage and every figured day's net rounds to zero."""
+    """Whether credits bring every figured day's net to zero in a split window with usage.
+
+    A net counts as zero within half a cent, which prints as $0.00. Each figured day with
+    usage must carry a credit, so a window of usage too small to print, or of usage a refund
+    cancels, is not said to be offset by credits.
+    """
     figured = [row for row in trend if row["total"] is not None]
     return (
         trend_split(trend)
         and any(row["usage"] for row in figured)
         and all(abs(float(row["total"])) < 0.005 for row in figured)  # type: ignore[arg-type]
+        and all(row["credits"] for row in figured if row["usage"])
     )
 
 
@@ -3587,6 +3606,10 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
     ``other_services``, which trend day is ``partial``, ``trend_split``, whether every
     figured day in the window carries the daily usage split, and ``trend_after``, each
     figured day dated after the window's last day, which the page names beside the chart.
+    The query also sorts the line item types into usage, ``Credit`` and other lines, says
+    which series have a figure in ``trend_series``, decides by the half-cent rule in
+    ``trend_offset`` whether credits zero every day, and scales usage alone to the month in
+    ``usage_month_end``, since the report's ``month_end`` adds credits to date unscaled.
 
     ``condition`` names a whole-directory state: ``no_directory`` when no cost read has filed
     a report, ``unreadable_directory`` with ``error`` naming the class, ``no_file`` when no
@@ -3623,7 +3646,7 @@ def query_cost(con: duckdb.DuckDBPyConnection, ctx: QueryContext) -> dict[str, o
        no error, the export's first month and a closed month whose delivery has not finished,
        without claiming which holds.
     4. ``trend_split_text`` says a report written before the daily usage split answers a day
-       in the trend's window, so the chart draws each day's net. It names no end, because
+       in the trend's window, so the page draws each day's net as a table. It names no end, because
        ``_cost_scan`` can take the current and the closed month from different files.
     5. ``trend_offset_text`` says credits bring every figured day's net to zero, where the
        chart's net ticks lie on its zero line.
