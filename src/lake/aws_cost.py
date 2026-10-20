@@ -57,6 +57,12 @@ no usage line has no N, and both figures read ``too_early``.
 3. The storage series carries each bucket's ``TimedStorage-*`` amount per usage type per
    day, in GB-months. The dashboard turns one day's amount into a billed size by the
    month's days. ``EarlyDelete-*`` is in GB-hours, so it is left out.
+4. The daily series come in three. ``daily`` is each day's net per product code, every line
+   included. ``daily_usage`` is the usage lines alone per product code, and ``daily_other``
+   is every other line per line item type, such as ``Credit`` and ``Tax``. So a day's
+   ``daily_usage`` plus its ``daily_other`` is its ``daily``, and the Cost panel can draw
+   the usage a credit offsets apart from the credit (marketlake #921). ``mtd.line_type`` is
+   the month to date per line item type, every line included.
 
 The figures sum ``line_item_unblended_cost``. ``line_item_net_unblended_cost`` exists only on
 a month with a discount, so nothing here names it. A period with more than one
@@ -468,12 +474,21 @@ def _grouped(table: pa.Table, keys: list[str], column: str = "cost") -> list[dic
     return [{**{key: row[key] for key in keys}, "total": row[f"{column}_sum"]} for row in rows]
 
 
-def _daily(table: pa.Table) -> dict[str, dict[str, float]]:
-    """The totals per UTC day by product code."""
+def _daily(table: pa.Table, key: str = "product") -> dict[str, dict[str, float]]:
+    """The totals per UTC day by ``key``, the product code unless a caller names another."""
     daily: dict[str, dict[str, float]] = {}
-    for row in _grouped(table, ["day", "product"]):
-        _add(daily.setdefault(row["day"].isoformat(), {}), row["product"], row["total"])
+    for row in _grouped(table, ["day", key]):
+        _add(daily.setdefault(row["day"].isoformat(), {}), row[key], row["total"])
     return daily
+
+
+def _daily_split(table: pa.Table) -> dict[str, dict[str, dict[str, float]]]:
+    """``daily_usage`` and ``daily_other``, the module docstring's fourth figure."""
+    usage = _usage_mask(table)
+    return {
+        "daily_usage": _daily(table.filter(usage)),
+        "daily_other": _daily(table.filter(pc.invert(usage)), key="line_type"),
+    }
 
 
 def _storage_daily(table: pa.Table, accounts: set[str]) -> dict[str, dict[str, dict[str, float]]]:
@@ -559,6 +574,9 @@ def current_figures(read: _Period, *, sessions: set[date], accounts: set[str]) -
     for row in _grouped(table.append_column("is_usage", usage), ["product", "is_usage"]):
         split = service.setdefault(row["product"], {"usage": 0.0, "other": 0.0})
         _add(split, "usage" if row["is_usage"] else "other", row["total"])
+    line_type: dict[str, float] = {}
+    for row in _grouped(table, ["line_type"]):
+        _add(line_type, row["line_type"], row["total"])
     usage_type: dict[str, dict[str, float]] = {}
     for row in _grouped(table, ["product", "usage_type"]):
         _add(usage_type.setdefault(row["product"], {}), row["usage_type"], row["total"])
@@ -603,11 +621,13 @@ def current_figures(read: _Period, *, sessions: set[date], accounts: set[str]) -
             "total": _sum(table),
             "mtd": {
                 "service": service,
+                "line_type": line_type,
                 "usage_type": usage_type,
                 "resource": resource,
                 "s3": s3,
             },
             "daily": _daily(table),
+            **_daily_split(table),
             "storage_daily": _storage_daily(table, accounts),
             "sessions": window_sessions,
             "cost_per_session": per_session,
@@ -632,6 +652,7 @@ def previous_figures(read: _Period, *, sessions: set[date], accounts: set[str]) 
             "days_in_month": month_days,
             "total": _sum(table),
             "daily": _daily(table),
+            **_daily_split(table),
             "storage_daily": _storage_daily(table, accounts),
             "sessions": count,
             "cost_per_session": _per_session(usage, count, last),

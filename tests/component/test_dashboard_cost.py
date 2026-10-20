@@ -1,9 +1,13 @@
 """The dashboard's Cost panel query, ``/api/cost``, marketlake #913.
 
 The query reads the sweep's cost files under ``reports/aws_cost/date=D/`` and makes every
-decision the panel shows, because nothing in the repository runs the page's JavaScript.
+decision the panel shows, so the page computes only where to draw.
+``tests/component/test_status_page_cost.py`` runs the page against what this returns.
 Each file here is literal JSON in the shape ``lake.aws_cost`` writes, so a change to the
 writer's shape that the query does not follow fails here rather than on the page.
+
+``october`` and ``september`` are the shape written before #921, with no daily usage split,
+so every test that does not name the split also shows an old report still reads.
 """
 
 from __future__ import annotations
@@ -118,6 +122,22 @@ def september(**changes) -> dict:
     }
     block.update(changes)
     return block
+
+
+def unsplit(day: str, total: float | None, by_service: dict, *, partial: bool = False) -> dict:
+    """A trend row from a block written before #921, which carries no usage split."""
+    return {
+        "day": day,
+        "partial": partial,
+        "total": total,
+        "by_service": by_service,
+        "usage": None,
+        "usage_by_series": None,
+        "usage_by_service": None,
+        "credits": None,
+        "other_lines": None,
+        "other_by_type": None,
+    }
 
 
 @pytest.fixture
@@ -338,11 +358,10 @@ def test_on_the_first_last_month_never_shows_as_month_to_date(root: Path):
     assert payload["current"] is None
     assert payload["previous"]["period"] == "2026-10"
     assert payload["previous"]["total"] == 21.1
-    assert payload["trend"][-1] == {
-        "day": "2026-10-31",
-        "total": 0.7,
-        "by_service": {"AmazonEC2": 0.7},
-    }
+    # With no current figures the closed month's newest day ends the trend, and it is as
+    # partial as any export's newest day, since the export lags a day.
+    assert payload["trend"][-1] == unsplit("2026-10-31", 0.7, {"AmazonEC2": 0.7}, partial=True)
+    assert [row["day"] for row in payload["trend"] if row["partial"]] == ["2026-10-31"]
     assert payload["s3"] == []
 
 
@@ -540,6 +559,7 @@ def test_nothing_in_a_file_of_the_wrong_types_raises(root: Path):
             "size_gb": None,
             "classes": [],
             "growth": None,
+            "size_series": [],
         }
     ]
 
@@ -633,13 +653,15 @@ def test_the_trend_is_thirty_calendar_days_from_both_series(root: Path):
     trend = cost(root)["trend"]
 
     assert len(trend) == 30
-    assert trend[0] == {"day": "2026-09-16", "total": 0.5, "by_service": {"AmazonEC2": 0.5}}
+    assert trend[0] == unsplit("2026-09-16", 0.5, {"AmazonEC2": 0.5})
     assert trend[-1]["day"] == "2026-10-15" and trend[-1]["total"] == 0.3
     by_day = {row["day"]: row for row in trend}
     assert by_day["2026-10-01"]["total"] == 0.7
     assert by_day["2026-10-01"]["by_service"] == {"AmazonEC2": 0.6, "AmazonS3": 0.1}
     # A day neither series carries has no figure rather than a zero.
-    assert by_day["2026-10-02"] == {"day": "2026-10-02", "total": None, "by_service": {}}
+    assert by_day["2026-10-02"] == unsplit("2026-10-02", None, {})
+    # The newest usage day, and only it, is partial.
+    assert [row["day"] for row in trend if row["partial"]] == ["2026-10-15"]
     assert "2026-09-15" not in by_day
 
 
@@ -656,6 +678,484 @@ def test_the_current_series_wins_a_day_both_carry(root: Path):
     by_day = {row["day"]: row for row in cost(root)["trend"]}
 
     assert by_day["2026-10-01"]["total"] == 0.7
+
+
+# -- usage and credits apart, #921 -------------------------------------------------------
+
+
+def split_october(**changes) -> dict:
+    """October as the writer gives it since #921, credits offsetting every dollar of usage.
+
+    The 14th carries $0.20 of EC2, $0.05 of S3, $0.10 of the VM's public address and $0.03
+    of CloudWatch, a credit of $0.38 and $0.02 of tax: a net of $0.02. The 15th, the newest
+    usage day, carries $0.10 of EC2 and a credit of $0.10.
+    """
+    block = october(
+        daily={
+            "2026-10-14": {
+                "AmazonEC2": 0.2 - 0.38 + 0.02,
+                "AmazonS3": 0.05,
+                "AmazonVPC": 0.1,
+                "AmazonCloudWatch": 0.03,
+            },
+            "2026-10-15": {"AmazonEC2": 0.0},
+        },
+        daily_usage={
+            "2026-10-14": {
+                "AmazonEC2": 0.2,
+                "AmazonS3": 0.05,
+                "AmazonVPC": 0.1,
+                "AmazonCloudWatch": 0.03,
+            },
+            "2026-10-15": {"AmazonEC2": 0.1},
+        },
+        daily_other={
+            "2026-10-14": {"Credit": -0.38, "Tax": 0.02},
+            "2026-10-15": {"Credit": -0.1},
+        },
+    )
+    block["mtd"] = {
+        **block["mtd"],
+        "line_type": {"Usage": 10.0, "DiscountedUsage": 0.55, "Credit": -10.55, "Tax": 0.1},
+    }
+    block.update(changes)
+    return block
+
+
+def test_a_trend_day_carries_its_usage_by_series_apart_from_its_credits(root: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    payload = cost(root)
+
+    assert payload["trend_split"] is True
+    assert payload["trend_split_text"] is None
+    by_day = {row["day"]: row for row in payload["trend"]}
+    day = by_day["2026-10-14"]
+    assert day["total"] == pytest.approx(0.02)
+    assert day["usage"] == pytest.approx(0.38)
+    # CloudWatch has no slot of its own, so it folds into other services, and the raw
+    # product codes stay beside the series for the tooltip and the table.
+    assert day["usage_by_series"] == {
+        "AmazonEC2": pytest.approx(0.2),
+        "AmazonS3": pytest.approx(0.05),
+        "AmazonVPC": pytest.approx(0.1),
+        "other_services": pytest.approx(0.03),
+    }
+    assert day["usage_by_service"]["AmazonCloudWatch"] == pytest.approx(0.03)
+    assert day["credits"] == pytest.approx(-0.38)
+    assert day["other_lines"] == pytest.approx(0.02)
+    # Credits ride in ``credits``, so the other lines by type leave them out.
+    assert day["other_by_type"] == {"Tax": pytest.approx(0.02)}
+    assert day["partial"] is False
+    newest = by_day["2026-10-15"]
+    assert newest["partial"] is True
+    assert newest["usage"] == pytest.approx(0.1) and newest["total"] == pytest.approx(0.0)
+    assert newest["other_lines"] == 0.0
+    # A day the split block does not carry has no figure, split or net.
+    assert by_day["2026-10-13"]["total"] is None and by_day["2026-10-13"]["usage"] is None
+
+
+def test_on_the_first_the_closed_months_newest_usage_day_is_partial(root: Path):
+    """The closed month carries no ``newest_day``, so its newest usage day comes from its
+    split. A tax line dated the month's last day does not move it, as it cannot move N, and
+    the window still ends on that tax line's day, so the tax shows."""
+    previous = september(
+        period="2026-10",
+        daily={"2026-10-30": {"AmazonEC2": 0.0}, "2026-10-31": {"AmazonEC2": 0.25}},
+        daily_usage={"2026-10-30": {"AmazonEC2": 0.2}},
+        daily_other={"2026-10-30": {"Credit": -0.2}, "2026-10-31": {"Tax": 0.25}},
+    )
+    file(root, "2026-11-01", entry("2026-11-01", "2026-11", "no_delivery", previous=previous))
+
+    trend = cost(root)["trend"]
+
+    assert trend[-1]["day"] == "2026-10-31" and trend[-1]["other_lines"] == 0.25
+    assert [row["day"] for row in trend if row["partial"]] == ["2026-10-30"]
+
+
+@pytest.mark.parametrize(
+    "november",
+    [
+        {"daily": {}, "daily_usage": {}, "daily_other": {}},
+        {
+            "daily": {"2026-11-01": {"AmazonEC2": 29.0}},
+            "daily_usage": {},
+            "daily_other": {"2026-11-01": {"Fee": 29.0}},
+        },
+    ],
+    ids=["a delivery of empty files", "a fee alone on the 1st"],
+)
+def test_a_current_month_with_no_usage_day_leaves_the_closed_months_day_partial(
+    root: Path, november: dict
+):
+    """The current period's ``newest_day`` is null with no usage line, so the export's
+    newest usage day is still the closed month's, and the fee still ends the window."""
+    previous = september(
+        period="2026-10",
+        daily={"2026-10-30": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-30": {"AmazonEC2": 0.2}},
+        daily_other={"2026-10-30": {"Credit": -0.2}},
+    )
+    current = october(period="2026-11", newest_day=None, complete_through=None, **november)
+    file(
+        root,
+        "2026-11-02",
+        entry("2026-11-02", "2026-11", "delivery", current=current, previous=previous),
+    )
+
+    trend = cost(root)["trend"]
+
+    assert [row["day"] for row in trend if row["partial"]] == ["2026-10-30"]
+    assert trend[-1]["day"] == ("2026-11-01" if november["daily"] else "2026-10-30")
+
+
+# The cases of #921's pass 6: every shape the current block and the closed month's block can
+# take, crossed, so the window's end and its partial day are covered as a class rather than
+# one case at a time. November's newest usage day is the 3rd, and a tax line is dated its
+# last day, the 30th, as the writer says a non-usage line can be.
+CURRENT_SHAPES = {
+    "no current block": None,
+    "usage through the 3rd": {
+        "newest_day": "2026-11-03",
+        "daily": {
+            "2026-11-02": {"AmazonEC2": 0.0},
+            "2026-11-03": {"AmazonEC2": 0.0},
+            "2026-11-30": {"AmazonEC2": 0.25},
+        },
+        "daily_usage": {"2026-11-02": {"AmazonEC2": 0.2}, "2026-11-03": {"AmazonEC2": 0.1}},
+        "daily_other": {
+            "2026-11-02": {"Credit": -0.2},
+            "2026-11-03": {"Credit": -0.1},
+            "2026-11-30": {"Tax": 0.25},
+        },
+    },
+    "empty files": {"newest_day": None, "daily": {}, "daily_usage": {}, "daily_other": {}},
+    "a fee alone": {
+        "newest_day": None,
+        "daily": {"2026-11-01": {"AmazonEC2": 29.0}},
+        "daily_usage": {},
+        "daily_other": {"2026-11-01": {"Fee": 29.0}},
+    },
+}
+PREVIOUS_SHAPES = {
+    "no closed month": None,
+    "written before the split": {
+        "daily": {"2026-10-30": {"AmazonEC2": 0.2}, "2026-10-31": {"AmazonEC2": 0.25}},
+    },
+    "split": {
+        "daily": {"2026-10-30": {"AmazonEC2": 0.0}, "2026-10-31": {"AmazonEC2": 0.25}},
+        "daily_usage": {"2026-10-30": {"AmazonEC2": 0.2}},
+        "daily_other": {"2026-10-30": {"Credit": -0.2}, "2026-10-31": {"Tax": 0.25}},
+    },
+    "split with no usage": {
+        "daily": {"2026-10-31": {"AmazonEC2": 0.25}},
+        "daily_usage": {},
+        "daily_other": {"2026-10-31": {"Tax": 0.25}},
+    },
+}
+
+
+@pytest.mark.parametrize("previous_shape", list(PREVIOUS_SHAPES))
+@pytest.mark.parametrize("current_shape", list(CURRENT_SHAPES))
+def test_every_figured_day_is_in_the_window_or_named_and_one_day_at_most_is_partial(
+    root: Path, current_shape: str, previous_shape: str
+):
+    changes = CURRENT_SHAPES[current_shape]
+    current = None
+    if changes is not None:
+        current = october(period="2026-11", complete_through=None, **changes)
+    closed = PREVIOUS_SHAPES[previous_shape]
+    previous = september(period="2026-10", **closed) if closed is not None else None
+    extra = {}
+    if current is not None:
+        extra["current"] = current
+    if previous is not None:
+        extra["previous"] = previous
+    state = "delivery" if current is not None else "no_delivery"
+    file(root, "2026-11-04", entry("2026-11-04", "2026-11", state, **extra))
+
+    payload = cost(root)
+
+    trend = payload["trend"]
+    figured = set()
+    for block in (current, previous):
+        if block is not None:
+            figured |= set(block["daily"])
+    if not trend:
+        assert not figured and payload["trend_after"] == []
+        return
+    drawn = {row["day"] for row in trend if row["total"] is not None}
+    after = {row["day"] for row in payload["trend_after"]}
+    # Every figured day inside or after the window is drawn or named, never both.
+    assert {day for day in figured if day >= trend[0]["day"]} == drawn | after
+    assert not drawn & after
+    assert all(day > trend[-1]["day"] for day in after)
+    # The partial day is the export's newest usage day wherever that can be known.
+    partial = [row["day"] for row in trend if row["partial"]]
+    assert len(partial) <= 1
+    newest = None
+    if current is not None and current["newest_day"]:
+        newest = current["newest_day"]
+    elif previous is not None and "daily_usage" in previous:
+        newest = max(previous["daily_usage"], default=None)
+    elif previous is not None:
+        # A block written before the split cannot tell a tax day from a usage day, so its
+        # newest figured day stands in, which no chart draws, since its window is a table.
+        newest = max(previous["daily"])
+    assert partial == ([newest] if newest is not None else [])
+
+
+@pytest.mark.parametrize(
+    "other",
+    [{}, {"Refund": -0.003}],
+    ids=["usage too small to print", "a refund that cancels it"],
+)
+def test_a_zero_net_without_a_credit_is_not_said_to_be_offset(root: Path, other: dict):
+    """Credits offset nothing on a day with no credit, whatever its net reads."""
+    usage = {"2026-10-15": {"AmazonS3": 0.003}}
+    net = 0.003 + sum(other.values())
+    current = split_october(
+        daily={"2026-10-15": {"AmazonS3": net}},
+        daily_usage=usage,
+        daily_other={"2026-10-15": other} if other else {},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    assert cost(root)["trend_offset_text"] is None
+
+
+def test_an_empty_product_code_or_line_type_is_named(root: Path):
+    current = split_october(
+        daily={"2026-10-15": {"": 0.3}},
+        daily_usage={"2026-10-15": {"": 0.1}},
+        daily_other={"2026-10-15": {"": 0.2}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    newest = cost(root)["trend"][-1]
+
+    assert newest["usage_by_service"] == {dashboard.NO_PRODUCT_CODE: 0.1}
+    assert newest["other_by_type"] == {dashboard.NO_LINE_TYPE: 0.2}
+    assert newest["credits"] == 0.0 and isinstance(newest["credits"], float)
+
+
+def test_credits_that_offset_every_day_are_said_once(root: Path):
+    """A day's net within half a cent of zero counts as offset, and one day it does not
+    offset, or a window with no usage, says nothing."""
+    zero = split_october(
+        daily={"2026-10-14": {"AmazonEC2": 0.004}, "2026-10-15": {"AmazonEC2": -0.004}},
+        daily_usage={"2026-10-14": {"AmazonEC2": 0.2}, "2026-10-15": {"AmazonEC2": 0.1}},
+        daily_other={"2026-10-14": {"Credit": -0.196}, "2026-10-15": {"Credit": -0.104}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=zero))
+    assert cost(root)["trend_offset_text"] == dashboard.TREND_OFFSET_TEXT
+
+    one_day = split_october()
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=one_day),
+        stamp="183000000001",
+    )
+    assert cost(root)["trend_offset_text"] is None
+
+    idle = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-15": {}},
+        daily_other={"2026-10-15": {}},
+    )
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=idle),
+        stamp="183000000002",
+    )
+    assert cost(root)["trend_offset_text"] is None
+
+
+def test_the_series_keep_their_slots_whichever_are_present(root: Path):
+    """A color follows its service, so a missing series moves no other one's slot."""
+    current = split_october(
+        daily={"2026-10-15": {"AmazonS3": 0.05}},
+        daily_usage={"2026-10-15": {"AmazonS3": 0.05}},
+        daily_other={"2026-10-15": {"Credit": -0.05}},
+    )
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    series = cost(root)["trend_series"]
+
+    assert [(row["key"], row["slot"], row["kind"]) for row in series] == [
+        ("AmazonS3", 2, "usage"),
+        ("credits", 6, "credit"),
+    ]
+
+
+def test_every_series_in_slot_order(root: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    series = cost(root)["trend_series"]
+
+    assert [(row["key"], row["slot"]) for row in series] == [
+        ("AmazonEC2", 1),
+        ("AmazonS3", 2),
+        ("AmazonVPC", 3),
+        ("other_services", 4),
+        ("other_lines", 5),
+        ("credits", 6),
+    ]
+    assert all(isinstance(row["label"], str) and row["label"] for row in series)
+
+
+def test_an_old_report_draws_the_net_and_says_why(root: Path):
+    """A report written before #921 has no split. The trend keeps its net figures and says
+    so, rather than drawing usage as zero."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=october()))
+
+    payload = cost(root)
+
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] == dashboard.TREND_SPLIT_TEXT
+    assert payload["trend_series"] == []
+    assert payload["current"]["lines"] is None
+    by_day = {row["day"]: row for row in payload["trend"]}
+    assert by_day["2026-10-14"]["total"] == 0.7
+    assert by_day["2026-10-14"]["usage"] is None
+
+
+def test_one_old_block_in_the_window_turns_the_split_off(root: Path):
+    """``current`` and ``previous`` can come from different files, so a window can mix a
+    split block with an old one. The chart then draws the net for the whole window, since
+    half a window of usage beside half of net would read as a fall in usage."""
+    previous = september(daily={"2026-09-30": {"AmazonEC2": 0.6}})
+    file(
+        root,
+        "2026-10-16",
+        entry("2026-10-16", "2026-10", "delivery", current=split_october(), previous=previous),
+    )
+
+    payload = cost(root)
+
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] == dashboard.TREND_SPLIT_TEXT
+
+
+def test_a_window_with_no_figure_names_no_old_report(root: Path):
+    current = split_october(daily={})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    payload = cost(root)
+
+    assert len(payload["trend"]) == 30
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] is None
+
+
+def test_no_trend_says_nothing_about_the_split(root: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "no_export"))
+
+    payload = cost(root)
+
+    assert payload["trend"] == []
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] is None
+    assert payload["trend_offset_text"] is None
+
+
+def test_the_projection_carries_the_usage_alone_beside_the_net(root: Path):
+    """$9.80 of usage over the 14-day window, scaled to October's 31 days, is $21.70 of
+    usage by month end, while ``month_end`` adds $3.50 of other lines to it."""
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=october()))
+
+    projection = cost(root)["current"]["projection"]
+
+    assert projection["month_end"] == 25.2
+    assert projection["usage_month_end"] == pytest.approx(21.7)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"window_days": 0}, {"window_days": "x"}, {"usage_through": None}],
+    ids=["zero days", "days not a number", "no usage figure"],
+)
+def test_a_projection_it_cannot_scale_has_no_usage_figure(root: Path, change: dict):
+    current = october()
+    current["projection"].update(change)
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    projection = cost(root)["current"]["projection"]
+
+    assert projection["usage_month_end"] is None
+
+
+def test_a_projection_too_early_to_make_has_no_usage_figure(root: Path):
+    current = october(projection={"status": "too_early"})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    assert cost(root)["current"]["projection"] == {"status": "too_early"}
+
+
+def test_the_month_to_date_lines_put_usage_credits_and_net_apart(root: Path):
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=split_october()))
+
+    current = cost(root)["current"]
+
+    assert current["lines"] == {
+        "usage": pytest.approx(10.55),
+        "credits": pytest.approx(-10.55),
+        "other": pytest.approx(0.1),
+        "net": pytest.approx(0.1),
+    }
+    assert [
+        (row["key"], row["usage"], [p["product"] for p in row["products"]])
+        for row in current["usage_by_series"]
+    ] == [
+        ("AmazonEC2", pytest.approx(10.15), ["AmazonEC2"]),
+        ("AmazonS3", pytest.approx(0.4), ["AmazonS3"]),
+    ]
+
+
+def test_month_to_date_usage_folds_unslotted_products_into_other_services(root: Path):
+    current = split_october()
+    current["mtd"] = {
+        **current["mtd"],
+        "service": {
+            "AmazonEC2": {"usage": 2.0, "other": -2.0},
+            "AmazonCloudWatch": {"usage": 0.3, "other": 0.0},
+            "AWSCostExplorer": {"usage": 0.5, "other": 0.0},
+            "AmazonVPC": {"usage": 0.0, "other": 0.0},
+        },
+    }
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    rows = cost(root)["current"]["usage_by_series"]
+
+    # VPC had no usage, so it draws no bar, and the fold names its products biggest first.
+    assert [(row["key"], row["slot"], row["usage"]) for row in rows] == [
+        ("AmazonEC2", 1, pytest.approx(2.0)),
+        ("other_services", 4, pytest.approx(0.8)),
+    ]
+    assert rows[1]["products"] == [
+        {"product": "AWSCostExplorer", "usage": pytest.approx(0.5)},
+        {"product": "AmazonCloudWatch", "usage": pytest.approx(0.3)},
+    ]
+
+
+def test_a_split_of_the_wrong_types_reads_as_no_figure(root: Path):
+    current = split_october(
+        daily={"2026-10-15": {"AmazonEC2": 0.1}},
+        daily_usage={"2026-10-15": {"AmazonEC2": "x", "AmazonS3": True}},
+        daily_other={"2026-10-15": ["Credit"]},
+    )
+    current["mtd"]["line_type"] = {"Usage": "x", "Credit": float("inf")}
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+
+    payload = cost(root)
+
+    newest = payload["trend"][-1]
+    assert newest["usage"] == 0.0 and newest["usage_by_series"] == {}
+    assert newest["credits"] == 0.0 and newest["other_lines"] == 0.0
+    assert payload["current"]["lines"] == {"usage": 0.0, "credits": 0.0, "other": 0.0, "net": 0.0}
+    json.dumps(payload, allow_nan=False)
 
 
 # -- the S3 split and the billed size ------------------------------------------------------
@@ -744,6 +1244,12 @@ def test_each_bucket_shows_its_split_beside_its_billed_size_and_growth(root: Pat
         "gb": pytest.approx(5.7),
         "gb_per_day": pytest.approx(5.7 / 13, abs=1e-6),
     }
+    # The chart's series runs through the size day, N - 1, so the partial 15th is left out,
+    # and each day sums its storage classes. EarlyDelete is in GB-hours and adds nothing.
+    assert bucket["size_series"] == [
+        {"day": "2026-10-01", "gb": pytest.approx(110.0)},
+        {"day": "2026-10-14", "gb": pytest.approx(115.7)},
+    ]
     assert bucket["groups"] == {
         "early delete": 0.03,
         "other": 0.001,
@@ -790,6 +1296,11 @@ def test_growth_reaches_into_the_closed_month_inside_the_trend_window(root: Path
     assert bucket["growth"]["from"] == "2026-09-20"
     assert bucket["growth"]["gb"] == pytest.approx(3.1)
     assert bucket["growth"]["days"] == 24
+    # The chart's series starts where the growth does, each day sized by its own month.
+    assert bucket["size_series"] == [
+        {"day": "2026-09-20", "gb": pytest.approx(90.0)},
+        {"day": "2026-10-14", "gb": pytest.approx(93.1)},
+    ]
 
 
 def test_a_size_with_no_storage_line_on_the_newest_complete_day_is_not_yet_available(
@@ -839,3 +1350,108 @@ def test_growth_can_start_on_the_trends_first_day(root: Path):
     [bucket] = payload["s3"]
     assert bucket["growth"]["from"] == "2026-09-16"
     assert bucket["growth"]["days"] == 28
+
+
+# -- what the mutation lens on PR #922 found no test for -----------------------------------
+# Each test below fails under a mutant the earlier tests let through: where a mark lands,
+# how long a bar is, whether segments stack, and the edges of the query's new fields.
+
+
+def _delivered(root: Path, current: dict, **extra) -> None:
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current, **extra))
+
+
+def test_two_folded_products_add_into_other_services(root: Path):
+    current = split_october()
+    current["daily_usage"]["2026-10-14"]["AWSCostExplorer"] = 0.01
+    _delivered(root, current)
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert day["usage_by_series"]["other_services"] == pytest.approx(0.04)
+
+
+def test_usage_by_service_is_usage_not_net(root: Path):
+    _delivered(root, split_october())
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert day["usage_by_service"]["AmazonEC2"] == pytest.approx(0.2)
+
+
+def test_half_a_split_is_no_split(root: Path):
+    current = split_october()
+    del current["daily_other"]
+    _delivered(root, current)
+    payload = cost(root)
+    assert payload["trend_split"] is False
+    assert payload["trend_split_text"] == dashboard.TREND_SPLIT_TEXT
+
+
+def test_no_offset_sentence_without_the_split(root: Path):
+    previous = september(daily={"2026-09-30": {"AmazonEC2": 0.0}})
+    current = split_october(
+        daily={"2026-10-14": {"AmazonEC2": 0.0}, "2026-10-15": {"AmazonEC2": 0.0}},
+        daily_usage={"2026-10-14": {"AmazonEC2": 0.2}, "2026-10-15": {"AmazonEC2": 0.1}},
+        daily_other={"2026-10-14": {"Credit": -0.2}, "2026-10-15": {"Credit": -0.1}},
+    )
+    _delivered(root, current, previous=previous)
+    payload = cost(root)
+    assert payload["trend_split"] is False
+    assert payload["trend_offset_text"] is None
+
+
+def test_a_line_type_map_of_the_wrong_type_is_no_lines(root: Path):
+    current = split_october()
+    current["mtd"]["line_type"] = ["Usage"]
+    _delivered(root, current)
+    assert cost(root)["current"]["lines"] is None
+
+
+def test_a_block_without_days_in_month_does_not_raise(root: Path):
+    current = split_october(days_in_month=None)
+    _delivered(root, current)
+    payload = cost(root)
+    assert payload["current"] is not None
+    assert payload["current"]["projection"]["usage_month_end"] is None
+
+
+def test_folded_products_list_biggest_first_against_name_order(root: Path):
+    current = split_october()
+    current["mtd"] = {
+        **current["mtd"],
+        "service": {
+            "AmazonCloudWatch": {"usage": 0.5, "other": 0.0},
+            "AWSCostExplorer": {"usage": 0.3, "other": 0.0},
+        },
+    }
+    _delivered(root, current)
+    [row] = cost(root)["current"]["usage_by_series"]
+    assert [p["product"] for p in row["products"]] == ["AmazonCloudWatch", "AWSCostExplorer"]
+
+
+def test_the_size_series_starts_on_the_trends_first_day(root: Path):
+    previous = september(
+        storage_daily={
+            "example-lake": {"TimedStorage-ByteHrs": {"2026-09-15": 3.0, "2026-09-16": 3.0}}
+        }
+    )
+    current = split_october(
+        storage_daily={"example-lake": {"TimedStorage-ByteHrs": {"2026-10-14": 3.0}}}
+    )
+    _delivered(root, current, previous=previous)
+    payload = cost(root)
+    assert payload["trend"][0]["day"] == "2026-09-16"
+    [bucket] = payload["s3"]
+    assert [p["day"] for p in bucket["size_series"]] == ["2026-09-16", "2026-10-14"]
+
+
+def test_a_payload_with_no_directory_has_empty_trend_fields(root: Path):
+    payload = cost(root)
+    assert payload["condition"] == "no_directory"
+    assert payload["trend_split"] is False
+    assert payload["trend_series"] == []
+    assert payload["trend_after"] == []
+
+
+def test_net_by_service_is_sorted_and_rounded(root: Path):
+    _delivered(root, split_october())
+    day = {row["day"]: row for row in cost(root)["trend"]}["2026-10-14"]
+    assert list(day["by_service"]) == sorted(day["by_service"])
+    assert day["by_service"]["AmazonEC2"] == -0.16
