@@ -150,6 +150,7 @@ def run_page(
     width: int = 640,
     resize_to: int = 0,
     observer: bool = False,
+    widths: dict[str, int] | None = None,
 ) -> dict:
     """Execute the page against ``payload`` and return the tree of each Cost section.
 
@@ -157,7 +158,7 @@ def run_page(
     leaves it out otherwise, so the page falls back to the window's resize event.
     """
     source = (
-        f"var __WIDTH = {width};\n"
+        f"var __WIDTH = {width};\nvar __WIDTHS = {json.dumps(widths or {})};\n"
         + "var __OBSERVERS = [];\nvar __OBSERVED = [];\n"
         + STUB.read_text(encoding="utf-8")
         + (OBSERVER if observer else "")
@@ -347,6 +348,9 @@ def test_a_chart_is_one_named_image_and_its_marks_take_no_focus(root: Path, tmp_
         assert chart["attrs"]["role"] == "img"
         assert chart["attrs"]["aria-label"].endswith("The figures are in the table below.")
         assert not [n for n in walk(chart) if "tabindex" in n.get("attrs", {})]
+        # Every node of the chart is SVG, which a browser draws only from that namespace.
+        svg_ns = "http://www.w3.org/2000/svg"
+        assert {n["ns"] for n in walk(chart) if n["tag"] != "#text"} == {svg_ns}
 
 
 def test_a_line_dated_after_the_window_is_named_beside_the_chart(root: Path, tmp_path: Path):
@@ -627,6 +631,21 @@ def test_a_chart_takes_its_containers_width(root: Path, tmp_path: Path, width: i
     for section in ("cost-services", "cost-trend"):
         [chart] = find(sections[section], "svg")
         assert chart["attrs"]["width"] == str(width)
+
+
+def test_every_chart_draws_at_the_panels_width(root: Path, tmp_path: Path):
+    """The width is read once, from the panel. A section's own box can read wider while a
+    classic scrollbar comes and goes mid-draw, and the charts must not follow it."""
+    storage = {"2026-10-01": 90 / 31, "2026-10-14": 93.1 / 31}
+    current = split_october(storage_daily={"example-lake": {"TimedStorage-ByteHrs": storage}})
+    file(root, "2026-10-16", entry("2026-10-16", "2026-10", "delivery", current=current))
+    wider = {"cost-services": 655, "cost-trend": 655, "cost-s3": 655}
+
+    sections = run_page(tmp_path, cost(root), width=640, widths=wider)
+
+    for section in ("cost-services", "cost-trend", "cost-s3"):
+        [chart] = find(sections[section], "svg")
+        assert chart["attrs"]["width"] == "640", section
 
 
 @pytest.mark.parametrize("observer", [True, False], ids=["ResizeObserver", "window resize"])

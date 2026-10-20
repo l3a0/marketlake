@@ -24,7 +24,8 @@
     /* The Cost panel's six chart series, in the slot order the cost query names (#921).
        The order and the light and dark steps passed the dataviz skill's palette validator
        for adjacent marks against #ffffff and #1e1e1e: credits, the sixth, sit next to the
-       first at the baseline. The light aqua, yellow and pink fall under 3:1 against
+       first at the baseline. The sixth keeps one step in both schemes, 3.37:1 against
+       #1e1e1e and 4.95:1 against white. The light aqua, yellow and pink fall under 3:1 against
        white, so every chart carries its numbers in a table as well. */
     --cost-1: #2a78d6;
     --cost-2: #eb6834;
@@ -1928,7 +1929,7 @@
       box.appendChild(figures);
     }
     if (current.usage_by_series && current.usage_by_series.length) {
-      box.appendChild(usageBars(current.usage_by_series, cost.currency, chartWidth(box)));
+      box.appendChild(usageBars(current.usage_by_series, cost.currency, lastCostWidth));
     } else if (lines) {
       box.appendChild(el("p", "No usage this month yet.", "empty"));
     }
@@ -2028,7 +2029,7 @@
       return;
     }
     box.appendChild(legend(cost.trend_series, true));
-    box.appendChild(trendChart(cost, chartWidth(box)));
+    box.appendChild(trendChart(cost, lastCostWidth));
     box.appendChild(trendTable(cost));
   }
 
@@ -2061,7 +2062,7 @@
       }
       var points = bucket.size_series || [];
       if (points.length >= 2) {
-        box.appendChild(sizeChart(bucket, chartWidth(box)));
+        box.appendChild(sizeChart(bucket, lastCostWidth));
         box.appendChild(tableToggle("size " + bucket.bucket, ["Day", "Billed size"],
           points.map(function (p) { return [p.day, gbText(p.gb)]; })));
       }
@@ -2085,7 +2086,10 @@
     });
   }
 
-  // The last payload drawn and the width it was drawn at, so a resize can redraw it.
+  // The last payload drawn and the width it was drawn at, so a resize can redraw it. The
+  // width is read once, from the panel, before anything is cleared, and every chart draws
+  // at it. Reading each section's own box as it fills would let a classic scrollbar that
+  // comes and goes mid-draw leave the charts at different widths.
   var lastCost = null;
   var lastCostWidth = null;
 

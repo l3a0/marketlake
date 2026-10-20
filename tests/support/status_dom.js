@@ -9,8 +9,10 @@
 // Plain ES5 that assumes nothing about its host, so `node` and `osascript -l
 // JavaScript` both run it. An element the page asks for by id is created on demand,
 // as the board's stub does, since the page's static markup is not parsed here.
-// `__WIDTH` is the width every element reports, which the page's charts size to.
+// `__WIDTH` is the width every element reports, which the page's charts size to, unless
+// `__WIDTHS` names a width for that element's id.
 var __WIDTH = typeof __WIDTH === "number" ? __WIDTH : 640;
+var __WIDTHS = typeof __WIDTHS === "object" ? __WIDTHS : {};
 
 function __Node(tag, ns) {
   this.tagName = tag;
@@ -20,7 +22,7 @@ function __Node(tag, ns) {
   this.attributes = {};
   this.listeners = {};
   this.style = {};
-  this.className = "";
+  this._class = "";
   this.title = "";
   this.hidden = false;
   this.open = false;
@@ -28,12 +30,12 @@ function __Node(tag, ns) {
   var self = this;
   this.classList = {
     add: function (name) {
-      var names = self.className ? self.className.split(/\s+/) : [];
+      var names = self._class ? self._class.split(/\s+/) : [];
       if (names.indexOf(name) < 0) { names.push(name); }
-      self.className = names.join(" ");
+      self._class = names.join(" ");
     },
     remove: function (name) {
-      self.className = (self.className ? self.className.split(/\s+/) : [])
+      self._class = (self._class ? self._class.split(/\s+/) : [])
         .filter(function (n) { return n !== name; }).join(" ");
     },
     toggle: function (name, on) {
@@ -43,10 +45,19 @@ function __Node(tag, ns) {
       return on;
     },
     contains: function (name) {
-      return (self.className ? self.className.split(/\s+/) : []).indexOf(name) >= 0;
+      return (self._class ? self._class.split(/\s+/) : []).indexOf(name) >= 0;
     }
   };
 }
+// An SVG element's ``className`` is an SVGAnimatedString in a browser, and assigning it
+// throws under the page's "use strict", so here too it can be read and never assigned.
+Object.defineProperty(__Node.prototype, "className", {
+  get: function () { return this._class; },
+  set: function (value) {
+    if (this.namespaceURI) { throw new TypeError("className is read-only on an SVG element"); }
+    this._class = String(value);
+  }
+});
 Object.defineProperty(__Node.prototype, "firstChild", {
   get: function () { return this.childNodes.length ? this.childNodes[0] : null; }
 });
@@ -59,7 +70,9 @@ Object.defineProperty(__Node.prototype, "children", {
   get: function () { return this.childNodes.filter(function (n) { return n.tagName !== "#text"; }); }
 });
 Object.defineProperty(__Node.prototype, "clientWidth", {
-  get: function () { return __WIDTH; }
+  get: function () {
+    return Object.prototype.hasOwnProperty.call(__WIDTHS, this.id) ? __WIDTHS[this.id] : __WIDTH;
+  }
 });
 Object.defineProperty(__Node.prototype, "textContent", {
   get: function () {
@@ -99,7 +112,7 @@ __Node.prototype.removeChild = function (child) {
 };
 __Node.prototype.setAttribute = function (name, value) {
   this.attributes[name] = String(value);
-  if (name === "class") { this.className = String(value); }
+  if (name === "class") { this._class = String(value); }
 };
 __Node.prototype.getAttribute = function (name) {
   if (name === "class") { return this.className || null; }
@@ -159,7 +172,7 @@ var window = {
 // The tree under a node as plain data, for the driver to print as JSON.
 function __dump(node) {
   if (node.tagName === "#text") { return { tag: "#text", text: node._text }; }
-  var out = { tag: node.tagName, cls: node.className, attrs: node.attributes,
+  var out = { tag: node.tagName, ns: node.namespaceURI, cls: node.className, attrs: node.attributes,
     title: node.title, style: node.style, open: node.open, children: [] };
   if (node.id) { out.id = node.id; }
   node.childNodes.forEach(function (child) { out.children.push(__dump(child)); });
