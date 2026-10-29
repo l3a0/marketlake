@@ -356,11 +356,22 @@ let CHAIN_ESC = null;
 /* marketlake: the milestone filter. MS_PREF is what the reader chose, kept per
    browser. MS is what the page draws, which falls back to the default whenever
    the choice names a milestone the tracker no longer carries, without
-   forgetting the choice. The default is MVP 2 while that milestone has open
-   issues, and every milestone otherwise. The filter decides only what is drawn.
+   forgetting the choice. The default is the lowest-numbered "MVP <n>" milestone
+   that has open issues, which is the open MVP, and every milestone when none has.
+   The number is compared as a number, so MVP 10 comes after MVP 9. The filter
+   decides only what is drawn.
    Depth, blockers and the tracer still read the whole tracker, so a card keeps
    its column and its "waits on" line when its blocker sits in another milestone. */
-const MS_ALL = "All", MS_DEFAULT = "MVP 2", MS_KEY = "marketlake-board-ms";
+const MS_ALL = "All", MS_KEY = "marketlake-board-ms";
+const mvpNumber = name => {
+  const m = /^MVP (\d+)$/.exec(String(name));
+  return m ? Number(m[1]) : null;
+};
+const msDefault = names => {
+  const mvps = names.filter(n => mvpNumber(n) !== null)
+    .sort((a, b) => mvpNumber(a) - mvpNumber(b));
+  return mvps.length ? mvps[0] : MS_ALL;
+};
 let MS_PREF = null;
 try { MS_PREF = localStorage.getItem(MS_KEY); } catch (e) { MS_PREF = null; }
 let MS = MS_ALL;
@@ -531,7 +542,7 @@ function msbar() {
   const names = [...counts.keys()].sort((a, b) =>
     (a === "no milestone") - (b === "no milestone") || String(a).localeCompare(String(b)));
   const valid = MS_PREF === MS_ALL || counts.has(MS_PREF);
-  MS = valid ? MS_PREF : (counts.has(MS_DEFAULT) ? MS_DEFAULT : MS_ALL);
+  MS = valid ? MS_PREF : msDefault(names);
   const shown = MS === MS_ALL ? TRACKER.length : counts.get(MS);
   const sel = document.getElementById("mssel");
   if (sel) {

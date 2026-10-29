@@ -298,11 +298,40 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         "the stamp above rather than live."
     )
     assert "Measured by hand" not in foot
+
     assert foot.endswith(
         "The In flight section decays fastest: a check that has gone green or red since "
         "then still reads here as it read then and a review posted since then still reads "
         "as owed."
     )
+
+
+@pytest.mark.parametrize(
+    ("milestones", "chosen"),
+    [
+        (["MVP 4", "MVP 4", "no milestone"], "MVP 4"),
+        (["MVP 10", "MVP 9", "no milestone"], "MVP 9"),
+        (["MVP 4", "MVP 3", "no milestone"], "MVP 3"),
+        (["MVP 4b", "MVPs", "no milestone"], "All"),
+        (["no milestone", "no milestone", "no milestone"], "All"),
+    ],
+    ids=["one open MVP", "a number, not text", "the lowest open MVP", "no MVP name", "none"],
+)
+def test_the_page_opens_on_the_open_mvp_milestone(
+    tmp_path: Path, milestones: list[str], chosen: str
+) -> None:
+    """The default is the lowest-numbered "MVP <n>" with open issues, compared as a number.
+
+    MVP 2 closed on 2026-10-19 and the page kept defaulting to it by name, so it opened on
+    "All" while MVP 4 was the open milestone. Each card's milestone here is a literal, so
+    no constant the page reads can move the fixture with it.
+    """
+    document = board()
+    document["tracker"] = [
+        {**card, "ms": ms} for card, ms in zip(document["tracker"], milestones, strict=True)
+    ]
+    result = run_page(tmp_path, [served(document)])
+    assert result["ids"]["mssel"]["value"] == chosen
 
 
 def test_a_board_with_nothing_in_flight_names_no_decay(tmp_path: Path) -> None:
