@@ -33,12 +33,13 @@ The document keeps the flat shape the page already reads::
    ``band`` is 0 in every entry, because the order alone ranks a card. A ``Board
    after:`` line in the body sets the tracker card's ``after``.
 
-The ``board-markers`` skill states what a session sets and when. Issue 873 moved
-those judgements onto GitHub. A marker line the strict grammar fails, two values
-that disagree, a line someone other than the owner wrote, and a verdict or order
-on a card that cannot carry one never stop the run. Each goes to the job summary,
-which names the issue and the marker's kind and never the line's text, because a
-refused line is a stranger's and the summary reaches a session's context.
+The ``l3a0`` plugin's ``update-build-board`` skill states what a session sets and
+when. Issue 873 moved those judgements onto GitHub. A marker line the strict
+grammar fails, two values that disagree, a line someone other than the owner
+wrote, and a verdict or order on a card that cannot carry one never stop the run.
+Each goes to the job summary, which names the issue and the marker's kind and never
+the line's text, because a refused line is a stranger's and the summary reaches a
+session's context.
 
 Two rules exist because the repository is public.
 
@@ -92,11 +93,12 @@ SCHEMA = 1
 PART_OF = re.compile(r"\bPart of #(\d+)\b")
 
 # The lines and labels a session sets for the judgements the page draws, as the
-# board-markers skill states them. They are l3a0/quantitative-trading's grammar:
-# case-sensitive, one ASCII space after the colon, and spaces or tabs allowed before
-# and after. Each is anchored at the start of a line, so prose quoting one mid-sentence
-# is not one. A verdict reads "Board verdict: build after 5 passes", or "decide" for a
-# loop that ended on a question only the owner can answer.
+# l3a0 plugin's update-build-board skill states them. They are
+# l3a0/quantitative-trading's grammar: case-sensitive, one ASCII space after the
+# colon, and spaces or tabs allowed before and after. Each is anchored at the start
+# of a line, so prose quoting one mid-sentence is not one. A verdict reads "Board
+# verdict: build after 5 passes", or "decide" for a loop that ended on a question
+# only the owner can answer.
 VERDICT = re.compile(
     r"^[ \t]*Board verdict: (build|decide) after (\d+) pass(?:es)?\.?[ \t]*$", re.MULTILINE
 )
@@ -136,8 +138,8 @@ ISSUE_URL = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull)/(
 REPO_REF = re.compile(r"(?<![\w.-])([\w.-]+/[\w.-]+)#(\d{1,15})\b")
 BARE_REF = re.compile(r"(?<![\w/.-])#(\d{1,15})\b")
 
-# The heading each plan-audit pass opens with, per the board-markers skill. A pass
-# newer than an issue's newest verdict is a plan that finished with no verdict.
+# The heading each plan-audit pass opens with, per the update-build-board skill. A
+# pass newer than an issue's newest verdict is a plan that finished with no verdict.
 PASS_HEADING = re.compile(r"^[ \t]*## Plan audit, pass \d+", re.MULTILINE)
 
 # The marker that closes a review, per `CLAUDE.md` under "Pull requests". The whole
@@ -152,8 +154,8 @@ NOT_REVIEWED = "no Review complete marker since the head commit"
 BOARD_JOBS = frozenset({"board-build", "board-deploy"})
 BOARD_APP = "github-actions"
 
-# The five words step 3 of the sync-prune-next skill lists. A check run that has not
-# completed is `running` whatever its conclusion says, and any state not named here,
+# The five words the update-build-board skill lists under `rollup`. A check run that
+# has not completed is `running` whatever its conclusion says, and any state not named here,
 # including one GitHub adds later, is `neutral`, which the page reads as unsettled.
 CHECK_WORD = {
     "SUCCESS": "success",

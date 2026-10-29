@@ -166,7 +166,7 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
   `lake_root`, so a reviewed pull request is the one way they change.
 - `.tool-versions` pins the `uv` version that CI and the VM's bootstrap install.
-- `.claude/skills/sync-prune-next/` holds the sync skill and the build board. Its
+- `.claude/skills/sync-prune-next/` holds the build board. Its
   `board.html` is the board's page, `favicon.ico` is its tab icon, `build_board.py`
   builds the page's `board.json` from GitHub, and `dom-stub.js` stands in for a browser
   when the tests run the page.
@@ -174,10 +174,14 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   `python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico`
   renders it. Rerun that command after changing the icon.
   CI lints the Python there and the tests load it.
-- `.claude/skills/board-markers/` holds the skill stating what a session sets on GitHub
-  for the build board, and when: the `working:` labels, the `Board verdict:` comment
-  line, and the `Board order:` and `Board after:` body lines that `build_board.py`
-  reads.
+  The skills that use the board come from the owner's `l3a0` Claude Code plugin,
+  [l3a0/claude-plugins](https://github.com/l3a0/claude-plugins), rather than from this
+  repository. `/l3a0:update-build-board` states what a session sets on GitHub for the
+  board, and when: the `working:` labels, the `Board verdict:` comment line, and the
+  `Board order:` and `Board after:` body lines that `build_board.py` reads.
+  `/l3a0:sync-prune-next` runs the status round that prunes finished worktrees, checks
+  the board and says what to take next. The folder keeps its old name because the
+  plugin finds this repository's board by the generator's path.
 - `.github/workflows/board.yml` runs `build_board.py` and publishes the page, its
   icon and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its
   `on:` block lists what starts a run, and a submitted review starts none.
