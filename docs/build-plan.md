@@ -6,7 +6,11 @@ Status: PLAN, 2026-08-26. The slice build closed on 2026-10-05.
 
 ## MVP milestones
 
-On 2026-10-05 deliverables D0 through D21 had shipped, and the owner closed the slice milestones. A milestone now exists only for an MVP deliverable, the next step on the shortest path to a product someone can use. The open one is [MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5), and its description says when it is done.
+On 2026-10-05 deliverables D0 through D21 had shipped, and the owner closed the slice milestones. A milestone now exists only for an MVP deliverable, the next step on the shortest path to a product someone can use. This section is the one place that names them, so the next MVP changes one line here. The [open milestones](https://github.com/l3a0/marketlake/milestones?state=open) are the authority.
+
+1. [MVP 2, capture on a hosted VM](https://github.com/l3a0/marketlake/milestone/5), opened 2026-10-05 and closed 2026-10-19.
+2. [MVP 3, see what the lake costs](https://github.com/l3a0/marketlake/milestone/6), opened 2026-10-16 and closed 2026-10-20.
+3. [MVP 4, serve ithildin-runtime its bars](https://github.com/l3a0/marketlake/milestone/7), opened 2026-10-29 and open. Its description says what it is for.
 
 The milestone lists the work, and each issue's blocked-by links give the order. This plan restates neither, because a copied list goes stale the first time an issue joins the milestone. The filing rule in `CLAUDE.md` says which issues join a milestone and which carry `deferred`.
 
