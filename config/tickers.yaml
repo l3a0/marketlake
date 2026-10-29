@@ -1,5 +1,6 @@
 GLD:
   bars:
+  - 1m
   - 1d
   options: false
 QQQ:
@@ -16,5 +17,6 @@ SPY:
   options: true
 USO:
   bars:
+  - 1m
   - 1d
   options: false
