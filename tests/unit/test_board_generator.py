@@ -156,7 +156,7 @@ def test_entries_sort_by_issue_then_by_pull_request() -> None:
     ],
 )
 def test_the_milestone_is_its_title_up_to_the_first_comma(title: str | None, expected: str) -> None:
-    """The page's default view selects "MVP 2", so the full title would switch it to All."""
+    """The page's default view matches the short name "MVP <n>", so a full title never matches."""
     assert card(build(FakeGitHub([issue(1, milestone=title)])), 1)["ms"] == expected
 
 
