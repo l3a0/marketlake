@@ -2601,11 +2601,11 @@ left AWS.
 [#867](https://github.com/l3a0/marketlake/issues/867) added the role `marketlake-scheduler`, the
 apply role's two statements that let it write the start schedules and pass that role, and
 a third that passes `marketlake-instance` only to EC2, in place of the unconditioned
-`iam:PassRole` that `InstanceRoleWrite` carried. No other open issue on the MVP 2 path
-changes `infra/bootstrap/`.
+`iam:PassRole` that `InstanceRoleWrite` carried. No other issue on the MVP 2 path changed
+`infra/bootstrap/`.
 
-[#912](https://github.com/l3a0/marketlake/issues/912), on the MVP 3 path, adds the
-variable `billing_bucket` and changes both CI roles.
+[#912](https://github.com/l3a0/marketlake/issues/912), on the MVP 3 path, added the
+variable `billing_bucket` and changed both CI roles.
 
 1. The apply role gains five statements, appended after the last one: a Deny on the
    billing bucket's objects, `s3:CreateBucket` and `s3:PutBucketPolicy` on the billing
