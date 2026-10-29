@@ -13,9 +13,10 @@ D0 through D21, and points at the MVP milestone that holds current work.
 ## Status
 
 The slice build closed on 2026-10-05. Current work is the
-[MVP 2](https://github.com/l3a0/marketlake/milestone/5) milestone, capture on a hosted VM.
-The AWS resources it needs are code under `infra/`, written for
-[OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
+[MVP 4](https://github.com/l3a0/marketlake/milestone/7) milestone, serve ithildin-runtime
+its bars. Before it, [MVP 2](https://github.com/l3a0/marketlake/milestone/5), capture on a
+hosted VM, closed on 2026-10-19. The AWS resources MVP 2 needed are code under `infra/`,
+written for [OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
 except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
 bucket, the instance role, the laptop's one IAM user, `marketlake-command`, with the two
@@ -45,8 +46,8 @@ once the owner creates its switch file
 ([#868](https://github.com/l3a0/marketlake/issues/868)). The schedule that starts it again
 each morning is [#867](https://github.com/l3a0/marketlake/issues/867).
 
-[MVP 3](https://github.com/l3a0/marketlake/milestone/6), see what the lake costs, is open
-beside it. On a host whose `config.yaml` names `cost_export`, the 18:30 sweep reads the AWS
+[MVP 3](https://github.com/l3a0/marketlake/milestone/6), see what the lake costs, closed on
+2026-10-20. On a host whose `config.yaml` names `cost_export`, the 18:30 sweep reads the AWS
 cost and usage export each night and files a summary under `reports/aws_cost/`, and the
 dashboard's Cost panel shows it ([#913](https://github.com/l3a0/marketlake/issues/913)).
 The export and its billing bucket are [#912](https://github.com/l3a0/marketlake/issues/912).
