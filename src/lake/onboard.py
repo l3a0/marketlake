@@ -278,7 +278,9 @@ def _record_first_requests(
     """Send the first snapshot's requests to the timing file, once the snapshot landed.
 
     The lines go under the minute the snapshot lands at, the same as a loop cycle's, and
-    only after it landed. A refused onboarding writes nothing to the lake, and the
+    only after it landed. The file is the one for that minute's Eastern date, the date
+    ``journal_snapshot`` files the segment under, so the lines and the segment agree on
+    which session the snapshot belongs to. A refused onboarding writes nothing to the lake, and the
     refusal tests assert that no ``journal/`` exists afterwards, so a refused snapshot's
     requests go unrecorded. The price is that the one onboarding most worth taking apart,
     a chain rejected on every window, leaves only its refusal message.
@@ -289,7 +291,7 @@ def _record_first_requests(
     capture.record_requests(
         lake_root,
         snap_ts=first_slot,
-        day=first_slot.date(),
+        day=_market_date(first_slot),
         records=records,
         where=f"onboarding {ticker}",
     )
@@ -645,15 +647,17 @@ def onboard(
         # for a whole chain exceeds Schwab's gateway body limit, which is a 502, so the
         # anchor tickers could not be onboarded at all until this fetched by the plan.
         #
-        # ``day`` is the clock's date, never the epoch's. It decides which windows are
-        # planned, and the rows land under ``cycle_start``'s own date because that is
-        # what ``journal_snapshot`` places the segment by. A backdated ``--capture-start``
-        # must not move the windows away from the day being captured.
+        # ``day`` is the Eastern date of the clock's now, never the epoch's. It decides
+        # which windows are planned, and the rows land under the same date because that
+        # is what ``journal_snapshot`` places the segment by. A backdated
+        # ``--capture-start`` must not move the windows away from the day being captured,
+        # and neither may the UTC date, which is already tomorrow's from 20:00 EDT
+        # (marketlake #930).
         fetched = capture.fetch_chain(
             clock,
             vendor,
             ticker,
-            day=cycle_start.date(),
+            day=_market_date(cycle_start),
             lake_root=lake_root,
             plan=plan if plan is not None else DEFAULT_CHAIN_PLAN,
             guards=guards if guards is not None else GuardConstants(),

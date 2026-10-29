@@ -1717,13 +1717,13 @@ def list_chain_cycles(
 
     **A cycle whose ET instant falls on another date is not listed.** ``snap`` is a
     wall-clock minute read against the session date, so an instant on any other date has
-    no ``HH:MM`` that names it and ``load_chain`` cannot return it. Onboarding makes this
-    real rather than hypothetical: it journals its first chain snapshot under the session
-    date at whatever hour it runs, and the live lake holds one stamped 03:25Z under
-    ``date=2026-09-16``, which is 23:25 ET on 2026-09-15. Such a cycle carries the
-    previous session's quotes, so a reader asking what changed during this session is
-    right not to see it, but the reason it does not is this rule rather than that
-    judgement. The count of what was dropped is not returned, because a caller that could
+    no ``HH:MM`` that names it and ``load_chain`` cannot return it. Onboarding made this
+    real rather than hypothetical: until marketlake #930 it journaled its first chain
+    snapshot under the UTC date at whatever hour it ran, and the live lake holds one
+    stamped 03:25Z under ``date=2026-09-16``, which is 23:25 ET on 2026-09-15. Such a
+    cycle carries the previous session's quotes, so a reader asking what changed during
+    this session is right not to see it, but the reason it does not is this rule rather
+    than that judgement. The count of what was dropped is not returned, because a caller that could
     act on it would need the instants, which is a door this one is not.
     """
     day_text = day.isoformat() if isinstance(day, date) else str(day)
