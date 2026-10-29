@@ -9,9 +9,9 @@ the quarantine exclusion, which is the whole reason #137 sits in slice 4.
 One rule here is worth a test of its own rather than a line in a docstring. ``snap`` is a
 wall-clock minute read against the session date, so a cycle whose Eastern instant falls on
 another date has no ``HH:MM`` that names it and ``load_chain`` cannot return it. Onboarding
-makes that real: it journals its first chain snapshot under the session date at whatever
-hour it runs, and the live lake holds one stamped 03:25Z under ``date=2026-09-16``, which
-is 23:25 Eastern on 2026-09-15.
+made that real: until marketlake #930 it journaled its first chain snapshot under the UTC
+date at whatever hour it ran, and the live lake holds one stamped 03:25Z under
+``date=2026-09-16``, which is 23:25 Eastern on 2026-09-15.
 """
 
 from __future__ import annotations
@@ -129,7 +129,8 @@ def test_a_session_of_gap_rows_lists_nothing(fixture_lake: FixtureLake):
 
 
 def test_a_cycle_stamped_on_another_date_is_not_listed(fixture_lake: FixtureLake):
-    """Onboarding's shape. 03:25Z under this session date is 23:25 Eastern the day before.
+    """The shape onboarding wrote until marketlake #930. 03:25Z under this session date is
+    23:25 Eastern the day before.
 
     No ``HH:MM`` on 2026-09-14 names that instant, so ``load_chain`` cannot return it and
     listing it would hand a walker a minute that resolves to a different cycle or to

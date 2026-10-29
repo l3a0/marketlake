@@ -31,7 +31,9 @@ The slice-1 steps, in order.
    around the request. The chain branch takes that pair from ``fetch_chain``, which
    stamps it around the whole windowed fetch, so the journaled round trip covers every
    window. The quote branch stamps its own pair around its one call. Both read the
-   injected clock.
+   injected clock. The snapshot files under the Eastern date of that minute, the session
+   it belongs to, and the command refuses before the fetch when compaction would lose
+   it from that date, which ``_refuse_a_date_compaction_loses`` says in full.
 3. *Write the roster entry.* The command writes the entry into this host's
    ``tickers.yaml`` in ``~/.config/marketlake/``. The reviewed roster is the repository's
    ``config/tickers.yaml``, which ``python -m lake.roster apply`` copies onto each host,
@@ -136,8 +138,8 @@ becomes an added step here without reshaping the flow.
   and fold its verdict into the report. Here only the single real-time entitlement
   precondition is checked, which is the one gate the design names for slice 1.
 
-Every dependency is injected: the clock, the vendor, the chain plan, and the guard
-constants. The plan and the guards default to their own in-memory constants rather than
+Every dependency is injected: the clock, the vendor, the calendar, the chain plan, and
+the guard constants. The plan and the guards default to their own in-memory constants rather than
 to a file read, so a caller naming only the clock and the vendor still runs offline. The
 whole flow therefore needs no network, no real token, and no wall-clock read. The one
 exception is the command line's own ``--capture-start`` check, which asks what time it is
@@ -155,11 +157,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 from lake import capture, capture_spans, journal, security_master
-from lake.calendar import MARKET_TZ
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.chain_plan import DEFAULT_CHAIN_PLAN, ChainPlan, load_chain_plan
 from lake.clock import Clock, SystemClock
 from lake.config import GuardConstants, input_errors_exit, load_config
-from lake.manifest import record_partition
+from lake.manifest import latest_entries, record_partition
+from lake.paths import LakePaths
 from lake.security_master import ID_TYPE_TICKER, KIND_EQUITY, SecurityMaster
 from lake.tickers import upsert_ticker
 from lake.timing import RequestRecord
@@ -378,6 +381,47 @@ def _market_date(instant: datetime) -> date:
     return instant.astimezone(MARKET_TZ).date()
 
 
+def _refuse_a_date_compaction_loses(
+    lake_root: Path, ticker: str, surface: str, day: date, calendar: Calendar
+) -> None:
+    """Refuse a first snapshot that would land under a date compaction loses it from.
+
+    The snapshot files under the Eastern date of the clock's now, the session it belongs
+    to (marketlake #930). Two such dates would lose it, so both are refused here, ahead of
+    the vendor call and ahead of every write, the same as the epoch refusals.
+
+    1. A date that is not a session. Compaction skips it on every run, so the segment is
+       never sealed and no reader sees it. A Sunday evening, when the VM is up for the
+       canary, is one.
+    2. A date whose partition for this ticker and surface is already in the manifest.
+       Compaction reads every segment left beside a sealed partition as a crash's
+       leftover and deletes it unread (marketlake #935). The roster's capture keeps an
+       enabled ticker the master cannot resolve, so a ticker deployed on an earlier night
+       has its day sealed at close+15 before its first onboard. An evening onboard of it
+       lands here, and so does an evening re-onboard of any live ticker.
+
+    The date comes from the clock's first read, and the snapshot takes its own from a
+    later read, after the vendor round trip. So an onboard that straddles midnight ET, or
+    that writes its segment while close+15 is sealing that day, can still land where this
+    did not look. #935's guard in compaction is what covers that, for every writer.
+    """
+    if not calendar.is_session(day):
+        raise OnboardError(
+            f"the first snapshot for {ticker} would file under {day.isoformat()}, which is "
+            "not a session, so compaction would never seal it. Onboard on a session day "
+            "instead, before that day's close+15 for a ticker the lake already captures."
+        )
+    paths = LakePaths(lake_root)
+    partition = paths.partition_path(surface, ticker, day).relative_to(lake_root).as_posix()
+    if partition in latest_entries(lake_root):
+        raise OnboardError(
+            f"the first snapshot for {ticker} would file under {day.isoformat()}, and "
+            f"{partition} is already sealed, so compaction would delete the snapshot as a "
+            "crash's leftover (marketlake #935). Onboard on the next session day, before "
+            "its close+15, such as between 07:30 and 09:30 ET on the VM."
+        )
+
+
 def _parse_capture_start(text: str) -> datetime:
     """Parse and check the ``--capture-start`` argument. ``argparse`` calls this.
 
@@ -564,6 +608,7 @@ def onboard(
     plan: ChainPlan | None = None,
     guards: GuardConstants | None = None,
     pid: int | None = None,
+    calendar: Calendar | None = None,
 ) -> OnboardReport:
     """Onboard one ticker into the lake and return its sign-off report.
 
@@ -590,6 +635,10 @@ def onboard(
     daemon reaches directly. Doing it here would put a config-directory read inside the
     one function built to need nothing. ``onboard_from_config`` is where the real plan is
     loaded and passed in.
+
+    ``calendar`` decides whether the snapshot's Eastern date is a session, and defaults to
+    the exchange's own ``ExchangeCalendar``, which reads the installed calendar package and
+    nothing on this machine.
     """
     lake_root = Path(lake_root)
     now = clock.now()
@@ -631,6 +680,13 @@ def onboard(
         # value, so it is what owes the duplicate-symbol guard. An omitted epoch resolves
         # at the clock's own date and leaves the idempotent re-onboard exactly as it was.
         _refuse_a_second_epoch(preflight, ticker)
+    _refuse_a_date_compaction_loses(
+        lake_root,
+        ticker,
+        journal.CHAINS_SURFACE if options else journal.QUOTES_SURFACE,
+        _market_date(now),
+        calendar if calendar is not None else ExchangeCalendar(),
+    )
 
     # The first snapshot proves the real-time entitlement before the ticker is trusted.
     # It is stamped like a capture cycle so it can be journaled as the first cycle:

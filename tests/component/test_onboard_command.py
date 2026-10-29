@@ -594,6 +594,12 @@ _SESSION_DATE_CASES = [
     pytest.param(
         datetime(2026, 10, 31, 0, 30, tzinfo=UTC), date(2026, 10, 30), id="friday-evening"
     ),
+    # 00:30 EDT on Friday 2026-10-30, just past midnight. A fixed five-hour offset, which is
+    # right all winter, reads this as Thursday, so this case is the summer half of the
+    # Monday case below.
+    pytest.param(
+        datetime(2026, 10, 30, 4, 30, tzinfo=UTC), date(2026, 10, 30), id="friday-after-midnight"
+    ),
     # 08:00 EDT on Thursday 2026-10-29, before the open, where the two dates agree.
     pytest.param(
         datetime(2026, 10, 29, 12, 0, tzinfo=UTC), date(2026, 10, 29), id="thursday-morning"
@@ -710,6 +716,103 @@ def test_a_friday_evening_snapshot_is_one_compaction_seals(lake_root, tmp_path):
 
     assert [day for day, _ in eligible] == [date(2026, 10, 30)]
     assert skipped == []
+
+
+def _seal(lake_root: Path, surface: str, ticker: str, day: date) -> None:
+    """Record ``ticker``'s partition for ``day`` in the manifest, as close+15 does."""
+    append_manifest(
+        lake_root,
+        partition=(
+            LakePaths(lake_root).partition_path(surface, ticker, day).relative_to(lake_root)
+        ).as_posix(),
+        source="compaction",
+        sha256="0" * 64,
+        rows=1,
+        fetched_at=datetime(2026, 10, 28, 20, 30, tzinfo=UTC).isoformat(),
+    )
+
+
+def _assert_nothing_onboarded(lake_root: Path, tickers_path: Path) -> None:
+    """No roster entry, no master, no span and no segment: the refusal came first."""
+    assert not tickers_path.exists()
+    assert not master_path(lake_root).exists()
+    assert not spans_path(lake_root).exists()
+    assert not list((lake_root / "journal").rglob("*.arrows"))
+
+
+@pytest.mark.parametrize(
+    ("surface", "options"),
+    [(journal.QUOTES_SURFACE, False), (journal.CHAINS_SURFACE, True)],
+    ids=["quotes", "chains"],
+)
+def test_an_onboard_into_a_day_already_sealed_is_refused_and_writes_nothing(
+    lake_root, tmp_path, surface, options
+):
+    """A snapshot filed beside a sealed partition is one compaction would delete.
+
+    Compaction reads a segment beside a sealed partition as a crash's leftover and unlinks
+    it unread (marketlake #935). The capture loop keeps a rostered ticker before its first
+    onboard, so Wednesday's partition is already sealed by 20:30 ET, and the onboard has to
+    refuse before it spends a request or writes anything.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    _seal(lake_root, surface, "QQQ", date(2026, 10, 28))
+
+    with pytest.raises(OnboardError, match="already sealed"):
+        onboard(
+            "QQQ",
+            clock=ManualClock(start=datetime(2026, 10, 29, 0, 30, tzinfo=UTC)),
+            vendor=_NoCallVendor(),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=options,
+        )
+
+    _assert_nothing_onboarded(lake_root, tickers_path)
+
+
+def test_a_sealed_partition_on_the_other_surface_refuses_nothing(lake_root, tmp_path):
+    """Only the surface the snapshot lands on decides, so a sealed quotes day lets chains in."""
+    _seal(lake_root, journal.QUOTES_SURFACE, "SPY", date(2026, 10, 28))
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=datetime(2026, 10, 29, 0, 30, tzinfo=UTC)),
+        vendor=_chain_vendor_for(date(2026, 10, 28)),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.snapshot_segment.startswith("journal/date=2026-10-28/surface=chains/")
+
+
+@pytest.mark.parametrize(
+    ("now", "day"),
+    [
+        # 20:00 EST on Sunday 2026-11-01, while the VM is up for the canary.
+        pytest.param(datetime(2026, 11, 2, 1, 0, tzinfo=UTC), "2026-11-01", id="sunday-evening"),
+        # 10:00 EST on Thanksgiving, 2026-11-26, a weekday with no session.
+        pytest.param(datetime(2026, 11, 26, 15, 0, tzinfo=UTC), "2026-11-26", id="holiday"),
+    ],
+)
+def test_an_onboard_on_a_day_with_no_session_is_refused_and_writes_nothing(
+    lake_root, tmp_path, now, day
+):
+    """A snapshot filed under a date that is not a session is one compaction never seals."""
+    tickers_path = tmp_path / "tickers.yaml"
+
+    with pytest.raises(OnboardError, match=f"under {day}, which is not a session"):
+        onboard(
+            "QQQ",
+            clock=ManualClock(start=now),
+            vendor=_NoCallVendor(),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=False,
+        )
+
+    _assert_nothing_onboarded(lake_root, tickers_path)
 
 
 def test_an_epoch_after_now_is_refused_and_writes_nothing(lake_root, tmp_path, capsys):
@@ -1218,8 +1321,8 @@ def test_a_chain_with_no_contract_refuses_rather_than_pinning_a_zero_anchor(lake
 def test_a_backdated_epoch_plans_the_same_windows_as_a_run_without_one(lake_root, tmp_path):
     """The windows come off the clock's date, never the epoch's.
 
-    ``--capture-start`` can put the epoch a week back, and it is an Eastern date besides,
-    while the rows land under the clock's own UTC date. Planning the windows against the
+    ``--capture-start`` can put the epoch a week back, while the rows land under the
+    Eastern date of the clock's now. Planning the windows against the
     epoch would ask for ranges nothing in the day being captured falls in, and the fetch
     would answer that as a chain whose every window failed.
     """
