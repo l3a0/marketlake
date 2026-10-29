@@ -34,7 +34,10 @@ The document keeps the flat shape the page already reads::
    after:`` line in the body sets the tracker card's ``after``.
 
 The ``l3a0`` plugin's ``update-build-board`` skill states what a session sets and
-when. Issue 873 moved those judgements onto GitHub. A marker line the strict
+when, and its ``## Generator compatibility`` names the commit of this file whose
+formats it matches. So a change to a marker regex, a label list or a query field
+ships with an l3a0/claude-plugins release that updates that skill, in the same step.
+Issue 873 moved those judgements onto GitHub. A marker line the strict
 grammar fails, two values that disagree, a line someone other than the owner
 wrote, and a verdict or order on a card that cannot carry one never stop the run.
 Each goes to the job summary, which names the issue and the marker's kind and never

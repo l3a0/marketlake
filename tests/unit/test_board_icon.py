@@ -6,7 +6,7 @@ grid, the ink and the command-line contract are each a value or a pure function,
 tier is unit. Two cases touch the filesystem, and neither crosses a subsystem boundary.
 
 1. The command-line case writes one file to a temporary directory.
-2. The pixel case reads the shipped icon beside the skill, as bytes.
+2. The pixel case reads the shipped icon beside the board's page, as bytes.
 
 The golden test, which compares the shipped file with ``render_board`` byte for byte,
 lives in ``tests/component/test_board_page.py`` with the board's other icon checks.
