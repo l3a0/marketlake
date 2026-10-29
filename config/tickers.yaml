@@ -1,3 +1,8 @@
+GLD:
+  bars:
+  - 1m
+  - 1d
+  options: false
 QQQ:
   bars:
   - 1m
@@ -10,3 +15,8 @@ SPY:
   - 1d
   chain_cadence: 1m
   options: true
+USO:
+  bars:
+  - 1m
+  - 1d
+  options: false
