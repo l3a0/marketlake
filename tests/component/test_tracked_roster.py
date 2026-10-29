@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from lake.tickers import TickerConfig, load_tickers
+from lake.vendor import BAR_FREQS
 
 ROOT = Path(__file__).resolve().parents[2]
 TRACKED_ROSTER = ROOT / "config" / "tickers.yaml"
@@ -24,6 +25,11 @@ TRACKED_ROSTER = ROOT / "config" / "tickers.yaml"
 # The keys an entry may carry, written out rather than read from ``TickerConfig``, so a
 # field renamed in the code fails here instead of moving the rule with it.
 ALLOWED_KEYS = frozenset({"options", "chain_cadence", "bars", "enabled"})
+
+# The bar frequencies the vendor can fetch, written out for the same reason. The nightly
+# bars run refuses the whole roster at exit 2 when an enabled entry names any other, so a
+# ``1D`` on one ticker stops every ticker's bars until a pull request fixes it.
+ALLOWED_BARS = frozenset({"1m", "1d"})
 
 
 def roster_problems(text: str) -> list[str]:
@@ -33,6 +39,7 @@ def roster_problems(text: str) -> list[str]:
     2. Every entry's keys are among ``ALLOWED_KEYS``.
     3. Every options entry names a ``chain_cadence``. Capture does not read it, and the
        rule keeps the file in the shape ``lake.onboard`` writes.
+    4. Every enabled entry's ``bars`` are among ``ALLOWED_BARS``.
     """
     document = yaml.safe_load(text) or {}
     problems = []
@@ -44,11 +51,19 @@ def roster_problems(text: str) -> list[str]:
             problems.append(f"{ticker}: unknown keys {unknown}")
         if settings.get("options") and "chain_cadence" not in settings:
             problems.append(f"{ticker}: options entry without chain_cadence")
+        if settings.get("enabled", True) is not False:
+            unfetchable = sorted(set(settings.get("bars", ())) - ALLOWED_BARS)
+            if unfetchable:
+                problems.append(f"{ticker}: unknown bars {unfetchable}")
     return problems
 
 
 def test_the_allowed_keys_are_the_loaders_fields():
     assert ALLOWED_KEYS == {field.name for field in fields(TickerConfig)} - {"ticker"}
+
+
+def test_the_allowed_bars_are_the_vendors_frequencies():
+    assert ALLOWED_BARS == set(BAR_FREQS)
 
 
 def test_the_tracked_roster_loads_with_an_enabled_ticker():
@@ -95,6 +110,17 @@ def test_the_tracked_roster_keeps_the_rules():
             "SPY: unknown keys ['option']",
             id="typo-in-the-first-entry",
         ),
+        pytest.param(
+            "GLD: {options: false, bars: [1D]}\n",
+            "GLD: unknown bars ['1D']",
+            id="bars-typo",
+        ),
+        pytest.param(
+            "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+            "USO: {options: false, bars: [daily]}\n",
+            "USO: unknown bars ['daily']",
+            id="bars-typo-in-the-second-entry",
+        ),
     ],
 )
 def test_the_rules_catch_a_typo(text, problem):
@@ -112,6 +138,13 @@ def test_the_rules_catch_a_typo(text, problem):
         pytest.param("IWM: {options: false, bars: [1d]}\n", id="equity-only-without-cadence"),
         # The loader reads a missing ``options`` as false, so the rule must too.
         pytest.param("IWM: {bars: [1d]}\n", id="no-options-key-without-cadence"),
+        # The nightly run checks only enabled entries, so a stale line on a retired one
+        # halts nothing.
+        pytest.param(
+            "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
+            "IWM: {options: false, bars: [1D], enabled: false}\n",
+            id="unknown-bars-on-a-disabled-entry",
+        ),
     ],
 )
 def test_the_rules_accept_a_roster_that_keeps_them(text):
