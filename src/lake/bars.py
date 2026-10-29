@@ -1407,8 +1407,9 @@ def _walk(
     writers rather than a vendor cost.
 
     ``fetch_session_bars`` reaches the vendor through here too and leaves this unbounded on
-    purpose. Its scope is one session against the enabled roster, which is four ticker-days at
-    this roster, and the runs that have crossed the ceiling through it number zero.
+    purpose. Its scope is one session against the enabled roster, which is one ticker-day per
+    enabled ticker and frequency, and the runs that have crossed the ceiling through it number
+    zero.
     """
     paths = LakePaths(root)
     session_clock = SessionClock(clock, calendar)
@@ -1982,8 +1983,10 @@ class BackfillPlan:
     asked for again on every later run.
 
     **The harm arrives at a depth rather than immediately, and the depth is measured.** Simulated
-    on this roster at a budget of 100, with a rebuilt manifest and the permanently-unlandable set
-    growing a session a trading day:
+    on the roster of the time, SPY and QQQ at ``1m`` and ``1d``, at a budget of 100, with a rebuilt
+    manifest and the permanently-unlandable set growing a session a trading day. Each depth below
+    scales with the ticker-days a session holds, so the four-ticker roster of marketlake #927
+    reaches each one at about half the range (an estimate, not re-simulated):
 
     - to about 25 sessions of range the two orders are indistinguishable, because the budget never
       binds;
