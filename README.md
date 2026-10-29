@@ -975,7 +975,10 @@ steps, and the order matters.
 
 1. **To onboard,** merge the roster pull request after the close, then run
    `lake.onboard` the same evening. Capture keeps an enabled ticker the security master
-   cannot resolve yet, so a forgotten onboard loses no minute.
+   cannot resolve yet, so a forgotten onboard loses no minute. That same capture seals
+   the ticker's day at close+15, so an onboard on a later evening is refused, and so is
+   one on a day with no session. Both refusals name the fix, which is to onboard on a
+   session day before its close+15, such as between 07:30 and 09:30 ET on the VM.
 2. **To retire,** run `lake.retire` after the close, then merge the roster pull request
    before 09:30 ET. A retire pull request merged before `lake.retire` has run is refused
    by the lake check, because the ticker's span is still open. A host that already has a

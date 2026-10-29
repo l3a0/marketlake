@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from lake import gap, journal, schema_drift
+from lake import compact, gap, journal, schema_drift
 from lake.calendar import MARKET_TZ
 from lake.capture import CAPTURE_SOURCE, CHAIN_SCHEMA_DRIFT
 from lake.capture_spans import SPANS_PARTITION, CaptureSpans, CaptureSpansError, spans_path
@@ -64,9 +64,10 @@ from tests.support.vendor import (
 _MID_SESSION = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
 
 # The date that instant lands on, which is the date the chain fetch plans its windows
-# against. It is the clock's UTC date, never the epoch's Eastern one, because it is the
-# date the journaled rows land under.
-_MID_SESSION_DAY = _MID_SESSION.date()
+# against. It is the Eastern date of the clock's now, never the epoch's, because it is the
+# date the journaled rows land under. At 11:00 ET the UTC date agrees with it, and the
+# tests under "the Eastern session date" below seed instants where it does not.
+_MID_SESSION_DAY = _MID_SESSION.astimezone(MARKET_TZ).date()
 
 
 def _chain_body(*, is_delayed: bool) -> dict:
@@ -510,7 +511,7 @@ def test_the_journaled_snapshot_carries_the_clock_not_the_epoch(lake_root, tmp_p
     )
 
     # ``cycle_start`` decides the segment's day, so the partition says which one was used.
-    assert f"date={_MID_SESSION.date().isoformat()}" in report.snapshot_segment
+    assert f"date={_MID_SESSION_DAY.isoformat()}" in report.snapshot_segment
     assert f"date={_BACKDATED_DAY.isoformat()}" not in report.snapshot_segment
 
     # The journal stores its instants as ISO strings, so the comparison is made in that
@@ -547,7 +548,7 @@ def test_the_equity_only_snapshot_carries_the_clock_too(lake_root, tmp_path):
     )
 
     assert report.capture_start == _BACKDATED
-    assert f"date={_MID_SESSION.date().isoformat()}" in report.snapshot_segment
+    assert f"date={_MID_SESSION_DAY.isoformat()}" in report.snapshot_segment
 
     ran_at = _MID_SESSION.isoformat()
     row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
@@ -571,6 +572,247 @@ def test_both_manifest_entries_carry_the_clock_not_the_epoch(lake_root, tmp_path
     entries = latest_entries(lake_root)
     assert entries[MASTER_PARTITION]["fetched_at"] == _MID_SESSION.isoformat()
     assert entries[SPANS_PARTITION]["fetched_at"] == _MID_SESSION.isoformat()
+
+
+# -- the Eastern session date ---------------------------------------------------------
+#
+# Production's clock is ``SystemClock``, which reads in UTC. A session's rows file under
+# its Eastern date, and from 20:00 EDT, or 19:00 EST, the UTC date has already moved on
+# to the next day. So these seed the clock in UTC, the way production does, at instants
+# where the two dates differ. A clock seeded with an Eastern-zoned instant files under
+# the Eastern date whatever the code does, which is how the UTC filing went unseen
+# (marketlake #930).
+
+_SESSION_DATE_CASES = [
+    # 20:30 EDT on Wednesday 2026-10-28, already Thursday in UTC. Filed under Thursday,
+    # compaction sealed Wednesday evening's snapshot into Thursday's session.
+    pytest.param(
+        datetime(2026, 10, 29, 0, 30, tzinfo=UTC), date(2026, 10, 28), id="wednesday-evening"
+    ),
+    # 20:30 EDT on Friday 2026-10-30, already Saturday in UTC, a date compaction never
+    # seals because it is not a session.
+    pytest.param(
+        datetime(2026, 10, 31, 0, 30, tzinfo=UTC), date(2026, 10, 30), id="friday-evening"
+    ),
+    # 00:30 EDT on Friday 2026-10-30, just past midnight. A fixed five-hour offset, which is
+    # right all winter, reads this as Thursday, so this case is the summer half of the
+    # Monday case below.
+    pytest.param(
+        datetime(2026, 10, 30, 4, 30, tzinfo=UTC), date(2026, 10, 30), id="friday-after-midnight"
+    ),
+    # 08:00 EDT on Thursday 2026-10-29, before the open, where the two dates agree.
+    pytest.param(
+        datetime(2026, 10, 29, 12, 0, tzinfo=UTC), date(2026, 10, 29), id="thursday-morning"
+    ),
+    # 23:30 EST on Monday 2026-11-02, the first session after the change to standard time
+    # on 2026-11-01. A fixed four-hour offset, which is right all summer, reads this as
+    # Tuesday, so only the zone's own rules file it under Monday.
+    pytest.param(
+        datetime(2026, 11, 3, 4, 30, tzinfo=UTC), date(2026, 11, 2), id="monday-after-dst-ends"
+    ),
+]
+
+
+def _chain_vendor_for(day: date) -> CassetteVendor:
+    """A chain vendor for ``day`` whose one contract expires inside that day's plan.
+
+    ``_chain_body`` expires its contracts in September 2026, which is behind every date
+    these cases run on, so the body here moves the expiration to 30 days after ``day``.
+    """
+    body = _chain_body(is_delayed=False)
+    expiry = (day + timedelta(days=30)).isoformat()
+    for side in ("callExpDateMap", "putExpDateMap"):
+        (strikes,) = body[side].values()
+        for contracts in strikes.values():
+            for contract in contracts:
+                contract["expirationDate"] = f"{expiry}T20:00:00.000+00:00"
+        body[side] = {f"{expiry}:30": strikes}
+    return CassetteVendor(windowed_chain_cassette("SPY", day, body))
+
+
+def _timing_days(lake_root: Path) -> list[str]:
+    """The dates of every timing file on disk, as the file names spell them."""
+    timing_dir = LakePaths(lake_root).timing_path(_MID_SESSION_DAY).parent
+    return sorted(path.name for path in timing_dir.glob("*.jsonl"))
+
+
+@pytest.mark.parametrize(("now", "session_day"), _SESSION_DATE_CASES)
+def test_the_equity_only_snapshot_files_under_the_eastern_date(
+    lake_root, tmp_path, now, session_day
+):
+    """The quote snapshot and its timing line both land under the Eastern date.
+
+    The rows keep their UTC spelling, the one every loop cycle's rows carry, so only the
+    partition and the timing file's date move.
+    """
+    report = onboard(
+        "QQQ",
+        clock=ManualClock(start=now),
+        vendor=_quote_vendor("QQQ", realtime=True),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    assert report.snapshot_segment.startswith(
+        f"journal/date={session_day.isoformat()}/surface=quotes/ticker=QQQ/"
+    )
+    assert _timing_days(lake_root) == [f"date={session_day.isoformat()}.jsonl"]
+    row = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()[0]
+    assert row["snap_ts"] == now.isoformat()
+
+
+@pytest.mark.parametrize(("now", "session_day"), _SESSION_DATE_CASES)
+def test_the_chain_snapshot_plans_and_files_under_the_eastern_date(
+    lake_root, tmp_path, now, session_day
+):
+    """The chain branch plans its windows from the Eastern date and files under it too.
+
+    The vendor answers only the windows planned from ``session_day``. A fetch planned from
+    the UTC date asks for windows it does not hold, every one fails, and onboarding
+    refuses, so a pass here also says which day the plan was drawn from.
+    """
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=now),
+        vendor=_chain_vendor_for(session_day),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert not report.partial_chain
+    assert report.snapshot_segment.startswith(
+        f"journal/date={session_day.isoformat()}/surface=chains/ticker=SPY/"
+    )
+    assert _timing_days(lake_root) == [f"date={session_day.isoformat()}.jsonl"]
+    rows = journal.read_segment(lake_root / report.snapshot_segment).to_pylist()
+    assert rows
+    assert {row["snap_ts"] for row in rows} == {now.isoformat()}
+
+
+def test_a_friday_evening_snapshot_is_one_compaction_seals(lake_root, tmp_path):
+    """A Friday evening onboard files under Friday, which the next sweep can seal.
+
+    Filed under the UTC date it landed under Saturday, which ``_sweep_scope`` skips as
+    not a session on every run, so the snapshot was never sealed at all.
+    """
+    friday_evening = datetime(2026, 10, 31, 0, 30, tzinfo=UTC)
+    onboard(
+        "QQQ",
+        clock=ManualClock(start=friday_evening),
+        vendor=_quote_vendor("QQQ", realtime=True),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=False,
+    )
+
+    # Monday's close+15, in UTC as production reads it.
+    calendar = weekday_sessions(date(2026, 10, 26), date(2026, 11, 2))
+    session = SessionClock(
+        clock=ManualClock(start=datetime(2026, 11, 2, 21, 30, tzinfo=UTC)), calendar=calendar
+    )
+    eligible, skipped = compact._sweep_scope(LakePaths(lake_root), session, calendar)
+
+    assert [day for day, _ in eligible] == [date(2026, 10, 30)]
+    assert skipped == []
+
+
+def _seal(lake_root: Path, surface: str, ticker: str, day: date) -> None:
+    """Record ``ticker``'s partition for ``day`` in the manifest, as close+15 does."""
+    append_manifest(
+        lake_root,
+        partition=(
+            LakePaths(lake_root).partition_path(surface, ticker, day).relative_to(lake_root)
+        ).as_posix(),
+        source="compaction",
+        sha256="0" * 64,
+        rows=1,
+        fetched_at=datetime(2026, 10, 28, 20, 30, tzinfo=UTC).isoformat(),
+    )
+
+
+def _assert_nothing_onboarded(lake_root: Path, tickers_path: Path) -> None:
+    """No roster entry, no master, no span and no segment: the refusal came first."""
+    assert not tickers_path.exists()
+    assert not master_path(lake_root).exists()
+    assert not spans_path(lake_root).exists()
+    assert not list((lake_root / "journal").rglob("*.arrows"))
+
+
+@pytest.mark.parametrize(
+    ("surface", "options"),
+    [(journal.QUOTES_SURFACE, False), (journal.CHAINS_SURFACE, True)],
+    ids=["quotes", "chains"],
+)
+def test_an_onboard_into_a_day_already_sealed_is_refused_and_writes_nothing(
+    lake_root, tmp_path, surface, options
+):
+    """A snapshot filed beside a sealed partition is one compaction would delete.
+
+    Compaction reads a segment beside a sealed partition as a crash's leftover and unlinks
+    it unread (marketlake #935). The capture loop keeps a rostered ticker before its first
+    onboard, so Wednesday's partition is already sealed by 20:30 ET, and the onboard has to
+    refuse before it spends a request or writes anything.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    _seal(lake_root, surface, "QQQ", date(2026, 10, 28))
+
+    with pytest.raises(OnboardError, match="already sealed"):
+        onboard(
+            "QQQ",
+            clock=ManualClock(start=datetime(2026, 10, 29, 0, 30, tzinfo=UTC)),
+            vendor=_NoCallVendor(),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=options,
+        )
+
+    _assert_nothing_onboarded(lake_root, tickers_path)
+
+
+def test_a_sealed_partition_on_the_other_surface_refuses_nothing(lake_root, tmp_path):
+    """Only the surface the snapshot lands on decides, so a sealed quotes day lets chains in."""
+    _seal(lake_root, journal.QUOTES_SURFACE, "SPY", date(2026, 10, 28))
+
+    report = onboard(
+        "SPY",
+        clock=ManualClock(start=datetime(2026, 10, 29, 0, 30, tzinfo=UTC)),
+        vendor=_chain_vendor_for(date(2026, 10, 28)),
+        lake_root=lake_root,
+        tickers_path=tmp_path / "tickers.yaml",
+        options=True,
+    )
+
+    assert report.snapshot_segment.startswith("journal/date=2026-10-28/surface=chains/")
+
+
+@pytest.mark.parametrize(
+    ("now", "day"),
+    [
+        # 20:00 EST on Sunday 2026-11-01, while the VM is up for the canary.
+        pytest.param(datetime(2026, 11, 2, 1, 0, tzinfo=UTC), "2026-11-01", id="sunday-evening"),
+        # 10:00 EST on Thanksgiving, 2026-11-26, a weekday with no session.
+        pytest.param(datetime(2026, 11, 26, 15, 0, tzinfo=UTC), "2026-11-26", id="holiday"),
+    ],
+)
+def test_an_onboard_on_a_day_with_no_session_is_refused_and_writes_nothing(
+    lake_root, tmp_path, now, day
+):
+    """A snapshot filed under a date that is not a session is one compaction never seals."""
+    tickers_path = tmp_path / "tickers.yaml"
+
+    with pytest.raises(OnboardError, match=f"under {day}, which is not a session"):
+        onboard(
+            "QQQ",
+            clock=ManualClock(start=now),
+            vendor=_NoCallVendor(),
+            lake_root=lake_root,
+            tickers_path=tickers_path,
+            options=False,
+        )
+
+    _assert_nothing_onboarded(lake_root, tickers_path)
 
 
 def test_an_epoch_after_now_is_refused_and_writes_nothing(lake_root, tmp_path, capsys):
@@ -1079,8 +1321,8 @@ def test_a_chain_with_no_contract_refuses_rather_than_pinning_a_zero_anchor(lake
 def test_a_backdated_epoch_plans_the_same_windows_as_a_run_without_one(lake_root, tmp_path):
     """The windows come off the clock's date, never the epoch's.
 
-    ``--capture-start`` can put the epoch a week back, and it is an Eastern date besides,
-    while the rows land under the clock's own UTC date. Planning the windows against the
+    ``--capture-start`` can put the epoch a week back, while the rows land under the
+    Eastern date of the clock's now. Planning the windows against the
     epoch would ask for ranges nothing in the day being captured falls in, and the fetch
     would answer that as a chain whose every window failed.
     """
