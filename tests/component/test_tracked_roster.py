@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from lake.bars import _require_supported
 from lake.tickers import TickerConfig, load_tickers
 from lake.vendor import BAR_FREQS
 
@@ -27,8 +28,9 @@ TRACKED_ROSTER = ROOT / "config" / "tickers.yaml"
 ALLOWED_KEYS = frozenset({"options", "chain_cadence", "bars", "enabled"})
 
 # The bar frequencies the vendor can fetch, written out for the same reason. The nightly
-# bars run refuses the whole roster at exit 2 when an enabled entry names any other, so a
-# ``1D`` on one ticker stops every ticker's bars until a pull request fixes it.
+# bars run in ``lake.sweep`` refuses its whole plan when an enabled, onboarded entry names
+# any other, so a ``1D`` on one ticker ends that night's bars for every ticker and withholds
+# the run's ping until a pull request fixes it.
 ALLOWED_BARS = frozenset({"1m", "1d"})
 
 
@@ -73,6 +75,12 @@ def test_the_tracked_roster_loads_with_an_enabled_ticker():
 
 def test_the_tracked_roster_keeps_the_rules():
     assert roster_problems(TRACKED_ROSTER.read_text(encoding="utf-8")) == []
+
+
+def test_the_bars_guard_accepts_the_tracked_roster():
+    # Rule 4 copies the guard's frequency check. This runs the guard itself, so the tracked
+    # file fails here whenever the guard would refuse it, even if the copy drifts.
+    _require_supported(load_tickers(TRACKED_ROSTER))
 
 
 @pytest.mark.parametrize(
@@ -121,6 +129,11 @@ def test_the_tracked_roster_keeps_the_rules():
             "USO: unknown bars ['daily']",
             id="bars-typo-in-the-second-entry",
         ),
+        pytest.param(
+            "QQQ: {options: true, chain_cadence: 1m, bars: [1m, 1D]}\n",
+            "QQQ: unknown bars ['1D']",
+            id="bars-typo-after-a-good-frequency",
+        ),
     ],
 )
 def test_the_rules_catch_a_typo(text, problem):
@@ -139,7 +152,7 @@ def test_the_rules_catch_a_typo(text, problem):
         # The loader reads a missing ``options`` as false, so the rule must too.
         pytest.param("IWM: {bars: [1d]}\n", id="no-options-key-without-cadence"),
         # The nightly run checks only enabled entries, so a stale line on a retired one
-        # halts nothing.
+        # halts nothing in the nightly run. A by-hand backfill still refuses it.
         pytest.param(
             "SPY: {options: true, chain_cadence: 1m, bars: [1m, 1d]}\n"
             "IWM: {options: false, bars: [1D], enabled: false}\n",
