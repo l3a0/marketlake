@@ -14,5 +14,16 @@
       "Bash(gh api *deleteEnvironment*)",
       "Bash(curl *deleteEnvironment*)"
     ]
+  },
+  "extraKnownMarketplaces": {
+    "l3a0": {
+      "source": {
+        "source": "github",
+        "repo": "l3a0/claude-plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "l3a0@l3a0": true
   }
 }
