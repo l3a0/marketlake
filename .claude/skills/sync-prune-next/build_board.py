@@ -18,8 +18,9 @@ The document keeps the flat shape the page already reads::
 1. ``state`` carries ``main``, the default branch's head as seven characters,
    ``updatedAt``, the time GitHub was read, and ``issues.open``.
 2. ``tracker`` has one card per open issue. ``ms`` is the milestone's title up to its
-   first comma, so "MVP 2, capture on a hosted VM" reads "MVP 2", the name the page's
-   default view selects. ``kind`` is ``parent`` while an open sub-issue exists, else
+   first comma, so "MVP 2, capture on a hosted VM" reads "MVP 2". The page's default
+   view selects the lowest-numbered milestone named exactly ``MVP <n>``, so it needs
+   the short name. ``kind`` is ``parent`` while an open sub-issue exists, else
    ``deferred`` under that label, else ``ready``. ``needs`` holds the open issues in
    this repository that a native "blocked by" link names.
 3. ``prs`` has one entry per open pull request and open issue it names, through

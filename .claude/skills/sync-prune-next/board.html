@@ -357,7 +357,7 @@ let CHAIN_ESC = null;
    browser. MS is what the page draws, which falls back to the default whenever
    the choice names a milestone the tracker no longer carries, without
    forgetting the choice. The default is the lowest-numbered "MVP <n>" milestone
-   that has open issues, which is the open MVP, and every milestone when none has.
+   that still has open issues, and every milestone when none has.
    The number is compared as a number, so MVP 10 comes after MVP 9. The filter
    decides only what is drawn.
    Depth, blockers and the tracer still read the whole tracker, so a card keeps

@@ -108,12 +108,14 @@ void 0;
 """
 
 
-def _prelude(responses: list[dict] | None) -> str:
+def _prelude(responses: list[dict] | None, stored: dict[str, str] | None = None) -> str:
     """A fake fetch serving ``responses`` in turn, and timers the driver can fire.
 
     Each response is ``{"status": n, "body": text}``, ``{"throw": true}`` for a network
     failure, or ``{"never": true}`` for a fetch that never settles. ``responses`` of
-    None is a host with no fetch at all.
+    None is a host with no fetch at all. ``stored`` is what the reader's browser already
+    holds in ``localStorage``. Without it the page has no ``localStorage``, so every read
+    throws and the page behaves as for a reader who chose nothing.
     """
     lines = [
         "var setTimeout = function () { return 0; };",
@@ -123,6 +125,14 @@ def _prelude(responses: list[dict] | None) -> str:
         "var __CUR = 0;",
         "var __FETCHES = [];",
     ]
+    if stored is not None:
+        lines += [
+            f"var __STORED = {json.dumps(stored)};",
+            "var localStorage = {",
+            "  getItem: function (k) { return k in __STORED ? __STORED[k] : null; },",
+            "  setItem: function (k, v) { __STORED[k] = String(v); },",
+            "};",
+        ]
     if responses is None:
         lines.append("var fetch = undefined;")
     else:
@@ -139,13 +149,15 @@ def _prelude(responses: list[dict] | None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_page(tmp_path: Path, responses: list[dict] | None) -> dict[str, Any]:
+def run_page(
+    tmp_path: Path, responses: list[dict] | None, stored: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Execute the page and return what it drew, what it fetched and its timers."""
     markup, script = _page_parts()
     source = (
         f"var __STARTS_HIDDEN = {json.dumps(_starts_hidden(markup))};\n"
         + STUB.read_text(encoding="utf-8")
-        + _prelude(responses)
+        + _prelude(responses, stored)
         + script
         + DRIVER
     )
@@ -298,7 +310,6 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         "the stamp above rather than live."
     )
     assert "Measured by hand" not in foot
-
     assert foot.endswith(
         "The In flight section decays fastest: a check that has gone green or red since "
         "then still reads here as it read then and a review posted since then still reads "
@@ -312,10 +323,20 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         (["MVP 4", "MVP 4", "no milestone"], "MVP 4"),
         (["MVP 10", "MVP 9", "no milestone"], "MVP 9"),
         (["MVP 4", "MVP 3", "no milestone"], "MVP 3"),
+        (["MVP 12", "MVP 10", "no milestone"], "MVP 10"),
+        (["Post-MVP 1", "MVP 4", "no milestone"], "MVP 4"),
         (["MVP 4b", "MVPs", "no milestone"], "All"),
         (["no milestone", "no milestone", "no milestone"], "All"),
     ],
-    ids=["one open MVP", "a number, not text", "the lowest open MVP", "no MVP name", "none"],
+    ids=[
+        "one open MVP",
+        "a number, not text",
+        "the lowest open MVP",
+        "two digits",
+        "a prefix",
+        "no MVP name",
+        "none",
+    ],
 )
 def test_the_page_opens_on_the_open_mvp_milestone(
     tmp_path: Path, milestones: list[str], chosen: str
@@ -331,6 +352,30 @@ def test_the_page_opens_on_the_open_mvp_milestone(
         {**card, "ms": ms} for card, ms in zip(document["tracker"], milestones, strict=True)
     ]
     result = run_page(tmp_path, [served(document)])
+    assert result["ids"]["mssel"]["value"] == chosen
+
+
+@pytest.mark.parametrize(
+    ("stored", "milestones", "chosen"),
+    [
+        ("MVP 2", ["MVP 4", "MVP 4", "no milestone"], "MVP 4"),
+        ("MVP 5", ["MVP 4", "MVP 5", "no milestone"], "MVP 5"),
+        ("All", ["MVP 4", "MVP 4", "no milestone"], "All"),
+        ("no milestone", ["MVP 4", "MVP 4", "no milestone"], "no milestone"),
+    ],
+    ids=["a closed milestone falls back", "an open one is kept", "All is kept", "none is kept"],
+)
+def test_a_stored_choice_wins_while_its_milestone_is_open(
+    tmp_path: Path, stored: str, milestones: list[str], chosen: str
+) -> None:
+    """A reader's stored milestone is drawn while the tracker carries it, and the default
+    otherwise, so a choice of a milestone that has since closed falls back to the open MVP."""
+    document = board()
+    document["tracker"] = [
+        {**card, "ms": ms} for card, ms in zip(document["tracker"], milestones, strict=True)
+    ]
+    keep = {"marketlake-board-ms": stored}
+    result = run_page(tmp_path, [served(document)], stored=keep)
     assert result["ids"]["mssel"]["value"] == chosen
 
 
