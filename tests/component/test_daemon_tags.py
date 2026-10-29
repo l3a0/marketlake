@@ -140,8 +140,9 @@ def test_run_cycle_files_every_row_under_the_slot_it_is_handed_in_utc(cassette_v
     [
         # The hooks ran past UTC midnight. The rows still belong to the slot's day.
         (et(16, 0), datetime(2026, 8, 25, 0, 0, 30, tzinfo=UTC), "2026-08-24"),
-        # A direct caller's evening slot is past UTC midnight. The day is the UTC date of
-        # snap_ts, the rule every cycle's partition follows, not the slot's Eastern date.
+        # A direct caller's evening slot is past UTC midnight. A cycle's day is the UTC date
+        # of snap_ts, not the slot's Eastern date. ``journal_snapshot`` takes the Eastern
+        # date since marketlake #930, and marketlake #937 is the issue that aligns this.
         (et(20, 30), datetime(2026, 8, 25, 0, 31, tzinfo=UTC), "2026-08-25"),
     ],
     ids=["clock-past-utc-midnight", "evening-eastern-slot"],

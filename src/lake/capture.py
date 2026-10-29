@@ -3062,11 +3062,12 @@ def journal_snapshot(
     the same primitives end to end, so the result is indistinguishable in shape from a
     segment ``run_cycle`` writes:
 
-    1. Derive the coordinates from ``cycle_start`` the way a cycle outside the loop does:
-       ``snap_ts`` is that instant floored to the minute unless ``slot`` names it, ``day``
-       is that slot's Eastern date, and ``start_ts`` is the writer-session stamp. The
-       date is Eastern because a caller here may run outside session hours, where a UTC
-       instant's own date is already the next day's (marketlake #930). The caller
+    1. Derive the coordinates from ``cycle_start``: ``snap_ts`` is that instant floored to
+       the minute unless ``slot`` names it, ``day`` is that slot's Eastern date, and
+       ``start_ts`` is the writer-session stamp. The date is Eastern because a caller here
+       may run outside session hours, where a UTC instant's own date is already the next
+       day's (marketlake #930). A cycle outside the loop still takes the UTC date, which
+       agrees inside session hours, and marketlake #937 is the issue that aligns it. The caller
        stamps ``cycle_start``, ``fetch_ts``, and ``fetch_end_ts`` from the injected clock
        around its own fetch.
     2. Build the surface's data batch with the D4 journal row builders.
