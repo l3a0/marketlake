@@ -326,6 +326,8 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         (["MVP 12", "MVP 10", "no milestone"], "MVP 10"),
         (["Post-MVP 1", "MVP 4", "no milestone"], "MVP 4"),
         (["MVP 4b", "MVPs", "no milestone"], "All"),
+        (["MVP4", "mvp 2", "no milestone"], "All"),
+        (["MVP ", "MVP 0", "no milestone"], "MVP 0"),
         (["no milestone", "no milestone", "no milestone"], "All"),
     ],
     ids=[
@@ -335,6 +337,8 @@ def test_a_good_document_draws_the_board_and_says_how_it_was_built(tmp_path: Pat
         "two digits",
         "a prefix",
         "no MVP name",
+        "near misses",
+        "zero",
         "none",
     ],
 )
