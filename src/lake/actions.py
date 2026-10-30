@@ -1,6 +1,6 @@
 """The corporate-actions ledger.
 
-Every price the lake stores is as-traded, so a split or a dividend has to be carried
+Every price marketlake captures is stored as-traded, so a split or a dividend has to be carried
 beside the prices rather than folded into them. This ledger is where each one lands. It
 is the store the dividend extraction, the split detector, and every adjusted view read,
 so its shape decides what all three can say.

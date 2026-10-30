@@ -746,7 +746,8 @@ class InstrumentUnknown(LoadError):
     null id is the join key gone: an adjusted read of that row would find no actions and hand
     back the as-traded price under an adjusted name.
 
-    ``adjust='none'`` reads the row, because as-traded is what it says it is.
+    ``adjust='none'`` reads the row, because it applies no factor, and its ``basis`` column says
+    what the numbers are.
     """
 
 
@@ -1183,8 +1184,8 @@ def read_provenance(
 
     No ``marketlake.*`` key at all is a captured partition with a ``raw`` basis, which is every
     partition the sweep writes. Any such key makes the partition an import, which must carry an
-    origin of ``imported``, a basis, a source and a source identity. A value that is present but
-    empty counts as missing. ``ProvenanceMalformed`` lists the seven shapes this refuses.
+    origin of ``imported``, a basis, a source and a source identity. An empty basis, source or
+    source identity counts as missing. ``ProvenanceMalformed`` lists the seven shapes this refuses.
     ``source_as_of`` is read by ``paths.parse_date_dir``, because on 3.12 ``date.fromisoformat``
     also accepts ``20120410`` and ``2012-W15-2``. A ``marketlake.*`` key this does not name is
     passed over once the origin key is present.

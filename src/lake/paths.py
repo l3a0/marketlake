@@ -249,6 +249,9 @@ def is_reader_file(rel: str) -> bool:
        ``loader.PartialRead`` naming an unrecorded version rather than as a missing file.
 
     The first two fail open, which is why they are worth checking first.
+
+    A reader of a mirror passes ``lake_root=`` on every call, because
+    ``resolve_lake_root(None)`` needs a ``config.yaml``.
     """
     return rel in _READER_LEDGERS or rel.startswith(f"{REFERENCE_DIR}/")
 

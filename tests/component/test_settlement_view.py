@@ -39,7 +39,15 @@ import pyarrow as pa
 import pytest
 
 from lake import actions, journal, oi
-from lake.loader import BarsAbsent, NoOptionClose, PartitionQuarantined
+from lake.loader import (
+    BASIS_ADJUSTED,
+    BASIS_RAW,
+    ORIGIN_IMPORTED,
+    BarsAbsent,
+    NoOptionClose,
+    PartitionQuarantined,
+    Provenance,
+)
 from lake.schema_versions import RecordedVersion, SchemaVersionLedger, running_fingerprints
 from lake.settle import (
     REASON_AM_SETTLED,
@@ -54,6 +62,7 @@ from lake.settle import (
     ExpirationUnreadable,
     settlement_view,
 )
+from tests.support.bars import write_bars
 from tests.support.lake import FixtureLake
 
 TICKER = "SPY"
@@ -945,3 +954,26 @@ def test_the_close_is_as_traded_even_when_a_split_would_move_it(fixture_lake):
     # as-traded close instead, and the contract is 107.39 in the money rather than 28.695.
     assert row["settlement_close"] == CLOSE
     assert row["intrinsic_cents"] == 10739
+
+
+@pytest.mark.parametrize("basis", [BASIS_RAW, BASIS_ADJUSTED])
+def test_an_imported_close_refuses_the_read(fixture_lake, basis):
+    """A daily close marketlake did not capture settles nothing, whatever basis it is in.
+
+    ``adjust='none'`` hands an imported row back as its source wrote it, so an ``adjusted`` close
+    would settle as-traded strikes against an adjusted price. An imported ``raw`` one carries no
+    gate behind it. The partition goes through ``write_bars``, the sweep's own writer, because
+    ``FixtureLake.with_bars`` writes no provenance. Catches the refusal removed, which would
+    settle the contract at 757.39 with nothing failing.
+    """
+    root = _lake(fixture_lake, [_contract(750.0)], with_bars=False)
+    as_of = date(2012, 4, 10) if basis == BASIS_ADJUSTED else None
+    provenance = Provenance(ORIGIN_IMPORTED, basis, "vintage", "sha256:" + "ab" * 32, as_of)
+    write_bars(
+        root, TICKER, DAILY, SESSION, [CLOSE], instrument_id=INSTRUMENT, provenance=provenance
+    )
+
+    with pytest.raises(CloseUnreadable) as caught:
+        _view(root)
+
+    assert "captured as-traded close" in str(caught.value)

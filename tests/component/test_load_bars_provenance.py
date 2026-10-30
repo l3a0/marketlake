@@ -383,3 +383,116 @@ def test_total_refuses_a_prior_close_marketlake_did_not_capture(
     with pytest.raises(AdjustmentIncomplete) as caught:
         load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_TOTAL)
     assert ORIGIN_IMPORTED in str(caught.value)
+
+
+# -- mutation-lens additions -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("adjust", [ADJUST_SPLIT, ADJUST_TOTAL])
+def test_an_adjusted_view_refuses_an_import_ahead_of_captured_rows(
+    fixture_lake: FixtureLake, adjust: str
+):
+    """The import is the earliest row and carries the captured instrument, so nothing else in
+    the read refuses. Catches a check that reads only the last row, which would scale the
+    imported row by the ledger and return it labelled adjusted.
+    """
+    from lake.loader import LoadError
+
+    root = _root(fixture_lake)
+    write_bars(
+        root, TICKER, DAILY, BEFORE, [600.0], instrument_id=INSTRUMENT, provenance=IMPORTED_RAW
+    )
+    write_bars(root, TICKER, DAILY, EX, [300.0], instrument_id=INSTRUMENT)
+
+    with pytest.raises(OriginNotCaptured) as caught:
+        load_bars(TICKER, DAILY, lake_root=root, adjust=adjust)
+
+    assert isinstance(caught.value, LoadError)
+
+
+def test_the_two_refusals_are_load_errors_and_malformed_is_no_value_error():
+    """Catches either class leaving ``LoadError``, and either becoming a ``ValueError``, which
+    the issue rules out because neither refusal is about an argument.
+    """
+    from lake.loader import LoadError
+
+    assert issubclass(OriginNotCaptured, LoadError)
+    assert issubclass(ProvenanceMalformed, LoadError)
+    assert not issubclass(ProvenanceMalformed, ValueError)
+    assert not issubclass(OriginNotCaptured, ValueError)
+
+
+def test_the_provenance_names_are_exported():
+    """Catches a name the issue's What 9 exports left out of ``__all__``."""
+    from lake import loader, paths
+
+    names = {
+        "ADJUST_COLUMN",
+        "OriginNotCaptured",
+        "ProvenanceMalformed",
+        "Provenance",
+        "read_provenance",
+        "provenance_metadata",
+        "ORIGIN_COLUMN",
+        "BASIS_COLUMN",
+        "SOURCE_COLUMN",
+        "SOURCE_AS_OF_COLUMN",
+        "ORIGIN_CAPTURED",
+        "ORIGIN_IMPORTED",
+        "BASIS_RAW",
+        "BASIS_ADJUSTED",
+        "ORIGIN_KEY",
+        "BASIS_KEY",
+        "SOURCE_KEY",
+        "SOURCE_ID_KEY",
+        "SOURCE_AS_OF_KEY",
+    }
+    assert names <= set(loader.__all__)
+    assert "is_reader_file" in paths.__all__
+
+
+def test_an_adjusted_view_refuses_an_import_with_no_instrument_column(fixture_lake: FixtureLake):
+    """Catches the origin check moved behind the missing-column ``LoadError``. The import is the
+    only partition read, because a captured one beside it would give the stitch the column.
+    """
+    root = _root(fixture_lake)
+    path = write_bars(root, TICKER, DAILY, EX, [300.0], instrument_id=None, provenance=IMPORTED_RAW)
+    table = pq.read_table(path)
+    keys = table.schema.metadata
+    pq.write_table(table.drop_columns(["instrument_id"]).replace_schema_metadata(keys), path)
+
+    with pytest.raises(OriginNotCaptured):
+        load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)
+
+
+# -- the contract, in literals ---------------------------------------------------------
+
+
+def test_the_column_names_values_and_keys_are_the_literal_contract(fixture_lake: FixtureLake):
+    """The names a consumer and an importer write against, spelled out rather than imported.
+
+    Every other test here imports the constants, so respelling one moves the test with it and
+    nothing fails. A consumer filtering on ``origin == "captured"``, or an importer writing
+    ``marketlake.origin``, depends on the strings themselves. Catches a column, a value or a key
+    renamed in ``lake.loader``.
+    """
+    as_of = date(2012, 4, 10)
+    imported = Provenance("imported", "adjusted", "vintage", "sha256:" + "ab" * 32, as_of)
+    root = _root(fixture_lake)
+    write_bars(root, TICKER, DAILY, BEFORE, [600.0], instrument_id=INSTRUMENT, provenance=imported)
+    write_bars(root, TICKER, DAILY, EX, [300.0], instrument_id=INSTRUMENT)
+
+    table = load_bars(TICKER, DAILY, lake_root=root)
+
+    assert tuple(table.column_names[-5:-1]) == ("origin", "basis", "source", "source_as_of")
+    assert table.column("origin").to_pylist() == ["imported", "captured"]
+    assert table.column("basis").to_pylist() == ["adjusted", "raw"]
+    assert table.column("source").to_pylist() == ["vintage", None]
+    assert table.column("source_as_of").to_pylist() == ["2012-04-10", None]
+    assert provenance_metadata(imported) == {
+        b"marketlake.origin": b"imported",
+        b"marketlake.basis": b"adjusted",
+        b"marketlake.source": b"vintage",
+        b"marketlake.source_id": b"sha256:" + b"ab" * 32,
+        b"marketlake.source_as_of": b"2012-04-10",
+    }

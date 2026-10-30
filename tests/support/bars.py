@@ -48,7 +48,8 @@ def write_bars(
 ) -> Path:
     """One bars partition holding a candle per close, written by the sweep's writer.
 
-    Each candle's open, high and low sit one either side of its close, and its volume is 100.
+    Each candle's open sits one below its close, its high one above and its low two below, and
+    its volume is 100.
     """
     candles = [
         {
