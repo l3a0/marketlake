@@ -416,8 +416,9 @@ A command run by hand is not a unit the stop can see.
    bucket through its instance profile and uses none of the four secrets every config
    holds, so placeholder values serve for those in that copy. A whole lake restored into
    the VM's own `lake_root` lasts only until the trim runs again. Each partition it brings
-   back beside a trim line takes the trim's recovery path and is trimmed again. The
-   download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
+   back beside a trim line takes the trim's recovery path and is trimmed again. On a host
+   whose bars window is `all`, such as the VM, a bar brought back that way gets a restore
+   line instead and stays. The download lands in a hidden working directory, `<dest>/.marketlake-restoring`, and its
    files are moved up into `<dest>` only once every file has verified, with
    `manifest.jsonl` moved last. A file that fails is named on its own line, `<dest>` gets
    no `manifest.jsonl`, and the command exits 1. Running it again resumes in the working

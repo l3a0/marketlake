@@ -2,14 +2,15 @@
 
 Marketlake #755 keeps only a window of recent sessions on the hosted VM's lake volume and
 leaves older partitions in the backup bucket. One config key, ``lake_window_sessions``, is
-both the window and the opt-in. A host without it never trims, writes no split checkpoint,
-and restores the whole lake from the bucket, which is the laptop today. Besides the render in
-``lake.vm_config``, which checks it, three jobs act on it.
+the opt-in, and its window is the one every surface takes unless that surface's own key
+overrides it. A host without it never trims, writes no split checkpoint, and restores the whole
+lake from the bucket, which is the laptop today. Besides the render in ``lake.vm_config``,
+which checks it, three jobs act on it.
 
 1. The 18:30 sweep writes the split checkpoint, which marketlake #786 added with the key.
-2. The trim removes what falls outside the window: chains since marketlake #787, quotes
-   under a landed daily bar since marketlake #794, and bars once their day's chains are gone
-   since marketlake #795.
+2. The trim removes what falls outside its surface's window: chains since marketlake #787,
+   quotes under a landed daily bar since marketlake #794, and bars once their day's chains are
+   gone since marketlake #795.
 3. ``lake.bucket``'s restore rebuilds the trimmed lake rather than the whole one, leaving out
    each partition the bucket's ``trimmed.jsonl`` says was removed on purpose (marketlake
    #785).

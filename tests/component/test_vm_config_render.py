@@ -1457,6 +1457,16 @@ CONFIG_REFUSALS = {
         {"lake_window_sessions": 22, "lake_window_sessions_quotes": "many"},
         "lake_window_sessions_quotes is not a whole number of sessions or all",
     ),
+    # Two refused keys are each named, joined into one message.
+    "two refused surface keys": (
+        {
+            "lake_window_sessions": 22,
+            "lake_window_sessions_quotes": "many",
+            "lake_window_sessions_bars": 21,
+        },
+        "lake_window_sessions_quotes is not a whole number of sessions or all. "
+        "lake_window_sessions_bars is under the floor of 22 sessions",
+    ),
     "a bars key without the base key": (
         {"lake_window_sessions_bars": "all"},
         "lake_window_sessions_bars is set and lake_window_sessions is not, and only "
@@ -1483,6 +1493,35 @@ def test_a_merged_config_a_job_would_refuse_is_refused(
 
     assert expected in _assert_refused(capsys, config_dir, before)
     assert len(hook.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("lake_window_sessions_chains", 25),
+        ("lake_window_sessions_quotes", "all"),
+        ("lake_window_sessions_bars", "all"),
+    ],
+)
+def test_a_per_surface_key_without_the_base_key_is_refused_in_one_whole_message(
+    monkeypatch, capsys, metadata, config_dir, not_root, key, value
+):
+    """Refusal 14, which the render alone raises. The message holds no ``": "``, so
+    ``report.redacted`` would keep all of it."""
+    SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes(**{key: value})) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    message = line.removeprefix(
+        f"vm_config: refused, and {config_dir / CONFIG_FILE} was left as it was: "
+    )
+    assert message == (
+        f"{key} is set and lake_window_sessions is not, and only lake_window_sessions turns "
+        f"trimming on. Set it in config/vm.yaml or remove {key}"
+    )
+    assert ": " not in message
 
 
 def test_a_lake_window_at_the_floor_renders(monkeypatch, capsys, metadata, config_dir, not_root):

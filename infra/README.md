@@ -1781,7 +1781,8 @@ after it have ended. Four facts hold for any restore onto the VM.
    secrets and no secret is copied. A whole lake restored into the VM's own `lake_root`
    lasts only until the trim runs again, because the VM's own `config.yaml` still sets the
    key. Each partition it brings back beside a trim line takes the trim's recovery path and
-   is trimmed again. The per-surface keys, such as `lake_window_sessions_bars`, play no part
+   is trimmed again. On a host whose bars window is `all`, such as the VM, a bar brought
+   back that way gets a restore line instead and stays. The per-surface keys, such as `lake_window_sessions_bars`, play no part
    in which restore runs, so the copy may keep them
    ([#953](https://github.com/l3a0/marketlake/issues/953)).
 4. The restore refuses, with exit 2 and before any download, when the volume would be left
@@ -1899,15 +1900,25 @@ owner's own SSH session.
 
 2. Check that nothing holds the lake-root lock. It prints `inactive` or `failed` for each
    unit. The evening upload runs inside the eod-sweep unit and holds the lock until as late
-   as about 20:17 ET, and `lake.lock` waits on it without a word. `deploy/busy-check.sh` is
-   sourced by the deploy and the stop, and is never run by hand.
+   as about 20:17 ET, and `lake.lock` waits on it without a word. The close+15 compaction
+   runs inside the daemon's own unit, `com.marketlake.daemon.service`, which this check does
+   not read. So run the restore only after that evening's 18:30 sweep and its upload have
+   ended, which the eod-sweep unit's `inactive` or `failed` confirms. When any unit reads
+   `active` or `activating`, wait and run the check again. `deploy/busy-check.sh` is sourced by the deploy and the
+   stop, and is never run by hand.
 
    ```bash
    systemctl is-active com.marketlake.eod-sweep.service com.marketlake.sunday.service marketlake-deploy.service
    ```
 
-3. Note the count step 5 asks for, then run the restore, with today's date as the
-   `--to` day. Start the VM first if the nightly stop has powered it off, as
+3. Count the bars trim lines, which step 5 compares against.
+
+   ```bash
+   grep -c '"kind": "trim", "partition": "bars/' /srv/marketlake/trimmed.jsonl
+   ```
+
+   Then run the restore, with today's date as the `--to` day. Start the VM first if the
+   nightly stop has powered it off, as
    [Start a stopped instance](#start-a-stopped-instance) says. An interactive login holds
    the VM up, by check 3 of [The nightly stop](#the-nightly-stop), so the switch that lets
    it stop need not be removed as [Restore the lake](#restore-the-lake) asks for a
@@ -1919,6 +1930,9 @@ owner's own SSH session.
    ~/marketlake/.venv/bin/python -m lake.bucket restore-range --surface bars --from 1990-01-01 --to <run day>
    ```
 
+   If the restore refuses because a file on disk does not match its manifest entry, follow
+   that message's own fix, then run the command again.
+
    The range starts at a fixed early date, before every bars day the manifest records, so
    no date has to be looked up. [#950](https://github.com/l3a0/marketlake/issues/950) can
    land GLD and USO history from 2006 to 2012, and a close+15 trim after its upload removes
@@ -1927,19 +1941,19 @@ owner's own SSH session.
    accepted. It hashes what is already present, so the wide range costs only that.
 
 4. Run the same command again. It restores 0 partitions.
-5. Before step 3, count the bars trim lines.
+5. After the next close+15, the trim's latest summary ends `bars=all`, and step 3's count,
+   run again, prints the same number. Step 3's restore lines name `bars/`
+   too, so only a count of trim lines tells the two apart. The journal check shows the
+   latest summary and any `trim     bars refused:` line.
 
    ```bash
-   grep -c '"kind": "trim", "partition": "bars/' /srv/marketlake/trimmed.jsonl
+   TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'trim     ' | tail -n 5
    ```
 
-   After the next close+15, the trim's summary ends `bars=all`, and the same count prints
-   the same number. Step 3's restore lines name `bars/` too, so only a count of trim lines
-   tells the two apart.
-
-   ```bash
-   TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'trim     window='
-   ```
+   When the latest summary does not end `bars=all`, read the `trim     bars refused:` line
+   and the nightly report's `lake window refused:` or `lake window edge not found:` line,
+   fix `config/vm.yaml` through a pull request, and leave
+   [#958](https://github.com/l3a0/marketlake/issues/958) open.
 
 Rendering the bars key before the first close+15 after [#950](https://github.com/l3a0/marketlake/issues/950)'s import is uploaded avoids
 trimming and then restoring an estimated 3,000 imported partitions, so when the order allows,

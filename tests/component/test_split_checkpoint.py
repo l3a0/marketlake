@@ -1623,6 +1623,20 @@ def test_quotes_and_bars_inheriting_one_window_file_one_line_naming_the_base_key
     ]
 
 
+def test_quotes_and_bars_keys_set_to_one_window_file_one_line_each(fixture_lake: FixtureLake):
+    """Each window was read from its own key, so each key files its own line, even though the two
+    windows are the same number of sessions."""
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window_sessions_quotes=400, window_sessions_bars=400)
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+    assert _window_lines(outcome) == [
+        f"lake window edge not found: lake_window_sessions_quotes, {UNPLACED}",
+        f"lake window edge not found: lake_window_sessions_bars, {UNPLACED}",
+    ]
+
+
 def test_a_surface_window_the_calendar_places_files_nothing(fixture_lake: FixtureLake):
     root = _both_edges_lake(fixture_lake)
 
@@ -1660,3 +1674,45 @@ def test_a_refused_bars_key_in_config_yaml_reaches_the_report(
     text = "\n".join(path.read_text() for path in filed)
     assert "lake window refused: lake_window_sessions_bars " in text
     assert read_checkpoint(root).cutoffs() == {"SPY": EARLY}
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions_chains", "lake_window_sessions_quotes"])
+def test_the_chains_and_quotes_keys_in_config_yaml_reach_the_report(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path: Path, key
+):
+    """Acceptance 9. ``sweep.main`` hands the chains and quotes keys to the sweep too, so a refused
+    one reaches the filed report under its own name."""
+    root = _swept_lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    with config.open("a") as handle:
+        handle.write(f"lake_window_sessions: 22\n{key}: ALL\n")
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: LONG_CALENDAR)
+    _record_execs(monkeypatch)
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    capsys.readouterr()
+
+    filed = (root / "reports").rglob("*.json")
+    text = "\n".join(path.read_text() for path in filed)
+    assert f"lake window refused: {key} " in text
+
+
+def test_an_unplaced_chains_edge_files_no_surface_edge_line(fixture_lake: FixtureLake):
+    """The other windows are counted only once the chains edge is, so a chains edge the calendar
+    cannot place files its own line and no quotes line beside it."""
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window=400, window_sessions_quotes=500)
+
+    assert not checkpoint_path(root).exists()
+    assert _window_lines(outcome) == [f"lake window edge not found: {UNPLACED}"]

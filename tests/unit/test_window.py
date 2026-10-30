@@ -499,3 +499,19 @@ def test_the_run_refusal_names_the_base_key_first():
         "lake_window_sessions_chains": _floor_message("lake_window_sessions_chains"),
     }
     assert resolved.run_refusal == _keeps_message("lake_window_sessions")
+
+
+def test_a_per_surface_key_is_judged_by_the_merged_guards():
+    """A guard that raises the floor to 31 refuses a quotes window of 30, which the default floor
+    of 22 would pass."""
+    guards = GuardConstants(trailing_median_sessions=30)
+    resolved = surface_windows(_stored(base=31, quotes=30), guards)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 31, "bars": 31}
+    assert resolved.refused == {
+        "lake_window_sessions_quotes": _floor_message("lake_window_sessions_quotes").replace(
+            "floor of 22", "floor of 31"
+        )
+    }
+    assert resolved.run_refusal is None

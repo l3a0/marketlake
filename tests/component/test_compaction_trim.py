@@ -1192,3 +1192,30 @@ def test_the_bars_key_in_config_yaml_reaches_the_trim(lake_root, tmp_path, monke
     assert summary.endswith(" bars=all")
     assert (lake_root / _brel("GLD", OLD[0])).exists()
     assert not (lake_root / _rel("SPY", OLD[0])).exists()
+
+
+def test_the_chains_and_quotes_keys_in_config_yaml_reach_the_trim(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """Acceptance 9. ``main`` hands the chains and quotes keys to ``compact`` too, so the summary
+    shows the chains key's window and the quotes key's ``all``."""
+    client = _surface_lake(lake_root, bars_only=("GLD",))
+    config = _evening_config(tmp_path, lake_root)
+    config.write_text(
+        config.read_text() + "lake_window_sessions_chains: 25\nlake_window_sessions_quotes: all\n"
+    )
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
+
+    code = compact_module.main(
+        ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+        clock=ManualClock(_et(TONIGHT, 16, 30)),
+        calendar=CALENDAR,
+    )
+
+    assert code == 0
+    summary = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("  trim     ")
+    ][0]
+    assert summary.startswith("  trim     window=25 ")
+    assert " quotes=all" in summary
