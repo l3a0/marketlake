@@ -17,7 +17,8 @@ What one run does, in the design's own order.
    is the calendar's answer and not the manifest's. Marketlake #431. It runs through
    ``split_checkpoint.walk_splits``, which resumes a ticker whose chains days were trimmed
    from the split checkpoint, and when the window key ``lake_window_sessions`` is set the run
-   writes tonight's checkpoint after the walk. Marketlake #786.
+   writes tonight's checkpoint after the walk, cut at the chains window's edge. Marketlake #786
+   and #953.
 2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
    walk covers every session the capture spans still hold unlanded rather than only
    the one the clock is in, because a daily bar waits for the next session to seal before
@@ -174,7 +175,7 @@ import shlex
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from functools import partial
@@ -213,7 +214,7 @@ from lake.control_plane import (
 )
 from lake.loader import SnapAbsent
 from lake.manifest import ManifestError, is_quarantined, latest_quarantine
-from lake.paths import CHAINS, QUOTES, default_token_path
+from lake.paths import BARS, CHAINS, QUOTES, default_token_path
 from lake.report import (
     ACTION,
     BARS_PIECE,
@@ -236,8 +237,14 @@ from lake.split_checkpoint import Checkpoint, SplitWalk, walk_splits, write_chec
 from lake.splits import SplitReport
 from lake.tickers import Roster, load_tickers
 from lake.vendor import Vendor
-from lake.window import EdgeNotFound, WindowRefused, window_edge
-from lake.window import window_sessions as window_sessions_of
+from lake.window import (
+    SURFACE_KEYS,
+    WINDOW_KEY,
+    EdgeNotFound,
+    SurfaceWindows,
+    surface_windows,
+    window_edge,
+)
 
 # The nightly summary's wire shape, per the design's message table. Priority 2 is the silent
 # tier: it lands in the notification drawer without interrupting, which is what makes one
@@ -942,28 +949,51 @@ def _check_disk_runway(
         report.add(f"disk runway unreadable: {type(exc).__name__}: {exc}", ACTION)
 
 
-def _window_edge(
-    window_sessions: int | str | None,
+def _checkpoint_edge(
+    stored: Mapping[str, object],
     guards: GuardConstants | None,
     *,
     calendar: Calendar,
     day: date,
     report: ReportLines,
 ) -> date | None:
-    """Tonight's window edge, or ``None`` when no checkpoint is to be written tonight.
+    """Tonight's checkpoint edge, the chains window's, or ``None`` when none is written tonight.
 
-    ``None`` for an absent key, which is every host that does not trim. A value the render
-    should have refused, or an edge the calendar cannot place, files an ``action`` line and
-    writes no checkpoint, so the trim then drops nothing and marketlake #438's runway alarm
-    covers the growth. Neither withholds the ping, because no captured data is at risk.
+    ``stored`` maps each window key to its stored value, unjudged. ``window.surface_windows``
+    judges them together, and ``None`` from it is a host without ``lake_window_sessions``,
+    which is every host that does not trim, whatever its per-surface keys hold. Each key it
+    refuses files one ``action`` line naming the key. A refused ``lake_window_sessions`` or
+    chains key writes no checkpoint, because the trim refuses the whole run on it, and a refused
+    quotes or bars key still writes one (marketlake #953).
+
+    The edge is the chains window's, never the narrowest or ``lake_window_sessions``'s, because
+    the trim cuts chains at it and a bars window that keeps every session counts no edge at all.
+    Once it is counted, :func:`_check_surface_edges` counts each other window the trim will.
+    Nothing here withholds the ping, because no captured data is at risk, and a night with no
+    checkpoint lets marketlake #438's runway alarm cover the growth.
     """
-    try:
-        sessions = window_sessions_of(window_sessions, guards or GuardConstants())
-    except WindowRefused as exc:
-        report.add(f"lake window refused: {exc}", ACTION)
+    resolved = surface_windows(stored, guards or GuardConstants())
+    if resolved is None:
         return None
-    if sessions is None:
+    for why in resolved.refused.values():
+        report.add(f"lake window refused: {why}", ACTION)
+    if resolved.run_refusal is not None:
         return None
+    chains = resolved.windows[CHAINS]
+    assert chains is not None, "the judge refuses all on the chains key"
+    edge = _window_edge(chains, calendar=calendar, day=day, report=report)
+    if edge is not None:
+        _check_surface_edges(resolved, chains, calendar=calendar, day=day, report=report)
+    return edge
+
+
+def _window_edge(
+    sessions: int, *, calendar: Calendar, day: date, report: ReportLines
+) -> date | None:
+    """The chains window's edge tonight, or ``None`` with an ``action`` line when it cannot be.
+
+    ``sessions`` was judged already, so this judges nothing and files no refusal of its own.
+    """
     try:
         return window_edge(calendar, day, sessions)
     except EdgeNotFound as exc:
@@ -974,6 +1004,36 @@ def _window_edge(
         # backstop for one it does not, the way the Friday wake contains the same calendar.
         report.add(f"lake window edge not found: {type(exc).__name__}", ACTION)
         return None
+
+
+def _check_surface_edges(
+    resolved: SurfaceWindows, chains: int, *, calendar: Calendar, day: date, report: ReportLines
+) -> None:
+    """File a line for each quotes or bars edge tonight's trim will not be able to count.
+
+    Only a numeric window that differs from the chains window has an edge of its own. The line
+    names the key the window was read from, so a window inherited from ``lake_window_sessions``
+    names that key, and quotes and bars inheriting one window file one line. The checkpoint is
+    untouched, because the trim keeps only that surface whole, and compaction's own line reaches
+    only the daemon's log. Any exception counts, since a hex window the judge passed raises
+    ``ValueError`` in the count's own message, and an escape from here would cost the night's
+    report file and ping.
+    """
+    counted: set[tuple[str, int]] = set()
+    for surface in (QUOTES, BARS):
+        sessions = resolved.windows.get(surface)
+        if sessions is None or sessions == chains:
+            continue
+        key = resolved.sources[surface]
+        if (key, sessions) in counted:
+            continue
+        counted.add((key, sessions))
+        try:
+            window_edge(calendar, day, sessions)
+        except EdgeNotFound as exc:
+            report.add(f"lake window edge not found: {key}, {exc}", ACTION)
+        except Exception as exc:  # noqa: BLE001 - as in ``_window_edge``
+            report.add(f"lake window edge not found: {key}, {type(exc).__name__}", ACTION)
 
 
 def _file_split_refusals(
@@ -1170,11 +1230,16 @@ def sweep(
     cost_client: aws_cost.ClientSource | None,
     guards: GuardConstants | None = None,
     window_sessions: int | str | None = None,
+    window_sessions_chains: int | str | None = None,
+    window_sessions_quotes: int | str | None = None,
+    window_sessions_bars: int | str | None = None,
 ) -> SweepOutcome:
     """Run one evening sweep. Every seam is required, and the module docstring says why.
 
     ``window_sessions`` is ``Config.lake_window_sessions`` as loaded, unjudged. It is a setting
-    rather than a seam, so it defaults to ``None``, an absent key, the way ``guards`` does.
+    rather than a seam, so it defaults to ``None``, an absent key, the way ``guards`` does. The
+    three ``window_sessions_*`` keywords are the per-surface keys, as loaded and unjudged, and
+    default to absent the same way (marketlake #953).
 
     ``publisher`` alone may be ``None``, which sends no digest and escalates no refused ping.
     That is what lets a test drive the run without a page reaching anywhere, and it is the
@@ -1260,8 +1325,20 @@ def sweep(
         # **The split walk runs through ``split_checkpoint.walk_splits``**, marketlake #786, which
         # resumes a ticker whose chains days were trimmed from the checkpoint or refuses it. The
         # window edge goes in only when the window key is set, because the edge is what the
-        # checkpoint written below is cut at, and nothing is written without the key.
-        edge = _window_edge(window_sessions, guards, calendar=calendar, day=day, report=report)
+        # checkpoint written below is cut at, and nothing is written without the key. The edge
+        # is the chains window's (marketlake #953).
+        edge = _checkpoint_edge(
+            {
+                WINDOW_KEY: window_sessions,
+                SURFACE_KEYS[CHAINS]: window_sessions_chains,
+                SURFACE_KEYS[QUOTES]: window_sessions_quotes,
+                SURFACE_KEYS[BARS]: window_sessions_bars,
+            },
+            guards,
+            calendar=calendar,
+            day=day,
+            report=report,
+        )
         split_walks: list[SplitWalk] = []
 
         def splits_walk() -> SplitReport:
@@ -1676,6 +1753,9 @@ def sweep_from_config(
         cost_client=aws_cost.client_source(config),
         guards=config.guards,
         window_sessions=config.lake_window_sessions,
+        window_sessions_chains=config.lake_window_sessions_chains,
+        window_sessions_quotes=config.lake_window_sessions_quotes,
+        window_sessions_bars=config.lake_window_sessions_bars,
     )
 
 

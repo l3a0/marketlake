@@ -1,8 +1,11 @@
 """The lake window: its floor, how a stored value is judged, and the edge it sets.
 
 marketlake #786 adds ``lake_window_sessions``, the number of recent sessions a host keeps on its
-lake volume. These are the value-only rules behind it. The render and the sweep that apply them
-are tested in ``tests/component``.
+lake volume, and marketlake #953 adds a key per surface beside it. These are the value-only rules
+behind them. The render, the sweep and the trim that apply them are tested in
+``tests/component``. Every key name and every new message is written out as a literal rather
+than read from the code, because every per-surface key name contains ``lake_window_sessions``,
+so a check against the code's constant would pass a message naming the wrong key.
 """
 
 from __future__ import annotations
@@ -14,11 +17,13 @@ import pytest
 from lake.config import GuardConstants
 from lake.window import (
     EDGE_SEARCH_DAYS,
+    KEEP_EVERY_SESSION,
     WINDOW_KEY,
     EdgeNotFound,
     WindowRefused,
     edge_search_days,
     most_sessions_in,
+    surface_windows,
     window_edge,
     window_floor,
     window_sessions,
@@ -257,7 +262,9 @@ def test_the_floor_reads_each_calendar_span(monkeypatch, span: str):
 
 
 def test_a_window_reaching_past_the_real_calendars_first_session_is_refused():
-    """``exchange_calendars`` refuses a day before 2006-10-09 with a ``ValueError``.
+    """``exchange_calendars`` refuses a day before its first session with a ``ValueError``.
+
+    That session lies 20 years before today and moves daily, so no fixed date names it.
 
     6,000 sessions reach back further than that. Escaping as ``DateOutOfBounds`` would cost the
     sweep its report, digest and ping, so the count refuses as ``EdgeNotFound`` instead.
@@ -272,3 +279,223 @@ def test_a_huge_window_on_a_calendar_with_no_session_stops_at_the_first_date():
     """The search outruns ``date.min`` before its own bound, and stepping past it overflows."""
     with pytest.raises(EdgeNotFound, match="first day a date can name"):
         window_edge(_CountingCalendar(limit=10**7), FRIDAY, 300_000)
+
+
+# -- a window per surface, marketlake #953 ------------------------------------------------------
+
+GUARDS = GuardConstants()
+
+
+def _floor_message(key: str) -> str:
+    """Today's floor message, which chains and quotes keep with their own key in it."""
+    return (
+        f"{key} is under the floor of 22 sessions that the readers of sealed chains and quotes "
+        "need, which are the battery's trailing median, the History panel and the disk runway. "
+        "Raise it in config/vm.yaml"
+    )
+
+
+def _keeps_message(key: str) -> str:
+    return (
+        f"{key} keeps every session, which only lake_window_sessions_bars and "
+        "lake_window_sessions_quotes may, because the split checkpoint is counted from the "
+        "chains window. Set a whole number in config/vm.yaml"
+    )
+
+
+BARS_FLOOR = (
+    "lake_window_sessions_bars is under the floor of 22 sessions that the chains and quotes "
+    "windows share. Raise it in config/vm.yaml"
+)
+BARS_NOT_A_NUMBER = "lake_window_sessions_bars is not a whole number of sessions or all"
+
+
+def _refusal(value: object, key: str) -> str:
+    with pytest.raises(WindowRefused) as raised:
+        window_sessions(value, GUARDS, key=key)
+    message = str(raised.value)
+    # ``report.redacted`` keeps a sweep line only up to its second ``": "``.
+    assert ": " not in message
+    return message
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions_bars", "lake_window_sessions_quotes"])
+def test_all_on_the_bars_or_quotes_key_keeps_every_session(key: str):
+    """``config._window_value`` stores ``all`` as its ``repr``, which is what the judge reads."""
+    assert window_sessions("'all'", GUARDS, key=key) is KEEP_EVERY_SESSION
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions", "lake_window_sessions_chains"])
+def test_all_on_the_chains_key_or_the_base_key_is_refused(key: str):
+    """Refusal 11.2 on #953. A chains window of every session counts no checkpoint edge."""
+    assert _refusal("'all'", key) == _keeps_message(key)
+
+
+@pytest.mark.parametrize("value", ["'ALL'", "'All'", "None", "'22'", "True", "[22]"])
+@pytest.mark.parametrize("key", ["lake_window_sessions_bars", "lake_window_sessions_quotes"])
+def test_a_bars_or_quotes_value_that_is_neither_a_number_nor_all_is_refused(key: str, value: str):
+    """Refusal 11.1. Only lower-case ``all`` keeps every session, and a blank key stores
+    ``"None"``. The message says ``or all``, which a prefix check could not see go missing."""
+    assert _refusal(value, key) == f"{key} is not a whole number of sessions or all"
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions", "lake_window_sessions_chains"])
+def test_a_chains_value_that_is_not_a_number_keeps_todays_text_with_its_key(key: str):
+    assert _refusal("'many'", key) == f"{key} is not a whole number of sessions"
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions_chains", "lake_window_sessions_quotes"])
+def test_a_chains_or_quotes_window_under_the_floor_names_its_own_key(key: str):
+    assert _refusal(21, key) == _floor_message(key)
+
+
+def test_a_bars_window_under_the_floor_does_not_claim_a_reader_needs_it():
+    """Refusal 11.3. No reader of sealed bars needs the floor, so the message says the floor is
+    the one the chains and quotes windows share."""
+    assert _refusal(21, "lake_window_sessions_bars") == BARS_FLOOR
+
+
+@pytest.mark.parametrize("key", ["lake_window_sessions_bars", "lake_window_sessions_quotes"])
+def test_a_number_on_a_per_surface_key_is_its_window(key: str):
+    assert window_sessions(25, GUARDS, key=key) == 25
+
+
+def test_the_base_floor_message_is_unchanged():
+    """A host with ``lake_window_sessions`` alone files the line it filed before #953."""
+    assert _refusal(21, "lake_window_sessions") == _floor_message("lake_window_sessions")
+
+
+# -- inheritance -------------------------------------------------------------------------------
+
+
+def _stored(**keys: object) -> dict[str, object]:
+    """The four stored values, each absent unless named, keyed by the literal key names."""
+    names = {
+        "base": "lake_window_sessions",
+        "chains": "lake_window_sessions_chains",
+        "quotes": "lake_window_sessions_quotes",
+        "bars": "lake_window_sessions_bars",
+    }
+    return {names[name]: value for name, value in keys.items()}
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [{}, {"bars": "'all'"}, {"bars": "'ALL'"}, {"chains": 25, "quotes": 3}],
+    ids=["nothing", "bars-all", "bars-ALL", "bad-and-good"],
+)
+def test_without_the_base_key_nothing_is_judged_and_nothing_trims(keys):
+    """Only ``lake_window_sessions`` turns trimming on, so a per-surface key alone, even one the
+    judge would refuse, is no window and files nothing. The render refuses it instead."""
+    assert surface_windows(_stored(**keys), GUARDS) is None
+
+
+def test_the_base_key_alone_sets_every_surface():
+    resolved = surface_windows(_stored(base=22), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22, "quotes": 22, "bars": 22}
+    assert resolved.refused == {}
+    assert resolved.run_refusal is None
+
+
+def test_an_absent_key_inherits_the_base_key_never_the_chains_key():
+    """Mutation this catches: an absent quotes or bars key taking the chains window."""
+    resolved = surface_windows(_stored(base=22, chains=25), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 25, "quotes": 22, "bars": 22}
+    assert resolved.refused == {}
+    assert resolved.run_refusal is None
+    assert resolved.sources == {
+        "chains": "lake_window_sessions_chains",
+        "quotes": "lake_window_sessions",
+        "bars": "lake_window_sessions",
+    }
+
+
+def test_bars_kept_is_none_beside_numeric_windows():
+    """The VM's own setting, ``lake_window_sessions: 22`` and ``lake_window_sessions_bars: all``."""
+    resolved = surface_windows(_stored(base=22, bars="'all'"), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22, "quotes": 22, "bars": None}
+    assert resolved.refused == {}
+    assert resolved.run_refusal is None
+
+
+def test_a_refused_bars_key_refuses_bars_alone():
+    """A refused surface is absent from ``windows``, so ``get`` cannot pass it off as kept."""
+    resolved = surface_windows(_stored(base=22, bars="'ALL'"), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22, "quotes": 22}
+    assert resolved.refused == {"lake_window_sessions_bars": BARS_NOT_A_NUMBER}
+    assert resolved.run_refusal is None
+
+
+def test_a_blank_key_is_present_and_does_not_inherit():
+    """A key written with no value stores ``"None"``. It is present, so it is refused rather than
+    given ``lake_window_sessions``'s window."""
+    resolved = surface_windows(_stored(base=22, bars="None"), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22, "quotes": 22}
+    assert resolved.refused == {"lake_window_sessions_bars": BARS_NOT_A_NUMBER}
+    assert resolved.run_refusal is None
+
+
+def test_two_refused_keys_are_two_entries_in_key_order():
+    resolved = surface_windows(_stored(base=22, bars="'All'", quotes=21), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22}
+    assert resolved.refused == {
+        "lake_window_sessions_quotes": _floor_message("lake_window_sessions_quotes"),
+        "lake_window_sessions_bars": BARS_NOT_A_NUMBER,
+    }
+    assert list(resolved.refused) == ["lake_window_sessions_quotes", "lake_window_sessions_bars"]
+    assert resolved.run_refusal is None
+
+
+def test_a_refused_base_key_is_one_entry_and_refuses_the_run():
+    """An absent key inherits the base key's verdict and adds no entry, so one bad base key is
+    one line in the sweep's report."""
+    resolved = surface_windows(_stored(base=21), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {}
+    assert resolved.refused == {"lake_window_sessions": _floor_message("lake_window_sessions")}
+    assert resolved.run_refusal == _floor_message("lake_window_sessions")
+
+
+def test_a_refused_base_key_refuses_the_run_beside_every_good_surface_key():
+    resolved = surface_windows(_stored(base=21, chains=22, quotes=22, bars="'all'"), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"chains": 22, "quotes": 22, "bars": None}
+    assert resolved.refused == {"lake_window_sessions": _floor_message("lake_window_sessions")}
+    assert resolved.run_refusal == _floor_message("lake_window_sessions")
+
+
+def test_a_refused_chains_key_refuses_the_run():
+    resolved = surface_windows(_stored(base=22, chains="'all'"), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {"quotes": 22, "bars": 22}
+    assert resolved.refused == {
+        "lake_window_sessions_chains": _keeps_message("lake_window_sessions_chains")
+    }
+    assert resolved.run_refusal == _keeps_message("lake_window_sessions_chains")
+
+
+def test_the_run_refusal_names_the_base_key_first():
+    resolved = surface_windows(_stored(base="'all'", chains=21), GUARDS)
+
+    assert resolved is not None
+    assert resolved.windows == {}
+    assert resolved.refused == {
+        "lake_window_sessions": _keeps_message("lake_window_sessions"),
+        "lake_window_sessions_chains": _floor_message("lake_window_sessions_chains"),
+    }
+    assert resolved.run_refusal == _keeps_message("lake_window_sessions")

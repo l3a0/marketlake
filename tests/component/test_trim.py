@@ -188,6 +188,8 @@ def _trim(
     clock: ManualClock | None = None,
     upload: UploadSummary | None = None,
     calendar=CALENDAR,
+    windows: dict[str, int | None] | None = None,
+    refused: dict[str, str] | None = None,
 ) -> TrimResult:
     with lake_lock(root):
         return trim(
@@ -198,6 +200,8 @@ def _trim(
             upload=upload if upload is not None else _upload(root),
             clock=clock if clock is not None else ManualClock(_et(TONIGHT, 16, 30)),
             calendar=calendar,
+            windows=windows,
+            refused=refused,
         )
 
 
@@ -1668,3 +1672,199 @@ def test_nothing_reads_json_from_the_ledger_but_the_ledger_module(lake_root):
     _trim(lake_root, client)
     for raw in trimmed.trimmed_path(lake_root).read_text().splitlines():
         assert isinstance(json.loads(raw), dict)
+
+
+# -- a window per surface, marketlake #953 ----------------------------------------------------
+#
+# Over these two weeks a window of 3 has its edge on 2026-08-25 and a window of 5 on 2026-08-21,
+# so 2026-08-24 lies between the two edges and 2026-08-20 past both. A window of 9 reaches the
+# first Monday, and a window of 10 is one the calendar cannot place.
+
+EDGE_5 = date(2026, 8, 21)
+BETWEEN = date(2026, 8, 24)
+PAST_BOTH = date(2026, 8, 20)
+
+
+def test_a_surfaces_own_window_renders_after_the_summary():
+    result = TrimResult(
+        window=3,
+        edge=EDGE,
+        surfaces=(("quotes", 5, EDGE_5), ("bars", None, None)),
+        surface_refused=(("bars", "why"),),
+    )
+    lines = result.render()
+    assert lines[0] == (
+        "  trim     window=3 edge=2026-08-25 trimmed=0 restored=0 skipped=0 rot=0 "
+        "quotes=5/2026-08-21 bars=all"
+    )
+    assert lines[1] == "  trim     bars refused: why"
+
+
+def test_chains_3_quotes_5_bars_kept_trims_each_surface_to_its_own_edge(lake_root):
+    """The chain between the two edges goes and its quotes partition stays, under a landed bar."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS)
+
+    first = _trim(lake_root, client, windows={"quotes": 5, "bars": None})
+    second = _trim(lake_root, client, windows={"quotes": 5, "bars": None})
+
+    assert first.surface_refused == ()
+    assert first.render()[0].endswith(" quotes=5/2026-08-21 bars=all")
+    for ticker in TICKERS:
+        assert _rel(ticker, BETWEEN) in first.trimmed
+        assert _rel(ticker, PAST_BOTH) in first.trimmed
+        assert (lake_root / _qrel(ticker, BETWEEN)).exists()
+        assert _qrel(ticker, PAST_BOTH) in first.trimmed
+    assert not any(rel.startswith("bars/") for rel in first.trimmed + second.trimmed)
+    assert all((lake_root / rel).exists() for rel in _expected_bars())
+
+
+def test_chains_5_bars_3_keeps_a_bar_whose_chain_is_inside_the_chains_window(lake_root):
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS)
+
+    first = _trim(lake_root, client, window=5, windows={"quotes": 5, "bars": 3})
+    second = _trim(lake_root, client, window=5, windows={"quotes": 5, "bars": 3})
+
+    assert _rel("SPY", PAST_BOTH) in first.trimmed
+    assert second.surface_refused == ()
+    for freq in BOTH_FREQS:
+        assert (lake_root / _brel("SPY", freq, BETWEEN)).exists()
+        assert _brel("SPY", freq, PAST_BOTH) in second.trimmed
+
+
+def test_chains_5_quotes_3_keeps_a_quotes_day_whose_bar_never_landed(lake_root):
+    client = _build(lake_root, quotes=True, no_bar=(("SPY", BETWEEN),))
+
+    result = _trim(lake_root, client, window=5, windows={"quotes": 3, "bars": 5})
+
+    assert _rel("SPY", PAST_BOTH) in result.trimmed
+    assert (lake_root / _qrel("SPY", BETWEEN)).exists()
+    assert _qrel("QQQ", BETWEEN) in result.trimmed
+    assert result.render()[0].endswith(" quotes=3/2026-08-25")
+
+
+def test_quotes_kept_keeps_every_quotes_partition(lake_root):
+    client = _build(lake_root, quotes=True)
+
+    result = _trim(lake_root, client, windows={"quotes": None, "bars": 3})
+
+    assert result.surface_refused == ()
+    assert result.render()[0].endswith(" quotes=all")
+    assert _rel("SPY", PAST_BOTH) in result.trimmed
+    assert not any(rel.startswith("quotes/") for rel in result.trimmed)
+    assert all((lake_root / _qrel(t, d)).exists() for t in TICKERS for d in SESSIONS)
+
+
+def test_chains_3_bars_5_keeps_bars_between_the_edges_with_or_without_a_chain(lake_root):
+    """GLD has no chains, and SPY's chain between the edges is gone by the second run, so only
+    the bars window keeps their bars there. Their bars past the bars edge go."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS, bars_only=("GLD",))
+
+    first = _trim(lake_root, client, windows={"quotes": 3, "bars": 5})
+    second = _trim(lake_root, client, windows={"quotes": 3, "bars": 5})
+
+    assert _rel("SPY", BETWEEN) in first.trimmed
+    for freq in BOTH_FREQS:
+        assert (lake_root / _brel("GLD", freq, BETWEEN)).exists()
+        assert (lake_root / _brel("SPY", freq, BETWEEN)).exists()
+        assert _brel("GLD", freq, PAST_BOTH) in first.trimmed
+        assert _brel("SPY", freq, PAST_BOTH) in second.trimmed
+
+
+def test_a_window_of_9_reaches_the_first_monday(lake_root):
+    client = _build(lake_root, quotes=True)
+
+    result = _trim(lake_root, client, windows={"quotes": 9, "bars": 3})
+
+    assert result.render()[0].endswith(" quotes=9/2026-08-17")
+    assert [rel for rel in result.trimmed if rel.startswith("quotes/")] == [
+        _qrel(ticker, FIRST_MONDAY) for ticker in sorted(TICKERS)
+    ]
+
+
+def test_a_surface_left_out_of_the_windows_is_kept_not_given_the_chains_window(lake_root):
+    client = _build(lake_root, quotes=True)
+
+    result = _trim(lake_root, client, windows={"bars": 3})
+
+    assert result.surface_refused == (
+        ("quotes", "no window was given for it, so it is kept whole"),
+    )
+    assert not any(rel.startswith("quotes/") for rel in result.trimmed)
+    assert _expected() == [rel for rel in result.trimmed if rel.startswith("chains/")]
+
+
+@pytest.mark.parametrize("surface", ["quotes", "bars"])
+def test_an_edge_the_calendar_cannot_place_refuses_its_surface_alone(lake_root, surface):
+    """Mutation this catches: the surface's edge refusing the whole run, as the chains one does."""
+    client = _build(lake_root, quotes=True)
+    other = "bars" if surface == "quotes" else "quotes"
+
+    result = _trim(lake_root, client, windows={surface: 10, other: 3})
+
+    why = (
+        "the window edge could not be counted: only 10 of 11 sessions in the 366 days up to "
+        "2026-08-28, so the window is longer than the search reaches"
+    )
+    assert result.refused is None and result.stopped is None
+    assert result.surface_refused == ((surface, why),)
+    assert f"  trim     {surface} refused: {why}" in result.render()
+    assert [rel for rel in result.trimmed if rel.startswith("chains/")] == _expected()
+    assert not any(rel.startswith(f"{surface}/") for rel in result.trimmed)
+
+
+def test_an_edge_that_raises_anything_refuses_its_surface_alone(lake_root, monkeypatch):
+    """A hex window too long to print makes the count raise ``ValueError`` in its own message,
+    which is not ``EdgeNotFound``."""
+    client = _build(lake_root, quotes=True)
+    real = trim_module.window_edge
+
+    def raising(calendar, tonight, sessions):
+        if sessions == 7:
+            raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
+        return real(calendar, tonight, sessions)
+
+    monkeypatch.setattr(trim_module, "window_edge", raising)
+    result = _trim(lake_root, client, windows={"quotes": 3, "bars": 6})
+
+    assert result.surface_refused == (
+        ("bars", "the window edge could not be counted (ValueError)"),
+    )
+    assert [rel for rel in result.trimmed if rel.startswith("chains/")] == _expected()
+
+
+@pytest.mark.parametrize("case", ["kept", "refused", "edge"])
+@pytest.mark.parametrize("surface", ["quotes", "bars"])
+def test_a_kept_or_refused_surface_beside_a_trim_line_gets_a_restore_line(lake_root, surface, case):
+    """Acceptance 7 on #953. A partition kept by its surface's window, beside the trim line a
+    crash left, gets a restore line and stays, so a rebuild does not take it for a designed
+    absence. Mutations this catches: the kept or refused surface skipped early, which writes no
+    restore line, and the surface given the chains window, which trims the file again. A bar
+    beside a trim line whose chain is on disk gets a restore line today anyway, so the bar here
+    is one whose chain the first run trimmed."""
+    client = _build(lake_root, quotes=True, bar_freqs=BOTH_FREQS)
+    if surface == "bars":
+        _trim(lake_root, client)
+        rel = _brel("SPY", "1d", SESSIONS[0])
+        assert not (lake_root / _rel("SPY", SESSIONS[0])).exists()
+    else:
+        rel = _qrel("SPY", SESSIONS[0])
+    _crashed_before_unlink(lake_root, rel)
+    other = "bars" if surface == "quotes" else "quotes"
+    windows: dict[str, int | None] = {other: 3}
+    refused = None
+    if case == "kept":
+        windows[surface] = None
+    elif case == "edge":
+        windows[surface] = 10
+    else:
+        refused = {surface: "a refusal"}
+    client.calls.clear()
+
+    result = _trim(lake_root, client, windows=windows, refused=refused)
+
+    assert rel in result.restored and rel not in result.trimmed
+    assert (lake_root / rel).exists()
+    assert trimmed.latest_trimmed(lake_root)[rel]["kind"] == trimmed.RESTORE_KIND
+    assert rel not in _gets(client)
+    if case != "kept":
+        assert [name for name, _ in result.surface_refused] == [surface]

@@ -8,9 +8,11 @@ deleted. That merge is *compaction*. This module is the close+15 job that does i
 re-sizes the chain chunk plan from what the day captured, then copies the lake to the backup
 target and pings. The backup target is a mounted directory, copied with ``rsync``, or a
 bucket, uploaded to by ``lake.bucket``. On a host whose config sets a window, the job then
-trims chains partitions older than the window, quotes partitions older than it under a landed
-daily bar, and bars partitions older than it once their day's chains are gone, which
-``lake.trim`` decides.
+trims chains partitions older than the chains window, quotes partitions older than the quotes
+window under a landed daily bar, and bars partitions older than the bars window once their
+day's chains are gone, which ``lake.trim`` decides. Each surface's window is
+``lake_window_sessions`` unless its own key overrides it, and the quotes and bars keys can keep
+every session (marketlake #953).
 
 The same job runs a second time on a weekday evening. The 18:30 vendor sweep writes bars,
 the actions ledger and reference-table updates into the lake after close+15 has uploaded
@@ -153,10 +155,12 @@ The job's rules, each glossed at first use.
    entry is re-recorded when a trim or restore line landed without it, so the upload never
    sends the ledger under a stale sha. A host with no ``trimmed.jsonl`` reads and writes
    nothing there. After the ping, still in the lock hold, a primary host with a bucket target
-   and a ``lake_window_sessions`` key trims chains partitions older than its window, quotes
-   partitions older than it under a landed daily bar, and bars partitions older than it once
-   their day's chains are gone, each once it is verified in the bucket (marketlake #787, #794,
-   #795). The trim is the only code that deletes a
+   and a ``lake_window_sessions`` key trims chains partitions older than the chains window,
+   quotes partitions older than the quotes window under a landed daily bar, and bars
+   partitions older than the bars window once their day's chains are gone, each once it is
+   verified in the bucket (marketlake #787, #794, #795). Each surface's window is
+   ``lake_window_sessions`` unless its own key overrides it (marketlake #953). The trim is the
+   only code that deletes a
    sealed partition on its own, and the hand-run ``recompact_ticker_day`` is the only code
    that replaces one. The trim records each partition in ``trimmed.jsonl`` first. It never
    raises, so a trim fault withholds no ping and loses none of the night's lines. Then every
@@ -212,6 +216,7 @@ from lake.manifest import (
 )
 from lake.parquet_footer import count_disagreement
 from lake.paths import (
+    BARS,
     CHAINS,
     DATE_PREFIX,
     QUOTES,
@@ -1471,14 +1476,20 @@ def _trim_step(
     ledger_repair: LedgerRepair | None,
     clock: Clock,
     calendar: Calendar,
+    surface_sessions: Mapping[str, int | str | None] | None = None,
 ) -> TrimResult | None:
     """Judge whether tonight's run may trim, and run the trim when it may. Never raises.
 
-    ``None`` means the config sets no window, which is every host that never trims, the
-    laptop included, so its result prints nothing new. Every other gate that refuses returns
-    a result naming why.
+    ``None`` means the config sets no ``lake_window_sessions``, which is every host that never
+    trims, the laptop included, so its result prints nothing new, whatever the per-surface keys
+    hold. Every other gate that refuses returns a result naming why.
 
-    1. The window has to clear its floor, which ``window.window_sessions`` judges.
+    ``surface_sessions`` maps each per-surface key's name to its stored value, unjudged, and a
+    key missing from it is absent (marketlake #953).
+
+    1. The windows have to clear their floor, which ``window.surface_windows`` judges. A refused
+       ``lake_window_sessions`` or chains key refuses the whole run. A refused quotes or bars key
+       refuses that surface alone, which the trim keeps whole.
     2. The role ``outbox.senders`` resolved has to be primary. A shadow's own trimmed ledger
        would be reverted by the resync (marketlake #832), which would leave its trims
        unexplained.
@@ -1491,12 +1502,18 @@ def _trim_step(
     from lake.trim import TrimResult, describe, trim
 
     try:
-        try:
-            window = lake_window.window_sessions(window_sessions, guards)
-        except lake_window.WindowRefused as exc:
-            return TrimResult(refused=str(exc))
-        if window is None:
+        resolved = lake_window.surface_windows(
+            {lake_window.WINDOW_KEY: window_sessions, **(surface_sessions or {})}, guards
+        )
+        if resolved is None:
             return None
+        if resolved.run_refusal is not None:
+            return TrimResult(refused=resolved.run_refusal)
+        window = resolved.windows[CHAINS]
+        assert window is not None, "the judge refuses all on the chains key"
+        # The judge names keys, and the trim names surfaces.
+        surface_of = {key: surface for surface, key in lake_window.SURFACE_KEYS.items()}
+        refused = {surface_of[key]: why for key, why in resolved.refused.items()}
         if role != outbox.PRIMARY:
             return TrimResult(
                 window=window,
@@ -1530,6 +1547,8 @@ def _trim_step(
             upload=summary,
             clock=clock,
             calendar=calendar,
+            windows=resolved.windows,
+            refused=refused,
         )
     except Exception as exc:
         return TrimResult(
@@ -2316,6 +2335,9 @@ def compact(
     plan_path: Path | str | None = None,
     role: str | None = None,
     window_sessions: int | str | None = None,
+    window_sessions_chains: int | str | None = None,
+    window_sessions_quotes: int | str | None = None,
+    window_sessions_bars: int | str | None = None,
 ) -> CompactionResult:
     """Run the close+15 job: sweep, seal, re-tune, back up, ping.
 
@@ -2331,7 +2353,10 @@ def compact(
     ping, and only when ``role`` is primary, ``window_sessions`` judges to a window, and the
     backup is a bucket upload that left a deadline and a watermark. Both default to off, so
     a caller that passes neither never trims. ``main`` passes the role ``outbox.senders``
-    resolved and the config's ``lake_window_sessions``.
+    resolved and the config's ``lake_window_sessions``. The three ``window_sessions_*``
+    keywords carry the per-surface keys, ``lake_window_sessions_chains`` and its siblings, as
+    stored, and each defaults to absent, which takes ``window_sessions``'s value (marketlake
+    #953).
 
     The run is idempotent. A second run over the same lake seals nothing and rewrites no
     plan. Its trim sends no read for a partition the first run trimmed, but it can trim one
@@ -2521,6 +2546,11 @@ def compact(
                 ledger_repair=ledger_repair,
                 clock=clock,
                 calendar=calendar,
+                surface_sessions={
+                    lake_window.SURFACE_KEYS[CHAINS]: window_sessions_chains,
+                    lake_window.SURFACE_KEYS[QUOTES]: window_sessions_quotes,
+                    lake_window.SURFACE_KEYS[BARS]: window_sessions_bars,
+                },
             )
             if trim_result is not None and trim_result.rot:
                 from lake.trim import rot_page_body
@@ -2784,6 +2814,9 @@ def main(
             # role passed is the one ``senders`` resolved, never the raw key.
             role=sends.role,
             window_sessions=config.lake_window_sessions,
+            window_sessions_chains=config.lake_window_sessions_chains,
+            window_sessions_quotes=config.lake_window_sessions_quotes,
+            window_sessions_bars=config.lake_window_sessions_bars,
         )
     except bucket.BucketRefusal as exc:
         # Only the bucket form raises this, so the path form keeps its own behavior for

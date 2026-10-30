@@ -35,7 +35,12 @@ Seven jobs live here.
    lake's own manifest, for a partition lost by accident or a rollback of trimming (marketlake
    #784, #795). While the host's config sets ``lake_window_sessions``, a rollback lasts only until
    the trim runs with a split checkpoint from a session after the restore's day, which drops
-   each restored partition outside the window again. A lasting rollback also removes the key.
+   each restored partition outside its surface's window again. A lasting rollback removes
+   ``lake_window_sessions`` and every per-surface window key together, because the render
+   refuses a per-surface key left on its own and keeps the old ``config.yaml``, which would leave
+   the trim running (marketlake #953). Raising a window brings nothing back, so a surface whose
+   window grew is restored this way too, and its ``--from`` may fall before the calendar's first
+   session, because the range is selected by manifest dates.
 6. **The resync**, ``python -m lake.bucket resync``, is run by hand on a host about to
    become primary again after the other host was primary (marketlake #832). It reads the
    bucket's ``manifest.jsonl``, tells another host's entries from a hand repair, and plans
@@ -5722,7 +5727,9 @@ def main(
     ``lake_root``, and the laptop, a shadow, is where a reader is likeliest to sit.
 
     ``restore`` reads ``lake_window_sessions`` through ``window.window_sessions`` before the
-    client is built, so a bad value refuses before any request. A host that sets the key
+    client is built, so a bad value refuses before any request. It reads no per-surface window
+    key, so the VM's ``lake_window_sessions_bars: all`` leaves its rebuild trimmed (marketlake
+    #953). A host that sets the key
     keeps a window, and its restore leaves out the designed absences the bucket's
     ``trimmed.jsonl`` records. A host without it restores the whole lake. A malformed value, or
     one under the floor, refuses with one line and exit 2. No other command reads the key, so

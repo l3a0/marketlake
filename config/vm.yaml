@@ -24,12 +24,24 @@
 # it on 2026-10-08, and chains were nearly all of each session's growth, so 22 stands. The
 # render refuses a value under the floor the readers of sealed chains and quotes need, which
 # lake.window derives. The key also picks what `lake.bucket restore` brings back: with it,
-# the restore rebuilds this trimmed lake from the bucket, #785. Removing the key stops the
-# checkpoint and the trim, and makes the restore bring back the whole lake, which outgrows the
-# volume as the lake grows.
+# the restore rebuilds this trimmed lake from the bucket, #785.
+#
+# `lake_window_sessions_bars: all` keeps every bars session on the VM, #953, from the owner's
+# ruling of 2026-10-29 on #938. Chains and quotes have no key of their own here, so each takes
+# lake_window_sessions's 22, and the split checkpoint is cut at the chains window's edge. A bar
+# is a few KB a day, and imported history lands under bars/ too. Raising a window brings
+# nothing back, so bars trimmed before this key reached the VM need the one-time restore in
+# infra/README.md, #958.
+#
+# Removing lake_window_sessions stops the checkpoint and the trim, and makes the restore bring
+# back the whole lake, which outgrows the volume as the lake grows. A lasting rollback of
+# trimming removes lake_window_sessions and every per-surface key together, because the render
+# refuses a per-surface key left on its own and keeps the old config.yaml, which would leave
+# the trim running.
 role: primary
 lake_root: /srv/marketlake
 token_store: store
 bucket_credentials: instance_profile
 bucket_region: us-east-1
 lake_window_sessions: 22
+lake_window_sessions_bars: all

@@ -735,7 +735,10 @@ def _sweep(
     pinger: FakePinger | None = None,
     transport: FakeTransport | None = None,
     guards: GuardConstants | None = None,
+    **surfaces,
 ):
+    """One sweep. ``surfaces`` carries the per-surface keywords, such as
+    ``window_sessions_bars``, as stored values."""
     pinger = FakePinger() if pinger is None else pinger
     transport = FakeTransport() if transport is None else transport
     outcome = sweep.sweep(
@@ -752,6 +755,7 @@ def _sweep(
         cost_client=None,
         window_sessions=window,
         guards=guards,
+        **surfaces,
     )
     return outcome, pinger
 
@@ -1449,3 +1453,210 @@ def test_a_window_past_the_calendars_first_session_still_files_and_pings(
     assert pinger.events
     assert any(line.startswith("lake window edge not found: ") for line in outcome.nightly.report)
     assert not checkpoint_path(root).exists()
+
+
+# -- a window per surface, marketlake #953 ----------------------------------------------------
+#
+# In ``LONG_CALENDAR`` a window of 22 has its edge on 2026-08-07 and a window of 25 on 2026-08-04.
+# A sealed SPY chains day on each edge tells the two apart, since the checkpoint's cutoff is the
+# last sealed day at or before the edge.
+
+EDGE_25 = date(2026, 8, 4)
+BARS_NOT_A_NUMBER = "lake_window_sessions_bars is not a whole number of sessions or all"
+QUOTES_NOT_A_NUMBER = "lake_window_sessions_quotes is not a whole number of sessions or all"
+
+
+def _both_edges_lake(fixture_lake: FixtureLake) -> Path:
+    return _swept_lake(
+        fixture_lake,
+        chains={("SPY", EDGE): sample_chains_table(), ("SPY", EDGE_25): sample_chains_table()},
+    )
+
+
+def _window_lines(outcome) -> list[str]:
+    return [line for line in outcome.nightly.report if line.startswith("lake window ")]
+
+
+@pytest.mark.parametrize(
+    ("window", "surfaces", "cutoff"),
+    [
+        (25, {"window_sessions_chains": 22, "window_sessions_bars": "'all'"}, EDGE),
+        (22, {"window_sessions_chains": 25}, EDGE_25),
+    ],
+    ids=["base-25-chains-22", "base-22-chains-25"],
+)
+def test_the_checkpoint_is_cut_at_the_chains_windows_edge(
+    fixture_lake: FixtureLake, window, surfaces, cutoff
+):
+    """Acceptance 4. The first case fails a build cutting at the base window, and the second one
+    cutting at the narrowest window, so only the chains window passes both."""
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window=window, **surfaces)
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": cutoff}
+    assert _window_lines(outcome) == []
+
+
+def test_a_refused_base_key_beside_every_surface_key_files_one_line_and_no_checkpoint(
+    fixture_lake: FixtureLake,
+):
+    root = _swept_lake(fixture_lake)
+
+    outcome, pinger = _sweep(
+        root,
+        window=21,
+        window_sessions_chains=22,
+        window_sessions_quotes=22,
+        window_sessions_bars="'all'",
+    )
+
+    assert not checkpoint_path(root).exists()
+    assert [
+        line for line in outcome.nightly.report if line.startswith("lake window refused: ")
+    ] == [
+        "lake window refused: lake_window_sessions is under the floor of 22 sessions that the "
+        "readers of sealed chains and quotes need, which are the battery's trailing median, the "
+        "History panel and the disk runway. Raise it in config/vm.yaml"
+    ]
+    assert pinger.events
+
+
+def test_a_host_with_only_a_bars_key_writes_no_checkpoint_and_files_no_window_line(
+    fixture_lake: FixtureLake,
+):
+    """Only ``lake_window_sessions`` turns trimming on, so even a bars value the judge would
+    refuse is never judged on a host without it."""
+    root = _swept_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window=None, window_sessions_bars="'ALL'")
+
+    assert not checkpoint_path(root).exists()
+    assert _window_lines(outcome) == []
+
+
+@pytest.mark.parametrize(
+    ("surfaces", "lines"),
+    [
+        ({"window_sessions_bars": "'ALL'"}, [f"lake window refused: {BARS_NOT_A_NUMBER}"]),
+        ({"window_sessions_quotes": "None"}, [f"lake window refused: {QUOTES_NOT_A_NUMBER}"]),
+        (
+            {"window_sessions_quotes": "'All'", "window_sessions_bars": "None"},
+            [
+                f"lake window refused: {QUOTES_NOT_A_NUMBER}",
+                f"lake window refused: {BARS_NOT_A_NUMBER}",
+            ],
+        ),
+    ],
+    ids=["bars", "quotes", "both"],
+)
+def test_a_refused_quotes_or_bars_key_files_its_line_and_still_writes_the_checkpoint(
+    fixture_lake: FixtureLake, surfaces, lines
+):
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, **surfaces)
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+    assert _window_lines(outcome) == lines
+    for index, line in enumerate(outcome.nightly.report):
+        if line in lines:
+            assert outcome.nightly.report_kinds[index] == ACTION
+
+
+def test_a_refused_chains_key_files_one_line_naming_it_and_no_checkpoint(
+    fixture_lake: FixtureLake,
+):
+    root = _swept_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window_sessions_chains="'all'")
+
+    assert not checkpoint_path(root).exists()
+    assert _window_lines(outcome) == [
+        "lake window refused: lake_window_sessions_chains keeps every session, which only "
+        "lake_window_sessions_bars and lake_window_sessions_quotes may, because the split "
+        "checkpoint is counted from the chains window. Set a whole number in config/vm.yaml"
+    ]
+
+
+HEX = int("f" * 4000, 16)
+UNPLACED = (
+    "only 26 of 400 sessions in the 1680 days up to 2026-09-14, so the window is longer than the "
+    "search reaches"
+)
+
+
+@pytest.mark.parametrize("surface", ["quotes", "bars"])
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [(400, UNPLACED), (HEX, "ValueError")],
+    ids=["edge-not-found", "edge-raises"],
+)
+def test_a_quotes_or_bars_edge_that_cannot_be_counted_files_its_key_and_keeps_the_checkpoint(
+    fixture_lake: FixtureLake, surface, value, why
+):
+    """Acceptance 5. A hex window loads as an ``int`` and passes the judge, and the count raises
+    ``ValueError`` formatting its message, which must not cost the night's report and ping."""
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, pinger = _sweep(root, **{f"window_sessions_{surface}": value})
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+    assert _window_lines(outcome) == [
+        f"lake window edge not found: lake_window_sessions_{surface}, {why}"
+    ]
+    assert outcome.filed_at is not None and pinger.events
+
+
+def test_quotes_and_bars_inheriting_one_window_file_one_line_naming_the_base_key(
+    fixture_lake: FixtureLake,
+):
+    """The window was read from ``lake_window_sessions``, so the line names that key, and the two
+    surfaces sharing it file it once."""
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window=400, window_sessions_chains=22)
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+    assert _window_lines(outcome) == [
+        f"lake window edge not found: lake_window_sessions, {UNPLACED}"
+    ]
+
+
+def test_a_surface_window_the_calendar_places_files_nothing(fixture_lake: FixtureLake):
+    root = _both_edges_lake(fixture_lake)
+
+    outcome, _ = _sweep(root, window_sessions_bars=25, window_sessions_quotes="'all'")
+
+    assert read_checkpoint(root).cutoffs() == {"SPY": EDGE}
+    assert _window_lines(outcome) == []
+
+
+def test_a_refused_bars_key_in_config_yaml_reaches_the_report(
+    fixture_lake: FixtureLake, capsys, monkeypatch, tmp_path: Path
+):
+    """Acceptance 9. ``sweep.main`` hands each per-surface key from ``config.yaml`` to the sweep."""
+    root = _swept_lake(fixture_lake)
+    config = write_config(tmp_path, lake_root=root)
+    with config.open("a") as handle:
+        handle.write("lake_window_sessions: 22\nlake_window_sessions_bars: ALL\n")
+    tickers = tmp_path / "tickers.yaml"
+    tickers.write_text("SPY:\n  options: true\n  bars:\n  - 1d\n")
+    monkeypatch.setattr("lake.runner.UrllibPinger", FakePinger)
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: FakeTransport())
+    monkeypatch.setattr(sweep, "ExchangeCalendar", lambda: LONG_CALENDAR)
+    _record_execs(monkeypatch)
+
+    sweep.main(
+        ["--config", str(config), "--tickers", str(tickers)],
+        clock=ManualClock(EVENING),
+        vendor_source=_CountingVendorSource(),
+        schedule_setter=_RecordingSetter(),
+        schedule_reader=lambda: _schedule_text(),
+    )
+    capsys.readouterr()
+
+    filed = (root / "reports").rglob("*.json")
+    text = "\n".join(path.read_text() for path in filed)
+    assert "lake window refused: lake_window_sessions_bars " in text
+    assert read_checkpoint(root).cutoffs() == {"SPY": EARLY}

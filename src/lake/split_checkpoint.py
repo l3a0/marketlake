@@ -11,7 +11,8 @@ This module, marketlake #786, saves those states and decides when a ticker resum
 **The checkpoint** is one Parquet file, ``reference/split_checkpoint.parquet``, one row per
 ticker. It carries the session day of the sweep that wrote it, each ticker's state, and each
 ticker's own security-master mappings cut at its cutoff. The 18:30 sweep writes it under the
-window key, ``lake_window_sessions``, and marketlake #787's trim reads it through
+window key, ``lake_window_sessions``, cut at the chains window's edge (marketlake #953), and
+marketlake #787's trim reads it through
 :func:`read_checkpoint` to drop only partitions at or before each ticker's cutoff. It is
 replaced by rename and recorded in the manifest under the lake-root lock, the way the
 reference tables are, so the bucket keeps every version a repair may need.
@@ -590,8 +591,8 @@ def walk_splits(
 ) -> SplitWalk:
     """Run the split walk, resuming each trimmed ticker from the checkpoint or refusing it.
 
-    Both callers come through here: the 18:30 sweep, with tonight's window edge when the window
-    key is set, and ``splits.detect_splits_from_config``, the hand command, with none. So a
+    Both callers come through here: the 18:30 sweep, with tonight's chains window edge when the
+    window key is set, and ``splits.detect_splits_from_config``, the hand command, with none. So a
     hand run on a trimmed lake resumes or refuses exactly as the sweep does, and never walks a
     trimmed ticker from scratch. Only the sweep writes the result, since only it has a session
     day to record.

@@ -5,9 +5,10 @@ drops an older partition once its copy in the backup bucket is verified. Chains 
 trimmed at the window edge (marketlake #787), quotes partitions at the same edge under a landed
 daily bar (marketlake #794), so a quotes day whose bar never lands stays for good, and bars
 partitions of both frequencies at the same edge once their day's chains are gone (marketlake
-#795). The owner means every dated surface to be trimmed at one cutoff in time, so nothing here
-assumes a surface. A line is keyed by the lake-relative ``partition``, which is any path
-``paths.parse_partition_rel`` or ``paths.parse_bars_rel`` reads, and nothing here parses it.
+#795). Since marketlake #953 each surface's edge is its own window's, and the VM keeps every
+bars session. Nothing here assumes a surface or a window. A line is keyed by the lake-relative
+``partition``, which is any path ``paths.parse_partition_rel`` or ``paths.parse_bars_rel``
+reads, and nothing here parses it.
 Before anything deletes a sealed partition, the lake has to be able to say that a missing file
 was removed on purpose. Without a record, every reader that walks the manifest reads a trimmed
 partition as loss: the Sunday scrub withholds its ping every week, the battery's coverage check

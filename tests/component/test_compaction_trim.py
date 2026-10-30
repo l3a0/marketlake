@@ -119,7 +119,10 @@ def _job(
     publisher: Publisher | None = None,
     backup=None,
     backup_target=TARGET,
+    surfaces: dict[str, object] | None = None,
 ):
+    """One compaction run. ``surfaces`` carries the per-surface keywords, such as
+    ``window_sessions_bars``, as stored values."""
     clock = clock if clock is not None else ManualClock(_et(TONIGHT, 16, 30))
     client.on_put = lambda kwargs, data: events.append(f"put {TARGET.rel(kwargs['Key'])}")
     previous = client.on_get
@@ -146,6 +149,7 @@ def _job(
         plan_path=root.parent / "chain_plan.json",
         role=role,
         window_sessions=window,
+        **(surfaces or {}),
     )
 
 
@@ -863,3 +867,328 @@ def test_the_real_trim_of_bars_feeds_the_rebuild(lake_root, tmp_path):
     )
     assert (windowed.restored, windowed.failures, windowed.trimmed_lost) == (True, [], [])
     assert _chains_files(tmp_path / "windowed", "bars") == kept
+
+
+# -- a window per surface, marketlake #953 ----------------------------------------------------
+#
+# In this calendar a window of 22 has its trim edge on 2026-07-29 and a window of 25 on
+# 2026-07-24, so 2026-07-27 lies between the two edges and the ``OLD`` days past both. The floor
+# of 22 keeps every window here from 22 to 29, and no guard can lower it.
+
+BETWEEN = date(2026, 7, 27)
+EDGE_25 = date(2026, 7, 24)
+# A summary line on a host with ``lake_window_sessions`` alone, written out whole.
+TODAYS_SUMMARY = "  trim     window=22 edge=2026-07-29 trimmed=2 restored=0 skipped=0 rot=0"
+
+
+def _brel(ticker: str, day: date, freq: str = "1d") -> str:
+    return f"bars/ticker={ticker}/freq={freq}/date={day.isoformat()}.parquet"
+
+
+def _surface_lake(
+    root: Path,
+    *,
+    tickers=("QQQ", "SPY"),
+    bars_only=(),
+    no_bar=(),
+) -> FakeS3:
+    """Chains, quotes and a daily bar per ticker on the ``OLD`` days, ``BETWEEN`` and yesterday.
+
+    ``bars_only`` tickers, such as GLD, get only a daily bar on each of those days, and
+    ``no_bar`` names ticker-days whose daily bar never landed. Everything is in the bucket.
+    """
+    lake = FixtureLake(root)
+    for day in (*OLD, BETWEEN, YESTERDAY):
+        for ticker in tickers:
+            lake.with_partition(
+                "chains", ticker, day, _chains(1, snap_ts=_snap(day, 0), ticker=ticker)
+            )
+            lake.with_partition(
+                "quotes", ticker, day, _quotes(1, snap_ts=_snap(day, 0), ticker=ticker)
+            )
+            if (ticker, day) not in no_bar:
+                lake.with_bars(ticker, "1d", day, pa.table({"close": [650.0]}))
+        for ticker in bars_only:
+            lake.with_bars(ticker, "1d", day, pa.table({"close": [180.0]}))
+    lake.build()
+    _checkpoint(root, YESTERDAY, dict.fromkeys(tickers, EDGE))
+    client = FakeS3()
+    first_upload(
+        root, TARGET, client=client, clock=ManualClock(_et(YESTERDAY, 19, 0)), calendar=CALENDAR
+    )
+    client.calls.clear()
+    return client
+
+
+def _surface_job(root: Path, client: FakeS3, *, minute: int = 30, **surfaces):
+    return _job(
+        root,
+        client,
+        [],
+        window=surfaces.pop("window", WINDOW),
+        clock=ManualClock(_et(TONIGHT, 16, minute)),
+        surfaces=surfaces,
+    )
+
+
+def _ran(result) -> list[str]:
+    """The run's trim result, asserted to have run with no surface refused."""
+    trim = result.trim
+    assert trim is not None and trim.refused is None and trim.stopped is None
+    assert trim.surface_refused == ()
+    # A run that refused could not have dropped the chain past the chains edge.
+    assert _rel("SPY", OLD[0]) in trim.trimmed
+    return list(trim.trimmed)
+
+
+def test_the_base_key_alone_prints_todays_summary_line_whole(lake_root):
+    """Acceptance 2 on #953. Mutation this catches: a surface's pair appended when its window is
+    the chains one, which changes the line every primary prints each night."""
+    client = _lake(lake_root)
+
+    result = _job(lake_root, client, [])
+
+    assert result.trim is not None
+    assert result.trim.render()[0] == TODAYS_SUMMARY
+    assert result.render().splitlines()[-1] == TODAYS_SUMMARY
+
+
+@pytest.mark.parametrize("value", ["'all'", "'ALL'", 25])
+def test_a_bars_key_without_the_base_key_never_trims_and_prints_nothing_new(lake_root, value):
+    """Acceptance 1. Only ``lake_window_sessions`` turns trimming on, so a host with a bars key
+    alone, even one the judge would refuse, trims exactly what a host with no key does."""
+    client = _lake(lake_root)
+    events: list[str] = []
+
+    result = _job(lake_root, client, events, window=None, surfaces={"window_sessions_bars": value})
+
+    assert result.trim is None
+    assert not any(event.startswith("get ") for event in events)
+    assert "trim" not in result.render()
+
+
+def test_an_absent_key_takes_the_base_window_never_the_chains_one(lake_root):
+    """Acceptance 1. With chains 25 and the quotes and bars keys absent, quotes and GLD's bars,
+    which have no chains, trim at the 22-session edge on 2026-07-27. SPY's chain that day is
+    inside the chains window, so its bar waits for it."""
+    client = _surface_lake(lake_root, bars_only=("GLD",))
+
+    result = _surface_job(lake_root, client, window_sessions_chains=25)
+    trimmed_rels = _ran(result)
+
+    assert _qrel("SPY", BETWEEN) in trimmed_rels
+    assert _brel("GLD", BETWEEN) in trimmed_rels
+    assert (lake_root / _rel("SPY", BETWEEN)).exists()
+    assert (lake_root / _brel("SPY", BETWEEN)).exists()
+    assert result.trim.render()[0].endswith(" quotes=22/2026-07-29 bars=22/2026-07-29")
+
+
+@pytest.mark.parametrize("bars", ["'all'", None], ids=["bars-kept", "bars-absent"])
+def test_chains_22_quotes_25_drops_the_chain_and_keeps_the_quotes_day_between(lake_root, bars):
+    surfaces = {"window_sessions_quotes": 25}
+    if bars is not None:
+        surfaces["window_sessions_bars"] = bars
+    client = _surface_lake(lake_root)
+
+    trimmed_rels = _ran(_surface_job(lake_root, client, **surfaces))
+    result = _surface_job(lake_root, client, minute=45, **surfaces)
+
+    assert _rel("SPY", BETWEEN) in trimmed_rels
+    assert (lake_root / _qrel("SPY", BETWEEN)).exists()
+    assert _qrel("SPY", OLD[0]) in trimmed_rels
+    tail = " quotes=25/2026-07-24 bars=all" if bars is not None else " quotes=25/2026-07-24"
+    assert result.trim is not None and result.trim.render()[0].endswith(tail)
+    if bars is not None:
+        assert all((lake_root / _brel(t, d)).exists() for t in ("QQQ", "SPY") for d in OLD)
+
+
+def test_chains_25_bars_22_keeps_a_bar_whose_chain_is_inside_the_chains_window(lake_root):
+    client = _surface_lake(lake_root)
+    surfaces = {"window": 25, "window_sessions_bars": 22}
+
+    first = _surface_job(lake_root, client, **surfaces)
+    assert first.trim is not None and first.trim.surface_refused == ()
+    assert _rel("SPY", OLD[0]) in first.trim.trimmed
+    second = _surface_job(lake_root, client, minute=45, **surfaces)
+
+    assert second.trim is not None
+    assert _brel("SPY", OLD[0]) in second.trim.trimmed
+    assert (lake_root / _rel("SPY", BETWEEN)).exists()
+    assert (lake_root / _brel("SPY", BETWEEN)).exists()
+
+
+def test_chains_25_quotes_22_keeps_a_quotes_day_past_its_edge_whose_bar_never_landed(lake_root):
+    client = _surface_lake(lake_root, no_bar=(("SPY", BETWEEN),))
+
+    first = _surface_job(lake_root, client, window_sessions_chains=25, window_sessions_quotes=22)
+    trimmed_rels = _ran(first)
+
+    assert (lake_root / _qrel("SPY", BETWEEN)).exists()
+    assert _qrel("QQQ", BETWEEN) in trimmed_rels
+
+
+def test_quotes_kept_keeps_every_quotes_partition(lake_root):
+    client = _surface_lake(lake_root)
+
+    result = _surface_job(lake_root, client, window_sessions_quotes="'all'")
+    trimmed_rels = _ran(result)
+
+    assert not any(rel.startswith("quotes/") for rel in trimmed_rels)
+    assert all((lake_root / _qrel(t, d)).exists() for t in ("QQQ", "SPY") for d in (*OLD, BETWEEN))
+    assert result.trim.render()[0].endswith(" quotes=all")
+
+
+def test_chains_22_bars_25_keeps_bars_between_the_edges_with_or_without_a_chain(lake_root):
+    """GLD has no chains, and SPY's chain between the edges goes on the first run, so the bars
+    window alone keeps their bars there on the second. Bars past the 25-session edge go."""
+    client = _surface_lake(lake_root, bars_only=("GLD",))
+
+    first = _surface_job(lake_root, client, window_sessions_bars=25)
+    trimmed_rels = _ran(first)
+    second = _surface_job(lake_root, client, minute=45, window_sessions_bars=25)
+
+    assert _rel("SPY", BETWEEN) in trimmed_rels
+    assert _brel("GLD", OLD[0]) in trimmed_rels
+    assert second.trim is not None and _brel("SPY", OLD[0]) in second.trim.trimmed
+    assert (lake_root / _brel("GLD", BETWEEN)).exists()
+    assert (lake_root / _brel("SPY", BETWEEN)).exists()
+    assert second.trim.render()[0].endswith(f" bars=25/{EDGE_25.isoformat()}")
+
+
+def test_bars_kept_leaves_every_bar_of_a_ticker_with_no_chains_for_load_bars(lake_root):
+    """Acceptance 3. GLD's bars of both frequencies sit on days the chains trim reaches, and a
+    run without the bars key would trim them, since GLD has no chain to wait for. They are
+    written by the sweep's own writer beside the schema-version ledger, so ``load_bars`` reads
+    them back, which the trim tests' one-column bars could not pass."""
+    from lake.loader import load_bars
+    from lake.manifest import record_partition
+    from tests.component.test_load_bars import _ledger_table
+    from tests.support.bars import write_bars
+
+    lake = FixtureLake(lake_root).with_reference("schema_versions", _ledger_table())
+    for day in (*OLD, YESTERDAY):
+        lake.with_partition("chains", "SPY", day, _chains(1, snap_ts=_snap(day, 0)))
+        lake.with_partition("quotes", "SPY", day, _quotes(1, snap_ts=_snap(day, 0)))
+        lake.with_bars("SPY", "1d", day, pa.table({"close": [650.0]}))
+    root = lake.build()
+    gld = []
+    for day in (*OLD, YESTERDAY):
+        for freq in ("1d", "1m"):
+            path = write_bars(root, "GLD", freq, day.isoformat(), [180.0], instrument_id=7)
+            gld.append(path.relative_to(root).as_posix())
+    with lake_lock(root):
+        for rel in gld:
+            record_partition(root, rel, source="bars", rows=1, fetched_at=None)
+    _checkpoint(root, YESTERDAY, {"SPY": EDGE})
+    client = FakeS3()
+    first_upload(
+        root, TARGET, client=client, clock=ManualClock(_et(YESTERDAY, 19, 0)), calendar=CALENDAR
+    )
+    assert all(client.objects.get(TARGET.key(rel)) is not None for rel in gld)
+
+    result = _surface_job(root, client, window_sessions_bars="'all'")
+    trimmed_rels = _ran(result)
+
+    assert {_rel("SPY", day) for day in OLD} | {_qrel("SPY", day) for day in OLD} <= set(
+        trimmed_rels
+    )
+    assert not any(rel.startswith("bars/") for rel in trimmed_rels)
+    assert all((root / rel).exists() for rel in gld)
+    for freq in ("1d", "1m"):
+        table = load_bars("GLD", freq, lake_root=root)
+        assert table.num_rows == len((*OLD, YESTERDAY))
+    assert result.trim.render()[0].endswith(" bars=all")
+
+
+HEX = int("f" * 4000, 16)
+
+
+@pytest.mark.parametrize("surface", ["quotes", "bars"])
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [
+        ("'ALL'", "{key} is not a whole number of sessions or all"),
+        (
+            400,
+            "the window edge could not be counted: only 30 of 401 sessions in the 1686 days "
+            "up to 2026-08-28, so the window is longer than the search reaches",
+        ),
+        (HEX, "the window edge could not be counted (ValueError)"),
+    ],
+    ids=["judge-refused", "edge-not-found", "edge-raises"],
+)
+def test_a_refused_quotes_or_bars_window_keeps_the_chains_trim_running(
+    lake_root, surface, value, why
+):
+    """Acceptance 5. Through ``compact``, since a ``_trim_step`` that forgets the judge's refusals
+    is seen only there. A hex window loads as an ``int`` and passes the judge, and the count
+    then raises ``ValueError`` formatting its own message."""
+    key = f"lake_window_sessions_{surface}"
+    client = _surface_lake(lake_root, bars_only=("GLD",))
+
+    result = _surface_job(lake_root, client, **{f"window_sessions_{surface}": value})
+
+    trim = result.trim
+    assert trim is not None and trim.refused is None and trim.stopped is None
+    expected = why.format(key=key)
+    assert trim.surface_refused == ((surface, expected),)
+    assert f"  trim     {surface} refused: {expected}" in result.render().splitlines()
+    assert _rel("SPY", OLD[0]) in trim.trimmed and _rel("SPY", BETWEEN) in trim.trimmed
+    assert not any(rel.startswith(f"{surface}/") for rel in trim.trimmed)
+
+
+def test_a_refused_base_key_refuses_the_whole_run_beside_every_good_surface_key(lake_root):
+    client = _surface_lake(lake_root)
+
+    result = _surface_job(
+        lake_root,
+        client,
+        window=21,
+        window_sessions_chains=22,
+        window_sessions_quotes=22,
+        window_sessions_bars="'all'",
+    )
+
+    assert result.trim is not None and result.trim.trimmed == ()
+    assert result.trim.render() == [
+        "  trim     refused: lake_window_sessions is under the floor of 22 sessions that the "
+        "readers of sealed chains and quotes need, which are the battery's trailing median, the "
+        "History panel and the disk runway. Raise it in config/vm.yaml"
+    ]
+
+
+def test_a_refused_chains_key_refuses_the_whole_run(lake_root):
+    client = _surface_lake(lake_root)
+
+    result = _surface_job(lake_root, client, window_sessions_chains="'all'")
+
+    assert result.trim is not None and result.trim.trimmed == ()
+    assert result.trim.refused == (
+        "lake_window_sessions_chains keeps every session, which only lake_window_sessions_bars "
+        "and lake_window_sessions_quotes may, because the split checkpoint is counted from the "
+        "chains window. Set a whole number in config/vm.yaml"
+    )
+
+
+def test_the_bars_key_in_config_yaml_reaches_the_trim(lake_root, tmp_path, monkeypatch, capsys):
+    """Acceptance 9. ``main`` hands each per-surface key from ``config.yaml`` to ``compact``."""
+    client = _surface_lake(lake_root, bars_only=("GLD",))
+    config = _evening_config(tmp_path, lake_root)
+    config.write_text(config.read_text() + "lake_window_sessions_bars: all\n")
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr("lake.runner.UrllibPinger", lambda: FakePinger())
+
+    code = compact_module.main(
+        ["--config", str(config), "--plan", str(tmp_path / "chain_plan.json")],
+        clock=ManualClock(_et(TONIGHT, 16, 30)),
+        calendar=CALENDAR,
+    )
+
+    assert code == 0
+    summary = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("  trim     ")
+    ][0]
+    assert summary.startswith("  trim     window=22 edge=2026-07-29 ")
+    assert summary.endswith(" bars=all")
+    assert (lake_root / _brel("GLD", OLD[0])).exists()
+    assert not (lake_root / _rel("SPY", OLD[0])).exists()

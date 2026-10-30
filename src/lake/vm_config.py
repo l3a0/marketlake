@@ -82,10 +82,16 @@ the cost read alone.
     refuses a backup setting, by design, so a target without its scheme would load as a
     relative path. The render is a job rather than the capture path, so it applies the
     bucket jobs' strict checks.
-13. ``lake_window_sessions`` is set and is not a whole number of sessions at or above
-    ``lake.window.window_floor``, marketlake #786. Loading stores the key without judging it,
-    for the reason ``lake.window`` gives, so the render is where a bad window stops before it
-    reaches the VM, rather than on the first night the sweep or the trim reads it.
+13. A window key is set and the jobs' judge, ``lake.window.surface_windows``, refuses it,
+    marketlake #786 and #953. ``lake_window_sessions`` and ``lake_window_sessions_chains`` have
+    to be a whole number of sessions at or above ``lake.window.window_floor``.
+    ``lake_window_sessions_quotes`` and ``lake_window_sessions_bars`` have to be one too, or
+    ``all``. Loading stores each key without judging it, for the reason ``lake.window`` gives,
+    so the render is where a bad window stops before it reaches the VM, rather than on the
+    first night the sweep or the trim reads it.
+14. A per-surface window key is set and ``lake_window_sessions`` is not, marketlake #953. Only
+    ``lake_window_sessions`` turns trimming on, so the jobs ignore such a key, and the render
+    refuses it rather than let the file say something the VM does not do.
 
 A refusal is raised outside the handler that caught its cause, as ``config.load_config``
 does, so neither its ``__cause__`` nor its ``__context__`` holds a YAML error. PyYAML
@@ -186,7 +192,7 @@ from lake.config import (
 )
 from lake.outbox import PRIMARY, SHADOW
 from lake.paths import temp_write_path
-from lake.window import WindowRefused, window_sessions
+from lake.window import SURFACE_KEYS, WINDOW_KEY, stored_windows, surface_windows
 
 # The four parameters and the ``config.yaml`` key each one fills. The names are literals,
 # because the instance role reads ``/marketlake/config/*`` and a name built from input
@@ -544,16 +550,23 @@ def _check_config(merged: Mapping[str, Any]) -> None:
     problems.extend(bucket_credential_problems(config))
     if problems:
         raise RenderRefused(". ".join(problems))
-    # The floor reads the merged guards, so a ``guards:`` override that raises the battery's
-    # trailing median raises the floor with it.
-    # Raised after the handler, the way every refusal here is, so it carries no context.
-    window_problem = None
-    try:
-        window_sessions(config.lake_window_sessions, config.guards)
-    except WindowRefused as exc:
-        window_problem = str(exc)
-    if window_problem is not None:
-        raise RenderRefused(window_problem)
+    # Refusal 13. The floor reads the merged guards, so a ``guards:`` override that raises the
+    # battery's trailing median raises the floor with it. The judge returns its refusals rather
+    # than raising them, so the one raised here carries no context.
+    stored = stored_windows(config)
+    resolved = surface_windows(stored, config.guards)
+    if resolved is None:
+        # Refusal 14, which is the render's alone. The jobs read no per-surface key on a host
+        # without ``lake_window_sessions``, so none of them would say this.
+        for key in SURFACE_KEYS.values():
+            if stored[key] is not None:
+                raise RenderRefused(
+                    f"{key} is set and {WINDOW_KEY} is not, and only {WINDOW_KEY} turns "
+                    f"trimming on. Set it in config/vm.yaml or remove {key}"
+                )
+        return
+    if resolved.refused:
+        raise RenderRefused(". ".join(resolved.refused.values()))
 
 
 def _same(left: object, right: object) -> bool:

@@ -33,9 +33,11 @@ beside the laptop until the cutover in
 Its lake volume holds a window of recent sessions, and the close+15 compaction trims older
 chains partitions once each is verified in the bucket ([#787](https://github.com/l3a0/marketlake/issues/787)).
 It trims older quotes partitions the same way, each under a landed daily bar
-([#794](https://github.com/l3a0/marketlake/issues/794)), and older bars partitions once
-their day's chains are gone ([#795](https://github.com/l3a0/marketlake/issues/795)).
-To read a trimmed range, the reading restore brings it from the bucket into a directory
+([#794](https://github.com/l3a0/marketlake/issues/794)). It keeps every bars session, since
+`config/vm.yaml` gives bars a window of their own that keeps them all
+([#953](https://github.com/l3a0/marketlake/issues/953)). A host with a numeric bars window
+trims older bars partitions once their day's chains are gone
+([#795](https://github.com/l3a0/marketlake/issues/795)). To read a trimmed range, the reading restore brings it from the bucket into a directory
 outside the live lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
 A merge to `main` reaches the VM through `.github/workflows/deploy.yml`, which asks the VM
 to deploy the commit once the owner approves the run
@@ -102,10 +104,12 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `src/lake/trim.py` is the only code that deletes a sealed partition on its own, and
   the hand-run `compact.recompact_ticker_day` is the only code that replaces one. On a
   primary host with a bucket target whose config sets `lake_window_sessions`, compaction
-  drops chains partitions older than that window once each is verified in the bucket,
-  and records each in `trimmed.jsonl`. It drops a quotes partition older than the window
-  the same way, once that ticker-day's daily bar has landed, and a bars partition of
-  either frequency once that ticker-day's chains partition is gone.
+  drops chains partitions older than the chains window once each is verified in the
+  bucket, and records each in `trimmed.jsonl`. It drops a quotes partition older than the
+  quotes window the same way, once that ticker-day's daily bar has landed, and a bars
+  partition of either frequency older than the bars window once that ticker-day's chains
+  partition is gone. Each window is `lake_window_sessions` unless the surface's own key
+  overrides it, and `src/lake/window.py` judges all four keys.
 - `src/lake/vm_config.py` writes the hosted VM's `config.yaml` from `config/vm.yaml`,
   four SSM parameters and the instance's `marketlake:backup-target` tag, refusing and
   keeping the old file when any input is wrong. An optional `marketlake:cost-export` tag
@@ -394,7 +398,9 @@ A command run by hand is not a unit the stop can see.
    `lake_window_sessions`, such as the laptop, the restored lake holds every file the
    bucket's manifest records, including any partition the hosted VM trimmed. On a host
    whose config sets the key, which is the hosted VM, the restore rebuilds that host's
-   trimmed lake ([#785](https://github.com/l3a0/marketlake/issues/785)). It leaves out
+   trimmed lake ([#785](https://github.com/l3a0/marketlake/issues/785)). The per-surface
+   window keys play no part in this choice
+   ([#953](https://github.com/l3a0/marketlake/issues/953)). It leaves out
    each partition the bucket's `trimmed.jsonl` says was removed on purpose. It also leaves
    out each report whose path names a day the lake's own run reported on, when that day is
    on or before the newest day among those partitions: the nightly files at the root of
@@ -443,7 +449,14 @@ A command run by hand is not a unit the stop can see.
    run alone leaves those days' bars trimmed, and nothing fetches them back. While the
    host's config sets `lake_window_sessions`, a rollback lasts only until the trim runs with
    a split checkpoint from a session after the restore's day, which drops each restored
-   partition outside the window again. A lasting rollback also removes the key. Leave out
+   partition outside its surface's window again. A lasting rollback removes
+   `lake_window_sessions` and every per-surface window key from `config/vm.yaml` together,
+   because the render refuses a per-surface key left on its own and keeps the old
+   `config.yaml`, which leaves the trim running. Raising a window brings nothing back either,
+   so a surface whose window grows needs this command for what the old window trimmed, as
+   the one-time bars restore in [infra/README.md](infra/README.md) does
+   ([#958](https://github.com/l3a0/marketlake/issues/958)). `--from` may fall before the
+   calendar's first session, since the range is selected by manifest dates. Leave out
    `--ticker` to take every ticker. It restores only partitions the lake's manifest records, verifies
    each download against the manifest's sha before it moves the file into place, and
    leaves a partition already on disk with that sha as it is. A partition trimmed on
@@ -565,12 +578,30 @@ then drops each chains partition older than that many sessions once its bucket c
 to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)).
 It drops each quotes partition older than the window the same way, under a landed daily bar
 ([#794](https://github.com/l3a0/marketlake/issues/794)). A quotes day whose daily bar never
-lands, such as an outage day the bars census reads as `SnapAbsent`, stays for good. It drops
-each bars partition of either frequency older than the window the same way, once that day's
-chains partition is gone, so a bar goes the night after its chain
-([#795](https://github.com/l3a0/marketlake/issues/795)). The summary's `trimmed=N` counts
-all three surfaces, so count `trimmed.jsonl` lines by their `chains/`, `quotes/` or `bars/`
-prefix to see what each one lost. The trim's lines, then any pruned ticker directories, end
+lands, such as an outage day the bars census reads as `SnapAbsent`, stays for good. On a
+host with a numeric bars window it drops each bars partition of either frequency older than
+that window the same way, once that day's chains partition is gone, so a bar goes no sooner
+than the night after its chain ([#795](https://github.com/l3a0/marketlake/issues/795)).
+
+Each surface can have a window of its own
+([#953](https://github.com/l3a0/marketlake/issues/953)).
+`lake_window_sessions_chains`, `lake_window_sessions_quotes` and `lake_window_sessions_bars`
+each override `lake_window_sessions` for one surface, and a surface without its own key
+takes `lake_window_sessions`'s value. The quotes and bars keys also take `all`, which keeps
+every session of that surface. `config/vm.yaml` sets `lake_window_sessions_bars: all`, so
+the VM keeps every bars session and trims chains and quotes at 22. Only
+`lake_window_sessions` turns trimming on, and the render refuses a per-surface key without
+it. The split checkpoint is cut at the chains window's edge, so the chains key cannot say
+`all`. The trim's summary line, which starts `trim     window=22 edge=<day>`, names the
+chains window and edge, and it gains a pair at its end for each surface whose window
+differs, such as `quotes=25/<edge>` or `bars=all`. A quotes or bars
+window the jobs refuse, or whose edge the calendar cannot count, keeps that surface whole for
+the night and prints `trim     bars refused: <why>` after the summary, while the other
+surfaces trim on. The 18:30 sweep files an action line for it too, `lake window refused:`
+or `lake window edge not found:` naming the key.
+
+The summary's `trimmed=N` counts all three surfaces, so count `trimmed.jsonl` lines by their
+`chains/`, `quotes/` or `bars/` prefix to see what each one lost. The trim's lines, then any pruned ticker directories, end
 the compaction log. They also end the eod-sweep job's log,
 because the compaction run the vendor sweep hands off to reaches the trim too. That run
 normally prints `trim     refused: the checkpoint is tonight's`, since the sweep has just
