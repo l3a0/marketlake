@@ -70,8 +70,10 @@ tabs open side by side would differ only in shape.
 ``render`` is deterministic and depends on nothing outside the standard library. A golden
 test compares each icon against its shipped file, so a checked-in binary is never the only
 record of what an icon is. Regenerate the dashboard's file with ``python -m lake.favicon``.
-The board's file lives in the repository rather than the package, so its command names it:
-``python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico``.
+The board's file lives in the repository rather than the package, at ``BOARD_ICON``, which
+the board's caller workflow names in its ``icon`` input (#942). So its command names it,
+run from the repository's root: ``python -m lake.favicon --board --out
+.github/board/favicon.ico``.
 """
 
 from __future__ import annotations
@@ -227,6 +229,13 @@ def render_board() -> bytes:
     return render(BOARD_MARK, BOARD_INK)
 
 
+# Where the board's icon lives, relative to the repository's root. The reusable board
+# workflow serves the file that ``.github/workflows/board.yml``'s ``icon`` input names,
+# which is this path. It is relative because an installed package has no repository
+# around it, so ``--board`` still needs ``--out``.
+BOARD_ICON = ".github/board/favicon.ico"
+
+
 def packaged_path() -> Path:
     """Where the rendered icon ships: beside the status page, inside the package."""
     return Path(__file__).resolve().parent / "static" / "favicon.ico"
@@ -241,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--board",
         action="store_true",
-        help="Render the build board's icon instead. Needs --out.",
+        help=f"Render the build board's icon instead. Needs --out, such as --out {BOARD_ICON}.",
     )
     parser.add_argument(
         "--out",
@@ -262,7 +271,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.board:
         if args.out is None:
-            parser.error("--board needs --out, since the board's icon lives outside the package")
+            parser.error(
+                f"--board needs --out, such as --out {BOARD_ICON} from the repository's root, "
+                "since the board's icon lives outside the package"
+            )
         out, body = args.out, render_board()
     else:
         out = args.out if args.out is not None else packaged_path()
@@ -273,6 +285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "BOARD_ICON",
     "BOARD_INK",
     "BOARD_MARK",
     "GRID",

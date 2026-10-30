@@ -7,9 +7,9 @@ page shows is whether the drawing says the same thing: usage above the baseline,
 below it, a figure the chart draws also in its table, and a report written before the
 daily usage split still drawing.
 
-Each test executes the page's whole script under a JavaScript engine, as
-``tests/component/test_board_page.py`` does for the build board, with
-``tests/support/status_dom.js`` standing in for the browser. The fetch routes by URL. It
+Each test executes the page's whole script under a JavaScript engine, as the build
+board's page tests in l3a0/repo-template do, with ``tests/support/status_dom.js``
+standing in for the browser. The fetch routes by URL. It
 serves ``/api/cost`` the payload the real query returns for a fixture lake, so the test
 crosses the real contract, and rejects every other route, so the other panels run only
 their failure paths. A throw while drawing the panel lands in ``costFailed``, which writes

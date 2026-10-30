@@ -6,10 +6,10 @@ grid, the ink and the command-line contract are each a value or a pure function,
 tier is unit. Two cases touch the filesystem, and neither crosses a subsystem boundary.
 
 1. The command-line case writes one file to a temporary directory.
-2. The pixel case reads the shipped icon beside the board's page, as bytes.
-
-The golden test, which compares the shipped file with ``render_board`` byte for byte,
-lives in ``tests/component/test_board_page.py`` with the board's other icon checks.
+2. The pixel case and the golden case read the shipped icon, as bytes. It lives at
+   ``.github/board/favicon.ico``, the path the board's caller workflow names in its
+   ``icon`` input (#942), and ``tests/component/test_board_workflow.py`` checks that
+   input against this file.
 
 The expected grid and ink are written here as literals rather than read from the
 module's own constants, so a change to a constant cannot carry the test with it.
@@ -25,7 +25,7 @@ import pytest
 from lake import favicon
 from tests.unit.test_dashboard_contract import _decode_png
 
-SHIPPED_ICON = Path(__file__).resolve().parents[2] / ".claude/skills/sync-prune-next/favicon.ico"
+SHIPPED_ICON = Path(__file__).resolve().parents[2] / ".github" / "board" / "favicon.ico"
 
 # The tick's cells as (column, row), counting from the grid's top-left.
 TICK_CELLS = {
@@ -145,6 +145,22 @@ def test_every_pixel_of_the_board_icon_matches_the_literal_grid(source):
                 expected = ink if cell == "#" else clear
                 assert pixels[y][x] == expected, f"{side}px pixel ({x},{y})"
     assert sides == [16, 32, 48]
+
+
+def test_the_shipped_icon_is_exactly_what_the_renderer_draws():
+    """Protects the board's icon from drifting away from its grid (#886).
+
+    Comparing the shipped file with ``render_board`` means the checked-in binary is never
+    the only record of the icon, as with the dashboard's. A grid, an ink or a size changed
+    without regenerating the file fails here.
+    """
+    assert SHIPPED_ICON.read_bytes() == favicon.render_board()
+
+
+def test_the_module_names_the_path_the_icon_ships_at():
+    # The literal is written out, so moving the constant without moving the file fails.
+    assert favicon.BOARD_ICON == ".github/board/favicon.ico"
+    assert SHIPPED_ICON.is_file()
 
 
 def test_the_cli_writes_the_board_icon_with_board(tmp_path):

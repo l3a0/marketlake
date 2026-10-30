@@ -1,39 +1,34 @@
 name: Board
 
-# Rebuilds the build board from GitHub and publishes it on GitHub Pages, so no session
-# has to measure and write it by hand (#872). .claude/skills/sync-prune-next/build_board.py
-# reads every figure through the API and writes board.json, and the page beside it,
-# board.html, fetches that file every two minutes. Session judgements reach it as
-# working: labels and as lines the owner writes in comments and issue bodies, which
-# the l3a0 plugin's update-build-board skill describes (#873).
+# Starts the build board's rebuild, which the reusable workflow
+# .github/workflows/build-board.yml in l3a0/repo-template carries out at commit
+# fd8317e537a3d85423757c56c034ace623878a81. That workflow checks out its own
+# generator, scripts/build_board.py, and its own page,
+# .claude/skills/update-build-board/board.html, at the same commit, so the
+# board changes only when the pin on the `uses:` line moves (#942). Moving it
+# means reading build-board.yml at the new commit, since its inputs and the
+# scopes its jobs ask for can change with it.
 #
-# A label, a body edit or a comment starts a run through `issues` and `issue_comment`.
-# A "blocked by" link and a sub-issue start none, because GitHub Actions lists no
-# trigger for either, so they reach the board on the next scheduled run.
+# Before #942 this repository carried its own generator and page under
+# .claude/skills/sync-prune-next. The inputs under `with:` turn on, one by one,
+# what that page did and the shared page does not do by default.
 #
-# Every trigger below, workflow_dispatch included, fires only once this file is on
-# main. Every one but workflow_dispatch runs on the default branch.
-# pull_request_target runs on a pull request's base branch, so its filter admits only
-# pull requests into main. workflow_dispatch alone can run another ref, and what stops
-# such a run from deploying is the github-pages environment's deployment branch
-# policy, which names main only.
+# A label, a body edit or a comment starts a run through `issues` and
+# `issue_comment`. A "blocked by" link and a sub-issue start none, because
+# GitHub Actions lists no trigger for either, so they reach the board on the
+# next scheduled run.
 #
-# Two rules keep strangers out of this workflow, and keep it inside the ruleset, which
-# refuses a merge while CodeQL reports a high or critical alert.
+# Every trigger below, workflow_dispatch included, fires only once this file is
+# on main. Every one but workflow_dispatch runs on the default branch.
+# pull_request_target runs on a pull request's base branch, so its filter admits
+# only pull requests into main. workflow_dispatch alone can run another ref,
+# and what stops such a run from deploying is the github-pages environment's
+# deployment branch policy, which names main only.
 #
-# 1. No step reads the event payload. Anyone can file an issue on a public repository,
-#    so an issue title expanded into a run step would run as shell. The generator reads
-#    everything through gh, which also makes a run's output independent of the event
-#    that started it. The only expressions here are the job token and the deployed
-#    page's address.
-# 2. pull_request_target runs with a write token on the default branch, so nothing here
-#    checks out a pull request's code. The checkout takes the default ref and keeps no
-#    credentials.
-#
-# No job is named `test`, because the ruleset on main requires a check by that name and
-# ci.yml provides it. The jobs' names, board-build and board-deploy, are also how the
-# generator drops this workflow's own checks from a pull request's rollup. Every action
-# is pinned to a commit, because the deploy job can mint an OIDC token.
+# No step here reads the event payload, and the reusable workflow checks out no
+# pull request's code and names every action by a commit SHA, which its own
+# header explains. This file holds no expression at all, since every input is a
+# literal.
 on:
   issues:
   issue_comment:
@@ -49,8 +44,10 @@ on:
     workflows: [CI, Infra]
     types: [completed]
   # The backstop for what starts no run, such as a "blocked by" link. GitHub can delay
-  # or drop a scheduled run under load. Off the hour, because the top of the hour is
-  # when GitHub is busiest.
+  # or drop a scheduled run under load. The shared generator reads this line to say
+  # when the board is stale, and it refuses any schedule that is not one list of
+  # minutes past every hour. Off the hour, because the top of the hour is when GitHub
+  # is busiest.
   schedule:
     - cron: "19,49 * * * *"
   workflow_dispatch:
@@ -65,54 +62,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  board-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Declaring any scope sets every unlisted one to none, so each scope the generator
-    # reads is named.
+  board:
+    # The union of the scopes the reusable workflow's two jobs declare, because a
+    # called workflow can only narrow what its caller grants. Each of its jobs
+    # narrows this to what it uses.
     permissions:
-      contents: read # the checkout, and the default branch's head
-      issues: read # open issues, their bodies, comments, labels, milestones and links
-      pull-requests: read # open pull requests, their comments and reviews
-      checks: read # check runs in each head commit's rollup
-      statuses: read # status contexts in each head commit's rollup
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # The runner's own Python, which is 3.12. The generator is standard library only.
-      - name: Build board.json from GitHub
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .claude/skills/sync-prune-next/build_board.py build
-          --repo "$GITHUB_REPOSITORY"
-          --out _site
-
-      # Pages serves index.html at the site's root. The page links its icon
-      # as favicon.ico beside it, so the icon goes in the same folder.
-      - name: Add the page
-        run: >-
-          cp .claude/skills/sync-prune-next/board.html _site/index.html &&
-          cp .claude/skills/sync-prune-next/favicon.ico _site/favicon.ico
-
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: _site
-
-  # Every successful run deploys, including one whose board matches the last apart from
-  # its stamp, so the stamp says when GitHub was last read.
-  board-deploy:
-    needs: board-build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      pages: write # to deploy the built site
-      id-token: write # to prove to Pages that this run is the deployment
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+      contents: read
+      issues: read
+      pull-requests: read
+      checks: read
+      statuses: read
+      actions: read
+      pages: write
+      id-token: write
+    uses: l3a0/repo-template/.github/workflows/build-board.yml@fd8317e537a3d85423757c56c034ace623878a81
+    # The shared workflow's inputs at that commit. Each is a string, and an empty
+    # one leaves the shared board's default in place.
+    with:
+      title: Marketlake Build Board
+      icon: .github/board/favicon.ico
+      subtitle: the order of work on the capture-first option-chain lake
+      note: >-
+        What each deliverable is for lives in
+        [the design doc](https://github.com/l3a0/marketlake/blob/main/docs/design.md),
+        and the slice order in
+        [the build plan](https://github.com/l3a0/marketlake/blob/main/docs/build-plan.md).
+        The order below follows the repository's ranking rule: capture reliability
+        first, then what makes the lake usable, and evidence from real use over any
+        ranking made in advance.
+      default-branch-head: "true"
+      milestone-default: MVP <n>
+      ranking: order
+      owner-body-lines: "true"
+      review-heading: Review complete
+      settled-rollup: "true"
+      sort-labels: "true"
+      label-colors: "true"

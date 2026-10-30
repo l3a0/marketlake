@@ -1,10 +1,10 @@
 // A DOM small enough to run src/lake/static/status.html's script, with a real element
 // tree. tests/component/test_status_page_cost.py loads it ahead of the page's script.
 //
-// The build board's stub, .claude/skills/sync-prune-next/dom-stub.js, keeps only an
-// innerHTML string per id, because board.html writes markup as strings. status.html
-// builds nodes with createElement and createElementNS and appends them, so this stub
-// keeps the nodes, and `__dump(node)` hands a test the tree the page drew.
+// The build board's stub, now in l3a0/repo-template, keeps only an innerHTML string
+// per id, because the board's page writes markup as strings. status.html builds nodes
+// with createElement and createElementNS and appends them, so this stub keeps the
+// nodes, and `__dump(node)` hands a test the tree the page drew.
 //
 // Plain ES5 that assumes nothing about its host, so `node` and `osascript -l
 // JavaScript` both run it. An element the page asks for by id is created on demand,
