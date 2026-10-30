@@ -166,25 +166,27 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
 - `config/vm.yaml` holds the VM's settings that are not secret, such as its `role` and
   `lake_root`, so a reviewed pull request is the one way they change.
 - `.tool-versions` pins the `uv` version that CI and the VM's bootstrap install.
-- `.claude/skills/sync-prune-next/` holds the build board. Its
-  `board.html` is the board's page, `favicon.ico` is its tab icon, `build_board.py`
-  builds the page's `board.json` from GitHub, and `dom-stub.js` stands in for a browser
-  when the tests run the page.
-  The tab icon is the dashboard's mark in blue with a tick, and
-  `python -m lake.favicon --board --out .claude/skills/sync-prune-next/favicon.ico`
+- `.github/workflows/board.yml` starts the build board's rebuild. It calls the
+  reusable workflow `build-board.yml` in
+  [l3a0/repo-template](https://github.com/l3a0/repo-template) at a pinned commit.
+  That workflow builds the page's `board.json` from GitHub with the template's
+  `scripts/build_board.py`, and publishes it beside the template's page on GitHub Pages
+  at <https://l3a0.github.io/marketlake/>. The inputs under `with:` turn on what this
+  repository's own page drew before [#942](https://github.com/l3a0/marketlake/issues/942)
+  moved it there, such as the milestone selector, the note and the `## Review complete`
+  rule. So the board changes only when the pin or an input changes here. Its `on:` block
+  lists what starts a run, and a submitted review starts none.
+- `.github/board/favicon.ico` is the board's tab icon, which the caller's `icon` input
+  names. It is the dashboard's mark in blue with a tick, and
+  `python -m lake.favicon --board --out .github/board/favicon.ico`
   renders it. Rerun that command after changing the icon.
-  CI lints the Python there and the tests load it.
   The skills that use the board come from the owner's `l3a0` Claude Code plugin,
   [l3a0/claude-plugins](https://github.com/l3a0/claude-plugins), rather than from this
   repository. `/l3a0:update-build-board` states what a session sets on GitHub for the
   board, and when: the `working:` labels, the `Board verdict:` comment line, and the
-  `Board order:` and `Board after:` body lines that `build_board.py` reads.
+  `Board order:` and `Board after:` body lines that the shared generator reads.
   `/l3a0:sync-prune-next` runs the status round that prunes finished worktrees, checks
-  the board and says what to take next. The folder keeps its old name because the
-  plugin finds this repository's board by the generator's path.
-- `.github/workflows/board.yml` runs `build_board.py` and publishes the page, its
-  icon and `board.json` on GitHub Pages at <https://l3a0.github.io/marketlake/>. Its
-  `on:` block lists what starts a run, and a submitted review starts none.
+  the board and says what to take next.
 
 Tests sit in one folder per tier, matching the build plan's placement rule.
 
@@ -1020,16 +1022,16 @@ request's suite with `-n auto`, one worker per physical core on its runner, and 
 one process on every push to `main`. A worker that crashes after its last test leaves a
 parallel run green, and the serial run on `main` is what catches that crash.
 
-The page tests run a page's script under `node` where it is installed, as on CI's runner.
-They are the build board's, in `tests/component/test_board_page.py`, and the dashboard's
-Cost panel's, in `tests/component/test_status_page_cost.py`. Otherwise they run it under
-`osascript -l JavaScript`, which ships with macOS, so they run on a Mac without `node`.
-With neither, they skip. To build the board's `board.json` from GitHub by hand, run the
-generator with the project's Python rather than the system `python3`, which on macOS is
-too old to import it.
+The page test runs the dashboard's Cost panel's script, in
+`tests/component/test_status_page_cost.py`, under `node` where it is installed, as on
+CI's runner. Otherwise it runs it under `osascript -l JavaScript`, which ships with macOS,
+so it runs on a Mac without `node`. With neither, it skips. The build board's page and
+generator are tested in l3a0/repo-template, and `tests/component/test_board_workflow.py`
+checks only this repository's caller. To rebuild the live board without waiting for an
+event, start the workflow on `main`.
 
 ```bash
-uv run python .claude/skills/sync-prune-next/build_board.py build --repo l3a0/marketlake --out <dir>
+gh workflow run board.yml --repo l3a0/marketlake --ref main
 ```
 
 The infrastructure under `infra/` needs OpenTofu, and applying it needs the AWS CLI. Both
