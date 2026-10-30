@@ -1028,10 +1028,10 @@ CI's runner. Otherwise it runs it under `osascript -l JavaScript`, which ships w
 so it runs on a Mac without `node`. With neither, it skips. The build board's page and
 generator are tested in l3a0/repo-template, and `tests/component/test_board_workflow.py`
 checks only this repository's caller. To rebuild the live board without waiting for an
-event, start the workflow on `main`.
+event, start the workflow, which runs on the default branch, `main`.
 
 ```bash
-gh workflow run board.yml --repo l3a0/marketlake --ref main
+gh workflow run board.yml --repo l3a0/marketlake
 ```
 
 The infrastructure under `infra/` needs OpenTofu, and applying it needs the AWS CLI. Both
