@@ -82,7 +82,7 @@ GitHub links none of these on its own, unlike `#NN`. So this rule also holds in 
 
 The doc survived three adversarial review batteries. That was 89+ agents and 58 verified findings, with zero findings refuted. It also survived the owner's own Socratic passes. Respect two conventions it carries:
 
-- **The considered-and-rejected register.** Cut machinery is pinned in the doc with its rationale. Examples: backfill, the streamer, the Saturday OI wake, the entire morning-OI job, extra-account quota farming, `pmset disablesleep`, the pause API, static dashboard rendering. Do not re-propose these. When something new is cut, pin it the same way.
+- **The considered-and-rejected register.** Cut machinery is pinned in the doc with its rationale. Examples: the streamer, the Saturday OI wake, the entire morning-OI job, extra-account quota farming, `pmset disablesleep`, the pause API, static dashboard rendering. Do not re-propose these. Backfill was on this list until the owner reversed it for imported history on 2026-10-29, and [docs/design.md](docs/design.md)'s `## Tradeoffs: prices, named` carries that ruling and what still holds. When something new is cut, pin it the same way.
 - **Pinned vocabulary.** Terms like *surface*, *segment*, *option_close*, *spot_close*, *comparable set*, and *capture_start* have exact definitions in the doc. Reuse them. Do not coin synonyms.
 
 One lesson from the review campaign is worth keeping in view. Reviews armor what exists. They rarely ask whether it should exist. The morning-OI job survived two hardening rounds before one first-principles question deleted it. Ask "why is this needed" before "is this correct."
