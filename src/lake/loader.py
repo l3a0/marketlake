@@ -23,10 +23,13 @@ layout either: nothing here rides on how the writer happened to order the file.
 
 ``load_bars`` is the fourth door and the first one that is not a read of chains or quotes,
 marketlake #368. It answers a ticker's bar series at one frequency over a range of sessions,
-in one of three views: as-traded, split-adjusted, or total-return. No adjusted price is ever
-stored, so each view is computed at read time out of the sealed bars and the corporate-actions
-ledger, and a newly discovered action fixes all of history without any stored number changing
-meaning.
+in one of three views: as stored, split-adjusted, or total-return. Marketlake stores the bars it
+captures as traded, so each adjusted view is computed at read time out of those bars and the
+corporate-actions ledger, and a newly discovered action fixes all of history without any stored
+number changing meaning. A bar imported from another source may be stored in that source's
+adjusted basis, marketlake #949. Every row says which in its ``origin`` and ``basis`` columns,
+read from its partition's schema metadata, and the adjusted views refuse a row marketlake did
+not capture, because the ledger says nothing about it.
 
 It shares this module's guards and almost none of its resolutions. What carries over is the
 quarantine guard, the exact-spelling check, ``_read`` and the overflow projection with its
@@ -239,9 +242,10 @@ version, which is what separates this from the ``row_kind`` refusal below. The c
 explain an empty answer are taken over every row, and Arrow's filter drops a row with no
 ``row_kind`` from both sides of them, so that one has to stay whole-partition and does.
 
-The loader never returns a table it cannot vouch for. Five shapes would otherwise come
+The loader never returns a table it cannot vouch for. Seven shapes would otherwise come
 back quietly wrong rather than loudly refused, and each raises instead. The first three are
-the capture surfaces' and the last two are the adjusted views'.
+the capture surfaces'. The fourth, fifth and sixth are the adjusted views', and the seventh
+refuses a bars read under every view.
 
 1. A row whose ``row_kind`` is null is neither a vendor observation nor an absence marker,
    and Arrow's filter drops it from both sides. It would vanish from the result and from
@@ -255,6 +259,11 @@ the capture surfaces' and the last two are the adjusted views'.
    hand back the as-traded price under an adjusted name. ``InstrumentUnknown``.
 5. A dividend whose prior close the lake cannot supply would be dropped from the factor,
    understating every return computed through it. ``AdjustmentIncomplete``.
+6. A row marketlake did not capture under an adjusted view would take the ledger's factors
+   on top of its source's own, or none at all, and come back labelled adjusted.
+   ``OriginNotCaptured``.
+7. A bars partition whose provenance keys cannot be read would hand back numbers whose basis
+   nobody stated. ``ProvenanceMalformed``.
 
 ``load_bars`` was the first door that spans partitions, because an adjusted view only means
 something over a series that crosses an ex-date, and ``load_contract_life`` is the second. Three
@@ -291,7 +300,8 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -309,7 +319,15 @@ from lake.extra_projection import EXTRA_COLUMN, ExtraProjection, project_extra
 from lake.manifest import latest_quarantine_by_check, withholding
 from lake.occ_mapping import instruments_holding
 from lake.parquet_footer import count_disagreement
-from lake.paths import BARS, CHAINS, PARQUET_SUFFIX, QUOTES, LakePaths, parse_date_dir
+from lake.paths import (
+    BARS,
+    CHAINS,
+    DATE_PREFIX,
+    PARQUET_SUFFIX,
+    QUOTES,
+    LakePaths,
+    parse_date_dir,
+)
 from lake.schema_versions import SchemaVersionLedger, ledger_path
 from lake.security_master import ID_TYPE_OCC, SecurityMaster, master_path
 from lake.security_master import Mapping as MappingRow
@@ -368,19 +386,68 @@ VOLUME_COLUMN = "volume"
 # of which were adjusted. A column concat keeps per row.
 ADJUST_COLUMN = "adjust"
 
-# The three views. ``none`` is as-traded, which is what the lake stores and the only thing it
-# ever stores. ``split`` divides out the cumulative split ratio, which is price continuity.
-# ``total`` folds the dividends in on top of that, which is total return.
+# The three views. ``none`` applies no factors and returns each row in its stored basis, which
+# for every bar marketlake captured is as-traded. ``split`` divides out the cumulative split
+# ratio, which is price continuity. ``total`` folds the dividends in on top of that, which is
+# total return. Both adjusted views read captured bars only, because the actions ledger is
+# written from captured quotes and chains and says nothing about a row from anywhere else.
 ADJUST_NONE = "none"
 ADJUST_SPLIT = "split"
 ADJUST_TOTAL = "total"
 ADJUSTMENTS = (ADJUST_NONE, ADJUST_SPLIT, ADJUST_TOTAL)
 
+# The four columns every answer from ``load_bars`` carries beside ``adjust``, saying where each
+# row came from and what its stored numbers are. ``origin`` is ``captured`` for a bar the sweep
+# fetched and ``imported`` for one an importer wrote from another source. ``basis`` is ``raw``
+# for as-traded numbers and ``adjusted`` for numbers the source had already adjusted. ``source``
+# and ``source_as_of`` name an imported row's source and the date that source recorded its
+# values, and both are null on a captured row. They are columns for the reason ``adjust`` is:
+# a stitch of an imported partition and a captured one keeps a column per row and keeps only
+# the first table's schema metadata.
+ORIGIN_COLUMN = "origin"
+BASIS_COLUMN = "basis"
+SOURCE_COLUMN = "source"
+SOURCE_AS_OF_COLUMN = "source_as_of"
+ORIGIN_CAPTURED = "captured"
+ORIGIN_IMPORTED = "imported"
+BASIS_RAW = "raw"
+BASIS_ADJUSTED = "adjusted"
+
+# The Parquet keys a bars partition's provenance is written under, as Arrow schema metadata.
+# ``bars._write_partition`` writes them through ``table.replace_schema_metadata`` before
+# ``pq.write_table``, and ``pq.read_table`` hands them back in ``schema.metadata``, so the read
+# finds them in the open it already makes. A file without the origin key is captured and raw.
+# Keys written with ``ParquetWriter.add_key_value_metadata`` land in the file-level metadata,
+# which ``pq.read_table`` drops when it rebuilds the schema from ``ARROW:schema``, so an import
+# written that way reads as captured. That is why the writer has one route and this reader
+# never reads ``ParquetFile.metadata.metadata``. ``source_id`` carries its scheme as a prefix,
+# such as ``sha256:``, so a later importer can name another kind of identity.
+_PROVENANCE_PREFIX = b"marketlake."
+ORIGIN_KEY = b"marketlake.origin"
+BASIS_KEY = b"marketlake.basis"
+SOURCE_KEY = b"marketlake.source"
+SOURCE_ID_KEY = b"marketlake.source_id"
+SOURCE_AS_OF_KEY = b"marketlake.source_as_of"
+
 __all__ = [
     "ADJUSTMENTS",
+    "ADJUST_COLUMN",
     "ADJUST_NONE",
     "ADJUST_SPLIT",
     "ADJUST_TOTAL",
+    "BASIS_ADJUSTED",
+    "BASIS_COLUMN",
+    "BASIS_KEY",
+    "BASIS_RAW",
+    "ORIGIN_CAPTURED",
+    "ORIGIN_COLUMN",
+    "ORIGIN_IMPORTED",
+    "ORIGIN_KEY",
+    "SOURCE_AS_OF_COLUMN",
+    "SOURCE_AS_OF_KEY",
+    "SOURCE_COLUMN",
+    "SOURCE_ID_KEY",
+    "SOURCE_KEY",
     "AdjustUnknown",
     "AdjustmentIncomplete",
     "BarsAbsent",
@@ -391,9 +458,12 @@ __all__ = [
     "NoCloseOfRecord",
     "NoOptionClose",
     "NoSpotClose",
+    "OriginNotCaptured",
     "PartialRead",
     "PartitionAbsent",
     "PartitionQuarantined",
+    "Provenance",
+    "ProvenanceMalformed",
     "SnapAbsent",
     "SnapMalformed",
     "list_chain_cycles",
@@ -402,8 +472,33 @@ __all__ = [
     "load_contract",
     "load_contract_life",
     "load_quotes",
+    "provenance_metadata",
+    "read_provenance",
     "resolve_lake_root",
 ]
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """Where one bars partition's rows came from and what basis their numbers are in.
+
+    ``read_provenance`` builds one from a partition's schema metadata and
+    ``provenance_metadata`` writes one back, so the keys are spelled in one place. A captured
+    partition is ``Provenance(ORIGIN_CAPTURED, BASIS_RAW)`` with the three source fields
+    ``None``. An imported one names its source, the source's identity for what it read, and,
+    for an ``adjusted`` basis, the date the source adjusted its prices to, because adjusted
+    prices are recomputed with every later dividend.
+    """
+
+    origin: str
+    basis: str
+    source: str | None = None
+    source_id: str | None = None
+    source_as_of: date | None = None
+
+
+# What a partition carrying no provenance key is, which is every partition the sweep wrote.
+_CAPTURED = Provenance(ORIGIN_CAPTURED, BASIS_RAW)
 
 
 class LoadError(Exception):
@@ -663,9 +758,49 @@ class AdjustmentIncomplete(LoadError):
     every return computed through it while the table still looks whole, which is the failure
     ``PartialRead`` refuses one layer down. So the read refuses instead.
 
-    Three ways in. The lake holds no ``1d`` partition before the ex-date at all. The one it
-    holds carries no usable close. Or that partition's own ``instrument_id`` is not the
-    dividend's, which means the close belongs to a different instrument than the event.
+    Four ways in. The lake holds no ``1d`` partition before the ex-date at all. The one it
+    holds was not captured by marketlake, so its close may be in another basis and the actions
+    ledger says nothing about it. It carries no usable close. Or its own ``instrument_id`` is not
+    the dividend's, which means the close belongs to a different instrument than the event.
+    """
+
+
+class OriginNotCaptured(LoadError):
+    """Raised when an adjusted view meets a row whose ``origin`` is not ``captured``.
+
+    The actions ledger is written from captured quotes, which give the dividends, and captured
+    chains, which give the splits. So it says nothing about a bar from anywhere else. An
+    imported ``adjusted`` row would take the ledger's factors on top of its source's own, and an
+    imported ``raw`` row would take none and come back labelled adjusted. ``adjust='none'``
+    reads every row, and the ``basis`` column says what its numbers are.
+
+    The name says what the row is not rather than what it is, because a row from any source
+    other than capture refuses the same way. A caller that catches this to fall back to
+    ``adjust='none'`` catches only this. ``ProvenanceMalformed`` is a sibling rather than a
+    subclass, so the fallback does not swallow a damaged file.
+    """
+
+
+class ProvenanceMalformed(LoadError):
+    """Raised when a bars partition's provenance keys cannot be read as a ``Provenance``.
+
+    Seven shapes reach here, and ``read_provenance`` names the partition and the shape.
+
+    1. An origin key reading anything but ``imported``, ``captured`` included. A file reading
+       ``captured`` with an ``adjusted`` basis would otherwise pass the adjusted-view refusal
+       and take the ledger's factors twice. A captured partition carries no key at all.
+    2. Any other ``marketlake.*`` key with no origin key, which would otherwise read as captured
+       while the file claims something else.
+    3. An origin key with the basis, the source or the source identity missing.
+    4. A basis that is neither ``raw`` nor ``adjusted``.
+    5. An ``adjusted`` basis with no ``source_as_of``, because an adjusted price means nothing
+       without the date it was adjusted to.
+    6. A value that is not UTF-8.
+    7. A ``source_as_of`` that is not a strict ``YYYY-MM-DD`` date, under either basis.
+
+    It refuses under every view, ``'none'`` included, because a read that cannot say what basis
+    its numbers are in would hand them back unlabelled. It is not a ``ValueError``, because the
+    damage is in a file rather than in an argument.
     """
 
 
@@ -849,11 +984,21 @@ def load_bars(
     that spans partitions, because the adjusted views only mean something over a series that
     crosses an ex-date.
 
-    ``adjust`` names the view. ``'none'`` is as-traded, which is what the lake stores and the
-    only thing it ever stores. ``'split'`` divides the cumulative split ratio out, which is
-    price continuity. ``'total'`` folds the dividends in on top of that, which is total return.
-    Every answer carries an ``adjust`` column naming the view that produced it, because a table
-    of adjusted numbers is shaped exactly like a table of as-traded ones.
+    ``adjust`` names the view. ``'none'`` applies no factors and returns each row in its stored
+    basis, which for every bar marketlake captured is as-traded. ``'split'`` divides the
+    cumulative split ratio out, which is price continuity. ``'total'`` folds the dividends in on
+    top of that, which is total return. Every answer carries an ``adjust`` column naming the view
+    that produced it, because a table of adjusted numbers is shaped exactly like a table of
+    as-traded ones.
+
+    **Every row also says where it came from** (marketlake #949). ``origin`` is ``captured`` or
+    ``imported``, ``basis`` is ``raw`` or ``adjusted``, and ``source`` and ``source_as_of`` name
+    an imported row's source and the date that source recorded its values, null on a captured
+    row. All four are strings on every answer. A default read returns both origins, and no
+    keyword filters them, so a consumer that needs captured history alone filters on
+    ``origin``. ``'split'`` and ``'total'`` refuse any row whose origin is not ``captured`` with
+    ``OriginNotCaptured``, because the actions ledger is written from captured data. A backtest
+    over imported rows reads ``'none'`` and reads ``basis`` with it.
 
     ``as_of`` is a market date that resolves the actions ledger point-in-time, and the default
     is the ledger's current answer. Both readings are the ledger's own, and the door takes both
@@ -877,11 +1022,13 @@ def load_bars(
 
     Every way a read resolves to no table raises a ``LoadError``: ``BarsAbsent`` for a range
     holding no partition, ``PartitionAbsent`` and ``PartitionQuarantined`` per day,
-    ``PartialRead`` for a projection that could not complete, ``InstrumentUnknown`` for a bar an
-    adjusted view cannot key, and ``AdjustmentIncomplete`` for a dividend factor the lake cannot
-    supply. An ``adjust`` outside ``ADJUSTMENTS`` raises ``AdjustUnknown``, which is a
-    ``ValueError`` too, because naming a view that does not exist is a bad argument rather than a
-    lake that could not answer.
+    ``PartialRead`` for a projection that could not complete, ``ProvenanceMalformed`` for a
+    partition whose provenance keys cannot be read, ``OriginNotCaptured`` for a row an adjusted
+    view cannot vouch for, ``InstrumentUnknown`` for a bar an adjusted view cannot key, and
+    ``AdjustmentIncomplete`` for a dividend factor the lake cannot supply, which includes a prior
+    close marketlake did not capture. An ``adjust`` outside ``ADJUSTMENTS`` raises
+    ``AdjustUnknown``, which is a ``ValueError`` too, because naming a view that does not exist
+    is a bad argument rather than a lake that could not answer.
 
     Three conditions raise something other than a ``LoadError``, for the reason ``load_chain``
     gives for its own three: each says a file contradicts its writer, so it raises the error of
@@ -1021,6 +1168,132 @@ def _partition_day(name: str) -> date | None:
     return parse_date_dir(name[: -len(PARQUET_SUFFIX)])
 
 
+def read_provenance(
+    metadata: Mapping[bytes, bytes] | None, *, partition: str | None = None
+) -> Provenance:
+    """The provenance a bars partition's schema metadata records, or ``ProvenanceMalformed``.
+
+    This is the one parser of the five provenance keys. ``load_bars`` reads every partition
+    through it, and ``provenance_metadata`` is its inverse, which ``bars._write_partition``
+    writes through when it is handed a ``provenance``. ``metadata`` is the Arrow schema
+    metadata, which ``load_bars`` takes from the table it read. Never pass
+    ``pq.ParquetFile(path).metadata.metadata``, the file-level metadata: keys written there by
+    ``ParquetWriter.add_key_value_metadata`` would read as imported here and as captured to
+    ``load_bars``. ``partition`` is what a refusal names.
+
+    No ``marketlake.*`` key at all is a captured partition with a ``raw`` basis, which is every
+    partition the sweep writes. Any such key makes the partition an import, which must carry an
+    origin of ``imported``, a basis, a source and a source identity. A value that is present but
+    empty counts as missing. ``ProvenanceMalformed`` lists the seven shapes this refuses.
+    ``source_as_of`` is read by ``paths.parse_date_dir``, because on 3.12 ``date.fromisoformat``
+    also accepts ``20120410`` and ``2012-W15-2``. A ``marketlake.*`` key this does not name is
+    passed over once the origin key is present.
+    """
+    where = "a bars partition" if partition is None else partition
+    keys: dict[bytes, str] = {}
+    for key, raw in (metadata or {}).items():
+        if not key.startswith(_PROVENANCE_PREFIX):
+            continue
+        try:
+            keys[key] = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProvenanceMalformed(
+                f"{where} carries a {key.decode('utf-8', 'replace')} value that is not UTF-8."
+            ) from exc
+    if not keys:
+        return _CAPTURED
+
+    named = ", ".join(sorted(key.decode() for key in keys))
+    origin = keys.get(ORIGIN_KEY)
+    if origin is None:
+        raise ProvenanceMalformed(
+            f"{where} carries {named} and no {ORIGIN_KEY.decode()}, so it would read as captured "
+            "while its own keys say it was not."
+        )
+    if origin != ORIGIN_IMPORTED:
+        raise ProvenanceMalformed(
+            f"{where} carries an origin of {origin!r}. A file names only {ORIGIN_IMPORTED!r}, "
+            "and a captured partition carries no provenance key at all."
+        )
+    missing = [key.decode() for key in (BASIS_KEY, SOURCE_KEY, SOURCE_ID_KEY) if not keys.get(key)]
+    if missing:
+        raise ProvenanceMalformed(
+            f"{where} is imported and carries no {', '.join(missing)}, so nothing says what its "
+            "numbers are or where they came from."
+        )
+    basis = keys[BASIS_KEY]
+    if basis not in (BASIS_RAW, BASIS_ADJUSTED):
+        raise ProvenanceMalformed(
+            f"{where} carries a basis of {basis!r}, which is neither {BASIS_RAW!r} nor "
+            f"{BASIS_ADJUSTED!r}."
+        )
+    as_of_text = keys.get(SOURCE_AS_OF_KEY)
+    as_of = None
+    if as_of_text is None:
+        if basis == BASIS_ADJUSTED:
+            raise ProvenanceMalformed(
+                f"{where} is {BASIS_ADJUSTED} and carries no {SOURCE_AS_OF_KEY.decode()}, so "
+                "nothing says which date its prices were adjusted to."
+            )
+    else:
+        as_of = parse_date_dir(DATE_PREFIX + as_of_text)
+        if as_of is None:
+            raise ProvenanceMalformed(
+                f"{where} carries a {SOURCE_AS_OF_KEY.decode()} of {as_of_text!r}, which is not "
+                "a YYYY-MM-DD date."
+            )
+    return Provenance(ORIGIN_IMPORTED, basis, keys[SOURCE_KEY], keys[SOURCE_ID_KEY], as_of)
+
+
+def provenance_metadata(provenance: Provenance) -> dict[bytes, bytes]:
+    """The schema metadata keys that record ``provenance``, the inverse of ``read_provenance``.
+
+    A captured provenance writes no key, so a partition written with it holds the bytes one
+    written with none holds. Anything ``read_provenance`` would not read back as the same
+    ``Provenance`` raises ``ValueError`` here, at the writer, rather than ``ProvenanceMalformed``
+    at every later read of the file.
+    """
+    if provenance.origin == ORIGIN_CAPTURED:
+        values: dict[bytes, str | None] = {}
+    else:
+        as_of = provenance.source_as_of
+        values = {
+            ORIGIN_KEY: provenance.origin,
+            BASIS_KEY: provenance.basis,
+            SOURCE_KEY: provenance.source,
+            SOURCE_ID_KEY: provenance.source_id,
+            SOURCE_AS_OF_KEY: None if as_of is None else as_of.isoformat(),
+        }
+    encoded = {key: value.encode("utf-8") for key, value in values.items() if value is not None}
+    try:
+        written = read_provenance(encoded)
+    except ProvenanceMalformed as exc:
+        raise ValueError(f"{provenance} cannot be written: {exc}") from exc
+    if written != provenance:
+        raise ValueError(f"{provenance} would read back as {written}.")
+    return encoded
+
+
+def _with_provenance(table: pa.Table, provenance: Provenance) -> pa.Table:
+    """``table`` with its partition's provenance as four string columns, the same on every row.
+
+    Each column is built as ``pa.string()`` even when every value is null. A null array built
+    without a type comes back as Arrow's ``null`` type, so an all-captured read would answer a
+    different schema from a read holding an import. ``source_as_of`` is ISO text rather than a
+    ``date32``, as every date column in the lake is, because a ``date32`` column meeting a string
+    one makes the permissive stitch raise ``ArrowTypeError``, which is not a ``LoadError``.
+    """
+    as_of = provenance.source_as_of
+    for name, value in (
+        (ORIGIN_COLUMN, provenance.origin),
+        (BASIS_COLUMN, provenance.basis),
+        (SOURCE_COLUMN, provenance.source),
+        (SOURCE_AS_OF_COLUMN, None if as_of is None else as_of.isoformat()),
+    ):
+        table = table.append_column(name, pa.array([value] * table.num_rows, type=pa.string()))
+    return table
+
+
 def _read_bars(
     root: Path, ticker: str, freq: str, day: date, include_quarantined: bool
 ) -> pa.Table:
@@ -1037,6 +1310,12 @@ def _read_bars(
     There is no fetch predicate, because a day is the selection. ``_predicate`` names the rows an
     answer is made of out of a partition holding a session's worth of other minutes, and a bars
     partition holds one session at one frequency, which is the whole answer for that day.
+
+    The partition's provenance is read here, per partition, out of the schema metadata ``_read``
+    already returns, and turned into columns before the caller stitches the days together. The
+    metadata then leaves the table. ``pa.concat_tables`` keeps the first table's schema metadata,
+    so a range whose first day was imported would otherwise carry ``marketlake.origin:
+    imported`` over every captured row after it.
     """
     day_text = day.isoformat()
     path = LakePaths(root).bars_partition_path(ticker, freq, day)
@@ -1050,10 +1329,12 @@ def _read_bars(
         absent_detail=f" The frequency {freq!r} is a level of that path.",
     )
     fetched = _read(path)
+    partition = path.relative_to(root).as_posix()
+    provenance = read_provenance(fetched.schema.metadata, partition=partition)
     projection = project_extra(fetched, surface=BARS, ledger=_ledger(root))
     if not projection.complete:
         raise PartialRead(ticker, day_text, BARS, projection)
-    return projection.table
+    return _with_provenance(projection.table.replace_schema_metadata(None), provenance)
 
 
 def _in_view(
@@ -1067,8 +1348,8 @@ def _in_view(
 ) -> pa.Table:
     """``table`` in the view ``adjust`` names, marked with which view that is.
 
-    The marker goes on every answer including the as-traded one, because what it protects
-    against is two answers being mixed, and one of the two is always as-traded.
+    The marker goes on every answer including the ``'none'`` one, because what it protects
+    against is two answers being mixed, and one of the two is always unadjusted by the view.
 
     ``lake.actions`` and ``lake.bars`` are imported here rather than at the top of the module,
     and the reason is an import direction rather than a preference: both of them import this
@@ -1082,7 +1363,17 @@ def _in_view(
     function. ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and reading the
     path instead would mint a second definition of a bar's session to get the answer the first
     one already gives.
+
+    An adjusted view refuses a row marketlake did not capture before it reads anything else:
+    before the actions ledger, before the missing-column refusal and before the
+    ``InstrumentUnknown`` walk. A row from another source can carry a null ``instrument_id``,
+    which would otherwise raise ``InstrumentUnknown``, and a damaged ledger raises
+    ``actions.LedgerLineError``, which is not a ``LoadError``. Either would reach a caller who
+    catches ``OriginNotCaptured`` to fall back to ``adjust='none'`` ahead of the refusal it
+    catches.
     """
+    if adjust != ADJUST_NONE:
+        _require_captured(table, ticker, adjust)
     marked = table.append_column(
         ADJUST_COLUMN, pa.array([adjust] * table.num_rows, type=pa.string())
     )
@@ -1165,6 +1456,22 @@ def _in_view(
         volume_factors.append(ratio)
 
     return _rescaled(marked, price_factors, volume_factors)
+
+
+def _require_captured(table: pa.Table, ticker: str, adjust: str) -> None:
+    """Raise ``OriginNotCaptured`` at the first row whose ``origin`` is not ``captured``.
+
+    A null origin is not captured either, so it refuses too.
+    """
+    origins = table.column(ORIGIN_COLUMN).to_pylist()
+    for origin, stamp in zip(origins, table.column(BAR_TS_COLUMN).to_pylist(), strict=True):
+        if origin != ORIGIN_CAPTURED:
+            raise OriginNotCaptured(
+                f"{ticker} holds a bar at {stamp} whose origin is {origin!r}, and the {adjust} "
+                "view adjusts only bars marketlake captured, because the actions ledger is "
+                "written from captured data and says nothing about this one. Read it with "
+                f"adjust={ADJUST_NONE!r}, whose {BASIS_COLUMN} column says what its numbers are."
+            )
 
 
 def _by_instrument(
@@ -1294,6 +1601,18 @@ def _prior_close(
     table = _read_bars(root, ticker, DAILY_FREQ, day, include_quarantined)
     if table.num_rows == 0:
         raise AdjustmentIncomplete(f"{detail}, and its {DAILY_FREQ} partition for {day} is empty.")
+
+    # The prior close is read whatever range was asked for, so a ``total`` read over captured
+    # rows reaches it even when the ex-date is the ticker's first captured session and the
+    # session before is an import. An imported close may be in another basis, and the ledger
+    # says nothing about it. This raises before the cache below is written, so no later ex-date
+    # can be handed the imported close either.
+    origin = table.column(ORIGIN_COLUMN)[0].as_py()
+    if origin != ORIGIN_CAPTURED:
+        raise AdjustmentIncomplete(
+            f"{detail}, and its {DAILY_FREQ} partition for {day} has an origin of {origin!r} "
+            f"rather than {ORIGIN_CAPTURED!r}."
+        )
     ordered = _sorted_by_instant(table, BAR_TS_COLUMN, DAILY_FREQ, ticker, day.isoformat())
     last = ordered.num_rows - 1
 
