@@ -300,10 +300,11 @@ def settlement_view(
     every way this read can fail raises before the roster is built.
 
     **On a trimmed lake** (marketlake #787) a session the VM's trim removed raises
-    ``PartitionAbsent``, the same answer as a session never captured. Since marketlake #795 the
-    trim takes old ``1d`` bars too, but each only once its day's chains partition is gone, so a
-    session whose chain the lake holds never raises ``BarsAbsent`` for a trimmed bar. A chains
-    range restore brings no bars back, so a rollback restores the bars range too, as the
+    ``PartitionAbsent``, the same answer as a session never captured. Since marketlake #795 a
+    host with a numeric bars window trims old ``1d`` bars too, but each only once its day's
+    chains partition is gone, so a session whose chain the lake holds never raises
+    ``BarsAbsent`` for a trimmed bar. The VM keeps every bars session since marketlake #953. A
+    chains range restore brings no bars back, so a rollback restores the bars range too, as the
     README's range restore item says. Nothing nightly calls this door. Reading a trimmed
     session means restoring it into a directory outside the live lake, which ``python -m
     lake.bucket restore-for-reading`` does (marketlake #837), bringing the session's bars with

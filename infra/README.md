@@ -1703,7 +1703,7 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. A config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
 | `deployed: <sha>, but the dashboard did not restart` | 1 | Read `journalctl -u com.marketlake.dashboard`, fix the cause, then run `sudo ~/.local/state/marketlake/systemd/restart.sh dashboard`. Capture is unaffected. |
 | `deployed: <sha>, with a failed step in deploy.log, but the dashboard did not restart` | 1 | The two rows above both apply. Fix the dashboard as its row says, then the failed step as its row says. |
-| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. |
+| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
 | `rollback to <sha> failed: <reason>` | 1 | The daemon may be down. Check `systemctl status com.marketlake.daemon`, then recover by the hand procedure below. |
 | `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
 | `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |
@@ -1781,7 +1781,10 @@ after it have ended. Four facts hold for any restore onto the VM.
    secrets and no secret is copied. A whole lake restored into the VM's own `lake_root`
    lasts only until the trim runs again, because the VM's own `config.yaml` still sets the
    key. Each partition it brings back beside a trim line takes the trim's recovery path and
-   is trimmed again.
+   is trimmed again. On a host whose bars window is `all`, such as the VM, a bar brought
+   back that way gets a restore line instead and stays. The per-surface keys, such as `lake_window_sessions_bars`, play no part
+   in which restore runs, so the copy may keep them
+   ([#953](https://github.com/l3a0/marketlake/issues/953)).
 4. The restore refuses, with exit 2 and before any download, when the volume would be left
    with less free space than the journal reserve, 13 times the busiest sealed day in the
    bucket. Grow the lake volume first, as item 3 under
@@ -1835,7 +1838,9 @@ only after the bucket's copy is verified, recording each in `trimmed.jsonl`
 ([#787](https://github.com/l3a0/marketlake/issues/787)). A quotes partition goes only under a
 landed daily bar ([#794](https://github.com/l3a0/marketlake/issues/794)), and a bars partition
 only once its day's chains partition is gone
-([#795](https://github.com/l3a0/marketlake/issues/795)). The
+([#795](https://github.com/l3a0/marketlake/issues/795)), on a host whose bars window is a
+number. The VM's keeps every session, so it trims no bars
+([#953](https://github.com/l3a0/marketlake/issues/953)). The
 resync's `--apply` deletes on purpose as well, only the covered journal segments and `bars/`
 partitions that the resuming host alone recorded
 ([#832](https://github.com/l3a0/marketlake/issues/832)). After the
@@ -1862,6 +1867,97 @@ Under either role, avoid Sunday 20:00 to 23:00 ET, while the Sunday job runs
 `chain_plan.json`, which lives on the root volume in the config directory. Capture uses
 the default plan until the next close+15 re-tune writes one, and a replacement during a
 session makes that night's re-tune skip the day.
+
+### Bring back the bars trimmed before the VM kept them all
+
+`config/vm.yaml` sets `lake_window_sessions_bars: all`, so from the deploy that renders it
+the VM keeps every bars session
+([#953](https://github.com/l3a0/marketlake/issues/953)). Raising a window brings nothing
+back, though. SPY and QQQ bars older than 22 sessions were trimmed from the VM after
+[#795](https://github.com/l3a0/marketlake/issues/795) shipped on 2026-10-14, and each still
+has a trim line, which the trim, the upload's absence check, the scrub and a rebuild all
+read as removed on purpose. This one-time restore puts them back, and
+[#958](https://github.com/l3a0/marketlake/issues/958) tracks the owner's run.
+
+Run it only after the deploy carrying [#953](https://github.com/l3a0/marketlake/issues/953) has rendered the bars key into the VM's
+`config.yaml`. Run before that, the old code trims the restore again, because a restore line
+keeps a partition only until a checkpoint from a later session. Run the five steps over the
+owner's own SSH session.
+
+1. Check the rendered key. It prints `lake_window_sessions_bars: all`.
+
+   ```bash
+   grep '^lake_window_sessions_bars:' ~/.config/marketlake/config.yaml
+   ```
+
+   When it prints nothing or another value, the render refused and kept the old
+   `config.yaml`, so do not restore. Read the render's line in the deploy log, as the
+   `with a failed step` row of [Deploy a commit](#deploy-a-commit) says.
+
+   ```bash
+   sudo tail -n 50 /var/lib/marketlake/deploy.log
+   ```
+
+2. Check that nothing holds the lake-root lock. It prints `inactive` or `failed` for each
+   unit. The evening upload runs inside the eod-sweep unit and holds the lock until as late
+   as about 20:17 ET, and `lake.lock` waits on it without a word. The close+15 compaction
+   runs inside the daemon's own unit, `com.marketlake.daemon.service`, which this check does
+   not read. So run the restore only after that evening's 18:30 sweep and its upload have
+   ended, which the eod-sweep unit's `inactive` or `failed` confirms. When any unit reads
+   `active` or `activating`, wait and run the check again. `deploy/busy-check.sh` is sourced by the deploy and the
+   stop, and is never run by hand.
+
+   ```bash
+   systemctl is-active com.marketlake.eod-sweep.service com.marketlake.sunday.service marketlake-deploy.service
+   ```
+
+3. Count the bars trim lines, which step 5 compares against.
+
+   ```bash
+   grep -c '"kind": "trim", "partition": "bars/' /srv/marketlake/trimmed.jsonl
+   ```
+
+   Then run the restore, with today's date as the `--to` day. Start the VM first if the
+   nightly stop has powered it off, as
+   [Start a stopped instance](#start-a-stopped-instance) says. An interactive login holds
+   the VM up, by check 3 of [The nightly stop](#the-nightly-stop), so the switch that lets
+   it stop need not be removed as [Restore the lake](#restore-the-lake) asks for a
+   whole-lake restore. A dropped connection ends the run, and running it again is safe,
+   since the range restore leaves present files alone. It refuses a start inside the next
+   session's pre-open bound and on Sunday from 19:55 to 23:30 ET.
+
+   ```bash
+   ~/marketlake/.venv/bin/python -m lake.bucket restore-range --surface bars --from 1990-01-01 --to <run day>
+   ```
+
+   If the restore refuses because a file on disk does not match its manifest entry, follow
+   that message's own fix, then run the command again.
+
+   The range starts at a fixed early date, before every bars day the manifest records, so
+   no date has to be looked up. [#950](https://github.com/l3a0/marketlake/issues/950) can
+   land GLD and USO history from 2006 to 2012, and a close+15 trim after its upload removes
+   that from the VM until this restore runs. The range restore selects by manifest dates and
+   asks the calendar only about now, so a `--from` before the calendar's first session is
+   accepted. It hashes what is already present, so the wide range costs only that.
+
+4. Run the same command again. It restores 0 partitions.
+5. After the next close+15, the trim's latest summary ends `bars=all`, and step 3's count,
+   run again, prints the same number. Step 3's restore lines name `bars/`
+   too, so only a count of trim lines tells the two apart. The journal check shows the
+   latest summary and any `trim     bars refused:` line.
+
+   ```bash
+   TZ=America/New_York journalctl -u com.marketlake.daemon | grep 'trim     ' | tail -n 5
+   ```
+
+   When the latest summary does not end `bars=all`, read the `trim     bars refused:` line
+   and the nightly report's `lake window refused:` or `lake window edge not found:` line,
+   fix `config/vm.yaml` through a pull request, and leave
+   [#958](https://github.com/l3a0/marketlake/issues/958) open.
+
+Rendering the bars key before the first close+15 after [#950](https://github.com/l3a0/marketlake/issues/950)'s import is uploaded avoids
+trimming and then restoring an estimated 3,000 imported partitions, so when the order allows,
+the deploy carrying [#953](https://github.com/l3a0/marketlake/issues/953) goes first.
 
 ### Start a stopped instance
 

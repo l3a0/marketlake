@@ -615,6 +615,33 @@ def test_the_window_key_decides_the_mode_through_main(tmp_path, monkeypatch, cap
     assert _files(whole) == {**lake.uploaded, SPY_1: lake.spy_1}
 
 
+@pytest.mark.parametrize(
+    ("lines", "windowed"),
+    [
+        ("lake_window_sessions_bars: all\n", False),
+        ("lake_window_sessions: 22\nlake_window_sessions_bars: all\n", True),
+        ("lake_window_sessions: 22\nlake_window_sessions_chains: 25\n", True),
+    ],
+    ids=["bars-key-alone", "base-and-bars", "base-and-chains"],
+)
+def test_the_restore_asks_only_whether_the_base_key_is_set(
+    tmp_path, monkeypatch, capsys, lines, windowed
+):
+    """Marketlake #953. A per-surface key decides nothing about the restore, so a host with a
+    bars key alone brings back the whole lake, and the VM's rebuild with ``lake_window_sessions``
+    set still leaves out the designed absences."""
+    lake = _trimmed_bucket(tmp_path)
+    config = write_config(tmp_path, lake.root)
+    config.write_text(config.read_text() + KEYS + lines)
+    dest = tmp_path / "restored"
+
+    assert _main(config, lake.client, monkeypatch, dest) == 0
+
+    expected = lake.uploaded if windowed else {**lake.uploaded, SPY_1: lake.spy_1}
+    assert _files(dest) == expected
+    assert ("trimmed on purpose" in capsys.readouterr().out) is windowed
+
+
 def _never_built(cfg):
     pytest.fail("main built a client before it judged lake_window_sessions")
 

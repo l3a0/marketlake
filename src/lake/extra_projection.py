@@ -55,9 +55,11 @@ ever reaching a segment.
 
 Read time is the only place this can happen. A compacted partition is immutable, and that
 immutability is what the manifest protocol, the two-way integrity scrub, and the backup all
-rest on. The VM's trim of chains past its window (marketlake #787), of quotes past it
-under a landed daily bar (marketlake #794), and of bars past it once their day's chains are
-gone (marketlake #795), is the only code that deletes a sealed partition on its own. It
+rest on. The trim of chains past the chains window (marketlake #787), of quotes past the
+quotes window under a landed daily bar (marketlake #794), and of bars past the bars window
+once their day's chains are gone (marketlake #795), is the only code that deletes a sealed
+partition on its own. Each window is its surface's own since marketlake #953, and the VM's
+bars window keeps every session. It
 removes a whole partition, records it in ``trimmed.jsonl``, and never rewrites one. The
 hand-run ``compact.recompact_ticker_day`` is the only code that replaces one.
 Rewriting a sealed partition to heal it would trade those guarantees for one convenience.

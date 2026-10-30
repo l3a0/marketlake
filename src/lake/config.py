@@ -88,6 +88,10 @@ volume, marketlake #786. An integer is stored as read and any other value as its
 and an absent key is ``None``. A host without the key never trims, and its
 ``lake.bucket restore`` brings back the whole lake rather than rebuilding a trimmed one,
 marketlake #785. ``lake.window`` judges it in each job that reads it, for the same reason.
+Three more keys, ``lake_window_sessions_chains``, ``lake_window_sessions_quotes`` and
+``lake_window_sessions_bars``, give one surface a window of its own, marketlake #953. They are
+stored the same way, so ``all`` stores ``"'all'"``, and ``lake.window`` says how each one
+inherits ``lake_window_sessions`` when it is absent.
 
 A fifth is ``cost_export``, the ``s3://`` location of the AWS cost and usage export, which
 ``lake.vm_config`` renders from an instance tag on the VM, marketlake #913. It is stored as
@@ -213,7 +217,12 @@ ROLE_KEY = "role"
 
 # The lake window key, marketlake #786: how many recent sessions this host keeps on its lake
 # volume, and the opt-in to trimming. ``lake.window`` judges it and says why loading does not.
+# Each per-surface key, marketlake #953, overrides it for one surface, and only this key turns
+# trimming on.
 LAKE_WINDOW_SESSIONS_KEY = "lake_window_sessions"
+LAKE_WINDOW_SESSIONS_CHAINS_KEY = "lake_window_sessions_chains"
+LAKE_WINDOW_SESSIONS_QUOTES_KEY = "lake_window_sessions_quotes"
+LAKE_WINDOW_SESSIONS_BARS_KEY = "lake_window_sessions_bars"
 
 # The cost export key, marketlake #913: where the AWS cost and usage export lands, as an
 # ``s3://`` location. Optional, and only the sweep's cost read judges it.
@@ -757,8 +766,12 @@ class Config:
     token_store: str = TOKEN_STORE_FILE
     token_store_region: str | None = None
     # The ``lake_window_sessions`` integer as the file held it, the ``repr`` of any other
-    # value, or ``None`` when the key is absent. ``lake.window.window_sessions`` judges it.
+    # value, or ``None`` when the key is absent. ``lake.window.surface_windows`` judges it with
+    # the three per-surface keys below, which are stored the same way (marketlake #953).
     lake_window_sessions: int | str | None = None
+    lake_window_sessions_chains: int | str | None = None
+    lake_window_sessions_quotes: int | str | None = None
+    lake_window_sessions_bars: int | str | None = None
     # The ``cost_export`` text as the file held it, or ``None`` when the key is absent or
     # empty. Only ``lake.aws_cost`` reads it, and loading never refuses it.
     cost_export: str | None = None
@@ -849,6 +862,9 @@ class Config:
             ),
             token_store_region=_optional_text(mapping.get(TOKEN_STORE_REGION_KEY)),
             lake_window_sessions=_window_value(mapping),
+            lake_window_sessions_chains=_window_value(mapping, LAKE_WINDOW_SESSIONS_CHAINS_KEY),
+            lake_window_sessions_quotes=_window_value(mapping, LAKE_WINDOW_SESSIONS_QUOTES_KEY),
+            lake_window_sessions_bars=_window_value(mapping, LAKE_WINDOW_SESSIONS_BARS_KEY),
             cost_export=_optional_text(mapping.get(COST_EXPORT_KEY)),
             command_access_key_id=None if command_key_id is None else Secret(command_key_id),
             command_secret_access_key=(
@@ -859,16 +875,20 @@ class Config:
         )
 
 
-def _window_value(mapping: Mapping[str, object]) -> int | str | None:
-    """The ``lake_window_sessions`` value as stored: ``None`` when absent, an ``int`` as read.
+def _window_value(
+    mapping: Mapping[str, object], key: str = LAKE_WINDOW_SESSIONS_KEY
+) -> int | str | None:
+    """A window key's value as stored: ``None`` when absent, an ``int`` as read.
 
-    Anything else is stored as its ``repr``, so a frozen config stays hashable and the job that
-    judges it can refuse it. A ``bool`` is an ``int`` to Python and is stored as its ``repr``,
-    because ``true`` is a typo rather than a window.
+    ``key`` is ``lake_window_sessions`` or one of its per-surface keys. Anything else is stored
+    as its ``repr``, so a frozen config stays hashable and the job that judges it can refuse it.
+    ``all`` stores ``"'all'"``, and a key left blank stores ``"None"``, so a blank key is present.
+    A ``bool`` is an ``int`` to Python and is stored as its ``repr``, because ``true`` is a typo
+    rather than a window.
     """
-    if LAKE_WINDOW_SESSIONS_KEY not in mapping:
+    if key not in mapping:
         return None
-    value = mapping[LAKE_WINDOW_SESSIONS_KEY]
+    value = mapping[key]
     if type(value) is int:
         return value
     return repr(value)

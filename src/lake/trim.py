@@ -5,10 +5,13 @@ GB a session. Every sealed partition is already in the backup bucket, so the VM 
 recent sessions and drops older partitions once the bucket's copy is proven. This module is the job
 that drops them: chains since marketlake #787, quotes under a landed daily bar since marketlake
 #794, and bars of both frequencies once their day's chains are gone since marketlake #795. Quotes
-and bars are a few KB a day, so trimming them buys a restore bounded to the same window as chains
-rather than disk. It runs inside the close+15 compaction, after the upload and the ping,
-under the lock hold the ping sits in, so it needs no lock of its own. ``lake.compact`` decides
-whether it runs at all and hands it an integer window. This module decides which partitions go.
+and bars are a few KB a day, so trimming them buys a bounded restore rather than disk, and since
+marketlake #953 each can keep a window of its own, or every session, which the VM keeps of bars.
+It runs inside the close+15 compaction, after the upload and the ping, under the lock hold the
+ping sits in, so it needs no lock of its own. ``lake.compact`` decides
+whether it runs at all and hands it the chains window, an integer, and each quotes and bars
+surface's own window, which may keep every session (marketlake #953). This module decides which
+partitions go.
 
 It lives outside ``lake.bucket`` because that module's rule is that only its range restore
 writes into a live lake. The bucket read it makes, ``bucket.current_digest``, writes
@@ -31,10 +34,14 @@ nothing.
    range restore brings it back without them. A check of that chains partition that raises
    keeps the bar and writes no line of its own, since the chains directory's own held line
    already names the fault.
-2. Its day is at or before the window edge, ``window.window_edge(calendar, tonight, W + 1)``.
-   Tonight's seal has landed since the sweep, hence W + 1, and the edge is computed here from
-   the window rather than read from the checkpoint, whose edge goes stale when the window
-   grows.
+2. Its day is at or before its surface's window edge, ``window.window_edge(calendar, tonight,
+   W + 1)``, where W is that surface's window. Tonight's seal has landed since the sweep, hence
+   W + 1, and the edge is computed here from the window rather than read from the checkpoint,
+   whose edge goes stale when the window grows. A quotes or bars surface that keeps every
+   session has no edge and loses nothing. One whose window was refused, or whose edge cannot
+   be counted, is kept whole that night while the other surfaces go on. The chains edge that
+   cannot be counted refuses the whole run, because the checkpoint is cut at the chains
+   window's edge.
 3. Its latest manifest entry sits below the watermark the nightly upload started from, so the
    bucket held it before tonight.
 4. Its ticker-day's journal directory holds no segments. ``compact._recover`` raises on a
@@ -105,6 +112,7 @@ from lake.clock import Clock
 from lake.config import BucketTarget
 from lake.manifest import is_quarantined, latest_entries, latest_quarantine, sha256_file
 from lake.paths import (
+    BARS,
     CHAINS,
     QUOTES,
     SEGMENT_GLOB,
@@ -175,11 +183,18 @@ class TrimResult:
     set when a failure that would repeat on every partition ended the run. ``deadline`` is
     set when the upload's deadline came first. Each names its repair.
 
-    ``window`` and ``edge`` are the window the run judged by and the last day it could drop.
+    ``window`` and ``edge`` are the chains window the run judged by and the last chains day it
+    could drop. ``surfaces`` names each quotes or bars window that differs from the chains one,
+    as ``(surface, window, edge)``, with ``None`` for both on a surface that keeps every session.
+    ``surface_refused`` names each quotes or bars surface whose window was refused or whose edge
+    could not be counted, as ``(surface, why)``. That surface was kept whole and the rest of the
+    run went on (marketlake #953).
     """
 
     window: int | None = None
     edge: date | None = None
+    surfaces: tuple[tuple[str, int | None, date | None], ...] = ()
+    surface_refused: tuple[tuple[str, str], ...] = ()
     trimmed: tuple[str, ...] = ()
     lined: tuple[str, ...] = ()
     restored: tuple[str, ...] = ()
@@ -202,10 +217,18 @@ class TrimResult:
         """The lines ``CompactionResult.render`` prints for the trim, indented to match."""
         if self.refused is not None:
             return [f"  trim     refused: {self.refused}"]
+        # A surface's own window is appended only where it differs from the chains window, so a
+        # host with ``lake_window_sessions`` alone prints the line it printed before #953.
+        own = "".join(
+            f" {surface}={'all' if window is None else f'{window}/{edge}'}"
+            for surface, window, edge in self.surfaces
+        )
         lines = [
             f"  trim     window={self.window} edge={self.edge} trimmed={len(self.trimmed)} "
-            f"restored={len(self.restored)} skipped={len(self.skipped)} rot={len(self.rot)}"
+            f"restored={len(self.restored)} skipped={len(self.skipped)} rot={len(self.rot)}{own}"
         ]
+        for surface, why in self.surface_refused:
+            lines.append(f"  trim     {surface} refused: {why}")
         for rel in self.lined:
             lines.append(f"  trim     line written, file kept: {rel}")
         for rel in self.restored:
@@ -419,21 +442,35 @@ def trim(
     upload: UploadSummary,
     clock: Clock,
     calendar: Calendar,
+    windows: Mapping[str, int | None] | None = None,
+    refused: Mapping[str, str] | None = None,
 ) -> TrimResult:
     """Drop every chains, quotes and bars partition the clauses allow, oldest first. Never raises.
 
-    ``window`` is the judged window key. ``upload`` is the nightly upload's summary, whose
-    ``deadline`` the run stops at and whose ``watermark`` clause 3 compares with. The caller
-    holds the lake-root lock.
+    ``window`` is the judged chains window. ``windows`` maps ``quotes`` and ``bars`` to each
+    surface's own judged window, or to ``None`` for a surface that keeps every session, and
+    ``refused`` maps a surface whose window the judge refused to the judge's message (marketlake
+    #953). Left out, every surface takes ``window`` and none is refused. Once ``windows`` is
+    passed, a quotes or bars surface missing from it is kept as refused, never given the chains
+    window. A refused surface, and one whose edge cannot be counted, is kept whole while the
+    rest of the run goes on.
+
+    ``upload`` is the nightly upload's summary, whose ``deadline`` the run stops at and whose
+    ``watermark`` clause 3 compares with. The caller holds the lake-root lock.
     """
     root = Path(lake_root)
     run = _Run(root=root, clock=clock)
     edge: date | None = None
+    plan = _surface_plan(window, windows, refused)
+    own: tuple[tuple[str, int | None, date | None], ...] = ()
+    surface_refused: tuple[tuple[str, str], ...] = ()
 
     def result(**kwargs: Any) -> TrimResult:
         return TrimResult(
             window=window,
             edge=edge,
+            surfaces=own,
+            surface_refused=surface_refused,
             trimmed=tuple(run.trimmed),
             lined=tuple(run.lined),
             restored=tuple(run.restored),
@@ -454,10 +491,14 @@ def trim(
                 "the bucket held before tonight",
             )
         today = SessionClock(clock, calendar).session_date()
-        selection = _select(root, today=today, window=window, calendar=calendar, upload=upload)
+        selection = _select(
+            root, today=today, window=window, plan=plan, calendar=calendar, upload=upload
+        )
         if isinstance(selection, str):
             return TrimResult(window=window, refused=selection)
         edge = selection.edge
+        own = selection.own
+        surface_refused = selection.surface_refused
         for directory, line in selection.held:
             run.hold(directory, line)
         for candidate in selection.candidates:
@@ -504,6 +545,98 @@ class _Selection:
     paths: LakePaths
     # Each directory that could not be checked, with the line that names its repair.
     held: tuple[tuple[str, str], ...] = ()
+    # ``TrimResult.surfaces`` and ``TrimResult.surface_refused``.
+    own: tuple[tuple[str, int | None, date | None], ...] = ()
+    surface_refused: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _SurfacePlan:
+    """What a quotes or bars surface is trimmed by: a window, every session kept, or a refusal."""
+
+    window: int | None
+    refused: str | None = None
+
+
+# The surfaces that can take a window of their own. Chains always take the run's ``window``,
+# because the split checkpoint is cut at the chains window's edge.
+_OWN_WINDOW_SURFACES = (QUOTES, BARS)
+
+# Why a refused surface's partitions are kept, and why one that keeps every session is.
+_KEPT_REFUSED = "its surface's window was refused"
+_KEPT_EVERY = "its surface keeps every session"
+
+
+def _surface_plan(
+    window: int,
+    windows: Mapping[str, int | None] | None,
+    refused: Mapping[str, str] | None,
+) -> dict[str, _SurfacePlan]:
+    """Each quotes and bars surface's plan from ``trim``'s arguments."""
+    plan: dict[str, _SurfacePlan] = {}
+    for surface in _OWN_WINDOW_SURFACES:
+        if refused is not None and surface in refused:
+            plan[surface] = _SurfacePlan(window=None, refused=refused[surface])
+        elif windows is None:
+            plan[surface] = _SurfacePlan(window=window)
+        elif surface not in windows:
+            plan[surface] = _SurfacePlan(
+                window=None, refused="no window was given for it, so it is kept whole"
+            )
+        else:
+            plan[surface] = _SurfacePlan(window=windows[surface])
+    return plan
+
+
+def _surface_edges(
+    *,
+    window: int,
+    edge: date,
+    plan: Mapping[str, _SurfacePlan],
+    calendar: Calendar,
+    today: date,
+) -> tuple[
+    dict[str, date | None],
+    tuple[tuple[str, int | None, date | None], ...],
+    tuple[tuple[str, str], ...],
+]:
+    """Each surface's edge, ``None`` where it keeps every session, and what to report.
+
+    A surface whose window was refused, or whose edge cannot be counted, is left out of the
+    edges and named in the refusals instead. Any exception counts, not only ``EdgeNotFound``,
+    because a window the judge passed can still make the count raise, such as a hex value too
+    long to print in the count's own message. The chains edge was counted already, and a
+    surface sharing its window shares its edge.
+    """
+    edges: dict[str, date | None] = {CHAINS: edge}
+    own: list[tuple[str, int | None, date | None]] = []
+    refusals: list[tuple[str, str]] = []
+    for surface in _OWN_WINDOW_SURFACES:
+        surface_plan = plan[surface]
+        if surface_plan.refused is not None:
+            refusals.append((surface, surface_plan.refused))
+            continue
+        sessions = surface_plan.window
+        if sessions is None:
+            edges[surface] = None
+            own.append((surface, None, None))
+            continue
+        if sessions == window:
+            edges[surface] = edge
+            continue
+        try:
+            counted = window_edge(calendar, today, sessions + 1)
+        except EdgeNotFound as exc:
+            refusals.append((surface, f"the window edge could not be counted: {exc}"))
+            continue
+        except Exception as exc:
+            refusals.append(
+                (surface, f"the window edge could not be counted ({type(exc).__name__})")
+            )
+            continue
+        edges[surface] = counted
+        own.append((surface, sessions, counted))
+    return edges, tuple(own), tuple(refusals)
 
 
 def _ticker_dir(rel: str) -> str:
@@ -549,12 +682,24 @@ def _chains_remain(
 
 
 def _select(
-    root: Path, *, today: date, window: int, calendar: Calendar, upload: UploadSummary
+    root: Path,
+    *,
+    today: date,
+    window: int,
+    plan: Mapping[str, _SurfacePlan],
+    calendar: Calendar,
+    upload: UploadSummary,
 ) -> _Selection | str:
     """Read the ledgers once and list the partitions to look at, oldest first, or refuse.
 
     The ledgers are read here, after the upload, because compaction's own manifest read holds
     partial entries for tonight's seals and predates the ledger repair.
+
+    The chains edge failing refuses the whole run, because the checkpoint is the chains
+    window's. A quotes or bars surface that keeps every session, or whose window was refused or
+    could not be counted, keeps each of its partitions by a ``kept_by`` reason rather than an
+    early skip. A partition beside a trim line then still reaches ``_one``, which writes its
+    restore line, so a rebuild does not read it as a designed absence (marketlake #953).
     """
     try:
         latest = latest_entries(root)
@@ -577,6 +722,9 @@ def _select(
         edge = window_edge(calendar, today, window + 1)
     except EdgeNotFound as exc:
         return f"the window edge could not be counted: {exc}"
+    edges, own, surface_refused = _surface_edges(
+        window=window, edge=edge, plan=plan, calendar=calendar, today=today
+    )
     try:
         trimmed_latest = trimmed.latest_trimmed(root)
         quarantine = latest_quarantine(root)
@@ -615,7 +763,11 @@ def _select(
             continue
         cutoff = cutoffs.get(ref.ticker)
         kept_by = None
-        if ref.day > edge:
+        if ref.surface not in edges:
+            kept_by = _KEPT_REFUSED
+        elif (surface_edge := edges[ref.surface]) is None:
+            kept_by = _KEPT_EVERY
+        elif ref.day > surface_edge:
             kept_by = "inside the window"
         elif ref.surface == CHAINS and (cutoff is None or ref.day > cutoff):
             # The split walk reads chains alone, so its cutoff keeps chains alone.
@@ -645,7 +797,12 @@ def _select(
     candidates = [item for item in candidates if item.directory not in held]
     candidates.sort(key=lambda item: (item.ref.day, item.ref.ticker))
     return _Selection(
-        edge=edge, candidates=tuple(candidates), paths=paths, held=tuple(held.items())
+        edge=edge,
+        candidates=tuple(candidates),
+        paths=paths,
+        held=tuple(held.items()),
+        own=own,
+        surface_refused=surface_refused,
     )
 
 

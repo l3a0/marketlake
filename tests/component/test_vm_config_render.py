@@ -308,11 +308,13 @@ def test_the_tracked_settings_render(monkeypatch, capsys, metadata, config_dir, 
 
     assert _render(monkeypatch, tracked.read_bytes()) == 0
     # The tracked file also sets the lake window, marketlake #786, the one value it carries
-    # that is not text, and the role is primary since #638's cutover and its return.
+    # that is not text, and keeps every bars session, marketlake #953. The role is primary
+    # since #638's cutover and its return.
     assert yaml.safe_load((config_dir / CONFIG_FILE).read_text()) == {
         **EXPECTED,
         "role": "primary",
         "lake_window_sessions": 22,
+        "lake_window_sessions_bars": "all",
     }
 
 
@@ -1412,6 +1414,71 @@ CONFIG_REFUSALS = {
         {"lake_window_sessions": 22, "guards": {"trailing_median_sessions": 30}},
         "lake_window_sessions is under the floor of 31 sessions",
     ),
+    # marketlake #953. Each message is written out whole, because every per-surface key's name
+    # contains ``lake_window_sessions`` and a check for that alone passes the wrong key.
+    "a chains window under the floor": (
+        {"lake_window_sessions": 22, "lake_window_sessions_chains": 21},
+        "lake_window_sessions_chains is under the floor of 22 sessions that the readers of "
+        "sealed chains and quotes need, which are the battery's trailing median, the History "
+        "panel and the disk runway. Raise it in config/vm.yaml",
+    ),
+    "a quotes window under the floor": (
+        {"lake_window_sessions": 22, "lake_window_sessions_quotes": 21},
+        "lake_window_sessions_quotes is under the floor of 22 sessions that the readers of "
+        "sealed chains and quotes need, which are the battery's trailing median, the History "
+        "panel and the disk runway. Raise it in config/vm.yaml",
+    ),
+    "a bars window under the floor": (
+        {"lake_window_sessions": 22, "lake_window_sessions_bars": 21},
+        "lake_window_sessions_bars is under the floor of 22 sessions that the chains and quotes "
+        "windows share. Raise it in config/vm.yaml",
+    ),
+    "all on the chains key": (
+        {"lake_window_sessions": 22, "lake_window_sessions_chains": "all"},
+        "lake_window_sessions_chains keeps every session, which only lake_window_sessions_bars "
+        "and lake_window_sessions_quotes may, because the split checkpoint is counted from the "
+        "chains window. Set a whole number in config/vm.yaml",
+    ),
+    "all on the base key": (
+        {"lake_window_sessions": "all"},
+        "lake_window_sessions keeps every session, which only lake_window_sessions_bars and "
+        "lake_window_sessions_quotes may, because the split checkpoint is counted from the "
+        "chains window. Set a whole number in config/vm.yaml",
+    ),
+    "ALL on the bars key": (
+        {"lake_window_sessions": 22, "lake_window_sessions_bars": "ALL"},
+        "lake_window_sessions_bars is not a whole number of sessions or all",
+    ),
+    "a blank bars key": (
+        {"lake_window_sessions": 22, "lake_window_sessions_bars": None},
+        "lake_window_sessions_bars is not a whole number of sessions or all",
+    ),
+    "a quotes key that is not a number": (
+        {"lake_window_sessions": 22, "lake_window_sessions_quotes": "many"},
+        "lake_window_sessions_quotes is not a whole number of sessions or all",
+    ),
+    # Two refused keys are each named, joined into one message.
+    "two refused surface keys": (
+        {
+            "lake_window_sessions": 22,
+            "lake_window_sessions_quotes": "many",
+            "lake_window_sessions_bars": 21,
+        },
+        "lake_window_sessions_quotes is not a whole number of sessions or all. "
+        "lake_window_sessions_bars is under the floor of 22 sessions",
+    ),
+    "a bars key without the base key": (
+        {"lake_window_sessions_bars": "all"},
+        "lake_window_sessions_bars is set and lake_window_sessions is not, and only "
+        "lake_window_sessions turns trimming on. Set it in config/vm.yaml or remove "
+        "lake_window_sessions_bars",
+    ),
+    "a chains key without the base key": (
+        {"lake_window_sessions_chains": 25},
+        "lake_window_sessions_chains is set and lake_window_sessions is not, and only "
+        "lake_window_sessions turns trimming on. Set it in config/vm.yaml or remove "
+        "lake_window_sessions_chains",
+    ),
 }
 
 
@@ -1428,6 +1495,35 @@ def test_a_merged_config_a_job_would_refuse_is_refused(
     assert len(hook.requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("lake_window_sessions_chains", 25),
+        ("lake_window_sessions_quotes", "all"),
+        ("lake_window_sessions_bars", "all"),
+    ],
+)
+def test_a_per_surface_key_without_the_base_key_is_refused_in_one_whole_message(
+    monkeypatch, capsys, metadata, config_dir, not_root, key, value
+):
+    """Refusal 14, which the render alone raises. The message holds no ``": "``, so
+    ``report.redacted`` would keep all of it."""
+    SsmHook().install(monkeypatch)
+    before = _existing(config_dir)
+
+    assert _render(monkeypatch, _settings_bytes(**{key: value})) == 2
+
+    line = _assert_refused(capsys, config_dir, before)
+    message = line.removeprefix(
+        f"vm_config: refused, and {config_dir / CONFIG_FILE} was left as it was: "
+    )
+    assert message == (
+        f"{key} is set and lake_window_sessions is not, and only lake_window_sessions turns "
+        f"trimming on. Set it in config/vm.yaml or remove {key}"
+    )
+    assert ": " not in message
+
+
 def test_a_lake_window_at_the_floor_renders(monkeypatch, capsys, metadata, config_dir, not_root):
     SsmHook().install(monkeypatch)
 
@@ -1438,22 +1534,62 @@ def test_a_lake_window_at_the_floor_renders(monkeypatch, capsys, metadata, confi
 
 
 @pytest.mark.parametrize(
-    ("line", "stored"),
+    ("settings", "written"),
     [
-        ("lake_window_sessions: 21\n", 21),
-        ("lake_window_sessions: '22'\n", "'22'"),
-        ("lake_window_sessions: true\n", "True"),
-        ("lake_window_sessions:\n", "None"),
-        ("", None),
+        ({"lake_window_sessions_bars": "all"}, {"lake_window_sessions_bars": "all"}),
+        ({"lake_window_sessions_quotes": "all"}, {"lake_window_sessions_quotes": "all"}),
+        (
+            {"lake_window_sessions_chains": 25, "lake_window_sessions_bars": 30},
+            {"lake_window_sessions_chains": 25, "lake_window_sessions_bars": 30},
+        ),
     ],
-    ids=["under the floor", "text", "a bool", "empty", "absent"],
+    ids=["bars all", "quotes all", "numbers"],
 )
-def test_loading_stores_a_lake_window_the_render_refuses(tmp_path: Path, line: str, stored):
+def test_a_per_surface_window_beside_the_base_key_renders(
+    monkeypatch, capsys, metadata, config_dir, not_root, settings, written
+):
+    """Marketlake #953. ``all`` is the quotes and bars keys' to say."""
+    SsmHook().install(monkeypatch)
+
+    assert _render(monkeypatch, _settings_bytes(lake_window_sessions=22, **settings)) == 0
+
+    loaded = yaml.safe_load((config_dir / CONFIG_FILE).read_text())
+    assert {key: loaded[key] for key in written} == written
+    assert loaded["lake_window_sessions"] == 22
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "lake_window_sessions",
+        "lake_window_sessions_chains",
+        "lake_window_sessions_quotes",
+        "lake_window_sessions_bars",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [
+        ("21", 21),
+        ("'22'", "'22'"),
+        ("true", "True"),
+        ("all", "'all'"),
+        ("ALL", "'ALL'"),
+        ("", "None"),
+        (None, None),
+    ],
+    ids=["under the floor", "text", "a bool", "all", "ALL", "empty", "absent"],
+)
+def test_loading_stores_a_lake_window_the_render_refuses(
+    tmp_path: Path, key: str, value: str | None, stored
+):
     """``load_config`` runs every capture cycle, so it stores the window and refuses nothing.
 
     A refusal there would stop capture on a typo. An integer is stored as read and anything else
-    as its ``repr``, and an absent key is ``None``, which means never trim.
+    as its ``repr``, and an absent key is ``None``, which means never trim. Marketlake #953 stores
+    each per-surface key the same way, a blank one as ``"None"``, which is present.
     """
+    line = "" if value is None else f"{key}: {value}\n".replace(": \n", ":\n")
     config = tmp_path / "config.yaml"
     config.write_text(
         f"lake_root: {tmp_path / 'lake'}\n"
@@ -1462,10 +1598,21 @@ def test_loading_stores_a_lake_window_the_render_refuses(tmp_path: Path, line: s
         f"{line}"
     )
 
-    loaded = load_config(config).lake_window_sessions
+    loaded = load_config(config)
 
-    assert loaded == stored
-    assert type(loaded) is type(stored)
+    assert getattr(loaded, key) == stored
+    assert type(getattr(loaded, key)) is type(stored)
+    others = {
+        name
+        for name in (
+            "lake_window_sessions",
+            "lake_window_sessions_chains",
+            "lake_window_sessions_quotes",
+            "lake_window_sessions_bars",
+        )
+        if name != key
+    }
+    assert all(getattr(loaded, name) is None for name in others)
 
 
 def test_a_refusal_with_no_old_file_writes_none(

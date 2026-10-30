@@ -800,6 +800,73 @@ def test_the_command_restores_and_prints_one_line(tmp_path, monkeypatch, capsys)
     assert out == [out[0]] and out[0].startswith("restore-range: restored 1 of 3")
 
 
+class _RefusingBefore:
+    """A calendar that answers like ``inner`` and raises on any day before ``first``.
+
+    ``exchange_calendars`` raises ``DateOutOfBounds``, a ``ValueError``, before its first session,
+    which lies 20 years before today and moves daily.
+    """
+
+    def __init__(self, inner, first: date) -> None:
+        self._inner = inner
+        self._first = first
+
+    def _check(self, day: date) -> None:
+        if day < self._first:
+            raise ValueError(f"{day.isoformat()} is before the calendar's first session")
+
+    def __getattr__(self, name):
+        method = getattr(self._inner, name)
+
+        def checked(day, *args, **kwargs):
+            self._check(day)
+            return method(day, *args, **kwargs)
+
+        return checked
+
+    def is_session(self, day: date) -> bool:
+        self._check(day)
+        return self._inner.is_session(day)
+
+
+def test_the_runbooks_early_from_date_restores_on_a_calendar_that_starts_later(
+    tmp_path, monkeypatch, capsys
+):
+    """Marketlake #953's runbook restores bars with ``--from 1990-01-01``, before the calendar's
+    first session, so no date has to be looked up. The range selects by manifest dates and asks
+    the calendar only about now. Mutation this catches: the start date checked against the
+    calendar, which would refuse the runbook's command."""
+    root, client, originals = _lake(tmp_path, bars=True)
+    for rel in (SPY_1D_1, QQQ_1D_1, SPY_1M_2):
+        _trim_away(root, client, rel)
+    config = write_config(tmp_path, root)
+    config.write_text(config.read_text() + KEYS)
+    monkeypatch.setattr(bucket, "client_from_config", lambda cfg: client)
+    argv = [
+        "restore-range",
+        "--surface",
+        "bars",
+        "--from",
+        "1990-01-01",
+        "--to",
+        "2026-08-31",
+        "--config",
+        str(config),
+        "--target",
+        "s3://lake-backup/lake",
+    ]
+    calendar = _RefusingBefore(CALENDAR, date(2026, 8, 24))
+
+    code = bucket.main(argv, clock=ManualClock(MONDAY_19), calendar=calendar)
+
+    assert code == 0, capsys.readouterr()
+    for rel in (SPY_1D_1, QQQ_1D_1, SPY_1M_2):
+        assert (root / rel).read_bytes() == originals[rel]
+        assert _kind(root, rel) == "restore"
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("restore-range: restored 3 of 5")
+
+
 def test_a_refusal_reaches_the_operator_as_one_line_and_exit_2(tmp_path, monkeypatch, capsys):
     root, client, _originals = _lake(tmp_path)
     (root / SPY_3).write_bytes(b"rotted bytes")
