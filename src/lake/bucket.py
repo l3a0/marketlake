@@ -183,25 +183,22 @@ from lake.manifest import (
     sha256_file,
 )
 from lake.paths import (
-    ACTIONS,
     ALERTS_DIR,
     BARS,
     CHAINS,
-    CORPORATE_ACTIONS_FILE,
     DATE_PARTITIONED,
     DATE_PREFIX,
     JOURNAL_DIR,
     LOST_AND_FOUND,
     MANIFEST_FILE,
-    QUARANTINE_FILE,
     QUOTES,
-    REFERENCE_DIR,
     REPORTS_DIR,
     TEMP_MARKER,
     TRIMMED_FILE,
     BarsRef,
     LakePaths,
     PartitionRef,
+    is_reader_file,
     parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
@@ -3863,13 +3860,6 @@ _ROLE_TEXT = {
     _SUPPORT_ROLE: "a file a reader needs beside the range",
 }
 
-# The two ledgers a reader needs beside the range, when the bucket's manifest records them.
-# ``load_bars`` and ``continuity_view`` adjust by the corporate-actions ledger, and every door
-# excludes what the quarantine ledger flags. Either one absent reads as no entries and raises
-# nothing, so leaving one out would change an answer silently. Everything the manifest records
-# under ``reference/`` joins them.
-_READING_LEDGERS = frozenset({f"{ACTIONS}/{CORPORATE_ACTIONS_FILE}", QUARANTINE_FILE})
-
 
 def _device(path: Path) -> int:
     """The device number of the filesystem holding ``path``."""
@@ -4024,9 +4014,11 @@ def _reading_plan(
        when the manifest records it, the way ``lake.bars`` builds its manifested skip rather
        than parsing it. ``paths.parse_bars_rel`` would select the same keys from the manifest,
        but building them keeps this role to the tickers and days the range selected.
-    4. ``actions/corporate_actions.jsonl`` and ``quarantine.jsonl``, and every file under
-       ``reference/``: the security master, the capture spans, the schema-version ledger and
-       the split checkpoint.
+    4. Every file ``paths.is_reader_file`` names: ``actions/corporate_actions.jsonl`` and
+       ``quarantine.jsonl``, and every file under ``reference/``, which is the security master,
+       the capture spans, the schema-version ledger and the split checkpoint. Either ledger
+       absent reads as no entries and raises nothing, so leaving one out would change an answer
+       silently.
 
     A key the bucket lists and the manifest does not record is never planned, because every
     file a reader needs is manifested. A refused day's journal segments and ``reports/`` are
@@ -4062,7 +4054,7 @@ def _reading_plan(
                 if rel in latest:
                     roles[rel] = _BARS_ROLE
     for rel in latest:
-        if rel in _READING_LEDGERS or rel.startswith(f"{REFERENCE_DIR}/"):
+        if is_reader_file(rel):
             roles[rel] = _SUPPORT_ROLE
     return roles, by_ticker
 

@@ -32,8 +32,10 @@ file, and a recompaction may reorder a partition. ``occ_symbol`` is also the tie
 
 **The close comes from ``bars/`` and from nowhere else.** ``load_bars(ticker, '1d', session,
 session)`` with ``adjust='none'``, because settlement is a same-date comparison and the
-design's one scale rule puts those in as-traded space. The read names a session and never a
-time of day, so a half day's 13:00 close needs no branch: it is what that session's daily
+design's one scale rule puts those in as-traded space. ``adjust='none'`` also hands back a bar
+marketlake did not capture, whose ``basis`` column may say ``adjusted``, so the close is refused
+unless its ``origin`` is ``captured`` and its ``basis`` is ``raw``. The read names a session and
+never a time of day, so a half day's 13:00 close needs no branch: it is what that session's daily
 partition holds.
 
 Three other sources look like they would do and none of them is it. ``spot_close`` is the
@@ -118,7 +120,16 @@ from pathlib import Path
 import pyarrow as pa
 
 from lake.bars import StampNotAnInstant, session_of
-from lake.loader import ADJUST_NONE, load_bars, load_chain, resolve_lake_root
+from lake.loader import (
+    ADJUST_NONE,
+    BASIS_COLUMN,
+    BASIS_RAW,
+    ORIGIN_CAPTURED,
+    ORIGIN_COLUMN,
+    load_bars,
+    load_chain,
+    resolve_lake_root,
+)
 from lake.splits import Deliverable, DeliverableUnreadable, deliverable_of_row
 from lake.vendor import DAILY_FREQ
 
@@ -252,6 +263,9 @@ class CloseUnreadable(SettlementError):
     agree when either number is missing, so such a candle is held and never lands. This refuses
     anyway, because the schema permits what the gate refuses, a caller can point ``lake_root``
     at any lake, and arithmetic against ``None`` is a ``TypeError`` rather than an answer.
+
+    It also refuses a close marketlake did not capture, or one whose ``basis`` is not ``raw``,
+    because settlement compares as-traded strikes against an as-traded close.
     """
 
 
@@ -276,8 +290,9 @@ def settlement_view(
 
     Both reads raise their own ``LoadError`` unchanged: ``NoOptionClose`` for a session whose
     chain carries no option-close cycle, ``BarsAbsent`` for one with no daily partition,
-    ``PartitionAbsent`` and ``PartitionQuarantined`` for either surface, and ``PartialRead``
-    for a projection that could not complete. This view adds ``ExpirationUnreadable`` and
+    ``PartitionAbsent`` and ``PartitionQuarantined`` for either surface, ``PartialRead`` for a
+    projection that could not complete, and ``ProvenanceMalformed`` for a bars partition whose
+    provenance keys cannot be read. This view adds ``ExpirationUnreadable`` and
     ``CloseUnreadable``, both under ``SettlementError``.
 
     A session whose chain holds no contract expiring on it returns an empty table at
@@ -411,11 +426,17 @@ def _settlement_close(
     sides compare parsed instants now, so a reader taking this view's close and a gate holding a
     bar are reading the same candle rather than two candles that happened to match.
 
-    Three shapes refuse rather than settling anything, and all three are session-wide because
-    the close is one number for the whole roster: an empty partition, a null close, and a close
-    that is not a whole number of cents. The last one matters because the comparison below runs
-    in cents, and a close the arithmetic cannot represent would otherwise mark every contract
-    on the session with a reason that names the strike.
+    Four shapes refuse rather than settling anything, and all four are session-wide because the
+    close is one number for the whole roster.
+
+    1. An empty partition.
+    2. A last row whose ``origin`` is not ``captured`` or whose ``basis`` is not ``raw``.
+       ``adjust='none'`` applies no factor, but it hands back an imported row as its source
+       wrote it, and an ``adjusted`` close is not the price the contracts settled against.
+    3. A null close.
+    4. A close that is not a whole number of cents. This matters because the comparison below
+       runs in cents, and a close the arithmetic cannot represent would otherwise mark every
+       contract on the session with a reason that names the strike.
     """
     bars = load_bars(
         ticker,
@@ -429,6 +450,15 @@ def _settlement_close(
     # ``load_bars`` orders its answer by the instant each ``bar_ts`` names, so the session's
     # close is the last row rather than a value this has to search for.
     close = None
+    if bars.num_rows:
+        origin = bars.column(ORIGIN_COLUMN)[-1].as_py()
+        basis = bars.column(BASIS_COLUMN)[-1].as_py()
+        if origin != ORIGIN_CAPTURED or basis != BASIS_RAW:
+            raise CloseUnreadable(
+                f"{ticker} {session_text} has a daily close whose origin is {origin!r} and "
+                f"whose basis is {basis!r}. Settlement takes only a captured as-traded close, so "
+                "no contract expiring on that session can be settled."
+            )
     if bars.num_rows and CLOSE_COLUMN in bars.column_names:
         close = _number(bars.column(CLOSE_COLUMN)[-1].as_py())
     if close is None:

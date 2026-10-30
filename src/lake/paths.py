@@ -224,6 +224,37 @@ SPLIT_CHECKPOINT = "split_checkpoint"
 # spelling of a lake path is the failure this file guards against.
 CORPORATE_ACTIONS_FILE = "corporate_actions.jsonl"
 
+# The two ledgers a reader needs beside the partitions it reads. ``load_bars`` and
+# ``continuity_view`` adjust by the corporate-actions ledger, and every door excludes what the
+# quarantine ledger flags. ``is_reader_file`` adds everything under ``reference/`` to them.
+_READER_LEDGERS = frozenset({f"{ACTIONS}/{CORPORATE_ACTIONS_FILE}", QUARANTINE_FILE})
+
+
+def is_reader_file(rel: str) -> bool:
+    """Whether the lake-relative key ``rel`` is a file any reader's lake root must hold.
+
+    That is the two ledgers above and every file under ``reference/``: the security master,
+    the capture spans, the schema-version ledger and the split checkpoint. A reader that reads
+    a lake it did not write, such as a reading restore or a mirror of the bucket, wants each
+    one at the SHA-256 the bucket's ``manifest.jsonl`` records. ``bucket._reading_plan`` plans
+    a reading restore's support files by this predicate, so the set is spelled once.
+
+    A missing file does not fail the same way for each of them, so check the manifest's keys
+    against what the root holds before reading.
+
+    1. A missing ``quarantine.jsonl`` reads as no verdicts, so a withheld partition is admitted.
+    2. A missing ``actions/corporate_actions.jsonl`` reads as no actions, so as-traded numbers
+       come back labelled ``split`` or ``total``.
+    3. A missing ``reference/schema_versions.parquet`` refuses every read. It surfaces as
+       ``loader.PartialRead`` naming an unrecorded version rather than as a missing file.
+
+    The first two fail open, which is why they are worth checking first.
+
+    A reader of a mirror passes ``lake_root=`` on every call, because
+    ``resolve_lake_root(None)`` needs a ``config.yaml``.
+    """
+    return rel in _READER_LEDGERS or rel.startswith(f"{REFERENCE_DIR}/")
+
 
 def _day_str(day: date | str) -> str:
     """Render a partition date. A ``date`` becomes ISO. A string passes through.
@@ -682,6 +713,7 @@ __all__ = [
     "SegmentRef",
     "config_dir",
     "default_token_path",
+    "is_reader_file",
     "parse_bars_rel",
     "parse_date_dir",
     "parse_partition_rel",

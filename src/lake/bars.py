@@ -158,8 +158,10 @@ from lake.loader import (
     PartialRead,
     PartitionAbsent,
     PartitionQuarantined,
+    Provenance,
     SnapAbsent,
     load_quotes,
+    provenance_metadata,
 )
 from lake.lock import lake_lock
 from lake.manifest import ManifestError, latest_entries, record_partition
@@ -1006,7 +1008,9 @@ def _fetch(vendor: Vendor, ticker: str, window: BarWindow):
     return call(ticker, start=window.start, end=window.end, extended_hours=window.extended_hours)
 
 
-def _write_partition(rows: Sequence[dict], partition: Path) -> int:
+def _write_partition(
+    rows: Sequence[dict], partition: Path, *, provenance: Provenance | None = None
+) -> int:
     """Write one bars partition atomically, and hand back the rows it holds.
 
     A temp file beside the target, a flush, then one rename, which is how ``compact``, the
@@ -1016,8 +1020,19 @@ def _write_partition(rows: Sequence[dict], partition: Path) -> int:
 
     The parent is created first, and a bars path is one directory level deeper than a chains
     or quotes one because of its ``freq=`` level.
+
+    ``provenance`` is for a partition the sweep did not capture. Its keys go on the table's
+    schema metadata, through ``loader.provenance_metadata``, before ``pq.write_table``, which is
+    the one route ``load_bars`` reads back. ``ParquetWriter.add_key_value_metadata`` writes to
+    the file-level metadata instead, which ``pq.read_table`` drops, so an import written that
+    way would read as captured. ``None``, which is every sweep write, writes the bytes it always
+    has, so no manifest checksum moves.
     """
     table = pa.Table.from_batches([bars_data_batch(rows)])
+    if provenance is not None:
+        keys = provenance_metadata(provenance)
+        if keys:
+            table = table.replace_schema_metadata({**(table.schema.metadata or {}), **keys})
     partition.parent.mkdir(parents=True, exist_ok=True)
     tmp = temp_write_path(partition, os.getpid())
     try:
