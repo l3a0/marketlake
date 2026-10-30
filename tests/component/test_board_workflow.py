@@ -74,22 +74,17 @@ def test_the_workflows_it_watches_exist_under_those_names() -> None:
     assert {"CI", "Infra"} <= names
 
 
-# The pattern the pinned generator's ``longest_gap_minutes`` reads the schedule with, in
-# repo-template's ``scripts/build_board.py`` at the commit ``PINNED`` names. It reads the
-# file's raw text rather than parsed YAML, so a line YAML accepts can still fail every
-# board run. It is copied here because nothing in this repository imports that generator.
-CRON = re.compile(r"""^\s*-\s*cron:\s*["']([^"']+)["']""", re.M)
-
-
 def test_one_cron_line_the_generator_can_read() -> None:
     """Twice an hour, at minutes of its own, on a line the generator finds.
 
-    ``longest_gap_minutes`` reads this line to say when the board is stale, and fails
-    the run when it finds no line or a schedule it cannot read. An unquoted line parses
-    as YAML and is invisible to its pattern, so the file's text is read with that same
-    pattern rather than parsed.
+    The pinned generator's ``longest_gap_minutes`` reads this line to say when the board
+    is stale, and fails the run when it finds no line or a schedule it cannot read. It
+    reads the file's raw text rather than parsed YAML, so an unquoted line parses as YAML
+    and is invisible to it. The file's text is therefore read with the generator's own
+    pattern, which ``PINNED`` records.
     """
-    assert CRON.findall(WORKFLOW.read_text(encoding="utf-8")) == ["19,49 * * * *"]
+    cron = re.compile(PINNED["cron"], re.M)
+    assert cron.findall(WORKFLOW.read_text(encoding="utf-8")) == ["19,49 * * * *"]
 
 
 def test_runs_queue_in_the_pages_group_without_cancelling() -> None:
@@ -127,16 +122,20 @@ def test_the_template_is_pinned_to_the_commit_the_header_names() -> None:
     assert re.findall(r"\b[0-9a-f]{40}\b", header) == [ref]
 
 
-# A record of the reusable workflow at the pinned commit: the inputs it declares and the
-# scopes its two jobs ask for. Nothing here reads the network, so this record is what ties
-# the caller to that file. Moving the pin fails the first test below until the record is
-# regenerated, so the pull request that moves it shows what changed. Regenerate it from a
-# checkout of l3a0/repo-template, copying the names under `on.workflow_call.inputs` and
-# each job's `permissions` from
+# A record of l3a0/repo-template at the pinned commit: the inputs its reusable workflow
+# declares, each of that workflow's jobs with its environment and the scopes it asks
+# for, and the pattern its generator reads the schedule with. Nothing here reads the
+# network, so this record is what ties the caller to those files. Moving the pin fails
+# the first test below until the record is regenerated, so the pull request that moves it
+# shows what changed. Regenerate it from a checkout of l3a0/repo-template:
 #
-#     git show <sha>:.github/workflows/build-board.yml
+# 1. From `git show <sha>:.github/workflows/build-board.yml`, copy the names under
+#    `on.workflow_call.inputs`, and each job's `environment` name and `permissions`.
+# 2. From `git show <sha>:scripts/build_board.py`, copy the cron pattern that
+#    `longest_gap_minutes` passes to `re.findall`.
 PINNED: dict[str, Any] = {
     "commit": "fd8317e537a3d85423757c56c034ace623878a81",
+    "cron": r"""^\s*-\s*cron:\s*["']([^"']+)["']""",
     "inputs": {
         "title",
         "icon",
@@ -154,18 +153,24 @@ PINNED: dict[str, Any] = {
     },
     "jobs": {
         "build": {
-            "contents": "read",
-            "issues": "read",
-            "pull-requests": "read",
-            "checks": "read",
-            "statuses": "read",
-            "actions": "read",
+            "environment": None,
+            "permissions": {
+                "contents": "read",
+                "issues": "read",
+                "pull-requests": "read",
+                "checks": "read",
+                "statuses": "read",
+                "actions": "read",
+            },
         },
         "deploy": {
-            "pages": "write",
-            "id-token": "write",
-            "contents": "read",
-            "actions": "read",
+            "environment": "github-pages",
+            "permissions": {
+                "pages": "write",
+                "id-token": "write",
+                "contents": "read",
+                "actions": "read",
+            },
         },
     },
 }
@@ -192,12 +197,30 @@ def test_the_job_grants_what_the_reusable_workflow_asks_for() -> None:
     the union of what the pinned workflow's two jobs declare, and nothing more.
     """
     union: dict[str, str] = {}
-    for scopes in PINNED["jobs"].values():
-        for scope, level in scopes.items():
+    for job in PINNED["jobs"].values():
+        for scope, level in job["permissions"].items():
             if union.get(scope) != "write":
                 union[scope] = level
     assert _workflow()["permissions"] == {}
     assert _job()["permissions"] == union
+
+
+def test_only_a_job_in_the_pages_environment_can_mint_an_oidc_token() -> None:
+    """Protects the AWS roles from a token this workflow should never mint.
+
+    The caller grants ``id-token: write`` because the called deploy job needs it to
+    prove itself to Pages. A called job holding that scope outside the ``github-pages``
+    environment, on a ``pull_request_target`` run, would mint a token whose subject ends
+    in ``:pull_request``, which an AWS role in ``infra/bootstrap/roles.tf`` trusts. So a
+    re-pin whose record gives that scope to a job outside the environment fails here.
+    """
+    minting = {
+        name: job["environment"]
+        for name, job in PINNED["jobs"].items()
+        if job["permissions"].get("id-token") == "write"
+    }
+    assert minting
+    assert set(minting.values()) == {"github-pages"}
 
 
 PROSE = ("title", "subtitle", "note")

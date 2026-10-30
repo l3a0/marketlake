@@ -6,9 +6,12 @@ name: Board
 # generator, scripts/build_board.py, and its own page,
 # .claude/skills/update-build-board/board.html, at the same commit, so the
 # board changes only when the pin on the `uses:` line moves (#942). Moving it
-# means reading build-board.yml at the new commit, since its inputs and the
-# scopes its jobs ask for can change with it, and updating the record of them
-# in tests/component/test_board_workflow.py. Check two things there as well.
+# means reading build-board.yml and scripts/build_board.py at the new commit,
+# since the workflow's inputs, its jobs' environments and scopes, and the
+# pattern the generator reads the cron line with can all change with it. It
+# also means updating the record of them in
+# tests/component/test_board_workflow.py. Check two things in build-board.yml
+# as well.
 # The called deploy job must keep `environment: github-pages`, and no other
 # called job may gain `id-token: write`. A job holding that scope with no
 # environment, on a pull_request_target run, would mint an OIDC token whose
