@@ -7,7 +7,13 @@ name: Board
 # .claude/skills/update-build-board/board.html, at the same commit, so the
 # board changes only when the pin on the `uses:` line moves (#942). Moving it
 # means reading build-board.yml at the new commit, since its inputs and the
-# scopes its jobs ask for can change with it.
+# scopes its jobs ask for can change with it, and updating the record of them
+# in tests/component/test_board_workflow.py. Check two things there as well.
+# The called deploy job must keep `environment: github-pages`, and no other
+# called job may gain `id-token: write`. A job holding that scope with no
+# environment, on a pull_request_target run, would mint an OIDC token whose
+# subject ends in `:pull_request`, which an AWS role in
+# infra/bootstrap/roles.tf trusts.
 #
 # Before #942 this repository carried its own generator and page under
 # .claude/skills/sync-prune-next. The inputs under `with:` turn on, one by one,
@@ -44,10 +50,10 @@ on:
     workflows: [CI, Infra]
     types: [completed]
   # The backstop for what starts no run, such as a "blocked by" link. GitHub can delay
-  # or drop a scheduled run under load. The shared generator reads this line to say
-  # when the board is stale, and it refuses any schedule that is not one list of
-  # minutes past every hour. Off the hour, because the top of the hour is when GitHub
-  # is busiest.
+  # or drop a scheduled run under load. The shared generator's `longest_gap_minutes`
+  # reads this line as raw text to say when the board is stale, and fails the run on a
+  # line it cannot read. Off the hour, because the top of the hour is when GitHub is
+  # busiest.
   schedule:
     - cron: "19,49 * * * *"
   workflow_dispatch:

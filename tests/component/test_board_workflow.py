@@ -6,7 +6,8 @@ commit. The template's suite checks the template's own caller, not this one. So 
 repository still owns of the board is checked here:
 
 1. The triggers, the schedule and the concurrency group.
-2. The pin and the scopes the job grants.
+2. The pin, and the inputs and scopes, checked against a record of the pinned
+   workflow kept in this file.
 3. The inputs, and the two files they name in this repository: the icon and the
    documents the note links to.
 4. That no expression can carry an event's text into the run.
@@ -14,8 +15,8 @@ repository still owns of the board is checked here:
 No trigger the workflow carries, ``workflow_dispatch`` included, runs a branch's copy of
 it before it is on ``main``, so these rules are checked here, in ``ci.yml``'s required
 ``test`` job, before then. Nothing here makes a network read, so nothing here checks that
-the pinned commit exists or that its workflow still takes these inputs. The first board
-run on ``main`` after the pin moves is that check.
+the pinned commit exists or that the record of it matches that commit's workflow. The
+first board run on ``main`` after the pin moves is that check.
 """
 
 from __future__ import annotations
@@ -73,20 +74,22 @@ def test_the_workflows_it_watches_exist_under_those_names() -> None:
     assert {"CI", "Infra"} <= names
 
 
-def test_one_cron_line_off_minute_zero() -> None:
-    """Twice an hour, at minutes of its own.
+# The pattern the pinned generator's ``longest_gap_minutes`` reads the schedule with, in
+# repo-template's ``scripts/build_board.py`` at the commit ``PINNED`` names. It reads the
+# file's raw text rather than parsed YAML, so a line YAML accepts can still fail every
+# board run. It is copied here because nothing in this repository imports that generator.
+CRON = re.compile(r"""^\s*-\s*cron:\s*["']([^"']+)["']""", re.M)
 
-    The shared generator reads this line to say when the board is stale, and it stops
-    the run on any schedule that is not one list of minutes past every hour. So a line
-    of another shape would pass this repository's CI and fail every board run.
+
+def test_one_cron_line_the_generator_can_read() -> None:
+    """Twice an hour, at minutes of its own, on a line the generator finds.
+
+    ``longest_gap_minutes`` reads this line to say when the board is stale, and fails
+    the run when it finds no line or a schedule it cannot read. An unquoted line parses
+    as YAML and is invisible to its pattern, so the file's text is read with that same
+    pattern rather than parsed.
     """
-    (entry,) = _workflow()[True]["schedule"]
-    assert entry == {"cron": "19,49 * * * *"}
-    minute, *rest = entry["cron"].split()
-    assert rest == ["*", "*", "*", "*"]
-    minutes = [int(m) for m in minute.split(",")]
-    assert minutes
-    assert all(0 < m < 60 for m in minutes)
+    assert CRON.findall(WORKFLOW.read_text(encoding="utf-8")) == ["19,49 * * * *"]
 
 
 def test_runs_queue_in_the_pages_group_without_cancelling() -> None:
@@ -124,50 +127,108 @@ def test_the_template_is_pinned_to_the_commit_the_header_names() -> None:
     assert re.findall(r"\b[0-9a-f]{40}\b", header) == [ref]
 
 
+# A record of the reusable workflow at the pinned commit: the inputs it declares and the
+# scopes its two jobs ask for. Nothing here reads the network, so this record is what ties
+# the caller to that file. Moving the pin fails the first test below until the record is
+# regenerated, so the pull request that moves it shows what changed. Regenerate it from a
+# checkout of l3a0/repo-template, copying the names under `on.workflow_call.inputs` and
+# each job's `permissions` from
+#
+#     git show <sha>:.github/workflows/build-board.yml
+PINNED: dict[str, Any] = {
+    "commit": "fd8317e537a3d85423757c56c034ace623878a81",
+    "inputs": {
+        "title",
+        "icon",
+        "data-label",
+        "subtitle",
+        "note",
+        "default-branch-head",
+        "label-colors",
+        "sort-labels",
+        "review-heading",
+        "settled-rollup",
+        "milestone-default",
+        "owner-body-lines",
+        "ranking",
+    },
+    "jobs": {
+        "build": {
+            "contents": "read",
+            "issues": "read",
+            "pull-requests": "read",
+            "checks": "read",
+            "statuses": "read",
+            "actions": "read",
+        },
+        "deploy": {
+            "pages": "write",
+            "id-token": "write",
+            "contents": "read",
+            "actions": "read",
+        },
+    },
+}
+
+
+def test_the_record_is_of_the_commit_the_caller_pins() -> None:
+    """Protects the checks below from comparing the caller with another commit's file."""
+    assert _job()["uses"].partition("@")[2] == PINNED["commit"]
+
+
+def test_every_input_is_one_the_pinned_workflow_declares() -> None:
+    """Protects the run from an input the called workflow does not take.
+
+    GitHub refuses a run whose caller passes an undeclared input, and that refusal would
+    first show on ``main``, after the merge.
+    """
+    assert set(_inputs()) <= PINNED["inputs"]
+
+
 def test_the_job_grants_what_the_reusable_workflow_asks_for() -> None:
     """Protects the run from a job asking for a scope the caller did not grant.
 
-    A called workflow can only narrow what its caller grants. These are the scopes the
-    template's build and deploy jobs declare at the pinned commit. Moving the pin means
-    reading the template's ``build-board.yml`` at the new commit, since its jobs may ask
-    for more.
+    A called workflow can only narrow what its caller grants, so the caller's job grants
+    the union of what the pinned workflow's two jobs declare, and nothing more.
     """
+    union: dict[str, str] = {}
+    for scopes in PINNED["jobs"].values():
+        for scope, level in scopes.items():
+            if union.get(scope) != "write":
+                union[scope] = level
     assert _workflow()["permissions"] == {}
-    assert _job()["permissions"] == {
-        "contents": "read",
-        "issues": "read",
-        "pull-requests": "read",
-        "checks": "read",
-        "statuses": "read",
-        "actions": "read",
-        "pages": "write",
-        "id-token": "write",
-    }
+    assert _job()["permissions"] == union
 
 
-NOTE = (
-    "What each deliverable is for lives in "
-    "[the design doc](https://github.com/l3a0/marketlake/blob/main/docs/design.md), "
-    "and the slice order in "
-    "[the build plan](https://github.com/l3a0/marketlake/blob/main/docs/build-plan.md). "
-    "The order below follows the repository's ranking rule: capture reliability first, "
-    "then what makes the lake usable, and evidence from real use over any ranking made "
-    "in advance."
-)
+PROSE = ("title", "subtitle", "note")
 
 
 def test_the_inputs_turn_on_what_the_old_page_did() -> None:
     """Protects the board from losing what marketlake's own page drew before #942.
 
-    Every input of the reusable workflow is a string, and an empty one leaves the shared
-    board's default in place. So each on-or-off input is the quoted string ``"true"``,
-    since a bare ``true`` reaches GitHub as a boolean.
+    The inputs that change what the board does are compared by value. The title, the
+    subtitle and the note are prose, so they need only be present, and the note's links
+    are checked below. Every input of the reusable workflow is a string, and an empty one
+    leaves the shared board's default in place. So each on-or-off input is the quoted
+    string ``"true"``, since a bare ``true`` reaches GitHub as a boolean.
     """
-    assert _inputs() == {
-        "title": "Marketlake Build Board",
+    inputs = _inputs()
+    assert set(inputs) == {
+        "title",
+        "icon",
+        "subtitle",
+        "note",
+        "default-branch-head",
+        "milestone-default",
+        "ranking",
+        "owner-body-lines",
+        "review-heading",
+        "settled-rollup",
+        "sort-labels",
+        "label-colors",
+    }
+    assert {key: value for key, value in inputs.items() if key not in PROSE} == {
         "icon": ".github/board/favicon.ico",
-        "subtitle": "the order of work on the capture-first option-chain lake",
-        "note": NOTE,
         "default-branch-head": "true",
         "milestone-default": "MVP <n>",
         "ranking": "order",
@@ -177,7 +238,9 @@ def test_the_inputs_turn_on_what_the_old_page_did() -> None:
         "sort-labels": "true",
         "label-colors": "true",
     }
-    assert all(isinstance(value, str) for value in _inputs().values())
+    for key in PROSE:
+        assert isinstance(inputs[key], str), key
+        assert inputs[key].strip(), key
 
 
 def test_the_icon_input_names_the_file_lake_favicon_writes() -> None:
