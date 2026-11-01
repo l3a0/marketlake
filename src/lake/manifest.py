@@ -146,9 +146,11 @@ SCRUB_EXCLUSIONS: tuple[str, ...] = (
 # the writer appended. These two names are the one place that mapping is read for meaning,
 # so the battery, the sign-off tool and every reader resolve a verdict the same way.
 # The prefix every bars import's manifest ``source`` starts with, as
-# ``bar-import:sha256:<hex>``. ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads
-# it to refuse deleting an import only one lake records, since no sweep regenerates one
-# (marketlake #950). It lives here, below both, so ``bucket`` imports no hand-run command.
+# ``bar-import:sha256:<hex>`` for a vintage (marketlake #950) and as
+# ``bar-import:schwab-window:<ticker>:<first>..<last>`` for Schwab's sessions before capture
+# (marketlake #951). ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads it to
+# refuse deleting an import only one lake records, since no sweep regenerates one.
+# It lives here, below both, so ``bucket`` imports no hand-run command.
 BAR_IMPORT_SOURCE_PREFIX = "bar-import:"
 
 VERDICT_FIELD = "verdict"

@@ -595,14 +595,15 @@ def session_of(bar_ts: str) -> date:
 
 
 def session_midnight(day: date) -> datetime:
-    """Session ``day``'s Eastern midnight as a UTC instant, the stamp an imported daily bar takes.
+    """Session ``day``'s Eastern midnight as a UTC instant, the stamp a vintage's daily bar takes.
 
     :func:`daily_session_of` reads it back as ``day`` in both seasons, and so does the strict
     Eastern date. A constant UTC hour does not do that under the strict date: ``04:00Z`` is
     midnight under daylight time and 23:00 the evening before under standard time, the slip
     marketlake #380 records. A captured daily bar carries the vendor's own stamp, ``05:00Z`` in
     summer, so consumers key on the session and never on the stamp.
-    ``lake.bar_import`` is the one caller (marketlake #950).
+    ``lake.bar_import`` is the one caller (marketlake #950). Its Schwab import keeps the vendor's
+    stamp and uses this only for the request's bounds (marketlake #951).
     """
     return datetime(day.year, day.month, day.day, tzinfo=MARKET_TZ).astimezone(UTC)
 

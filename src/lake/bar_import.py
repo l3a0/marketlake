@@ -17,12 +17,10 @@ candle's session, and a candle outside the window is dropped. The last session m
 the run's own Eastern date, because the shared run window allows an evening run and a daily
 candle is not final on its own day.
 
-Its basis is ``adjusted``, as of the fetch's Eastern date. A read-only probe on 2026-11-01
-found Schwab's daily candles split-adjusted to the day they are fetched and never adjusted for
-dividends: NVDA's 2024-06-07 close comes back as 120.888 where it traded at 1,208.88 before its
-10-for-1, AAPL's 2020-08-28 as 124.8075 where it traded at 499.23 before its 4-for-1, and SPY's
-2026-09-17 as 762.6, the as-traded close the lake captured the day before a 1.88883 ex-date.
-The basis vocabulary has no word for split-only, so this paragraph carries it.
+Its basis is ``adjusted``, as of the fetch's Eastern date, because Schwab's daily candles are
+split-adjusted to the day they are fetched, though never for dividends. ``docs/design.md``'s
+``## Tradeoffs: prices, named`` carries the probe that measured it. The basis vocabulary has no
+word for split-only.
 
 Its identity is the ticker and the window, ``schwab-window:<ticker>:<first>..<last>``, carried
 as ``source_id`` and, under ``bar-import:``, as the manifest ``source``. The lake alone gives
@@ -32,8 +30,10 @@ revised a volume. The ticker is in it so one ticker's undo cuts only that ticker
 
 **Where an import lands.** At the captured path, ``bars/ticker=T/freq=1d/date=D.parquet``, so
 ``load_bars``, the nightly upload, the trim and both restores handle it with no new path. Each
-row is built by ``journal.bars_rows`` from a one-candle body, the capture path's own builder, so
-``schema_version``, ``extra`` and the spelling of ``bar_ts`` match a captured bar. The five
+row is built by ``journal.bars_rows``, the capture path's own builder, so ``schema_version``,
+``extra`` and the spelling of ``bar_ts`` match a captured bar. A vintage's row comes from a
+one-candle body built from the file's four prices, and the rest of this paragraph is about
+it. The five
 stamps of the fetch, ``fetch_ts``, ``fetch_end_ts``, ``window_start``, ``window_end`` and
 ``extended_hours``, are null, since no fetch happened, and no reader of a bars partition uses
 them. ``volume`` is left out, so it is null, because the vintages' volume unit is unverified and
@@ -178,7 +178,7 @@ from lake.paths import (
     parse_bars_rel,
     parse_date_dir,
 )
-from lake.schwab import SchwabVendor, VendorAuthError
+from lake.schwab import SchwabVendor, VendorAuthError, is_transient_failure
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError
 from lake.session import SessionClock
 from lake.trimmed import is_designed_absence, latest_trimmed
@@ -925,6 +925,15 @@ def _fetch_schwab(vendor: Vendor, window: _SchwabWindow, *, clock: Clock):
             f"Schwab's daily bars for {window.ticker} failed ({type(exc).__name__}: {exc}), so "
             "nothing was imported. Run the import again"
         ) from None
+    except Exception as exc:
+        # An httpx timeout or dropped connection is the network's, and a rerun meets it afresh.
+        # Anything else is a bug and keeps its traceback, which a cassette miss in a test needs.
+        if not is_transient_failure(exc):
+            raise
+        raise BarImportRefused(
+            f"Schwab's daily bars for {window.ticker} did not arrive ({type(exc).__name__}), so "
+            "nothing was imported. Run the import again"
+        ) from None
     fetch_end_ts = clock.now()
     if not 200 <= response.status < 300:
         raise BarImportRefused(
@@ -1518,11 +1527,19 @@ def main(
             return 0
         if args.command == "schwab":
             factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
-            vendor = factory(
-                default_token_path(),
-                api_key=config.schwab_api_key.reveal(),
-                app_secret=config.schwab_app_secret.reveal(),
-            )
+            token = default_token_path()
+            try:
+                vendor = factory(
+                    token,
+                    api_key=config.schwab_api_key.reveal(),
+                    app_secret=config.schwab_app_secret.reveal(),
+                )
+            except (OSError, ValueError) as exc:
+                # schwab-py reads the token file while it builds the client.
+                raise BarImportRefused(
+                    f"the Schwab token at {token} cannot be read ({type(exc).__name__}), so "
+                    "nothing was imported. Mint a new token with python -m lake.reauth"
+                ) from None
             summary = import_schwab(
                 config.lake_root,
                 args.tickers,

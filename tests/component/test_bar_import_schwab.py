@@ -22,6 +22,7 @@ import math
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pyarrow.parquet as pq
 import pytest
 
@@ -29,7 +30,7 @@ from lake import bar_import
 from lake.bar_import import BarImportRefused, import_schwab, undo_schwab
 from lake.calendar import MARKET_TZ
 from lake.capture_spans import CaptureSpans, spans_path
-from lake.cassette import Cassette, Interaction
+from lake.cassette import Cassette, CassetteError, Interaction
 from lake.config import BucketTarget
 from lake.loader import load_bars, read_provenance
 from lake.manifest import append_manifest, latest_entries, sha256_file
@@ -425,6 +426,22 @@ def test_a_vendor_failure_refuses(tmp_path):
     assert "VendorError" in _refused(root, vendor=_Failing(VendorError("boom")))
 
 
+def test_a_dropped_connection_refuses_with_one_line(tmp_path):
+    root = _lake(tmp_path)
+
+    message = _refused(root, vendor=_Failing(httpx.ConnectTimeout("timed out")))
+
+    assert "did not arrive (ConnectTimeout)" in message and "Run the import again" in message
+
+
+def test_a_failure_that_is_not_the_networks_keeps_its_traceback(tmp_path):
+    """A cassette miss is ``CassetteError``. Catching it would hide a wrong window as a refusal."""
+    root = _lake(tmp_path)
+
+    with pytest.raises(CassetteError):
+        _run(root, vendor=_Vendors(GLD=_vendor(end=END + timedelta(days=1))))
+
+
 def test_a_ticker_not_onboarded_refuses_before_any_request(tmp_path):
     root = _lake(tmp_path, ("USO",))
     vendors = _Vendors(GLD=_vendor())
@@ -500,6 +517,18 @@ def test_an_undo_of_a_ticker_imported_before_another_refuses(tmp_path):
     assert _snapshot(root) == after
 
 
+def test_an_undo_inside_the_session_refuses_before_it_reads_the_lake(tmp_path):
+    """The window refuses first, so an undo at 10:00 says why without reading the master."""
+    root = _lake(tmp_path)
+    (root / "reference" / "security_master.parquet").unlink()
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, now=datetime(2026, 11, 2, 10, 0, tzinfo=MARKET_TZ))
+
+    assert "Nothing was undone" in str(refused.value)
+    assert "security master" not in str(refused.value).lower()
+
+
 def test_an_undo_with_nothing_imported_changes_nothing(tmp_path):
     root = _lake(tmp_path)
     before = _snapshot(root)
@@ -549,6 +578,26 @@ def test_a_schwab_refusal_reaches_the_operator_as_one_line_and_exit_2(tmp_path, 
     assert exited.value.code == 2
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1 and err[0].startswith("bar_import: ") and "reauth" in err[0]
+
+
+def test_an_unreadable_token_reaches_the_operator_as_one_line(tmp_path, capsys):
+    root = _lake(tmp_path)
+    config = write_config(tmp_path, root)
+
+    def factory(token_path, **kwargs):
+        raise FileNotFoundError(token_path)
+
+    with pytest.raises(SystemExit) as exited:
+        bar_import.main(
+            ["schwab", "GLD", "--config", str(config)],
+            clock=ManualClock(MONDAY_0745),
+            calendar=CALENDAR,
+            vendor_factory=factory,
+        )
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "cannot be read (FileNotFoundError)" in err[0]
 
 
 def test_the_schwab_command_refuses_on_a_shadow_host(tmp_path, capsys):
