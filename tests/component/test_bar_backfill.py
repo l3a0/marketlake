@@ -38,7 +38,6 @@ from lake import actions, bars, journal, report
 from lake.bars import (
     CHECK_BAR_CLOSE,
     CHECK_BAR_RESPONSE,
-    FOLLOWING_UNSEALED,
     MINUTE_EXTENDED_HOURS,
     GateSkip,
     SpansAbsent,
@@ -313,12 +312,12 @@ def _lake(
     """A lake holding sealed quotes, the ledger, the master and the capture spans.
 
     ``quotes`` defaults to a captured 16:15 close on every session in the range, which is what
-    lets a daily bar pass the close cross-check on every day the walk reaches, and on the session
-    after it, whose seal ends the newest session's wait. A test about the gate's blind spots
-    names its own.
+    lets a daily bar pass the close cross-check on every day the walk reaches. Nothing is sealed
+    for the session after the range, the state the lake is in at the newest session's own 18:30
+    sweep. A test about the gate's blind spots names its own.
     """
     if quotes is None:
-        quotes = {("SPY", day): [_quote_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
+        quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS}
     for (ticker, day), rows in quotes.items():
         fixture_lake.with_quotes(ticker, day, _quotes_table(rows))
     for ticker, freq, day, table in bars_partitions:
@@ -680,12 +679,11 @@ def test_a_session_whose_quotes_hold_only_gap_rows_is_abandoned_without_a_reques
     reading ``held`` alone would pass with the request still going out.
 
     They land in ``abandoned`` rather than ``unsettled`` because their own sessions sealed days
-    ago, and the sessions after them too.
-    ``test_the_newest_session_is_unsettled_rather_than_abandoned`` holds the other side on the same
-    run.
+    ago. ``test_a_session_whose_own_quotes_have_not_sealed_is_unsettled_rather_than_abandoned``
+    covers the other side.
     """
     quotes: dict[tuple[str, date], list[dict]] = {}
-    for day in (*SESSIONS, date(2026, 9, 17)):
+    for day in SESSIONS:
         rows = [_gap_row(day)] if day <= date(2026, 9, 10) else [_quote_row(day)]
         quotes[("SPY", day)] = rows
     root = _lake(fixture_lake, quotes=quotes)
@@ -716,27 +714,48 @@ def test_a_session_whose_quotes_hold_only_gap_rows_is_abandoned_without_a_reques
     assert _findings(root, date(2026, 9, 8)) == [], "an abandoned ticker-day filed a finding"
 
 
-def test_the_newest_session_is_unsettled_rather_than_abandoned(fixture_lake: FixtureLake):
-    """#319 test 8, re-pointed by marketlake #434.
+def test_the_newest_session_lands_at_its_own_sweep(fixture_lake: FixtureLake):
+    """Marketlake #962: the newest session's daily bar lands on its own evening.
 
-    The newest session in range waits for the following session to seal, and that session's
-    partition does not exist yet, so the walk reads nothing and records ``FOLLOWING_UNSEALED``.
-    That one settles itself: tomorrow's seal ends the wait and the next run lands the bar.
+    The run is 2026-09-16's 18:30 sweep, and no quotes partition exists for the session after it.
+    Before marketlake #962 the walk skipped the newest session here, waiting for the next one to
+    seal, so every healthy run reported it under ``unsettled`` and landed it a night late. Now the
+    gate reads the session's own 16:15 quote, which compaction sealed at close+15, and the bar
+    lands with every older session.
+    """
+    root = _lake(fixture_lake)
+    assert not LakePaths(root).quotes_partition_path("SPY", date(2026, 9, 17)).exists()
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+    assert result.unsettled == (), "the newest session still waited for the next one to seal"
+    assert result.abandoned == ()
+    assert result.held == ()
+    assert len(vendor.calls) == len(SESSIONS)
+    assert {entry.session for entry in result.landed} == set(SESSIONS)
+    assert _partition(root, "SPY", DAILY_FREQ, date(2026, 9, 16)).exists()
+
+
+def test_a_session_whose_own_quotes_have_not_sealed_is_unsettled_rather_than_abandoned(
+    fixture_lake: FixtureLake,
+):
+    """#319 test 8, re-pointed by marketlake #434 and again by marketlake #962.
+
+    The newest session's quotes are not sealed, which is a run before its compaction or a night
+    compaction failed. The gate's read finds no partition, and the manifest holds no entry for the
+    session, so the walk records it under ``unsettled``. That one settles itself: the seal ends
+    it and the next run lands the bar.
 
     **So it is the case the abandoned line must not swallow.** Both reach the same skip and both
-    save the same request, and only the manifest separates them: this session's following day has
-    not been sealed, while the outage's own sessions have. Recording them together would put a
-    ticker-day that lands tomorrow into the count of ones the lake has given up on, and that count
-    is the one an operator is meant to act on.
-
-    It happens on every healthy run, on a lake with nothing wrong with it, which is why the sweep
-    reports ``abandoned`` and leaves this one to the command's own output.
+    save the same request, and only the manifest separates them: this session has not been
+    sealed, while the outage's own sessions have. Recording them together would put a ticker-day
+    that lands on a later run into the count of ones the lake has given up on, and that count is
+    the one an operator is meant to act on.
     """
-    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS}
+    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS[:-1]}
     root = _lake(fixture_lake, quotes=quotes)
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
-    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), FOLLOWING_UNSEALED),)
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), "PartitionAbsent"),)
     assert result.abandoned == ()
     assert result.held == ()
     assert len(vendor.calls) == len(SESSIONS) - 1
@@ -767,7 +786,7 @@ def test_a_repaired_reference_makes_an_abandoned_ticker_day_fetchable_again(
     first_vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     first = _run(root, first_vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
 
-    assert len(first.abandoned) == len(SESSIONS) - 1
+    assert len(first.abandoned) == len(SESSIONS)
     assert first.landed == ()
     assert first_vendor.calls == []
 
@@ -781,7 +800,7 @@ def test_a_repaired_reference_makes_an_abandoned_ticker_day_fetchable_again(
     assert [entry.session for entry in second.landed] == [date(2026, 9, 9)], (
         "the repaired reference did not make its bar fetchable again"
     )
-    assert len(second.abandoned) == len(SESSIONS) - 2
+    assert len(second.abandoned) == len(SESSIONS) - 1
     assert [call["symbol"] for call in second_vendor.calls] == ["SPY"]
 
 
@@ -816,11 +835,11 @@ def test_a_lake_that_contradicts_its_own_writers_is_held_rather_than_abandoned(
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
 
-    # The newest session waits for a following session the lake has not sealed, so it is
-    # unsettled before anything is read. Every other session in range reads and is refused.
-    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), FOLLOWING_UNSEALED),)
+    # Every session in range reads and is refused, the newest one included, since marketlake
+    # #962 removed the wait that once skipped it unread.
+    assert result.unsettled == ()
     assert result.abandoned == ()
-    assert len(result.held) == len(SESSIONS) - 1
+    assert len(result.held) == len(SESSIONS)
     assert all(finding.finding.check == CHECK_BAR_CLOSE for finding in result.held)
     assert all("LoadError" in (f.finding.exception or "") for f in result.held)
     assert vendor.calls == [], "a reference the walk could not read still spent the request"
@@ -874,12 +893,12 @@ def test_a_partition_the_projection_cannot_present_costs_one_ticker_day(
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ, MINUTE_FREQ)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ, MINUTE_FREQ]}))
 
-    assert len(result.held) == len(SESSIONS) - 1, "a broken partition ended the walk"
+    assert len(result.held) == len(SESSIONS), "a broken partition ended the walk"
     named = type(refusal).__name__
     assert all(named in (f.finding.exception or "") for f in result.held)
     assert len(result.landed) == len(SESSIONS), "the minute half went down with the daily half"
     assert {call["symbol"] for call in vendor.calls} == {"SPY"}
-    assert len(result.unsettled) == 1 and result.abandoned == ()
+    assert result.unsettled == () and result.abandoned == ()
 
 
 # ``PartialRead`` carries the projection that could not be presented whole, so building one needs
@@ -918,7 +937,8 @@ def test_every_refusal_that_means_unreadable_takes_the_skip(
     """
     from lake import bars as bars_module
 
-    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS}
+    # The newest session's own quotes are left unsealed, so the one refusal lands in both buckets.
+    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS[:-1]}
     root = _lake(fixture_lake, quotes=quotes)
 
     def refuse(ticker, day, *args, **kwargs):
@@ -929,10 +949,11 @@ def test_every_refusal_that_means_unreadable_takes_the_skip(
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
 
     assert result.held == (), "a refusal that means unreadable was filed as a finding"
-    # The newest session is the one whose following quotes the lake has not sealed, so it waits
-    # unread while the rest are read, refused and abandoned. Which bucket is the manifest's
-    # answer, not the refusal's, so the split is asserted here rather than left to read as noise.
-    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), FOLLOWING_UNSEALED),)
+    # The newest session is the one whose own quotes the lake has not sealed, so its refusal is
+    # pending while the rest are abandoned. Which bucket is the manifest's answer, not the
+    # refusal's, so the split is asserted here rather than left to read as noise.
+    pending = GateSkip("SPY", DAILY_FREQ, date(2026, 9, 16), type(refusal).__name__)
+    assert result.unsettled == (pending,)
     assert len(result.abandoned) == len(SESSIONS) - 1
     assert {entry.reason for entry in result.abandoned} == {type(refusal).__name__}
     assert vendor.calls == []
@@ -978,7 +999,7 @@ def test_the_minute_half_lands_on_a_session_the_daily_gate_refuses(fixture_lake:
     it guards, and the calls below are what says so: every minute ticker-day still goes out on a
     lake where every daily one would be abandoned.
     """
-    quotes = {("SPY", day): [_gap_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
+    quotes = {("SPY", day): [_gap_row(day)] for day in SESSIONS}
     root = _lake(fixture_lake, quotes=quotes)
     vendor = RecordingVendor(_cassette(freqs=(MINUTE_FREQ,)))
     result = _run(root, vendor)
@@ -1005,7 +1026,7 @@ def test_the_bar_before_an_ex_date_lands_and_the_total_view_divides_by_it(
     from 2026-09-14's, and the older rows' adjusted closes say which one the view used.
     """
     before, ex_date, earlier = date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 11)
-    quotes = {("SPY", day): [_quote_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
+    quotes = {("SPY", day): [_quote_row(day)] for day in SESSIONS}
     quotes[("SPY", before)] = [_quote_row(before, captured=762.6)]
     # Both of the ex-date's close rows carry the adjusted previous close, and the 16:00 one is
     # the row the gate before #618 read, so a reverted gate makes its comparison and holds.
@@ -1489,8 +1510,7 @@ def test_a_held_finding_is_rendered_in_the_backfill_block(fixture_lake: FixtureL
     Marketlake #434 made the second of those a skip before the fetch, so it produces no finding
     to render and this test would otherwise have asserted an empty block.
     """
-    quotes = {("SPY", day): [_quote_row(day)] for day in (*SESSIONS, date(2026, 9, 17))}
-    root = _lake(fixture_lake, quotes=quotes)
+    root = _lake(fixture_lake)
     result = _run(
         root,
         RecordingVendor(_cassette(freqs=(DAILY_FREQ,)), fail_with={"SPY": VendorError("refused")}),
@@ -1511,15 +1531,15 @@ def test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block(fixture_lak
     walk had never planned it. The nightly digest carries one counted line instead, for its own
     byte budget, and this is the output that carries the detail.
 
-    The lake below gaps 09-08 through 09-10 and settles the rest, so one run produces both: three
-    sessions whose own quotes sealed empty, and the newest session, still waiting for the next
-    one to seal.
+    The lake below gaps 09-08 through 09-10, settles 09-11 through 09-15, and seals nothing for
+    the newest session, so one run produces both: three sessions whose own quotes sealed empty,
+    and the newest session, whose own compaction has not run.
     """
-    # 2026-09-17 is deliberately absent, so the newest session in range is still waiting while
+    # 2026-09-16 is deliberately absent, so the newest session in range is still pending while
     # the outage's three have their own quotes sealed empty.
     quotes = {
         ("SPY", day): [_gap_row(day)] if day <= date(2026, 9, 10) else [_quote_row(day)]
-        for day in SESSIONS
+        for day in SESSIONS[:-1]
     }
     root = _lake(fixture_lake, quotes=quotes)
     result = _run(
@@ -1536,7 +1556,7 @@ def test_the_two_gate_skip_blocks_are_rendered_in_the_backfill_block(fixture_lak
     first = rendered.index("  unsettled: 1")
     assert rendered[first : first + 6] == [
         "  unsettled: 1",
-        "    - SPY 1d 2026-09-16: FollowingUnsealed",
+        "    - SPY 1d 2026-09-16: PartitionAbsent",
         "  abandoned: 3",
         "    - SPY 1d 2026-09-10: SnapAbsent",
         "    - SPY 1d 2026-09-09: SnapAbsent",
@@ -1756,7 +1776,7 @@ def test_a_budgeted_run_still_counts_every_skip_behind_the_bound(fixture_lake: F
     """
     quotes = {
         ("SPY", day): [_gap_row(day)] if day <= date(2026, 9, 10) else [_quote_row(day)]
-        for day in (*SESSIONS, date(2026, 9, 17))
+        for day in SESSIONS
     }
     root = _lake(fixture_lake, quotes=quotes)
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
@@ -1886,7 +1906,7 @@ def test_the_single_session_fetch_is_not_bounded_by_the_budget(fixture_lake: Fix
     quotes = {
         (ticker, day): [_quote_row(day, ticker=ticker)]
         for ticker in ("SPY", "QQQ")
-        for day in (*SESSIONS, date(2026, 9, 17))
+        for day in SESSIONS
     }
     root = _lake(fixture_lake, quotes=quotes, master=_master(("SPY", "QQQ")))
     vendor = RecordingVendor(_cassette(tickers=("SPY", "QQQ"), freqs=(MINUTE_FREQ,)))

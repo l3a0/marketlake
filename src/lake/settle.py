@@ -109,8 +109,10 @@ is absent rather than naming a convention, and a strike no whole number of cents
 or an infinity is one of these rather than an arithmetic error, for the reason ``_number`` gives.
 
 One consequence is worth stating rather than discovering. The daily gate compares a candle
-against the *following* session's captured close, so a session's settlement is available one
-session later at the earliest. D19's OI view carries the same lag for its own reasons.
+against the session's own 16:15 quote, and the bar lands at that session's own 18:30 sweep, so a
+session's settlement is available that evening. Marketlake #618 moved the comparison onto the
+session's own quote and marketlake #962 moved the fetch onto its own evening. D19's OI view
+still publishes a session's open interest one session later, for its own reasons.
 """
 
 from __future__ import annotations

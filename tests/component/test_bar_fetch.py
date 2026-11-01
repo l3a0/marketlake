@@ -44,7 +44,6 @@ from lake.bars import (
     CHECK_BAR_SPAN,
     CLOSE_CROSS_TOLERANCE,
     CLOSE_VALUE_ABSENT,
-    FOLLOWING_UNSEALED,
     MINUTE_EXTENDED_HOURS,
     GateSkip,
     UnsupportedBarFreq,
@@ -69,9 +68,11 @@ from tests.support.lake import FixtureLake
 from tests.support.schwab import FakeResponse, FakeSchwabClient
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
 
-# The session the sweep fetches, and the one after it whose seal the daily bar waits for.
-# 2026-09-14 is a Monday, so the week is an ordinary one and the calendar-next session is the
-# following day. The bar is judged against the session's own 16:15 quote, marketlake #618.
+# The session the sweep fetches, and the calendar-next session after it. 2026-09-14 is a
+# Monday, so the week is an ordinary one and the calendar-next session is the following day. The
+# bar is judged against the session's own 16:15 quote, marketlake #618, and since marketlake #962
+# it waits for nothing of FOLLOWING's. The tests that still seal FOLLOWING do so to show the gate
+# does not read it, or for a reason of their own.
 SESSION = date(2026, 9, 14)
 FOLLOWING = date(2026, 9, 15)
 MONDAY = date(2026, 9, 14)
@@ -172,17 +173,17 @@ def _gap_row(day: date, ticker: str = "SPY") -> dict:
 
 
 def _sealed(*tickers: str, session_rows: dict[str, list[dict]] | None = None) -> dict:
-    """Each ticker's session and the session after it, both sealed.
+    """Each ticker's session sealed, and nothing for the session after it.
 
-    The session carries the 16:15 row the gate reads, and the following session is only what
-    the bar waits for, so it carries an ordinary row. ``session_rows`` replaces a ticker's
-    session rows, for a test about what the gate reads.
+    The session carries the 16:15 row the gate reads. FOLLOWING is left unsealed on purpose:
+    since marketlake #962 a daily bar lands at its own session's sweep, so every daily test
+    built on this runs with no partition for the next session, the state the lake is in at 18:30.
+    ``session_rows`` replaces a ticker's session rows, for a test about what the gate reads.
     """
     session_rows = session_rows or {}
     quotes: dict[tuple[str, date], list[dict]] = {}
     for ticker in tickers:
         quotes[(ticker, SESSION)] = session_rows.get(ticker, [_quote_row(SESSION, ticker=ticker)])
-        quotes[(ticker, FOLLOWING)] = [_quote_row(FOLLOWING, ticker=ticker)]
     return quotes
 
 
@@ -401,10 +402,10 @@ def _lake(
     master: SecurityMaster | None = None,
     bars_partitions: tuple[tuple[str, str, date, pa.Table], ...] = (),
 ) -> Path:
-    """A lake holding the two sessions' sealed quotes, the ledger, and the master.
+    """A lake holding sealed quotes, the ledger, and the master.
 
     ``quotes`` defaults to SPY's session carrying the captured close the close cross-check
-    reads, and the following session sealed beside it. ``bars_partitions`` seals bars beside
+    reads, with no partition for the session after it. ``bars_partitions`` seals bars beside
     them, for the tests about the manifested skip.
     """
     if quotes is None:
@@ -525,6 +526,10 @@ def test_a_close_disagreeing_past_the_tolerance_is_held_and_lands_nothing(
     A pre-adjusted bar disagrees with minutely quotes the lake sealed before any adjustment
     could reach them, which is what this check exists to catch. The partition never lands,
     because the shape is gate-before-land.
+
+    It runs at the session's own sweep, with no quotes partition for the next session, which is
+    marketlake #962's second "Done when": removing the wait for the next session left the gate
+    against the session's own 16:15 quote in place.
     """
     drifted = SETTLED_CLOSE * (1 + PER_EVENT_DIVIDEND)
     root = _lake(fixture_lake)
@@ -532,6 +537,9 @@ def test_a_close_disagreeing_past_the_tolerance_is_held_and_lands_nothing(
 
     result = _run(root, vendor)
 
+    assert not LakePaths(root).quotes_partition_path("SPY", FOLLOWING).exists()
+    assert [call["symbol"] for call in vendor.calls] == ["SPY"], "the bar was never fetched"
+    assert result.unsettled == () and result.abandoned == ()
     assert result.landed == ()
     assert not _partition(root, "SPY", DAILY_FREQ).exists()
     (held,) = result.held
@@ -551,6 +559,10 @@ def test_a_close_inside_the_tolerance_lands_and_is_manifested_under_the_sweep_so
 
     The entry's sha is read off the bytes on disk at record time, so a partition whose file
     and entry disagree is a torn write rather than a passing test.
+
+    The run is the session's own 18:30 sweep: SESSION's quotes are sealed and no partition
+    exists for FOLLOWING, and the bar lands anyway. That is marketlake #962's first "Done when".
+    Before it, this run reported SPY under ``unsettled`` and fetched nothing.
     """
     inside = SETTLED_CLOSE * (1 + SETTLED_DRIFT)
     root = _lake(fixture_lake)
@@ -558,7 +570,11 @@ def test_a_close_inside_the_tolerance_lands_and_is_manifested_under_the_sweep_so
 
     result = _run(root, vendor)
 
+    assert not LakePaths(root).quotes_partition_path("SPY", FOLLOWING).exists()
+    assert [call["symbol"] for call in vendor.calls] == ["SPY"], "the bar was never fetched"
+    assert result.unsettled == (), "the bar still waited for the next session to seal"
     (landed,) = result.landed
+    assert landed.session == SESSION
     assert result.held == ()
     partition = _partition(root, "SPY", DAILY_FREQ)
     assert partition.exists()
@@ -619,8 +635,8 @@ def test_a_session_whose_quotes_have_no_close_row_never_reaches_the_vendor(
     It lands in ``abandoned`` because the manifest holds the session's own quotes: the lake
     sealed them and they carry no data row at 16:15, so nothing this walk can wait for changes
     that. The gate has read the session's own 16:15 row since marketlake #618.
-    ``test_the_newest_session_is_unsettled_rather_than_abandoned`` holds the other side, where
-    the lake has sealed nothing yet.
+    ``test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way`` covers the
+    other side, where the lake has sealed nothing yet.
 
     The run continues to the next ticker, which is the containment: one unreadable session is
     not the other tickers' bars to lose.
@@ -652,13 +668,14 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 ):
     """#280 test 7.
 
-    Tonight's session has no next partition yet, which this job's first real run meets: the
-    following session has not happened, so compaction has sealed nothing for it. The bar waits
-    for that seal and reads nothing, which is ``FOLLOWING_UNSEALED``, and this is the half that
-    can settle: tomorrow's seal ends the wait. What lands the bar is a run that asks about this
-    session again, and this entry point never does, because it fetches the one session it is given.
-    Marketlake #422 moved the evening run to the span walk for that reason, and
-    ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow`` is where the recovery is held.
+    SPY's own session has no quotes partition, which a run before that session's compaction
+    meets, or a run on a night compaction failed. The gate's read finds no partition, which is
+    ``PartitionAbsent``, and the manifest records no seal for the session, so the ticker-day is
+    pending rather than given up on. This is the half that can settle: the seal ends it. What
+    lands the bar is a run that asks about this session again, and this entry point never does,
+    because it fetches the one session it is given. Marketlake #422 moved the evening run to the
+    span walk for that reason, and ``test_a_daily_bar_held_tonight_is_reached_again_tomorrow``
+    is where the recovery is covered.
     """
     root = _lake(
         fixture_lake,
@@ -669,7 +686,7 @@ def test_a_session_with_no_sealed_quotes_partition_is_contained_the_same_way(
 
     result = _run(root, vendor, roster=_roster({"SPY": ["1d"], "QQQ": ["1d"]}))
 
-    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, FOLLOWING_UNSEALED),)
+    assert result.unsettled == (GateSkip("SPY", DAILY_FREQ, SESSION, "PartitionAbsent"),)
     assert result.abandoned == (), "a session the lake never sealed was called abandoned"
     assert result.held == ()
     assert [call["symbol"] for call in vendor.calls] == ["QQQ"]
@@ -1017,7 +1034,7 @@ def test_the_command_against_a_lake_with_no_master_exits_two_with_a_named_line(
     An unseeded lake is an operator mistake with a one-command fix, and a traceback names the
     wrong thing. The line names the command that fixes it.
     """
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    fixture_lake.with_quotes("SPY", SESSION, _quotes_table([_quote_row(SESSION)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
     config = write_config(tmp_path, root)
@@ -1752,10 +1769,11 @@ def test_a_daily_stamp_the_evening_before_lands_under_the_next_session(fixture_l
 
 
 # The first standard-time week after 2026-11-01, where marketlake #380's slip first reaches the
-# live sweep. Monday's bar is fetched once Tuesday has sealed, and its bracket runs from Sunday's
-# date to Tuesday's, so the response carries Tuesday's candle beside Monday's.
+# live sweep. Monday's bracket runs from Sunday's date to Tuesday's. Since marketlake #962 Monday's
+# bar is fetched on Monday evening, when the response holds no Tuesday candle, so a response
+# carrying Tuesday's candle beside Monday's arises on a retry of a Monday the gate or the span
+# check held, run after Tuesday has traded. That retry is the case this fixture builds.
 WINTER_MONDAY = date(2026, 11, 2)
-WINTER_FOLLOWING = date(2026, 11, 3)
 
 
 @pytest.mark.parametrize(
@@ -1785,10 +1803,7 @@ def test_a_standard_time_daily_stamp_at_the_daylight_offset_lands_under_its_own_
     The window and the quote minute are spelled as literals in standard time, so a test that
     moved with the production window builder could not pass here by accident.
     """
-    quotes = {
-        ("SPY", WINTER_MONDAY): [_quote_row(WINTER_MONDAY, minute="21:15")],
-        ("SPY", WINTER_FOLLOWING): [_quote_row(WINTER_FOLLOWING, minute="21:15")],
-    }
+    quotes = {("SPY", WINTER_MONDAY): [_quote_row(WINTER_MONDAY, minute="21:15")]}
     root = _lake(fixture_lake, quotes=quotes)
     monday = bars_candle(
         datetime(2026, 11, 2, 4, 0, tzinfo=UTC),
@@ -2116,7 +2131,7 @@ def test_the_reference_minute_is_the_option_close_the_calendar_names():
     assert bars._reference_minute(clock.bounds(early)) == "13:15"
 
 
-def test_a_session_the_lake_never_sealed_waits_even_when_the_next_one_has(
+def test_a_session_the_lake_never_sealed_is_unsettled_even_when_the_next_one_is_sealed(
     fixture_lake: FixtureLake,
 ):
     """Which manifest entry separates waiting from giving up, after marketlake #618.
@@ -2126,7 +2141,9 @@ def test_a_session_the_lake_never_sealed_waits_even_when_the_next_one_has(
     now. Here the next session is sealed and the session is not, which is the shape a compaction
     the machine slept through leaves, and launchd runs the missed job on the next wake. So the bar
     is ``unsettled`` under the class the read raised, not abandoned. Asking the next session's
-    entry, as the walk did when that was the partition read, calls it a permanent loss.
+    entry, as the walk did when that was the partition read, calls it a permanent loss. Since
+    marketlake #962 nothing in the walk asks about the next session at all, and this keeps a
+    later change from bringing that question back on the wrong side.
     """
     root = _lake(fixture_lake, quotes={("SPY", FOLLOWING): [_quote_row(FOLLOWING)]})
     vendor = _RecordingVendor(_cassette())
@@ -2450,25 +2467,6 @@ def test_the_span_check_refuses_to_answer_for_an_empty_candle_list():
     bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
     with pytest.raises(ValueError, match="non-empty"):
         bars.check_bar_span([], [], bar_window(MINUTE_FREQ, bounds))
-
-
-def test_the_next_session_search_matches_the_bound_oi_already_uses():
-    """A third spelling of one step, with its bound deliberately not chosen again.
-
-    ``oi`` and ``control_plane`` already disagree, 30 against 14, and marketlake #334 owns
-    collapsing the three. A third number would have left that issue two values to settle
-    instead of one.
-    """
-    from lake import oi
-
-    assert bars.NEXT_SESSION_SEARCH_DAYS == oi._NEXT_SESSION_SEARCH_DAYS
-    calendar = weekday_sessions(MONDAY, MONDAY + timedelta(days=7))
-    assert bars._calendar_next_session(calendar, SESSION) == FOLLOWING
-    # A Friday is what the default bound has to reach past. Monday to Tuesday is one day, so a
-    # horizon of one would serve it and the default would say nothing.
-    friday, monday = date(2026, 9, 18), date(2026, 9, 21)
-    assert bars._calendar_next_session(calendar, friday) == monday
-    assert bars._calendar_next_session(calendar, friday, horizon=1) is None
 
 
 def test_the_daily_margin_is_an_argument_the_window_builder_reads():
@@ -3418,19 +3416,14 @@ def test_the_fetch_stamps_are_the_two_ends_of_the_vendor_call(fixture_lake: Fixt
     assert _entries(root, rel)[0]["fetched_at"] == started.isoformat()
 
 
-def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: FixtureLake):
-    """The last session a calendar knows about has no next session for its bar to wait for.
+def test_a_session_the_calendar_cannot_follow_is_gated_and_lands(fixture_lake: FixtureLake):
+    """The last session a calendar knows about is gated and landed like any other.
 
-    A real calendar always has one, so this is the branch nothing reaches in production and
-    everything reaches on a fake. It still has to hold rather than land ungated, because
-    gate-before-land is the whole shape.
-
-    **Marketlake #434's gate precondition deliberately passes this one through.** It needs a
-    following session whose seal the bar waits for, so it cannot answer here, and the answer is a
-    guard rather than a fourth outcome: this records the calendar being wrong rather than the
-    lake having no data, which is a held finding's job. The request is still spent, on a path
-    ``_calendar_next_session`` says a real calendar never produces, and the assertions below say
-    so rather than leaving the choice looking accidental.
+    Before marketlake #962 this held the bar under ``NoFollowingSession``, because the walk waited
+    for the calendar-next session's seal and a calendar with nothing after the session gave it
+    none to wait for. The wait is gone, so the daily gate runs on every daily ticker-day, this one
+    included. Bringing the hold back left the rest of the suite green, which is why this test
+    stays rather than going with the branch it used to cover.
     """
     root = _lake(fixture_lake)
     only_monday = weekday_sessions(MONDAY)
@@ -3446,13 +3439,11 @@ def test_a_session_the_calendar_cannot_follow_holds_the_bar(fixture_lake: Fixtur
         session=SESSION,
     )
 
-    assert result.landed == ()
-    (held,) = result.held
-    assert held.finding.check == CHECK_BAR_CLOSE
-    assert "NoFollowingSession" in (held.finding.exception or "")
+    (landed,) = result.landed
+    assert landed.session == SESSION
+    assert result.held == ()
     assert result.unsettled == () and result.abandoned == ()
     assert [call["symbol"] for call in vendor.calls] == ["SPY"]
-    assert result.attempted == 1
 
 
 def test_a_failed_write_leaves_no_temp_file_beside_the_partition(
@@ -3501,7 +3492,8 @@ def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: Fixtur
     Every other render assertion sits on a run where landed equals attempted and where one
     finding carries numbers. This one lands one partition, holds a finding whose detail comes
     from its exception rather than from a pair, skips a third ticker-day at the gate, and reads
-    all of it back.
+    all of it back. The skipped one is SPY, whose own session has no sealed quotes, so the gate's
+    read raises ``PartitionAbsent`` and the manifest says the session is pending.
 
     The held half is driven by a refused request rather than by an absent close of record.
     Marketlake #434 made the second of those a skip, so it no longer produces a finding at all,
@@ -3526,7 +3518,7 @@ def test_the_report_renders_a_run_that_both_landed_and_held(fixture_lake: Fixtur
     assert result.attempted == 2, "a ticker-day skipped at the gate was counted attempted"
     assert "VendorError" in rendered, "a finding with no pair rendered no detail"
     assert "unsettled: 1" in rendered and "abandoned: 0" in rendered
-    assert f"    - SPY 1d {SESSION.isoformat()}: {FOLLOWING_UNSEALED}" in rendered
+    assert f"    - SPY 1d {SESSION.isoformat()}: PartitionAbsent" in rendered
     assert "QQQ 1d" in rendered
     assert "filed at" in rendered
 
