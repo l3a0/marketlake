@@ -78,10 +78,14 @@ import reaches the bucket. The runtime reads the bucket, so removing files on th
 withdraw nothing from it, and once the nightly upload has sent an import no command withdraws
 it. So the undo refuses unless the manifest's last lines are exactly the import's entries, and
 the bucket's ``manifest.jsonl`` is absent or a byte prefix of the manifest cut back to before
-them, and the bucket lists none of the import's keys. Under the lock it re-reads the manifest,
-deletes the import's files and their leftover temps, flushes the directories, and only then cuts
-the manifest back in place with ``bucket._rewrite_manifest``, the resync's own rewrite. A crash
-between the two leaves manifested missing files, which a rerun finishes.
+them, and the bucket lists none of the import's keys. It reads the bucket before the lock and
+again under it, because an upload that runs while the undo waits appends nothing to this lake's
+manifest. Under the lock it also re-reads the manifest, deletes the import's files and their
+leftover temps, flushes the directories, and only then cuts the manifest back in place with
+``bucket._rewrite_manifest``, the resync's own rewrite. A crash between the two leaves recorded
+files missing. A rerun of the undo finishes it while nothing else has been recorded. After that
+only the import's rerun repairs it, by writing its own recorded files back, which ends the
+nightly upload's refusal on a recorded file it cannot find.
 
 **Only the primary runs it.** The laptop's role holds no ``s3:PutObject`` since #638, so an
 import there never reaches the bucket, and its next resync would refuse on it. The next

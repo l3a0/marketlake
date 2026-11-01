@@ -4908,7 +4908,8 @@ def _rewrite_manifest(root: Path, keep: int, tail: bytes, expected: bytes) -> No
     the whole file must then read back as ``expected``. Each flush is :func:`_flush_fd`'s. A
     crash leaves the file as it was or as a byte prefix of ``expected``, and a re-run finishes
     from either. ``keep`` is never 0, since the plan refuses a rewind that shares no whole
-    line, so the file is never empty between the two writes. The lock's own descriptor is
+    line and the bar import's undo refuses a cut to an empty manifest (marketlake #950), so the
+    file is never empty between the two writes. The lock's own descriptor is
     never touched, so the lock holds throughout.
     """
     path = manifest_path(root)

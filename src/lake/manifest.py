@@ -1504,8 +1504,10 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     the backup, and must not read as loss.
 
     Why the copy can say that exactly. The manifest is append-only, so the copy on the
-    backup is a prefix of the lake's. The bucket resync is the one exception to rule 1, and
-    it leaves the lake's manifest equal to a bucket's copy, which the next sync copies.
+    backup is a prefix of the lake's. Two writers are exceptions to rule 1. The bucket resync
+    leaves the lake's manifest equal to a bucket's copy, which the next sync copies. The bar
+    import's undo (marketlake #950) cuts the import's lines off the end only while the
+    bucket's copy is absent or a prefix of what remains, so that copy stays a prefix.
     Every lake write appends its manifest entry under the lake-root lock, and the
     compaction job's sync holds that same lock, so at the
     moment the copy was taken every file's bytes matched its newest entry at or before
