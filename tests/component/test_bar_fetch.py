@@ -2606,6 +2606,30 @@ def test_a_refused_daily_fetch_counts_the_sessions_its_stamps_name():
     assert (span.covered, span.requested) == (3.0, 1.0)
 
 
+def test_a_refused_minute_fetch_reads_its_evening_candle_by_its_own_date():
+    """A minute selection keeps the strict reading, so a refused fetch files what it received.
+
+    The response carries the session's open, its last regular minute and a candle at 19:59
+    Eastern, the shape of marketlake #421's unflagged recording. The evening candle names the
+    session under the minute reading, so the span check files 630 minutes against 390. Read by the
+    daily rule it would name the next session and drop out, and the refused fetch would file 390
+    against 390, which reads as full coverage on a bar that never landed.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    window = bar_window(MINUTE_FREQ, bounds)
+    built = [
+        {"bar_ts": "2026-09-14T13:30:00+00:00", "close": 648.0},
+        {"bar_ts": "2026-09-14T19:59:00+00:00", "close": 650.0},
+        {"bar_ts": "2026-09-14T23:59:00+00:00", "close": 651.0},
+    ]
+    selected = bars.select_session_rows(built, window)
+    assert len(selected) == 3, "the evening candle was read by the daily rule"
+    span = bars.check_bar_span(built, selected, window)
+    assert (span.covers, span.covered, span.requested) == (False, 630.0, 390.0)
+
+
 def test_the_daily_bounds_are_dated_in_the_markets_own_zone():
     """The zone the bracket's own dates are read in, which nothing else in the suite pins.
 
