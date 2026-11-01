@@ -90,6 +90,15 @@ def test_the_override_is_a_boolean_off_by_default_read_only_by_the_send() -> Non
     assert readers[0]["env"] == {"DEPLOY_OVERRIDE_WINDOW": "${{ inputs.override_window }}"}
 
 
+def test_an_overriding_run_says_so_in_its_name() -> None:
+    """The approval page and the run list show the run's name, so the owner sees which run
+    overrides before approving it. Only whitespace falls back to GitHub's own name, the
+    commit message on a push, so every other run keeps the name it had."""
+    assert _workflow()["run-name"] == (
+        "${{ inputs.override_window && 'Deploy main, overriding the deploy window' || ' ' }}"
+    )
+
+
 def test_the_job_runs_only_on_a_push_or_a_dispatch_on_main() -> None:
     assert set(_workflow()["jobs"]) == {"deploy"}
     condition = " ".join(_job()["if"].split())

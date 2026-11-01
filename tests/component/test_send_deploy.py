@@ -524,7 +524,7 @@ def test_the_send_names_the_instance_the_document_and_the_window(runner):
 # -- the override (#987) ---------------------------------------------------------------
 
 OVERRIDDEN = ", with the deploy window overridden"
-ASKED = "this run asked the VM to override its deploy window"
+ASKED = "this run was started with override_window"
 
 
 def _assert_overridden(
@@ -628,6 +628,18 @@ def test_the_suffix_on_a_run_that_did_not_ask_is_outcome_unknown(runner, invocat
         result.stdout.splitlines()[-1]
         == f"send-deploy: StatusDetails {status}, ResponseCode {code}"
     )
+
+
+def test_an_override_that_sends_nothing_still_names_the_input_and_claims_no_send(runner):
+    """A stopped VM ends the run before the send, so the notice names the input and says
+    nothing about what reached the VM."""
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW="true", INSTANCES=f"{INSTANCE}\tstopped")
+    summary = (
+        f'not sent: the VM is stopped. {FIND}, and "Start a stopped instance" starts it.'
+        " Re-run this workflow once it runs"
+    )
+    _assert_overridden(runner, result, 1, summary, "none", "none")
+    assert not runner.calls("aws ssm")
 
 
 def test_a_host_older_than_the_override_reports_its_own_line(runner):

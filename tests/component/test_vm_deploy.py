@@ -1186,6 +1186,15 @@ def test_the_override_keeps_the_restarts_bound(vm):
     assert not vm.ran("restart.sh")
 
 
+def test_the_override_keeps_the_window_exit_check(vm):
+    """A window that exits 1, such as one killed after printing both lines, still stops
+    an overridden deploy."""
+    proc = vm.deploy(vm.c["c2"], "--override-window", FAKE_WINDOW_RC="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == "not deployed: python -m lake.deploy_window exited 1" + OVERRIDDEN
+    _assert_untouched(vm)
+
+
 def test_the_override_keeps_the_window_output_check(vm):
     proc = vm.deploy(vm.c["c2"], "--override-window", FAKE_WINDOW_RC="3", FAKE_NEXT_SPAN="soon")
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -1415,6 +1424,7 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
         ),
         (["--sha", "a" * 40, "--help"], None),
         (["--override-window", "--sha", "a" * 40, "--now"], "{usage}" + OVERRIDDEN),
+        (["--sha", "a" * 40, "--now", "--override-window"], "{usage}" + OVERRIDDEN),
     ],
     ids=[
         "nothing",
@@ -1428,6 +1438,7 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
         "octal expiry",
         "unknown flag",
         "unknown flag after the override",
+        "unknown flag before the override",
     ],
 )
 def test_a_usage_error_is_one_line_on_stdout(vm, argv, line):

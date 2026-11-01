@@ -2405,7 +2405,8 @@ The run takes four steps.
    `marketlake:host = capture` in the states
    [Find the VM's address](#find-the-vms-address) lists. When that instance is running,
    the script sends it the SSM document `marketlake-deploy` with the commit and a
-   ten-minute delivery window, waits for the command to end, and prints one summary.
+   ten-minute delivery window, and with `overrideWindow` on a run that overrides the
+   window, waits for the command to end, and prints one summary.
 
 The VM stops itself once each day's work is done, as [The nightly stop](#the-nightly-stop)
 says, so a deploy approved in the evening or at the weekend can find it stopped. The run
@@ -2435,7 +2436,7 @@ The repository is public, so the run's log and its summary show only the summary
 | `outcome unknown: ...` | 1 | Compare `HEAD` with `/var/lib/marketlake/deployed` on the VM, and read `deploy.log`. When they differ, re-run the deploy for `HEAD`. |
 | `not sent: the VM is stopped. ...` | 1 | The VM stopped itself for the night. Start it as the line says, then re-run the job once it runs. |
 | `not sent: the VM is still starting. ...` | 1 | Wait for it to run, then re-run the job. |
-| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of instances with the tag when it is not exactly one, or a `DescribeInstances` reply that is not an instance id and its state. |
+| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of instances with the tag when it is not exactly one, a `DescribeInstances` reply that is not an instance id and its state, or a `DEPLOY_OVERRIDE_WINDOW` that is neither `true` nor `false`. |
 
 ### Override the deploy window
 
@@ -2469,8 +2470,9 @@ a span, a restart that cannot start in time ends `not restarted`, and the same r
 again once the span has opened restarts it.
 
 Every last line `vm-deploy.sh` prints then ends `, with the deploy window overridden`, and
-the run's log and summary add "This run asked the VM to override its deploy window". A
-hand run on the VM takes the same flag.
+the run's log and summary add "This run was started with override_window". The run's name
+in the Actions list reads "Deploy main, overriding the deploy window", so the approval
+shows which run overrides. A hand run on the VM takes the same flag.
 
 ```bash
 sudo ~/marketlake/deploy/vm-deploy.sh --sha <sha> --override-window

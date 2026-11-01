@@ -32,10 +32,11 @@
 #      InProgress, Delayed and Cancelling, and retries InvocationDoesNotExist, which
 #      comes just after the send, until notAfter;
 #   4. reads StatusDetails, ResponseCode and the last non-empty line of the host's
-#      output, and maps them to one summary. With the override the host ends every line
-#      ", with the deploy window overridden", and the suffix comes off before the line is
-#      matched against the table. Without it, a line with the suffix matches only as
-#      itself.
+#      output, and maps them to one summary. With the override vm-deploy.sh ends every
+#      line ", with the deploy window overridden", and the suffix comes off before the
+#      line is matched against the table. A line without it, such as a refusal from the
+#      document's step or the usage line of a vm-deploy.sh older than the flag, reads as
+#      itself. Without the override, a line with the suffix matches only as itself.
 #
 # The repository is public, so this prints only that summary, StatusDetails and
 # ResponseCode, on stdout and in the step summary. It never prints the host's output,
@@ -68,7 +69,7 @@ finish() {
   printf 'send-deploy: %s\n' "$2"
   printf 'send-deploy: StatusDetails %s, ResponseCode %s\n' "$STATUS" "$CODE"
   if [[ $OVERRIDE == 1 ]]; then
-    printf 'send-deploy: this run asked the VM to override its deploy window\n'
+    printf 'send-deploy: this run was started with override_window\n'
   fi
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
@@ -76,7 +77,7 @@ finish() {
       printf '%s\n\n' "$2"
       printf 'StatusDetails %s, ResponseCode %s\n' "$STATUS" "$CODE"
       if [[ $OVERRIDE == 1 ]]; then
-        printf '\nThis run asked the VM to override its deploy window.\n'
+        printf '\nThis run was started with override_window.\n'
       fi
     } >> "$GITHUB_STEP_SUMMARY"
   fi

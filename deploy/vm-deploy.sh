@@ -174,6 +174,10 @@ trap 'OUTCOME_CODE=1; OUTCOME_LINE="$UNKNOWN"; exit 1' TERM INT HUP
 # -- arguments -------------------------------------------------------------------------
 
 USAGE="not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]"
+# Read before the loop, so a usage error carries the suffix wherever the flag stands.
+for arg in "$@"; do
+  if [[ "$arg" == --override-window ]]; then OVERRIDE=1; fi
+done
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sha|--not-after)

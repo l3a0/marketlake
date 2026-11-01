@@ -8,8 +8,11 @@
 #
 # A run started by hand can set override_window, which asks the VM to skip that refusal
 # and nothing else (#987). The run still waits for the owner's approval, and every check
-# the host makes besides the window still holds. A push has no inputs, so a push-triggered
-# run cannot set it. infra/README.md's "Override the deploy window" says when and how.
+# the host makes besides the window still holds. A push has no inputs, so this workflow
+# never asks for it on a push. The limit is the workflow's, not the role's: the deploy
+# role may send the document with any of its allowed values, so what bounds the override
+# is the code on main and the owner's approval. The run's name says when it overrides, so
+# the approval shows it. infra/README.md's "Override the deploy window" says when and how.
 #
 # No job here is named `test`, because the ruleset on main requires a check by that
 # name and ci.yml provides it.
@@ -21,6 +24,8 @@
 # Every action is pinned to a commit. Any step in a job with `id-token: write` can mint
 # the job's OIDC token, so a re-pointed tag would get the AWS role.
 name: Deploy
+# Only whitespace leaves GitHub's own name, the commit message on a push.
+run-name: ${{ inputs.override_window && 'Deploy main, overriding the deploy window' || ' ' }}
 
 on:
   push:
