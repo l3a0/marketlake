@@ -24,8 +24,9 @@ nothing.
    disk. One already absent is done or lost, and either way no ``GetObject`` is sent for it. A
    quotes partition also needs its ticker-day's daily bar,
    ``bars/ticker=T/freq=1d/date=D.parquet``, to be in the manifest. The bars census reads a
-   quotes day only while that bar has not landed, so a day whose bar never lands, such as a
-   ``SnapAbsent`` outage day or a ticker whose roster carries no ``1d``, is kept for good. A bars
+   quotes day only while that bar has not landed, so a day whose bar never lands, such as an
+   outage day with no 1-minute bars to gate it against or a ticker whose roster carries no
+   ``1d``, is kept for good. A bars
    partition of either frequency also needs its ticker-day's chains partition to be gone on
    purpose or never recorded: absent from disk, and either a designed absence or missing from
    the manifest. ``settle.settlement_view`` and ``continuity.continuity_view`` read a day's bars

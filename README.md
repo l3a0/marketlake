@@ -594,7 +594,7 @@ then drops each chains partition older than that many sessions once its bucket c
 to the manifest, recording it in `trimmed.jsonl` ([#787](https://github.com/l3a0/marketlake/issues/787)).
 It drops each quotes partition older than the window the same way, under a landed daily bar
 ([#794](https://github.com/l3a0/marketlake/issues/794)). A quotes day whose daily bar never
-lands, such as an outage day the bars census reads as `SnapAbsent`, stays for good. On a
+lands, such as an outage day with no 1-minute bars to gate its daily bar against, stays for good. On a
 host with a numeric bars window it drops each bars partition of either frequency older than
 that window the same way, once that day's chains partition is gone, so a bar goes no sooner
 than the night after its chain ([#795](https://github.com/l3a0/marketlake/issues/795)).
