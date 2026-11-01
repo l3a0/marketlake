@@ -2,13 +2,12 @@
 
 These run the onboarding core against a throwaway lake and a throwaway tickers.yaml,
 with a cassette-backed vendor and a manual clock. No network and no token are crossed.
-The tests that drive the command line cross the real clock, because the command builds its
-own rather than taking one. Three of them pass ``--capture-start`` and use an instant far
-enough from now that the answer cannot change the outcome. The four that drive a refusal
-or a sign-off through ``main`` assert nothing that a date decides, and they reach the
-recorded vendor through the one seam the command has, which is where it builds the
-Schwab-backed one. The tier is component: onboarding writes and reads real files, with the
-clock and vendor still fake.
+The tests that drive the command line hand ``main`` the same manual clock, set inside a
+session. Before ``main`` took a clock they crossed the real one, and the onboarding's
+session check refused every run on a weekend or a holiday, so the required ``test`` check
+failed on every pull request opened then (marketlake #964). They reach the recorded vendor
+through the seam where the command builds the Schwab-backed one. The tier is component:
+onboarding writes and reads real files, with the clock and vendor still fake.
 
 They cover the slice-1 contract: register with a stamped capture_start and a ticker
 mapping only (the FIGI is deferred to a CUSIP-keyed backfill), verify the real-time
@@ -834,7 +833,8 @@ def test_an_epoch_after_now_is_refused_and_writes_nothing(lake_root, tmp_path, c
                 str(config_path),
                 "--tickers",
                 str(tickers_path),
-            ]
+            ],
+            clock=ManualClock(start=_MID_SESSION),
         )
 
     assert exit_info.value.code == 2
@@ -1683,7 +1683,8 @@ def test_the_seed_spans_refusal_reaches_the_operator_as_one_line(
                 str(tickers_path),
                 "--token",
                 str(tmp_path / "token.json"),
-            ]
+            ],
+            clock=ManualClock(start=_MID_SESSION),
         )
 
     # The code is compared by type as well as by value. ``SystemExit(2.0)`` satisfies
@@ -1727,7 +1728,8 @@ def test_a_delayed_feed_refused_through_the_command_prints_the_not_trusted_line(
                 str(tickers_path),
                 "--token",
                 str(tmp_path / "token.json"),
-            ]
+            ],
+            clock=ManualClock(start=_MID_SESSION),
         )
 
     assert exit_info.value.code == 2
@@ -1756,7 +1758,8 @@ def test_an_onboarding_that_succeeds_still_returns_zero(lake_root, tmp_path, mon
             str(tickers_path),
             "--token",
             str(tmp_path / "token.json"),
-        ]
+        ],
+        clock=ManualClock(start=_MID_SESSION),
     )
 
     assert code == 0
@@ -1769,8 +1772,8 @@ def test_an_onboarding_that_succeeds_still_returns_zero(lake_root, tmp_path, mon
     assert load_tickers(tickers_path).get("SPY").options is False
 
 
-def _drive_main(tmp_path, config_path, tickers_path):
-    """Run the command the way the boundary tests below run it."""
+def _drive_main(tmp_path, config_path, tickers_path, *, now: datetime = _MID_SESSION):
+    """Run the command the way the boundary tests below run it, on a clock set to ``now``."""
     return main(
         [
             "SPY",
@@ -1781,8 +1784,69 @@ def _drive_main(tmp_path, config_path, tickers_path):
             str(tickers_path),
             "--token",
             str(tmp_path / "token.json"),
-        ]
+        ],
+        clock=ManualClock(start=now),
     )
+
+
+def test_the_command_refuses_a_day_with_no_session_on_the_clock_it_is_handed(
+    lake_root, tmp_path, monkeypatch, capsys
+):
+    """The session check still refuses through the command, judged by the handed clock.
+
+    This and the sign-off test above decide together that ``main`` runs on the clock it is
+    handed, whatever day the suite runs on. Run on a session day, a ``main`` that read the
+    real clock would pass the sign-off and fail this. Run on a weekend, it would pass this
+    and fail the sign-off, which is how the sign-off failed before the seam (marketlake
+    #964).
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
+
+    # 11:00 EST on Sunday 2026-11-01.
+    sunday = datetime(2026, 11, 1, 16, 0, tzinfo=UTC)
+    with pytest.raises(SystemExit) as exit_info:
+        _drive_main(tmp_path, config_path, tickers_path, now=sunday)
+
+    assert exit_info.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "onboard: the first snapshot for SPY would file under 2026-11-01, which is not a "
+        "session, so compaction would never seal it. Onboard on a session day instead, "
+        "before that day's close+15 for a ticker the lake already captures.\n"
+    )
+    assert captured.out == ""
+    _assert_nothing_onboarded(lake_root, tickers_path)
+
+
+def test_the_capture_start_check_reads_the_clock_the_command_is_handed(lake_root, tmp_path, capsys):
+    """An epoch after the handed clock's now is refused, though the real clock is past it.
+
+    A check that read the operating system's clock would let this epoch through and open
+    a span that starts after the onboarding's own now. The printed now is the handed one.
+    """
+    tickers_path = tmp_path / "tickers.yaml"
+    config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    day_after = (_MID_SESSION + timedelta(days=1)).isoformat()
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "SPY",
+                "--capture-start",
+                day_after,
+                "--config",
+                str(config_path),
+                "--tickers",
+                str(tickers_path),
+            ],
+            clock=ManualClock(start=_MID_SESSION),
+        )
+
+    assert exit_info.value.code == 2
+    assert f"is after now ({_MID_SESSION.isoformat()})" in capsys.readouterr().err
+    _assert_nothing_onboarded(lake_root, tickers_path)
 
 
 def test_a_corrupt_master_still_reaches_the_operator_as_a_traceback(
