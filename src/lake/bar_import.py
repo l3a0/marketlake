@@ -3,9 +3,32 @@
 l3a0/ithildin-runtime backtests on quantitative-trading's GLD and USO vintages, and the owner
 ruled on 2026-10-29 that marketlake stores every source the runtime reads and serves it through
 ``load_bars`` (marketlake #938). ``docs/design.md`` carries that ruling and what it protects.
-This module is the import path, and ``vintage`` is its first subcommand. #951's import of
-Schwab's earlier sessions adds the second, by building a ``_Plan`` per ticker and handing it to
-``_land``, which holds every rule that does not depend on the source.
+This module is the import path, and ``vintage`` is its first subcommand. ``schwab`` is the
+second (marketlake #951). Each builds a ``_Plan`` per ticker and hands it to ``_land``, which
+holds every rule that does not depend on the source.
+
+**The Schwab import** lands the ``SCHWAB_SESSIONS`` sessions ending the session before a
+ticker's first capture span session, from one ``vendor.get_daily_bars`` response per ticker,
+fetched before the lock. The capture path cannot reach those sessions by design, since
+``bars._span_sessions`` takes its range from the spans. Each row is the sweep's own, built by
+``journal.bars_rows`` from the vendor's candle, so ``bar_ts`` is the vendor's stamp, ``volume``
+its count, and the fetch's four stamps are the request's. ``bars.daily_session_of`` names each
+candle's session, and a candle outside the window is dropped. The last session must fall before
+the run's own Eastern date, because the shared run window allows an evening run and a daily
+candle is not final on its own day.
+
+Its basis is ``adjusted``, as of the fetch's Eastern date. A read-only probe on 2026-11-01
+found Schwab's daily candles split-adjusted to the day they are fetched and never adjusted for
+dividends: NVDA's 2024-06-07 close comes back as 120.888 where it traded at 1,208.88 before its
+10-for-1, AAPL's 2020-08-28 as 124.8075 where it traded at 499.23 before its 4-for-1, and SPY's
+2026-09-17 as 762.6, the as-traded close the lake captured the day before a 1.88883 ex-date.
+The basis vocabulary has no word for split-only, so this paragraph carries it.
+
+Its identity is the ticker and the window, ``schwab-window:<ticker>:<first>..<last>``, carried
+as ``source_id`` and, under ``bar-import:``, as the manifest ``source``. The lake alone gives
+it, so the undo names the import without a vendor call, and a rerun skips every recorded key
+whatever Schwab answers that day. A digest of the response would refuse a rerun once Schwab
+revised a volume. The ticker is in it so one ticker's undo cuts only that ticker's lines.
 
 **Where an import lands.** At the captured path, ``bars/ticker=T/freq=1d/date=D.parquet``, so
 ``load_bars``, the nightly upload, the trim and both restores handle it with no new path. Each
@@ -24,7 +47,7 @@ That is a deliberate exception to the security master's date rule: ``onboard`` s
 ``valid_from`` to the onboarding date, and ``actions.resolve_instrument`` refuses any earlier
 day, so no instrument is valid on a vintage's 2006 sessions by the master's own reading.
 
-**The identity of an import** is its source's SHA-256, carried in the manifest entry's
+**The identity of a vintage import** is its source's SHA-256, carried in the manifest entry's
 ``source`` as ``bar-import:sha256:<hex>``. The file's metadata carries the same identity, both
 built from one ``Vintage`` value, so the two cannot disagree. The manifest decides a rerun,
 because the trim removes a file and keeps its entry, so a check that read the file would find
@@ -71,9 +94,11 @@ are flushed, rather than one append per partition, which would re-read the whole
 time.
 
 **A dry run** checks every rule, the conflicts included, reads the manifest without the lock,
-and writes nothing. The runbook runs it first.
+and writes nothing. The Schwab import's dry run still fetches, so it checks the response too.
+The runbook runs it first.
 
-**An undo** (``undo``, by the owner's decision of 2026-11-01 on #950) works only until the
+**An undo** (``undo`` and ``schwab-undo``, by the owner's decision of 2026-11-01 on #950,
+which ``_undo`` holds for both) works only until the
 import reaches the bucket. The runtime reads the bucket, so removing files on the VM alone would
 withdraw nothing from it, and once the nightly upload has sent an import no command withdraws
 it. So the undo refuses unless the manifest's last lines are exactly the import's entries, and
