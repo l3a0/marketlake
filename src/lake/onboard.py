@@ -141,9 +141,11 @@ becomes an added step here without reshaping the flow.
 Every dependency is injected: the clock, the vendor, the calendar, the chain plan, and
 the guard constants. The plan and the guards default to their own in-memory constants rather than
 to a file read, so a caller naming only the clock and the vendor still runs offline. The
-whole flow therefore needs no network, no real token, and no wall-clock read. The one
-exception is the command line's own ``--capture-start`` check, which asks what time it is
-now and so reads the real clock before any of this is reached. The thin ``onboard_from_config``
+whole flow therefore needs no network, no real token, and no wall-clock read. The command
+line's ``main`` takes a clock as well, defaulting to the real one, and its own
+``--capture-start`` check asks that same clock what time it is, before any of this is
+reached. So a test that drives the command decides what day it is, and a weekend cannot
+turn the session check against it (marketlake #964). The thin ``onboard_from_config``
 wires the real config and the Schwab-backed vendor around the same core, keeping every
 real construction lazy.
 """
@@ -422,7 +424,7 @@ def _refuse_a_date_compaction_loses(
         )
 
 
-def _parse_capture_start(text: str) -> datetime:
+def _parse_capture_start(text: str, clock: Clock) -> datetime:
     """Parse and check the ``--capture-start`` argument. ``argparse`` calls this.
 
     Three things are refused here, at parse time, so a typo costs neither a vendor call
@@ -442,8 +444,8 @@ def _parse_capture_start(text: str) -> datetime:
     named line and exit 2 rather than a ``ValueError``.
 
     Every refusal raises ``ArgumentTypeError``, so the operator gets one named line and
-    exit 2 rather than a stack. The clock is the real one, because this runs before any
-    caller has built a clock and the question is what time it is now.
+    exit 2 rather than a stack. The clock is the one ``main`` runs the whole command on, so
+    the parse and the onboarding agree on what time it is now.
     """
     import argparse
 
@@ -458,7 +460,7 @@ def _parse_capture_start(text: str) -> datetime:
             f"{text!r} carries no UTC offset, so it reads as a naive midnight. Pass an "
             "offset, like 2026-09-08T17:07:00+00:00 or 2026-09-08T13:07:00-04:00."
         )
-    now = SystemClock().now()
+    now = clock.now()
     if instant > now:
         raise argparse.ArgumentTypeError(
             f"{text!r} is after now ({now.isoformat()}). A capture span starting in the "
@@ -967,8 +969,11 @@ def onboard_from_config(
     )
 
 
-def _build_parser():
+def _build_parser(clock: Clock):
     import argparse
+
+    def _parse_capture_start_now(text: str) -> datetime:
+        return _parse_capture_start(text, clock)
 
     parser = argparse.ArgumentParser(
         prog="python -m lake.onboard",
@@ -991,7 +996,7 @@ def _build_parser():
     )
     parser.add_argument(
         "--capture-start",
-        type=_parse_capture_start,
+        type=_parse_capture_start_now,
         help=(
             "The instant capture began, as an ISO-8601 instant carrying an offset, like "
             "2026-09-08T17:07:00+00:00. Defaults to now. Pass it to seed a lake that was "
@@ -1007,8 +1012,11 @@ def _build_parser():
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
     """The ``python -m lake.onboard`` entry. Returns a process exit code.
+
+    ``clock`` defaults to the real one. It answers both the ``--capture-start`` check and
+    the onboarding itself, so one clock decides what time it is for the whole command.
 
     A refusal prints one line and exits 2, the same shape ``input_errors_exit`` uses and
     the code the sibling commands use for an operator mistake. Every refusal message here
@@ -1023,11 +1031,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     normal outcome of the command, while a master that fails to resolve is a bug or a
     corrupt lake, and there the stack is what a reader needs.
     """
-    args = _build_parser().parse_args(argv)
+    run_clock = clock if clock is not None else SystemClock()
+    args = _build_parser(run_clock).parse_args(argv)
     try:
         with input_errors_exit("onboard"):
             report = onboard_from_config(
                 args.ticker,
+                clock=run_clock,
                 config_path=args.config,
                 tickers_path=args.tickers,
                 token_path=args.token,
