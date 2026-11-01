@@ -15,10 +15,12 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    write leaves no terminating newline, so the next entry fuses onto the fragment and
    the entries behind that line are unreachable. Marketlake #447 carries what that
    costs the manifest and the corporate-actions ledgers, which still read short. Entries
-   are only ever appended, with one exception, the resync. ``python -m lake.bucket
-   resync`` (marketlake #832), run by hand under the lake-root lock, cuts the manifest
-   back to the entries it shares with the bucket's copy and appends that copy's tail in
-   place, so the file ends equal to the bucket's.
+   are only ever appended, with two exceptions, each run by hand under the lake-root lock.
+   ``python -m lake.bucket resync`` (marketlake #832) cuts the manifest back to the entries
+   it shares with the bucket's copy and appends that copy's tail in place, so the file ends
+   equal to the bucket's. ``python -m lake.bar_import undo`` (marketlake #950) cuts it back
+   to before an import whose entries are still its last lines, while the bucket's copy
+   holds none of them.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
 3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha,
@@ -143,6 +145,12 @@ SCRUB_EXCLUSIONS: tuple[str, ...] = (
 # data-quality verdicts, and ``read_quarantine`` returns each entry as the opaque mapping
 # the writer appended. These two names are the one place that mapping is read for meaning,
 # so the battery, the sign-off tool and every reader resolve a verdict the same way.
+# The prefix every bars import's manifest ``source`` starts with, as
+# ``bar-import:sha256:<hex>``. ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads
+# it to refuse deleting an import only one lake records, since no sweep regenerates one
+# (marketlake #950). It lives here, below both, so ``bucket`` imports no hand-run command.
+BAR_IMPORT_SOURCE_PREFIX = "bar-import:"
+
 VERDICT_FIELD = "verdict"
 CLEAN_VERDICT = "clean"
 
@@ -1496,8 +1504,10 @@ def backup_scrub(lake_root: Path, backup_root: Path) -> BackupScrubResult:
     the backup, and must not read as loss.
 
     Why the copy can say that exactly. The manifest is append-only, so the copy on the
-    backup is a prefix of the lake's. The bucket resync is the one exception to rule 1, and
-    it leaves the lake's manifest equal to a bucket's copy, which the next sync copies.
+    backup is a prefix of the lake's. Two writers are exceptions to rule 1. The bucket resync
+    leaves the lake's manifest equal to a bucket's copy, which the next sync copies. The bar
+    import's undo (marketlake #950) cuts the import's lines off the end only while the
+    bucket's copy is absent or a prefix of what remains, so that copy stays a prefix.
     Every lake write appends its manifest entry under the lake-root lock, and the
     compaction job's sync holds that same lock, so at the
     moment the copy was taken every file's bytes matched its newest entry at or before

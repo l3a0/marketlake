@@ -265,7 +265,8 @@ OUT_OF_SCOPE = "out_of_scope"
 # The third, and the one with no partition behind it. A session the lake never captured has no
 # file to withhold, and ``loader._clear_partition`` raises ``PartitionAbsent`` before it
 # consults the ledger, so a verdict written for that path would change no read. It could also
-# never be cleared: there is no backfill, so the partition can never land and no later ``clean``
+# never be cleared: capture never fetches backward, and an import never lands a session a
+# capture span covers (marketlake #950), so the partition can never land and no later ``clean``
 # can supersede the line, which would then sit in ``sweep.count_quarantined`` and
 # ``dashboard._open_quarantines`` until a human signed off a file that does not exist.
 MISSING_SESSION = "missing_session"
@@ -826,7 +827,8 @@ def sealed_partitions(lake_root: Path | str, *, day: date | None = None) -> list
     ``day=None`` walks the whole lake, which is what a first run and a hand run both want. The
     18:30 job passes the session it is about, because a night's run is about that night and
     walking the rest costs the whole lake's Parquet for verdicts that cannot have changed. They
-    cannot: a sealed partition is immutable, there is no backfill, and :func:`trailing_medians`
+    cannot: a sealed partition is immutable, nothing lands a session a capture span covers after
+    the fact (an import stops before the first one, marketlake #950), and :func:`trailing_medians`
     takes only sessions before the one it judges, so a whole-lake re-run is deterministic.
 
     That holds on a lake nothing trimmed. On a host that trims chains past its window

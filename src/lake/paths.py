@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -423,6 +423,27 @@ def temp_write_path(target: Path | str, pid: int) -> Path:
     return target.with_name(f"{target.name}{TEMP_MARKER}{pid}")
 
 
+def leftover_temps(directory: Path | str, names: Collection[str]) -> list[Path]:
+    """Every temp file in ``directory`` an atomic write to one of ``names`` could have left.
+
+    ``temp_write_path`` names it ``<name>.tmp-<pid>``, so this is the one reading of that name.
+    The directory is listed once, rather than once per name, because the bar import asks about
+    1,500 keys in one directory, and a ticker is free text to a glob, so it is never globbed. An
+    absent directory holds none.
+    """
+    directory = Path(directory)
+    try:
+        entries = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    found: list[Path] = []
+    for entry in sorted(entries):
+        base, marker, _pid = entry.partition(TEMP_MARKER)
+        if marker and base in names:
+            found.append(directory / entry)
+    return found
+
+
 # -- reading a path back apart -----------------------------------------------
 
 # ``parse_segment_rel`` is the inverse of ``LakePaths.segment_path``. That method builds
@@ -669,6 +690,7 @@ def default_token_path(home: str | Path | None = None) -> Path:
 
 
 __all__ = [
+    "leftover_temps",
     "ACTIONS",
     "ALERTS_DIR",
     "AWS_COST_DIR",

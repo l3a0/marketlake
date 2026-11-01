@@ -28,9 +28,10 @@ is already on it, and no new file to the lake tree or the backup. The handle is
 opened read-only, so accidental truncation or corruption of the integrity root through
 the lock path is structurally impossible. ``flock`` works fine on a read-only handle.
 
-The one writer that changes the manifest other than by appending is the bucket resync
-(marketlake #832). It holds this lock and opens a descriptor of its own to truncate the
-file and append to it in place, so the lock path still never writes. The file keeps its
+Two writers change the manifest other than by appending: the bucket resync (marketlake
+#832) and the bar import's undo (marketlake #950), which shares the resync's rewrite. Each
+holds this lock and opens a descriptor of its own to truncate the file, and the resync then
+appends to it, in place, so the lock path still never writes. The file keeps its
 inode, which is what keeps the lock whole. A new file renamed over the manifest would
 split it: the next job to ask would lock the new file while the holder still locked the
 old one.

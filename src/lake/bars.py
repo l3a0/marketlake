@@ -594,6 +594,19 @@ def session_of(bar_ts: str) -> date:
     return _as_instant(bar_ts).astimezone(MARKET_TZ).date()
 
 
+def session_midnight(day: date) -> datetime:
+    """Session ``day``'s Eastern midnight as a UTC instant, the stamp an imported daily bar takes.
+
+    :func:`daily_session_of` reads it back as ``day`` in both seasons, and so does the strict
+    Eastern date. A constant UTC hour does not do that under the strict date: ``04:00Z`` is
+    midnight under daylight time and 23:00 the evening before under standard time, the slip
+    marketlake #380 records. A captured daily bar carries the vendor's own stamp, ``05:00Z`` in
+    summer, so consumers key on the session and never on the stamp.
+    ``lake.bar_import`` is the one caller (marketlake #950).
+    """
+    return datetime(day.year, day.month, day.day, tzinfo=MARKET_TZ).astimezone(UTC)
+
+
 def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
     """The rows of ``rows`` that belong to the session being fetched.
 
@@ -1995,6 +2008,17 @@ def read_capture_spans(lake_root: Path) -> CaptureSpans:
         raise SpansAbsent(path) from exc
 
 
+def span_covers(span: CaptureSpan, bounds: SessionBounds) -> bool:
+    """Whether ``span`` covers the session whose bounds are ``bounds``.
+
+    The session's window is ``[open, equity_close]`` and the span is half-open ``[start, end)``,
+    and they must intersect. :func:`_span_sessions` gives the reasons for that reading and calls
+    this, and so does ``lake.bar_import``'s bound (marketlake #950), so the walk and the import
+    never disagree about which session capture covers.
+    """
+    return bounds.equity_close > span.start and (span.end is None or bounds.open < span.end)
+
+
 def _span_sessions(
     span: CaptureSpan, session_clock: SessionClock, calendar: Calendar, now: datetime
 ) -> Iterator[date]:
@@ -2039,6 +2063,10 @@ def _span_sessions(
     range from the spans rather than from a typed date is supposed to make impossible. It is
     refused here rather than later because the manifested skip never re-fetches what has landed,
     so a guard added afterwards would leave the partition on disk.
+
+    **The import's bound is this rule without its ceiling.** ``lake.bar_import`` refuses any
+    session on or after the first one :func:`span_covers` accepts, whether or not its close has
+    passed, so an import and this walk never name the same session (marketlake #950).
     """
     if span.end is not None and span.end <= span.start:
         return
@@ -2051,10 +2079,7 @@ def _span_sessions(
     while day <= last:
         if calendar.is_session(day):
             bounds = session_clock.bounds(day)
-            covered = bounds.equity_close > span.start and (
-                span.end is None or bounds.open < span.end
-            )
-            if covered and bounds.equity_close <= now:
+            if span_covers(span, bounds) and bounds.equity_close <= now:
                 yield day
         day += timedelta(days=1)
 
@@ -2508,9 +2533,11 @@ def _build_parser():
     # spans, the calendar and the clock, so a session the lake never captured cannot be named
     # by anyone. The session stays injectable on :func:`fetch_session_bars` for tests.
     #
-    # The design's "there is no backfill anywhere in the implementation" is about pre-capture
-    # history, and the floor is what keeps it true: every session this walks is one a capture
-    # span covers, so the run works forward from capture start and asks for nothing earlier.
+    # The floor keeps the sweep forward-only: every session this walks is one a capture span
+    # covers, so the run works forward from capture start and asks for nothing earlier. History
+    # before capture began reaches the lake only through ``lake.bar_import``, a separate writer
+    # that lands sessions before the first one a span covers and never one on or after it
+    # (marketlake #950).
     parser.add_argument(
         "--backfill",
         action="store_true",
@@ -2663,6 +2690,8 @@ __all__ = [
     "main",
     "plan_backfill",
     "select_session_rows",
+    "session_midnight",
+    "span_covers",
     "session_of",
 ]
 

@@ -1215,7 +1215,8 @@ def test_the_command_names_no_session_of_its_own(fixture_lake: FixtureLake, tmp_
     this job consults a capture-span floor, and the security master is not the barrier it
     looks like: a session it cannot place files a finding and lands the row anyway with a null
     ``instrument_id``. So the flag would have let one typo land bars for a session the lake
-    never captured, and the design says there is no backfill anywhere in the implementation.
+    never captured. History from before capture reaches the lake only through
+    ``lake.bar_import``, which refuses any session a capture span covers (marketlake #950).
     marketlake #319 owns the floor and the span of sessions a run covers.
     """
     root = _lake(fixture_lake)

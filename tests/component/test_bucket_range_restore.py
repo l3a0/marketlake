@@ -539,6 +539,13 @@ def test_the_sunday_scrub_window_refuses_before_any_request(tmp_path):
     line = _refuses(root, client, now=SUNDAY_20)
 
     assert "Sunday" in line and "19:55" in line
+    # The text the range restore printed before marketlake #950 shared the check with the bar
+    # import, which words its own refusal. Catches the shared wording leaking into this one.
+    assert line == (
+        "the range restore does not run on Sunday from 19:55 to 23:30, while the Sunday job may "
+        "be scrubbing the lake, since a download in flight reads to the scrub as an orphan. Run "
+        "it on another evening after the 18:30 sweep."
+    )
     assert client.calls == []
     assert not (root / SPY_1).exists()
 
@@ -553,6 +560,11 @@ def test_a_session_refuses_before_any_request(tmp_path, now):
     line = _refuses(root, client, now=now)
 
     assert "next session" in line
+    assert line == (
+        "the range restore stops at 2026-08-31T09:00:00-04:00, ahead of the next session's "
+        "capture start, because capture waits on the lake lock with no timeout. Run it after "
+        "that session's 18:30 sweep."
+    )
     assert client.calls == []
     assert not (root / SPY_1).exists()
 

@@ -175,6 +175,7 @@ from lake.journal import F_FULLFSYNC
 from lake.lock import lake_lock
 from lake.manifest import (
     _NAMED_PATHS,
+    BAR_IMPORT_SOURCE_PREFIX,
     SCRUB_EXCLUSIONS,
     BackupScrubResult,
     ManifestError,
@@ -198,12 +199,12 @@ from lake.paths import (
     MANIFEST_FILE,
     QUOTES,
     REPORTS_DIR,
-    TEMP_MARKER,
     TRIMMED_FILE,
     BarsRef,
     LakePaths,
     PartitionRef,
     is_reader_file,
+    leftover_temps,
     parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
@@ -3380,6 +3381,57 @@ def _surface_refusal(surface: str, command: str, accepted: frozenset[str]) -> st
     )
 
 
+@dataclass(frozen=True)
+class RunWindowWords:
+    """How one job words the two refusals ``_run_window_refusal`` shares.
+
+    ``job`` names it, ``in_flight`` names what the scrub would find half-written, and each
+    repair says when to run it instead, which differs because the range restore runs in the
+    evening and the bar import in the morning.
+    """
+
+    job: str
+    in_flight: str
+    sunday_repair: str
+    bound_repair: str
+
+
+_RANGE_RESTORE_WORDS = RunWindowWords(
+    job="the range restore",
+    in_flight="a download in flight",
+    sunday_repair="Run it on another evening after the 18:30 sweep",
+    bound_repair="Run it after that session's 18:30 sweep",
+)
+
+
+def _run_window_refusal(
+    now: datetime, *, clock: Clock, calendar: Calendar, words: RunWindowWords
+) -> str | None:
+    """Why a job may not hold the lake lock at ``now``, or ``None`` when it may.
+
+    Two windows refuse. The Sunday scrub window does, because the scrub takes no lock and a
+    file in flight reads to it as an orphan. So does a ``now`` inside a session or its pre-open
+    margin, by ``session_bound``, because capture waits on ``lake_lock`` with no timeout. The
+    range restore and the bar import (marketlake #950) both check it before the lock and again
+    after taking it, since a lock can be waited on past the bound. Each raises its own refusal
+    class on the text, worded by its own ``words``. ``resync`` keeps a twin of these two checks
+    in its own closure, which marketlake #966 tracks.
+    """
+    if in_sunday_scrub_window(now):
+        return (
+            f"{words.job} does not run on Sunday from 19:55 to 23:30, while the Sunday job may be "
+            f"scrubbing the lake, since {words.in_flight} reads to the scrub as an orphan. "
+            f"{words.sunday_repair}"
+        )
+    bound = session_bound(now, clock=clock, calendar=calendar)
+    if bound is not None and now >= bound:
+        return (
+            f"{words.job} stops at {bound.isoformat()}, ahead of the next session's capture "
+            f"start, because capture waits on the lake lock with no timeout. {words.bound_repair}"
+        )
+    return None
+
+
 def _reversed_refusal(first: date, last: date) -> str | None:
     """Why a range that ends before it starts refuses, or ``None`` for one that does not."""
     if first <= last:
@@ -3469,15 +3521,10 @@ def _fsync_path(path: Path) -> None:
 def _leftover_temps(path: Path) -> list[Path]:
     """Every temp file an atomic write to ``path`` could have left beside it.
 
-    ``paths.temp_write_path`` names it ``<name>.tmp-<pid>``. The directory is listed rather than
-    globbed, because a ticker is free text to a glob and ``[`` in one would match other names.
+    ``paths.leftover_temps`` reads ``paths.temp_write_path``'s ``<name>.tmp-<pid>``, for this
+    one name. The bar import asks it about every key of a vintage at once (marketlake #950).
     """
-    prefix = f"{path.name}{TEMP_MARKER}"
-    try:
-        names = os.listdir(path.parent)
-    except FileNotFoundError:
-        return []
-    return [path.parent / name for name in sorted(names) if name.startswith(prefix)]
+    return leftover_temps(path.parent, {path.name})
 
 
 def restore_range(
@@ -3566,20 +3613,11 @@ def restore_range(
         return RangeRestoreRefused(f"{why}.{done}")
 
     def guard() -> None:
-        now = clock.now()
-        if in_sunday_scrub_window(now):
-            raise refuse(
-                "the range restore does not run on Sunday from 19:55 to 23:30, while the Sunday "
-                "job may be scrubbing the lake, since a download in flight reads to the scrub as "
-                "an orphan. Run it on another evening after the 18:30 sweep"
-            )
-        bound = session_bound(now, clock=clock, calendar=calendar)
-        if bound is not None and now >= bound:
-            raise refuse(
-                f"the range restore stops at {bound.isoformat()}, ahead of the next session's "
-                "capture start, because capture waits on the lake lock with no timeout. Run it "
-                "after that session's 18:30 sweep"
-            )
+        why = _run_window_refusal(
+            clock.now(), clock=clock, calendar=calendar, words=_RANGE_RESTORE_WORDS
+        )
+        if why is not None:
+            raise refuse(why)
 
     def stamp() -> str:
         return clock.now().astimezone(MARKET_TZ).isoformat()
@@ -3931,7 +3969,14 @@ class ReadingRestoreSummary:
         )
 
 
-def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
+def _refuse_inside_lake_root(
+    dest: Path,
+    lake_root: Path,
+    *,
+    refusal: type[Exception] = RestoreRefused,
+    inside: str | None = None,
+    outcome: str = "nothing was restored",
+) -> None:
     """Refuse a destination that is ``lake_root`` or sits anywhere under it.
 
     The resolved destination and each of its ancestors is compared with ``lake_root`` by
@@ -3940,10 +3985,16 @@ def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
     destination under ``lake`` read as outside a ``lake_root`` spelled ``Lake``. A
     ``lake_root`` that cannot be statted falls back to comparing resolved paths. A failure to
     stat anything else is one line rather than a traceback.
+
+    The reading restore calls it with the defaults. The bar import (marketlake #950) passes its
+    own ``refusal`` class, the ``inside`` line for a source file in the lake, and the
+    ``outcome`` its other lines end on.
     """
-    refused = RestoreRefused(
-        f"{dest} is inside lake_root {lake_root}. A reading restore writes only outside the live "
-        "lake, so nothing was restored. Name a directory elsewhere"
+    refused = refusal(
+        inside
+        if inside is not None
+        else f"{dest} is inside lake_root {lake_root}. A reading restore writes only outside the "
+        "live lake, so nothing was restored. Name a directory elsewhere"
     )
     try:
         resolved = dest.resolve()
@@ -3964,15 +4015,14 @@ def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
             if os.path.samestat(here, root_stat):
                 raise refused
     except OSError as exc:
-        raise RestoreRefused(
+        raise refusal(
             _local(f"checking whether {dest} is inside lake_root {lake_root}", exc)
-            + ", so nothing was restored"
+            + f", so {outcome}"
         ) from None
     except RuntimeError as exc:
         # Python 3.12's ``Path.resolve`` raises this on a symbolic link loop.
-        raise RestoreRefused(
-            f"checking whether {dest} is inside lake_root {lake_root} failed ({exc}), so "
-            "nothing was restored"
+        raise refusal(
+            f"checking whether {dest} is inside lake_root {lake_root} failed ({exc}), so {outcome}"
         ) from None
 
 
@@ -4695,16 +4745,19 @@ def _plan_resync(
             for entry in lake_tail
             if entry["partition"] == SPANS_PARTITION
             or (entry["partition"] == QUARANTINE_FILE and entry.get("source") == SIGNOFF_SOURCE)
+            # No sweep regenerates an import, so the deletion above would lose it (#950).
+            or str(entry.get("source")).startswith(BAR_IMPORT_SOURCE_PREFIX)
         }
     )
     decided = [rel for rel in decided if holds_mine(rel)]
     if decided:
         raise refuse(
             f"this lake's own entries past the shared ones record a human decision in "
-            f"{_quoted(decided)}, an onboard, retire or seed_spans write to {SPANS_PARTITION} "
-            f"or a signoff in {QUARANTINE_FILE}, which the bucket's copy would silently "
-            "replace, so the resync changed nothing. Redo that decision on the primary after "
-            "the switch, or move the file out of the lake by hand, then run the resync again"
+            f"{_quoted(decided)}, an onboard, retire or seed_spans write to {SPANS_PARTITION}, "
+            f"a signoff in {QUARANTINE_FILE} or a bars import by python -m lake.bar_import, "
+            "which the bucket's copy would silently replace or delete, so the resync changed "
+            "nothing. Redo that decision on the primary after the switch, or move the file out "
+            "of the lake by hand, then run the resync again"
         )
     if outside:
         raise refuse(
@@ -4855,7 +4908,8 @@ def _rewrite_manifest(root: Path, keep: int, tail: bytes, expected: bytes) -> No
     the whole file must then read back as ``expected``. Each flush is :func:`_flush_fd`'s. A
     crash leaves the file as it was or as a byte prefix of ``expected``, and a re-run finishes
     from either. ``keep`` is never 0, since the plan refuses a rewind that shares no whole
-    line, so the file is never empty between the two writes. The lock's own descriptor is
+    line and the bar import's undo refuses a cut to an empty manifest (marketlake #950), so the
+    file is never empty between the two writes. The lock's own descriptor is
     never touched, so the lock holds throughout.
     """
     path = manifest_path(root)
@@ -4937,14 +4991,16 @@ def resync(
        step 6's list, refuses whatever its bytes: a chains or quotes partition B does not
        name, or a journal segment no compacted partition and no segment of B covers, may be
        the only copy, and any other such file is one the resync would leave unrecorded. An
-       entry for the capture spans, or a signoff in the quarantine ledger, is a human
-       decision the bucket's copy would silently replace, and refuses only while the file on
-       disk still holds that tail's sha for its path. An entry for the schema-version ledger
-       is a warning instead. Last, a download or a deletion whose path differs only by case
-       from another path B names or this lake's tail names refuses.
+       entry for the capture spans, a signoff in the quarantine ledger, or a ``bars/``
+       partition whose ``source`` starts ``bar-import:``, which no sweep regenerates
+       (marketlake #950), is a human decision the bucket's copy would silently replace, and
+       refuses only while the file on disk still holds that tail's sha for its path. An entry
+       for the schema-version ledger is a warning instead. Last, a download or a deletion
+       whose path differs only by case from another path B names or this lake's tail names
+       refuses.
     6. Deletions: a file only this lake's tail names, on disk, goes when it is a journal
-       segment whose compacted partition B records, a ``bars/`` partition, or a
-       ``trimmed.jsonl`` B names none of, whatever its bytes.
+       segment whose compacted partition B records, a ``bars/`` partition the sweep wrote, or
+       a ``trimmed.jsonl`` B names none of, whatever its bytes.
     7. Checks: every download is in the listing, its stored SHA-256 equals B's entry, and the
        free space left covers the journal reserve. A stored SHA-256 that differs means the
        other host's last upload stopped before its ``manifest.jsonl`` or is still running,
