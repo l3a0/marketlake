@@ -6,7 +6,8 @@
 #
 #     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]
 #
-# --override-window skips the window's refusal in step 3 and nothing else, marketlake #987.
+# --override-window skips the window's refusal in step 3, except during a session, and
+# nothing else, marketlake #987.
 # The owner gives it by hand, or through the deploy workflow's override_window input on a
 # run started by hand. Every line the wrapper prints then ends ", with the deploy window
 # overridden", so nobody reads the outcome as an ordinary deploy's.
@@ -41,8 +42,9 @@
 #        given, when a com.marketlake.* service
 #        other than the two residents is in a state other than inactive or failed, or
 #        when the daemon's cgroup holds a process besides its main one, such as a
-#        compaction. It keeps the window's next_span_start for step 6, and under
-#        --override-window reads today's close hold for step 6 too. The two busy
+#        compaction. It keeps the window's next_span_start for step 6. Under
+#        --override-window it refuses inside today's session hold, and keeps the hold
+#        for step 6 too. The two busy
 #        checks live in deploy/busy-check.sh, which deploy/vm-stop.sh sources too;
 #     4. fetches origin main as the owner, and refuses with exit 2 a sha not on
 #        origin/main, a sha behind HEAD, a dirty tree or a branch other than main. It
@@ -54,8 +56,8 @@
 #     6. decides whether a restart is owed: when the record is absent or names another
 #        sha, or when needrestart names a com.marketlake.* service still mapping a
 #        replaced library. After a bootstrap exit 0 or 4 it waits up to 15 minutes for
-#        the busy checks of step 3 to clear, and under the override for the close hold to
-#        pass, then restarts the daemon, checks that its
+#        the busy checks of step 3 to clear, and under the override for the session to
+#        end, then restarts the daemon, checks that its
 #        MainPID holds for 120 seconds, and restarts the dashboard. After any other exit
 #        it restarts nothing;
 #     7. rolls back after a failed daemon restart, or after a failed bootstrap in a run
@@ -474,24 +476,44 @@ elif [[ $WINDOW_RC == 3 ]]; then
   finish 3 "not deployed: $WINDOW_LINE"
 fi
 
-# An overridden deploy can restart the daemon during a session, and the busy checks cannot
-# see the close cycles, which run inside it. So it reads today's close hold, from the
-# equity close to the close+15 compaction, and the wait before the restart holds the
-# restart out of it (#987). An ordinary deploy never starts inside a session.
-CLOSE_HOLD_START=""
-CLOSE_HOLD_END=""
+# The override never skips market hours (the owner's ruling on #987). It reads today's
+# session hold and refuses a start from the margin before the open to the close+15
+# compaction, so a deploy it lets start ends before the open. The wait before the restart
+# holds the restart out of the session too. An ordinary deploy never reaches a session.
+SESSION_OPEN=""
+SESSION_END=""
 if [[ $OVERRIDE == 1 ]]; then
   HOLD_RC=0
-  HOLD_OUT="$(as_owner "$PYTHON" -m lake.deploy_window --close-hold)" || HOLD_RC=$?
+  HOLD_OUT="$(as_owner "$PYTHON" -m lake.deploy_window --session-hold)" || HOLD_RC=$?
   out "$HOLD_OUT"
-  HOLD_RE='^close_hold=(0|[1-9][0-9]*),(0|[1-9][0-9]*)$'
   if [[ $HOLD_RC != 0 ]]; then
-    finish 1 "not deployed: python -m lake.deploy_window --close-hold exited $HOLD_RC"
-  elif [[ "$HOLD_OUT" =~ $HOLD_RE ]]; then
-    CLOSE_HOLD_START="${BASH_REMATCH[1]}"
-    CLOSE_HOLD_END="${BASH_REMATCH[2]}"
-  elif [[ "$HOLD_OUT" != close_hold=none ]]; then
-    finish 1 "not deployed: python -m lake.deploy_window printed no close_hold line"
+    finish 1 "not deployed: python -m lake.deploy_window --session-hold exited $HOLD_RC"
+  fi
+  HOLD_LINE=""
+  HOLD_VALUE=""
+  LINES=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    LINES=$((LINES + 1))
+    case "$LINES" in
+      1) HOLD_LINE="$line" ;;
+      2) HOLD_VALUE="$line" ;;
+    esac
+  done <<< "$HOLD_OUT"
+  # The hold's line reaches a public log, so only its own shape passes.
+  WHEN_RE='[A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Z]{3,4}'
+  HOLD_LINE_RE="^the session holds a deploy from $WHEN_RE until $WHEN_RE\$"
+  HOLD_RE='^session_hold=(0|[1-9][0-9]*),(0|[1-9][0-9]*),(0|[1-9][0-9]*)$'
+  if [[ $LINES == 2 && "$HOLD_LINE" =~ $HOLD_LINE_RE && "$HOLD_VALUE" =~ $HOLD_RE ]]; then
+    REFUSE_FROM="${BASH_REMATCH[1]}"
+    SESSION_OPEN="${BASH_REMATCH[2]}"
+    SESSION_END="${BASH_REMATCH[3]}"
+    NOW="$(date +%s)"
+    if [[ $NOW -ge $REFUSE_FROM && $NOW -lt $SESSION_END ]]; then
+      finish 3 "not deployed: $HOLD_LINE, which the override does not skip"
+    fi
+  elif [[ $LINES != 2 || "$HOLD_LINE" != "no session holds a deploy today" \
+    || "$HOLD_VALUE" != session_hold=none ]]; then
+    finish 1 "not deployed: python -m lake.deploy_window printed no session_hold line"
   fi
 fi
 
@@ -630,7 +652,7 @@ NOT_RESTARTED="not restarted: the tree is at $SHA, and the last recorded deploy 
 
 # Waits for the busy checks to clear, polling, and gives up when the wait runs out or the
 # next refused span is too close for a restart and its check. Under the override it also
-# waits while a restart and its check would overlap the close hold. No Python runs here,
+# waits while a restart and its check would overlap the session. No Python runs here,
 # since the venv now imports the new commit.
 wait_until_clear() {
   local polls=$((BUSY_WAIT_SECONDS / POLL_SECONDS)) n=0 rc now
@@ -641,10 +663,10 @@ wait_until_clear() {
       return 1
     fi
     rc=0
-    if [[ -n "$CLOSE_HOLD_START" && $(( now + RESTART_CHECK_SECONDS )) -ge $CLOSE_HOLD_START \
-      && $now -lt $CLOSE_HOLD_END ]]; then
+    if [[ -n "$SESSION_OPEN" && $(( now + RESTART_CHECK_SECONDS )) -ge $SESSION_OPEN \
+      && $now -lt $SESSION_END ]]; then
       rc=1
-      BUSY_REASON="the session's close runs until epoch $CLOSE_HOLD_END"
+      BUSY_REASON="the session runs until epoch $SESSION_END"
     else
       busy_check || rc=$?
     fi

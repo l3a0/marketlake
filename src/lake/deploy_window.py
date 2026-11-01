@@ -41,19 +41,25 @@ than ``MARGIN``.
 Every span is measured in absolute time, as UTC instants, so a span next to a clock change
 is still the right number of real minutes long.
 
-**The close hold keeps an overridden deploy's restart off the session's close.** A deploy
-that overrides the window (marketlake #987) can restart the daemon during a session, and
-the busy checks cannot see the close cycles, which run inside the daemon. A restart that
-kills the equity close's cycle loses that day's ``spot_close`` for good, and one that
-kills the close+5 fill can lose the ``option_close``. So ``--close-hold`` prints one line
-instead of the two above, ``close_hold=<start>,<end>`` in epoch seconds, or
-``close_hold=none`` when today is not a session. It runs from today's equity close to its
-close+15 compaction, which the busy check sees once it starts. Both come from
-``SessionClock.bounds``, so an early close moves the hold with it. ``vm-deploy.sh`` reads
-it only under the override and holds the restart out of it.
+**The session hold keeps an overridden deploy out of market hours.** A deploy that
+overrides the window (marketlake #987) skips the spans above, and on 2026-11-01 the owner
+ruled that it still never runs during a session. The busy checks cannot see the capture
+cycles or the close+5 fill, which run inside the daemon, and a restart that kills the
+equity close's cycle loses that day's ``spot_close`` for good. So ``--session-hold``
+prints two lines instead of the two above.
+
+1. A line for people, naming today's hold in Eastern time, or saying no session holds a
+   deploy today.
+2. ``session_hold=<refuse_from>,<open>,<end>`` in epoch seconds, or ``session_hold=none``.
+   ``end`` is the close+15 compaction, which the busy check sees once it starts.
+   ``refuse_from`` is ``MARGIN`` before the open, so a deploy that starts before it ends,
+   or rolls back, before the session opens. ``vm-deploy.sh`` refuses an overridden start
+   from ``refuse_from`` to ``end`` and holds its restart out of ``open`` to ``end``.
+
+The times come from ``SessionClock.bounds``, so an early close moves the hold with it.
 
 The module reads the clock through the ``Clock`` seam, and the exchange calendar for the
-close hold, and nothing else. It needs no config file and no lake, so it runs before the
+session hold, and nothing else. It needs no config file and no lake, so it runs before the
 deploy has checked either.
 """
 
@@ -219,22 +225,25 @@ def _minutes(delta: timedelta) -> int:
     return int(delta.total_seconds() // 60)
 
 
-def close_hold(clock: Clock, calendar: Calendar) -> tuple[datetime, datetime] | None:
-    """Today's span from the equity close to the close+15 compaction, or ``None`` off a
-    session, in which an overridden deploy must not restart the daemon (#987)."""
+def session_hold(clock: Clock, calendar: Calendar) -> tuple[datetime, datetime, datetime] | None:
+    """Today's ``refuse_from``, ``open`` and ``end`` for an overridden deploy (#987), or
+    ``None`` off a session."""
     session = SessionClock(clock, calendar)
     today = session.session_date()
     if not calendar.is_session(today):
         return None
     bounds = session.bounds(today)
-    return bounds.equity_close, bounds.compaction
+    return bounds.open - MARGIN, bounds.open, bounds.compaction
 
 
-def close_hold_line(hold: tuple[datetime, datetime] | None) -> str:
+def session_hold_lines(hold: tuple[datetime, datetime, datetime] | None) -> tuple[str, str]:
     if hold is None:
-        return "close_hold=none"
-    start, end = hold
-    return f"close_hold={int(start.timestamp())},{int(end.timestamp())}"
+        return ("no session holds a deploy today", "session_hold=none")
+    refuse_from, opens, end = hold
+    return (
+        f"the session holds a deploy from {_eastern(refuse_from)} until {_eastern(end)}",
+        "session_hold=" + ",".join(str(int(when.timestamp())) for when in hold),
+    )
 
 
 def main(
@@ -252,18 +261,19 @@ def main(
         description="Exit 0 when a deploy of the hosted VM may start now, and 3 when not.",
     )
     parser.add_argument(
-        "--close-hold",
+        "--session-hold",
         action="store_true",
-        help="print only today's close hold, which an overridden deploy's restart avoids",
+        help="print today's session hold, which an overridden deploy stays out of",
     )
     args = parser.parse_args(argv)
     if clock is None:
         from lake.clock import SystemClock  # lazy: only the console reads the wall clock
 
         clock = SystemClock()
-    if args.close_hold:
+    if args.session_hold:
         calendar = ExchangeCalendar() if calendar is None else calendar
-        print(close_hold_line(close_hold(clock, calendar)))
+        for line in session_hold_lines(session_hold(clock, calendar)):
+            print(line)
         return ALLOWED
     verdict = decide(clock.now())
     for line in verdict.lines():

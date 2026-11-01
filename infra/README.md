@@ -2444,8 +2444,14 @@ The window can refuse a deploy for hours. On 2026-11-01 the deploy of
 [PR #977](https://github.com/l3a0/marketlake/pull/977) was approved at about 17:20 ET on a
 Sunday and refused until 23:30, under the 210-minute margin then in force. A run started
 by hand can skip that refusal
-([#987](https://github.com/l3a0/marketlake/issues/987)). It skips nothing else, and it still
-waits for the owner's approval.
+([#987](https://github.com/l3a0/marketlake/issues/987)), except during market hours. It
+skips nothing else, and it still waits for the owner's approval.
+
+On a session day the VM refuses an overridden deploy from 90 minutes before the open until
+the close+15 compaction, which is 08:00 to 16:30 Eastern on a regular day and 08:00 to
+13:30 on an early close. A deploy it lets start then ends before the session opens, and
+its restart never lands inside the session. So a weekday override can start from 06:30 to
+08:00 and from 16:30 to 18:45, and a refusal names the hold it hit.
 
 1. **End any deploy run that waits on approval first.** Every deploy run joins the
    `deploy-vm` concurrency group, and a run waiting on approval holds it. A run started
@@ -2467,10 +2473,7 @@ waits for the owner's approval.
    keeps the override too.
 
 The VM still refuses with exit 3 while a job runs, such as the sweep or its upload, and its
-restart still waits up to 15 minutes for the busy checks. On a session day it also waits
-out the close, from the equity close to the close+15 compaction, which is 16:00 to 16:30
-on a regular day and 13:00 to 13:30 on an early close, because the daemon runs the close
-cycles itself and the busy checks cannot see them. The restart still refuses to
+restart still waits up to 15 minutes for the busy checks. The restart still refuses to
 start within 180 seconds of the next refused span opening. Started inside a span, that is
 the span after, so the restart runs once the busy checks clear. Started in the hours before
 a span, a restart that cannot start in time ends `not restarted`, and the same run started
@@ -2507,26 +2510,18 @@ run for the commit the VM already runs. It skips nothing and restarts nothing, a
 `deployed: <sha> (already current), with the deploy window overridden`.
 
 After an override that ends `not restarted`, because its bootstrap ran past the next span's
-opening, restart with another override run once that span has opened. An ordinary deploy
-waits for the window to allow it, and the daemon runs the old code until then.
+opening, restart with another override run once that span has opened and, on a session
+day, once the session hold has ended. An ordinary deploy waits for the window to allow
+it, and the daemon runs the old code until then.
 
 To withdraw the override, revert the pull request that added it. A document left with
 `overrideWindow` does nothing while its default is `false`.
 
-Its price is the reason the window exists, and `docs/design.md` measures it. Override
-inside a session only for a fix that cannot wait for 18:45.
+Its price is the reason the window exists, and `docs/design.md` measures it.
 
 - A deploy over the Sunday canary at 20:00 can make the `sunday` check miss and page.
-- A restart during a session loses the minute it lands in, marked `daemon_dead`. The busy
-  checks cannot see the cycles, which run inside the daemon.
-- The restart waits out the close, but a rollback's restart after a failed restart does
-  not, and a restart that kills the 16:00 cycle loses that day's `spot_close` for every
-  ticker, for good.
-- Started shortly before a span, a failed bootstrap stays in place through the span,
-  because its rollback waits like a restart.
-- A commit that changes a capture schema, such as one touching `src/lake/journal.py`,
-  splits each ticker-day in flight. A retyped column then refuses that ticker-day's
-  compaction until it is recompacted by hand.
+- Started shortly before a span, such as at 07:55 on a weekday, a failed bootstrap stays
+  in place through the span, because its rollback waits like a restart.
 
 ### The `deploy` environment and its secret
 

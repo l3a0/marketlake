@@ -304,10 +304,10 @@ FAKE_LINUX_INSTALL = (
 # The checkout's venv interpreter. The render and the roster read stdin, which the fake
 # keeps so a test can check what each was fed. The deploy window prints its two lines,
 # FAKE_WINDOW_LINE and a next_span_start of FAKE_NEXT_SPAN, and exits FAKE_WINDOW_RC.
-# FAKE_WINDOW_BAD prints one line with no span instead. With --close-hold it prints
-# FAKE_CLOSE_HOLD, close_hold=none by default, and exits FAKE_CLOSE_HOLD_RC. The control
-# plane, which deploy/vm-stop.sh runs as `ping vm-stop`, prints a ping line and exits
-# FAKE_PING_RC.
+# FAKE_WINDOW_BAD prints one line with no span instead. With --session-hold it prints
+# FAKE_SESSION_LINE and FAKE_SESSION_HOLD when the second is set, the two lines for no
+# session otherwise, and exits FAKE_SESSION_HOLD_RC. The control plane, which
+# deploy/vm-stop.sh runs as `ping vm-stop`, prints a ping line and exits FAKE_PING_RC.
 FAKE_VENV_PYTHON = (
     "#!/bin/bash\n"
     'printf \'venv-python %s\\n\' "$*" >> "$LOG"\n'
@@ -317,9 +317,16 @@ FAKE_VENV_PYTHON = (
   lake.token_store) exit "$(next_rc pull "${PULL_RCS:-}")" ;;
   lake.roster) cat > "$STATE/stdin-roster"; exit "$(next_rc roster "${ROSTER_RCS:-}")" ;;
   lake.deploy_window)
-    if [[ "${3:-}" == --close-hold ]]; then
-      echo "${FAKE_CLOSE_HOLD:-close_hold=none}"
-      exit "${FAKE_CLOSE_HOLD_RC:-0}"
+    if [[ "${3:-}" == --session-hold ]]; then
+      if [[ -n "${FAKE_SESSION_HOLD:-}" ]]; then
+        held="the session holds a deploy from Mon 2026-11-02 08:00 EST"
+        echo "${FAKE_SESSION_LINE:-$held until Mon 2026-11-02 16:30 EST}"
+        echo "$FAKE_SESSION_HOLD"
+      else
+        echo "no session holds a deploy today"
+        echo "session_hold=none"
+      fi
+      exit "${FAKE_SESSION_HOLD_RC:-0}"
     fi
     if [[ -n "${FAKE_WINDOW_BAD:-}" ]]; then echo "a deploy may start now"; exit 0; fi
     echo "${FAKE_WINDOW_LINE:-a deploy may start now, and until Mon 2026-10-12 06:30 EDT}"

@@ -432,10 +432,10 @@ def _mode(override: bool) -> tuple[list[str], dict[str, str], str]:
     return ["--override-window"], {"FAKE_WINDOW_RC": "3", "FAKE_WINDOW_LINE": REFUSAL}, OVERRIDDEN
 
 
-def _hold(start: int, end: int) -> str:
-    """A close_hold line from ``start`` to ``end`` seconds after now."""
+def _hold(refuse_from: int, opens: int, end: int) -> str:
+    """A session_hold line whose three moments are these many seconds after now."""
     now = int(time.time())
-    return f"close_hold={now + start},{now + end}"
+    return f"session_hold={now + refuse_from},{now + opens},{now + end}"
 
 
 # -- the tools -------------------------------------------------------------------------
@@ -1212,19 +1212,64 @@ def test_the_override_keeps_the_restarts_bound(vm):
     assert not vm.ran("restart.sh")
 
 
-@pytest.mark.parametrize(
-    ("start", "end"), [(-60, 3600), (100, 3600)], ids=["inside the hold", "within the lead"]
+HOLD_LINE = (
+    "the session holds a deploy from Mon 2026-11-02 08:00 EST until Mon 2026-11-02 16:30 EST"
 )
-def test_the_override_holds_the_restart_out_of_the_close(vm, start, end):
-    """The close cycles run inside the daemon, where the busy checks cannot see them, so
-    an overridden restart waits out today's close hold and gives up as for a busy job."""
+
+
+@pytest.mark.parametrize(
+    ("refuse_from", "opens", "end"),
+    [(0, 5400, 30000), (-5400, -60, 3600), (-30000, -24600, 60)],
+    ids=["from the margin", "in the session", "before the compaction"],
+)
+def test_the_override_refuses_inside_the_session_hold(vm, refuse_from, opens, end):
+    """The owner ruled on 2026-11-01 that the override never runs during market hours."""
+    proc = vm.deploy(
+        vm.c["c2"],
+        "--override-window",
+        FAKE_WINDOW_RC="3",
+        FAKE_WINDOW_LINE=REFUSAL,
+        FAKE_SESSION_HOLD=_hold(refuse_from, opens, end),
+    )
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert (
+        _outcome(proc) == f"not deployed: {HOLD_LINE}, which the override does not skip{OVERRIDDEN}"
+    )
+    assert not vm.ran(f"sudo -u {OWNER} -H timeout")
+    _assert_untouched(vm)
+
+
+@pytest.mark.parametrize(
+    ("refuse_from", "opens", "end"),
+    [(-30000, -24600, -1), (60, 5460, 30000)],
+    ids=["after the compaction", "before the margin"],
+)
+def test_the_override_deploys_outside_the_session_hold(vm, refuse_from, opens, end):
     vm.record(vm.c["c1"])
     proc = vm.deploy(
         vm.c["c3"],
         "--override-window",
         FAKE_WINDOW_RC="3",
         FAKE_WINDOW_LINE=REFUSAL,
-        FAKE_CLOSE_HOLD=_hold(start, end),
+        FAKE_SESSION_HOLD=_hold(refuse_from, opens, end),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr + vm.deploy_log.read_text()
+    assert _outcome(proc) == f"deployed: {vm.c['c3']}{OVERRIDDEN}"
+    assert not vm.ran("sleep 30")
+
+
+@pytest.mark.parametrize("opens", [-60, 100], ids=["open", "within the lead"])
+def test_the_override_holds_the_restart_out_of_the_session(vm, opens):
+    """A deploy that started before the hold and ran long still never restarts inside the
+    session. The capture cycles run inside the daemon, where the busy checks cannot see
+    them, so the wait gives up as for a busy job."""
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(
+        vm.c["c3"],
+        "--override-window",
+        FAKE_WINDOW_RC="3",
+        FAKE_WINDOW_LINE=REFUSAL,
+        FAKE_SESSION_HOLD=_hold(3000, opens, 30000),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _outcome(proc) == (
@@ -1233,67 +1278,69 @@ def test_the_override_holds_the_restart_out_of_the_close(vm, start, end):
     )
     assert vm.ran("sleep") == ["sleep 30"] * 30
     assert not vm.ran("restart.sh")
-    assert "waiting, because the session's close runs until epoch" in vm.deploy_log.read_text()
+    assert "waiting, because the session runs until epoch" in vm.deploy_log.read_text()
 
 
-@pytest.mark.parametrize(
-    ("start", "end"), [(-7200, -1), (7200, 9000)], ids=["passed", "hours ahead"]
-)
-def test_a_close_hold_away_from_now_lets_the_restart_run(vm, start, end):
-    vm.record(vm.c["c1"])
-    proc = vm.deploy(
-        vm.c["c3"],
-        "--override-window",
-        FAKE_WINDOW_RC="3",
-        FAKE_WINDOW_LINE=REFUSAL,
-        FAKE_CLOSE_HOLD=_hold(start, end),
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr + vm.deploy_log.read_text()
-    assert _outcome(proc) == f"deployed: {vm.c['c3']}{OVERRIDDEN}"
-    assert not vm.ran("sleep 30")
+def _session_hold_call(vm: VM) -> str:
+    return f"sudo -u {OWNER} -H {vm.checkout}/.venv/bin/python -m lake.deploy_window --session-hold"
 
 
-def _close_hold_call(vm: VM) -> str:
-    return f"sudo -u {OWNER} -H {vm.checkout}/.venv/bin/python -m lake.deploy_window --close-hold"
-
-
-def test_the_close_hold_is_read_before_the_merge_under_the_override(vm):
+def test_the_session_hold_is_read_before_the_fetch_under_the_override(vm):
     fetch = f"sudo -u {OWNER} -H timeout 300 git -C {vm.checkout} fetch origin main"
     proc = vm.deploy(vm.c["c3"], "--override-window")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     calls = vm.calls()
-    assert calls.index(_close_hold_call(vm)) < calls.index(fetch)
+    assert calls.index(_session_hold_call(vm)) < calls.index(fetch)
 
 
-def test_an_ordinary_deploy_never_reads_the_close_hold(vm):
-    proc = vm.deploy(vm.c["c2"], FAKE_CLOSE_HOLD=_hold(-60, 3600))
+def test_an_ordinary_deploy_never_reads_the_session_hold(vm):
+    proc = vm.deploy(vm.c["c2"], FAKE_SESSION_HOLD=_hold(-60, 0, 3600))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _close_hold_call(vm) not in vm.calls()
+    assert _session_hold_call(vm) not in vm.calls()
+
+
+NO_HOLD = "not deployed: python -m lake.deploy_window printed no session_hold line"
 
 
 @pytest.mark.parametrize(
     ("env", "line"),
     [
         (
-            {"FAKE_CLOSE_HOLD_RC": "2"},
-            "not deployed: python -m lake.deploy_window --close-hold exited 2",
+            {"FAKE_SESSION_HOLD_RC": "2"},
+            "not deployed: python -m lake.deploy_window --session-hold exited 2",
         ),
+        ({"FAKE_SESSION_HOLD": "session_hold=soon"}, NO_HOLD),
+        ({"FAKE_SESSION_HOLD": "session_hold=1,2"}, NO_HOLD),
+        ({"FAKE_SESSION_HOLD": "session_hold=01,2,3"}, NO_HOLD),
+        ({"FAKE_SESSION_HOLD": "session_hold=1,2,3", "FAKE_SESSION_LINE": "held"}, NO_HOLD),
         (
-            {"FAKE_CLOSE_HOLD": "close_hold=soon"},
-            "not deployed: python -m lake.deploy_window printed no close_hold line",
+            {
+                "FAKE_SESSION_HOLD": "session_hold=1,2,3",
+                "FAKE_SESSION_LINE": HOLD_LINE + " by SENTINEL-FROM-THE-HOST",
+            },
+            NO_HOLD,
         ),
+        ({"FAKE_SESSION_HOLD": "session_hold=none"}, NO_HOLD),
         (
-            {"FAKE_CLOSE_HOLD": "close_hold=1,"},
-            "not deployed: python -m lake.deploy_window printed no close_hold line",
-        ),
-        (
-            {"FAKE_CLOSE_HOLD": "close_hold=01,2"},
-            "not deployed: python -m lake.deploy_window printed no close_hold line",
+            {
+                "FAKE_SESSION_LINE": "no session holds a deploy today",
+                "FAKE_SESSION_HOLD": "session_hold=soon",
+            },
+            NO_HOLD,
         ),
     ],
-    ids=["exit 2", "not a number", "no end", "a leading zero"],
+    ids=[
+        "exit 2",
+        "not a number",
+        "two moments",
+        "a leading zero",
+        "a line of another shape",
+        "a line carrying more",
+        "none under a hold line",
+        "no session beside a bad value",
+    ],
 )
-def test_a_close_hold_it_cannot_read_is_not_deployed(vm, env, line):
+def test_a_session_hold_it_cannot_read_is_not_deployed(vm, env, line):
     proc = vm.deploy(vm.c["c2"], "--override-window", **env)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _outcome(proc) == line + OVERRIDDEN
