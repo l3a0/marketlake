@@ -1177,6 +1177,34 @@ def test_the_undo_refuses_in_the_run_window(tmp_path):
     assert _snapshot(root) == after
 
 
+def test_the_undo_checks_the_window_before_it_reads_the_bucket(tmp_path):
+    """Catches a window checked only under the lock, after the bucket's requests."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    client = FakeS3()
+
+    assert "Sunday" in _undo_refused(root, sources, vintages, client=client, now=SUNDAY_20)
+    assert client.calls == []
+
+
+def test_the_undo_checks_the_window_again_once_the_lock_is_taken(tmp_path, monkeypatch):
+    """A lock waited on past the bound. Catches a window checked only before the lock."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    clock = ManualClock(MONDAY_0745)
+    real = bar_import.lake_lock
+
+    @contextmanager
+    def slow_lock(path):
+        clock.set(MONDAY_BOUND)
+        with real(path):
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", slow_lock)
+    after = _snapshot(root)
+
+    assert "next session" in _undo_refused(root, sources, vintages, now=clock)
+    assert _snapshot(root) == after
+
+
 def test_a_manifest_that_changed_before_the_lock_refuses_the_undo(tmp_path, monkeypatch):
     """A capture cycle appends while the undo reads the bucket. Catches a cut made from the
     bytes read before the lock."""
