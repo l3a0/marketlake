@@ -849,3 +849,22 @@ def test_the_cassette_key_is_the_one_the_vendor_looks_up():
         "end": "2026-10-30T04:00:00+00:00",
     }
     assert BARS_ENDPOINT == "bars"
+
+
+def test_the_schwab_command_reads_the_bucket_for_a_missing_key(tmp_path, monkeypatch, capsys):
+    """Catches a command that passes no bucket, which would refuse the one repair an undo stopped
+    part-way before the upload needs."""
+    root, rel, _original = _lost_one(tmp_path)
+    monkeypatch.setattr(bar_import, "connect", lambda config: (UNDO_TARGET, FakeS3()))
+    config = write_config(tmp_path, root)
+
+    code = bar_import.main(
+        ["schwab", "GLD", "--config", str(config)],
+        clock=ManualClock(TUESDAY_0745),
+        calendar=CALENDAR,
+        vendor_factory=lambda *a, **k: _Vendors(GLD=_vendor()),
+    )
+
+    assert code == 0
+    assert (root / rel).exists()
+    assert "1 recorded file(s) found missing and written again" in capsys.readouterr().out
