@@ -1710,7 +1710,7 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
 | `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |
 | `not deployed: <reason>` | 1, 2 or 3 | Exit 3 means not now: run again at the moment the line names, or once the named job has finished. Exit 2 is a refusal, such as a sha not on `main`, a dirty checkout or a daemon that is not running, and the line names what to fix. Exit 1 is a failure, and the log says which step. |
-| Any line above, ending `, with the deploy window overridden` | as that line | The run was given `--override-window`. Read the line without the suffix. |
+| Any line above, ending `, with the deploy window overridden` | as that line | The run was given `--override-window`. Read the line without the suffix. A `not restarted` line from an override needs another override run to restart, as [Override the deploy window](#override-the-deploy-window) says, because an ordinary deploy waits for the window. |
 | `outcome unknown: read deploy.log` | 1 | The run was killed, left no result, or found the checkout in a state it could not restore. First run `systemctl is-active marketlake-deploy`, and wait while it prints `active`, because Ctrl-C on a hand run leaves the deploy running. Then compare `git -C ~/marketlake rev-parse HEAD` with `sudo cat /var/lib/marketlake/deployed`. When they differ, deploy `HEAD` again. When `git -C ~/marketlake status --porcelain` lists changes, a merge failed partway and so did its restore, so first run `git -C ~/marketlake reset --hard` and `git -C ~/marketlake clean -fd` inside the hours above. |
 
 **The hand procedure, for a daemon that is not running.** The script refuses with exit 2
@@ -2451,8 +2451,11 @@ waits for the owner's approval.
    while one waits stays pending behind it, and a push to `main` in the meantime cancels
    that pending run. Approve the waiting run, which the window refuses at once with exit
    3, or cancel it.
-2. **Start the run with the input.** In the Actions tab, run the Deploy workflow on `main`
-   with "Skip the VM's deploy window refusal" ticked, or run this.
+2. **Start the run with the input.** Before 19:30 ET on a Sunday the VM is stopped, since
+   `marketlake-start-sunday` starts it only then, so first start it and wait for it to
+   run, as [Start a stopped instance](#start-a-stopped-instance) says. In the Actions tab,
+   run the Deploy workflow on `main` with "Skip the VM's deploy window refusal" ticked, or
+   run this.
 
    ```bash
    gh workflow run deploy.yml --repo l3a0/marketlake --ref main -f override_window=true
@@ -2482,12 +2485,41 @@ The override needs two things in place first. The `marketlake-deploy` document m
 its `overrideWindow` parameter, which an infra apply adds, or `SendCommand` fails with
 `InvalidParameters`. And the VM must have deployed a commit that carries the flag once,
 because the deploy runs the checkout's script before it moves it, and an older script
-refuses the flag with its usage line and exit 2.
+refuses the flag with its usage line and exit 2. Check the first with the admin profile.
 
-Its price is the reason the window exists. A deploy over the Sunday canary at 20:00 can
-make the `sunday` check miss and page. A restart during capture ends the daemon's cycle in
-progress, and a moved checkout changes what every new process imports from the moment the
-merge lands.
+```bash
+aws ssm describe-document --name marketlake-deploy --query 'Document.Parameters[].Name' --profile marketlake-admin --region us-east-1
+```
+
+It lists `overrideWindow` once the apply has run. Check the second on the VM, where this
+prints a count above zero once the checkout carries the flag.
+
+```bash
+grep -c -- --override-window ~/marketlake/deploy/vm-deploy.sh
+```
+
+Drill it once before an evening that needs it. During the allowed hours, start an override
+run for the commit the VM already runs. It skips nothing and restarts nothing, and ends
+`deployed: <sha> (already current), with the deploy window overridden`.
+
+After an override that ends `not restarted`, because its bootstrap ran past the next span's
+opening, restart with another override run once that span has opened. An ordinary deploy
+waits for the window to allow it, and the daemon runs the old code until then.
+
+To withdraw the override, revert the pull request that added it. A document left with
+`overrideWindow` does nothing while its default is `false`.
+
+Its price is the reason the window exists, and `docs/design.md` measures it. Override
+inside a session only for a fix that cannot wait for 18:45.
+
+- A deploy over the Sunday canary at 20:00 can make the `sunday` check miss and page.
+- A restart during a session loses the minute it lands in, marked `daemon_dead`. The busy
+  checks cannot see the cycles, which run inside the daemon.
+- A restart that kills the 16:00 cycle loses that day's `spot_close` for every ticker,
+  for good.
+- A commit that changes a capture schema, such as one touching `src/lake/journal.py`,
+  splits each ticker-day in flight. A retyped column then refuses that ticker-day's
+  compaction until it is recompacted by hand.
 
 ### The `deploy` environment and its secret
 
