@@ -1975,6 +1975,10 @@ def _span_sessions(
     range from the spans rather than from a typed date is supposed to make impossible. It is
     refused here rather than later because the manifested skip never re-fetches what has landed,
     so a guard added afterwards would leave the partition on disk.
+
+    **The import's bound is this rule without its ceiling.** ``lake.bar_import`` refuses any
+    session on or after the first one whose window intersects a span, whether or not its close
+    has passed, so an import and this walk never name the same session (marketlake #950).
     """
     if span.end is not None and span.end <= span.start:
         return
@@ -2444,9 +2448,11 @@ def _build_parser():
     # spans, the calendar and the clock, so a session the lake never captured cannot be named
     # by anyone. The session stays injectable on :func:`fetch_session_bars` for tests.
     #
-    # The design's "there is no backfill anywhere in the implementation" is about pre-capture
-    # history, and the floor is what keeps it true: every session this walks is one a capture
-    # span covers, so the run works forward from capture start and asks for nothing earlier.
+    # The floor keeps the sweep forward-only: every session this walks is one a capture span
+    # covers, so the run works forward from capture start and asks for nothing earlier. History
+    # before capture began reaches the lake only through ``lake.bar_import``, a separate writer
+    # that lands sessions before the first one a span covers and never one on or after it
+    # (marketlake #950).
     parser.add_argument(
         "--backfill",
         action="store_true",

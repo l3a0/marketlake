@@ -122,6 +122,11 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   enters the lake.
 - `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
   the hours the scheduled jobs run in.
+- `src/lake/bar_import.py` imports daily bars marketlake did not capture into `bars/`,
+  for sessions before a ticker's capture began.
+  `python -m lake.bar_import vintage <csv>...` lands the quantitative-trading vintages the
+  module lists by SHA-256. It runs on the primary only, refuses any key the manifest
+  already names, and marks each bar imported with its source and price basis.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   the proxy pool that measures a read's peak Arrow memory, and `status_dom.js`, the DOM
   stub the Cost panel's page test runs the dashboard's script against.
@@ -508,8 +513,11 @@ A command run by hand is not a unit the stop can see.
    bytes it holds now, except the covered segments and `bars/` partitions it deletes. It
    covers a partition the bucket's `trimmed.jsonl` says was removed on purpose while this
    lake still holds a file there with other bytes. A file with the trimmed bytes themselves
-   stays. It also covers an `onboard`, `retire` or `seed_spans` change to the capture spans
-   and a quarantine sign-off, while the file still holds this lake's own version. Move such
+   stays. It also covers an `onboard`, `retire` or `seed_spans` change to the capture spans,
+   a quarantine sign-off and a `bars/` partition `python -m lake.bar_import` wrote, while the
+   file still holds this lake's own version. No sweep regenerates an import, so it is never
+   among the `bars/` partitions the resync deletes
+   ([#950](https://github.com/l3a0/marketlake/issues/950)). Move such
    a file out of the lake by hand, or redo the decision on the new primary after the switch,
    then run it again. It refuses when a file it would download or delete differs only by
    case from another path either manifest names, because on macOS the two are one file. It
