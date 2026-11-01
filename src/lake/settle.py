@@ -51,14 +51,15 @@ that agrees four times out of four is a good check and still not the source, bec
 **Which session a daily stamp names does not reach this read**, and it is now settled anyway.
 This read asks for the close of a *named* session, and a bars partition is addressed by its
 ``date=`` path level. ``bars.select_session_rows`` filters every landed row through
-``session_of``, and two gates run before a candle lands: the span check refuses a daily fetch
-whose selection came back empty, and ``check_close_cross`` compares the landed close against the
-close the lake settled from its own captured quotes. So even a wrong convention would cost this
-view a ``BarsAbsent`` rather than a wrong close.
+``bars.daily_session_of``, and two gates run before a candle lands: the span check refuses a daily
+fetch whose selection came back empty, and ``check_close_cross`` compares the landed close against
+the close the lake settled from its own captured quotes.
 
-It is not wrong. marketlake #362 was open on a fixture convention when this was written, and the
-owner's live SPY recording closed it: a daily candle is stamped on the session's own Eastern date,
-at or shortly after midnight, which is the date ``session_of`` already reads.
+Those gates are not a full defence against a wrong convention, which marketlake #380 measured. A
+response mixing two stamp offsets in standard time handed a session the next session's candle,
+the span check covered it, and only the close gate stood between it and the partition. So the
+convention is what keeps this read right. A daily stamp names its session by an 18:00 Eastern day
+boundary, which reads every convention #380 lists, the vendor's 05:00 UTC among them.
 
 **The threshold is compared in whole cents.** Intrinsic per share is the close minus the
 strike for a call and the strike minus the close for a put, floored at zero, and
@@ -329,9 +330,11 @@ def _roster(
     """The chain's rows whose expiration falls on ``session``, ordered by ``occ_symbol``.
 
     The expiration is read as the Eastern calendar date of the stamp it holds, through
-    ``bars.session_of``. That function is already the rule for how a stamp names a session,
-    pinned in ``journal.py`` on the bars schema, and ``load_bars`` reads a bar's session
-    through it rather than off the ``date=`` path level.
+    ``bars.session_of``. That function is already the rule for how an instant names a session,
+    pinned in ``journal.py`` on the bars schema, and ``load_bars`` reads a minute bar's session
+    through it rather than off the ``date=`` path level. A daily bar's stamp is read by
+    ``bars.daily_session_of`` instead, whose later day boundary is for a vendor stamp near
+    midnight and has nothing to say about an expiration at 16:00.
 
     A string comparison would be a second rule. It would also be wrong as written: the column
     is an instant rather than a date, spelled ``2026-09-15T20:00:00.000+00:00``, so an equality
@@ -379,12 +382,12 @@ def _roster(
 def _expires_on(stamp: object) -> date | None:
     """The session a contract's expiration stamp names, or ``None`` when it names none.
 
-    The reading is ``bars.session_of``'s, which is the rule for how a stamp names a session and
-    is what ``load_bars`` uses on a bar. It now enforces the precondition its docstring used to
-    only document, that the stamp is a UTC instant, and raises ``StampNotAnInstant`` on one
+    The reading is ``bars.session_of``'s, which is the rule for how an instant names a session and
+    is what ``load_bars`` uses on a minute bar. It now enforces the precondition its docstring used
+    to only document, that the stamp is a UTC instant, and raises ``StampNotAnInstant`` on one
     carrying no offset. Marketlake #385 moved that refusal there, and the duplicate test this
-    function used to carry came out with it, which is what the previous version of this
-    docstring said would happen.
+    function used to carry came out with it, which is what the previous version of this docstring
+    said would happen.
 
     An offset is what makes the reading a fact rather than a property of the machine. A naive
     stamp parses, and ``astimezone`` then reads it in whatever timezone the process is running

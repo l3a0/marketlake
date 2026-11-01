@@ -1032,7 +1032,7 @@ def test_the_bar_before_an_ex_date_lands_and_the_total_view_divides_by_it(
     table = load_bars("SPY", DAILY_FREQ, end=before, adjust=ADJUST_TOTAL, lake_root=root)
     closes = dict(
         zip(
-            (bars.session_of(stamp) for stamp in table.column("bar_ts").to_pylist()),
+            (bars.daily_session_of(stamp) for stamp in table.column("bar_ts").to_pylist()),
             table.column("close").to_pylist(),
             strict=True,
         )

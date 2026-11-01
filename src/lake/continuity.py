@@ -192,7 +192,7 @@ from pathlib import Path
 import pyarrow as pa
 
 from lake import actions
-from lake.bars import session_of
+from lake.bars import daily_session_of
 from lake.loader import (
     ADJUST_NONE,
     ADJUST_SPLIT,
@@ -700,8 +700,8 @@ def _read_bars(
 def _closes(bars: pa.Table) -> dict[date, float]:
     """Each session's closing candle, keyed by the session its own stamp names.
 
-    A bar's session is ``bars.session_of`` rather than the ``date=`` level of the partition it
-    came out of, which is the rule ``loader._in_view`` states: reading the path would mint a
+    A bar's session is ``bars.daily_session_of`` rather than the ``date=`` level of the partition
+    it came out of, which is the rule ``loader._in_view`` states: reading the path would mint a
     second definition of a bar's session to get the answer the first one already gives. That
     call is on ``bar_ts``, which ``journal._bars_rows`` mints through ``_epoch_ms_to_iso`` at
     ``+00:00``, so it inherits the writer's guarantee exactly as ``load_bars``'s own call does.
@@ -726,7 +726,7 @@ def _closes(bars: pa.Table) -> dict[date, float]:
         number = _number(close)
         if number is None or number <= 0:
             continue
-        found[session_of(str(stamp))] = number
+        found[daily_session_of(str(stamp))] = number
     return found
 
 
