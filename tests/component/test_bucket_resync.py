@@ -805,6 +805,21 @@ def test_a_signoff_in_this_lakes_tail_refuses_and_a_battery_verdict_does_not(tmp
     assert repr(QUARANTINE) in message
 
 
+def test_an_imported_bars_file_only_this_lake_holds_refuses_rather_than_deletes(tmp_path):
+    """Marketlake #950. No sweep regenerates an import, so deleting it as the resync deletes a
+    lake-only captured bars file would lose it. Catches the import prefix left out of the
+    refusal, and the prefix matched on the whole string rather than its start."""
+    laptop, vm, client, _files = _switched(tmp_path)
+    rel = "bars/ticker=GLD/freq=1d/date=2006-04-26.parquet"
+    _record(laptop, rel, b"imported bar", source="bar-import:sha256:" + "ab" * 32)
+
+    message = _refused(laptop, client)
+
+    assert "human decision" in message
+    assert repr(rel) in message
+    assert (laptop / rel).read_bytes() == b"imported bar"
+
+
 def test_any_other_file_only_this_lake_holds_refuses(tmp_path):
     laptop, vm, client, _files = _switched(tmp_path)
     rel = "reference/other_table.parquet"

@@ -89,8 +89,14 @@ class ExchangeCalendar:
     time, so callers read the same clock the doc speaks in.
     """
 
-    def __init__(self, name: str = DEFAULT_CALENDAR) -> None:
-        self._cal = xcals.get_calendar(name)
+    def __init__(self, name: str = DEFAULT_CALENDAR, *, start: date | None = None) -> None:
+        # ``exchange_calendars`` starts a calendar 20 years before today unless told otherwise,
+        # and its ``is_session`` raises ``DateOutOfBounds`` before that. ``start`` reaches
+        # further back, for the bar import's history (marketlake #950).
+        if start is None:
+            self._cal = xcals.get_calendar(name)
+        else:
+            self._cal = xcals.get_calendar(name, start=pd.Timestamp(start))
 
     @property
     def name(self) -> str:

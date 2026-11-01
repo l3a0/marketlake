@@ -3380,6 +3380,36 @@ def _surface_refusal(surface: str, command: str, accepted: frozenset[str]) -> st
     )
 
 
+# How the range restore names itself in a refusal it shares with another job.
+_RANGE_RESTORE = "the range restore"
+
+
+def _run_window_refusal(now: datetime, *, clock: Clock, calendar: Calendar, job: str) -> str | None:
+    """Why ``job`` may not hold the lake lock at ``now``, or ``None`` when it may.
+
+    Two windows refuse. The Sunday scrub window does, because the scrub takes no lock and a
+    file in flight reads to it as an orphan. So does a ``now`` inside a session or its pre-open
+    margin, by ``session_bound``, because capture waits on ``lake_lock`` with no timeout. The
+    range restore and the bar import (marketlake #950) both check it before the lock and again
+    after taking it, since a lock can be waited on past the bound. Each raises its own refusal
+    class on the text. ``resync`` keeps a twin of these two checks in its own closure.
+    """
+    if in_sunday_scrub_window(now):
+        return (
+            f"{job} does not run on Sunday from 19:55 to 23:30, while the Sunday job may be "
+            "scrubbing the lake, since a file in flight reads to the scrub as an orphan. Run it "
+            "outside that window"
+        )
+    bound = session_bound(now, clock=clock, calendar=calendar)
+    if bound is not None and now >= bound:
+        return (
+            f"{job} stops at {bound.isoformat()}, ahead of the next session's capture start, "
+            "because capture waits on the lake lock with no timeout. Run it after that "
+            "session's 18:30 sweep"
+        )
+    return None
+
+
 def _reversed_refusal(first: date, last: date) -> str | None:
     """Why a range that ends before it starts refuses, or ``None`` for one that does not."""
     if first <= last:
@@ -3566,20 +3596,9 @@ def restore_range(
         return RangeRestoreRefused(f"{why}.{done}")
 
     def guard() -> None:
-        now = clock.now()
-        if in_sunday_scrub_window(now):
-            raise refuse(
-                "the range restore does not run on Sunday from 19:55 to 23:30, while the Sunday "
-                "job may be scrubbing the lake, since a download in flight reads to the scrub as "
-                "an orphan. Run it on another evening after the 18:30 sweep"
-            )
-        bound = session_bound(now, clock=clock, calendar=calendar)
-        if bound is not None and now >= bound:
-            raise refuse(
-                f"the range restore stops at {bound.isoformat()}, ahead of the next session's "
-                "capture start, because capture waits on the lake lock with no timeout. Run it "
-                "after that session's 18:30 sweep"
-            )
+        why = _run_window_refusal(clock.now(), clock=clock, calendar=calendar, job=_RANGE_RESTORE)
+        if why is not None:
+            raise refuse(why)
 
     def stamp() -> str:
         return clock.now().astimezone(MARKET_TZ).isoformat()
@@ -3931,7 +3950,14 @@ class ReadingRestoreSummary:
         )
 
 
-def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
+def _refuse_inside_lake_root(
+    dest: Path,
+    lake_root: Path,
+    *,
+    refusal: type[Exception] = RestoreRefused,
+    inside: str | None = None,
+    outcome: str = "nothing was restored",
+) -> None:
     """Refuse a destination that is ``lake_root`` or sits anywhere under it.
 
     The resolved destination and each of its ancestors is compared with ``lake_root`` by
@@ -3940,10 +3966,16 @@ def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
     destination under ``lake`` read as outside a ``lake_root`` spelled ``Lake``. A
     ``lake_root`` that cannot be statted falls back to comparing resolved paths. A failure to
     stat anything else is one line rather than a traceback.
+
+    The reading restore calls it with the defaults. The bar import (marketlake #950) passes its
+    own ``refusal`` class, the ``inside`` line for a source file in the lake, and the
+    ``outcome`` its other lines end on.
     """
-    refused = RestoreRefused(
-        f"{dest} is inside lake_root {lake_root}. A reading restore writes only outside the live "
-        "lake, so nothing was restored. Name a directory elsewhere"
+    refused = refusal(
+        inside
+        if inside is not None
+        else f"{dest} is inside lake_root {lake_root}. A reading restore writes only outside the "
+        "live lake, so nothing was restored. Name a directory elsewhere"
     )
     try:
         resolved = dest.resolve()
@@ -3964,15 +3996,14 @@ def _refuse_inside_lake_root(dest: Path, lake_root: Path) -> None:
             if os.path.samestat(here, root_stat):
                 raise refused
     except OSError as exc:
-        raise RestoreRefused(
+        raise refusal(
             _local(f"checking whether {dest} is inside lake_root {lake_root}", exc)
-            + ", so nothing was restored"
+            + f", so {outcome}"
         ) from None
     except RuntimeError as exc:
         # Python 3.12's ``Path.resolve`` raises this on a symbolic link loop.
-        raise RestoreRefused(
-            f"checking whether {dest} is inside lake_root {lake_root} failed ({exc}), so "
-            "nothing was restored"
+        raise refusal(
+            f"checking whether {dest} is inside lake_root {lake_root} failed ({exc}), so {outcome}"
         ) from None
 
 
@@ -4436,6 +4467,7 @@ def _plan_resync(
 
     It writes nothing. The steps are :func:`resync`'s 2 to 7, less the downloads.
     """
+    from lake.bar_import import BAR_IMPORT_SOURCE_PREFIX
     from lake.battery import SIGNOFF_SOURCE
     from lake.capture_spans import SPANS_PARTITION
     from lake.paths import BARS, QUARANTINE_FILE, parse_segment_rel
@@ -4695,16 +4727,19 @@ def _plan_resync(
             for entry in lake_tail
             if entry["partition"] == SPANS_PARTITION
             or (entry["partition"] == QUARANTINE_FILE and entry.get("source") == SIGNOFF_SOURCE)
+            # No sweep regenerates an import, so the deletion above would lose it (#950).
+            or str(entry.get("source")).startswith(BAR_IMPORT_SOURCE_PREFIX)
         }
     )
     decided = [rel for rel in decided if holds_mine(rel)]
     if decided:
         raise refuse(
             f"this lake's own entries past the shared ones record a human decision in "
-            f"{_quoted(decided)}, an onboard, retire or seed_spans write to {SPANS_PARTITION} "
-            f"or a signoff in {QUARANTINE_FILE}, which the bucket's copy would silently "
-            "replace, so the resync changed nothing. Redo that decision on the primary after "
-            "the switch, or move the file out of the lake by hand, then run the resync again"
+            f"{_quoted(decided)}, an onboard, retire or seed_spans write to {SPANS_PARTITION}, "
+            f"a signoff in {QUARANTINE_FILE} or a bars import by python -m lake.bar_import, "
+            "which the bucket's copy would silently replace or delete, so the resync changed "
+            "nothing. Redo that decision on the primary after the switch, or move the file out "
+            "of the lake by hand, then run the resync again"
         )
     if outside:
         raise refuse(
