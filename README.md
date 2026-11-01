@@ -265,6 +265,18 @@ The lifecycle rules expect the lake under the `lake/` prefix, so `backup_target`
 `/lake`, which keeps the live check's probe objects under `live-check/` outside it. The
 examples below use the placeholder bucket `example-lake-backup`.
 
+On a primary with a bucket target, the daemon also sends each quotes segment to the sibling
+prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as its manifest
+entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). No lifecycle rule names
+that prefix, so every segment under it is kept forever. The `lag` command reads how long
+each of one day's segments took to arrive, from the bucket alone, and writes nothing. On
+the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
+dev group into the daemon's venv:
+
+```bash
+~/marketlake/.venv/bin/python -m lake.live_upload lag --date YYYY-MM-DD
+```
+
 Read the role's ARN in the owner's own shell, under the admin profile, and write it
 straight into the copy of `config.yaml` being edited, so the account id it carries
 reaches no transcript or log:

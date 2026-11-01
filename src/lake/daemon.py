@@ -225,7 +225,7 @@ from lake.control_plane import (
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import CHAINS_SURFACE
-from lake.live_upload import LiveUpload, UploadAlarm
+from lake.live_upload import LiveUpload, NotStarted, UploadAlarm, not_started_message
 from lake.live_upload import prepare as prepare_live_upload
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.paths import default_token_path
@@ -272,12 +272,13 @@ PullRunner = Callable[[Sequence[str]], object]
 # 30-second read, so two spawns from this daemon do not overlap.
 PULL_SPACING = timedelta(minutes=5)
 
-# Builds the live upload's client and hands back the upload, or ``None`` on a host that runs
-# none (marketlake #943). The real one is ``live_upload.prepare`` over ``bucket.connect``. It
-# is required for the reason ``CompactionRunner`` is: a caller who forgot it would PUT a
-# throwaway lake's segments to whatever bucket the config named. ``None`` starts no upload,
-# which is what every test passes unless it is about the upload.
-LiveUploadStarter = Callable[[Config, Clock], LiveUpload | None]
+# Builds the live upload's client and hands back the upload, a ``NotStarted`` naming why a
+# host that should run one could not, or ``None`` on a host that runs none (marketlake #943).
+# The real one is ``live_upload.prepare`` over ``bucket.connect``. It is required for the
+# reason ``CompactionRunner`` is: a caller who forgot it would PUT a throwaway lake's
+# segments to whatever bucket the config named. ``None`` starts no upload, which is what
+# every test passes unless it is about the upload.
+LiveUploadStarter = Callable[[Config, Clock], LiveUpload | NotStarted | None]
 
 
 class CycleRunner(Protocol):
@@ -1447,6 +1448,17 @@ def _report_schema_version(
         print(f"schema_version: page not sent: {delivery.reason}, {kept}", file=sys.stderr)
 
 
+def _page_live_upload_not_started(refusal: NotStarted, publisher: Publisher, now: datetime) -> None:
+    """Page once that the live upload could not start, and say so when the page did not go.
+
+    Once per process, as ``_report_schema_version`` is, because the build runs once and its
+    verdict cannot change inside one process. The starter has already printed the reason.
+    """
+    delivery = publisher.publish(not_started_message(refusal), now=now)
+    if not delivery.sent:
+        print(f"live_upload: not-started page not sent: {delivery.reason}", file=sys.stderr)
+
+
 def run_loop_from_config(
     *,
     config_path: str | Path | None = None,
@@ -1506,7 +1518,9 @@ def run_loop_from_config(
 
     ``live_upload`` is required for the same reason, and may be ``None``. It builds the
     bucket client the live upload sends each quotes segment with, and hands back the
-    upload, or ``None`` on a host that runs none (marketlake #943). It is called once, here,
+    upload, or ``None`` on a host that runs none (marketlake #943). On a host that should run
+    one and could not start it, it hands back a ``NotStarted``, and this pages once through
+    ``publisher`` before the loop starts. It is called once, here,
     before ``run_loop`` starts any cycle, because building a client hides every ``AWS_*``
     variable from the whole process for the length of the build. The thread it hands back
     is started here and asked to stop when the loop returns. Its alarm rides ``on_tick``
@@ -1580,8 +1594,12 @@ def run_loop_from_config(
     _report_schema_version(config_path, publisher, clock.now())
     # The live upload's client is built here, on this thread and before the loop starts any
     # cycle, for the reason the docstring gives. A build that fails prints one line inside
-    # the starter and hands back ``None``, and capture runs on without the upload.
-    upload = live_upload(load_config(config_path), clock) if live_upload is not None else None
+    # the starter and hands back a ``NotStarted``, which pages once here, and capture runs
+    # on without the upload.
+    started = live_upload(load_config(config_path), clock) if live_upload is not None else None
+    upload = started if isinstance(started, LiveUpload) else None
+    if isinstance(started, NotStarted):
+        _page_live_upload_not_started(started, publisher, clock.now())
     upload_alarm = UploadAlarm(upload, publisher, clock) if upload is not None else None
     holder = AssertionHolder(runner=assertion_runner)
     caller_on_tick = hooks.on_tick

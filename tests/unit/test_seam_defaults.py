@@ -52,7 +52,9 @@ joined them with the close+15 compaction: it spawns that job as its own process,
 seam is the spawn rather than the ``rsync`` the child goes on to run. It spawns the token
 pull in auth death the same way, so that seam is a spawn too (marketlake #702). It builds
 the live upload's bucket client itself as well, through ``live_upload.prepare`` over
-``bucket.connect`` (marketlake #943). ``clock`` and
+``bucket.connect`` (marketlake #943). ``live_upload.prepare`` requires that ``connect`` and
+``LiveUpload`` requires its ``client``, and ``live_upload.main`` accepts neither, building
+its client itself as ``bucket.main`` does. ``clock`` and
 ``calendar`` stay injectable on both. A system clock and an exchange calendar never
 reach past this process, so neither is a seam. A test drives a seam-requiring helper
 directly, or, to exercise a ``main``, monkeypatches the producer the ``main`` builds and
@@ -72,6 +74,7 @@ from lake import (
     compact,
     control_plane,
     daemon,
+    live_upload,
     reauth,
     runner,
     sweep,
@@ -117,6 +120,8 @@ REQUIRED = [
     (bucket.first_upload, "client"),
     (bucket.bucket_scrub, "client"),
     (bucket.BucketBackup, "client"),
+    (live_upload.prepare, "connect"),
+    (live_upload.LiveUpload, "client"),
 ]
 
 # Each row is a ``main`` and a seam it must never accept. A ``main`` builds its live seams
@@ -157,6 +162,8 @@ FORBIDDEN = [
     (vm_config.main, "client_factory"),
     (vm_config.main, "tag_reader"),
     (bucket.main, "client"),
+    (live_upload.main, "client"),
+    (live_upload.main, "connect"),
     (compact.main, "client"),
     (control_plane.main, "bucket_client"),
     (sweep.main, "execv"),

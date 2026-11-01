@@ -7,25 +7,31 @@ the create-only PUT's 412 and S3's ``BadDigest`` refusal. Most cases call ``pass
 directly, so no thread runs and nothing waits. The daemon cases run the production entry
 with a manual clock and a real upload thread, polling every millisecond.
 
-Eleven behaviours are covered, numbered as marketlake #943's build names them.
+Twelve behaviours are covered, the first eleven numbered as marketlake #943's build names
+them.
 
 1. A manifested quotes segment goes up under the live prefix, create-only, carrying its
    manifest digest as ``ChecksumSHA256``, the ``STANDARD`` class and its entry as metadata.
 2. A second upload of a key is refused. A matching HEAD counts it as already there and sends
    no second PUT. A HEAD that differs, or a ``BadDigest``, refuses the key for good and pages.
+   A HEAD that fails keeps the segment owed.
 3. The upload never takes the lake-root lock, and the module imports no lock.
 4. A bucket that fails every request for a whole session costs no cycle, pages once after
    ten minutes, PUTs nothing outside the live prefix, and prints its recovery line.
 5. A bars import manifested between two segments is never sent, and neither is
    ``manifest.jsonl``.
 6. A chains segment and a segment with no manifest entry stay at home.
-7. A segment whose partition is sealed, or whose file is gone, is dropped as superseded.
+7. A segment whose partition is sealed, or whose file is gone from a sealed day, is dropped
+   as superseded. A file gone from a day not yet sealed is counted as vanished.
 8. A manifest cut back in place is read from the start again, and nothing already in the
    bucket is sent twice.
-9. Only a primary with a prefixed bucket target starts an upload, and a client that cannot
-   be built starts none while the loop runs on.
+9. Only a primary with a prefixed bucket target starts an upload. On that host a target
+   with no prefix, or a client that cannot be built, starts none and pages once while the
+   loop runs on.
 10. The client is built on the caller's thread before the first cycle.
 11. The lag command's arithmetic, over a fake listing and through its ``main``.
+12. The alarm: when it pages, at most once an Eastern date for falling behind, and never
+    held up by a request in flight.
 """
 
 from __future__ import annotations
@@ -42,17 +48,22 @@ from pathlib import Path
 
 import pytest
 
-from lake import daemon, journal, live_upload
+from lake import capture, daemon, journal, live_upload
 from lake.alert import Message, Publisher
 from lake.bucket import BucketSettingsInvalid
+from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult, SegmentOutcome
 from lake.config import BucketTarget, load_config
 from lake.gap import SEGMENT_STAMP_FORMAT
 from lake.live_upload import (
     BEHIND_EVENT,
+    BEHIND_TITLE,
     LIVE_SUFFIX,
+    NOT_STARTED_EVENT,
+    NOT_STARTED_TITLE,
     REFUSED_EVENT,
     LiveUpload,
+    NotStarted,
     UploadAlarm,
     live_target,
     prepare,
@@ -162,6 +173,66 @@ def _wait_until(condition, seconds: float = 10.0) -> None:
         time.sleep(0.001)
 
 
+def _unreadable(monkeypatch, path: Path) -> None:
+    """Make one file's read fail as a file owned by another user does, and no other's."""
+    original = Path.read_bytes
+
+    def read_bytes(self: Path) -> bytes:
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+
+def _seal(root: Path, ticker: str = "SPY") -> None:
+    """Record the day's quotes partition in the manifest, as compaction does when it seals."""
+    append_manifest(
+        root,
+        partition=f"quotes/ticker={ticker}/date=2026-09-02.parquet",
+        source="compaction",
+        sha256="cd" * 32,
+        rows=3,
+        fetched_at=None,
+    )
+
+
+# The page bodies' shared sentences, as literals, so a constant cannot check itself.
+COST = (
+    "Until the upload catches up, the runtime cannot see today's session in the bucket. "
+    "Capture and the nightly upload are unaffected."
+)
+LOG = "journalctl -u com.marketlake.daemon.service | grep live_upload"
+RESTART_CAUTION = "A restart mid-session can cost a captured minute"
+
+
+# -- the wire shape -----------------------------------------------------------------
+
+
+def test_the_events_titles_and_timings_match_the_design_literally():
+    """Compared against the literals, because the constants cannot check themselves."""
+    assert live_upload.BEHIND_EVENT == "segment_upload_behind"
+    assert live_upload.REFUSED_EVENT == "segment_upload_refused"
+    assert live_upload.NOT_STARTED_EVENT == "segment_upload_not_started"
+    assert live_upload.BEHIND_TITLE == "Live upload behind"
+    assert live_upload.REFUSED_TITLE == "Live upload refused a segment"
+    assert live_upload.NOT_STARTED_TITLE == "Live upload not started"
+    assert live_upload.POLL_SECONDS == 5.0
+    assert live_upload.BACKOFF_CAP_SECONDS == 60.0
+    assert live_upload.BEHIND_AFTER == timedelta(minutes=10)
+
+
+def test_the_stamp_the_lag_reads_is_the_stamp_capture_writes():
+    """A segment named the way capture names one reads back as the cycle's own start."""
+    assert capture._SEGMENT_STAMP_FORMAT == SEGMENT_STAMP_FORMAT
+    start = datetime(2026, 9, 2, 14, 0, 3, 250000, tzinfo=UTC)
+    path = journal.segment_path(
+        Path("/lake"), "quotes", "SPY", DAY, start.strftime(capture._SEGMENT_STAMP_FORMAT), 77
+    )
+    rel = path.relative_to(Path("/lake")).as_posix()
+    assert segment_start(rel) == start
+
+
 # -- 1. a segment goes up under the live prefix, create-only ----------------------
 
 
@@ -260,8 +331,11 @@ def test_a_key_holding_other_bytes_is_refused_for_good_and_pages_once(tmp_path, 
     assert fake.body(f"lake-live/{rel}") == b"someone else's bytes"
     assert upload.state().refused == (rel,)
     (page,) = transport.sent
-    assert page.event == REFUSED_EVENT
+    assert page.event == "segment_upload_refused"
+    assert page.title == "Live upload refused a segment"
     assert rel in page.body
+    assert LOG in page.body
+    assert "runtime cannot see those minutes in the bucket" in page.body
     assert "lake-backup" not in page.body
     assert f"{rel} refused: the bucket already holds other bytes" in capsys.readouterr().err
 
@@ -284,6 +358,28 @@ def test_bytes_that_no_longer_match_their_entry_are_refused_for_good(tmp_path):
     assert fake.keys() == []
     assert upload.state().refused == (rel,)
     assert [message.event for message in transport.sent] == [REFUSED_EVENT]
+
+
+def test_a_key_already_there_whose_head_fails_is_neither_counted_nor_refused(tmp_path):
+    """A 412 says the key exists, and only the HEAD says whose bytes it holds."""
+    root = _root(tmp_path)
+    rel, _ = _write_segment(root)
+    fake = FakeS3()
+    fake.store(f"lake-live/{rel}", b"someone else's bytes")
+    upload = _upload(root, fake)
+    head = fake.head_object
+    fake.head_object = lambda **kwargs: (_ for _ in ()).throw(unreachable())
+
+    failed = upload.pass_once()
+
+    assert failed is not None and "already in the bucket, and its HEAD was" in failed
+    state = upload.state()
+    assert (state.owed, state.already_there, state.uploaded, state.refused) == (1, 0, 0, ())
+
+    fake.head_object = head
+    assert upload.pass_once() is None
+    state = upload.state()
+    assert (state.owed, state.already_there, state.refused) == (0, 0, (rel,))
 
 
 # -- 3. the upload never takes the lake-root lock ------------------------------------
@@ -465,18 +561,58 @@ def test_a_segment_sealed_while_it_was_owed_is_dropped_rather_than_retried(tmp_p
     assert (upload.state().superseded, upload.state().owed) == (1, 0)
 
 
-def test_a_segment_whose_file_is_gone_is_dropped_as_superseded(tmp_path):
+def test_a_segment_whose_file_is_gone_from_a_sealed_day_is_dropped_as_superseded(
+    tmp_path, monkeypatch, capsys
+):
+    """Compaction seals the day and then deletes it, so the seal can land mid-pass.
+
+    Here the pass reads the manifest, and only then does compaction record the partition
+    and delete the segment, so the pass meets a missing file whose seal it has not read.
+    """
+    root = _root(tmp_path)
+    rel, _ = _write_segment(root)
+    fake = FakeS3()
+    upload = _upload(root, fake)
+    read_tail = upload._read_tail
+    reads = []
+
+    def then_compact() -> None:
+        read_tail()
+        reads.append(1)
+        if len(reads) == 1:
+            _seal(root)
+            (root / rel).unlink()
+
+    monkeypatch.setattr(upload, "_read_tail", then_compact)
+
+    assert upload.pass_once() is None
+    assert upload.pass_once() is None
+
+    assert fake.calls == []
+    state = upload.state()
+    assert (state.superseded, state.vanished, state.owed) == (1, 0, 0)
+    assert "missing from the lake" not in capsys.readouterr().err
+
+
+def test_a_segment_gone_before_its_day_was_sealed_is_counted_apart_and_named(tmp_path, capsys):
     root = _root(tmp_path)
     rel, _ = _write_segment(root)
     (root / rel).unlink()
+    kept, _ = _write_segment(root, ticker="QQQ")
     fake = FakeS3()
     upload = _upload(root, fake)
 
     assert upload.pass_once() is None
     assert upload.pass_once() is None
 
-    assert fake.calls == []
-    assert (upload.state().superseded, upload.state().owed) == (1, 0)
+    assert fake.put_keys() == [f"lake-live/{kept}"]
+    state = upload.state()
+    assert (state.vanished, state.superseded, state.owed, state.uploaded) == (1, 0, 0, 1)
+    lines = [line for line in capsys.readouterr().err.splitlines() if rel in line]
+    assert lines == [
+        f"live_upload: {rel} is missing from the lake before its day was sealed, so it "
+        "stays out of the live prefix"
+    ]
 
 
 # -- 8. a manifest cut back in place --------------------------------------------------
@@ -558,8 +694,12 @@ def test_a_backlog_older_than_ten_minutes_pages_once_and_recovery_prints_a_line(
     alarm.check(clock.now())
     clock.advance(60)
     alarm.check(clock.now())
-    assert [message.event for message in transport.sent] == [BEHIND_EVENT]
-    assert "1 quotes segments owed" in transport.sent[0].body
+    assert [message.event for message in transport.sent] == ["segment_upload_behind"]
+    assert transport.sent[0].title == "Live upload behind"
+    body = transport.sent[0].body
+    assert "1 quotes segments owed, the oldest first read at 10:00 ET" in body
+    assert COST in body and LOG in body
+    assert "lake-backup" not in body
 
     fake.fail_with = None
     upload.pass_once()
@@ -590,15 +730,259 @@ def test_a_thread_that_stopped_pages_once_and_never_reads_as_caught_up(
     alarm.check(NOW + timedelta(minutes=1))
 
     assert [message.event for message in transport.sent] == [BEHIND_EVENT]
-    assert "stopped" in transport.sent[0].body
+    assert transport.sent[0].title == BEHIND_TITLE
+    body = transport.sent[0].body
+    assert body.startswith("The live upload thread stopped.")
+    assert COST in body and LOG in body and RESTART_CAUTION in body
     err = capsys.readouterr().err
     assert "live_upload: stopped: RuntimeError: a bug" in err
     assert "caught up" not in err
 
 
+def test_a_thread_that_cannot_read_the_manifest_pages_once_after_ten_minutes(tmp_path, monkeypatch):
+    """It owes nothing, because it never reads an entry, so only the clean pass shows it."""
+    root = _root(tmp_path)
+    _write_segment(root)
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, FakeS3(), clock)
+
+    def denied() -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(upload, "_read_tail", denied)
+    transport = _Recording()
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+
+    for _ in range(10):
+        assert upload.pass_once() == "manifest.jsonl could not be read (PermissionError)"
+        clock.advance(60)
+        alarm.check(clock.now())
+    assert upload.state().owed == 0
+    assert transport.sent == []
+    clock.advance(1)
+    upload.pass_once()
+    alarm.check(clock.now())
+    clock.advance(60)
+    upload.pass_once()
+    alarm.check(clock.now())
+
+    (page,) = transport.sent
+    assert (page.event, page.title) == ("segment_upload_behind", "Live upload behind")
+    assert page.body.startswith(
+        "No pass of the live upload has ended cleanly since 10:00 ET, 10 minutes ago."
+    )
+    assert COST in page.body and LOG in page.body
+
+
+def test_a_thread_started_late_is_not_behind_on_its_first_minute(tmp_path, monkeypatch):
+    """The daemon builds the upload, then wires its hooks, and only then starts the thread."""
+    root = _root(tmp_path)
+    clock = ManualClock(start=NOW)
+    upload = LiveUpload(lake_root=root, target=LIVE, client=FakeS3(), clock=clock)
+    clock.advance(11 * 60)
+    release = threading.Event()
+    # A thread that is alive and has not finished its first pass yet.
+    monkeypatch.setattr(upload, "_run", lambda: release.wait(30))
+    transport = _Recording()
+    upload.start()
+    try:
+        assert upload.state().last_clean_pass == clock.now()
+        UploadAlarm(upload, _publisher(root, transport), clock).check(clock.now())
+        assert transport.sent == []
+    finally:
+        release.set()
+        upload._thread.join(10)
+
+
+def _owe_one(root: Path, fake: FakeS3, upload: LiveUpload, start: datetime) -> None:
+    """A new segment the bucket refuses to take, read by one pass."""
+    _write_segment(root, start=start)
+    fake.fail_with = unreachable()
+    assert upload.pass_once() is not None
+
+
+def test_a_flapping_bucket_pages_once_a_date_and_prints_each_catch_up(tmp_path, capsys):
+    """24 to 28 pages a session were measured before, from a page on every catch-up."""
+    root = _root(tmp_path)
+    fake = FakeS3()
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, fake, clock)
+    transport = _Recording(clock)
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+
+    for _ in range(3):
+        _owe_one(root, fake, upload, clock.now())
+        clock.advance(11 * 60)
+        alarm.check(clock.now())
+        fake.fail_with = None
+        assert upload.pass_once() is None
+        alarm.check(clock.now())
+        clock.advance(60)
+
+    assert [message.event for message in transport.sent] == [BEHIND_EVENT]
+    caught_up = [line for line in capsys.readouterr().err.splitlines() if "caught up" in line]
+    assert len(caught_up) == 3
+
+    # The next Eastern date pages again.
+    clock.set(datetime(2026, 9, 3, 14, 0, tzinfo=UTC))
+    _owe_one(root, fake, upload, clock.now())
+    clock.advance(11 * 60)
+    alarm.check(clock.now())
+
+    assert [message.event for message in transport.sent] == [BEHIND_EVENT, BEHIND_EVENT]
+    assert [at.astimezone(MARKET_TZ).date() for at in transport.at] == [
+        date(2026, 9, 2),
+        date(2026, 9, 3),
+    ]
+
+
+def test_a_thread_that_stops_pages_even_on_a_date_a_flap_already_paged(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    fake = FakeS3()
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, fake, clock)
+    transport = _Recording()
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+    _owe_one(root, fake, upload, clock.now())
+    clock.advance(11 * 60)
+    alarm.check(clock.now())
+    fake.fail_with = None
+    upload.pass_once()
+    alarm.check(clock.now())
+
+    def broken() -> None:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(upload, "pass_once", broken)
+    upload.start()
+    upload._thread.join(10)
+    clock.advance(60)
+    alarm.check(clock.now())
+
+    assert [message.event for message in transport.sent] == [BEHIND_EVENT, BEHIND_EVENT]
+    assert transport.sent[1].body.startswith("The live upload thread stopped.")
+
+
+def test_a_hung_put_never_holds_up_the_alarm(tmp_path):
+    """The alarm reads a copy of the state under a lock no request is ever made inside."""
+    root = _root(tmp_path)
+    _write_segment(root)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hang(kwargs, data) -> None:
+        entered.set()
+        release.wait(30)
+
+    fake = FakeS3(on_put=hang)
+    clock = ManualClock(start=NOW)
+    upload = LiveUpload(lake_root=root, target=LIVE, client=fake, clock=clock)
+    upload.start()
+    try:
+        assert entered.wait(10)
+        alarm = UploadAlarm(upload, _publisher(root, _Recording()), clock)
+        checked = threading.Thread(target=alarm.check, args=(NOW,), daemon=True)
+        checked.start()
+        checked.join(1.0)
+        assert not checked.is_alive(), "the alarm waited on a PUT in flight"
+    finally:
+        release.set()
+        upload.stop()
+
+
+def test_the_upload_thread_is_a_daemon_thread(tmp_path):
+    upload = LiveUpload(
+        lake_root=_root(tmp_path), target=LIVE, client=FakeS3(), clock=ManualClock(start=NOW)
+    )
+    upload.start()
+    try:
+        assert upload._thread is not None
+        assert upload._thread.daemon
+        assert upload._thread.name == "live-upload"
+    finally:
+        upload.stop()
+        upload._thread.join(10)
+
+
 def test_the_retry_waits_double_from_five_seconds_up_to_a_minute():
     waits = [retry_delay(n, poll=5.0, cap=60.0) for n in range(7)]
     assert waits == [5.0, 5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+
+
+def _record_waits(monkeypatch, upload: LiveUpload, count: int) -> list[float]:
+    """Replace the thread's wait with a recorder that ends the run after ``count`` waits."""
+    waits: list[float] = []
+
+    def wait(timeout: float) -> bool:
+        waits.append(timeout)
+        return len(waits) >= count
+
+    monkeypatch.setattr(upload._stop, "wait", wait)
+    return waits
+
+
+def test_the_thread_waits_longer_after_each_pass_the_bucket_failed(tmp_path, monkeypatch):
+    """The production poll and cap, through ``_run`` itself rather than ``retry_delay``."""
+    root = _root(tmp_path)
+    _write_segment(root)
+    fake = FakeS3()
+    fake.fail_with = unreachable()
+    upload = _upload(root, fake)
+    waits = _record_waits(monkeypatch, upload, 6)
+
+    upload._run()
+
+    assert waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+    assert len(fake.puts()) == 6
+
+
+def test_the_thread_names_a_failure_again_only_when_its_cause_changes(
+    tmp_path, monkeypatch, capsys
+):
+    upload = _upload(_root(tmp_path), FakeS3())
+    results = iter(["a: unreachable", "a: unreachable", "b: refused", "b: refused", None, "c"])
+    monkeypatch.setattr(upload, "pass_once", lambda: next(results))
+    _record_waits(monkeypatch, upload, 6)
+
+    upload._run()
+
+    assert capsys.readouterr().err.splitlines() == [
+        "live_upload: a: unreachable, retrying",
+        "live_upload: b: refused, retrying",
+        "live_upload: sending again after 4 failed passes",
+        "live_upload: c, retrying",
+    ]
+
+
+def test_an_unreadable_segment_stays_owed_and_the_rest_go_up(tmp_path, monkeypatch, capsys):
+    root = _root(tmp_path)
+    rels = [_write_segment(root, start=NOW + timedelta(minutes=n))[0] for n in range(6)]
+    _unreadable(monkeypatch, root / rels[0])
+    fake = FakeS3()
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, fake, clock)
+    transport = _Recording()
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+
+    assert upload.pass_once() is None
+    assert upload.pass_once() is None
+
+    assert fake.put_keys() == [f"lake-live/{rel}" for rel in rels[1:]]
+    state = upload.state()
+    assert (state.owed, state.uploaded) == (1, 5)
+    named = [line for line in capsys.readouterr().err.splitlines() if rels[0] in line]
+    assert named == [
+        f"live_upload: {rels[0]} could not be read (PermissionError), so it stays owed and "
+        "is tried again each pass"
+    ]
+
+    clock.advance(601)
+    upload.pass_once()
+    alarm.check(clock.now())
+
+    (page,) = transport.sent
+    assert page.event == BEHIND_EVENT
+    assert page.body.startswith("1 quotes segments owed, the oldest first read at 10:00 ET")
 
 
 def test_a_failed_request_keeps_the_segment_owed_and_ends_the_pass(tmp_path):
@@ -655,16 +1039,13 @@ def test_a_primary_with_a_bucket_target_prepares_an_upload_to_the_live_prefix(tm
 
 
 @pytest.mark.parametrize(
-    ("target", "role", "line"),
+    ("target", "role"),
     [
-        pytest.param(S3_TARGET, "shadow", None, id="shadow"),
-        pytest.param(None, None, None, id="path-target"),
-        pytest.param("s3://lake-backup", None, "names no key prefix", id="empty-prefix"),
+        pytest.param(S3_TARGET, "shadow", id="shadow"),
+        pytest.param(None, None, id="path-target"),
     ],
 )
-def test_no_upload_starts_off_a_primary_with_a_prefixed_bucket(
-    tmp_path, capsys, target, role, line
-):
+def test_a_host_that_runs_no_upload_prepares_none_and_says_nothing(tmp_path, capsys, target, role):
     root = _root(tmp_path)
     if target is None:
         path = write_config(tmp_path, root)
@@ -672,31 +1053,58 @@ def test_no_upload_starts_off_a_primary_with_a_prefixed_bucket(
         path = _bucket_config(tmp_path, root, target=target, role=role)
 
     assert prepare(load_config(path), ManualClock(start=NOW), connect=_never) is None
+    assert "live_upload" not in capsys.readouterr().err
 
-    err = capsys.readouterr().err
-    if line is None:
-        assert "live_upload" not in err
-    else:
-        (printed,) = err.splitlines()
-        assert printed.startswith("live_upload: not started: ")
-        assert line in printed
+
+def test_a_target_with_no_prefix_is_a_start_that_failed(tmp_path, capsys):
+    root = _root(tmp_path)
+    path = _bucket_config(tmp_path, root, target="s3://lake-backup")
+
+    refusal = prepare(load_config(path), ManualClock(start=NOW), connect=_never)
+
+    assert isinstance(refusal, NotStarted)
+    assert "names no key prefix" in refusal.reason
+    (printed,) = capsys.readouterr().err.splitlines()
+    assert printed == f"live_upload: not started: {refusal.reason}"
 
 
 @pytest.mark.parametrize(
-    "error",
-    [BucketSettingsInvalid("bucket_region is not set in config.yaml"), RuntimeError("boom")],
-    ids=["settings", "unexpected"],
+    ("error", "reason"),
+    [
+        pytest.param(
+            BucketSettingsInvalid("bucket_region is not set in config.yaml"),
+            "bucket_region is not set in config.yaml",
+            id="settings",
+        ),
+        pytest.param(
+            RuntimeError("boom lake-backup"),
+            "the client build raised RuntimeError",
+            id="unexpected",
+        ),
+    ],
 )
-def test_a_client_that_cannot_be_built_starts_no_upload(tmp_path, capsys, error):
+def test_a_client_that_cannot_be_built_is_a_start_that_failed(tmp_path, capsys, error, reason):
     root = _root(tmp_path)
     config = load_config(_bucket_config(tmp_path, root))
 
     def connect(config, target):
         raise error
 
-    assert prepare(config, ManualClock(start=NOW), connect=connect) is None
+    refusal = prepare(config, ManualClock(start=NOW), connect=connect)
+
+    assert refusal == NotStarted(reason=reason)
     (printed,) = capsys.readouterr().err.splitlines()
-    assert printed.startswith("live_upload: not started: ")
+    assert printed == f"live_upload: not started: {reason}"
+
+
+def test_the_not_started_page_names_the_reason_the_cost_and_the_restart_risk():
+    message = live_upload.not_started_message(NotStarted(reason="bucket_region is not set"))
+
+    assert message.event == "segment_upload_not_started"
+    assert message.title == "Live upload not started"
+    assert message.body.startswith("The live upload did not start: bucket_region is not set.")
+    assert COST in message.body and LOG in message.body and RESTART_CAUTION in message.body
+    assert "A daemon restart retries the client build." in message.body
 
 
 # -- 4, 9 and 10. through the daemon's production entry --------------------------------
@@ -804,12 +1212,21 @@ def _run(rig: _Rig, clock: ManualClock, *, ticks, cycles, live, transport, hooks
 
 
 def _seen(state) -> int:
-    return state.owed + state.uploaded + state.already_there + state.superseded + len(state.refused)
+    return (
+        state.owed
+        + state.uploaded
+        + state.already_there
+        + state.superseded
+        + state.vanished
+        + len(state.refused)
+    )
 
 
 def test_a_bucket_down_for_the_session_costs_no_cycle_and_pages_once(tmp_path, capsys):
     rig = _Rig(tmp_path)
-    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
+    # The long grace lets a cycle wait, in real time, for a thread scheduled late under load
+    # without the clock moving on underneath it.
+    clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30), grace=10.0)
     fake = FakeS3()
     fake.fail_with = unreachable()
     uploads: list[LiveUpload] = []
@@ -851,12 +1268,14 @@ def test_a_bucket_down_for_the_session_costs_no_cycle_and_pages_once(tmp_path, c
     assert len(cycles.rels) == 25
     entries = [json.loads(line) for line in manifest_path(rig.root).read_text().splitlines()]
     assert [entry["partition"] for entry in entries if entry["source"] == "capture"] == cycles.rels
-    # One page, once the oldest owed segment was more than ten minutes old.
+    # One page, once the oldest owed segment was more than ten minutes old, or no pass had
+    # ended cleanly for that long. The last clean pass can fall at 09:59:30, before the
+    # first cycle's entry, so the page can come at 10:10 itself.
     pages = zip(transport.sent, transport.at, strict=True)
     behind = [at for message, at in pages if message.event == BEHIND_EVENT]
     assert len(behind) == 1
     first_cycle = et(2026, 9, 2, 10, 0)
-    assert timedelta(minutes=10) < behind[0] - first_cycle <= timedelta(minutes=11, seconds=30)
+    assert timedelta(minutes=10) <= behind[0] - first_cycle <= timedelta(minutes=11, seconds=30)
     assert [message.event for message in transport.sent] == [BEHIND_EVENT]
     # Nothing outside the live prefix, and never the manifest.
     assert fake.put_keys(), "the upload never tried"
@@ -873,7 +1292,7 @@ def test_a_bucket_down_for_the_session_costs_no_cycle_and_pages_once(tmp_path, c
     assert uploads[0]._stop.is_set()
 
 
-def test_a_client_that_cannot_be_built_leaves_the_loop_capturing(tmp_path, capsys):
+def test_a_client_that_cannot_be_built_pages_once_and_leaves_the_loop_capturing(tmp_path, capsys):
     rig = _Rig(tmp_path)
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     cycles = _Cycles(rig, clock)
@@ -881,25 +1300,39 @@ def test_a_client_that_cannot_be_built_leaves_the_loop_capturing(tmp_path, capsy
     def connect(config, target):
         raise BucketSettingsInvalid("bucket_region is not set in config.yaml")
 
+    transport = _Recording(clock)
     _run(
         rig,
         clock,
         ticks=3,
         cycles=cycles,
         live=lambda config, clock: prepare(config, clock, connect=connect),
-        transport=_Recording(),
+        transport=transport,
     )
 
     assert len(cycles.rels) == 3
     err = capsys.readouterr().err
     assert "live_upload: not started: bucket_region is not set in config.yaml" in err
     assert not any(t.name == "live-upload" for t in threading.enumerate())
+    pages = [
+        (message, at)
+        for message, at in zip(transport.sent, transport.at, strict=True)
+        if message.event == NOT_STARTED_EVENT
+    ]
+    ((page, at),) = pages
+    assert page.title == NOT_STARTED_TITLE
+    assert "bucket_region is not set in config.yaml" in page.body
+    assert RESTART_CAUTION in page.body
+    assert "lake-backup" not in page.body
+    # Sent at startup, before the first cycle at 10:00.
+    assert at < et(2026, 9, 2, 10, 0)
 
 
-def test_a_shadow_daemon_builds_no_client_and_starts_no_thread(tmp_path):
+def test_a_shadow_daemon_builds_no_client_starts_no_thread_and_pages_nothing(tmp_path):
     rig = _Rig(tmp_path, role="shadow")
     clock = ManualClock(start=et(2026, 9, 2, 9, 59, 30))
     cycles = _Cycles(rig, clock)
+    transport = _Recording()
 
     _run(
         rig,
@@ -907,11 +1340,12 @@ def test_a_shadow_daemon_builds_no_client_and_starts_no_thread(tmp_path):
         ticks=2,
         cycles=cycles,
         live=lambda config, clock: prepare(config, clock, connect=_never),
-        transport=_Recording(),
+        transport=transport,
     )
 
     assert len(cycles.rels) == 2
     assert not any(t.name == "live-upload" for t in threading.enumerate())
+    assert not any(message.event.startswith("segment_upload") for message in transport.sent)
 
 
 def test_the_client_is_built_on_the_calling_thread_before_the_first_cycle(tmp_path):
@@ -969,8 +1403,22 @@ def test_the_lag_is_last_modified_less_the_start_its_key_carries():
     # Another day's segment and a key outside the live prefix are both left out.
     _lagged(fake, NOW + timedelta(days=1), 500)
     fake.store("lake/journal/date=2026-09-02/surface=quotes/ticker=SPY/seg-x.arrows", b"x")
+    # A listing that ignored the continuation token would ask for the first page forever,
+    # so a repeated token fails at once rather than hanging the suite.
+    tokens: list[str | None] = []
+    list_objects_v2 = fake.list_objects_v2
+
+    def once_per_token(**kwargs):
+        token = kwargs.get("ContinuationToken")
+        if token in tokens:
+            raise AssertionError(f"the listing asked for the page at {token!r} twice")
+        tokens.append(token)
+        return list_objects_v2(**kwargs)
+
+    fake.list_objects_v2 = once_per_token
 
     listing = live_upload.list_live(fake, LIVE, DAY)
+    assert tokens == [None, "2"]
     lags = live_upload.segment_lags(listing, LIVE)
 
     assert [(one.rel, one.lag.total_seconds()) for one in lags] == sorted(

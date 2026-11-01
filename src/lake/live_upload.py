@@ -21,7 +21,8 @@ delay the watchdog, every later minute and the close+5 guard.
 running daemon would hide them from a capture cycle and from a child spawned meanwhile.
 :func:`prepare` therefore builds the client on the calling thread, which is the daemon's
 main thread before ``run_loop`` starts any cycle, through ``bucket.connect``. A build that
-fails prints one line and starts no thread, and capture runs on without it. The client
+fails prints one line, starts no thread, and hands the daemon a ``NotStarted``, which it
+pages once. Capture runs on without the upload. The client
 takes the nightly upload's settings, a 10-second connect timeout, a 60-second read timeout
 and three attempts, so a request that hangs costs this thread a few minutes and costs
 capture nothing.
@@ -42,7 +43,9 @@ Neither is a chains segment, which marketlake #974 defers, nor any other partiti
 ``manifest.jsonl`` included. The bucket's copy of the manifest stays the nightly upload's
 alone, so it still names only files the bucket holds. A segment is dropped and counted as
 superseded when the quotes partition it compacts into is already manifested, or when its
-file is gone, which is what compaction leaves once it has sealed the day.
+file is gone from a day the manifest records sealed, which is what compaction leaves. A
+file gone from a day not yet sealed is missing from the lake. It is named in one line,
+counted as vanished and never sent.
 
 **One request per segment.** Each goes up as one ``PutObject`` under the sibling prefix
 ``<prefix>-live/``, so the VM's segments land at ``lake-live/journal/...``. That keeps them
@@ -67,15 +70,19 @@ because a segment is never rewritten. A refusal is recorded and the alarm pages 
 **When the bucket does not answer.** Any other failure, a 409 from a concurrent
 conditional write included, keeps the segment owed. The pass stops there, since the next
 segment would meet the same bucket, and the thread waits longer before each retry, 5
-seconds doubling to 60. It holds nothing capture uses while it waits. A whole session
+seconds doubling to 60. It holds nothing capture uses while it waits. A segment the
+daemon cannot read on its own disk is different. It stays owed and is named once, and the
+pass goes on to the next segment, because no other segment shares its cause. A whole session
 without the bucket loses nothing: the minutes stay on disk, compaction seals them, and the
 nightly upload sends the sealed partitions as it always has.
 
 **The alarm runs on the loop thread.** A thread that died could not report its own death,
 so ``UploadAlarm.check`` rides the daemon's ``on_tick`` and reads ``LiveUpload.state`` each
-minute. It pages once through the daemon's ``Publisher`` when the thread has stopped or the
-oldest owed segment is more than ten minutes old, and prints one line when the upload
-catches up. It pages once more, under its own event, the first time a key is refused.
+minute. It pages through the daemon's ``Publisher`` when the thread has stopped, when the
+oldest owed segment was first read more than ten minutes ago, or when no pass has ended
+cleanly for ten minutes. It pages at most once an Eastern date for falling behind, apart
+from a thread that stopped, and prints one line each time the upload catches up. It pages
+once more, under its own event, the first time a key is refused.
 
 **The lag command.** ``python -m lake.live_upload lag --date YYYY-MM-DD`` lists the live
 prefix for one day's quotes segments and prints, for each segment and in summary, its
@@ -134,7 +141,8 @@ POLL_SECONDS = 5.0
 # ``POLL_SECONDS`` and doubles, so a bucket that is down gets one request a minute.
 BACKOFF_CAP_SECONDS = 60.0
 
-# How old the oldest owed segment may get before the alarm pages.
+# How long the alarm lets the oldest owed segment wait, counted from when this process first
+# read it, and how long it lets the thread go without a pass that ended cleanly.
 BEHIND_AFTER = timedelta(minutes=10)
 
 # The lag acceptance item 1 allows between a cycle's start and its segment in the bucket.
@@ -147,11 +155,25 @@ LIVE_SUFFIX = "-live"
 # fourteen times over.
 STORAGE_CLASS = "STANDARD"
 
-# The two events the alarm pages under, as the design's message table names them.
+# The events the live upload pages under, as the design's message table names them. The
+# first two are the alarm's. The third is the daemon's, once at startup.
 BEHIND_EVENT = "segment_upload_behind"
 REFUSED_EVENT = "segment_upload_refused"
+NOT_STARTED_EVENT = "segment_upload_not_started"
 BEHIND_TITLE = "Live upload behind"
 REFUSED_TITLE = "Live upload refused a segment"
+NOT_STARTED_TITLE = "Live upload not started"
+
+# What every live upload page says it costs, where its log is, and what a restart risks.
+# The runtime is ithildin-runtime, which reads only the bucket.
+_COST = (
+    "Until the upload catches up, the runtime cannot see today's session in the bucket. "
+    "Capture and the nightly upload are unaffected."
+)
+_LOG = "On the VM, journalctl -u com.marketlake.daemon.service | grep live_upload reads the log."
+_RESTART_CAUTION = (
+    "A restart mid-session can cost a captured minute, so weigh it against the decision time."
+)
 
 # S3's answers to a conditional write. A 412 means the key already exists. A 409 means
 # another conditional write to the same key was in flight, which is worth a retry.
@@ -280,6 +302,22 @@ class UploadState:
     already_there: int
     superseded: int
     refused: tuple[str, ...]
+    # When the last pass that failed nothing ended, or when the thread started. A thread
+    # that cannot read the manifest owes nothing, so only this shows it is stuck.
+    last_clean_pass: datetime | None = None
+    # Manifested segments whose file was gone before the manifest recorded their day sealed.
+    vanished: int = 0
+
+
+@dataclass(frozen=True)
+class NotStarted:
+    """A live upload this host should run and could not start, and why, for the page.
+
+    ``reason`` is one operator line. It names a setting or an exception's type, never a
+    bucket name, a key or an exception's message.
+    """
+
+    reason: str
 
 
 @dataclass
@@ -336,11 +374,21 @@ class LiveUpload:
         self._uploaded = 0
         self._already_there = 0
         self._superseded = 0
+        self._vanished = 0
+        # The segments whose read failed for a reason other than a missing file. Each is
+        # named once, not on every pass that retries it.
+        self._unreadable: set[str] = set()
+        self._last_clean: datetime = clock.now()
 
     # -- the thread ----------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the thread. It is a daemon thread, so it never holds the process open."""
+        """Start the thread. It is a daemon thread, so it never holds the process open.
+
+        The clean-pass clock starts here too, so a thread just started is never behind.
+        """
+        with self._lock:
+            self._last_clean = self._clock.now()
         self._thread = threading.Thread(target=self._run, name="live-upload", daemon=True)
         self._thread.start()
 
@@ -350,21 +398,25 @@ class LiveUpload:
 
     def _run(self) -> None:
         failures = 0
+        last: str | None = None
         try:
             while not self._stop.is_set():
                 failed = self.pass_once()
                 if failed is not None:
                     failures += 1
-                    # One line when a run of failures starts, not one per retry, because a
-                    # bucket down for a session would otherwise write a line every minute.
-                    if failures == 1:
+                    # One line when a run of failures starts or its cause changes, not one
+                    # per retry, because a bucket down for a session would otherwise write a
+                    # line every minute. A long outage still names its current cause.
+                    if failed != last:
                         print(f"live_upload: {failed}, retrying", file=sys.stderr)
+                    last = failed
                 elif failures:
                     print(
                         f"live_upload: sending again after {failures} failed passes",
                         file=sys.stderr,
                     )
                     failures = 0
+                    last = None
                 if self._stop.wait(retry_delay(failures, poll=self._poll, cap=self._cap)):
                     return
         except Exception as exc:  # noqa: BLE001 - the alarm reports a thread that stopped
@@ -387,6 +439,8 @@ class LiveUpload:
                 already_there=self._already_there,
                 superseded=self._superseded,
                 refused=tuple(self._refused),
+                last_clean_pass=self._last_clean,
+                vanished=self._vanished,
             )
 
     # -- one pass ------------------------------------------------------------------
@@ -395,7 +449,9 @@ class LiveUpload:
         """Read the manifest's new lines, then try every owed segment once, oldest first.
 
         Returns ``None`` when nothing failed, or the one line naming the failure that ended
-        the pass early. That failure leaves its segment, and every one after it, owed.
+        the pass early. That failure leaves its segment, and every one after it, owed. A pass
+        that returns ``None`` records when it ended, which the alarm reads as the last clean
+        pass.
         """
         try:
             self._read_tail()
@@ -407,6 +463,8 @@ class LiveUpload:
             failed = self._send(rel)
             if failed is not None:
                 return failed
+        with self._lock:
+            self._last_clean = self._clock.now()
         return None
 
     def _read_tail(self) -> None:
@@ -487,7 +545,12 @@ class LiveUpload:
                 self._waiting.setdefault(compacted, []).append(rel)
 
     def _send(self, rel: str) -> str | None:
-        """One attempt at one owed segment. ``None`` unless the bucket failed to answer."""
+        """One attempt at one owed segment. ``None`` unless the bucket failed to answer.
+
+        Only a failed request ends the pass, because the next segment would meet the same
+        bucket. A segment that cannot be read stays owed and the pass goes on to the next
+        one, so one unreadable file holds back no other segment.
+        """
         with self._lock:
             owed = self._owed.get(rel)
         if owed is None:
@@ -499,12 +562,21 @@ class LiveUpload:
         try:
             data = (self._root / rel).read_bytes()
         except FileNotFoundError:
-            # Compaction deletes a day's segments once it has sealed the day, so a file gone
-            # is a file the nightly upload carries inside a partition.
-            self._settle(rel, digest, superseded=True)
+            self._gone(rel, digest)
             return None
         except OSError as exc:
-            return f"{rel} could not be read ({type(exc).__name__})"
+            # A file the daemon cannot read, such as one a hand-run command left owned by
+            # root. It stays owed, so the alarm pages once it has waited ten minutes.
+            with self._lock:
+                named = rel in self._unreadable
+                self._unreadable.add(rel)
+            if not named:
+                print(
+                    f"live_upload: {rel} could not be read ({type(exc).__name__}), so it "
+                    "stays owed and is tried again each pass",
+                    file=sys.stderr,
+                )
+            return None
         key = self._target.key(rel)
         try:
             self._client.put_object(
@@ -528,6 +600,35 @@ class LiveUpload:
             return f"{rel}: {_describe(exc)}"
         self._settle(rel, digest, uploaded=True)
         return None
+
+    def _gone(self, rel: str, digest: str) -> None:
+        """Settle a manifested segment whose file is gone.
+
+        Compaction deletes a day's segments once it has sealed the day, so a file gone from
+        a sealed day is one the nightly upload carries inside a partition. Compaction
+        records the seal in the manifest before it deletes, so the manifest is read again
+        first, in case the seal landed after this pass read it. A file gone from a day the
+        manifest has not sealed is missing from the lake. It stays out of the bucket, is
+        named once and is counted apart.
+        """
+        try:
+            self._read_tail()
+        except OSError:
+            pass
+        with self._lock:
+            sealed = _compacted_partition_for_segment(rel) in self._sealed
+        if sealed:
+            self._settle(rel, digest, superseded=True)
+            return
+        with self._lock:
+            if self._owed.pop(rel, None) is None:
+                return
+            self._vanished += 1
+        print(
+            f"live_upload: {rel} is missing from the lake before its day was sealed, so it "
+            "stays out of the live prefix",
+            file=sys.stderr,
+        )
 
     def _already_sent(self, rel: str, key: str, digest: str) -> str | None:
         """Settle a key S3 already holds, by the SHA-256 it stored for it."""
@@ -576,14 +677,17 @@ def prepare(
     connect: Connector,
     poll_seconds: float = POLL_SECONDS,
     backoff_cap_seconds: float = BACKOFF_CAP_SECONDS,
-) -> LiveUpload | None:
-    """The live upload for this host, with its client built, or ``None`` when it runs none.
+) -> LiveUpload | NotStarted | None:
+    """The live upload for this host with its client built, why it could not start, or none.
 
-    Only a primary with a bucket target runs one. A target with no prefix refuses with one
-    line, and so does a client that cannot be built. Either way capture runs on without the
-    upload. The client is built here, on the caller's thread, so the daemon builds it
-    before ``run_loop`` starts any cycle. ``connect`` is ``bucket.connect`` in production
-    and a fake in every test. Nothing here starts the thread.
+    Only a primary with a bucket target runs one, and any other host gets ``None``. On a
+    primary with a bucket target, a target with no prefix and a client that cannot be built
+    each print one line and hand back ``NotStarted``, which the daemon pages once. Either
+    way capture runs on without the upload. On the VM the daemon starts at every 07:30
+    boot, so one slow answer from the metadata service would otherwise lose the day's live
+    read in silence. The client is built here, on the caller's thread, so the daemon builds
+    it before ``run_loop`` starts any cycle. ``connect`` is ``bucket.connect`` in
+    production and a fake in every test. Nothing here starts the thread.
     """
     role, _ = outbox.role_of(config)
     target = config.backup_target
@@ -591,21 +695,13 @@ def prepare(
         return None
     try:
         live = live_target(target)
-    except LivePrefixRefused as exc:
-        print(f"live_upload: not started: {exc}", file=sys.stderr)
-        return None
-    try:
         _, client = connect(config, target)
     except ConfigError as exc:
-        # ``bucket.connect`` words every refusal as one operator line naming the setting.
-        print(f"live_upload: not started: {exc}", file=sys.stderr)
-        return None
+        # ``live_target`` and ``bucket.connect`` word every refusal as one operator line
+        # naming the setting, never the bucket.
+        return _not_started(str(exc))
     except Exception as exc:  # noqa: BLE001 - capture outranks the live upload
-        print(
-            f"live_upload: not started: the client build raised {type(exc).__name__}",
-            file=sys.stderr,
-        )
-        return None
+        return _not_started(f"the client build raised {type(exc).__name__}")
     return LiveUpload(
         lake_root=config.lake_root,
         target=live,
@@ -616,27 +712,58 @@ def prepare(
     )
 
 
+def _not_started(reason: str) -> NotStarted:
+    print(f"live_upload: not started: {reason}", file=sys.stderr)
+    return NotStarted(reason=reason)
+
+
+def not_started_message(refusal: NotStarted) -> Message:
+    """The page the daemon sends once at startup when the live upload could not start."""
+    return Message(
+        event=NOT_STARTED_EVENT,
+        title=NOT_STARTED_TITLE,
+        body=(
+            f"The live upload did not start: {refusal.reason}. {_COST} A daemon restart "
+            f"retries the client build. {_RESTART_CAUTION} {_LOG}"
+        ),
+    )
+
+
 # -- the alarm -----------------------------------------------------------------------
 
 
+def _clock_time(when: datetime) -> str:
+    return when.astimezone(MARKET_TZ).strftime("%H:%M")
+
+
 def _behind_body(state: UploadState, now: datetime) -> str | None:
-    """The page body when the upload is behind, or ``None`` while it keeps up."""
+    """The page body when the upload is behind, or ``None`` while it keeps up.
+
+    Behind means one of three things: the thread has stopped, the oldest owed segment was
+    first read more than ``BEHIND_AFTER`` ago, or no pass has ended cleanly for that long.
+    The last covers a thread that is alive but stuck, such as one that cannot read the
+    manifest and so never comes to owe anything.
+    """
     if not state.alive:
         return (
-            "The live upload thread stopped, and the daemon log's live_upload line names "
-            "why. Capture is unaffected, and the nightly upload still sends the sealed day. "
-            "A daemon restart starts the thread again."
+            f"The live upload thread stopped. {_COST} A daemon restart starts the thread "
+            f"again. {_RESTART_CAUTION} {_LOG}"
         )
     since = state.oldest_owed_since
-    if since is None or now - since <= BEHIND_AFTER:
-        return None
-    minutes = int((now - since).total_seconds() // 60)
-    return (
-        f"{state.owed} quotes segments owed, the oldest first read at "
-        f"{since.astimezone(MARKET_TZ).strftime('%H:%M')} ET, {minutes} minutes ago. "
-        "Capture is unaffected, and the nightly upload still sends the sealed day. The "
-        "daemon log's live_upload lines name the failure."
-    )
+    if since is not None and now - since > BEHIND_AFTER:
+        minutes = int((now - since).total_seconds() // 60)
+        return (
+            f"{state.owed} quotes segments owed, the oldest first read at "
+            f"{_clock_time(since)} ET, {minutes} minutes ago. {_COST} {_LOG}"
+        )
+    clean = state.last_clean_pass
+    if clean is not None and now - clean > BEHIND_AFTER:
+        minutes = int((now - clean).total_seconds() // 60)
+        return (
+            f"No pass of the live upload has ended cleanly since {_clock_time(clean)} ET, "
+            f"{minutes} minutes ago. {_COST} {_LOG}"
+        )
+    return None
 
 
 def _refused_body(refused: Sequence[str]) -> str:
@@ -648,19 +775,23 @@ def _refused_body(refused: Sequence[str]) -> str:
     return (
         f"{count} refused, because the bucket holds other bytes under the key or the bytes "
         f"no longer match the manifest entry: {names}. A segment is never rewritten, so "
-        "each stays out of the live prefix. The daemon log names why for each."
+        "each stays out of the live prefix, and the runtime cannot see those minutes in "
+        "the bucket until the nightly upload sends the sealed day. Capture and the nightly "
+        f"upload are unaffected. {_LOG}"
     )
 
 
 class UploadAlarm:
-    """Pages for the live upload from the loop thread, once per transition.
+    """Pages for the live upload from the loop thread.
 
     Two transitions page.
 
-    1. The upload falls behind, meaning the thread has stopped or the oldest owed segment
-       is more than ten minutes old. It pages once, and prints one line when the upload
-       catches up, which re-arms it. A stopped thread never catches up, so it pages once
-       for the life of the process.
+    1. The upload falls behind, as ``_behind_body`` defines it. It pages at most once an
+       Eastern date, and prints one line each time the upload catches up. A bucket that
+       flaps would otherwise page on every recovery and spend the daemon's daily page cap,
+       which capture's own alarms share. A thread that stops pages even on a date that
+       already paged, because a stopped thread never catches up and nothing else would
+       report it.
     2. The first key the upload refuses. A refusal is permanent, so later ones are only
        printed by the thread, and the page counts the refused keys it knew of.
 
@@ -673,6 +804,7 @@ class UploadAlarm:
         self._publisher = publisher
         self._clock = clock
         self._behind = False
+        self._behind_paged_on: date | None = None
         self._refusal_paged = False
 
     def check(self, slot: datetime) -> None:
@@ -680,7 +812,10 @@ class UploadAlarm:
         body = _behind_body(state, self._clock.now())
         if body is not None and not self._behind:
             self._behind = True
-            self._page(Message(event=BEHIND_EVENT, title=BEHIND_TITLE, body=body), slot)
+            day = slot.astimezone(MARKET_TZ).date()
+            if not state.alive or self._behind_paged_on != day:
+                self._behind_paged_on = day
+                self._page(Message(event=BEHIND_EVENT, title=BEHIND_TITLE, body=body), slot)
         elif body is None and self._behind:
             self._behind = False
             print(
@@ -827,14 +962,19 @@ __all__ = [
     "BEHIND_AFTER",
     "BEHIND_EVENT",
     "LAG_LIMIT",
+    "BEHIND_TITLE",
     "LIVE_SUFFIX",
+    "NOT_STARTED_EVENT",
+    "NOT_STARTED_TITLE",
     "POLL_SECONDS",
     "REFUSED_EVENT",
+    "REFUSED_TITLE",
     "STORAGE_CLASS",
     "Connector",
     "LagSummary",
     "LiveUpload",
     "LivePrefixRefused",
+    "NotStarted",
     "SegmentLag",
     "UploadAlarm",
     "UploadState",
@@ -844,6 +984,7 @@ __all__ = [
     "list_live",
     "live_target",
     "main",
+    "not_started_message",
     "prepare",
     "retry_delay",
     "segment_lags",
