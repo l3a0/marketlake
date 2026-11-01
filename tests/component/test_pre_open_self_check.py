@@ -79,6 +79,7 @@ def _run_daemon(tmp_path: Path, start: datetime, pid: int) -> Path:
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
         pull_runner=None,
+        live_upload=None,
         cycle_runner=no_cycle,
         should_continue=once,
     )

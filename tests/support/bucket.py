@@ -36,6 +36,12 @@ follows a lookup whose requests all passed. ``on_put`` and ``on_get`` run before
 ``PutObject`` or a ``GetObject`` is answered, so a test can fail or time one kind of call
 alone.
 
+A ``PutObject`` with ``IfNoneMatch="*"`` on a key that holds any version is refused with
+``PreconditionFailed``, HTTP 412, as S3 refuses a conditional write, and stores nothing. That
+is how the live upload's create-only PUT is tested (marketlake #943). Each version keeps the
+``Metadata`` its PUT carried, and ``HeadObject`` answers with it, as S3 answers with user
+metadata.
+
 Every stored version carries a ``LastModified``, which ``ListObjectsV2``, ``HeadObject`` and
 ``GetObject`` answer with, as S3 does. ``store`` takes one, and a version stored without one
 gets the fake's own clock, which starts at ``EPOCH`` and moves one second per version, so a
@@ -88,6 +94,7 @@ class Version:
     checksum_type: str | None = FULL_OBJECT
     storage_class: str | None = None
     last_modified: datetime = EPOCH
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 class _Events:
@@ -230,6 +237,8 @@ class FakeS3:
         data = body.read() if hasattr(body, "read") else bytes(body)
         if self.on_put is not None:
             self.on_put(kwargs, data)
+        if kwargs.get("IfNoneMatch") == "*" and self.objects.get(kwargs["Key"]):
+            raise client_error("PreconditionFailed", "PutObject", 412)
         supplied = kwargs.get("ChecksumSHA256")
         if supplied is not None:
             try:
@@ -247,6 +256,7 @@ class FakeS3:
             FULL_OBJECT if supplied else None,
             kwargs.get("StorageClass"),
         )
+        version.metadata = dict(kwargs.get("Metadata", {}))
         response = {"VersionId": version.version_id}
         if supplied is not None:
             response["ChecksumSHA256"] = supplied
@@ -283,6 +293,8 @@ class FakeS3:
         }
         if current.storage_class is not None:
             response["StorageClass"] = current.storage_class
+        if current.metadata:
+            response["Metadata"] = dict(current.metadata)
         if kwargs.get("ChecksumMode") == "ENABLED" and current.checksum is not None:
             response["ChecksumSHA256"] = current.checksum
             if current.checksum_type is not None:

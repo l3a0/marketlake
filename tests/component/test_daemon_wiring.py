@@ -338,6 +338,7 @@ def _run(
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls if pulls else None,
+        live_upload=None,
         cycle_runner=cycle_runner,
         hooks=hooks,
         should_continue=_stop_after(ticks),
@@ -2174,6 +2175,7 @@ def test_a_holiday_still_runs_the_job_so_its_check_is_fed(tmp_path):
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls,
+        live_upload=None,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(2),
     )
@@ -2202,6 +2204,7 @@ def test_a_weekend_owes_the_job_nothing(tmp_path):
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls,
+        live_upload=None,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(2),
     )
@@ -2555,6 +2558,7 @@ def test_a_compaction_spawn_that_raises_costs_the_seal_and_not_the_session(tmp_p
         pinger=rig.pinger,
         compaction_runner=_boom,
         pull_runner=rig.pulls,
+        live_upload=None,
         cycle_runner=_no_cycle,
         hooks=hooks,
         should_continue=_stop_after(4),
@@ -2646,6 +2650,7 @@ def _assertion_run(rig, clock, *, ticks: int, runner, hooks=None) -> None:
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls,
+        live_upload=None,
         cycle_runner=_no_cycle,
         hooks=hooks,
         should_continue=_stop_after(ticks),
@@ -2773,6 +2778,7 @@ def test_a_page_the_transport_refuses_is_not_retried_every_minute(tmp_path, caps
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls,
+        live_upload=None,
         cycle_runner=_no_cycle,
         should_continue=_stop_after(4),
     )
@@ -3241,6 +3247,7 @@ def test_the_plists_unset_paths_reach_every_read_unchanged(tmp_path, monkeypatch
         pinger=rig.pinger,
         compaction_runner=rig.compaction,
         pull_runner=rig.pulls,
+        live_upload=None,
         hooks=daemon.DaemonHooks(
             on_tick=stall,
             on_cycle=lambda slot, result: cycles.append(slot),

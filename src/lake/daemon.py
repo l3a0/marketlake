@@ -167,12 +167,24 @@ on. The daemon never leaves that way, and every test of the loop does.
 
 The launchd plist that runs the daemon is deliberately not here. It is D14's.
 
-Nothing is pinged or backed up per minute, unlike the slice-1 runner. The two session-
-relative jobs the loop dispatches own both. The close+15 compaction seals the day, syncs
-the lake to the backup target except on a ``shadow`` host, and pings the ``compaction``
-check, once a day. The
-dead-man ping is the per-minute exception, and it reports that the daemon is running
-rather than that anything landed.
+Nothing is pinged or backed up per minute, unlike the slice-1 runner, with two exceptions.
+The two session-relative jobs the loop dispatches own the rest. The close+15 compaction
+seals the day, syncs the lake to the backup target except on a ``shadow`` host, and pings
+the ``compaction`` check, once a day. The exceptions are these.
+
+1. The dead-man ping, which reports that the daemon is running rather than that anything
+   landed.
+2. The live upload in ``lake.live_upload`` (marketlake #943), which sends each quotes
+   segment to the bucket as its manifest entry lands, on a primary with a bucket target.
+   Three things make it safe beside capture.
+
+   1. It runs on a thread of its own, so no cycle and no hook waits on a request.
+   2. It takes no lock, because it reads ``manifest.jsonl`` read-only.
+   3. It sends nothing the nightly upload relies on. Its keys sit under a sibling prefix,
+      and it never sends ``manifest.jsonl``.
+
+   Its alarm rides ``on_tick``, on the loop thread, so a thread that dies is still
+   reported.
 """
 
 from __future__ import annotations
@@ -185,11 +197,13 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 from lake import control_plane, outbox, token_store
 from lake.alert import REFUSED, Message, Publisher, Transport
+from lake.bucket import connect as bucket_connect
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture import (
     CycleResult,
@@ -201,7 +215,7 @@ from lake.capture_spans import CaptureSpans, CaptureSpansError, spans_path
 from lake.clock import Clock, SystemClock
 from lake.close_guard import CloseGuard
 from lake.close_guard import GuardOutcome as CloseGuardOutcome
-from lake.config import ConfigError, input_errors_exit, load_config
+from lake.config import Config, ConfigError, input_errors_exit, load_config
 from lake.control_plane import (
     AssertionHolder,
     AssertionRunner,
@@ -211,6 +225,8 @@ from lake.control_plane import (
 from lake.deadman import CAPTURE_SLUG, DeadMan
 from lake.gap import GapMarker, MarkingReport, surfaces_for
 from lake.journal import CHAINS_SURFACE
+from lake.live_upload import LiveUpload, NotStarted, UploadAlarm, not_started_message
+from lake.live_upload import prepare as prepare_live_upload
 from lake.metadata import stamp_assertion_pid, stamp_cycle, stamp_ping
 from lake.paths import default_token_path
 from lake.reference_read import read_or_none
@@ -255,6 +271,14 @@ PullRunner = Callable[[Sequence[str]], object]
 # SSM client gives up after about two minutes, three attempts of a 10-second connect and a
 # 30-second read, so two spawns from this daemon do not overlap.
 PULL_SPACING = timedelta(minutes=5)
+
+# Builds the live upload's client and hands back the upload, a ``NotStarted`` naming why a
+# host that should run one could not, or ``None`` on a host that runs none (marketlake #943).
+# The real one is ``live_upload.prepare`` over ``bucket.connect``. It is required for the
+# reason ``CompactionRunner`` is: a caller who forgot it would PUT a throwaway lake's
+# segments to whatever bucket the config named. ``None`` starts no upload, which is what
+# every test passes unless it is about the upload.
+LiveUploadStarter = Callable[[Config, Clock], LiveUpload | NotStarted | None]
 
 
 class CycleRunner(Protocol):
@@ -1424,6 +1448,17 @@ def _report_schema_version(
         print(f"schema_version: page not sent: {delivery.reason}, {kept}", file=sys.stderr)
 
 
+def _page_live_upload_not_started(refusal: NotStarted, publisher: Publisher, now: datetime) -> None:
+    """Page once that the live upload could not start, and say so when the page did not go.
+
+    Once per process, as ``_report_schema_version`` is, because the build runs once and its
+    verdict cannot change inside one process. The starter has already printed the reason.
+    """
+    delivery = publisher.publish(not_started_message(refusal), now=now)
+    if not delivery.sent:
+        print(f"live_upload: not-started page not sent: {delivery.reason}", file=sys.stderr)
+
+
 def run_loop_from_config(
     *,
     config_path: str | Path | None = None,
@@ -1438,6 +1473,7 @@ def run_loop_from_config(
     pinger: Pinger,
     compaction_runner: CompactionRunner,
     pull_runner: PullRunner | None,
+    live_upload: LiveUploadStarter | None,
     should_continue: Callable[[], bool] = _forever,
 ) -> None:
     """Run the loop wired from the real clock, calendar, and config. It never returns.
@@ -1479,6 +1515,17 @@ def run_loop_from_config(
     therefore resumes capture at the first pull after the token parameter changed, not on
     the next cycle. ``main`` passes ``None`` under ``token_store: file`` or ``both``, and
     the cycle hook then pulls nothing.
+
+    ``live_upload`` is required for the same reason, and may be ``None``. It builds the
+    bucket client the live upload sends each quotes segment with, and hands back the
+    upload, or ``None`` on a host that runs none (marketlake #943). On a host that should run
+    one and could not start it, it hands back a ``NotStarted``, and this pages once through
+    ``publisher`` before the loop starts. It is called once, here,
+    before ``run_loop`` starts any cycle, because building a client hides every ``AWS_*``
+    variable from the whole process for the length of the build. The thread it hands back
+    is started here and asked to stop when the loop returns. Its alarm rides ``on_tick``
+    last, after every other tick hook, so a caller's own hook has run by the time it reads
+    the upload's state. ``main`` passes ``live_upload.prepare`` over ``bucket.connect``.
 
     ``plan_path`` names the machine-derived chunk plan the close+15 re-tune rewrites. It
     defaults to the same file the capture cycle reads, so the two never disagree about
@@ -1545,6 +1592,15 @@ def run_loop_from_config(
     # reads at that hour. And it runs before any hook is wired, so the report leaves before
     # startup gap-marking takes the lake-root lock.
     _report_schema_version(config_path, publisher, clock.now())
+    # The live upload's client is built here, on this thread and before the loop starts any
+    # cycle, for the reason the docstring gives. A build that fails prints one line inside
+    # the starter and hands back a ``NotStarted``, which pages once here, and capture runs
+    # on without the upload.
+    started = live_upload(load_config(config_path), clock) if live_upload is not None else None
+    upload = started if isinstance(started, LiveUpload) else None
+    if isinstance(started, NotStarted):
+        _page_live_upload_not_started(started, publisher, clock.now())
+    upload_alarm = UploadAlarm(upload, publisher, clock) if upload is not None else None
     holder = AssertionHolder(runner=assertion_runner)
     caller_on_tick = hooks.on_tick
     pid_stamp = _assertion_pid_stamp(config_path)
@@ -1979,6 +2035,10 @@ def run_loop_from_config(
         # the capture machine is one minute, so the minute this page is late by is the
         # minute the machine can spend asleep.
         report_lost_assertion(slot)
+        # Last of all, so every hook above, a caller's own included, has run this minute.
+        # It reads a copy of the upload's state and never waits on the upload's thread.
+        if upload_alarm is not None:
+            upload_alarm.check(slot)
 
     hooks = replace(hooks, on_cycle=on_cycle, on_missed=on_missed, on_tick=on_tick)
 
@@ -1995,13 +2055,21 @@ def run_loop_from_config(
             session_phase=session_phase,
         )
 
-    run_loop(
-        session_clock,
-        cycle_runner if cycle_runner is not None else run_a_cycle,
-        clock=clock,
-        hooks=hooks,
-        should_continue=should_continue,
-    )
+    if upload is not None:
+        upload.start()
+    try:
+        run_loop(
+            session_clock,
+            cycle_runner if cycle_runner is not None else run_a_cycle,
+            clock=clock,
+            hooks=hooks,
+            should_continue=should_continue,
+        )
+    finally:
+        # A daemon thread never holds the process open, so this matters only to a caller
+        # whose loop returns, which is every test and never production.
+        if upload is not None:
+            upload.stop()
 
 
 # -- the command-line entry ----------------------------------------------------
@@ -2082,6 +2150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pinger=sends.pinger,
             compaction_runner=_spawn_compaction,
             pull_runner=_spawn_token_pull if pulls else None,
+            live_upload=partial(prepare_live_upload, connect=bucket_connect),
             assertion_runner=None if control_plane.is_macos() else _hold_nothing,
         )
     return 0
@@ -2092,6 +2161,7 @@ __all__ = [
     "PULL_SPACING",
     "CycleRunner",
     "DaemonHooks",
+    "LiveUploadStarter",
     "PullRunner",
     "build_parser",
     "main",

@@ -285,8 +285,10 @@ class SlugEscalation:
 #    exclusion does: excluding the token alone leaves ``config.yaml``'s secrets behind.
 #
 # Considered and rejected, pinned here so none is re-proposed. ``journal/`` holds the
-# only copy of the day's capture until close+15 seals it, which is the single-copy
-# window the backup exists to close. ``manifest.jsonl`` is the integrity root, and a
+# only copy of the day's chains until close+15 seals them, and of its quotes too on any
+# host but a primary with a bucket target, whose live upload also sends each quotes
+# segment to the bucket as it lands (marketlake #943). That is the single-copy window
+# the backup exists to close. ``manifest.jsonl`` is the integrity root, and a
 # restore without it can verify nothing. ``quarantine.jsonl`` and ``reports/`` are
 # pinned by the design as inside the sync root. ``.DS_Store`` is Finder state rather
 # than anything this system writes, the primary's own reverse scrub already names it as
