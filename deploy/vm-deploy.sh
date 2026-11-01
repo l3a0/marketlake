@@ -75,9 +75,15 @@
 # result file, so a run killed partway reports itself unknown. TERM, INT and HUP exit 1
 # through a trap, because bash 3.2 enters the EXIT trap after SIGTERM with $? at 0.
 #
-# The caps below sum to 200 minutes, a rollback included, and lake.deploy_window refuses
-# a start less than 210 minutes before its next refused span, so even a deploy that rolls
+# The caps below sum to 80 minutes, a rollback included, and lake.deploy_window refuses
+# a start less than 90 minutes before its next refused span, so even a deploy that rolls
 # back ends before that span opens. A test checks the sum against the window's margin.
+# The bootstrap's cap comes from a measurement (marketlake #986). The slowest bootstrap
+# the VM has run is its first boot, at 19 seconds, and no deploy's bootstrap has taken
+# more than about 17. A bootstrap still retrying through an outage of SSM or the package
+# index is cut off at the cap and rolled back, where it once ran its retries out and exited
+# 4. The other caps bound a wait on something else, such as a lock, the fetch or a busy
+# job, so the bootstrap's time does not size them.
 #
 # Unlike the refusals of the other deploy/ scripts, every last line goes to stdout, the
 # usage error included, because the CI side reads the host's outcome from
@@ -97,11 +103,11 @@
 # Written for bash 3.2 as well as a current bash, because the test suite runs it on a Mac.
 set -euo pipefail
 
-# -- the caps, which sum to 200 minutes ------------------------------------------------
+# -- the caps, which sum to 80 minutes -------------------------------------------------
 
 FETCH_SECONDS=300                # git fetch, once
 INSTALL_LOCK_WAIT_SECONDS=600    # the install lock, for the merge and for a rollback's reset
-BOOTSTRAP_SECONDS=4500           # each of two bootstraps, the deploy's and a rollback's
+BOOTSTRAP_SECONDS=900            # each of two bootstraps, the deploy's and a rollback's
 BOOTSTRAP_KILL_SECONDS=60        # timeout's wait between SIGTERM and SIGKILL
 BUSY_WAIT_SECONDS=900            # the wait for the busy checks, before a restart or a rollback
 RESTART_CHECK_SECONDS=180        # each of two restarts with their hold check

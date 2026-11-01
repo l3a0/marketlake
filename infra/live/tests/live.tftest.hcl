@@ -801,9 +801,9 @@ run "deploy_document_runs_only_vm_deploy" {
       for step in jsondecode(aws_ssm_document.deploy.content).mainSteps :
       [step.action, step.name, step.inputs.timeoutSeconds, length(step.inputs.runCommand), join(",", sort(keys(step.inputs)))]
       ] == [
-      ["aws:runShellScript", "deploy", 13200, 1, "runCommand,timeoutSeconds"],
+      ["aws:runShellScript", "deploy", 6000, 1, "runCommand,timeoutSeconds"],
     ]
-    error_message = "The deploy document is not one aws:runShellScript step with a 13,200-second timeout and one command."
+    error_message = "The deploy document is not one aws:runShellScript step with a 6,000-second timeout and one command."
   }
 
   # The step's lines, without comments and blank lines, start by setting PATH and the

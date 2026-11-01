@@ -72,7 +72,7 @@ run "trust_policies_match_the_oidc_subjects" {
   # the role allows.
   assert {
     condition     = aws_iam_role.deploy.max_session_duration == 18000
-    error_message = "The deploy role's session limit is not 18,000 seconds, so the deploy job cannot assume it for its 240 minutes."
+    error_message = "The deploy role's session limit is not 18,000 seconds, so the deploy job cannot assume it for its 120 minutes."
   }
 
   assert {

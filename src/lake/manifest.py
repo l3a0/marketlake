@@ -18,9 +18,9 @@ The ledger lives at ``manifest.jsonl`` at the lake root. Its rules are few and e
    are only ever appended, with two exceptions, each run by hand under the lake-root lock.
    ``python -m lake.bucket resync`` (marketlake #832) cuts the manifest back to the entries
    it shares with the bucket's copy and appends that copy's tail in place, so the file ends
-   equal to the bucket's. ``python -m lake.bar_import undo`` (marketlake #950) cuts it back
-   to before an import whose entries are still its last lines, while the bucket's copy
-   holds none of them.
+   equal to the bucket's. ``python -m lake.bar_import undo`` and ``schwab-undo`` (marketlake
+   #950, #951) cut it back to before an import whose entries are still its last lines, while
+   the bucket's copy holds none of them.
 2. *Last entry wins*, keyed by the file's path. A re-run legitimately appends a second
    entry for the same path. The current truth is the last entry for that path.
 3. *Two-way scrub.* Every entry's file must exist and match its last recorded sha,
@@ -146,9 +146,11 @@ SCRUB_EXCLUSIONS: tuple[str, ...] = (
 # the writer appended. These two names are the one place that mapping is read for meaning,
 # so the battery, the sign-off tool and every reader resolve a verdict the same way.
 # The prefix every bars import's manifest ``source`` starts with, as
-# ``bar-import:sha256:<hex>``. ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads
-# it to refuse deleting an import only one lake records, since no sweep regenerates one
-# (marketlake #950). It lives here, below both, so ``bucket`` imports no hand-run command.
+# ``bar-import:sha256:<hex>`` for a vintage (marketlake #950) and as
+# ``bar-import:schwab-window:<ticker>:<first>..<last>`` for Schwab's sessions before capture
+# (marketlake #951). ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads it to
+# refuse deleting an import only one lake records, since no sweep regenerates one.
+# It lives here, below both, so ``bucket`` imports no hand-run command.
 BAR_IMPORT_SOURCE_PREFIX = "bar-import:"
 
 VERDICT_FIELD = "verdict"

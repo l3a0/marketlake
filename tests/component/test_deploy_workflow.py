@@ -448,7 +448,7 @@ def test_the_timeouts_follow_from_the_margin() -> None:
     assert delivery == 600
     job_minutes = _job()["timeout-minutes"]
     assert job_minutes * 60 >= delivery + timeout + 600
-    assert job_minutes == 240
+    assert job_minutes == 120
 
 
 def test_the_document_runs_the_step_file() -> None:

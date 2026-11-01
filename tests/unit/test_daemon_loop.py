@@ -53,7 +53,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from lake import daemon
+from lake import bucket, daemon, live_upload
 from lake.alert import NtfyTransport
 from lake.calendar import MARKET_TZ
 from lake.capture import CycleResult
@@ -1384,6 +1384,7 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
         "pinger",
         "compaction_runner",
         "pull_runner",
+        "live_upload",
         "assertion_runner",
     }
     assert seen["config_path"] == str(config)
@@ -1401,6 +1402,11 @@ def test_main_passes_the_paths_to_the_config_entry(tmp_path, monkeypatch):
     # This config has no ``token_store`` key, so it is the ``file`` laptop, which ran the
     # re-auth itself and pulls nothing.
     assert seen["pull_runner"] is None
+    # The live upload's starter is the real one, over the real ``bucket.connect``, so a
+    # primary with a bucket target builds a real client (marketlake #943).
+    starter = seen["live_upload"]
+    assert starter.func is live_upload.prepare
+    assert starter.keywords == {"connect": bucket.connect}
     # The topic, not just the class. It is the write credential for the ntfy channel, so
     # the wiring worth covering is which topic reached the transport. Asserting the class
     # alone passes a `main` that ignored --config and read the machine's own config,
@@ -1528,6 +1534,7 @@ def test_the_wired_daemon_holds_the_caffeinate_assertion_once_per_window(tmp_pat
         pinger=pinger,
         compaction_runner=lambda args: None,
         pull_runner=None,
+        live_upload=None,
         should_continue=_stop_after(4),
     )
     # Four ticks, one window, one caffeinate process.
@@ -1557,6 +1564,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_config(tmp_path):
             pinger=FakePinger(),
             compaction_runner=lambda args: None,
             pull_runner=None,
+            live_upload=None,
             should_continue=_stop_after(1),
         )
 
@@ -1578,6 +1586,7 @@ def test_the_wired_daemon_refuses_to_start_without_a_roster(tmp_path):
             pinger=FakePinger(),
             compaction_runner=lambda args: None,
             pull_runner=None,
+            live_upload=None,
             should_continue=_stop_after(1),
         )
 
@@ -1602,6 +1611,7 @@ def test_the_wired_daemon_still_runs_a_caller_tick_hook(tmp_path):
         pinger=FakePinger(),
         compaction_runner=lambda args: None,
         pull_runner=None,
+        live_upload=None,
         should_continue=_stop_after(2),
     )
     assert len(ticks) == 2
