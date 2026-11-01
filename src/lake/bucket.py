@@ -3522,7 +3522,7 @@ def _leftover_temps(path: Path) -> list[Path]:
     """Every temp file an atomic write to ``path`` could have left beside it.
 
     ``paths.leftover_temps`` reads ``paths.temp_write_path``'s ``<name>.tmp-<pid>``, for this
-    one name. The bar import asks it about every key of a vintage at once (marketlake #950).
+    one name. The bar import asks it about every key of an import at once (marketlake #950).
     """
     return leftover_temps(path.parent, {path.name})
 

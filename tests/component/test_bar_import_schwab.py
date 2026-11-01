@@ -18,6 +18,7 @@ inputs, so no expected value comes from the code under test.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -42,7 +43,7 @@ from tests.support.bars import write_bars
 from tests.support.bucket import FakeS3
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
-from tests.support.config import write_config
+from tests.support.config import SCHWAB_API_KEY, SCHWAB_APP_SECRET, write_config
 from tests.support.lake import FixtureLake
 from tests.support.vendor import CassetteVendor, bars_candle, bars_interactions
 
@@ -77,7 +78,13 @@ def _sessions() -> list[date]:
 SESSIONS = _sessions()
 
 
-def _lake(tmp_path: Path, tickers=("GLD",), *, onboard: datetime = ONBOARD) -> Path:
+def _lake(
+    tmp_path: Path, tickers=("GLD",), *, onboard: datetime = ONBOARD, ids: dict | None = None
+) -> Path:
+    """A lake whose master holds each ticker from ``onboard``, with an open span from then.
+
+    ``ids``, when given, is filled with each ticker's instrument id as the master issued it.
+    """
     root = FixtureLake(tmp_path / "lake").with_reference("schema_versions", _ledger_table()).build()
     master = SecurityMaster()
     ledger = CaptureSpans()
@@ -88,6 +95,8 @@ def _lake(tmp_path: Path, tickers=("GLD",), *, onboard: datetime = ONBOARD) -> P
             valid_from=onboard.date(),
             ticker=ticker,
         )
+        if ids is not None:
+            ids[ticker] = instrument
         ledger.open_span(instrument, onboard.astimezone(UTC), options=False)
     master.write(master_path(root))
     ledger.write(spans_path(root))
@@ -130,12 +139,16 @@ def _vendor(
 class _Vendors:
     """One cassette vendor per ticker, recording every request it answers."""
 
-    def __init__(self, **by_ticker: CassetteVendor) -> None:
+    def __init__(self, *, clock: ManualClock | None = None, **by_ticker: CassetteVendor) -> None:
         self.by_ticker = by_ticker
+        self.clock = clock
         self.requests: list[tuple[str, datetime, datetime]] = []
 
     def get_daily_bars(self, symbol, *, start, end, extended_hours=None, previous_close=None):
         self.requests.append((symbol, start, end))
+        if self.clock is not None:
+            # A request takes a second, so the fetch's two stamps differ.
+            self.clock.advance(1)
         return self.by_ticker[symbol].get_daily_bars(
             symbol,
             start=start,
@@ -145,7 +158,7 @@ class _Vendors:
         )
 
 
-def _run(root, tickers=("GLD",), *, vendor=None, now=MONDAY_0745, dry_run=False):
+def _run(root, tickers=("GLD",), *, vendor=None, now=MONDAY_0745, dry_run=False, bucket=None):
     return import_schwab(
         root,
         list(tickers),
@@ -153,6 +166,7 @@ def _run(root, tickers=("GLD",), *, vendor=None, now=MONDAY_0745, dry_run=False)
         clock=now if isinstance(now, ManualClock) else ManualClock(now),
         calendar=CALENDAR,
         dry_run=dry_run,
+        bucket=bucket,
     )
 
 
@@ -222,15 +236,24 @@ def test_each_partition_records_the_window_identity(tmp_path):
 
 def test_each_row_records_the_request_it_came_from(tmp_path):
     """The rows come from the sweep's builder, so they carry the fetch and its window."""
-    root = _lake(tmp_path)
+    ids: dict[str, int] = {}
+    root = _lake(tmp_path, ("GLD", "USO"), ids=ids)
+    # A UTC clock, as the real one is, so the stamps read in UTC.
+    clock = ManualClock(MONDAY_0745.astimezone(UTC))
+    vendors = _Vendors(clock=clock, GLD=_vendor("GLD"), USO=_vendor("USO"))
 
-    _run(root)
+    _run(root, ("GLD", "USO"), vendor=vendors, now=clock)
 
     row = pq.read_table(root / _rel("GLD", FIRST)).to_pylist()[0]
     assert row["window_start"] == "2026-09-04T04:00:00+00:00"
     assert row["window_end"] == "2026-10-30T04:00:00+00:00"
-    assert row["fetch_ts"] is not None and row["fetch_end_ts"] is not None
-    assert row["instrument_id"] is not None
+    # 07:45 ET is 12:45Z, and each request advances the clock a second.
+    assert row["fetch_ts"] == "2026-11-02T12:45:00+00:00"
+    assert row["fetch_end_ts"] == "2026-11-02T12:45:01+00:00"
+    for ticker in ("GLD", "USO"):
+        table = load_bars(ticker, "1d", lake_root=root, adjust="none")
+        assert set(table.column("instrument_id").to_pylist()) == {ids[ticker]}
+    assert ids["GLD"] != ids["USO"]
 
 
 def test_a_session_the_response_lacks_is_counted_and_the_rest_land(tmp_path):
@@ -325,15 +348,28 @@ def test_a_candle_outside_the_window_is_dropped_not_landed(tmp_path):
         _candle(d, n) for n, d in enumerate(SESSIONS)
     ]
 
-    _run(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
+    summary = _run(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
 
     assert _bars_files(root) == [_rel("GLD", d) for d in SESSIONS]
+    assert "2 candle(s) outside the window dropped" in summary.render()
+
+
+def test_a_candle_the_builder_cannot_read_is_counted_apart_from_a_missing_session(tmp_path):
+    root = _lake(tmp_path)
+    candles = [_candle(d, n) for n, d in enumerate(SESSIONS)]
+    del candles[10]["datetime"]
+
+    line = _run(root, vendor=_Vendors(GLD=_vendor(candles=candles))).render()
+
+    assert "1 candle(s) the row builder could not read" in line
+    assert "1 session(s) the calendar names and the response lacks" in line
+    assert "0 candle(s) outside the window dropped" in line
 
 
 def test_a_stamp_the_evening_before_names_the_next_session(tmp_path):
-    """A winter 04:00Z stamp is 23:00 Eastern the evening before. ``bars.daily_session_of``'s
-    18:00 boundary reads it as the next session, where a strict Eastern date would name the
-    session before and drop the candle as a duplicate or land it a day early."""
+    """A stamp at 23:00 Eastern, 03:00Z under daylight time, sits on the evening before.
+    ``bars.daily_session_of``'s 18:00 boundary reads it as the next session, where a strict
+    Eastern date would name 2026-10-29 and clash with that session's own candle."""
     root = _lake(tmp_path)
     candles = [_candle(d, n) for n, d in enumerate(SESSIONS[:-1])]
     evening = _candle(LAST, 39)
@@ -350,10 +386,100 @@ def test_a_last_session_that_is_today_refuses(tmp_path):
     """An evening onboarding imported that evening would land a candle before it is final."""
     root = _lake(tmp_path, onboard=datetime(2026, 11, 2, 17, 30, tzinfo=MARKET_TZ))
 
-    message = _refused(root, now=datetime(2026, 11, 2, 19, 0, tzinfo=MARKET_TZ))
+    # The real clock runs in UTC, and 19:00 ET is already 2026-11-03 there.
+    message = _refused(root, now=datetime(2026, 11, 3, 0, 0, tzinfo=UTC))
 
     assert "2026-11-02" in message and "not final" in message
     assert not (root / "bars").exists()
+
+
+def test_source_as_of_is_the_fetchs_eastern_date_on_a_utc_clock(tmp_path):
+    """21:00 ET on 2026-11-02 is 02:00Z on 2026-11-03. The as-of date is the Eastern one."""
+    root = _lake(tmp_path)
+
+    _run(root, now=datetime(2026, 11, 3, 2, 0, tzinfo=UTC))
+
+    table = load_bars("GLD", "1d", lake_root=root, adjust="none")
+    assert set(table.column("source_as_of").to_pylist()) == {"2026-11-02"}
+
+
+# -- a recorded key found missing ---------------------------------------------------------
+
+
+def _split_vendor() -> _Vendors:
+    """Tuesday's answer after a 2-for-1 split: every price halved, every volume doubled."""
+    candles = []
+    for n, day in enumerate(SESSIONS):
+        candle = _candle(day, n)
+        for name in ("open", "high", "low", "close"):
+            candle[name] = candle[name] / 2
+        candle["volume"] *= 2
+        candles.append(candle)
+    return _Vendors(GLD=_vendor(candles=candles))
+
+
+def _lost_one(tmp_path: Path) -> tuple[Path, str, bytes]:
+    root = _lake(tmp_path)
+    _run(root)
+    rel = _rel("GLD", date(2026, 9, 9))
+    original = (root / rel).read_bytes()
+    (root / rel).unlink()
+    return root, rel, original
+
+
+TUESDAY_0745 = datetime(2026, 11, 3, 7, 45, tzinfo=MARKET_TZ)
+
+
+def test_a_missing_key_the_bucket_holds_refuses_rather_than_writing_a_new_fetch(tmp_path):
+    """A rescaled fetch written over a key the upload sent would put two scales in one import
+    and replace the bucket's copy at the next upload."""
+    root, rel, _original = _lost_one(tmp_path)
+    client = FakeS3()
+    client.store(UNDO_TARGET.key(rel), b"sent")
+    after = _snapshot(root)
+
+    message = _refused(
+        root, vendor=_split_vendor(), now=TUESDAY_0745, bucket=lambda: (UNDO_TARGET, client)
+    )
+
+    assert f"{rel} is recorded under this import and missing here, and the bucket holds it" in (
+        message
+    )
+    assert "restore-range --surface bars --ticker GLD --from 2026-09-09 --to 2026-09-09" in message
+    assert _snapshot(root) == after
+
+
+def test_a_missing_key_with_no_bucket_to_read_refuses(tmp_path):
+    root, rel, _original = _lost_one(tmp_path)
+    after = _snapshot(root)
+
+    message = _refused(root, vendor=_split_vendor(), now=TUESDAY_0745)
+
+    assert "no bucket to read" in message and "restore-range" in message
+    assert _snapshot(root) == after
+
+
+def test_a_missing_key_the_bucket_lacks_is_written_again(tmp_path):
+    """The state an undo stopped part-way leaves before the upload, which only a rerun repairs."""
+    root, rel, _original = _lost_one(tmp_path)
+
+    summary = _run(root, now=TUESDAY_0745, bucket=lambda: (UNDO_TARGET, FakeS3()))
+
+    assert (root / rel).exists()
+    assert "1 recorded file(s) found missing and written again" in summary.render()
+
+
+def test_a_full_rerun_reads_no_bucket(tmp_path):
+    """The bucket is read only for a missing recorded key."""
+    root = _lake(tmp_path)
+    _run(root)
+
+    def no_bucket():  # pragma: no cover - a full rerun never asks
+        raise AssertionError("the bucket was read")
+
+    summary = _run(root, now=TUESDAY_0745, bucket=no_bucket)
+
+    assert "40 already imported" in summary.render()
 
 
 # -- refusals ---------------------------------------------------------------------------
@@ -369,11 +495,13 @@ def test_two_candles_for_one_session_refuse(tmp_path):
     assert not (root / "bars").exists()
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf, None, "101.5"])
-def test_a_price_that_is_not_a_finite_number_refuses(tmp_path, value):
+@pytest.mark.parametrize("name", ["open", "high", "low", "close"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, None, "101.5", True])
+def test_a_price_that_is_not_a_finite_number_refuses(tmp_path, name, value):
+    """``True`` builds as 1.0 in a float column, so the batch check alone would land it."""
     root = _lake(tmp_path)
     candles = [_candle(d, n) for n, d in enumerate(SESSIONS)]
-    candles[3]["close"] = value
+    candles[3][name] = value
 
     assert "not a finite number" in _refused(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
     assert not (root / "bars").exists()
@@ -417,7 +545,9 @@ def test_a_dead_token_refuses_with_the_reauth_line(tmp_path):
 
     message = _refused(root, vendor=_Failing(VendorAuthError("refresh token expired")))
 
-    assert "python -m lake.reauth" in message
+    # The VM has no browser, so the repair is the laptop's reauth.sh and the VM's pull.
+    assert "reauth.sh on the laptop" in message
+    assert "python -m lake.token_store pull" in message
 
 
 def test_a_vendor_failure_refuses(tmp_path):
@@ -447,6 +577,27 @@ def test_a_ticker_not_onboarded_refuses_before_any_request(tmp_path):
     vendors = _Vendors(GLD=_vendor())
 
     assert "lake.onboard GLD" in _refused(root, vendor=vendors)
+    assert vendors.requests == []
+
+
+def test_a_calendar_short_of_forty_sessions_refuses_before_any_request(tmp_path):
+    root = _lake(tmp_path)
+    vendors = _Vendors(GLD=_vendor())
+    short = weekday_sessions(*(date(2026, 9, 28) + timedelta(weeks=n) for n in range(6)))
+
+    with pytest.raises(BarImportRefused) as refused:
+        import_schwab(root, ["GLD"], vendor=vendors, clock=ManualClock(MONDAY_0745), calendar=short)
+
+    assert "short of 40" in str(refused.value)
+    assert vendors.requests == []
+
+
+def test_a_lake_root_with_no_manifest_refuses(tmp_path):
+    root = _lake(tmp_path)
+    (root / "manifest.jsonl").unlink()
+    vendors = _Vendors(GLD=_vendor())
+
+    assert "holds no manifest.jsonl" in _refused(root, vendor=vendors)
     assert vendors.requests == []
 
 
@@ -513,7 +664,9 @@ def test_an_undo_of_a_ticker_imported_before_another_refuses(tmp_path):
     with pytest.raises(BarImportRefused) as refused:
         _undo(root, ("GLD",))
 
-    assert "something else was recorded after it" in str(refused.value)
+    message = str(refused.value)
+    assert "bar-import:schwab-window:USO:2026-09-04..2026-10-30 was recorded after it" in message
+    assert "Undo that import first" in message
     assert _snapshot(root) == after
 
 
@@ -527,6 +680,33 @@ def test_an_undo_inside_the_session_refuses_before_it_reads_the_lake(tmp_path):
 
     assert "Nothing was undone" in str(refused.value)
     assert "security master" not in str(refused.value).lower()
+
+
+def test_an_undo_after_a_killed_import_says_to_rerun_the_import(tmp_path):
+    """A killed import leaves files no manifest line records, which the undo cannot cut."""
+    root = _lake(tmp_path)
+    before = _snapshot(root)
+    _run(root)
+    (root / "manifest.jsonl").write_bytes(before["manifest.jsonl"])
+    after = _snapshot(root)
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root)
+
+    assert f"{_rel('GLD', FIRST)} is on disk and the manifest records none of this import" in str(
+        refused.value
+    )
+    assert _snapshot(root) == after
+
+
+def test_an_undo_of_a_lake_root_with_no_manifest_refuses(tmp_path):
+    root = _lake(tmp_path)
+    (root / "manifest.jsonl").unlink()
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root)
+
+    assert "holds no manifest.jsonl" in str(refused.value)
 
 
 def test_an_undo_with_nothing_imported_changes_nothing(tmp_path):
@@ -548,7 +728,7 @@ def test_the_schwab_command_builds_the_vendor_from_the_config(tmp_path, capsys):
     built: list[tuple] = []
 
     def factory(token_path, *, api_key, app_secret):
-        built.append((Path(token_path).name, bool(api_key), bool(app_secret)))
+        built.append((Path(token_path).name, api_key, app_secret))
         return _Vendors(GLD=_vendor())
 
     code = bar_import.main(
@@ -559,7 +739,7 @@ def test_the_schwab_command_builds_the_vendor_from_the_config(tmp_path, capsys):
     )
 
     assert code == 0
-    assert built == [("token.json", True, True)]
+    assert built == [("token.json", SCHWAB_API_KEY, SCHWAB_APP_SECRET)]
     assert "bar_import: GLD: landed 40 of 40 row(s)" in capsys.readouterr().out
 
 
@@ -580,12 +760,17 @@ def test_a_schwab_refusal_reaches_the_operator_as_one_line_and_exit_2(tmp_path, 
     assert len(err) == 1 and err[0].startswith("bar_import: ") and "reauth" in err[0]
 
 
-def test_an_unreadable_token_reaches_the_operator_as_one_line(tmp_path, capsys):
+@pytest.mark.parametrize(
+    "error", [FileNotFoundError("token.json"), json.JSONDecodeError("Expecting", "{not", 1)]
+)
+def test_an_unreadable_token_reaches_the_operator_as_one_line(tmp_path, capsys, error):
+    """schwab-py reads the token while it builds the client, so a missing file raises
+    ``OSError`` and a corrupt one ``ValueError`` before any request."""
     root = _lake(tmp_path)
     config = write_config(tmp_path, root)
 
     def factory(token_path, **kwargs):
-        raise FileNotFoundError(token_path)
+        raise error
 
     with pytest.raises(SystemExit) as exited:
         bar_import.main(
@@ -597,7 +782,26 @@ def test_an_unreadable_token_reaches_the_operator_as_one_line(tmp_path, capsys):
 
     assert exited.value.code == 2
     err = capsys.readouterr().err.strip().splitlines()
-    assert len(err) == 1 and "cannot be read (FileNotFoundError)" in err[0]
+    assert len(err) == 1 and f"cannot be read ({type(error).__name__})" in err[0]
+
+
+def test_the_run_window_refuses_before_the_token_is_read(tmp_path, capsys):
+    root = _lake(tmp_path)
+    config = write_config(tmp_path, root)
+
+    def factory(*args, **kwargs):  # pragma: no cover - the window refuses first
+        raise AssertionError("the token was read inside the session")
+
+    with pytest.raises(SystemExit) as exited:
+        bar_import.main(
+            ["schwab", "GLD", "--config", str(config)],
+            clock=ManualClock(datetime(2026, 11, 2, 10, 0, tzinfo=MARKET_TZ)),
+            calendar=CALENDAR,
+            vendor_factory=factory,
+        )
+
+    assert exited.value.code == 2
+    assert "Nothing was written" in capsys.readouterr().err
 
 
 def test_the_schwab_command_refuses_on_a_shadow_host(tmp_path, capsys):

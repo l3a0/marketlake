@@ -639,7 +639,8 @@ def daily_session_of(bar_ts: str) -> date:
 
     It gives up one convention, a stamp at the end of the session's UTC day: 23:59 UTC is 19:59 EDT
     and names the next session here. No source this lake reads stamps that way. The vendor's
-    stamps sit near Eastern midnight, and an imported bar is stamped at Eastern midnight.
+    stamps sit near Eastern midnight, a vintage's imported bar is stamped at Eastern midnight, and
+    a Schwab import keeps the vendor's stamp.
 
     The naive-stamp refusal is :func:`_as_instant`'s and the zone is ``MARKET_TZ``, both shared
     with :func:`session_of`, so neither is a second copy.

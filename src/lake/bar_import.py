@@ -18,9 +18,8 @@ the run's own Eastern date, because the shared run window allows an evening run 
 candle is not final on its own day.
 
 Its basis is ``adjusted``, as of the fetch's Eastern date, because Schwab's daily candles are
-split-adjusted to the day they are fetched, though never for dividends. ``docs/design.md``'s
-``## Tradeoffs: prices, named`` carries the probe that measured it. The basis vocabulary has no
-word for split-only.
+split-adjusted to the day they are fetched. ``docs/design.md``'s ``## Tradeoffs: prices,
+named`` carries the probe that measured it, which also found one dividend left unadjusted.
 
 Its identity is the ticker and the window, ``schwab-window:<ticker>:<first>..<last>``, carried
 as ``source_id`` and, under ``bar-import:``, as the manifest ``source``. The lake alone gives
@@ -62,11 +61,11 @@ nothing and pass a different source in silence. The import instant goes in the e
    checked before anything is read, again once the lock is taken, and again before every
    partition is written.
 2. The lake root holds ``manifest.jsonl``, since ``lake_lock`` would create one under a wrong
-   ``lake_root``, and no source file sits inside it, where the scrub reads it as an orphan and
+   ``lake_root``, and no vintage file sits inside it, where the scrub reads it as an orphan and
    the nightly upload sends it to the bucket.
-3. Each source's SHA-256 is one ``VINTAGES`` lists, which names its ticker, and no two sources
-   name one ticker.
-4. The file is read by column name, because the vintages' order is ``Close,High,Low,Open``.
+3. A vintage's SHA-256 is one ``VINTAGES`` lists, which names its ticker, and no two sources
+   name one ticker. The Schwab import refuses a ticker named twice for the same reason.
+4. A vintage file is read by column name, because the vintages' order is ``Close,High,Low,Open``.
    Its ``Ticker`` row must name the listed ticker. A duplicate date and a date the exchange did
    not trade both refuse. A session the calendar names and the file lacks is counted, not
    refused. The calendar is built with an explicit start, because ``exchange_calendars`` starts
@@ -81,7 +80,10 @@ nothing and pass a different source in silence. The import instant goes in the e
    counted, and a key it records under any other source refuses the whole run, because nothing
    replaces an import or a captured bar. So does an unrecorded file at a key whose metadata
    names another source or none, since only this import's own killed run leaves one it may
-   replace.
+   replace. A recorded key whose file is missing is written again, except that a Schwab plan
+   first asks the bucket, by ``_Plan.rewrite_check``, and refuses once the bucket holds the key.
+7. The Schwab import's own rules, its window, the not-final guard and the checks on its
+   response, are the Schwab paragraph's above and ``_schwab_bars``'.
 
 **A stop leaves nothing unrecorded.** A refusal or a write failure part-way through a ticker
 records the partitions it already renamed into place, in one manifest append, and then says
@@ -314,6 +316,18 @@ class TickerImport:
     dry_run: bool = False
     # What the line calls the source when it counts the sessions missing from it.
     holder: str = "the file"
+    # A response's candles that land nowhere: those naming a session outside the window, and
+    # those the row builder could not read. ``None`` for a source with no such candles.
+    dropped: int | None = None
+    unreadable: int | None = None
+
+    def _candles(self) -> str:
+        if self.dropped is None and self.unreadable is None:
+            return ""
+        return (
+            f", {self.dropped or 0} candle(s) outside the window dropped, "
+            f"{self.unreadable or 0} candle(s) the row builder could not read"
+        )
 
     def render(self) -> str:
         if self.dry_run:
@@ -322,14 +336,14 @@ class TickerImport:
                 f"{self.source}, {self.skipped} already imported, {self.missing} session(s) the "
                 f"calendar names and {self.holder} lacks, {self.replaced} unrecorded file(s) "
                 f"from an earlier run to replace, {self.rewritten} recorded file(s) missing to "
-                "write again. Nothing was written"
+                f"write again{self._candles()}. Nothing was written"
             )
         return (
             f"{self.ticker}: landed {self.landed} of {self.rows} row(s) from {self.source}, "
             f"{self.skipped} already imported, {self.missing} session(s) the calendar names and "
             f"{self.holder} lacks, {len(self.temps_removed)} leftover temp file(s) removed, "
             f"{self.replaced} unrecorded file(s) from an earlier run replaced, "
-            f"{self.rewritten} recorded file(s) found missing and written again"
+            f"{self.rewritten} recorded file(s) found missing and written again{self._candles()}"
         )
 
 
@@ -347,8 +361,14 @@ class ImportSummary:
 class _Plan:
     """One ticker's rows from one source, and everything ``_land`` needs to land them.
 
-    ``path`` is what a refusal names as the source. ``instrument_id`` and ``todo`` are filled
-    as the rules are decided.
+    ``path`` is what a refusal names as the source. ``instrument_id``, ``todo`` and
+    ``rewrites`` are filled as the rules are decided.
+
+    ``rewrite_check`` is asked about the recorded keys ``_decide`` found missing before any is
+    written again, and returns a refusal or ``None``. A vintage has none, because its pinned file
+    writes the same values every time. A Schwab plan has one, because a later fetch can carry
+    revised or rescaled values under the same identity, and writing them over a copy the upload
+    already sent would put two scales inside one import.
     """
 
     ticker: str
@@ -359,6 +379,8 @@ class _Plan:
     report: TickerImport
     instrument_id: int | None = None
     todo: list[_SourceBar] = field(default_factory=list)
+    rewrites: list[str] = field(default_factory=list)
+    rewrite_check: Callable[[Sequence[str]], str | None] | None = None
 
 
 def _read_source(path: Path, vintage: Vintage) -> list[_SourceBar]:
@@ -571,6 +593,7 @@ def _decide(
                     plan.report.skipped += 1
                 else:
                     plan.report.rewritten += 1
+                    plan.rewrites.append(rel)
                     plan.todo.append(bar)
                 continue
             if target.exists():
@@ -593,6 +616,15 @@ def _decide(
             f"{conflicts[0]}, and this run offers {offered}. {len(conflicts)} key(s) conflict, "
             "nothing was written, and no command replaces an import or a captured bar"
         )
+
+
+def _check_rewrites(plans: Sequence[_Plan], refuse) -> None:
+    """Ask each plan's ``rewrite_check`` about its missing recorded keys, before any write."""
+    for plan in plans:
+        if plan.rewrites and plan.rewrite_check is not None:
+            why = plan.rewrite_check(plan.rewrites)
+            if why is not None:
+                raise refuse(why)
 
 
 def _land(
@@ -631,6 +663,7 @@ def _land(
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
         except ManifestError as exc:
             raise BarImportRefused(f"{exc}, so nothing was imported") from None
+        _check_rewrites(plans, refuse)
         for plan in plans:
             plan.report.dry_run = True
             plan.report.landed = len(plan.todo)
@@ -644,6 +677,7 @@ def _land(
             if why is not None:
                 raise refuse(why)
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
+            _check_rewrites(plans, refuse)
             for plan in plans:
                 directory = paths.bars_partition_path(
                     plan.ticker, DAILY_FREQ, plan.bars[0].day
@@ -829,6 +863,14 @@ SCHWAB_SESSIONS = 40
 # What each Schwab partition's provenance names as its source.
 SCHWAB_SOURCE = "schwab:pricehistory"
 
+# How a dead or unreadable token is repaired on the primary, the hosted VM, where the import
+# runs. ``lake.reauth`` drives a browser, which the VM does not have, so the laptop mints the
+# token into the token parameter and the VM pulls it, as the README's token section says.
+_TOKEN_REPAIR = (
+    "Run reauth.sh on the laptop, then python -m lake.token_store pull on this host, then run "
+    "the import again"
+)
+
 # The scheme ``Provenance.source_id`` carries before a Schwab import's ticker and window.
 _SCHWAB_WINDOW_SCHEME = "schwab-window:"
 
@@ -918,7 +960,7 @@ def _fetch_schwab(vendor: Vendor, window: _SchwabWindow, *, clock: Clock):
     except VendorAuthError as exc:
         raise BarImportRefused(
             f"the vendor refused the credentials ({type(exc).__name__}), so nothing was "
-            "imported. Mint a new token with python -m lake.reauth"
+            f"imported. {_TOKEN_REPAIR}"
         ) from None
     except VendorError as exc:
         raise BarImportRefused(
@@ -950,7 +992,8 @@ def _schwab_bars(window: _SchwabWindow, body, stamps, report: TickerImport) -> l
     its own count. Each stamp's session is ``bars.daily_session_of``'s, and a candle naming a
     session outside the window is dropped. Two naming one session refuse, a price that is not a
     finite number refuses, and so does a row its column refuses, checked here by building the
-    batch rather than at the write under the lock. A session the response lacks is counted.
+    batch rather than at the write under the lock. A session the response lacks is counted, and
+    so are the candles dropped and those the builder could not read, so the line says which.
     """
     fetch_ts, fetch_end_ts, start, end = stamps
     rows = bars_rows(
@@ -965,10 +1008,15 @@ def _schwab_bars(window: _SchwabWindow, body, stamps, report: TickerImport) -> l
         extended_hours=None,
     )
     wanted = set(window.sessions)
+    candles = body.get("candles")
+    sent = len(candles) if isinstance(candles, list) else 0
+    report.unreadable = sent - len(rows)
+    report.dropped = 0
     by_session: dict[date, Mapping[str, object]] = {}
     for row in rows:
         day = daily_session_of(str(row["bar_ts"]))
         if day not in wanted:
+            report.dropped += 1
             continue
         if day in by_session:
             raise BarImportRefused(
@@ -1002,6 +1050,49 @@ def _schwab_bars(window: _SchwabWindow, body, stamps, report: TickerImport) -> l
     return found
 
 
+def _restore_repair(ticker: str, rels: Sequence[str]) -> str:
+    days = sorted(ref.day for rel in rels if (ref := parse_bars_rel(rel)) is not None)
+    return (
+        f"python -m lake.bucket restore-range --surface bars --ticker {ticker} "
+        f"--from {days[0].isoformat()} --to {days[-1].isoformat()}"
+    )
+
+
+def _unsent_check(ticker: str, bucket) -> Callable[[Sequence[str]], str | None]:
+    """A ``rewrite_check`` that refuses once the bucket holds any of the missing keys."""
+
+    def check(rels: Sequence[str]) -> str | None:
+        if bucket is None:
+            return (
+                f"{rels[0]} is recorded under this import and missing, and with no bucket to "
+                "read nothing says the upload has not sent it. Restore it with "
+                f"{_restore_repair(ticker, rels)}"
+            )
+        target, client = bucket()
+        try:
+            listing = list_bucket(client, target)
+        except Exception as exc:  # noqa: BLE001 - every bucket failure is sorted by _failure
+            sorted_failure = _bucket._failure(exc)
+            if sorted_failure is None:
+                raise
+            kind, detail = sorted_failure
+            return (
+                f"{rels[0]} is recorded under this import and missing, and the bucket read was "
+                f"{kind} with {detail}, so nothing says the upload has not sent it. Run the "
+                f"import again: {target}"
+            )
+        sent = sorted(rel for rel in rels if rel in listing)
+        if sent:
+            return (
+                f"{sent[0]} is recorded under this import and missing here, and the bucket holds "
+                "it, so a fresh fetch, which may carry revised values, must not replace it. "
+                f"Restore it with {_restore_repair(ticker, sent)}"
+            )
+        return None
+
+    return check
+
+
 def import_schwab(
     lake_root: Path | str,
     tickers: Sequence[str],
@@ -1010,6 +1101,7 @@ def import_schwab(
     clock: Clock,
     calendar: Calendar,
     dry_run: bool = False,
+    bucket: Callable[[], tuple[BucketTarget, object]] | None = None,
 ) -> ImportSummary:
     """Import Schwab's daily bars for the ``SCHWAB_SESSIONS`` sessions before each ticker's capture.
 
@@ -1017,7 +1109,13 @@ def import_schwab(
     ``_first_span_session`` reads it. Every rule of ``_land`` holds, and the vintage import's
     run-window and lake-root checks run first. Each ticker's response is fetched before the lock,
     because capture waits on it. A dry run fetches, checks every rule and writes nothing. The
-    module docstring carries the basis and the identity, and the evidence for each.
+    module docstring carries the basis and the identity.
+
+    ``bucket`` returns the bucket's target and client, and is called only when a recorded key's
+    file is missing. That key is written again only while the bucket lists none of the plan's
+    missing keys, which is the state an undo stopped part-way leaves before the upload. Once
+    the upload has sent a key, the fetch may carry revised values, so the repair is a restore of
+    the sent copy. With no ``bucket``, a missing recorded key refuses.
     """
     root = Path(lake_root)
     outcome = "nothing was imported"
@@ -1057,6 +1155,7 @@ def import_schwab(
                 bars=found,
                 report=report,
                 instrument_id=window.instrument_id,
+                rewrite_check=_unsent_check(window.ticker, bucket),
             )
         )
     empty = [plan.ticker for plan in plans if not plan.bars]
@@ -1116,6 +1215,14 @@ def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str]]:
         start -= 1
     earlier = [index for index in range(start) if sources[index] in identities]
     if earlier:
+        after = {sources[index] for index in range(earlier[0] + 1, start)} - identities
+        if after and all(source.startswith(BAR_IMPORT_SOURCE_PREFIX) for source in after):
+            raise BarImportRefused(
+                f"line {earlier[0] + 1} of manifest.jsonl records {partitions[earlier[0]]} for "
+                f"this import, and the import {sorted(after)[0]} was recorded after it, so "
+                "nothing was undone. Undo that import first, then this one, then run that import "
+                "again if it was good"
+            )
         raise BarImportRefused(
             f"line {earlier[0] + 1} of manifest.jsonl records {partitions[earlier[0]]} for this "
             "import, and something else was recorded after it, so cutting the manifest back "
@@ -1526,6 +1633,11 @@ def main(
             print(f"{COMMAND}: {undone.render()}")
             return 0
         if args.command == "schwab":
+            why = _run_window_refusal(
+                clock.now(), clock=clock, calendar=calendar, words=_RUN_WINDOW_WORDS
+            )
+            if why is not None:
+                raise BarImportRefused(f"{why}. Nothing was written")
             factory = SchwabVendor.from_token if vendor_factory is None else vendor_factory
             token = default_token_path()
             try:
@@ -1538,7 +1650,7 @@ def main(
                 # schwab-py reads the token file while it builds the client.
                 raise BarImportRefused(
                     f"the Schwab token at {token} cannot be read ({type(exc).__name__}), so "
-                    "nothing was imported. Mint a new token with python -m lake.reauth"
+                    f"nothing was imported. {_TOKEN_REPAIR}"
                 ) from None
             summary = import_schwab(
                 config.lake_root,
@@ -1547,6 +1659,7 @@ def main(
                 clock=clock,
                 calendar=calendar,
                 dry_run=args.dry_run,
+                bucket=lambda: connect(config),
             )
         else:
             summary = import_vintages(
