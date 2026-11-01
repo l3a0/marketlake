@@ -35,7 +35,7 @@ import pyarrow as pa
 import pytest
 import yaml
 
-from lake import journal, report, runway, sweep
+from lake import bars, journal, report, runway, sweep
 from lake.actions import ActionsError, actions_path
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
@@ -3416,11 +3416,41 @@ def _judged_quotes_table(rows: list[dict]) -> pa.Table:
     return pa.table(columns, schema=JUDGED_QUOTES_SCHEMA)
 
 
+def _minute_bars_table(day: date) -> pa.Table:
+    """A 1-minute partition an earlier run landed, whose last candle closes at the daily close."""
+    day_open, day_close = _bounds(day)
+    candles = [
+        bars_candle(day_open, open_=648.0, high=649.0, low=647.5, close=648.5, volume=1_400_000),
+        bars_candle(
+            day_close - timedelta(minutes=1),
+            open_=649.5,
+            high=650.5,
+            low=649.0,
+            close=SETTLED_CLOSE,
+            volume=2_100_000,
+        ),
+    ]
+    built = journal.bars_rows(
+        {"candles": candles, "symbol": "SPY", "empty": False},
+        ticker="SPY",
+        freq=MINUTE_FREQ,
+        instrument_id=1,
+        fetch_ts=day_close,
+        fetch_end_ts=day_close,
+        window_start=day_open,
+        window_end=day_close,
+        extended_hours=False,
+    )
+    return pa.Table.from_batches([journal.bars_data_batch(built)])
+
+
 def _operator_night(
     fixture_lake: FixtureLake,
     *,
     close_absent: date | None = None,
     lost: date | None = None,
+    minute_bars: tuple[date, ...] = (),
+    trim_minutes: bool = False,
 ):
     """A sweep over the lake shape the operator read on 2026-09-17 (marketlake #530).
 
@@ -3432,7 +3462,10 @@ def _operator_night(
 
     ``close_absent`` turns one outage day into a data row with no close, which the walk
     files as ``CloseValueAbsent``. ``lost`` deletes one outage day's sealed quotes file, which
-    it files as ``PartitionAbsent``.
+    it files as ``PartitionAbsent``. ``minute_bars`` puts an earlier run's 1-minute partition on
+    disk for each outage day it names, so the walk gates that day's daily bar against it
+    (marketlake #947) and lands it. ``trim_minutes`` then removes those files while their
+    manifest entries stay, the way the trim leaves a partition it moved to the bucket.
     """
     night = date(2026, 9, 18)
     baseline = date(2026, 9, 17)
@@ -3447,13 +3480,18 @@ def _operator_night(
             rows[1]["regular_market_last_price"] = None
         fixture_lake.with_quotes("SPY", day, _judged_quotes_table(rows))
         fixture_lake.with_chains("SPY", day, sample_chains_table())
+    for day in minute_bars:
+        fixture_lake.with_bars("SPY", MINUTE_FREQ, day, _minute_bars_table(day))
     root = _lake(fixture_lake, quotes={})
     if lost is not None:
         (root / QUOTES / "ticker=SPY" / f"date={lost.isoformat()}.parquet").unlink()
+    if trim_minutes:
+        for day in minute_bars:
+            LakePaths(root).bars_partition_path("SPY", MINUTE_FREQ, day).unlink()
     interactions: list = []
     # The night's own session is fetched too, since marketlake #962 lands a daily bar on its own
     # evening rather than waiting for the next session to seal.
-    for day in (date(2026, 9, 16), baseline, night):
+    for day in (*minute_bars, date(2026, 9, 16), baseline, night):
         day_open, day_close = _bounds(day)
         interactions.extend(
             bars_interactions(
@@ -3513,14 +3551,73 @@ def test_an_outage_line_with_a_close_value_absent_is_still_a_standing_fact(
     assert kind_of(outcome.nightly, "bars abandoned") == INFO
 
 
+def test_a_bar_gated_against_the_minute_close_is_counted_on_its_own_line(
+    fixture_lake: FixtureLake,
+):
+    # Marketlake #947. One outage day has its 1-minute partition on disk, so its daily bar lands
+    # against that partition's last close and leaves the abandoned census. The nightly records
+    # it on its own line, ``info``, because the bar landed and nothing is wrong. The other five
+    # stay abandoned under the same reason as before.
+    rescued = OUTAGE_SESSIONS[0]
+    root, outcome = _operator_night(fixture_lake, minute_bars=(rescued,))
+    assert outcome.nightly.report[:2] == (
+        "bars abandoned: 5 ticker-day(s), 5 SnapAbsent",
+        "bars gated against the 1m close: 1 ticker-day(s)",
+    )
+    assert kind_of(outcome.nightly, "bars gated against the 1m close") == INFO
+    assert outcome.nightly.problems == ()
+    assert LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, rescued).exists()
+
+
 def test_only_the_two_absences_nothing_can_repair_read_as_a_standing_fact():
     """The set that makes the ``bars abandoned`` line ``info``, spelled with literals.
 
     Each reason outside it wants a person: a restore, a sign-off or a schema change. The outage
     tests drive two of those, and none drives ``PartialRead``, so widening the set to take it in
-    would pass them all. Marketlake #618 swapped ``NoSpotClose`` for ``SnapAbsent`` here.
+    would pass them all. Marketlake #618 swapped ``NoSpotClose`` for ``SnapAbsent`` here. Since
+    marketlake #947 the set lives in ``bars``, whose walk also reads it to choose which abandoned
+    bars are gated against their 1-minute close, so a wider set would also land bars past a
+    quarantine.
     """
-    assert sweep._PERMANENT_ABANDON_REASONS == {"SnapAbsent", "CloseValueAbsent"}
+    assert bars.PERMANENT_ABANDON_REASONS == {"SnapAbsent", "CloseValueAbsent"}
+    assert sweep.PERMANENT_ABANDON_REASONS is bars.PERMANENT_ABANDON_REASONS
+
+
+def test_the_gated_line_stands_when_every_outage_day_is_rescued(fixture_lake: FixtureLake):
+    # The night the fallback was built for: every outage day has its 1-minute partition, so
+    # nothing is abandoned and the gated line is the only bars record of the night. The mutation
+    # lens on #975 found the line could ride on the abandoned census being present.
+    _, outcome = _operator_night(fixture_lake, minute_bars=OUTAGE_SESSIONS)
+    lines = outcome.nightly.report
+    assert not any(line.startswith("bars abandoned") for line in lines)
+    assert f"bars gated against the 1m close: {len(OUTAGE_SESSIONS)} ticker-day(s)" in lines
+    assert kind_of(outcome.nightly, "bars gated against the 1m close") == INFO
+
+
+def test_a_lost_quotes_day_never_falls_back_and_still_asks_for_a_restore(
+    fixture_lake: FixtureLake,
+):
+    # Marketlake #947. The quotes partition is gone from disk and the day's 1-minute partition is
+    # on disk. ``PartitionAbsent`` wants a restore of the quotes, so the bar does not land against
+    # the minute bars, and the census line stays ``action`` naming the lost partition.
+    lost = OUTAGE_SESSIONS[0]
+    root, outcome = _operator_night(fixture_lake, lost=lost, minute_bars=(lost,))
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 1 PartitionAbsent, 5 SnapAbsent"
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION
+    assert not LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, lost).exists()
+
+
+def test_a_trimmed_minute_partition_asks_for_a_restore(fixture_lake: FixtureLake):
+    # Marketlake #947. The manifest records an outage day's 1-minute partition and the trim took
+    # the file, so the walk abandons that day under ``MinuteBarsAbsent``. A bars restore would land
+    # the bar, so the line is ``action``, where the quote reason alone would read as ``info``.
+    rescued = OUTAGE_SESSIONS[0]
+    root, outcome = _operator_night(fixture_lake, minute_bars=(rescued,), trim_minutes=True)
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 1 MinuteBarsAbsent, 5 SnapAbsent"
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION
+    assert not LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, rescued).exists()
 
 
 def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: FixtureLake):
