@@ -98,7 +98,8 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   from `config.yaml` alone. Three clients can sign with the VM's instance profile: the
   bucket's, the token pull's, and the config render's, which takes its settings from the
   tracked `config/vm.yaml` because it writes `config.yaml`. The sweep's cost read builds
-  its client the bucket's way, through `bucket.connect`.
+  its client the bucket's way, through `bucket.connect`, and so does the daemon's live
+  upload.
 - `src/lake/token_store.py` carries the Schwab token to a hosted VM through an SSM
   parameter: the re-auth's put and the VM's pull.
 - `src/lake/trim.py` is the only code that deletes a sealed partition on its own, and
@@ -120,6 +121,13 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   directory outside the lake, and writes one summary per run under
   `reports/aws_cost/date=D/`, which the dashboard's Cost panel reads. The raw export never
   enters the lake.
+- `src/lake/live_upload.py` is the daemon's live upload. On a primary with a bucket
+  target, a thread of the daemon sends each quotes segment to the bucket's sibling
+  `<prefix>-live/` prefix as soon as its manifest entry lands, create-only and with the
+  entry on the object, and never sends `manifest.jsonl`
+  ([#943](https://github.com/l3a0/marketlake/issues/943)).
+  `python -m lake.live_upload lag --date YYYY-MM-DD` reads how long each segment took to
+  arrive, from the bucket alone.
 - `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
   the hours the scheduled jobs run in.
 - `src/lake/bar_import.py` imports daily bars marketlake did not capture into `bars/`,

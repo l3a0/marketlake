@@ -52,6 +52,11 @@ Seven jobs live here.
    outside ``lake_root``, with what a reader needs beside it, so a session the VM's trim
    removed can be read there with ``lake_root`` pointed at that directory (marketlake #837).
 
+The per-minute live upload is not an eighth. It lives in ``lake.live_upload``, which the
+daemon runs on a thread of its own, and it borrows this module's ``connect``, its checksum
+helpers and its sorting of failures (marketlake #943). Its keys sit under a sibling
+prefix, so no job here lists them.
+
 **The manifest's digest travels with every upload.** ``manifest.jsonl`` records each
 file's SHA-256 as 64 hex characters. S3 takes a SHA-256 as ``ChecksumSHA256``, the
 base64 of the 32 raw digest bytes, so the uploader converts hex to base64 and the scrub
