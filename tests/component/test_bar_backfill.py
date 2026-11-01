@@ -18,9 +18,10 @@ Two things about the fixture calendar are worth naming before the tests.
    the fixture weeks run 2026-09-07 with that holiday and 2026-09-14 whole. That gives the same
    seven sessions from the live lake's span start to 2026-09-16 that the issue's own count is
    taken against.
-2. **The daily stamps are the fixture's convention.** They sit at Eastern midnight of the session,
-   which is what ``tests/component/test_bar_fetch.py`` uses. The code reads the session off the
-   stamp rather than off the window, so the convention can move without moving a rule.
+2. **The daily stamps are the fixture's convention.** They sit at 04:00 UTC, which is Eastern
+   midnight on every session here because all of them fall in daylight time. The code reads the
+   session off the stamp rather than off the window, so the convention can move without moving a
+   rule. ``tests/component/test_bar_fetch.py`` stamps the vendor's own 05:00 UTC.
 """
 
 from __future__ import annotations
@@ -250,7 +251,7 @@ def _minute_candles(day: date, close: float = SETTLED_CLOSE) -> list[dict]:
 
 
 def _daily_candle(day: date, close: float = SETTLED_CLOSE) -> dict:
-    """One daily candle, stamped at Eastern midnight of its session."""
+    """One daily candle, stamped at 04:00 UTC, Eastern midnight on a session in daylight time."""
     when = datetime.fromisoformat(f"{day.isoformat()}T00:00:00-04:00")
     return bars_candle(when, open_=645.0, high=651.0, low=644.0, close=close, volume=70_000_000)
 
@@ -1032,7 +1033,7 @@ def test_the_bar_before_an_ex_date_lands_and_the_total_view_divides_by_it(
     table = load_bars("SPY", DAILY_FREQ, end=before, adjust=ADJUST_TOTAL, lake_root=root)
     closes = dict(
         zip(
-            (bars.session_of(stamp) for stamp in table.column("bar_ts").to_pylist()),
+            (bars.daily_session_of(stamp) for stamp in table.column("bar_ts").to_pylist()),
             table.column("close").to_pylist(),
             strict=True,
         )
