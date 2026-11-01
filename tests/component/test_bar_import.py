@@ -26,6 +26,7 @@ code under test.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -1089,10 +1090,13 @@ def test_an_undo_with_nothing_to_undo_changes_nothing(tmp_path):
     source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
     before = _snapshot(root)
 
-    summary = _undo(root, [source], _listed((source, "GLD")))
+    client = FakeS3()
+    summary = _undo(root, [source], _listed((source, "GLD")), client=client)
 
     assert summary.lines == 0 and "nothing to undo" in summary.render()
     assert _snapshot(root) == before
+    # Nothing to undo reads no bucket, so an outage cannot refuse it.
+    assert client.calls == []
 
 
 def test_an_entry_recorded_after_the_import_refuses_the_undo(tmp_path):
@@ -1396,3 +1400,169 @@ def test_an_undo_on_a_shadow_host_refuses_with_exit_2(tmp_path, monkeypatch, cap
     assert code == 2
     assert "shadow" in capsys.readouterr().err
     assert _snapshot(root) == after
+
+
+def test_an_undo_removes_only_the_named_import(tmp_path):
+    """GLD then USO, and the undo names only USO, whose lines come last. Catches a tail walk that
+    takes any import's lines rather than these imports' own."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    gld = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+    uso = _csv(
+        tmp_path / "src" / "uso.csv", [("2006-04-25", 2.0), ("2006-04-26", 3.0)], ticker="USO"
+    )
+    _run(root, [gld], _listed((gld, "GLD")))
+    after_gld = _snapshot(root)
+    _run(root, [uso], _listed((uso, "USO")))
+
+    summary = _undo(root, [uso], _listed((uso, "USO")))
+
+    assert summary.lines == 2
+    assert _snapshot(root) == after_gld
+
+
+def test_an_undo_with_no_manifest_refuses(tmp_path):
+    root, sources, vintages, _before = _imported(tmp_path)
+    (root / "manifest.jsonl").unlink()
+    after = _snapshot(root)
+
+    assert "holds no manifest.jsonl" in _undo_refused(root, sources, vintages)
+    assert _snapshot(root) == after
+
+
+def test_the_undo_flushes_the_directories_before_it_cuts_the_manifest(tmp_path, monkeypatch):
+    """Catches a cut made before the deletions are durable, which a power loss would turn into
+    files nothing records."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    events: list[str] = []
+    real_fsync, real_cut = bar_import._fsync_path, bar_import._bucket._rewrite_manifest
+
+    def fsync(path):
+        events.append(Path(path).relative_to(root).as_posix())
+        real_fsync(path)
+
+    def cut(*args, **kwargs):
+        events.append("cut")
+        return real_cut(*args, **kwargs)
+
+    monkeypatch.setattr(bar_import, "_fsync_path", fsync)
+    monkeypatch.setattr(bar_import._bucket, "_rewrite_manifest", cut)
+
+    _undo(root, sources, vintages)
+
+    assert events == ["bars", "bars/ticker=GLD", "bars/ticker=GLD/freq=1d", "cut"]
+
+
+def _append_line(root: Path, line: bytes) -> None:
+    with (root / "manifest.jsonl").open("ab") as handle:
+        handle.write(line + b"\n")
+
+
+def test_a_tail_entry_outside_bars_refuses_the_undo(tmp_path):
+    root, sources, vintages, _before = _imported(tmp_path)
+    identity = next(iter(vintages.values())).manifest_source
+    entry = {
+        "partition": "reference/odd.parquet",
+        "source": identity,
+        "sha256": "0" * 64,
+        "rows": 1,
+        "fetched_at": None,
+    }
+    _append_line(root, json.dumps(entry).encode())
+    after = _snapshot(root)
+
+    assert "not a bars partition" in _undo_refused(root, sources, vintages)
+    assert _snapshot(root) == after
+
+
+def test_a_tail_key_recorded_before_the_import_refuses_the_undo(tmp_path):
+    """The cut would make that earlier entry the latest again, for a file the undo deletes.
+    Catches an undo that relies on the import never writing such a key."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    rel = _rel("GLD", "2006-04-26")
+    lines = (root / "manifest.jsonl").read_bytes().splitlines()
+    first = [line for line in lines if rel.encode() in line][0]
+    earlier = json.loads(first)
+    earlier["source"] = SWEEP_SOURCE
+    # The earlier entry goes before every import line, as a captured bar would have.
+    head = [line for line in lines if b"bar-import:" not in line]
+    tail = [line for line in lines if b"bar-import:" in line]
+    (root / "manifest.jsonl").write_bytes(
+        b"\n".join([*head, json.dumps(earlier).encode(), *tail]) + b"\n"
+    )
+    after = _snapshot(root)
+
+    assert "before this import too" in _undo_refused(root, sources, vintages)
+    assert _snapshot(root) == after
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [(b'{"partition": "x"}', "not a whole entry"), (b"garbage", "not a whole entry")],
+    ids=["no-source", "not-json"],
+)
+def test_a_manifest_line_that_is_not_an_entry_refuses_the_undo(tmp_path, line, expected):
+    root, sources, vintages, _before = _imported(tmp_path)
+    raw = (root / "manifest.jsonl").read_bytes()
+    (root / "manifest.jsonl").write_bytes(line + b"\n" + raw)
+    after = _snapshot(root)
+
+    assert expected in _undo_refused(root, sources, vintages)
+    assert _snapshot(root) == after
+
+
+def test_an_empty_manifest_has_nothing_to_undo(tmp_path):
+    """Catches the torn-line check reading an empty manifest as torn."""
+    root = _lake(tmp_path)
+    (root / "manifest.jsonl").write_bytes(b"")
+    source = _csv(tmp_path / "src" / "gld.csv", [("2026-01-05", 1.0)])
+
+    assert _undo(root, [source], _listed((source, "GLD"))).lines == 0
+
+
+def test_a_failed_deletion_refuses_with_one_line(tmp_path, monkeypatch):
+    root, sources, vintages, _before = _imported(tmp_path)
+    real = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self.suffix == ".parquet":
+            raise PermissionError(13, "Permission denied")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    message = _undo_refused(root, sources, vintages)
+
+    assert "Permission denied" in message and "Run the undo again before 09:00 ET" in message
+
+
+def test_a_rewrite_that_does_not_read_back_names_the_bucket_copy(tmp_path, monkeypatch):
+    root, sources, vintages, _before = _imported(tmp_path)
+
+    def fails(*_args, **_kwargs):
+        raise bar_import._bucket.ResyncRefused("the read-back differs")
+
+    monkeypatch.setattr(bar_import._bucket, "_rewrite_manifest", fails)
+
+    assert "Copy the bucket's manifest.jsonl over it" in _undo_refused(root, sources, vintages)
+
+
+def test_a_bucket_setting_refusal_reaches_the_operator_as_one_line(tmp_path, monkeypatch, capsys):
+    root, sources, vintages, _before = _imported(tmp_path)
+    monkeypatch.setattr(bar_import, "VINTAGES", vintages)
+
+    def no_client(config):
+        raise bar_import._bucket.BucketSettingsInvalid("bucket_region is not set")
+
+    monkeypatch.setattr(bar_import, "connect", no_client)
+    config = write_config(tmp_path, root)
+
+    with pytest.raises(SystemExit) as exited:
+        bar_import.main(
+            ["undo", *map(str, sources), "--config", str(config)],
+            clock=ManualClock(MONDAY_0745),
+            calendar=CALENDAR,
+        )
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "bucket_region is not set" in err[0]
