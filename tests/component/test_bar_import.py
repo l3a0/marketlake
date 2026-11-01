@@ -58,7 +58,7 @@ from lake.security_master import (
 )
 from tests.component.test_load_bars import _ledger_table
 from tests.support.bars import write_bars
-from tests.support.bucket import FakeS3
+from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
@@ -1117,7 +1117,7 @@ def test_a_bucket_copy_holding_the_import_refuses_the_undo(tmp_path):
 
     message = _undo_refused(root, sources, vintages, client=client)
 
-    assert "the nightly upload has sent the import" in message
+    assert "may already hold the import" in message
     assert _snapshot(root) == after
 
 
@@ -1137,13 +1137,24 @@ def test_a_bucket_object_at_an_import_key_refuses_the_undo(tmp_path):
     assert _snapshot(root) == after
 
 
-def test_a_bucket_that_cannot_be_read_refuses_the_undo(tmp_path):
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (unreachable(), "unreachable"),
+        (client_error("AccessDenied", "HeadObject", 403), "refused with AccessDenied"),
+    ],
+    ids=["unreachable", "refused"],
+)
+def test_a_bucket_that_cannot_be_read_refuses_the_undo(tmp_path, failure, expected):
+    """Each failure names its kind, so a credential refusal and an outage read differently."""
     root, sources, vintages, _before = _imported(tmp_path)
     client = FakeS3()
-    client.fail_with = OSError("network down")
+    client.fail_with = failure
     after = _snapshot(root)
 
-    assert "could not be read" in _undo_refused(root, sources, vintages, client=client)
+    message = _undo_refused(root, sources, vintages, client=client)
+
+    assert expected in message and "nothing was undone" in message
     assert _snapshot(root) == after
 
 
@@ -1173,7 +1184,11 @@ def test_the_undo_refuses_in_the_run_window(tmp_path):
     after = _snapshot(root)
 
     assert "Sunday" in _undo_refused(root, sources, vintages, now=SUNDAY_20)
-    assert "next session" in _undo_refused(root, sources, vintages, now=MONDAY_10)
+    late = _undo_refused(root, sources, vintages, now=MONDAY_10)
+    # Past the bound no undo can run before capture records a minute, so the line never says
+    # to try again that day.
+    assert "the undo stops at" in late and "the import stays" in late
+    assert "between the VM's 07:30" not in late
     assert _snapshot(root) == after
 
 
@@ -1220,7 +1235,7 @@ def test_a_manifest_that_changed_before_the_lock_refuses_the_undo(tmp_path, monk
     monkeypatch.setattr(bar_import, "lake_lock", busy_lock)
     message = _undo_refused(root, sources, vintages)
 
-    assert "changed while the undo checked the bucket" in message
+    assert "no longer its last ones" in message
     assert len(_bars_files(root)) == 3
 
 
@@ -1249,3 +1264,135 @@ def test_the_undo_command_reads_the_bucket_from_the_config(tmp_path, monkeypatch
     assert code == 0
     assert "bar_import: undid 2 manifest line(s)" in capsys.readouterr().out
     assert _snapshot(root) == before
+
+
+def test_an_upload_while_the_undo_waits_for_the_lock_refuses_it(tmp_path, monkeypatch):
+    """An upload that sends the import holds the lock and appends nothing to this lake's
+    manifest. Catches a bucket read made only before the lock, which would cut the lake while the
+    bucket keeps serving the import and stops every later upload."""
+    root, sources, vintages, before = _imported(tmp_path)
+    client = FakeS3()
+    client.store(UNDO_TARGET.key("manifest.jsonl"), before["manifest.jsonl"])
+    real = bar_import.lake_lock
+
+    @contextmanager
+    def upload_then_lock(path):
+        for rel in _bars_files(root):
+            client.store(UNDO_TARGET.key(rel), (root / rel).read_bytes())
+        client.store(UNDO_TARGET.key("manifest.jsonl"), (root / "manifest.jsonl").read_bytes())
+        with real(path):
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", upload_then_lock)
+    after = _snapshot(root)
+
+    message = _undo_refused(root, sources, vintages, client=client)
+
+    assert "nothing was undone" in message.lower()
+    assert _snapshot(root) == after
+
+
+def test_a_bucket_copy_that_changed_while_the_undo_waited_refuses_it(tmp_path, monkeypatch):
+    """The bucket's copy is first absent and then appears, still a prefix. Catches a second read
+    that checks the listing and not the copy itself."""
+    root, sources, vintages, before = _imported(tmp_path)
+    client = FakeS3()
+    real = bar_import.lake_lock
+
+    @contextmanager
+    def first_upload_then_lock(path):
+        client.store(UNDO_TARGET.key("manifest.jsonl"), before["manifest.jsonl"])
+        with real(path):
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", first_upload_then_lock)
+    after = _snapshot(root)
+
+    assert "changed while the undo waited" in _undo_refused(root, sources, vintages, client=client)
+    assert _snapshot(root) == after
+
+
+def test_a_stopped_undo_past_an_append_is_repaired_by_the_import(tmp_path, monkeypatch):
+    """The undo stops after its deletions, and capture records a minute before anyone reruns it.
+    No undo can finish that, so the import's rerun writes the missing files back. Catches a rerun
+    that skips them, which leaves the nightly upload stopping on missing files for good."""
+    root, sources, vintages, _before = _imported(tmp_path)
+
+    def crash(*_args, **_kwargs):
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import._bucket, "_rewrite_manifest", crash)
+        with pytest.raises(Crash):
+            _undo(root, sources, vintages)
+    _manifest_bars(root, "GLD", "2026-08-31", source=SWEEP_SOURCE)
+    assert "recorded after it" in _undo_refused(root, sources, vintages)
+
+    summary = _run(root, sources, vintages)
+
+    (ticker,) = summary.tickers
+    assert (ticker.landed, ticker.rewritten, ticker.skipped) == (2, 2, 0)
+    latest = latest_entries(root)
+    for rel, entry in latest.items():
+        if rel.startswith("bars/"):
+            assert entry["sha256"] == sha256_file(root / rel)
+
+
+def test_an_undo_after_a_killed_import_says_to_rerun_the_import(tmp_path, monkeypatch):
+    """Renamed files with no entry, which the manifest cannot show the undo. Catches an undo that
+    reports nothing to undo while those files wait for the upload."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0)])
+    vintages = _listed((source, "GLD"))
+
+    def crash(*_args, **_kwargs):
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import, "append_entries", crash)
+        with pytest.raises(Crash):
+            _run(root, [source], vintages)
+
+    assert "Run the import again" in _undo_refused(root, [source], vintages)
+    assert _bars_files(root) == [_rel("GLD", "2006-04-26")]
+
+
+def test_an_undo_that_would_empty_the_manifest_refuses(tmp_path):
+    """An empty manifest reads as a prefix of any bucket copy, which the resync's rewrite never
+    leaves. Catches a cut to zero bytes."""
+    root = _lake(tmp_path)
+    (root / "manifest.jsonl").write_bytes(b"")
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0)])
+    vintages = _listed((source, "GLD"))
+    _run(root, [source], vintages)
+    after = _snapshot(root)
+
+    assert "leave it empty" in _undo_refused(root, [source], vintages)
+    assert _snapshot(root) == after
+
+
+def test_an_undo_of_an_unlisted_file_refuses(tmp_path):
+    root, sources, vintages, _before = _imported(tmp_path)
+    stray = _csv(tmp_path / "src" / "stray.csv", [("2006-04-27", 9.0)])
+    after = _snapshot(root)
+
+    assert "no vintage this module lists" in _undo_refused(root, [stray], vintages)
+    assert _snapshot(root) == after
+
+
+def test_an_undo_on_a_shadow_host_refuses_with_exit_2(tmp_path, monkeypatch, capsys):
+    root, sources, vintages, _before = _imported(tmp_path)
+    monkeypatch.setattr(bar_import, "VINTAGES", vintages)
+    monkeypatch.setattr(bar_import, "connect", lambda config: (UNDO_TARGET, FakeS3()))
+    config = write_config(tmp_path, root, role="shadow")
+    after = _snapshot(root)
+
+    code = bar_import.main(
+        ["undo", *map(str, sources), "--config", str(config)],
+        clock=ManualClock(MONDAY_0745),
+        calendar=CALENDAR,
+    )
+
+    assert code == 2
+    assert "shadow" in capsys.readouterr().err
+    assert _snapshot(root) == after
