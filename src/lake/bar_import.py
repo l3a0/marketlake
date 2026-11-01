@@ -14,8 +14,9 @@ fetched before the lock. The capture path cannot reach those sessions by design,
 ``journal.bars_rows`` from the vendor's candle, so ``bar_ts`` is the vendor's stamp, ``volume``
 its count, and the fetch's four stamps are the request's. ``bars.daily_session_of`` names each
 candle's session, and a candle outside the window is dropped. The last session must fall before
-the run's own Eastern date, because the shared run window allows an evening run and a daily
-candle is not final on its own day.
+the run's own Eastern date, because the shared run window allows an evening run. The sweep
+fetches a session's candle that evening only behind its close gate (marketlake #962), and an
+imported candle has no gate, so it waits until the day after.
 
 Its basis is ``adjusted``, as of the fetch's Eastern date, because Schwab's daily candles are
 split-adjusted to the day they are fetched. ``docs/design.md``'s ``## Tradeoffs: prices,
@@ -1133,8 +1134,8 @@ def import_schwab(
         if window.sessions[-1] >= today:
             raise BarImportRefused(
                 f"{window.ticker}'s last session to import is {window.sessions[-1].isoformat()}, "
-                "and its daily bar is not final until the day after, so nothing was imported. "
-                "Run it on a later weekday morning"
+                "and an imported daily bar has no close gate to check it on its own day, so "
+                "nothing was imported. Run it on a later weekday morning"
             )
 
     plans: list[_Plan] = []

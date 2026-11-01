@@ -387,13 +387,13 @@ def test_a_stamp_the_evening_before_names_the_next_session(tmp_path):
 
 
 def test_a_last_session_that_is_today_refuses(tmp_path):
-    """An evening onboarding imported that evening would land a candle before it is final."""
+    """An evening onboarding imported that evening would land a candle no close gate checked."""
     root = _lake(tmp_path, onboard=datetime(2026, 11, 2, 17, 30, tzinfo=MARKET_TZ))
 
     # The real clock runs in UTC, and 19:00 ET is already 2026-11-03 there.
     message = _refused(root, now=datetime(2026, 11, 3, 0, 0, tzinfo=UTC))
 
-    assert "2026-11-02" in message and "not final" in message
+    assert "2026-11-02" in message and "no close gate" in message
     assert not (root / "bars").exists()
 
 
