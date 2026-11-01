@@ -19,12 +19,11 @@ What one run does, in the design's own order.
    from the split checkpoint, and when the window key ``lake_window_sessions`` is set the run
    writes tonight's checkpoint after the walk, cut at the chains window's edge. Marketlake #786
    and #953.
-2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, and the
-   walk covers every session the capture spans still hold unlanded rather than only
-   the one the clock is in, because a daily bar waits for the next session to seal before
-   it is fetched, and on the night of its own session that has not happened. Marketlake
-   #422, with marketlake #434 turning that night's fetch into a skip and marketlake #618
-   moving the check onto the session's own 16:15 quote.
+2. The bar walk, ``bars.backfill_bars``. The close cross-check is inside it, against the
+   session's own 16:15 quote since marketlake #618, and tonight's daily bar lands tonight
+   since marketlake #962. The walk still covers every session the capture spans hold
+   unlanded rather than only the one the clock is in, so a bar held on an earlier night is
+   attempted again and an evening the sweep missed is recovered. Marketlake #422.
 3. The validation battery, ``battery.judge``, which judges the sealed chains and quotes
    partitions and writes a quarantine verdict for what fails. The design places it between the
    bar fetch and the Friday branch, which is where this list puts it.
@@ -1369,28 +1368,32 @@ def sweep(
                 )
         if closed:
             # **The walk is the backfill, not a single session, and marketlake #422 is why.**
-            # A daily bar is fetched only once the calendar-next session has sealed, which at
-            # 18:30 on session S it has not. Until marketlake #618 that session was also what
-            # the bar was judged against. The single-session fetch said that
-            # settled itself because the next run would land the bar, and it did not: the next
-            # run fetched the *next* session and met the same absence for it, and nothing
-            # scheduled ever came back. So the nightly job landed no daily bar at all, and this
-            # walk is what makes that promise true.
+            # When marketlake #422 made the swap, a daily bar was fetched only once the
+            # calendar-next session had sealed, which at 18:30 on session S it has not. The
+            # single-session fetch said that settled itself because the next run would land the
+            # bar, and it did not: the next run fetched the *next* session and met the same
+            # absence for it, and nothing scheduled ever came back. So the nightly job landed no
+            # daily bar at all, and this walk is what makes that promise true.
             #
-            # **What that night's ticker-day does about it changed under marketlake #434.** It
-            # used to be fetched, gated against a close nobody had captured, and held, which
-            # spent a vendor request and filed a withheld file on a gate that could not pass.
-            # Whether the next session has sealed is this lake's to answer rather than the
-            # vendor's, so the walk asks it first and reports the ticker-day under ``unsettled``
-            # instead. The recovery above
-            # is untouched, which is what makes the skip safe: a session skipped tonight is a
-            # session tomorrow's run still walks.
+            # **Marketlake #962 removed that wait, and the walk stays.** Tonight's daily bar is
+            # now fetched tonight, gated against its own session's 16:15 quote, which compaction
+            # sealed at close+15. What still needs the walk is everything a single session
+            # cannot reach: a bar the gate or the span check held on an earlier night, and an
+            # evening this job did not run at all. Neither is manifested, so the next run walks
+            # it again with nothing written down to clear.
+            #
+            # **A session whose own quotes have not sealed is skipped, which is marketlake
+            # #434.** Such a ticker-day used to be fetched, gated against a close nobody had
+            # captured, and held, which spent a vendor request and filed a withheld file on a
+            # gate that could not pass. Whether the session has sealed is this lake's to answer
+            # rather than the vendor's, so the walk asks it first and reports the ticker-day
+            # under ``unsettled`` instead. A session skipped tonight is a session tomorrow's run
+            # still walks.
             #
             # ``backfill_bars`` is the walk that already existed, marketlake #319, and it
             # subsumes the single-session fetch rather than running beside it: ``_span_sessions``
             # puts a session in range once its equity close has arrived, so at 18:30 today is in
-            # range along with every earlier session still unlanded. Yesterday's held daily bar
-            # is reached with its following session now sealed.
+            # range along with every earlier session still unlanded.
             #
             # **Its cost is bounded rather than reasoned about, which is marketlake #478.** This
             # comment used to argue the walk was safe because a run at the 1-minute lookback
@@ -1512,13 +1515,14 @@ def sweep(
                 # than naming an entry.
                 #
                 # **``unsettled`` is deliberately not reported here.** It is a ticker-day that
-                # cannot be judged yet, because the next session has not sealed or its own has
-                # not. On a healthy run that is the newest session and nothing else, waiting for
-                # the next one, right every night by construction. A line
-                # that is loud every evening is one the reader learns to skip, which is the
-                # argument ``dashboard._ping_owed`` already makes in those words. It still
-                # reaches the by-hand run's own output, which is where a reader who wants it
-                # goes.
+                # cannot be judged yet, because its own session's quotes have not sealed. Since
+                # marketlake #962 a healthy 18:30 run leaves it empty, so a non-empty one means
+                # the session's quotes did not seal, and an alarm already covers each way that
+                # happens. A compaction that did not run or did not finish misses its ping, which
+                # the ``compaction`` check alarms on. One that refused the ticker-day as schema
+                # drift or damaged segments still pings, and pages on the refusal instead. A line
+                # here would repeat those alarms in a second place. It still reaches the by-hand
+                # run's own output, which is where a reader who wants it goes.
                 if walked.abandoned:
                     reasons = Counter(entry.reason for entry in walked.abandoned)
                     census = ", ".join(

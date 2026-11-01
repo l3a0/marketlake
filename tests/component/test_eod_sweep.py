@@ -383,7 +383,9 @@ def _lake(
     because a production lake has it recorded and marketlake #130 put a check for that on this
     job. A case about that check passes one that does not.
 
-    ``quotes`` defaults to the following session, which is what tonight's daily bar waits for.
+    ``quotes`` defaults to none beyond what ``judged`` seals. Nothing is sealed for the session
+    after tonight's, which is the state the lake is in at 18:30, and since marketlake #962
+    tonight's daily bar waits for nothing of that session's.
 
     ``judged`` seals SPY's quotes and chains for each day in the shape the battery judges clean.
     A daily bar is gated against its own session's 16:15 quote (marketlake #618), so it defaults
@@ -395,7 +397,7 @@ def _lake(
     if judged is None:
         judged = (SESSION,) if quotes is None else ()
     if quotes is None:
-        quotes = {("SPY", FOLLOWING): _session_rows(FOLLOWING)}
+        quotes = {}
     for (ticker, day), rows in quotes.items():
         fixture_lake.with_quotes(ticker, day, _quotes_table(rows))
     for day in judged:
@@ -434,10 +436,10 @@ def _spans(instrument_ids: tuple[int, ...] = (1,)) -> CaptureSpans:
 def _seal_late(fixture_lake: FixtureLake, root: Path, day: date) -> None:
     """Seal SPY's quotes for ``day`` after the lake was built, the way compaction does.
 
-    The partition and its manifest entry arrive together, because the manifest entry is what a
-    daily bar's wait reads (marketlake #618). ``FixtureLake.build`` would rewrite the manifest
-    from the fixture's own list and drop what the runs before this appended, so the entry is
-    appended the way a real writer appends it.
+    The partition and its manifest entry arrive together, because the manifest entry is what the
+    bars walk reads to tell a session still pending from one given up on (marketlake #618).
+    ``FixtureLake.build`` would rewrite the manifest from the fixture's own list and drop what the
+    runs before this appended, so the entry is appended the way a real writer appends it.
     """
     fixture_lake.with_quotes("SPY", day, _quotes_table(_session_rows(day)))
     rel = LakePaths(root).partition_path(QUOTES, "SPY", day).relative_to(root).as_posix()
@@ -525,7 +527,8 @@ def test_an_ordinary_evening_runs_every_walk_pings_files_and_sends_one_digest(
 
     assert [name for name, _ in outcome.nightly.pieces] == ["dividends", "splits", "bars"]
     assert all(piece.finished for _, piece in outcome.nightly.pieces), outcome.render()
-    # Tonight's daily bar lands: its own session is sealed and so is the one it waits for.
+    # Tonight's daily bar lands on its own evening: its session is sealed and nothing is sealed
+    # for the session after it, which since marketlake #962 the bar does not wait for.
     assert dict(outcome.nightly.pieces)["bars"].landed == 1
     assert outcome.nightly.problems == ()
     assert pinger.urls == [PING_URL]
@@ -854,7 +857,7 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     was never set look the same, which is why ``expected_one_shot`` expects it only between
     this run and its own firing.
     """
-    root = _lake(fixture_lake, judged=())
+    root = _lake(fixture_lake, quotes={("SPY", FOLLOWING): _session_rows(FOLLOWING)}, judged=())
     setter = _RecordingSetter()
     outcome, pinger, _ = _run(
         root,
@@ -864,11 +867,13 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
 
     assert setter.sundays == [SUNDAY]
+    assert dict(outcome.nightly.pieces)["bars"].landed == 1
     # **One report-tier line, and the bars walk deliberately does not add a second.** This
-    # fixture lake seals one quotes partition, so the sessions before Friday are each gated
-    # against a session the lake never sealed. The manifest is what the walk asks, and it says
-    # nothing was sealed for them, so they are unsettled rather than abandoned and nothing here
-    # claims the lake has given up. A compaction that has not run is not a bar that is lost.
+    # fixture lake seals one quotes partition, FOLLOWING's, so that session's bar lands and every
+    # other session of the week is gated against quotes the lake never sealed. The manifest is
+    # what the walk asks, and it says nothing was sealed for them, so they are unsettled rather
+    # than abandoned and nothing here claims the lake has given up. A compaction that has not run
+    # is not a bar that is lost.
     # ``test_a_sealed_reference_that_offers_no_close_is_reported_by_reason`` drives the line
     # this run does not produce.
     #
@@ -926,13 +931,13 @@ def test_a_sealed_reference_that_offers_no_close_is_reported_by_reason(
     #
     # A daily bar is gated against its own session's 16:15 row (marketlake #618), so the sessions
     # that carry the reasons are the bars' own: 2026-09-14 quarantined, and 2026-09-15 and
-    # 2026-09-16 holding gap rows. 2026-09-17 is sealed so the 2026-09-16 bar's wait is over.
+    # 2026-09-16 holding gap rows. 2026-09-17, the night of the run, has no quotes sealed, so
+    # its bar is unsettled.
     gap = _session_rows(FOLLOWING, row_kind=journal.ROW_KIND_GAP)
     quotes = {
         ("SPY", SESSION): _session_rows(SESSION),
         ("SPY", FOLLOWING): gap,
         ("SPY", date(2026, 9, 16)): gap,
-        ("SPY", date(2026, 9, 17)): _session_rows(date(2026, 9, 17)),
     }
     fixture_lake.with_quarantine(
         {"partition": f"quotes/ticker=SPY/date={SESSION.isoformat()}.parquet", "verdict": "held"}
@@ -1569,7 +1574,9 @@ def test_a_quarantined_quotes_partition_does_not_take_the_whole_sweep(
     net under this rule rather than a replacement for it. The sentence above still decides where a
     *per-ticker* condition belongs, and marketlake #446 owns the ones now caught too high.
     """
-    root = _lake(fixture_lake)
+    root = _lake(
+        fixture_lake, quotes={("SPY", FOLLOWING): _session_rows(FOLLOWING)}, judged=(SESSION,)
+    )
     partition = (
         LakePaths(root).partition_path(QUOTES, "SPY", FOLLOWING).relative_to(root).as_posix()
     )
@@ -2069,11 +2076,11 @@ def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLak
     back are never recovered. Clamping each span's start to two days before the run left the whole
     suite green, which is how that gap was found.
 
-    Here the quotes that end 2026-09-14's wait do not seal until three sessions later, which is
-    the shape a repair takes: someone fixes the gap rows days after the outage. The walk has to
-    still be asking about that session.
+    Here 2026-09-14's own quotes do not seal until three sessions later, which is the shape a
+    repair takes: someone recovers a compaction that failed, days after the session. The walk has
+    to still be asking about that session.
     """
-    root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
+    root = _lake(fixture_lake, quotes={}, judged=())
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
 
     first, _, _ = _run(
@@ -2082,9 +2089,9 @@ def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLak
     assert dict(first.nightly.pieces)["bars"].landed == 0
     assert not partition.exists()
 
-    # Three sessions pass before the session SESSION's bar waits for is sealed.
+    # Three sessions pass before SESSION's own quotes are sealed.
     late = date(2026, 9, 17)
-    _seal_late(fixture_lake, root, FOLLOWING)
+    _seal_late(fixture_lake, root, SESSION)
 
     fourth, _, _ = _run(
         root,
@@ -2092,7 +2099,7 @@ def test_the_walk_reaches_back_further_than_one_session(fixture_lake: FixtureLak
         vendor_source=_CountingVendorSource(_cassette(session=late)),
     )
 
-    assert partition.exists(), "the walk stopped short of the session it held three nights before"
+    assert partition.exists(), "the walk stopped short of a session three nights back"
     table = pa.parquet.read_table(partition)
     assert table.column("bar_ts").to_pylist() == [f"{SESSION.isoformat()}T04:00:00+00:00"]
 
@@ -2134,46 +2141,65 @@ def test_a_stale_frequency_on_a_retired_ticker_does_not_withhold_the_ping(
     assert outcome.nightly.pinged is True
 
 
-def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: FixtureLake):
-    """Marketlake #422. The defect was that nothing ever came back for a held session.
+def test_tonights_daily_bar_lands_tonight(fixture_lake: FixtureLake):
+    """Marketlake #962: the 18:30 run lands the daily bar of the session it runs on.
 
-    A daily bar was judged against the calendar-next session's settled close, and at 18:30 on
-    session S that session has not been captured, so every daily bar was held on the night it
-    was fetched. ``fetch_session_bars`` said that settles itself because "the next run lands the
-    bar". It did not. The next run fetched the *next* session, met the same absence for it, and
-    nothing scheduled ever asked about S again. The nightly job therefore landed no daily bar,
-    ever.
-
-    Marketlake #618 moved the comparison onto the session's own 16:15 quote and kept the wait
-    for the next session's seal, so the shape this test covers is unchanged.
-
-    **This is the test the old shape could not pass.** Two runs a day apart over one lake. The
-    first is the night of ``SESSION`` with no quotes sealed for the session after it, so no bar
-    lands and no partition exists. The second is the following night, by which point that
-    session's quotes are sealed, and it has to reach back and land the bar the first run left.
-
-    The second run is the whole point: under a single-session fetch it would ask only about
-    ``FOLLOWING`` and ``SESSION``'s partition would stay missing forever.
-
-    **Marketlake #434 changed what night one does about it, not what night two recovers.** That
-    night used to fetch the bar, gate it against a close nobody had captured, and hold a finding.
-    Whether the next session has sealed is this lake's answer rather than the vendor's, so the
-    walk asks the manifest first and the ticker-day is left unsettled with the request unspent.
-    The recovery below is unchanged, which is what makes the skip safe: a session that is skipped
-    tonight is a session the next run still walks.
+    SESSION's quotes are sealed, as close+15 compaction leaves them, and nothing is sealed for
+    FOLLOWING, because at 18:30 on SESSION that session has not traded. Before marketlake #962
+    the walk waited for FOLLOWING's seal, so this run landed nothing and the bar arrived a night
+    late. The gate reads only SESSION's own 16:15 quote, so nothing about FOLLOWING is needed.
     """
     root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
     partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
 
-    # Night one, the night of SESSION. The bar waits for the calendar-next session to seal, and
-    # that session has not been captured yet, so nothing is fetched for it.
-    first, _, _ = _run(
+    outcome, _, _ = _run(
         root,
         now=EVENING,
         vendor_source=_CountingVendorSource(_cassette(session=SESSION)),
     )
+
+    assert not LakePaths(root).partition_path(QUOTES, "SPY", FOLLOWING).exists()
+    walked = dict(outcome.nightly.pieces)["bars"]
+    assert (walked.landed, walked.held) == (1, 0), "tonight's bar did not land tonight"
+    assert partition.exists()
+    table = pa.parquet.read_table(partition)
+    assert table.column("bar_ts").to_pylist() == [f"{SESSION.isoformat()}T04:00:00+00:00"]
+
+
+def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: FixtureLake):
+    """Marketlake #422. The defect was that nothing ever came back for a held session.
+
+    When marketlake #422 was filed, a daily bar was judged against the calendar-next session's
+    close, and at 18:30 on session S that session had not been captured, so every daily bar was
+    held on the night it was fetched. ``fetch_session_bars`` said that settles itself because "the
+    next run lands the bar". It did not. The next run fetched the *next* session, met the same
+    absence for it, and nothing scheduled ever asked about S again. The nightly job therefore
+    landed no daily bar, ever.
+
+    Marketlake #618 moved the comparison onto the session's own 16:15 quote, and marketlake #962
+    removed the wait for the next session's seal, so tonight's bar now lands tonight
+    (``test_tonights_daily_bar_lands_tonight``). What still needs the reach-back is a bar the gate
+    holds. Here the vendor's close on night one sits outside the tolerance, so the bar is held
+    and no partition exists. On night two the vendor serves the close that agrees, and the run
+    has to reach back and land the bar the first run held.
+
+    The second run is the whole point: under a single-session fetch it would ask only about
+    ``FOLLOWING`` and ``SESSION``'s partition would stay missing forever. Nothing is written down
+    between the two nights. A held bar is not manifested, so the next walk asks about it again.
+    """
+    root = _lake(fixture_lake, quotes={}, judged=(SESSION,))
+    partition = LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, SESSION)
+
+    # Night one, the night of SESSION. Its quotes are sealed, the bar is fetched, and the gate
+    # holds it because the vendor's close sits 20 basis points from the 16:15 quote, a literal
+    # rather than a multiple of the tolerance so the test cannot move with the constant.
+    first, _, _ = _run(
+        root,
+        now=EVENING,
+        vendor_source=_CountingVendorSource(_cassette(SETTLED_CLOSE * 1.002, session=SESSION)),
+    )
     held = dict(first.nightly.pieces)["bars"]
-    assert (held.landed, held.held) == (0, 0), "the bar landed on the night it was fetched"
+    assert (held.landed, held.held) == (0, 1), "the gate did not hold the disagreeing bar"
     assert not partition.exists()
 
     # FOLLOWING's quotes seal, which is what its own compaction does the next afternoon.
@@ -2187,7 +2213,7 @@ def test_a_daily_bar_held_tonight_is_reached_again_tomorrow(fixture_lake: Fixtur
         vendor_source=_CountingVendorSource(_cassette(session=FOLLOWING)),
     )
     landed = dict(second.nightly.pieces)["bars"]
-    assert landed.landed == 1, "the run did not reach back to the session it held last night"
+    assert landed.landed == 2, "the run did not reach back to the session it held last night"
     assert partition.exists(), "SESSION's daily partition never landed"
 
     # And it is SESSION's bar, not the newer session's.
@@ -3463,7 +3489,9 @@ def _operator_night(
         for day in minute_bars:
             LakePaths(root).bars_partition_path("SPY", MINUTE_FREQ, day).unlink()
     interactions: list = []
-    for day in (*minute_bars, date(2026, 9, 16), baseline):
+    # The night's own session is fetched too, since marketlake #962 lands a daily bar on its own
+    # evening rather than waiting for the next session to seal.
+    for day in (*minute_bars, date(2026, 9, 16), baseline, night):
         day_open, day_close = _bounds(day)
         interactions.extend(
             bars_interactions(
