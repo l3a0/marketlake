@@ -224,23 +224,11 @@ CHECK_BAR_RESPONSE = "bar_response"
 # drops the neighbours.
 DAILY_WINDOW_MARGIN = timedelta(days=1)
 
-# The Eastern time of day from which a daily stamp names the next session rather than its own
-# date. Marketlake #380 decided it against the stamps the lake holds, and ``docs/design.md``
-# carries the reasoning under its storage section. The measurement, briefly:
-#
-# Every one of the 44 daily bars the laptop lake held on 2026-11-01 is stamped 05:00 UTC, which is
-# 01:00 EDT and a midnight at the standard offset in a daylight month. #362's recording caught one
-# at 04:00 UTC, a midnight at the daylight offset. In standard time that second spelling is 23:00
-# Eastern the evening before, so reading the stamp's own Eastern date files the bar a session
-# early. The vendor's offset is out of season on every bar it has sent, so it carries no seasonal
-# meaning a reader could honour.
-#
-# A boundary has to sit after the latest stamp that falls inside its own session, a candle
-# stamped at the 16:00 close, and before the earliest that falls on the evening before, UTC
-# midnight, which is 19:00 EST. 18:00 is inside that band. Read this way a stamp names its session
-# under every convention #380 lists, in both seasons: midnight at UTC-5, at UTC-4, at seasonal
-# Eastern time, at UTC, and at the close. Snapping to the nearest midnight was the other candidate
-# and loses the close stamp, which lies nearer the next midnight than its own.
+# The Eastern hour from which a daily stamp names the next session rather than its own date.
+# Marketlake #380 decided it, and ``docs/design.md`` carries the measurement and the readings it
+# rejected, under its storage section. The boundary sits after the latest stamp inside a session,
+# a candle stamped at the 16:00 close, and before the earliest on the evening before, UTC midnight
+# at 19:00 EST.
 #
 # It is an integer hour rather than a ``datetime.time``, which is how this package pins a wall-clock
 # moment that is not a session time, the form ``tests/support/enforcement.py`` lets through.
@@ -579,8 +567,9 @@ def session_of(bar_ts: str) -> date:
     the calendar module's, which is what keeps this from naming a session time of its own.
 
     Marketlake #362 measured this against a live recording rather than leaving it assumed. Two
-    daily stamps came back, at 00:00 and 01:00 Eastern, and this reading names the right session
-    for both.
+    daily stamps came back, at 00:00 and 01:00 Eastern, and in daylight time this reading names the
+    right session for both. A daily stamp is read by :func:`daily_session_of` since marketlake
+    #380, for the reason the paragraph below gives.
 
     **Which session each stamp names was fixed from outside the recording.** The stamps alone do
     not settle it: two candles are equally consistent with a stamp naming the session it opens
@@ -593,10 +582,10 @@ def session_of(bar_ts: str) -> date:
     #362 stamps are both local midnight under different UTC offsets, one standard and one
     daylight, in a month that is daylight throughout. Mirrored into winter the same slip crosses
     the date backwards: 04:00 UTC in January is 23:00 Eastern on the previous day, and this
-    returns that previous date. Marketlake #380 measured the cost, which is not always a stall: a
-    response mixing the two spellings hands the session the next session's candle, and only the
-    close gate stood between that candle and the partition. :func:`bar_session` picks the reading
-    by frequency.
+    returns that previous date. Marketlake #380 measured the cost, which is not always a stall:
+    when the next session's candle carries that spelling, this reading hands it to the session
+    being fetched, and only the close gate stood between it and the partition.
+    :func:`bar_session` picks the reading by frequency.
 
     **A stamp carrying no offset is refused rather than read.** ``StampNotAnInstant`` says why.
     A naive stamp resolves against the process's own timezone, so this would answer by the
@@ -629,13 +618,17 @@ def daily_session_of(bar_ts: str) -> date:
     """The session a daily bar's own stamp names, whichever UTC offset the vendor stamped it at.
 
     A stamp before ``DAILY_STAMP_ROLLOVER_HOUR`` Eastern names its own Eastern date, and one at or
-    after it names the next. ``DAILY_STAMP_ROLLOVER_HOUR`` carries the measurement and the band the
-    boundary sits in. So 05:00 UTC, the stamp every landed bar carries, names its own date in both
-    seasons, and 04:00 UTC, which is 23:00 the evening before in standard time, names the same
-    session rather than the one before it. Marketlake #380.
+    after it names the next. ``DAILY_STAMP_ROLLOVER_HOUR`` names the band the boundary sits in. So
+    05:00 UTC, the stamp every landed bar carries, names its own date in both seasons, and 04:00
+    UTC, which is 23:00 the evening before in standard time, names the same session rather than the
+    one before it. Marketlake #380.
 
-    The reading is :func:`session_of`'s Eastern clock with a later day boundary, so the naive-stamp
-    refusal and the zone are that function's rather than a second copy of them.
+    It gives up one convention, a stamp at the end of the session's UTC day: 23:59 UTC is 19:59 EDT
+    and names the next session here. No source this lake reads stamps that way. The vendor's
+    stamps sit near Eastern midnight, and an imported bar is stamped at Eastern midnight.
+
+    The naive-stamp refusal is :func:`_as_instant`'s and the zone is ``MARKET_TZ``, both shared
+    with :func:`session_of`, so neither is a second copy.
     """
     eastern = _as_instant(bar_ts).astimezone(MARKET_TZ)
     if eastern.hour >= DAILY_STAMP_ROLLOVER_HOUR:
@@ -809,6 +802,9 @@ def check_bar_span(
         # and UTC midnight in any season both do. Reading the candle only by its session refused
         # that response, which marketlake #380's third plan audit executed through the sweep. A
         # response that ignored the bounds still reaches years outside them under either reading.
+        # The price is one session of slack at the far edge: under stamps at UTC midnight, or at
+        # 04:00 UTC in standard time, a response reaching exactly one session past the bracket
+        # passes. The selection still lands only the session's own candle.
         first = window.start.astimezone(MARKET_TZ).date()
         last = window.end.astimezone(MARKET_TZ).date()
         outside = [

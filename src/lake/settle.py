@@ -48,18 +48,19 @@ be compared over, 760.88 and 757.39 on SPY and 709.18 and 704.54 on QQQ. A numbe
 that agrees four times out of four is a good check and still not the source, because the
 ``bars/`` close has passed gate-before-land and this one has passed nothing.
 
-**Which session a daily stamp names does not reach this read**, and it is now settled anyway.
-This read asks for the close of a *named* session, and a bars partition is addressed by its
-``date=`` path level. ``bars.select_session_rows`` filters every landed row through
-``bars.daily_session_of``, and two gates run before a candle lands: the span check refuses a daily
-fetch whose selection came back empty, and ``check_close_cross`` compares the landed close against
-the close the lake settled from its own captured quotes.
+**This read takes no session from a stamp, and the stamp still decides which candle it reads.**
+It asks for the close of a *named* session, and a bars partition is addressed by its ``date=``
+path level. What a stamp decides is which candle the sweep landed under that date:
+``bars.select_session_rows`` filters every landed daily row through ``bars.daily_session_of``,
+and two gates run before a candle lands. The span check refuses a daily fetch whose selection
+came back empty, and ``check_close_cross`` compares the landed close against the close the lake
+settled from its own captured quotes.
 
-Those gates are not a full defence against a wrong convention, which marketlake #380 measured. A
-response mixing two stamp offsets in standard time handed a session the next session's candle,
-the span check covered it, and only the close gate stood between it and the partition. So the
-convention is what keeps this read right. A daily stamp names its session by an 18:00 Eastern day
-boundary, which reads every convention #380 lists, the vendor's 05:00 UTC among them.
+Those gates are not a full defence against a wrong reading of the stamp, which marketlake #380
+measured. In standard time a next-session candle stamped at the daylight offset read as the
+session being fetched, the span check covered it, and only the close gate stood between it and
+the partition. So the reading is what keeps this read right, and ``bars.daily_session_of`` carries
+it.
 
 **The threshold is compared in whole cents.** Intrinsic per share is the close minus the
 strike for a call and the strike minus the close for a put, floored at zero, and

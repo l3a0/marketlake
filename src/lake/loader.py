@@ -1366,7 +1366,10 @@ def _in_view(
     the ``date=`` level of the partition it was read out of. The path level is free and the two
     agree on every partition the writer wrote, because ``select_session_rows`` filters every
     landed row through that same function. The frequency matters because a daily stamp names its
-    session by a later day boundary than a minute stamp does, which marketlake #380 decided.
+    session by a later day boundary than a minute stamp does, which marketlake #380 decided. A
+    partition landed before #380 went through the strict reading, and every daily stamp the lake
+    was measured to hold reads alike under both. Nothing checks that a row's session equals its
+    ``date=``, which marketlake #967 holds.
     ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and reading the path
     instead would mint a second definition of a bar's session to get the answer the first one
     already gives.

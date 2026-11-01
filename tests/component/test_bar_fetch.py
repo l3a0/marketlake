@@ -16,14 +16,13 @@ Two properties of the fixtures are worth naming before the tests.
    asked for. The cassette key carries the window, so a drifted fetch would miss every
    recording, and asserting the recorded call says which window rather than only that one
    was found.
-2. **The daily stamps are one of the two instants a recording showed.** Marketlake #362
-   recorded ``freq=1d`` live and found the stamp falls on the session's Eastern date, at or
-   shortly after midnight, rather than at midnight exactly. The two candles it caught were
-   23 hours apart, one at 00:00 Eastern and one at 01:00. These fixtures use the midnight
-   spelling, which is the first of the two, and
-   ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` holds the other
-   against the recording itself. What the code reads off a stamp is the session, which is
-   what survives the hour of wander between them.
+2. **The daily stamps are the vendor's own.** ``_daily_candle`` stamps 05:00 UTC, which every
+   landed daily bar the lake was measured to hold carries. Marketlake #362's recording caught a
+   second spelling, 04:00 UTC, and
+   ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` holds it against the
+   recording itself. What the code reads off a stamp is the session, through
+   ``bars.daily_session_of``, and marketlake #380 is why that reading has an 18:00 Eastern day
+   boundary rather than the stamp's own Eastern date.
 """
 
 from __future__ import annotations
