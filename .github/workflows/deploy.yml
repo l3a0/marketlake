@@ -6,6 +6,11 @@
 # whether this moment is safe, so an approval during the refused hours fails the run
 # with the time a deploy may start, and a re-run after that time deploys.
 #
+# A run started by hand can set override_window, which asks the VM to skip that refusal
+# and nothing else (#987). The run still waits for the owner's approval, and every check
+# the host makes besides the window still holds. A push has no inputs, so a push-triggered
+# run cannot set it. infra/README.md's "Override the deploy window" says when and how.
+#
 # No job here is named `test`, because the ruleset on main requires a check by that
 # name and ci.yml provides it.
 #
@@ -21,6 +26,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      override_window:
+        description: "Skip the VM's deploy window refusal. Busy jobs still refuse."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -114,4 +124,7 @@ jobs:
 
       - name: Ask the VM to deploy this commit
         if: steps.head.outputs.state == 'fresh'
+        env:
+          # Empty on a push, which has no inputs.
+          DEPLOY_OVERRIDE_WINDOW: ${{ inputs.override_window }}
         run: deploy/send-deploy.sh

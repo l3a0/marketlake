@@ -1,10 +1,10 @@
 """The deploy document's one shell step, run under dash against fakes (#676).
 
 ``infra/live/deploy.tf`` reads ``infra/live/deploy-step.sh`` into the SSM document
-``marketlake-deploy`` with ``file()``. The SSM agent substitutes ``{{ sha }}`` and
-``{{ notAfter }}`` and runs the step as root with ``sh``, which is dash on Ubuntu. The test
-substitutes both the same way and runs the result with ``/bin/dash`` by name, because a
-Mac's ``/bin/sh`` is bash and accepts what dash refuses.
+``marketlake-deploy`` with ``file()``. The SSM agent substitutes ``{{ sha }}``,
+``{{ notAfter }}`` and ``{{ overrideWindow }}`` and runs the step as root with ``sh``, which
+is dash on Ubuntu. The test substitutes all three the same way and runs the result with
+``/bin/dash`` by name, because a Mac's ``/bin/sh`` is bash and accepts what dash refuses.
 
 The step sets its own ``PATH`` and reads ``/etc/marketlake/bootstrap.conf`` by its absolute
 path, so the test rewrites those two literals to reach the fakes and a temporary root.
@@ -41,18 +41,22 @@ printf '%s\n' "$@" > "$STATE/argv"
 printf '%s' "$$" > "$STATE/pid"
 pwd > "$STATE/cwd"
 printf '%s' "$PATH" > "$STATE/path"
-echo "${VM_DEPLOY_LINE:-deployed: $4}"
+echo "${VM_DEPLOY_LINE:-deployed: ${!#}}"
 exit "${VM_DEPLOY_RC:-0}"
 """
 
 pytestmark = pytest.mark.skipif(not DASH.exists(), reason="the step runs under /bin/dash")
 
 
-def substituted(sha: str = SHA, not_after: str = NOT_AFTER) -> str:
-    """The step as the agent runs it, with both parameters in place."""
+def substituted(sha: str = SHA, not_after: str = NOT_AFTER, override: str = "false") -> str:
+    """The step as the agent runs it, with the three parameters in place. A send that
+    omits ``overrideWindow`` gets the document's default, ``false``."""
     text = STEP.read_text()
-    assert text.count("{{ sha }}") == 1 and text.count("{{ notAfter }}") == 1
+    # Two commands carry the sha and the expiry, and one test picks between them.
+    assert text.count("{{ sha }}") == 2 and text.count("{{ notAfter }}") == 2
+    assert text.count("{{ overrideWindow }}") == 1
     text = text.replace("{{ sha }}", sha).replace("{{ notAfter }}", not_after)
+    text = text.replace("{{ overrideWindow }}", override)
     assert "{{" not in text and "}}" not in text
     return text
 
@@ -180,6 +184,25 @@ def test_the_step_runs_vm_deploy_with_the_two_parameters(host, rc):
     assert (host.state / "pid").read_text() == str(pid)
     assert (host.state / "cwd").read_text() == "/\n"
     assert (host.state / "path").read_text() == host.script_path
+
+
+@pytest.mark.parametrize(
+    ("override", "flag"), [("true", ["--override-window"]), ("false", [])], ids=["true", "false"]
+)
+def test_the_override_adds_its_flag_only_when_asked(host, override, flag):
+    """The checkout's vm-deploy.sh runs before the deploy moves it, and one older than the
+    flag refuses it, so ``false`` must reach the script as a run without it (#987)."""
+    host.write_step(substituted(override=override))
+    proc, _ = host.run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout == f"deployed: {SHA}\n"
+    assert (host.state / "argv").read_text().splitlines() == [
+        *flag,
+        "--not-after",
+        NOT_AFTER,
+        "--sha",
+        SHA,
+    ]
 
 
 def test_a_newline_after_the_sha_cuts_off_nothing_the_host_needs(host):

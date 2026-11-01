@@ -14,9 +14,13 @@ lines.
    start. On exit 3 it names the next moment one may, which is the end of the current
    refused span, or the end of a later one when the margin below refuses the gap between
    them.
-2. ``next_span_start=<epoch seconds>``, the start of the first refused span that ends
-   after now. Inside a span that start is in the past. ``vm-deploy.sh`` keeps it, so its
-   wait before the restart needs no Python once the checkout has moved.
+2. ``next_span_start=<epoch seconds>``, the start of the first refused span that has not
+   opened yet. ``vm-deploy.sh`` keeps it, so its wait before the restart needs no Python
+   once the checkout has moved. Outside a span it is the start of the span ahead. Inside
+   a span it is the start of the one after, because a deploy that overrides the window
+   (marketlake #987) starts inside one, and the current span's start, already past, would
+   refuse its restart after the merge had moved the tree. Every other reader acts on the
+   value only after exit 0, where the two readings agree.
 
 **A refused span** covers each day of the week on which the units have schedules. It runs
 from ``LEAD`` before that day's earliest scheduled start to the later of ``TAIL`` after
@@ -169,6 +173,9 @@ def decide(
     if not spans:
         raise ValueError("no unit has a schedule, so no span bounds a deploy")
     first = spans[0]
+    upcoming = next((span.start for span in spans if span.start > now), None)
+    if upcoming is None:
+        raise ValueError("no refused span opens within the lookahead")
     if first.contains(now):
         reason = "the scheduled jobs run until then"
         free_from, rest = first.end, spans[1:]
@@ -191,7 +198,7 @@ def decide(
     return Verdict(
         REFUSED,
         f"a deploy may start next at {_eastern(free_from)}, because {reason}",
-        first.start,
+        upcoming,
     )
 
 

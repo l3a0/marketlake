@@ -1124,6 +1124,93 @@ def test_the_window_refusal_is_the_last_line(vm):
     _assert_untouched(vm)
 
 
+# -- the override (#987) ----------------------------------------------------------------
+
+OVERRIDDEN = ", with the deploy window overridden"
+REFUSAL = "a deploy may start next at Sun 2026-11-01 23:30 EST, because less than 210 minutes"
+
+
+def test_the_override_skips_the_window_refusal(vm):
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(vm.c["c2"], "--override-window", FAKE_WINDOW_RC="3", FAKE_WINDOW_LINE=REFUSAL)
+    assert proc.returncode == 0, proc.stdout + proc.stderr + vm.deploy_log.read_text()
+    assert _outcome(proc) == f"deployed: {vm.c['c2']}{OVERRIDDEN}"
+    assert vm.head() == vm.c["c2"]
+    assert vm.recorded() == vm.c["c2"]
+    assert vm.ran("restart.sh") == ["restart.sh daemon", "restart.sh dashboard"]
+    log = vm.deploy_log.read_text()
+    assert "--override-window was given" in log
+    assert "the window refuses a deploy now, and --override-window skips that refusal" in log
+    # The inner run's own line carries no suffix, so the wrapper's pairing reads it bare.
+    assert (vm.state / "last-result").read_text() == f"0 deployed: {vm.c['c2']}\n"
+
+
+def test_the_wrapper_passes_the_override_to_the_inner_run(vm):
+    proc = vm.deploy(vm.c["c2"], "--override-window")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    [run] = vm.ran("systemd-run ")
+    assert run.endswith(f"{vm.script} --inner --sha {vm.c['c2']} --override-window"), run
+
+
+def test_the_override_marks_a_deploy_the_window_allowed_too(vm):
+    proc = vm.deploy(vm.c["c2"], "--override-window")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"deployed: {vm.c['c2']}{OVERRIDDEN}"
+    assert "skips that refusal" not in vm.deploy_log.read_text()
+
+
+def test_the_override_keeps_the_busy_check(vm):
+    vm.activating(SWEEP)
+    proc = vm.deploy(vm.c["c2"], "--override-window", FAKE_WINDOW_RC="3", FAKE_WINDOW_LINE=REFUSAL)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert _outcome(proc) == f"not deployed: {SWEEP} is activating{OVERRIDDEN}"
+    _assert_untouched(vm)
+
+
+def test_the_override_keeps_the_restarts_bound(vm):
+    """The window's next_span_start still bounds the restart under the override."""
+    vm.record(vm.c["c1"])
+    soon = str(int(time.time()) + 100)
+    proc = vm.deploy(
+        vm.c["c3"],
+        "--override-window",
+        FAKE_WINDOW_RC="3",
+        FAKE_WINDOW_LINE=REFUSAL,
+        FAKE_NEXT_SPAN=soon,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is"
+        f" {vm.c['c1']}{OVERRIDDEN}"
+    )
+    assert not vm.ran("restart.sh")
+
+
+def test_the_override_keeps_the_window_output_check(vm):
+    proc = vm.deploy(vm.c["c2"], "--override-window", FAKE_WINDOW_RC="3", FAKE_NEXT_SPAN="soon")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        "not deployed: python -m lake.deploy_window printed no next_span_start line" + OVERRIDDEN
+    )
+    _assert_untouched(vm)
+
+
+def test_the_override_is_added_after_the_pairing_of_code_and_line(vm):
+    line = f"deployed: {vm.c['c2']}"
+    proc = vm.deploy(
+        vm.c["c2"], "--override-window", FAKE_SYSTEMD_RUN="result", FAKE_RESULT=f"0 {line}\\n"
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _outcome(proc) == line + OVERRIDDEN
+    # An inner line that already carries the suffix is not a deployed line for the sha.
+    content = f"0 {line}{OVERRIDDEN}\\n"
+    proc = vm.deploy(
+        vm.c["c2"], "--override-window", FAKE_SYSTEMD_RUN="result", FAKE_RESULT=content
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == UNKNOWN + OVERRIDDEN
+
+
 @pytest.mark.parametrize(
     ("env", "line"),
     [
@@ -1327,6 +1414,7 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
             "not deployed: --not-after must be epoch seconds",
         ),
         (["--sha", "a" * 40, "--help"], None),
+        (["--override-window", "--sha", "a" * 40, "--now"], "{usage}" + OVERRIDDEN),
     ],
     ids=[
         "nothing",
@@ -1339,13 +1427,17 @@ def test_an_inner_run_outside_a_unit_is_refused(vm):
         "expiry suffix",
         "octal expiry",
         "unknown flag",
+        "unknown flag after the override",
     ],
 )
 def test_a_usage_error_is_one_line_on_stdout(vm, argv, line):
     proc = vm.run([str(vm.script), *argv])
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    usage = "not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]"
-    assert _outcome(proc) == (line or usage)
+    usage = (
+        "not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]"
+        " [--override-window]"
+    )
+    assert _outcome(proc) == (line or usage).format(usage=usage)
     assert vm.calls() == []
 
 

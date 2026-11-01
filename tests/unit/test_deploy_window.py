@@ -20,6 +20,7 @@ from tests.support.clock import ManualClock
 SATURDAY = date(2026, 10, 10)
 SUNDAY = date(2026, 10, 11)
 MONDAY = date(2026, 10, 12)
+TUESDAY = date(2026, 10, 13)
 FRIDAY = date(2026, 10, 16)
 
 HOST = cp.SystemdHost(python="/p/python", owner="o", home="/h", project_dir="/h/m")
@@ -128,11 +129,11 @@ def test_a_deploy_may_start_outside_the_spans_and_their_margin(capsys, now, late
 @pytest.mark.parametrize(
     ("now", "free", "span", "reason"),
     [
-        (et(MONDAY, 8), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "the scheduled jobs run"),
-        (et(MONDAY, 18, 44, 59), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "the scheduled"),
+        (et(MONDAY, 8), "Mon 2026-10-12 18:45 EDT", et(TUESDAY, 8), "the scheduled jobs run"),
+        (et(MONDAY, 18, 44, 59), "Mon 2026-10-12 18:45 EDT", et(TUESDAY, 8), "the scheduled"),
         (et(MONDAY, 4, 30, 1), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "less than 210"),
         (et(SUNDAY, 16, 0, 1), "Sun 2026-10-11 23:30 EDT", et(SUNDAY, 19, 30), "less than"),
-        (et(SUNDAY, 21), "Sun 2026-10-11 23:30 EDT", et(SUNDAY, 19, 30), "the scheduled"),
+        (et(SUNDAY, 21), "Sun 2026-10-11 23:30 EDT", et(MONDAY, 8), "the scheduled"),
     ],
     ids=["span opens", "span closes", "margin", "sunday margin", "sunday span"],
 )
@@ -141,7 +142,8 @@ def test_a_deploy_may_not_start_inside_a_span_or_its_margin(capsys, now, free, s
     assert code == 3
     assert len(lines) == 2
     assert lines[0].startswith(f"a deploy may start next at {free}, because {reason}")
-    # Inside a span its start is in the past, and vm-deploy.sh keeps it either way.
+    # In the margin it is the span ahead. Inside a span it is the one after, since the
+    # current span's start is past and an overridden deploy's restart reads it (#987).
     assert lines[1] == f"next_span_start={epoch(span)}"
 
 
@@ -163,11 +165,14 @@ def test_a_gap_shorter_than_the_margin_refuses_up_to_the_later_span():
         _job("late", cp.WallClockTime(23, 0), (5,)),
         _job("early", cp.WallClockTime(1, 0), (6,)),
     ]
-    for now in (et(SATURDAY, 23), et(SATURDAY, 20)):
+    for now, upcoming in (
+        (et(SATURDAY, 23), et(SUNDAY, 0, 30)),
+        (et(SATURDAY, 20), et(SATURDAY, 22, 30)),
+    ):
         verdict = dw.decide(now, units, _no_window)
         assert verdict.code == dw.REFUSED
         assert "next at Sun 2026-10-11 01:15 EDT" in verdict.line
-        assert verdict.next_span_start == et(SATURDAY, 22, 30).astimezone(UTC)
+        assert verdict.next_span_start == upcoming.astimezone(UTC)
 
 
 def test_a_span_that_started_yesterday_is_still_found():
@@ -175,6 +180,8 @@ def test_a_span_that_started_yesterday_is_still_found():
     verdict = dw.decide(et(SUNDAY, 0, 1), units, _no_window)
     assert verdict.code == dw.REFUSED
     assert "next at Sun 2026-10-11 00:05 EDT" in verdict.line
+    # The only span left to open is the same job's, a week on.
+    assert verdict.next_span_start == et(SATURDAY + timedelta(7), 23, 20).astimezone(UTC)
 
 
 # -- a clock change --------------------------------------------------------------------

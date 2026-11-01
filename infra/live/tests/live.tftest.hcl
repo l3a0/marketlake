@@ -786,8 +786,14 @@ run "deploy_document_runs_only_vm_deploy" {
         description    = "The epoch second after which the host refuses to start."
         allowedPattern = "^[0-9]{10}$"
       }
+      overrideWindow = {
+        type          = "String"
+        description   = "true skips the host's deploy window refusal, and nothing else."
+        allowedValues = ["false", "true"]
+        default       = "false"
+      }
     }
-    error_message = "The deploy document's parameters are not exactly sha and notAfter with their anchored patterns."
+    error_message = "The deploy document's parameters are not exactly sha and notAfter with their anchored patterns, and overrideWindow with false and true, defaulting to false."
   }
 
   assert {
@@ -814,15 +820,18 @@ run "deploy_document_runs_only_vm_deploy" {
     error_message = "The deploy step does not set its PATH and change to / before anything else."
   }
 
-  # The one command the step runs, with the two parameters and nothing else substituted.
+  # The two commands the step can run, with the three parameters and nothing else
+  # substituted. The override's flag goes only on a request that asks for it.
   assert {
     condition = [
       for line in split("\n", jsondecode(aws_ssm_document.deploy.content).mainSteps[0].inputs.runCommand[0]) :
       line if strcontains(line, "{{")
       ] == [
+      "if [ \"{{ overrideWindow }}\" = true ]; then",
+      "  exec \"$home/marketlake/deploy/vm-deploy.sh\" --override-window --not-after {{ notAfter }} --sha {{ sha }}",
       "exec \"$home/marketlake/deploy/vm-deploy.sh\" --not-after {{ notAfter }} --sha {{ sha }}",
     ]
-    error_message = "The deploy step does not run exactly deploy/vm-deploy.sh with --not-after and then --sha."
+    error_message = "The deploy step does not run exactly deploy/vm-deploy.sh with --not-after and then --sha, adding --override-window only when asked."
   }
 
   assert {

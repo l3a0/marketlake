@@ -4,7 +4,12 @@
 #
 # Usage, as root, from any directory:
 #
-#     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]
+#     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]
+#
+# --override-window skips the window's refusal in step 3 and nothing else, marketlake #987.
+# The owner gives it by hand, or through the deploy workflow's override_window input on a
+# run started by hand. Every line the wrapper prints then ends ", with the deploy window
+# overridden", so nobody reads the outcome as an ordinary deploy's.
 #
 # The owner runs it by hand, and the CI half of #676 runs it through SSM Run Command,
 # by way of infra/live/deploy-step.sh, after the owner approves a merge's deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
@@ -32,7 +37,8 @@
 #     2. refuses with exit 2 unless the daemon's ActiveState is active. A stopped daemon
 #        was stopped on purpose, and the bootstrap's enable --now would start it;
 #     3. refuses with exit 3 at the wrong moment: when python -m lake.deploy_window, run
-#        as the owner from the current venv, says no, when a com.marketlake.* service
+#        as the owner from the current venv, says no, unless --override-window was
+#        given, when a com.marketlake.* service
 #        other than the two residents is in a state other than inactive or failed, or
 #        when the daemon's cgroup holds a process besides its main one, such as a
 #        compaction. It keeps the window's next_span_start for step 6. The two busy
@@ -78,7 +84,7 @@
 # a config value, a host path or a line of a step's output. A reason names the failed
 # step and points at deploy.log. Exit 0 comes only with a "deployed:" line for the
 # requested sha, and that line only with exit 0, and the wrapper reads any other pairing
-# as "outcome unknown".
+# as "outcome unknown". The wrapper pairs them before it adds the override's suffix.
 #
 # docs/design.md and issue #676 carry the reasoning for each step.
 #
@@ -110,6 +116,7 @@ DEPLOY_SERVICE="$DEPLOY_UNIT.service"
 UNKNOWN="outcome unknown: read deploy.log"
 FAILED_STEP=", with a failed step in deploy.log"
 NOT_RUN_BEFORE=", which has not run before"
+OVERRIDDEN=", with the deploy window overridden"
 SHA_RE='^[0-9a-f]{40}$'
 # No leading zero, because bash reads one as octal, and 0999 is then an error rather than
 # a number.
@@ -120,6 +127,7 @@ ROOT="${MARKETLAKE_INSTALL_ROOT:-}"
 INNER=0
 SHA=""
 NOT_AFTER=""
+OVERRIDE=0
 RESULT=""
 OUTCOME_CODE=1
 OUTCOME_LINE="$UNKNOWN"
@@ -144,15 +152,20 @@ finish() {
 }
 
 # The wrapper, and an inner run with no result file, print the outcome and exit with its
-# code. An inner run with a result file writes it there and exits 0 on every path it
-# decides, or 1 from a signal trap.
+# code, adding the override's suffix when it was asked for. An inner run with a result
+# file writes it there, without the suffix, and exits 0 on every path it decides, or 1
+# from a signal trap.
 on_exit() {
   if [[ $INNER == 1 && -n "$RESULT" ]]; then
     say "outcome: $OUTCOME_CODE $OUTCOME_LINE"
     out "$OUTCOME_CODE $OUTCOME_LINE" > "$RESULT" 2>/dev/null || true
     return
   fi
-  out "$OUTCOME_LINE"
+  if [[ $OVERRIDE == 1 ]]; then
+    out "$OUTCOME_LINE$OVERRIDDEN"
+  else
+    out "$OUTCOME_LINE"
+  fi
   exit "$OUTCOME_CODE"
 }
 trap on_exit EXIT
@@ -160,7 +173,7 @@ trap 'OUTCOME_CODE=1; OUTCOME_LINE="$UNKNOWN"; exit 1' TERM INT HUP
 
 # -- arguments -------------------------------------------------------------------------
 
-USAGE="not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]"
+USAGE="not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sha|--not-after)
@@ -169,6 +182,9 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --inner)
       INNER=1
+      shift ;;
+    --override-window)
+      OVERRIDE=1
       shift ;;
     *)
       finish 2 "$USAGE" ;;
@@ -295,6 +311,9 @@ if [[ $INNER == 0 ]]; then
   if [[ -n "$NOT_AFTER" ]]; then
     INNER_ARGS+=(--not-after "$NOT_AFTER")
   fi
+  if [[ $OVERRIDE == 1 ]]; then
+    INNER_ARGS+=(--override-window)
+  fi
   systemd-run --unit="$DEPLOY_UNIT" --wait --collect --quiet -p OOMPolicy=continue \
     -p "StandardOutput=append:$DEPLOY_LOG" -p "StandardError=append:$DEPLOY_LOG" \
     "${ENVS[@]}" "$SELF" "${INNER_ARGS[@]}" >&2 || true
@@ -352,6 +371,9 @@ if ! flock -n 8; then
   finish 3 "not deployed: another deploy is running"
 fi
 say "deploying $SHA, invocation $INVOCATION_ID, at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ $OVERRIDE == 1 ]]; then
+  say "--override-window was given, so the window's refusal will not stop this deploy"
+fi
 
 # Read once and kept, because the restart below removes it. Anything but a sha reads as
 # absent, which owes a restart.
@@ -429,7 +451,11 @@ if [[ $LINES != 2 || -z "$WINDOW_LINE" || ! "$NEXT_SPAN_START" =~ $EPOCH_RE ]]; 
 fi
 # The window's line reaches a public log, so only its own shape passes.
 WINDOW_LINE_RE='^a deploy may start next at [A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Z]{3,4}, because [a-z0-9 ]+$'
-if [[ $WINDOW_RC == 3 ]]; then
+# The override skips only the refusal. The window's next_span_start still bounds the
+# restart, and inside a span it names the span after, so the restart can still run.
+if [[ $WINDOW_RC == 3 && $OVERRIDE == 1 ]]; then
+  say "the window refuses a deploy now, and --override-window skips that refusal"
+elif [[ $WINDOW_RC == 3 ]]; then
   if [[ ! "$WINDOW_LINE" =~ $WINDOW_LINE_RE ]]; then
     finish 3 "not deployed: the window refuses a deploy now, see deploy.log"
   fi

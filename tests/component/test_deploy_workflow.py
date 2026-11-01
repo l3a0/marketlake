@@ -12,6 +12,9 @@ shows up first on ``main``. These run in ``ci.yml``'s required ``test`` job inst
    Running both steps' scripts shows what each does.
 4. The credentials step keeps the account id masked and asks for the session the role
    allows.
+5. The ``override_window`` dispatch input is a boolean that is off by default, and reaches
+   ``send-deploy.sh`` only through ``env:`` (#987). A push has no inputs, so it reaches
+   the script empty there.
 
 The rest checks the workflow against the two configurations, since each one's own tests
 see only itself. The document name in the workflow's ``env:`` is the one ``infra/live``
@@ -72,7 +75,19 @@ def test_the_workflow_runs_on_a_push_to_main_and_on_dispatch() -> None:
     triggers = _workflow()[True]
     assert set(triggers) == {"push", "workflow_dispatch"}
     assert triggers["push"] == {"branches": ["main"]}
-    assert not triggers["workflow_dispatch"]
+    assert set(triggers["workflow_dispatch"]) == {"inputs"}
+
+
+def test_the_override_is_a_boolean_off_by_default_read_only_by_the_send() -> None:
+    inputs = _workflow()[True]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"override_window"}
+    assert inputs["override_window"]["type"] == "boolean"
+    assert inputs["override_window"]["default"] is False
+    # The push trigger takes no inputs, so only a run started by hand can set it.
+    assert set(_workflow()[True]["push"]) == {"branches"}
+    readers = [step for step in _job()["steps"] if "inputs." in str(step)]
+    assert readers == [_job()["steps"][-1]]
+    assert readers[0]["env"] == {"DEPLOY_OVERRIDE_WINDOW": "${{ inputs.override_window }}"}
 
 
 def test_the_job_runs_only_on_a_push_or_a_dispatch_on_main() -> None:
@@ -140,7 +155,9 @@ def test_no_script_interpolates_an_expression() -> None:
 def test_the_last_step_runs_send_deploy() -> None:
     last = _job()["steps"][-1]
     assert last["run"].strip() == "deploy/send-deploy.sh"
-    assert "env" not in last, "the document and the tag come from the workflow's env: alone"
+    # The document and the tag come from the workflow's env: alone, and the step adds only
+    # the override.
+    assert set(last["env"]) == {"DEPLOY_OVERRIDE_WINDOW"}
 
 
 def test_send_deploy_is_tracked_executable() -> None:
