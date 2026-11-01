@@ -190,8 +190,11 @@ def test_a_vintage_lands_and_reads_back_through_load_bars(tmp_path):
     assert table.column("low").to_pylist() == [62.65, 61.3, 64.07]
     assert table.column("open").to_pylist() == [63.15, 61.8, 64.57]
     assert table.column("volume").to_pylist() == [None, None, None]
-    assert table.column("origin").to_pylist() == [ORIGIN_IMPORTED] * 3
-    assert table.column("basis").to_pylist() == [BASIS_ADJUSTED] * 3
+    # Literals rather than the loader's constants, which the writer and the reader share.
+    assert table.column("origin").to_pylist() == ["imported"] * 3
+    assert table.column("basis").to_pylist() == ["adjusted"] * 3
+    # The ticker's current instrument, the first and only one ``_lake`` registered.
+    assert table.column("instrument_id").to_pylist() == [1, 1, 1]
     assert table.column("source").to_pylist() == ["test:gld.csv"] * 3
     assert table.column("source_as_of").to_pylist() == ["2012-04-10"] * 3
     # Eastern midnight as a UTC instant: 04:00Z under daylight time, 05:00Z under standard time.
@@ -210,9 +213,10 @@ def test_a_vintage_lands_and_reads_back_through_load_bars(tmp_path):
 
 
 def test_a_session_the_file_lacks_is_counted_and_not_refused(tmp_path):
-    """Catches a missing session refused, or not counted. 2006-04-25 is the session missing."""
+    """Friday 2006-04-21 to Tuesday 2006-04-25, with Monday the one session missing. Catches a
+    missing session refused, not counted, or a weekend day counted as one."""
     root = _lake(tmp_path)
-    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-24", 60.0), ("2006-04-26", 61.0)])
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-21", 60.0), ("2006-04-25", 61.0)])
 
     summary = _run(root, [source], _listed((source, "GLD")))
 
@@ -406,11 +410,16 @@ def test_a_leftover_temp_file_is_removed_and_the_key_lands(tmp_path):
     target.parent.mkdir(parents=True)
     temp = target.with_name(target.name + ".tmp-4242")
     temp.write_bytes(b"torn")
+    # A leftover beside a key this source does not hold, which is evidence for the scrub, not
+    # this import's to remove.
+    other = target.with_name("date=2006-04-27.parquet.tmp-4242")
+    other.write_bytes(b"not mine")
 
     summary = _run(root, [source], _listed((source, "GLD")))
 
     assert not temp.exists()
-    assert _bars_files(root) == [_rel("GLD", "2006-04-26")]
+    assert other.read_bytes() == b"not mine"
+    assert _bars_files(root) == [_rel("GLD", "2006-04-26"), other.relative_to(root).as_posix()]
     assert summary.tickers[0].temps_removed == [temp.relative_to(root).as_posix()]
 
 
@@ -437,7 +446,7 @@ def test_a_run_killed_before_its_append_is_completed_by_the_rerun(tmp_path, monk
 
     summary = _run(root, [source], vintages)
 
-    assert summary.tickers[0].landed == 2
+    assert (summary.tickers[0].landed, summary.tickers[0].replaced) == (2, 2)
     latest = latest_entries(root)
     for rel in _bars_files(root):
         assert latest[rel]["sha256"] == sha256_file(root / rel)
@@ -511,6 +520,155 @@ def test_an_instrument_with_no_span_refuses(tmp_path):
     assert _bars_files(root) == []
 
 
+def test_an_unrecorded_file_another_writer_left_refuses(tmp_path):
+    """A file at an import key with no manifest entry and no provenance, which reads as captured.
+    Catches the rerun's repair overwriting a file it cannot show is this import's own."""
+    root = _lake(tmp_path)
+    foreign = write_bars(root, "GLD", "1d", "2006-04-26", [9.0], instrument_id=1)
+    before = foreign.read_bytes()
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0)])
+
+    message = _refused(root, [source], _listed((source, "GLD")))
+
+    assert _rel("GLD", "2006-04-26") in message and "unrecorded" in message
+    assert foreign.read_bytes() == before
+
+
+def test_a_torn_unrecorded_file_is_replaced(tmp_path):
+    """A file no reader can parse is what a torn write leaves, so the rerun replaces it."""
+    root = _lake(tmp_path)
+    target = LakePaths(root).bars_partition_path("GLD", "1d", "2006-04-26")
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"torn")
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0)])
+
+    summary = _run(root, [source], _listed((source, "GLD")))
+
+    assert (summary.tickers[0].landed, summary.tickers[0].replaced) == (1, 1)
+    assert load_bars("GLD", "1d", lake_root=root).column("close").to_pylist() == [2.0]
+
+
+def test_two_sources_naming_one_ticker_refuse(tmp_path):
+    """Catches the second source overwriting the first before either is recorded."""
+    root = _lake(tmp_path)
+    first = _csv(tmp_path / "src" / "a.csv", [("2006-04-26", 1.0)])
+    second = _csv(tmp_path / "src" / "b.csv", [("2006-04-26", 2.0)])
+
+    message = _refused(root, [first, second], _listed((first, "GLD"), (second, "GLD")))
+
+    assert "two sources name GLD" in message
+    assert _bars_files(root) == []
+
+
+def test_a_mid_session_onboard_makes_that_session_capture_covered(tmp_path):
+    """An onboard at 13:07 Wednesday covers Wednesday, whose window ends at its 16:00 close.
+    Catches the bound read against the session's open rather than its close, which would admit
+    a session capture's walk lands."""
+    root = _lake(tmp_path, onboard=datetime(2026, 8, 26, 13, 7, tzinfo=MARKET_TZ))
+    wednesday = _csv(tmp_path / "src" / "wed.csv", [("2026-08-26", 1.0)])
+    tuesday = _csv(tmp_path / "src" / "tue.csv", [("2026-08-25", 1.0)])
+    vintages = _listed((wednesday, "GLD"), (tuesday, "GLD"))
+
+    assert "2026-08-26" in _refused(root, [wednesday], vintages)
+    _run(root, [tuesday], vintages)
+    assert _bars_files(root) == [_rel("GLD", "2026-08-25")]
+
+
+def test_a_span_that_covers_no_session_sets_no_bound(tmp_path):
+    """Opened Friday 2026-08-21 after the close and closed Saturday, so capture covered nothing
+    then, and the ticker rejoins Wednesday evening. Catches a bound read from a span's start
+    rather than from the first session ``span_covers`` accepts."""
+    root = _lake(tmp_path, spans=False)
+    master = SecurityMaster.read(master_path(root))
+    (instrument,) = master.instrument_ids()
+    spans = CaptureSpans()
+    spans.open_span(instrument, datetime(2026, 8, 21, 21, 30, tzinfo=UTC), options=False)
+    spans.close_span(instrument, datetime(2026, 8, 22, 16, 0, tzinfo=UTC))
+    spans.open_span(instrument, EVENING_ONBOARD.astimezone(UTC), options=False)
+    spans.write(spans_path(root))
+    monday = _csv(tmp_path / "src" / "mon.csv", [("2026-08-24", 1.0), ("2026-08-26", 2.0)])
+
+    _run(root, [monday], _listed((monday, "GLD")))
+
+    assert _bars_files(root) == [_rel("GLD", "2026-08-24"), _rel("GLD", "2026-08-26")]
+
+
+def test_a_span_covering_no_instant_sets_no_bound(tmp_path):
+    """A ``[t, t)`` span on Monday 10:00, then the evening onboard's span. Catches the empty span
+    read as covering Monday, which would refuse Tuesday."""
+    root = _lake(tmp_path, spans=False)
+    master = SecurityMaster.read(master_path(root))
+    (instrument,) = master.instrument_ids()
+    empty = datetime(2026, 8, 24, 14, 0, tzinfo=UTC)
+    spans = CaptureSpans()
+    spans.open_span(instrument, empty, options=False)
+    spans.close_span(instrument, empty)
+    spans.open_span(instrument, EVENING_ONBOARD.astimezone(UTC), options=False)
+    spans.write(spans_path(root))
+    source = _csv(tmp_path / "src" / "gld.csv", [("2026-08-25", 1.0)])
+
+    _run(root, [source], _listed((source, "GLD")))
+
+    assert _bars_files(root) == [_rel("GLD", "2026-08-25")]
+
+
+def test_a_dry_run_reports_what_would_land_and_writes_nothing(tmp_path):
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-25", 1.0), ("2006-04-26", 2.0)])
+    before = _snapshot(root)
+
+    summary = import_vintages(
+        root,
+        [source],
+        clock=ManualClock(MONDAY_0745),
+        calendar=CALENDAR,
+        vintages=_listed((source, "GLD")),
+        dry_run=True,
+    )
+
+    assert _snapshot(root) == before
+    assert "GLD: dry run, would land 2 of 2 row(s)" in summary.render()
+    assert "Nothing was written" in summary.render()
+
+
+def test_a_dry_run_still_refuses_a_conflict(tmp_path):
+    """The conflicts are what the dry run exists to show before the write."""
+    root = _lake(tmp_path)
+    _manifest_bars(root, "GLD", "2006-04-26", source=SWEEP_SOURCE)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0)])
+    before = _snapshot(root)
+
+    with pytest.raises(BarImportRefused, match="captured bars"):
+        import_vintages(
+            root,
+            [source],
+            clock=ManualClock(MONDAY_0745),
+            calendar=CALENDAR,
+            vintages=_listed((source, "GLD")),
+            dry_run=True,
+        )
+    assert _snapshot(root) == before
+
+
+def test_the_command_builds_the_real_calendar_and_takes_a_dry_run(tmp_path, monkeypatch, capsys):
+    """``main`` with no calendar, as the VM runs it, on a lake onboarded at 08:00 on 2026-10-30
+    and a clock at 07:45 on Monday 2026-11-02. The dry run lands nothing, then the run lands."""
+    root = _lake(tmp_path, onboard=datetime(2026, 10, 30, 8, 0, tzinfo=MARKET_TZ))
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 2.0), ("2026-10-29", 3.0)])
+    monkeypatch.setattr(bar_import, "VINTAGES", _listed((source, "GLD")))
+    config = write_config(tmp_path, root)
+    clock = ManualClock(datetime(2026, 11, 2, 7, 45, tzinfo=MARKET_TZ))
+    argv = ["vintage", str(source), "--config", str(config)]
+
+    assert bar_import.main([*argv, "--dry-run"], clock=clock) == 0
+    assert _bars_files(root) == []
+    assert bar_import.main(argv, clock=clock) == 0
+
+    out = capsys.readouterr().out
+    assert "GLD: dry run, would land 2 of 2" in out and "GLD: landed 2 of 2" in out
+    assert _bars_files(root) == [_rel("GLD", "2006-04-26"), _rel("GLD", "2026-10-29")]
+
+
 # -- 6. the run guards -------------------------------------------------------------------
 
 
@@ -547,17 +705,23 @@ def test_the_bound_is_checked_again_once_the_lock_is_taken(tmp_path, monkeypatch
             yield
 
     monkeypatch.setattr(bar_import, "lake_lock", slow_lock)
+    target = LakePaths(root).bars_partition_path("GLD", "1d", "2006-04-26")
+    target.parent.mkdir(parents=True)
+    temp = target.with_name(target.name + ".tmp-4242")
+    temp.write_bytes(b"torn")
 
     assert "next session" in _refused(root, [source], _listed((source, "GLD")), now=clock)
-    assert _bars_files(root) == []
+    # The leftover survives, so the refusal came before the repairs, not at the first write.
+    assert temp.read_bytes() == b"torn"
+    assert _bars_files(root) == [temp.relative_to(root).as_posix()]
 
 
-def test_the_bound_is_checked_again_before_each_tickers_append(tmp_path, monkeypatch):
-    """The bound passes while the first ticker's files are written. Catches a check made only
-    once, under the lock, which would let a long run hold capture out."""
-    root = _lake(tmp_path, ("GLD", "USO"))
-    gld = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 63.0)])
-    uso = _csv(tmp_path / "src" / "uso.csv", [("2006-04-26", 70.0)], ticker="USO")
+def test_a_stop_part_way_through_a_ticker_records_what_it_wrote(tmp_path, monkeypatch):
+    """The bound passes after the first of GLD's two writes. Catches a window checked only once
+    per ticker, which would hold capture out, and a stop that leaves the written file with no
+    manifest entry for the scrub to page on."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-25", 1.0), ("2006-04-26", 2.0)])
     clock = ManualClock(MONDAY_0745)
     real = bars._write_partition
 
@@ -568,10 +732,78 @@ def test_the_bound_is_checked_again_before_each_tickers_append(tmp_path, monkeyp
 
     monkeypatch.setattr(bars, "_write_partition", slow_write)
 
-    message = _refused(root, [gld, uso], _listed((gld, "GLD"), (uso, "USO")), now=clock)
+    message = _refused(root, [source], _listed((source, "GLD")), now=clock)
 
     assert "next session" in message
-    assert not any(rel.startswith("bars/") for rel in latest_entries(root))
+    assert "1 partition(s) were recorded before this stop, and a rerun picks up the rest" in message
+    assert _bars_files(root) == [_rel("GLD", "2006-04-25")]
+    assert [rel for rel in latest_entries(root) if rel.startswith("bars/")] == _bars_files(root)
+
+
+def test_the_bound_is_checked_before_the_next_tickers_writes(tmp_path, monkeypatch):
+    """The bound passes as GLD's append lands. Catches a run that goes on to write USO."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    gld = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 63.0)])
+    uso = _csv(tmp_path / "src" / "uso.csv", [("2006-04-26", 70.0)], ticker="USO")
+    clock = ManualClock(MONDAY_0745)
+    real = bar_import.append_entries
+
+    def late_append(lake_root, entries, **kwargs):
+        appended = real(lake_root, entries, **kwargs)
+        clock.set(MONDAY_BOUND)
+        return appended
+
+    monkeypatch.setattr(bar_import, "append_entries", late_append)
+
+    message = _refused(root, [gld, uso], _listed((gld, "GLD"), (uso, "USO")), now=clock)
+
+    assert "next session" in message and "1 partition(s) were recorded" in message
+    assert _bars_files(root) == [_rel("GLD", "2006-04-26")]
+
+
+def test_a_failed_write_records_what_landed_before_it(tmp_path, monkeypatch):
+    """Catches a write failure that leaves the earlier files of the ticker unrecorded."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-25", 1.0), ("2006-04-26", 2.0)])
+    real = bars._write_partition
+    calls = []
+
+    def failing_write(rows, partition, **kwargs):
+        calls.append(partition)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        return real(rows, partition, **kwargs)
+
+    monkeypatch.setattr(bars, "_write_partition", failing_write)
+
+    message = _refused(root, [source], _listed((source, "GLD")))
+
+    assert "No space left on device" in message and "1 partition(s) were recorded" in message
+    assert _bars_files(root) == [_rel("GLD", "2006-04-25")]
+    assert [rel for rel in latest_entries(root) if rel.startswith("bars/")] == _bars_files(root)
+
+
+def test_the_directories_are_flushed_before_the_manifest_names_the_files(tmp_path, monkeypatch):
+    """Catches the flush dropped, which a power loss would turn into manifested missing files."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+    events: list[str] = []
+    real_fsync, real_append = bar_import._fsync_path, bar_import.append_entries
+
+    def fsync(path):
+        events.append(Path(path).relative_to(root).as_posix())
+        real_fsync(path)
+
+    def append(lake_root, entries, **kwargs):
+        events.append("append")
+        return real_append(lake_root, entries, **kwargs)
+
+    monkeypatch.setattr(bar_import, "_fsync_path", fsync)
+    monkeypatch.setattr(bar_import, "append_entries", append)
+
+    _run(root, [source], _listed((source, "GLD")))
+
+    assert events == ["bars/ticker=GLD/freq=1d", "bars/ticker=GLD", "bars", "append"]
 
 
 def test_a_lake_root_with_no_manifest_refuses(tmp_path):
@@ -678,7 +910,7 @@ def test_every_imported_key_reads_back_imported(tmp_path, monkeypatch):
     ]
     for rel, entry in imported.items():
         provenance = read_provenance(pq.read_schema(root / rel).metadata)
-        assert provenance.origin == ORIGIN_IMPORTED
+        assert provenance.origin == "imported"
         assert f"bar-import:{provenance.source_id}" == entry["source"]
         assert entry["rows"] == 1
     assert calls == [

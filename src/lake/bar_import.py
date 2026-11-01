@@ -4,7 +4,8 @@ l3a0/ithildin-runtime backtests on quantitative-trading's GLD and USO vintages, 
 ruled on 2026-10-29 that marketlake stores every source the runtime reads and serves it through
 ``load_bars`` (marketlake #938). ``docs/design.md`` carries that ruling and what it protects.
 This module is the import path, and ``vintage`` is its first subcommand. #951's import of
-Schwab's earlier sessions adds the second.
+Schwab's earlier sessions adds the second, by building a ``_Plan`` per ticker and handing it to
+``_land``, which holds every rule that does not depend on the source.
 
 **Where an import lands.** At the captured path, ``bars/ticker=T/freq=1d/date=D.parquet``, so
 ``load_bars``, the nightly upload, the trim and both restores handle it with no new path. Each
@@ -14,7 +15,7 @@ stamps of the fetch, ``fetch_ts``, ``fetch_end_ts``, ``window_start``, ``window_
 ``extended_hours``, are null, since no fetch happened, and no reader of a bars partition uses
 them. ``volume`` is left out, so it is null, because the vintages' volume unit is unverified and
 an import is write-once. ``bar_ts`` is the session's Eastern midnight, by
-``bars.session_midnight``. ``bars._write_partition`` writes each file with the vintage's
+``bars.session_midnight``. ``bars._write_partition`` writes each file with the source's
 ``Provenance``, which ``load_bars`` reads back as the ``origin``, ``basis``, ``source`` and
 ``source_as_of`` columns.
 
@@ -34,13 +35,14 @@ nothing and pass a different source in silence. The import instant goes in the e
 
 1. The run window. Capture waits on ``lake_lock`` with no timeout, so nothing runs inside a
    session or its pre-open margin, and the Sunday scrub takes no lock, so nothing runs while it
-   may be reading. ``bucket._run_window_refusal`` is shared with the range restore, and it is
-   checked again after the lock is taken and before each ticker's writes and its manifest
-   append.
+   may be reading. ``bucket._run_window_refusal`` is shared with the range restore. It is
+   checked before anything is read, again once the lock is taken, and again before every
+   partition is written.
 2. The lake root holds ``manifest.jsonl``, since ``lake_lock`` would create one under a wrong
    ``lake_root``, and no source file sits inside it, where the scrub reads it as an orphan and
    the nightly upload sends it to the bucket.
-3. Each source's SHA-256 is one ``VINTAGES`` lists, which names its ticker.
+3. Each source's SHA-256 is one ``VINTAGES`` lists, which names its ticker, and no two sources
+   name one ticker.
 4. The file is read by column name, because the vintages' order is ``Close,High,Low,Open``.
    Its ``Ticker`` row must name the listed ticker. A duplicate date and a date the exchange did
    not trade both refuse. A session the calendar names and the file lacks is counted, not
@@ -48,20 +50,28 @@ nothing and pass a different source in silence. The import instant goes in the e
    20 years before today and raises ``DateOutOfBounds`` before that, and about 130 of each
    vintage's rows already fall there.
 5. No date on or after the ticker's first capture span session. That is the first session
-   whose equity close falls after the earliest span of any instrument the ticker has named,
+   ``bars.span_covers`` accepts for any span of any instrument the ticker has named, which is
    ``bars._span_sessions``' rule without its ceiling of today's close. A key landed for such a
    session would be manifested before capture's bar, and the backfill's manifested skip would
    never fetch the captured one.
 6. Under the lock, a key the manifest records under this import's identity is skipped and
    counted, and a key it records under any other source refuses the whole run, because nothing
-   replaces an import or a captured bar.
+   replaces an import or a captured bar. So does an unrecorded file at a key whose metadata
+   names another source or none, since only this import's own killed run leaves one it may
+   replace.
 
-**A killed run is repaired by the rerun.** A kill can leave a ``<key>.tmp-<pid>`` file, or a
-renamed file with no manifest entry, and the Sunday scrub pages on both. Under the lock the
-rerun removes leftover temps beside this import's keys and overwrites an unrecorded file at a
-key it writes, as the range restore's step 2 does. Each ticker's entries land in one
-``manifest.append_entries`` call after the directories are flushed, rather than one append per
-partition, which would re-read the whole manifest each time.
+**A stop leaves nothing unrecorded.** A refusal or a write failure part-way through a ticker
+records the partitions it already renamed into place, in one manifest append, and then says
+how many. Only a kill leaves a ``<key>.tmp-<pid>`` file, or a renamed file with no manifest
+entry, and the Sunday scrub pages on both until a rerun repairs them. Under the lock the rerun
+removes leftover temps beside this import's keys and overwrites an unrecorded file at a key it
+writes when that file carries this import's identity, or cannot be read, which a torn write
+leaves. Each ticker's entries land in one ``manifest.append_entries`` call after the directories
+are flushed, rather than one append per partition, which would re-read the whole manifest each
+time.
+
+**A dry run** checks every rule, the conflicts included, reads the manifest without the lock,
+and writes nothing. An import cannot be undone by any command, so the runbook runs it first.
 
 **Only the primary runs it.** The laptop's role holds no ``s3:PutObject`` since #638, so an
 import there never reaches the bucket, and its next resync would refuse on it. The next
@@ -77,17 +87,19 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 from lake import bars, outbox
 from lake.actions import MasterAbsent, read_master
-from lake.bars import SpansAbsent, read_capture_spans, session_midnight
+from lake.bars import SpansAbsent, read_capture_spans, session_midnight, span_covers
 from lake.bucket import (
+    RunWindowWords,
     _fsync_path,
     _refuse_inside_lake_root,
     _run_window_refusal,
@@ -97,24 +109,28 @@ from lake.capture_spans import CaptureSpans, CaptureSpansError
 from lake.clock import Clock
 from lake.config import input_errors_exit, load_config
 from lake.journal import bars_rows
-from lake.loader import BASIS_ADJUSTED, ORIGIN_IMPORTED, Provenance
+from lake.loader import BASIS_ADJUSTED, ORIGIN_IMPORTED, Provenance, read_provenance
 from lake.lock import lake_lock
-from lake.manifest import ManifestError, append_entries, latest_entries, manifest_path, sha256_file
-from lake.paths import DATE_PREFIX, TEMP_MARKER, LakePaths, parse_date_dir
+from lake.manifest import (
+    BAR_IMPORT_SOURCE_PREFIX,
+    ManifestError,
+    append_entries,
+    latest_entries,
+    manifest_path,
+    sha256_file,
+)
+from lake.paths import DATE_PREFIX, LakePaths, leftover_temps, parse_date_dir
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError
+from lake.session import SessionClock
 from lake.vendor import DAILY_FREQ
 
 COMMAND = "bar_import"
 
-# The prefix every import's manifest ``source`` starts with. ``bucket._plan_resync`` matches it
-# to refuse deleting an import only this lake records.
-BAR_IMPORT_SOURCE_PREFIX = "bar-import:"
-
 # The scheme ``Provenance.source_id`` carries before a source's hex digest.
 _SHA256_SCHEME = "sha256:"
 
-# How many days past a span's start the first session is looked for. A long weekend with a
-# holiday spans four days without one.
+# How many days past a span's start an open span's first session is looked for. A long weekend
+# with a holiday spans four days without one.
 _SESSION_LOOKAHEAD_DAYS = 10
 
 # The vintage's columns this import reads, by the header's name for each.
@@ -123,6 +139,15 @@ _PRICE_COLUMNS = {"open": "Open", "high": "High", "low": "Low", "close": "Close"
 SHADOW_REFUSAL = (
     "this host's role is shadow, and only the primary uploads to the bucket, so an import here "
     "would never reach it. Run it on the primary"
+)
+
+# The window the runbook runs the import in, which both run-window refusals send the operator
+# back to. The nightly stop powers the VM off in the evening, so the morning is the window.
+_RUN_WINDOW_WORDS = RunWindowWords(
+    job="the bar import",
+    in_flight="a partition in flight",
+    sunday_repair="Run it on a weekday between the VM's 07:30 ET start and 09:00 ET",
+    bound_repair="Run it on a weekday between the VM's 07:30 ET start and 09:00 ET",
 )
 
 
@@ -202,9 +227,14 @@ class _SourceBar:
     close: float
 
 
+
+
 @dataclass
 class TickerImport:
-    """What one source did to its ticker, for the line the command prints."""
+    """What one source did to its ticker, for the line the command prints.
+
+    On a dry run ``landed`` counts what the run would land, and the line says so.
+    """
 
     ticker: str
     source: str
@@ -214,8 +244,16 @@ class TickerImport:
     skipped: int = 0
     replaced: int = 0
     temps_removed: list[str] = field(default_factory=list)
+    dry_run: bool = False
 
     def render(self) -> str:
+        if self.dry_run:
+            return (
+                f"{self.ticker}: dry run, would land {self.landed} of {self.rows} row(s) from "
+                f"{self.source}, {self.skipped} already imported, {self.missing} session(s) the "
+                f"calendar names and the file lacks, {self.replaced} unrecorded file(s) from an "
+                "earlier run to replace. Nothing was written"
+            )
         return (
             f"{self.ticker}: landed {self.landed} of {self.rows} row(s) from {self.source}, "
             f"{self.skipped} already imported, {self.missing} session(s) the calendar names and "
@@ -236,10 +274,19 @@ class ImportSummary:
 
 @dataclass
 class _Plan:
-    vintage: Vintage
+    """One ticker's rows from one source, and everything ``_land`` needs to land them.
+
+    ``path`` is what a refusal names as the source. ``instrument_id`` and ``todo`` are filled
+    as the rules are decided.
+    """
+
+    ticker: str
+    provenance: Provenance
+    manifest_source: str
     path: Path
     bars: list[_SourceBar]
     report: TickerImport
+    instrument_id: int | None = None
     todo: list[_SourceBar] = field(default_factory=list)
 
 
@@ -335,20 +382,41 @@ def _missing_sessions(plan: _Plan, history: Calendar) -> int:
     return missing
 
 
+def _first_covered(span, sessions: SessionClock, calendar: Calendar) -> date | None:
+    """The first session ``span`` covers by ``bars.span_covers``, with no ceiling, or ``None``.
+
+    A closed span is searched to its end. An open one is searched ``_SESSION_LOOKAHEAD_DAYS``
+    past its start. A span covering no instant, ``[t, t)``, covers no session, as
+    ``bars._span_sessions`` reads it.
+    """
+    if span.end is not None and span.end <= span.start:
+        return None
+    day = span.start.astimezone(MARKET_TZ).date()
+    last = (
+        span.end.astimezone(MARKET_TZ).date()
+        if span.end is not None
+        else day + timedelta(days=_SESSION_LOOKAHEAD_DAYS)
+    )
+    while day <= last:
+        if calendar.is_session(day) and span_covers(span, sessions.bounds(day)):
+            return day
+        day += timedelta(days=1)
+    return None
+
+
 def _first_span_session(
     ticker: str,
     master: SecurityMaster,
     spans: CaptureSpans,
     *,
     today: date,
+    clock: Clock,
     calendar: Calendar,
 ) -> tuple[int, date]:
     """The ticker's current instrument and its first capture span session.
 
-    The first span session is the first calendar session whose equity close falls after the
-    earliest span of any instrument the ticker has named, because ``bars/`` paths are keyed by
-    ticker. A span covering no instant, ``[t, t)``, covers no session, as ``_span_sessions``
-    reads it.
+    The first span session is the earliest first session of any span of any instrument the
+    ticker has named, because ``bars/`` paths are keyed by ticker.
     """
     try:
         current = master.resolve(ticker, today, id_type=ID_TYPE_TICKER)
@@ -359,46 +427,198 @@ def _first_span_session(
             f"the security master resolves no instrument for {ticker} today, so it is not "
             f"onboarded and nothing was imported. Run python -m lake.onboard {ticker} first"
         )
-    starts = [
-        span.start
+    owned = [
+        span
         for instrument in sorted(master.instruments_named(ticker, ID_TYPE_TICKER))
         for span in spans.spans_of(instrument)
-        if span.end is None or span.end > span.start
     ]
-    if not starts:
+    if not owned:
         raise BarImportRefused(
             f"{ticker} has no capture span, so nothing says which sessions capture covers and "
             "nothing was imported. Run python -m lake.onboard, which opens one"
         )
-    start = min(starts)
-    day = start.astimezone(MARKET_TZ).date()
-    for _ in range(_SESSION_LOOKAHEAD_DAYS):
-        if calendar.is_session(day) and calendar.session_close(day) > start:
-            return current, day
-        day += timedelta(days=1)
-    raise BarImportRefused(
-        f"the calendar names no session in the {_SESSION_LOOKAHEAD_DAYS} days from {ticker}'s "
-        f"capture start {start.isoformat()}, so nothing was imported"
-    )
+    sessions = SessionClock(clock, calendar)
+    firsts = [first for span in owned if (first := _first_covered(span, sessions, calendar))]
+    if not firsts:
+        raise BarImportRefused(
+            f"no capture span of {ticker} covers a session the calendar names, so nothing says "
+            "which sessions capture covers and nothing was imported"
+        )
+    return current, min(firsts)
 
 
-def _remove_temps(directory: Path, names: set[str], root: Path) -> list[str]:
-    """Remove each temp file a write to one of ``names`` left in ``directory``.
+def _holder(rel: str, held: str) -> str:
+    if held.startswith(BAR_IMPORT_SOURCE_PREFIX):
+        return f"{rel} is already held by the import {held}"
+    return f"{rel} is already held by captured bars (manifest source {held!r})"
 
-    The directory is listed once rather than once per key, which ``bucket._leftover_temps``
-    does, because a vintage writes 1,500 keys into one directory.
+
+def _decide(root: Path, plans: Sequence[_Plan], latest: Mapping[str, Mapping]) -> None:
+    """Sort every key into skipped or to write, or refuse the whole run on the first conflict.
+
+    A key the manifest records under the plan's own identity is skipped. Any other recorded key
+    conflicts. An unrecorded file at a key is replaced only when its metadata names the plan's
+    own source identity, which a killed run of this import leaves, or when it cannot be read,
+    which a torn write leaves. Any other unrecorded file conflicts, because nothing says it is
+    this import's to replace.
     """
+    paths = LakePaths(root)
+    conflicts: list[str] = []
+    for plan in plans:
+        for bar in plan.bars:
+            target = paths.bars_partition_path(plan.ticker, DAILY_FREQ, bar.day)
+            rel = target.relative_to(root).as_posix()
+            entry = latest.get(rel)
+            if entry is not None:
+                held = str(entry.get("source"))
+                if held == plan.manifest_source:
+                    plan.report.skipped += 1
+                else:
+                    conflicts.append(_holder(rel, held))
+                continue
+            if target.exists():
+                try:
+                    found = read_provenance(pq.read_schema(target).metadata, partition=rel)
+                except (OSError, ValueError):
+                    found = None
+                except Exception as exc:  # noqa: BLE001 - a malformed key is someone else's file
+                    conflicts.append(f"{rel} is an unrecorded file this import cannot read ({exc})")
+                    continue
+                if found is not None and found.source_id != plan.provenance.source_id:
+                    owner = found.source_id or "no source, so it reads as captured"
+                    conflicts.append(f"{rel} is an unrecorded file whose metadata names {owner}")
+                    continue
+                plan.report.replaced += 1
+            plan.todo.append(bar)
+    if conflicts:
+        offered = ", ".join(sorted({plan.manifest_source for plan in plans}))
+        raise BarImportRefused(
+            f"{conflicts[0]}, and this run offers {offered}. {len(conflicts)} key(s) conflict, "
+            "nothing was written, and no command replaces an import or a captured bar"
+        )
+
+
+def _land(
+    root: Path,
+    plans: Sequence[_Plan],
+    *,
+    clock: Clock,
+    calendar: Calendar,
+    dry_run: bool = False,
+) -> ImportSummary:
+    """Decide every key under the lock and land each plan's new partitions.
+
+    The run window is checked once the lock is taken and before every partition is written. A
+    stop part-way through a ticker, whether that check or a failed write, records the partitions
+    already renamed into place in one append before it raises, so it leaves nothing for the
+    scrub to page on. A dry run decides every key from an unlocked read and writes nothing.
+    """
+    summary = ImportSummary()
+    recorded = 0
+
+    def window() -> str | None:
+        return _run_window_refusal(
+            clock.now(), clock=clock, calendar=calendar, words=_RUN_WINDOW_WORDS
+        )
+
+    def refuse(why: str) -> BarImportRefused:
+        if not recorded:
+            return BarImportRefused(f"{why}. Nothing was written")
+        return BarImportRefused(
+            f"{why}. {recorded} partition(s) were recorded before this stop, and a rerun picks up "
+            "the rest"
+        )
+
+    if dry_run:
+        try:
+            _decide(root, plans, latest_entries(root))
+        except ManifestError as exc:
+            raise BarImportRefused(f"{exc}, so nothing was imported") from None
+        for plan in plans:
+            plan.report.dry_run = True
+            plan.report.landed = len(plan.todo)
+            summary.tickers.append(plan.report)
+        return summary
+
+    paths = LakePaths(root)
     try:
-        entries = os.listdir(directory)
-    except FileNotFoundError:
-        return []
-    removed: list[str] = []
-    for entry in sorted(entries):
-        base, marker, _pid = entry.partition(TEMP_MARKER)
-        if marker and base in names:
-            (directory / entry).unlink()
-            removed.append((directory / entry).relative_to(root).as_posix())
-    return removed
+        with lake_lock(root):
+            why = window()
+            if why is not None:
+                raise refuse(why)
+            _decide(root, plans, latest_entries(root))
+            for plan in plans:
+                directory = paths.bars_partition_path(
+                    plan.ticker, DAILY_FREQ, plan.bars[0].day
+                ).parent
+                names = {
+                    paths.bars_partition_path(plan.ticker, DAILY_FREQ, bar.day).name
+                    for bar in plan.bars
+                }
+                for temp in leftover_temps(directory, names):
+                    temp.unlink()
+                    plan.report.temps_removed.append(temp.relative_to(root).as_posix())
+                summary.tickers.append(plan.report)
+                if not plan.todo:
+                    continue
+                entries: list[dict[str, object]] = []
+                stop: str | None = None
+                try:
+                    for bar in plan.todo:
+                        stop = window()
+                        if stop is not None:
+                            break
+                        target = paths.bars_partition_path(plan.ticker, DAILY_FREQ, bar.day)
+                        candle = {
+                            "datetime": int(session_midnight(bar.day).timestamp() * 1000),
+                            "open": bar.open,
+                            "high": bar.high,
+                            "low": bar.low,
+                            "close": bar.close,
+                        }
+                        rows = bars_rows(
+                            {"candles": [candle]},
+                            ticker=plan.ticker,
+                            freq=DAILY_FREQ,
+                            instrument_id=plan.instrument_id,
+                            fetch_ts=None,
+                            fetch_end_ts=None,
+                            window_start=None,
+                            window_end=None,
+                            extended_hours=None,
+                        )
+                        bars._write_partition(rows, target, provenance=plan.provenance)
+                        entries.append(
+                            {
+                                "partition": target.relative_to(root).as_posix(),
+                                "source": plan.manifest_source,
+                                "sha256": None,
+                                "rows": len(rows),
+                                "fetched_at": clock.now().astimezone(MARKET_TZ).isoformat(),
+                            }
+                        )
+                finally:
+                    if entries:
+                        # A first import creates ``bars/ticker=T/`` and ``freq=1d/``, so each
+                        # directory and the parent that names it are flushed before the manifest
+                        # names the files.
+                        for flushed in (directory, directory.parent, directory.parent.parent):
+                            _fsync_path(flushed)
+                        append_entries(root, entries)
+                        recorded += len(entries)
+                        plan.report.landed = len(entries)
+                if stop is not None:
+                    raise refuse(stop)
+    except BarImportRefused:
+        raise
+    except ManifestError as exc:
+        raise refuse(f"{exc}, so the bar import stopped") from None
+    except OSError as exc:
+        raise refuse(
+            f"writing the import under {root} failed ({type(exc).__name__}: "
+            f"{exc.strerror or exc}). Fix that and run the bar import again"
+        ) from None
+    return summary
 
 
 def import_vintages(
@@ -409,33 +629,21 @@ def import_vintages(
     calendar: Calendar,
     history: Calendar | None = None,
     vintages: Mapping[str, Vintage] | None = None,
+    dry_run: bool = False,
 ) -> ImportSummary:
     """Import each listed vintage in ``sources`` into ``lake_root``'s bars surface.
 
     ``calendar`` places the run window and the first capture span session. ``history`` judges
     the sources' dates and defaults to the exchange calendar built from the earliest of them.
-    ``vintages`` defaults to ``VINTAGES``. The module docstring gives the rules in order.
+    ``vintages`` defaults to ``VINTAGES``. ``dry_run`` checks every rule and writes nothing. The
+    module docstring gives the rules in order.
     """
     root = Path(lake_root)
     listed = VINTAGES if vintages is None else vintages
-    summary = ImportSummary()
-    recorded = 0
-    written = 0
 
-    def refuse(why: str) -> BarImportRefused:
-        if not written:
-            return BarImportRefused(why)
-        return BarImportRefused(
-            f"{why}. {recorded} partition(s) were recorded before this stop, and a rerun picks up "
-            "the rest"
-        )
-
-    def guard() -> None:
-        why = _run_window_refusal(clock.now(), clock=clock, calendar=calendar, job="the bar import")
-        if why is not None:
-            raise refuse(f"{why}, and nothing more was written" if written else why)
-
-    guard()
+    why = _run_window_refusal(clock.now(), clock=clock, calendar=calendar, words=_RUN_WINDOW_WORDS)
+    if why is not None:
+        raise BarImportRefused(f"{why}. Nothing was written")
     if not manifest_path(root).is_file():
         raise BarImportRefused(
             f"lake_root {root} holds no manifest.jsonl, so it may name the wrong directory and "
@@ -468,7 +676,7 @@ def import_vintages(
                 f"{path} has SHA-256 {digest}, which is no vintage this module lists, so nothing "
                 "was imported. Fetch the file at the commit the list names"
             )
-        if any(plan.vintage.ticker == vintage.ticker for plan in plans):
+        if any(plan.ticker == vintage.ticker for plan in plans):
             raise BarImportRefused(
                 f"two sources name {vintage.ticker}, and one partition per ticker-day means the "
                 "first source imported holds each day, so nothing was imported"
@@ -476,7 +684,9 @@ def import_vintages(
         rows = _read_source(path, vintage)
         plans.append(
             _Plan(
-                vintage=vintage,
+                ticker=vintage.ticker,
+                provenance=vintage.provenance,
+                manifest_source=vintage.manifest_source,
                 path=path,
                 bars=rows,
                 report=TickerImport(vintage.ticker, vintage.manifest_source, len(rows)),
@@ -494,17 +704,14 @@ def import_vintages(
             f"({type(exc).__name__}), so nothing was imported"
         ) from None
     today = clock.now().astimezone(MARKET_TZ).date()
-    instruments: dict[str, int] = {}
     for plan in plans:
-        ticker = plan.vintage.ticker
-        instrument, first = _first_span_session(
-            ticker, master, spans, today=today, calendar=calendar
+        plan.instrument_id, first = _first_span_session(
+            plan.ticker, master, spans, today=today, clock=clock, calendar=calendar
         )
-        instruments[ticker] = instrument
         late = [bar.day for bar in plan.bars if bar.day >= first]
         if late:
             raise BarImportRefused(
-                f"{plan.path} holds {min(late).isoformat()}, on or after {ticker}'s first "
+                f"{plan.path} holds {min(late).isoformat()}, on or after {plan.ticker}'s first "
                 f"capture span session {first.isoformat()}, which capture covers, so nothing "
                 "was imported"
             )
@@ -520,106 +727,7 @@ def import_vintages(
     for plan in plans:
         plan.report.missing = _missing_sessions(plan, history)
 
-    paths = LakePaths(root)
-    try:
-        with lake_lock(root):
-            guard()
-            latest = latest_entries(root)
-            conflicts: list[tuple[str, str, str]] = []
-            for plan in plans:
-                ticker = plan.vintage.ticker
-                for bar in plan.bars:
-                    rel = paths.bars_partition_path(ticker, DAILY_FREQ, bar.day)
-                    entry = latest.get(rel.relative_to(root).as_posix())
-                    if entry is None:
-                        plan.todo.append(bar)
-                    elif entry.get("source") == plan.vintage.manifest_source:
-                        plan.report.skipped += 1
-                    else:
-                        conflicts.append(
-                            (
-                                rel.relative_to(root).as_posix(),
-                                str(entry.get("source")),
-                                plan.vintage.manifest_source,
-                            )
-                        )
-            if conflicts:
-                rel, held, offered = conflicts[0]
-                holder = (
-                    f"the import {held}"
-                    if held.startswith(BAR_IMPORT_SOURCE_PREFIX)
-                    else f"captured bars (manifest source {held!r})"
-                )
-                raise BarImportRefused(
-                    f"{rel} is already held by {holder}, and this run offers {offered}. "
-                    f"{len(conflicts)} key(s) conflict, nothing was written, and no command "
-                    "replaces an import or a captured bar"
-                )
-
-            for plan in plans:
-                ticker = plan.vintage.ticker
-                directory = paths.bars_partition_path(ticker, DAILY_FREQ, plan.bars[0].day).parent
-                keys = {
-                    paths.bars_partition_path(ticker, DAILY_FREQ, bar.day).name for bar in plan.bars
-                }
-                plan.report.temps_removed = _remove_temps(directory, keys, root)
-                summary.tickers.append(plan.report)
-                if not plan.todo:
-                    continue
-                guard()
-                entries: list[dict[str, object]] = []
-                for bar in plan.todo:
-                    target = paths.bars_partition_path(ticker, DAILY_FREQ, bar.day)
-                    if target.exists():
-                        plan.report.replaced += 1
-                    candle = {
-                        "datetime": int(session_midnight(bar.day).timestamp() * 1000),
-                        "open": bar.open,
-                        "high": bar.high,
-                        "low": bar.low,
-                        "close": bar.close,
-                    }
-                    rows = bars_rows(
-                        {"candles": [candle]},
-                        ticker=ticker,
-                        freq=DAILY_FREQ,
-                        instrument_id=instruments[ticker],
-                        fetch_ts=None,
-                        fetch_end_ts=None,
-                        window_start=None,
-                        window_end=None,
-                        extended_hours=None,
-                    )
-                    written += bars._write_partition(
-                        rows, target, provenance=plan.vintage.provenance
-                    )
-                    entries.append(
-                        {
-                            "partition": target.relative_to(root).as_posix(),
-                            "source": plan.vintage.manifest_source,
-                            "sha256": None,
-                            "rows": len(rows),
-                            "fetched_at": clock.now().astimezone(MARKET_TZ).isoformat(),
-                        }
-                    )
-                # A first import creates ``bars/ticker=T/`` and ``freq=1d/``, so each directory
-                # and the parent that names it are flushed before the manifest names the files.
-                for flushed in (directory, directory.parent, directory.parent.parent):
-                    _fsync_path(flushed)
-                guard()
-                append_entries(root, entries)
-                recorded += len(entries)
-                plan.report.landed = len(entries)
-    except BarImportRefused:
-        raise
-    except ManifestError as exc:
-        raise refuse(f"{exc}, so the bar import stopped") from None
-    except OSError as exc:
-        raise refuse(
-            f"writing the import under {root} failed ({type(exc).__name__}: "
-            f"{exc.strerror or exc}). Fix that and run the bar import again"
-        ) from None
-    return summary
+    return _land(root, plans, clock=clock, calendar=calendar, dry_run=dry_run)
 
 
 def _source_file(value: str) -> Path:
@@ -647,6 +755,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CSV",
         help="A vintage CSV outside lake_root. Its SHA-256 names its ticker.",
     )
+    vintage.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check every rule, the conflicts included, and write nothing.",
+    )
     vintage.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     return parser
 
@@ -659,8 +772,9 @@ def main(
 ) -> int:
     """The ``python -m lake.bar_import`` entry. Returns a process exit code.
 
-    It exits 0 when every row is in the lake, a rerun of a finished import included, and 2 on a
-    refusal, with one line. A shadow host refuses before anything is read.
+    It exits 0 when every row is in the lake, a rerun of a finished import included, or when a
+    dry run found nothing to refuse, and 2 on a refusal, with one line. A shadow host refuses
+    before anything is read.
     """
     args = build_parser().parse_args(argv)
     with input_errors_exit(COMMAND, BarImportRefused):
@@ -680,6 +794,7 @@ def main(
             args.sources,
             clock=clock,
             calendar=calendar if calendar is not None else ExchangeCalendar(),
+            dry_run=args.dry_run,
         )
     for ticker in summary.tickers:
         print(f"{COMMAND}: {ticker.render()}")

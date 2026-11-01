@@ -175,6 +175,7 @@ from lake.journal import F_FULLFSYNC
 from lake.lock import lake_lock
 from lake.manifest import (
     _NAMED_PATHS,
+    BAR_IMPORT_SOURCE_PREFIX,
     SCRUB_EXCLUSIONS,
     BackupScrubResult,
     ManifestError,
@@ -198,12 +199,12 @@ from lake.paths import (
     MANIFEST_FILE,
     QUOTES,
     REPORTS_DIR,
-    TEMP_MARKER,
     TRIMMED_FILE,
     BarsRef,
     LakePaths,
     PartitionRef,
     is_reader_file,
+    leftover_temps,
     parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
@@ -3380,32 +3381,53 @@ def _surface_refusal(surface: str, command: str, accepted: frozenset[str]) -> st
     )
 
 
-# How the range restore names itself in a refusal it shares with another job.
-_RANGE_RESTORE = "the range restore"
+@dataclass(frozen=True)
+class RunWindowWords:
+    """How one job words the two refusals ``_run_window_refusal`` shares.
+
+    ``job`` names it, ``in_flight`` names what the scrub would find half-written, and each
+    repair says when to run it instead, which differs because the range restore runs in the
+    evening and the bar import in the morning.
+    """
+
+    job: str
+    in_flight: str
+    sunday_repair: str
+    bound_repair: str
 
 
-def _run_window_refusal(now: datetime, *, clock: Clock, calendar: Calendar, job: str) -> str | None:
-    """Why ``job`` may not hold the lake lock at ``now``, or ``None`` when it may.
+_RANGE_RESTORE_WORDS = RunWindowWords(
+    job="the range restore",
+    in_flight="a download in flight",
+    sunday_repair="Run it on another evening after the 18:30 sweep",
+    bound_repair="Run it after that session's 18:30 sweep",
+)
+
+
+def _run_window_refusal(
+    now: datetime, *, clock: Clock, calendar: Calendar, words: RunWindowWords
+) -> str | None:
+    """Why a job may not hold the lake lock at ``now``, or ``None`` when it may.
 
     Two windows refuse. The Sunday scrub window does, because the scrub takes no lock and a
     file in flight reads to it as an orphan. So does a ``now`` inside a session or its pre-open
     margin, by ``session_bound``, because capture waits on ``lake_lock`` with no timeout. The
     range restore and the bar import (marketlake #950) both check it before the lock and again
     after taking it, since a lock can be waited on past the bound. Each raises its own refusal
-    class on the text. ``resync`` keeps a twin of these two checks in its own closure.
+    class on the text, worded by its own ``words``. ``resync`` keeps a twin of these two checks
+    in its own closure, which marketlake #966 tracks.
     """
     if in_sunday_scrub_window(now):
         return (
-            f"{job} does not run on Sunday from 19:55 to 23:30, while the Sunday job may be "
-            "scrubbing the lake, since a file in flight reads to the scrub as an orphan. Run it "
-            "outside that window"
+            f"{words.job} does not run on Sunday from 19:55 to 23:30, while the Sunday job may be "
+            f"scrubbing the lake, since {words.in_flight} reads to the scrub as an orphan. "
+            f"{words.sunday_repair}"
         )
     bound = session_bound(now, clock=clock, calendar=calendar)
     if bound is not None and now >= bound:
         return (
-            f"{job} stops at {bound.isoformat()}, ahead of the next session's capture start, "
-            "because capture waits on the lake lock with no timeout. Run it after that "
-            "session's 18:30 sweep"
+            f"{words.job} stops at {bound.isoformat()}, ahead of the next session's capture "
+            f"start, because capture waits on the lake lock with no timeout. {words.bound_repair}"
         )
     return None
 
@@ -3499,15 +3521,10 @@ def _fsync_path(path: Path) -> None:
 def _leftover_temps(path: Path) -> list[Path]:
     """Every temp file an atomic write to ``path`` could have left beside it.
 
-    ``paths.temp_write_path`` names it ``<name>.tmp-<pid>``. The directory is listed rather than
-    globbed, because a ticker is free text to a glob and ``[`` in one would match other names.
+    ``paths.leftover_temps`` reads ``paths.temp_write_path``'s ``<name>.tmp-<pid>``, for this
+    one name. The bar import asks it about every key of a vintage at once (marketlake #950).
     """
-    prefix = f"{path.name}{TEMP_MARKER}"
-    try:
-        names = os.listdir(path.parent)
-    except FileNotFoundError:
-        return []
-    return [path.parent / name for name in sorted(names) if name.startswith(prefix)]
+    return leftover_temps(path.parent, {path.name})
 
 
 def restore_range(
@@ -3596,7 +3613,9 @@ def restore_range(
         return RangeRestoreRefused(f"{why}.{done}")
 
     def guard() -> None:
-        why = _run_window_refusal(clock.now(), clock=clock, calendar=calendar, job=_RANGE_RESTORE)
+        why = _run_window_refusal(
+            clock.now(), clock=clock, calendar=calendar, words=_RANGE_RESTORE_WORDS
+        )
         if why is not None:
             raise refuse(why)
 
@@ -4467,7 +4486,6 @@ def _plan_resync(
 
     It writes nothing. The steps are :func:`resync`'s 2 to 7, less the downloads.
     """
-    from lake.bar_import import BAR_IMPORT_SOURCE_PREFIX
     from lake.battery import SIGNOFF_SOURCE
     from lake.capture_spans import SPANS_PARTITION
     from lake.paths import BARS, QUARANTINE_FILE, parse_segment_rel

@@ -1931,6 +1931,17 @@ def read_capture_spans(lake_root: Path) -> CaptureSpans:
         raise SpansAbsent(path) from exc
 
 
+def span_covers(span: CaptureSpan, bounds: SessionBounds) -> bool:
+    """Whether ``span`` covers the session whose bounds are ``bounds``.
+
+    The session's window is ``[open, equity_close]`` and the span is half-open ``[start, end)``,
+    and they must intersect. :func:`_span_sessions` gives the reasons for that reading and calls
+    this, and so does ``lake.bar_import``'s bound (marketlake #950), so the walk and the import
+    never disagree about which session capture covers.
+    """
+    return bounds.equity_close > span.start and (span.end is None or bounds.open < span.end)
+
+
 def _span_sessions(
     span: CaptureSpan, session_clock: SessionClock, calendar: Calendar, now: datetime
 ) -> Iterator[date]:
@@ -1977,8 +1988,8 @@ def _span_sessions(
     so a guard added afterwards would leave the partition on disk.
 
     **The import's bound is this rule without its ceiling.** ``lake.bar_import`` refuses any
-    session on or after the first one whose window intersects a span, whether or not its close
-    has passed, so an import and this walk never name the same session (marketlake #950).
+    session on or after the first one :func:`span_covers` accepts, whether or not its close has
+    passed, so an import and this walk never name the same session (marketlake #950).
     """
     if span.end is not None and span.end <= span.start:
         return
@@ -1991,10 +2002,7 @@ def _span_sessions(
     while day <= last:
         if calendar.is_session(day):
             bounds = session_clock.bounds(day)
-            covered = bounds.equity_close > span.start and (
-                span.end is None or bounds.open < span.end
-            )
-            if covered and bounds.equity_close <= now:
+            if span_covers(span, bounds) and bounds.equity_close <= now:
                 yield day
         day += timedelta(days=1)
 
@@ -2603,6 +2611,7 @@ __all__ = [
     "plan_backfill",
     "select_session_rows",
     "session_midnight",
+    "span_covers",
     "session_of",
 ]
 

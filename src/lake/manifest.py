@@ -143,6 +143,12 @@ SCRUB_EXCLUSIONS: tuple[str, ...] = (
 # data-quality verdicts, and ``read_quarantine`` returns each entry as the opaque mapping
 # the writer appended. These two names are the one place that mapping is read for meaning,
 # so the battery, the sign-off tool and every reader resolve a verdict the same way.
+# The prefix every bars import's manifest ``source`` starts with, as
+# ``bar-import:sha256:<hex>``. ``lake.bar_import`` writes it, and ``bucket._plan_resync`` reads
+# it to refuse deleting an import only one lake records, since no sweep regenerates one
+# (marketlake #950). It lives here, below both, so ``bucket`` imports no hand-run command.
+BAR_IMPORT_SOURCE_PREFIX = "bar-import:"
+
 VERDICT_FIELD = "verdict"
 CLEAN_VERDICT = "clean"
 
