@@ -316,7 +316,7 @@ FAKE_VENV_PYTHON = (
   lake.roster) cat > "$STATE/stdin-roster"; exit "$(next_rc roster "${ROSTER_RCS:-}")" ;;
   lake.deploy_window)
     if [[ -n "${FAKE_WINDOW_BAD:-}" ]]; then echo "a deploy may start now"; exit 0; fi
-    echo "${FAKE_WINDOW_LINE:-a deploy may start now, and until Mon 2026-10-12 04:30 EDT}"
+    echo "${FAKE_WINDOW_LINE:-a deploy may start now, and until Mon 2026-10-12 06:30 EDT}"
     echo "next_span_start=${FAKE_NEXT_SPAN:-4102444800}"
     exit "${FAKE_WINDOW_RC:-0}" ;;
   lake.control_plane)

@@ -464,7 +464,7 @@ resource "aws_iam_role_policy" "apply" {
 # Trusted only in the `deploy` environment, which needs the owner's approval, and only
 # on `main`, like the apply role. .github/workflows/deploy.yml assumes it to ask the VM
 # to deploy one commit through the SSM document marketlake-deploy, and nothing else.
-# Its session lasts five hours, longer than the job's 240 minutes.
+# Its session lasts five hours, longer than the job's 120 minutes.
 resource "aws_iam_role" "deploy" {
   name                 = "marketlake-deploy"
   max_session_duration = 18000

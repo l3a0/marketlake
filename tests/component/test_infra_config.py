@@ -1180,12 +1180,15 @@ def test_bound_3_fails_a_grace_that_ends_while_a_stop_is_allowed(tmp_path: Path)
             _check_start("test", time(6, 0), _WEEKDAYS, short)
     hour = _script(tmp_path, "UPTIME_SECONDS=3600\n")
     assert _check_start("test", time(6, 0), _WEEKDAYS, hour) == 25
+    # A Sunday start at 17:00 with an hour's grace lets go at 18:00, which decide allows.
+    with pytest.raises(AssertionError, match=_BOUND_3_FAILS):
+        _check_start("test", time(17, 0), {6}, hour)
 
 
 def test_uptime_grace_reads_the_assignment_and_skips_the_reads() -> None:
-    """Bound 3 has hours of slack on both live starts, so no grace of zero or more turns it
-    red, and a wrong read would pass it. The read is checked here instead, on a value the
-    live script does not hold."""
+    """Bound 3 has an hour of slack on the weekday start and 90 minutes on Sunday's, so no
+    grace of zero or more turns it red, and a wrong read would pass it. The read is checked
+    here instead, on a value the live script does not hold."""
     script = (
         "#!/bin/bash\n"
         "# UPTIME_SECONDS=7200 in a comment sets nothing.\n"

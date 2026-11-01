@@ -72,8 +72,10 @@
 # back ends before that span opens. A test checks the sum against the window's margin.
 # The bootstrap's cap comes from a measurement (marketlake #986). The slowest bootstrap
 # the VM has run is its first boot, at 19 seconds, and no deploy's bootstrap has taken
-# more than about 17. The other caps bound a wait on something else, such as a lock, the
-# fetch or a busy job, so the bootstrap's time does not size them.
+# more than about 17. A bootstrap still retrying through an outage of SSM or the package
+# index is cut off at the cap and rolled back, where it once ran its retries out and exited
+# 4. The other caps bound a wait on something else, such as a lock, the fetch or a busy
+# job, so the bootstrap's time does not size them.
 #
 # Unlike the refusals of the other deploy/ scripts, every last line goes to stdout, the
 # usage error included, because the CI side reads the host's outcome from

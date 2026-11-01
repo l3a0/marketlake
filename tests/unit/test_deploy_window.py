@@ -242,6 +242,43 @@ def test_a_gap_of_exactly_the_margin_frees_the_earlier_end():
     assert dw.decide(et(SATURDAY, 23, 15), units, _no_window).code == dw.ALLOWED
 
 
+def test_a_span_inside_the_current_one_does_not_shorten_it():
+    """Saturday's assertion window runs to 03:00 Sunday, and Sunday's span, 00:30 to 01:15,
+    lies inside it, so a deploy may start only once Saturday's span ends."""
+    units = [
+        _job("late", cp.WallClockTime(22, 0), (5,)),
+        _job("early", cp.WallClockTime(1, 0), (6,)),
+    ]
+
+    def window(day: date) -> cp.AssertionWindow | None:
+        if day == SATURDAY:
+            return cp.AssertionWindow(et(SATURDAY, 21, 0), et(SUNDAY, 3, 0))
+        return None
+
+    verdict = dw.decide(et(SATURDAY, 23), units, window)
+    assert verdict.code == dw.REFUSED
+    assert "next at Sun 2026-10-11 03:00 EDT" in verdict.line
+
+
+def test_the_gap_between_spans_is_measured_in_real_minutes_when_the_clocks_fall_back():
+    """Saturday's span ends at 01:00 EDT and Sunday's starts at 02:00 EST. That is one hour
+    on the wall and two in real time, more than the margin, so Saturday's end frees a start."""
+    saturday = FALL_BACK - timedelta(1)
+    units = [
+        _job("late", cp.WallClockTime(23, 0), (5,)),
+        _job("dawn", cp.WallClockTime(2, 30), (6,)),
+    ]
+
+    def window(day: date) -> cp.AssertionWindow | None:
+        if day == saturday:
+            return cp.AssertionWindow(et(saturday, 22, 0), et(FALL_BACK, 1, 0, fold=0))
+        return None
+
+    verdict = dw.decide(et(saturday, 23), units, window)
+    assert verdict.code == dw.REFUSED
+    assert "next at Sun 2026-11-01 01:00 EDT" in verdict.line
+
+
 # -- the entry -------------------------------------------------------------------------
 
 

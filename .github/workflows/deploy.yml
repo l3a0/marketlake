@@ -109,7 +109,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
-          # The deploy role allows 18,000 seconds, longer than this job's 240 minutes.
+          # The deploy role allows 18,000 seconds, longer than this job's 120 minutes.
           role-duration-seconds: 18000
 
       - name: Ask the VM to deploy this commit
