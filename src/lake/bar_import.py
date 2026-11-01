@@ -71,7 +71,17 @@ are flushed, rather than one append per partition, which would re-read the whole
 time.
 
 **A dry run** checks every rule, the conflicts included, reads the manifest without the lock,
-and writes nothing. An import cannot be undone by any command, so the runbook runs it first.
+and writes nothing. The runbook runs it first.
+
+**An undo** (``undo``, by the owner's decision of 2026-11-01 on #950) works only until the
+import reaches the bucket. The runtime reads the bucket, so removing files on the VM alone would
+withdraw nothing from it, and once the nightly upload has sent an import no command withdraws
+it. So the undo refuses unless the manifest's last lines are exactly the import's entries, and
+the bucket's ``manifest.jsonl`` is absent or a byte prefix of the manifest cut back to before
+them, and the bucket lists none of the import's keys. Under the lock it re-reads the manifest,
+deletes the import's files and their leftover temps, flushes the directories, and only then cuts
+the manifest back in place with ``bucket._rewrite_manifest``, the resync's own rewrite. A crash
+between the two leaves manifested missing files, which a rerun finishes.
 
 **Only the primary runs it.** The laptop's role holds no ``s3:PutObject`` since #638, so an
 import there never reaches the bucket, and its next resync would refuse on it. The next
@@ -86,6 +96,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -96,13 +107,18 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from lake import bars, outbox
+from lake import bucket as _bucket
 from lake.actions import MasterAbsent, read_master
 from lake.bars import SpansAbsent, read_capture_spans, session_midnight, span_covers
 from lake.bucket import (
+    BucketTarget,
     RunWindowWords,
     _fsync_path,
     _refuse_inside_lake_root,
     _run_window_refusal,
+    connect,
+    list_bucket,
+    read_copy_state,
 )
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.capture_spans import CaptureSpans, CaptureSpansError
@@ -119,7 +135,7 @@ from lake.manifest import (
     manifest_path,
     sha256_file,
 )
-from lake.paths import DATE_PREFIX, LakePaths, leftover_temps, parse_date_dir
+from lake.paths import DATE_PREFIX, LakePaths, leftover_temps, parse_bars_rel, parse_date_dir
 from lake.security_master import ID_TYPE_TICKER, SecurityMaster, SecurityMasterError
 from lake.session import SessionClock
 from lake.vendor import DAILY_FREQ
@@ -728,6 +744,200 @@ def import_vintages(
     return _land(root, plans, clock=clock, calendar=calendar, dry_run=dry_run)
 
 
+@dataclass
+class UndoSummary:
+    """What one undo removed, for the line the command prints."""
+
+    lines: int = 0
+    partitions: int = 0
+    temps_removed: list[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        if not self.lines:
+            return "nothing to undo: the manifest records none of these imports"
+        return (
+            f"undid {self.lines} manifest line(s) and removed {self.partitions} partition(s) "
+            f"and {len(self.temps_removed)} leftover temp file(s)"
+        )
+
+
+def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str]]:
+    """Where the manifest's trailing run of these imports' entries starts, and their partitions.
+
+    Refuses a torn last line, a line that is not an entry, and an entry of these imports that
+    sits before an entry of anything else, which the cut would then take with it.
+    """
+    if raw and not raw.endswith(b"\n"):
+        raise BarImportRefused(
+            "manifest.jsonl ends in a torn line, so the undo cannot tell where the import starts "
+            "and nothing was undone"
+        )
+    offsets: list[int] = []
+    sources: list[str] = []
+    partitions: list[str] = []
+    at = 0
+    for number, line in enumerate(raw.split(b"\n")[:-1], start=1):
+        offsets.append(at)
+        at += len(line) + 1
+        try:
+            entry = json.loads(line)
+            sources.append(str(entry["source"]))
+            partitions.append(str(entry["partition"]))
+        except (ValueError, KeyError, TypeError):
+            raise BarImportRefused(
+                f"line {number} of manifest.jsonl is not a whole entry, so nothing was undone"
+            ) from None
+    start = len(sources)
+    while start > 0 and sources[start - 1] in identities:
+        start -= 1
+    earlier = [index for index in range(start) if sources[index] in identities]
+    if earlier:
+        raise BarImportRefused(
+            f"line {earlier[0] + 1} of manifest.jsonl records {partitions[earlier[0]]} for this "
+            "import, and something else was recorded after it, so cutting the manifest back "
+            "would take that too and nothing was undone. No command undoes an import once "
+            "anything else has been recorded after it"
+        )
+    tail = partitions[start:]
+    for rel in tail:
+        if parse_bars_rel(rel) is None:
+            raise BarImportRefused(
+                f"manifest.jsonl records {rel} under this import, which is not a bars "
+                "partition, so nothing was undone"
+            )
+    cut = offsets[start] if start < len(offsets) else len(raw)
+    return cut, tail
+
+
+def undo_vintages(
+    lake_root: Path | str,
+    sources: Sequence[Path],
+    *,
+    client: object,
+    target: BucketTarget,
+    clock: Clock,
+    calendar: Calendar,
+    vintages: Mapping[str, Vintage] | None = None,
+) -> UndoSummary:
+    """Undo the imports of the listed vintages in ``sources``, while the bucket holds none of it.
+
+    The module docstring gives the rule. ``client`` and ``target`` are the bucket's, read only.
+    """
+    root = Path(lake_root)
+    listed = VINTAGES if vintages is None else vintages
+
+    def window() -> str | None:
+        return _run_window_refusal(
+            clock.now(), clock=clock, calendar=calendar, words=_RUN_WINDOW_WORDS
+        )
+
+    why = window()
+    if why is not None:
+        raise BarImportRefused(f"{why}. Nothing was undone")
+    path = manifest_path(root)
+    if not path.is_file():
+        raise BarImportRefused(
+            f"lake_root {root} holds no manifest.jsonl, so it may name the wrong directory and "
+            "nothing was undone"
+        )
+    identities: set[str] = set()
+    for source in sources:
+        try:
+            digest = sha256_file(Path(source))
+        except OSError as exc:
+            raise BarImportRefused(
+                f"{source} cannot be read ({type(exc).__name__}), so nothing was undone"
+            ) from None
+        vintage = listed.get(digest)
+        if vintage is None:
+            raise BarImportRefused(
+                f"{source} has SHA-256 {digest}, which is no vintage this module lists, so "
+                "nothing was undone"
+            )
+        identities.add(vintage.manifest_source)
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise BarImportRefused(
+            f"{path} cannot be read ({type(exc).__name__}), so nothing was undone"
+        ) from None
+    cut, tail = _import_tail(raw, identities)
+    summary = UndoSummary()
+    if not tail:
+        return summary
+
+    # The bucket, read before the lock, because a request can take seconds and capture waits
+    # on the lock with no timeout. The manifest is re-read under the lock, so nothing that
+    # changed meanwhile is cut.
+    try:
+        copy = read_copy_state(client, target, raw[:cut])
+        listing = list_bucket(client, target)
+    except Exception as exc:  # noqa: BLE001 - any failure to read the bucket refuses
+        raise BarImportRefused(
+            f"the bucket could not be read ({type(exc).__name__}), so nothing says the import "
+            f"has not reached it and nothing was undone: {target}"
+        ) from None
+    if copy.present and not copy.is_prefix:
+        raise BarImportRefused(
+            "the bucket's manifest.jsonl is not a prefix of this lake's cut back to before the "
+            "import, so the nightly upload has sent the import, and no command withdraws an "
+            f"import from the bucket. Nothing was undone: {target}"
+        )
+    sent = sorted(rel for rel in tail if rel in listing)
+    if sent:
+        raise BarImportRefused(
+            f"the bucket already holds {sent[0]} and {len(sent) - 1} more of the import's "
+            f"partitions, so no command withdraws them from it. Nothing was undone: {target}"
+        )
+
+    try:
+        with lake_lock(root):
+            why = window()
+            if why is not None:
+                raise BarImportRefused(f"{why}. Nothing was undone")
+            if path.read_bytes() != raw:
+                raise BarImportRefused(
+                    "manifest.jsonl changed while the undo checked the bucket, so nothing was "
+                    "undone. Run the undo again"
+                )
+            directories: dict[Path, set[str]] = {}
+            for rel in tail:
+                partition = root / rel
+                directories.setdefault(partition.parent, set()).add(partition.name)
+                if partition.exists():
+                    partition.unlink()
+                    summary.partitions += 1
+            for directory, names in sorted(directories.items()):
+                for temp in leftover_temps(directory, names):
+                    temp.unlink()
+                    summary.temps_removed.append(temp.relative_to(root).as_posix())
+            flushed = {
+                parent
+                for directory in directories
+                for parent in (directory, directory.parent, directory.parent.parent)
+                if parent.is_dir()
+            }
+            for directory in sorted(flushed):
+                _fsync_path(directory)
+            try:
+                _bucket._rewrite_manifest(root, cut, b"", raw[:cut])
+            except _bucket.ResyncRefused:
+                raise BarImportRefused(
+                    f"{path} does not read back as the manifest cut back to before the import. "
+                    "Restore it from the bucket's copy before anything else writes"
+                ) from None
+            summary.lines = len(tail)
+    except BarImportRefused:
+        raise
+    except OSError as exc:
+        raise BarImportRefused(
+            f"undoing the import under {root} failed ({type(exc).__name__}: "
+            f"{exc.strerror or exc}). Run the undo again, which finishes what this one started"
+        ) from None
+    return summary
+
+
 def _source_file(value: str) -> Path:
     """An argparse ``type=`` hook: the path must name a file."""
     path = Path(value)
@@ -759,6 +969,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check every rule, the conflicts included, and write nothing.",
     )
     vintage.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
+    undo = commands.add_parser(
+        "undo",
+        help="Undo the imports of these vintages, while the bucket holds none of them.",
+    )
+    undo.add_argument(
+        "sources",
+        nargs="+",
+        type=_source_file,
+        metavar="CSV",
+        help="A vintage CSV the import read. Its SHA-256 names the import to undo.",
+    )
+    undo.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     return parser
 
 
@@ -770,12 +992,13 @@ def main(
 ) -> int:
     """The ``python -m lake.bar_import`` entry. Returns a process exit code.
 
-    It exits 0 when every row is in the lake, a rerun of a finished import included, or when a
-    dry run found nothing to refuse, and 2 on a refusal, with one line. A shadow host refuses
-    before anything is read.
+    It exits 0 when every row is in the lake, a rerun of a finished import included, when a
+    dry run found nothing to refuse, or when an undo finished or found nothing to undo, and 2
+    on a refusal, with one line. A shadow host refuses before anything is read. ``undo`` builds
+    the bucket's client from the config, which it only reads.
     """
     args = build_parser().parse_args(argv)
-    with input_errors_exit(COMMAND, BarImportRefused):
+    with input_errors_exit(COMMAND, BarImportRefused, _bucket.BucketRefusal):
         config = load_config(args.config)
         role, warning = outbox.role_of(config)
         if warning is not None:
@@ -787,11 +1010,24 @@ def main(
             from lake.clock import SystemClock
 
             clock = SystemClock()
+        calendar = calendar if calendar is not None else ExchangeCalendar()
+        if args.command == "undo":
+            target, client = connect(config)
+            undone = undo_vintages(
+                config.lake_root,
+                args.sources,
+                client=client,
+                target=target,
+                clock=clock,
+                calendar=calendar,
+            )
+            print(f"{COMMAND}: {undone.render()}")
+            return 0
         summary = import_vintages(
             config.lake_root,
             args.sources,
             clock=clock,
-            calendar=calendar if calendar is not None else ExchangeCalendar(),
+            calendar=calendar,
             dry_run=args.dry_run,
         )
     for ticker in summary.tickers:
@@ -807,10 +1043,12 @@ __all__ = [
     "BarImportRefused",
     "ImportSummary",
     "TickerImport",
+    "UndoSummary",
     "Vintage",
     "build_parser",
     "import_vintages",
     "main",
+    "undo_vintages",
 ]
 
 
