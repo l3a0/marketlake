@@ -207,7 +207,7 @@ def test_a_vintage_lands_and_reads_back_through_load_bars(tmp_path):
         "2006-12-15T05:00:00+00:00",
         "2007-07-16T04:00:00+00:00",
     ]
-    assert [bars.session_of(ts) for ts in table.column("bar_ts").to_pylist()] == [
+    assert [bars.daily_session_of(ts) for ts in table.column("bar_ts").to_pylist()] == [
         date(2006, 4, 26),
         date(2006, 12, 15),
         date(2007, 7, 16),
