@@ -3555,6 +3555,20 @@ def test_only_the_two_absences_nothing_can_repair_read_as_a_standing_fact():
     assert sweep.PERMANENT_ABANDON_REASONS is bars.PERMANENT_ABANDON_REASONS
 
 
+def test_a_lost_quotes_day_never_falls_back_and_still_asks_for_a_restore(
+    fixture_lake: FixtureLake,
+):
+    # Marketlake #947. The quotes partition is gone from disk and the day's 1-minute partition is
+    # on disk. ``PartitionAbsent`` wants a restore of the quotes, so the bar does not land against
+    # the minute bars, and the census line stays ``action`` naming the lost partition.
+    lost = OUTAGE_SESSIONS[0]
+    root, outcome = _operator_night(fixture_lake, lost=lost, minute_bars=(lost,))
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 1 PartitionAbsent, 5 SnapAbsent"
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION
+    assert not LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, lost).exists()
+
+
 def test_a_trimmed_minute_partition_asks_for_a_restore(fixture_lake: FixtureLake):
     # Marketlake #947. The manifest records an outage day's 1-minute partition and the trim took
     # the file, so the walk abandons that day under ``MinuteBarsAbsent``. A bars restore would land

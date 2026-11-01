@@ -1400,12 +1400,24 @@ def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
     walk's filing catch, which files it under ``CHECK_BAR_MINUTE_CLOSE``.
 
     The read goes through ``load_bars``, so a quarantined partition is refused rather than read.
+
+    **A damaged file is turned into a ``LoadError`` here.** pyarrow refuses a flipped byte with a
+    bare ``OSError`` or a ``UnicodeDecodeError``, and the walk's filing catch names neither, so one
+    damaged 1-minute file would stop the whole bars walk every night, the minute half with it.
+    Nothing in the walk read a bars partition before marketlake #947, which is why this read is
+    the first to need it. The message carries the class and never the exception's own text,
+    which names an absolute path on the capture machine, for the reason :class:`_GateClose`
+    gives.
     """
     try:
         table = load_bars(ticker, MINUTE_FREQ, session, session, lake_root=lake_root)
+        close = _bar_close(table.select(["bar_ts", "close"]).to_pylist())
     except (BarsAbsent, PartitionQuarantined, PartialRead) as exc:
         return _GateClose(reason=MINUTE_REASON_PREFIX + type(exc).__name__)
-    close = _bar_close(table.select(["bar_ts", "close"]).to_pylist())
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LoadError(
+            f"{ticker} {session.isoformat()} 1m partition could not be read: {type(exc).__name__}"
+        ) from exc
     if close is None:
         return _GateClose(reason=MINUTE_REASON_PREFIX + CLOSE_VALUE_ABSENT)
     return _GateClose(close=close)

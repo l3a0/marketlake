@@ -2170,9 +2170,10 @@ def test_the_minute_close_is_the_last_candle_and_a_close_inside_the_tolerance_la
 ):
     """The reference is the last candle's close, and 3 basis points of drift still lands.
 
-    The fixture's first candle closes at 648.5, 23 basis points away, so a reference taken from
-    the first row would hold this bar. The daily candle sits 3 basis points above the last
-    candle, inside the measured drift of the 15:59 candle against the official close.
+    The fixture's first candle closes at 648.5, 26 basis points below this daily close, so a
+    reference taken from the first row would hold this bar. The daily candle sits 3 basis points
+    above the last candle, inside the measured drift of the 15:59 candle against the official
+    close.
     """
     day = date(2026, 9, 9)
     root = _lake(
@@ -2360,3 +2361,128 @@ def test_the_backfill_block_names_a_bar_gated_against_the_minute_close(
         "    - SPY 1d 2026-09-09 1 row(s) at bars/ticker=SPY/freq=1d/date=2026-09-09.parquet"
         ", gated against the 1m close"
     ]
+
+
+def test_a_null_close_at_the_reference_minute_falls_back_too(fixture_lake: FixtureLake):
+    """``CloseValueAbsent`` is the other permanent reason, and it takes the fallback as well.
+
+    The 16:15 row is a data row whose ``regular_market_last_price`` is null, so the quote read
+    produces no number and raises nothing. That is as permanent as a gap row, so the bar is gated
+    against the 1-minute close and lands.
+    """
+    day = date(2026, 9, 9)
+    quotes = {("SPY", d): [_quote_row(d)] for d in (*SESSIONS, date(2026, 9, 17))}
+    quotes[("SPY", day)] = [_quote_row(day, captured=None)]
+    root = _lake(
+        fixture_lake,
+        quotes=quotes,
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+
+    gated = {entry.session: entry.gated_by for entry in result.landed}
+    assert gated[day] == CHECK_BAR_MINUTE_CLOSE
+    assert result.abandoned == () and result.held == ()
+
+
+def test_a_minute_close_ten_basis_points_off_is_held(fixture_lake: FixtureLake):
+    """The fallback compares at the 16:15 gate's 5 basis points, not at something looser.
+
+    Ten basis points is above the tolerance and below every dividend the lake has measured, so a
+    tolerance loosened enough to let a dividend-sized adjustment through would land this bar.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,), daily_closes={day: 650.65}))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
+    assert day not in {entry.session for entry in result.landed}
+
+
+def test_a_minute_partition_at_an_unrecorded_version_is_abandoned_under_the_minute_reason(
+    fixture_lake: FixtureLake,
+):
+    """``PartialRead`` on the minute read is a schema change somebody has to record.
+
+    The partition is stamped at a schema version the ledger does not hold, so ``load_bars``
+    raises ``PartialRead``. That wants a person rather than a filed finding, so the bar is
+    abandoned under ``MinutePartialRead`` and nothing is held.
+    """
+    day = date(2026, 9, 9)
+    table = _minute_table(day)
+    versions = pa.array([99] * table.num_rows, type=table.schema.field("schema_version").type)
+    table = table.set_column(
+        table.schema.get_field_index("schema_version"), "schema_version", versions
+    )
+    root = _lake(
+        fixture_lake, quotes=_outage_quotes(), bars_partitions=(("SPY", MINUTE_FREQ, day, table),)
+    )
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+
+    assert GateSkip("SPY", DAILY_FREQ, day, "MinutePartialRead") in result.abandoned
+    assert result.held == ()
+
+
+def test_a_minute_partition_with_no_last_close_is_abandoned_under_the_minute_reason(
+    fixture_lake: FixtureLake,
+):
+    """A recorded 1-minute partition whose last row carries no close gives no reference.
+
+    It is abandoned under ``MinuteCloseValueAbsent`` rather than the quote's ``SnapAbsent``, so the
+    census does not read a partition somebody should look at as a loss nothing can change.
+    """
+    day = date(2026, 9, 9)
+    table = _minute_table(day)
+    closes = table.column("close").to_pylist()
+    closes[-1] = None
+    table = table.set_column(
+        table.schema.get_field_index("close"),
+        "close",
+        pa.array(closes, type=table.schema.field("close").type),
+    )
+    root = _lake(
+        fixture_lake, quotes=_outage_quotes(), bars_partitions=(("SPY", MINUTE_FREQ, day, table),)
+    )
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+
+    assert GateSkip("SPY", DAILY_FREQ, day, "MinuteCloseValueAbsent") in result.abandoned
+    assert result.held == ()
+
+
+@pytest.mark.parametrize("offset", [4, 40], ids=["thrift-oserror", "utf8-decode"])
+def test_a_damaged_minute_file_is_held_and_the_walk_goes_on(fixture_lake: FixtureLake, offset):
+    """One flipped byte in a 1-minute file costs its own ticker-day and nothing else.
+
+    pyarrow refuses such a file with a bare ``OSError`` or a ``UnicodeDecodeError``, and the
+    walk's filing catch names neither. Unconverted, the first would stop the bars walk every night
+    and the second would end the sweep with no report at all. Both offsets were measured by the
+    operator lens on #975 to raise one of the two.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    path = _partition(root, "SPY", MINUTE_FREQ, day)
+    data = bytearray(path.read_bytes())
+    data[offset] ^= 0xFF
+    path.write_bytes(bytes(data))
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
+    assert "1m partition could not be read" in (result.held[0].finding.exception or "")
+    assert {entry.session for entry in result.landed} == set(SESSIONS) - set(OUTAGE)
