@@ -2,10 +2,13 @@
 
 These run the onboarding core against a throwaway lake and a throwaway tickers.yaml,
 with a cassette-backed vendor and a manual clock. No network and no token are crossed.
-The tests that drive the command line hand ``main`` the same manual clock, set inside a
-session. Before ``main`` took a clock they crossed the real one, and the onboarding's
-session check refused every run on a weekend or a holiday, so the required ``test`` check
-failed on every pull request opened then (marketlake #964). They reach the recorded vendor
+The tests that drive the command line past argument parsing hand ``main`` a manual clock
+set inside a session, apart from the one that hands it a Sunday on purpose. Before ``main``
+took a clock they crossed the real one, and the onboarding's session check refused every
+run on a weekend or a holiday, so the required ``test`` check failed on every pull request
+opened then (marketlake #964). The tests refused at parse time hand it no clock, so the
+default the real command runs on stays tested, and their refusal comes before the session
+check, so the day does not decide them. The command-line tests reach the recorded vendor
 through the seam where the command builds the Schwab-backed one. The tier is component:
 onboarding writes and reads real files, with the clock and vendor still fake.
 
@@ -819,6 +822,10 @@ def test_an_epoch_after_now_is_refused_and_writes_nothing(lake_root, tmp_path, c
 
     A mistyped year is enough to do it, and nothing says so, so the refusal runs before
     anything is written.
+
+    This one hands ``main`` no clock, so it covers the default the real command runs on.
+    The refusal comes at parse time, before the session check, so the day does not
+    decide it.
     """
     tickers_path = tmp_path / "tickers.yaml"
     config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
@@ -833,8 +840,7 @@ def test_an_epoch_after_now_is_refused_and_writes_nothing(lake_root, tmp_path, c
                 str(config_path),
                 "--tickers",
                 str(tickers_path),
-            ],
-            clock=ManualClock(start=_MID_SESSION),
+            ]
         )
 
     assert exit_info.value.code == 2
@@ -1820,26 +1826,34 @@ def test_the_command_refuses_a_day_with_no_session_on_the_clock_it_is_handed(
     _assert_nothing_onboarded(lake_root, tickers_path)
 
 
-def test_the_capture_start_check_reads_the_clock_the_command_is_handed(lake_root, tmp_path, capsys):
+def test_the_capture_start_check_reads_the_clock_the_command_is_handed(
+    lake_root, tmp_path, monkeypatch, capsys
+):
     """An epoch after the handed clock's now is refused, though the real clock is past it.
 
     A check that read the operating system's clock would let this epoch through and open
     a span that starts after the onboarding's own now. The printed now is the handed one.
+    The recorded vendor and a token path are in place, so a check that let the epoch
+    through would onboard and exit 0, and fail on the exit rather than on a missing token.
     """
     tickers_path = tmp_path / "tickers.yaml"
     config_path = _write_config(tmp_path / "config.yaml", lake_root=lake_root)
+    _stub_the_vendor(monkeypatch, _quote_vendor("SPY", realtime=True))
     day_after = (_MID_SESSION + timedelta(days=1)).isoformat()
 
     with pytest.raises(SystemExit) as exit_info:
         main(
             [
                 "SPY",
+                "--no-options",
                 "--capture-start",
                 day_after,
                 "--config",
                 str(config_path),
                 "--tickers",
                 str(tickers_path),
+                "--token",
+                str(tmp_path / "token.json"),
             ],
             clock=ManualClock(start=_MID_SESSION),
         )
