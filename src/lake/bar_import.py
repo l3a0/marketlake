@@ -227,8 +227,6 @@ class _SourceBar:
     close: float
 
 
-
-
 @dataclass
 class TickerImport:
     """What one source did to its ticker, for the line the command prints.
