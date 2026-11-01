@@ -668,11 +668,15 @@ def test_a_session_whose_quotes_hold_only_gap_rows_is_abandoned_without_a_reques
 ):
     """#319 test 7, re-pointed by marketlake #434.
 
-    This is the live lake's own condition: 2026-09-08 through 2026-09-10 hold gap rows and no data
+    This was the live lake's own condition: 2026-09-08 through 2026-09-10 hold gap rows and no data
     row, so the gate's 16:15 read raises ``SnapAbsent`` for them and the close cross-check has no
-    comparison. Those quotes are sealed and nothing can rebuild a data row that never existed, so
-    no later run changes the verdict. The live lake's 2026-09-11 is gapped too, and its bars
-    landed before marketlake #618 moved the reference, so this fixture gives it a data row.
+    comparison. The live lake also holds their 1-minute bars, so since marketlake #947 they land
+    against those. This fixture puts no 1-minute partition on disk, which is the case that still
+    abandons, as ``test_a_gap_day_with_no_minute_partition_stays_abandoned`` says too.
+    Those quotes are sealed and nothing can rebuild a data row that never existed, so with no
+    1-minute partition no later run changes the verdict. The live lake's 2026-09-11 is gapped
+    too, and its bars landed before marketlake #618 moved the reference, so this fixture gives it
+    a data row.
 
     **This used to fetch, hold and file, on every run for ever.** The bar was never landed, so it
     was never manifested, so the manifested skip never reached it. Six ticker-days on the live
@@ -2211,7 +2215,8 @@ def test_a_quarantined_minute_partition_leaves_the_bar_abandoned(fixture_lake: F
     """The minute read goes through ``load_bars``, so a quarantine there is honoured too.
 
     A battery verdict on the minute partition is a reason not to trust it as a reference. The
-    daily bar stays abandoned under its quote reason, and nothing is filed for it.
+    daily bar stays abandoned, nothing is filed for it, and its reason names the minute read, so
+    the sweep's census asks for the sign-off that would land it rather than reading as a loss.
     """
     day = date(2026, 9, 9)
     fixture_lake.with_quarantine(
@@ -2225,8 +2230,84 @@ def test_a_quarantined_minute_partition_leaves_the_bar_abandoned(fixture_lake: F
     vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
     result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
 
-    assert GateSkip("SPY", DAILY_FREQ, day, "SnapAbsent") in result.abandoned
+    assert GateSkip("SPY", DAILY_FREQ, day, "MinutePartitionQuarantined") in result.abandoned
     assert result.held == ()
+    assert day not in {entry.session for entry in result.landed}
+
+
+def test_a_trimmed_minute_partition_is_abandoned_under_the_minute_reason(
+    fixture_lake: FixtureLake,
+):
+    """The VM's six: the manifest records the minute partition and the trim took the file.
+
+    ``load_bars`` lists sessions from disk, so the read finds nothing and raises ``BarsAbsent``.
+    A restore of the bars range would land the bar, so the reason says the minute read failed,
+    which the sweep's census reads as ``ACTION``, rather than the quote's ``SnapAbsent``, which it
+    reads as a loss nothing can change. Nothing is filed and no request is spent.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    _partition(root, "SPY", MINUTE_FREQ, day).unlink()
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert result.abandoned == (
+        GateSkip("SPY", DAILY_FREQ, date(2026, 9, 10), "SnapAbsent"),
+        GateSkip("SPY", DAILY_FREQ, day, "MinuteBarsAbsent"),
+        GateSkip("SPY", DAILY_FREQ, date(2026, 9, 8), "SnapAbsent"),
+    )
+    assert result.held == ()
+    assert len(vendor.calls) == len(SESSIONS) - len(OUTAGE)
+
+
+def test_a_minute_file_the_manifest_does_not_record_is_not_a_reference(
+    fixture_lake: FixtureLake,
+):
+    """A 1-minute file with no manifest entry is one a killed run left, so it gates nothing.
+
+    The quotes side asks for the same seal. The bar stays abandoned under its quote reason, and
+    the daily candle is not fetched.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(fixture_lake, quotes=_outage_quotes())
+    path = _partition(root, "SPY", MINUTE_FREQ, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(_minute_table(day), path)
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert GateSkip("SPY", DAILY_FREQ, day, "SnapAbsent") in result.abandoned
+    assert day not in {entry.session for entry in result.landed}
+    assert len(vendor.calls) == len(SESSIONS) - len(OUTAGE)
+
+
+def test_a_minute_partition_that_contradicts_its_writer_is_held_under_the_minute_check(
+    fixture_lake: FixtureLake,
+):
+    """A 1-minute file ``load_bars`` refuses as malformed is filed, and filed under its own check.
+
+    The read raises ``ProvenanceMalformed``, which says the file contradicts its writer rather
+    than that nothing is there, so it is held the way a malformed quotes partition is. The token
+    is ``CHECK_BAR_MINUTE_CLOSE``, so the withheld record sends its reader to the 1-minute file
+    rather than to the quotes.
+    """
+    day = date(2026, 9, 9)
+    table = _minute_table(day)
+    table = table.replace_schema_metadata(
+        {**(table.schema.metadata or {}), b"marketlake.bogus": b"x"}
+    )
+    root = _lake(
+        fixture_lake, quotes=_outage_quotes(), bars_partitions=(("SPY", MINUTE_FREQ, day, table),)
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
+    assert "ProvenanceMalformed" in (result.held[0].finding.exception or "")
     assert day not in {entry.session for entry in result.landed}
 
 

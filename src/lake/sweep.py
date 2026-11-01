@@ -1458,7 +1458,9 @@ def sweep(
                         f"first: {walked.unwalked[0]}",
                         ACTION,
                     )
-                # A daily ticker-day whose gate has no close of record and never will. It is
+                # A daily ticker-day whose gate has no close of record, and no 1-minute close to
+                # stand in for it (marketlake #947). Its ``Minute`` reasons say a restore or a
+                # sign-off of the 1-minute partition would land it. It is
                 # not a refusal, so it does not withhold the ping, and marketlake #434 is what
                 # stopped it being a held finding: filed nightly under ``reports/withheld/`` it
                 # was a permanent condition wearing an incident's clothes, and a genuinely new
@@ -1523,8 +1525,9 @@ def sweep(
                         f"{count} {reason}" for reason, count in sorted(reasons.items())
                     )
                     # ``INFO`` only when every reason says the sealed partition holds no
-                    # usable close, which nothing can change. The other three want a human:
-                    # a restore, a sign-off, or a schema change (marketlake #530).
+                    # usable close and no 1-minute partition was ever recorded to stand in, which
+                    # nothing can change. The others want a human: a restore, a sign-off, or a
+                    # schema change (marketlake #530), of the quotes or of the 1-minute bars.
                     report.add(
                         f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}",
                         INFO if set(reasons) <= PERMANENT_ABANDON_REASONS else ACTION,
@@ -1533,9 +1536,9 @@ def sweep(
                 # was missed, which is marketlake #947. It reports no fault: the bar landed, and
                 # the vendor's daily candle is the same official close whichever reference judged
                 # it. The reference is looser, the last regular trade rather than the close, so
-                # the line is the nightly record of which bars it judged. Counted rather than
-                # named, for the reason the abandoned census above gives, and it carries one
-                # ``": "`` so ``report.redacted`` keeps it whole.
+                # the line counts the bars it judged, night by night. It names none of them, for
+                # the reason the abandoned census above gives, and the by-hand ``--backfill``
+                # block names each. It carries one ``": "`` so ``report.redacted`` keeps it whole.
                 minute_gated = [
                     entry for entry in walked.landed if entry.gated_by == CHECK_BAR_MINUTE_CLOSE
                 ]

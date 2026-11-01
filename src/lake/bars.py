@@ -284,10 +284,13 @@ MINUTE_EXTENDED_HOURS = False
 # is a separate choice with no evidence behind it.
 #
 # The 1-minute fallback of marketlake #947 does carry a drift, because its reference is the 15:59
-# candle's last regular trade rather than the official close. That candle stayed within 2.23 basis
-# points of the vendor's close over 42 ticker-days on the laptop lake and 1.82 over 42 on the VM,
-# matching it to the cent on 3 of them. So the fallback refuses an adjustment above about 7.2
-# basis points, which still sits under the smallest dividend above.
+# candle's last regular trade rather than the official close. On SPY and QQQ that candle stayed
+# within 2.23 basis points of the vendor's close over 42 ticker-days on the laptop lake,
+# 2026-09-14 to 2026-10-12, and 1.82 over 42 on the VM, 2026-10-01 to 2026-10-29. The two overlap
+# on 16, so the sample is 68 distinct ticker-days, and it matched to the cent on 3 of them. So on
+# those tickers the fallback refuses an adjustment above about 7.2 basis points, which still sits
+# under the smallest dividend above. GLD and USO, and early-close sessions, are unmeasured: neither
+# lake held a session of either ticker, or an early close, when this was measured.
 CLOSE_CROSS_TOLERANCE = 5e-4
 
 # The reason an abandoned ticker-day carries when the reference read produced no number and
@@ -313,6 +316,14 @@ FOLLOWING_UNSEALED = "FollowingUnsealed"
 # ``SnapAbsent`` is a gap row at the 16:15 minute, which is what the live lake's six abandoned
 # ticker-days from the 2026-09-08 outage carry.
 PERMANENT_ABANDON_REASONS = frozenset({SnapAbsent.__name__, CLOSE_VALUE_ABSENT})
+
+# What an abandoned ticker-day's reason starts with when the fallback's own 1-minute read is what
+# failed, as in ``MinuteBarsAbsent`` or ``MinutePartitionQuarantined``. The partition is one the
+# manifest records, so a restore or a sign-off would land the bar, and none of these is in
+# ``PERMANENT_ABANDON_REASONS``. That turns the sweep's census line to ``ACTION``, where the quote
+# reason alone would read as a loss nothing can change. The VM's six from the 2026-09-08 outage
+# read ``MinuteBarsAbsent`` until their trimmed 1-minute partitions are restored.
+MINUTE_REASON_PREFIX = "Minute"
 
 # The column the gate compares the vendor's close against, on the session's own ``option_close``
 # row. Not ``last``, which carries extended-hours trades by 16:15: 760.73 against a 760.88 close
@@ -1275,7 +1286,7 @@ def _captured_close(lake_root: Path, ticker: str, session: date, minute: str) ->
     # answers. Either way the comparison is left with no number and the caller holds the bar,
     # which is the same outcome a missing column gives, and the caller skips the ticker-day
     # under ``CLOSE_VALUE_ABSENT`` rather than spending a request on a comparison that has no
-    # second number in it.
+    # second number in it, unless the session's own 1-minute close stands in (marketlake #947).
     values = {
         value
         for value in table.column(REFERENCE_COLUMN).to_pylist()
@@ -1367,8 +1378,8 @@ def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _Ga
     return _GateClose(close=close)
 
 
-def _minute_close(lake_root: Path, ticker: str, session: date) -> float | None:
-    """The session's last 1-minute close as the lake holds it, or ``None`` when there is none.
+def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
+    """The session's last 1-minute close as the lake holds it, or the reason it cannot be read.
 
     This is the reference a daily bar is gated against when its sealed quotes hold no usable
     close, which is marketlake #947. The six abandoned ticker-days on the live lake each lost the
@@ -1380,17 +1391,24 @@ def _minute_close(lake_root: Path, ticker: str, session: date) -> float | None:
     at the equity close, with ``MINUTE_EXTENDED_HOURS`` false. :func:`_bar_close` picks it, so the
     tie rule is ``load_bars``'s here too.
 
+    The walk asks only about a partition the manifest records or this walk landed, so a refusal
+    here is a partition that should be readable and is not. The three refusals that mean it cannot
+    be read come back as a reason under ``MINUTE_REASON_PREFIX``: ``BarsAbsent`` for a file the
+    trim moved to the bucket, ``PartitionQuarantined`` for one awaiting a sign-off, and
+    ``PartialRead`` for a schema change. A partition whose last row carries no close comes back
+    the same way. Every other ``LoadError`` says a file contradicts its writer, and reaches the
+    walk's filing catch, which files it under ``CHECK_BAR_MINUTE_CLOSE``.
+
     The read goes through ``load_bars``, so a quarantined partition is refused rather than read.
-    The three refusals that mean the partition cannot be read return ``None``, and the ticker-day
-    stays abandoned under its quote reason until a later run finds one. Every other ``LoadError``
-    says a file contradicts its writer, and reaches the walk's filing catch, as a quotes read
-    that raised one would.
     """
     try:
         table = load_bars(ticker, MINUTE_FREQ, session, session, lake_root=lake_root)
-    except (BarsAbsent, PartitionQuarantined, PartialRead):
-        return None
-    return _bar_close(table.select(["bar_ts", "close"]).to_pylist())
+    except (BarsAbsent, PartitionQuarantined, PartialRead) as exc:
+        return _GateClose(reason=MINUTE_REASON_PREFIX + type(exc).__name__)
+    close = _bar_close(table.select(["bar_ts", "close"]).to_pylist())
+    if close is None:
+        return _GateClose(reason=MINUTE_REASON_PREFIX + CLOSE_VALUE_ABSENT)
+    return _GateClose(close=close)
 
 
 def _calendar_next_session(
@@ -1471,8 +1489,9 @@ def fetch_session_bars(
     stopped them reaching the vendor. A daily bar for the session this was given is fetched only
     once the next session has sealed, which at any hour of that session it has not, so every
     daily ticker-day here is reported under ``unsettled`` rather than fetched and held. One whose
-    own session is sealed and offers no close is reported under ``abandoned``. Both cost no
-    request and file no finding, and :class:`BarsReport` carries the argument in full.
+    own session is sealed and offers no close, and no 1-minute close to stand in for it, is
+    reported under ``abandoned``. Both cost no request and file no finding, and
+    :class:`BarsReport` carries the argument in full.
 
     **Two failures are not contained per ticker-day**, and the catch below is narrow rather
     than broad for exactly that reason. ``VendorAuthError`` is a dead refresh token and is not
@@ -1547,9 +1566,10 @@ def _walk(
     the gate reads, and the following session is what a daily bar waits for.
 
     **A daily ticker-day whose gate has no close of record never reaches the vendor**, which is
-    marketlake #434. :func:`_gate_close` says whether one exists and the manifest says whether that
-    can still change, and the two answers are recorded apart because they mean opposite things
-    to a reader. See the skip below for both.
+    marketlake #434, unless its sealed session's own 1-minute close stands in, which is marketlake
+    #947. :func:`_gate_close` says whether one exists and the manifest says whether that can still
+    change, and the two answers are recorded apart because they mean opposite things to a reader.
+    See the skip below for both.
 
     **``budget`` bounds the requests one walk may spend, and ``None`` means unbounded.** It is
     marketlake #478, and the backfill is what sets it. Nothing paces this loop, so a walk over a
@@ -1697,20 +1717,33 @@ def _walk(
             # every ticker-day is judged against one moment the way the manifest snapshot above
             # already is.
             session_key = paths.quotes_partition_path(ticker, session).relative_to(root).as_posix()
-            minute_close: float | None = None
+            minute_key = (
+                paths.bars_partition_path(ticker, MINUTE_FREQ, session).relative_to(root).as_posix()
+            )
+            minute = _GateClose()
             try:
                 gate_close = _gate_close(root, ticker, session, _reference_minute(bounds(session)))
                 # **The fallback, for a sealed session whose quotes hold no usable close**, which
                 # is marketlake #947. Those ticker-days were abandoned for good before it, so one
                 # missed 16:15 quote left a permanent hole in every lookback that reached the
                 # session. The session's own 1-minute bars are the reference instead, read inside
-                # this ``try`` so a 1-minute partition that contradicts its writer files the same
-                # way a quotes partition does. Only the permanent reasons take it, because each of
-                # the others wants a person, and landing past a quarantine would step over the
-                # verdict. :func:`_minute_close` carries the read and ``CLOSE_CROSS_TOLERANCE`` the
-                # drift it was measured with.
-                if gate_close.reason in PERMANENT_ABANDON_REASONS and session_key in manifested:
-                    minute_close = _minute_close(root, ticker, session)
+                # this ``try`` so a 1-minute partition that contradicts its writer files the way a
+                # quotes partition does, under the fallback's own check. Only the permanent reasons
+                # take it, because each of the others wants a person, and landing past a
+                # quarantine would step over the verdict. The 1-minute partition has to be one the
+                # manifest records or this walk landed, which is the seal the quotes side asks
+                # for: a file with no entry is one a killed run left. :func:`_minute_close`
+                # carries the read and ``CLOSE_CROSS_TOLERANCE`` the drift it was measured with.
+                if (
+                    gate_close.reason in PERMANENT_ABANDON_REASONS
+                    and session_key in manifested
+                    and (
+                        minute_key in manifested
+                        or any(entry.partition == minute_key for entry in landed)
+                    )
+                ):
+                    close_check = CHECK_BAR_MINUTE_CLOSE
+                    minute = _minute_close(root, ticker, session)
             except (
                 LoadError,
                 CloseOfRecordDisagrees,
@@ -1740,21 +1773,21 @@ def _walk(
                 # The request is still saved, which is all marketlake #434 asked for: a gate
                 # whose close of record is ambiguous cannot pass either. So this holds without
                 # fetching, and ``attempted`` stays the count of ticker-days that reached the
-                # vendor.
+                # vendor. ``close_check`` names the read that raised, the 16:15 quote's or the
+                # 1-minute fallback's, so the withheld record points at the file that is wrong.
                 hold(
-                    _finding(
-                        ticker, window, CHECK_BAR_CLOSE, exception=f"{type(exc).__name__}: {exc}"
-                    )
+                    _finding(ticker, window, close_check, exception=f"{type(exc).__name__}: {exc}")
                 )
                 continue
-            if minute_close is not None:
-                reference = minute_close
-                close_check = CHECK_BAR_MINUTE_CLOSE
+            if minute.close is not None:
+                reference = minute.close
             elif gate_close.reason is not None:
-                # No 1-minute partition either, or a reason that wants a person. The walk asks
-                # again every night at no request's cost, so a 1-minute partition landed later
-                # lets this bar land then.
-                entry = GateSkip(ticker, freq, session, gate_close.reason)
+                # No recorded 1-minute partition, one that cannot be read, or a reason that wants
+                # a person. A fallback read that failed names itself, so the census can tell a
+                # restore or a sign-off that would land the bar from a loss nothing can change.
+                # The walk asks again every night at no request's cost, so a 1-minute partition
+                # landed or restored later lets this bar land then.
+                entry = GateSkip(ticker, freq, session, minute.reason or gate_close.reason)
                 (abandoned if session_key in manifested else unsettled).append(entry)
                 continue
             else:
@@ -2021,7 +2054,7 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
 
     ``selected`` holds the rows for the session being gated, which on ``1d`` is the one candle
     whose stamp maps to it. The last by stamp is the session's close on either frequency, so
-    the same reading answers a 1-min partition should a check ever want it.
+    the same reading answers a 1-min partition, which :func:`_minute_close` asks of it.
 
     **The last by stamp is the last instant, not the last string.** This sorted the raw text
     until marketlake #386, and the two orders come apart whenever two stamps spell one instant
@@ -2047,7 +2080,9 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     by ``select_session_rows`` and then by ``check_bar_span``, so a stamp that would raise has
     ended the ticker-day before this runs. A change that reorders those two checks puts the raise
     back on this path, where the ``except`` below does not cover it: that clause is about a close
-    the vendor retyped, not about a stamp.
+    the vendor retyped, not about a stamp. :func:`_minute_close`'s rows come from ``load_bars``
+    instead, whose ``_sorted_by_instant`` parses every stamp by the same rule and raises a
+    ``LoadError`` first, which the walk files.
     """
     if not rows:
         return None
@@ -2752,6 +2787,7 @@ def main(
 __all__ = [
     "VendorFactory",
     "CHECK_BAR_CLOSE",
+    "CHECK_BAR_MINUTE_CLOSE",
     "CHECK_BAR_RESPONSE",
     "CHECK_BAR_SPAN",
     "CLOSE_CROSS_TOLERANCE",
@@ -2759,6 +2795,8 @@ __all__ = [
     "DAILY_STAMP_ROLLOVER_HOUR",
     "DAILY_WINDOW_MARGIN",
     "MINUTE_EXTENDED_HOURS",
+    "MINUTE_REASON_PREFIX",
+    "PERMANENT_ABANDON_REASONS",
     "BackfillPlan",
     "BackfillReport",
     "BarWindow",

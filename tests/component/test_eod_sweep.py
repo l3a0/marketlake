@@ -35,7 +35,7 @@ import pyarrow as pa
 import pytest
 import yaml
 
-from lake import journal, report, runway, sweep
+from lake import bars, journal, report, runway, sweep
 from lake.actions import ActionsError, actions_path
 from lake.alert import Publisher
 from lake.bars import CHECK_BAR_CLOSE
@@ -3424,6 +3424,7 @@ def _operator_night(
     close_absent: date | None = None,
     lost: date | None = None,
     minute_bars: tuple[date, ...] = (),
+    trim_minutes: bool = False,
 ):
     """A sweep over the lake shape the operator read on 2026-09-17 (marketlake #530).
 
@@ -3437,7 +3438,8 @@ def _operator_night(
     files as ``CloseValueAbsent``. ``lost`` deletes one outage day's sealed quotes file, which
     it files as ``PartitionAbsent``. ``minute_bars`` puts an earlier run's 1-minute partition on
     disk for each outage day it names, so the walk gates that day's daily bar against it
-    (marketlake #947) and lands it.
+    (marketlake #947) and lands it. ``trim_minutes`` then removes those files while their
+    manifest entries stay, the way the trim leaves a partition it moved to the bucket.
     """
     night = date(2026, 9, 18)
     baseline = date(2026, 9, 17)
@@ -3457,6 +3459,9 @@ def _operator_night(
     root = _lake(fixture_lake, quotes={})
     if lost is not None:
         (root / QUOTES / "ticker=SPY" / f"date={lost.isoformat()}.parquet").unlink()
+    if trim_minutes:
+        for day in minute_bars:
+            LakePaths(root).bars_partition_path("SPY", MINUTE_FREQ, day).unlink()
     interactions: list = []
     for day in (*minute_bars, date(2026, 9, 16), baseline):
         day_open, day_close = _bounds(day)
@@ -3546,7 +3551,20 @@ def test_only_the_two_absences_nothing_can_repair_read_as_a_standing_fact():
     bars are gated against their 1-minute close, so a wider set would also land bars past a
     quarantine.
     """
-    assert sweep.PERMANENT_ABANDON_REASONS == {"SnapAbsent", "CloseValueAbsent"}
+    assert bars.PERMANENT_ABANDON_REASONS == {"SnapAbsent", "CloseValueAbsent"}
+    assert sweep.PERMANENT_ABANDON_REASONS is bars.PERMANENT_ABANDON_REASONS
+
+
+def test_a_trimmed_minute_partition_asks_for_a_restore(fixture_lake: FixtureLake):
+    # Marketlake #947. The manifest records an outage day's 1-minute partition and the trim took
+    # the file, so the walk abandons that day under ``MinuteBarsAbsent``. A bars restore would land
+    # the bar, so the line is ``action``, where the quote reason alone would read as ``info``.
+    rescued = OUTAGE_SESSIONS[0]
+    root, outcome = _operator_night(fixture_lake, minute_bars=(rescued,), trim_minutes=True)
+    (line,) = [entry for entry in outcome.nightly.report if entry.startswith("bars abandoned")]
+    assert line == "bars abandoned: 6 ticker-day(s), 1 MinuteBarsAbsent, 5 SnapAbsent"
+    assert kind_of(outcome.nightly, "bars abandoned") == ACTION
+    assert not LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, rescued).exists()
 
 
 def test_an_outage_line_with_a_lost_partition_asks_for_a_restore(fixture_lake: FixtureLake):
