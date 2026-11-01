@@ -1513,10 +1513,12 @@ def sweep(
                 # **``unsettled`` is deliberately not reported here.** It is a ticker-day that
                 # cannot be judged yet, because its own session's quotes have not sealed. Since
                 # marketlake #962 a healthy 18:30 run leaves it empty, so a non-empty one means
-                # a compaction that did not run or did not finish, and the ``compaction`` check
-                # already alarms on that when its ping does not arrive. A line here would repeat
-                # that alarm in a second place. It still reaches the by-hand run's own output,
-                # which is where a reader who wants it goes.
+                # the session's quotes did not seal, and an alarm already covers each way that
+                # happens. A compaction that did not run or did not finish misses its ping, which
+                # the ``compaction`` check alarms on. One that refused the ticker-day as schema
+                # drift or damaged segments still pings, and pages on the refusal instead. A line
+                # here would repeat those alarms in a second place. It still reaches the by-hand
+                # run's own output, which is where a reader who wants it goes.
                 if walked.abandoned:
                     reasons = Counter(entry.reason for entry in walked.abandoned)
                     census = ", ".join(

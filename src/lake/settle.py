@@ -112,7 +112,7 @@ One consequence is worth stating rather than discovering. The daily gate compare
 against the session's own 16:15 quote, and the bar lands at that session's own 18:30 sweep, so a
 session's settlement is available that evening. Marketlake #618 moved the comparison onto the
 session's own quote and marketlake #962 moved the fetch onto its own evening. D19's OI view
-still settles a session one session later, for its own reasons.
+still publishes a session's open interest one session later, for its own reasons.
 """
 
 from __future__ import annotations

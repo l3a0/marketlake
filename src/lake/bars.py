@@ -623,8 +623,9 @@ def daily_session_of(bar_ts: str) -> date:
     05:00 UTC, the stamp every bar landed before marketlake #962 carries, names its own date in both
     seasons. 04:00 UTC, which is 23:00 the evening before in standard time, names the same session
     rather than the one before it. Marketlake #380. Since marketlake #962 a bar lands as the newest
-    candle of a response fetched on its own session's evening, which marketlake #362's recording
-    stamped at 04:00 UTC, so both stamps reach the lake.
+    candle of a response fetched on its own session's evening. Marketlake #380 holds, as a
+    hypothesis from one daylight-time recording in marketlake #362, that the vendor stamps such a
+    candle 04:00 UTC, so both stamps may reach the lake.
 
     It gives up one convention, a stamp at the end of the session's UTC day: 23:59 UTC is 19:59 EDT
     and names the next session here. No source this lake reads stamps that way. The vendor's
@@ -2196,7 +2197,8 @@ class BackfillReport:
     5. Its request budget was spent before anything landed, which is marketlake #478's.
 
     ``unsettled`` names a daily ticker-day whose gate cannot be judged *yet*, because its own
-    session's compaction has not run, so the session's quotes are not sealed. On a healthy lake
+    session's quotes are not sealed: the compaction did not run, or it refused that ticker-day as
+    schema drift or damaged segments. On a healthy lake
     at the 18:30 sweep it is empty, because since marketlake #962 a daily bar waits for no later
     session. The first run after the quotes seal lands it. The reason is the class name the
     gate's read raised, ``PartitionAbsent`` for a session with no quotes partition.

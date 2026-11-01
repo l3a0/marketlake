@@ -1034,7 +1034,7 @@ def test_the_command_against_a_lake_with_no_master_exits_two_with_a_named_line(
     An unseeded lake is an operator mistake with a one-command fix, and a traceback names the
     wrong thing. The line names the command that fixes it.
     """
-    fixture_lake.with_quotes("SPY", FOLLOWING, _quotes_table([_quote_row(FOLLOWING)]))
+    fixture_lake.with_quotes("SPY", SESSION, _quotes_table([_quote_row(SESSION)]))
     fixture_lake.with_reference("schema_versions", _ledger_table())
     root = fixture_lake.build()
     config = write_config(tmp_path, root)
@@ -3414,6 +3414,36 @@ def test_the_fetch_stamps_are_the_two_ends_of_the_vendor_call(fixture_lake: Fixt
     # for rather than when it came back.
     rel = _partition(root, "SPY", DAILY_FREQ).relative_to(root).as_posix()
     assert _entries(root, rel)[0]["fetched_at"] == started.isoformat()
+
+
+def test_a_session_the_calendar_cannot_follow_is_gated_and_lands(fixture_lake: FixtureLake):
+    """The last session a calendar knows about is gated and landed like any other.
+
+    Before marketlake #962 this held the bar under ``NoFollowingSession``, because the walk waited
+    for the calendar-next session's seal and a calendar with nothing after the session gave it
+    none to wait for. The wait is gone, so the daily gate runs on every daily ticker-day, this one
+    included. Bringing the hold back left the rest of the suite green, which is why this test
+    stays rather than going with the branch it used to cover.
+    """
+    root = _lake(fixture_lake)
+    only_monday = weekday_sessions(MONDAY)
+    only_monday._sessions = {SESSION: only_monday._sessions[SESSION]}
+    vendor = _RecordingVendor(_cassette())
+
+    result = fetch_session_bars(
+        lake_root=root,
+        vendor=vendor,
+        clock=ManualClock(FIRST_NIGHT),
+        calendar=only_monday,
+        roster=_roster({"SPY": ["1d"]}),
+        session=SESSION,
+    )
+
+    (landed,) = result.landed
+    assert landed.session == SESSION
+    assert result.held == ()
+    assert result.unsettled == () and result.abandoned == ()
+    assert [call["symbol"] for call in vendor.calls] == ["SPY"]
 
 
 def test_a_failed_write_leaves_no_temp_file_beside_the_partition(

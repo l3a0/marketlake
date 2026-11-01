@@ -867,6 +867,7 @@ def test_the_friday_run_sets_the_sunday_one_shot_and_reads_it_back(fixture_lake:
     )
 
     assert setter.sundays == [SUNDAY]
+    assert dict(outcome.nightly.pieces)["bars"].landed == 1
     # **One report-tier line, and the bars walk deliberately does not add a second.** This
     # fixture lake seals one quotes partition, FOLLOWING's, so that session's bar lands and every
     # other session of the week is gated against quotes the lake never sealed. The manifest is
