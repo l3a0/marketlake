@@ -2033,14 +2033,16 @@ def test_the_plan_orders_by_the_whole_date_across_a_month_boundary():
 # -- the 1-minute fallback for a sealed session with no usable close (marketlake #947) ----------
 
 
-def _minute_table(day: date, close: float = SETTLED_CLOSE) -> pa.Table:
+def _minute_table(
+    day: date, close: float = SETTLED_CLOSE, *, ticker: str = "SPY", instrument_id: int = 1
+) -> pa.Table:
     """A 1-minute partition an earlier run landed, whose last candle closes at ``close``."""
     open_et, close_et = _bounds(day)
     built = journal.bars_rows(
-        {"candles": _minute_candles(day, close), "symbol": "SPY", "empty": False},
-        ticker="SPY",
+        {"candles": _minute_candles(day, close), "symbol": ticker, "empty": False},
+        ticker=ticker,
         freq=MINUTE_FREQ,
-        instrument_id=1,
+        instrument_id=instrument_id,
         fetch_ts=TONIGHT,
         fetch_end_ts=TONIGHT,
         window_start=open_et,
@@ -2486,3 +2488,41 @@ def test_a_damaged_minute_file_is_held_and_the_walk_goes_on(fixture_lake: Fixtur
     assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
     assert "1m partition could not be read" in (result.held[0].finding.exception or "")
     assert {entry.session for entry in result.landed} == set(SESSIONS) - set(OUTAGE)
+
+
+def test_a_fallback_leaves_the_next_ticker_on_the_same_session_on_its_own_quote(
+    fixture_lake: FixtureLake,
+):
+    """The reference and its check are per ticker-day, never carried to the next one.
+
+    ``QQQ`` sorts before ``SPY``, so its fallback on 2026-09-09 is walked first, and ``SPY`` on the
+    same session has its own 16:15 close. ``SPY`` must be judged against that quote and say so.
+    The mutation lens on #975 found that hoisting either per-day default above the loop passed
+    every single-ticker test.
+    """
+    day = date(2026, 9, 9)
+    quotes = {}
+    for d in (*SESSIONS, date(2026, 9, 17)):
+        quotes[("SPY", d)] = [_quote_row(d)]
+        quotes[("QQQ", d)] = [_gap_row(d, "QQQ")] if d == day else [_quote_row(d, ticker="QQQ")]
+    root = _lake(
+        fixture_lake,
+        quotes=quotes,
+        master=_master(("SPY", "QQQ")),
+        spans=_open_span(1, 2),
+        bars_partitions=(
+            ("QQQ", MINUTE_FREQ, day, _minute_table(day, ticker="QQQ", instrument_id=2)),
+        ),
+    )
+    vendor = RecordingVendor(_cassette(tickers=("SPY", "QQQ"), freqs=(DAILY_FREQ,)))
+    result = _run(
+        root,
+        vendor,
+        roster=_roster({"SPY": [DAILY_FREQ], "QQQ": [DAILY_FREQ]}),
+        spans=_open_span(1, 2),
+    )
+
+    gated = {(e.ticker, e.session): e.gated_by for e in result.landed}
+    assert gated[("QQQ", day)] == CHECK_BAR_MINUTE_CLOSE
+    assert gated[("SPY", day)] == CHECK_BAR_CLOSE
+    assert all(check == CHECK_BAR_CLOSE for (_, session), check in gated.items() if session != day)

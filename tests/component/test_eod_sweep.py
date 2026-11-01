@@ -3555,6 +3555,17 @@ def test_only_the_two_absences_nothing_can_repair_read_as_a_standing_fact():
     assert sweep.PERMANENT_ABANDON_REASONS is bars.PERMANENT_ABANDON_REASONS
 
 
+def test_the_gated_line_stands_when_every_outage_day_is_rescued(fixture_lake: FixtureLake):
+    # The night the fallback was built for: every outage day has its 1-minute partition, so
+    # nothing is abandoned and the gated line is the only bars record of the night. The mutation
+    # lens on #975 found the line could ride on the abandoned census being present.
+    _, outcome = _operator_night(fixture_lake, minute_bars=OUTAGE_SESSIONS)
+    lines = outcome.nightly.report
+    assert not any(line.startswith("bars abandoned") for line in lines)
+    assert f"bars gated against the 1m close: {len(OUTAGE_SESSIONS)} ticker-day(s)" in lines
+    assert kind_of(outcome.nightly, "bars gated against the 1m close") == INFO
+
+
 def test_a_lost_quotes_day_never_falls_back_and_still_asks_for_a_restore(
     fixture_lake: FixtureLake,
 ):
