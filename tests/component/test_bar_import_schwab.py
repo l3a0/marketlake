@@ -35,6 +35,7 @@ from lake.cassette import Cassette, CassetteError, Interaction
 from lake.config import BucketTarget
 from lake.loader import load_bars, read_provenance
 from lake.manifest import append_manifest, latest_entries, sha256_file
+from lake.paths import default_token_path
 from lake.schwab import VendorAuthError
 from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.vendor import BARS_ENDPOINT, VendorError, VendorResponse, bars_params
@@ -263,6 +264,7 @@ def test_a_session_the_response_lacks_is_counted_and_the_rest_land(tmp_path):
     summary = _run(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
 
     assert len(_bars_files(root)) == 39
+    assert "landed 39 of 39 row(s)" in summary.render()
     assert "1 session(s) the calendar names and the response lacks" in summary.render()
 
 
@@ -352,6 +354,8 @@ def test_a_candle_outside_the_window_is_dropped_not_landed(tmp_path):
 
     assert _bars_files(root) == [_rel("GLD", d) for d in SESSIONS]
     assert "2 candle(s) outside the window dropped" in summary.render()
+    # A dropped candle is not a missing session, so the count does not go negative or hide one.
+    assert "0 session(s) the calendar names and the response lacks" in summary.render()
 
 
 def test_a_candle_the_builder_cannot_read_is_counted_apart_from_a_missing_session(tmp_path):
@@ -367,13 +371,13 @@ def test_a_candle_the_builder_cannot_read_is_counted_apart_from_a_missing_sessio
 
 
 def test_a_stamp_the_evening_before_names_the_next_session(tmp_path):
-    """A stamp at 23:00 Eastern, 03:00Z under daylight time, sits on the evening before.
+    """A stamp at 19:00 Eastern, 23:00Z the same UTC day, sits on the evening before.
     ``bars.daily_session_of``'s 18:00 boundary reads it as the next session, where a strict
-    Eastern date would name 2026-10-29 and clash with that session's own candle."""
+    Eastern date or a UTC date would name 2026-10-29 and clash with that session's candle."""
     root = _lake(tmp_path)
     candles = [_candle(d, n) for n, d in enumerate(SESSIONS[:-1])]
     evening = _candle(LAST, 39)
-    evening["datetime"] = int(datetime(2026, 10, 29, 23, 0, tzinfo=MARKET_TZ).timestamp() * 1000)
+    evening["datetime"] = int(datetime(2026, 10, 29, 19, 0, tzinfo=MARKET_TZ).timestamp() * 1000)
 
     _run(root, vendor=_Vendors(GLD=_vendor(candles=[*candles, evening])))
 
@@ -482,6 +486,120 @@ def test_a_full_rerun_reads_no_bucket(tmp_path):
     assert "40 already imported" in summary.render()
 
 
+def test_source_as_of_moves_with_the_day_of_the_fetch(tmp_path):
+    root = _lake(tmp_path)
+
+    _run(root, now=datetime(2026, 11, 3, 7, 45, tzinfo=MARKET_TZ))
+
+    table = load_bars("GLD", "1d", lake_root=root, adjust="none")
+    assert set(table.column("source_as_of").to_pylist()) == {"2026-11-03"}
+
+
+def test_a_whole_number_price_lands(tmp_path):
+    """Schwab's JSON can carry 101 rather than 101.0, which is a finite price."""
+    root = _lake(tmp_path)
+    candles = [_candle(d, n) for n, d in enumerate(SESSIONS)]
+    candles[0]["close"] = 101
+
+    _run(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
+
+    assert load_bars("GLD", "1d", lake_root=root, adjust="none").column("close")[0].as_py() == 101.0
+
+
+def test_candles_listed_newest_first_are_recorded_oldest_first(tmp_path):
+    root = _lake(tmp_path)
+    candles = list(reversed([_candle(d, n) for n, d in enumerate(SESSIONS)]))
+
+    _run(root, vendor=_Vendors(GLD=_vendor(candles=candles)))
+
+    lines = (root / "manifest.jsonl").read_text().splitlines()
+    recorded = [json.loads(line)["partition"] for line in lines if "schwab-window" in line]
+    assert recorded == [_rel("GLD", d) for d in SESSIONS]
+
+
+def test_each_row_records_no_extended_hours_flag(tmp_path):
+    """The sweep's daily request leaves the flag unset, and so does this one."""
+    root = _lake(tmp_path)
+
+    _run(root)
+
+    assert pq.read_table(root / _rel("GLD", LAST)).column("extended_hours").to_pylist() == [None]
+
+
+def test_a_window_across_a_long_closure_finds_its_forty_sessions(tmp_path):
+    """Three closed weeks stretch the 40 sessions over 78 days, inside the 120-day bound.
+
+    Counted by hand: 20 sessions in October, 8 in September before the closure on 2026-09-14
+    (Labor Day out), and 12 in August back to 2026-08-14.
+    """
+    root = _lake(tmp_path)
+    closed = {date(2026, 9, 14) + timedelta(days=n) for n in range(21)}
+    calendar = weekday_sessions(
+        *(date(2026, 7, 13) + timedelta(weeks=n) for n in range(19)),
+        holidays=closed | {LABOR_DAY},
+    )
+    start = datetime(2026, 8, 14, 4, tzinfo=UTC)
+    vendors = _Vendors(GLD=_vendor(start=start))
+
+    import_schwab(root, ["GLD"], vendor=vendors, clock=ManualClock(MONDAY_0745), calendar=calendar)
+
+    assert vendors.requests == [("GLD", start, END)]
+
+
+def test_an_empty_response_for_the_second_ticker_refuses_and_writes_nothing(tmp_path):
+    root = _lake(tmp_path, ("GLD", "USO"))
+    vendors = _Vendors(GLD=_vendor("GLD"), USO=_vendor("USO", candles=[]))
+
+    assert "Schwab's response for USO holds none" in _refused(root, ("GLD", "USO"), vendor=vendors)
+    assert not (root / "bars").exists()
+
+
+def test_a_dry_run_through_the_command_writes_nothing(tmp_path, capsys):
+    root = _lake(tmp_path)
+    before = _snapshot(root)
+    config = write_config(tmp_path, root)
+
+    code = bar_import.main(
+        ["schwab", "GLD", "--dry-run", "--config", str(config)],
+        clock=ManualClock(MONDAY_0745),
+        calendar=CALENDAR,
+        vendor_factory=lambda *a, **k: _Vendors(GLD=_vendor()),
+    )
+
+    assert code == 0
+    assert "dry run, would land 40 of 40 row(s)" in capsys.readouterr().out
+    assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    "damage, expected",
+    [
+        ("absent", "security master"),
+        ("corrupt", "nothing was imported"),
+        ("unreadable", "cannot be read (PermissionError)"),
+    ],
+)
+def test_a_master_that_cannot_be_read_refuses_before_any_request(tmp_path, damage, expected):
+    root = _lake(tmp_path)
+    path = master_path(root)
+    if damage == "absent":
+        path.unlink()
+    elif damage == "corrupt":
+        path.write_bytes(b"not parquet")
+    else:
+        path.chmod(0)
+    vendors = _Vendors(GLD=_vendor())
+
+    try:
+        message = _refused(root, vendor=vendors)
+    finally:
+        if path.exists():
+            path.chmod(0o644)
+
+    assert expected in message
+    assert vendors.requests == []
+
+
 # -- refusals ---------------------------------------------------------------------------
 
 
@@ -526,10 +644,11 @@ def test_an_empty_response_refuses(tmp_path):
     )
 
 
-def test_a_status_that_is_not_2xx_refuses(tmp_path):
+@pytest.mark.parametrize("status", [302, 404, 500])
+def test_a_status_that_is_not_2xx_refuses(tmp_path, status):
     root = _lake(tmp_path)
 
-    assert "status 500" in _refused(root, vendor=_Vendors(GLD=_vendor(status=500)))
+    assert f"status {status}" in _refused(root, vendor=_Vendors(GLD=_vendor(status=status)))
 
 
 class _Failing:
@@ -709,6 +828,25 @@ def test_an_undo_of_a_lake_root_with_no_manifest_refuses(tmp_path):
     assert "holds no manifest.jsonl" in str(refused.value)
 
 
+def test_an_undo_inside_the_session_words_itself_as_the_undo(tmp_path):
+    root = _lake(tmp_path)
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, now=datetime(2026, 11, 2, 10, 0, tzinfo=MARKET_TZ))
+
+    assert str(refused.value).startswith("the undo ")
+
+
+def test_an_undo_of_a_ticker_not_onboarded_says_nothing_was_undone(tmp_path):
+    root = _lake(tmp_path)
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, ("USO",))
+
+    message = str(refused.value)
+    assert "nothing was undone" in message and "imported" not in message
+
+
 def test_an_undo_with_nothing_imported_changes_nothing(tmp_path):
     root = _lake(tmp_path)
     before = _snapshot(root)
@@ -727,7 +865,10 @@ def test_the_schwab_command_builds_the_vendor_from_the_config(tmp_path, capsys):
     config = write_config(tmp_path, root)
     built: list[tuple] = []
 
+    seen: list[Path] = []
+
     def factory(token_path, *, api_key, app_secret):
+        seen.append(Path(token_path))
         built.append((Path(token_path).name, api_key, app_secret))
         return _Vendors(GLD=_vendor())
 
@@ -740,6 +881,7 @@ def test_the_schwab_command_builds_the_vendor_from_the_config(tmp_path, capsys):
 
     assert code == 0
     assert built == [("token.json", SCHWAB_API_KEY, SCHWAB_APP_SECRET)]
+    assert seen == [default_token_path()]
     assert "bar_import: GLD: landed 40 of 40 row(s)" in capsys.readouterr().out
 
 
