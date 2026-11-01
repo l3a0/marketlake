@@ -1669,10 +1669,10 @@ sudo ~/marketlake/deploy/vm-deploy.sh --sha "$(git -C ~/marketlake rev-parse HEA
 ```
 
 The terminal stays blank until the run ends, because the script prints its one line
-only then. No run on the VM has been timed yet. A run that restarts the daemon takes at
-least the bootstrap plus the 120 seconds it watches the daemon after the restart, and its
-caps bound the longest run, a rollback included, at 200 minutes. Follow the progress from
-a second shell.
+only then. A run that restarts the daemon takes the bootstrap plus the 120 seconds it
+watches the daemon after the restart. On the VM that has come to 134 to 137 seconds in
+all, and a run that restarts nothing takes about 10. Its caps bound the longest run, a
+rollback included, at 80 minutes. Follow the progress from a second shell.
 
 ```bash
 sudo tail -f /var/lib/marketlake/deploy.log
@@ -1681,8 +1681,8 @@ sudo tail -f /var/lib/marketlake/deploy.log
 Ctrl-C stops only the hand run's wait, which prints `outcome unknown: read deploy.log`.
 The deploy keeps running as `marketlake-deploy.service`, so read its outcome in the log.
 
-A deploy may start from 18:45 to 04:30 Eastern on a weekday night, all of Saturday,
-Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. Outside those hours the script
+A deploy may start from 18:45 to 06:30 Eastern on a weekday night, all of Saturday,
+Sunday until 18:00, and from Sunday 23:30 to Monday 06:30. Outside those hours the script
 refuses with exit 3 and names the next moment one may start. The hours keep the merge and
 the restart away from capture, compaction, the sweep and the Sunday job, with enough room
 that a deploy which rolls back still ends before the jobs start.
@@ -2123,7 +2123,7 @@ powers the VM off only when all six of its checks pass, in this order.
    cgroup. The deploy runs the same check, from `deploy/busy-check.sh`. It covers the
    close+15 compaction and its trim, the 18:30 sweep and the evening upload after it.
 5. **window.** `python -m lake.deploy_window` allows a start now, which keeps the stop out
-   of 08:00 to 18:45 ET on a weekday and 19:30 to 23:30 ET on Sunday, and out of the 210
+   of 08:00 to 18:45 ET on a weekday and 19:30 to 23:30 ET on Sunday, and out of the 90
    minutes before each.
 6. **deploy.** `marketlake-deploy.service` is not running. The script then takes the deploy
    lock and the install lock without waiting, checks the deploy again, and holds both
@@ -2476,8 +2476,8 @@ gh secret list --env deploy --repo l3a0/marketlake
 
 ### The owner's first deploy
 
-A deploy may start, and so may a pull by hand, from 18:45 to 04:30 ET on a weekday
-night, all of Saturday, Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. The
+A deploy may start, and so may a pull by hand, from 18:45 to 06:30 ET on a weekday
+night, all of Saturday, Sunday until 18:00, and from Sunday 23:30 to Monday 06:30. The
 first deploy takes seven steps, in order.
 
 1. Pull on the VM inside those hours and run the manual first deploy that

@@ -46,9 +46,9 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # 10 minutes for delivery, the document's 220-minute timeout, and 10 for setup and
+    # 10 minutes for delivery, the document's 100-minute timeout, and 10 for setup and
     # polling.
-    timeout-minutes: 240
+    timeout-minutes: 120
     # Needs the owner's approval, and holds the deploy role's ARN.
     environment: deploy
     # One deploy at a time. Cancelling a running job would stop only the host's wrapper,

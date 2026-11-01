@@ -29,7 +29,7 @@ rather than the roster, so neither moves a span (marketlake #868). ``deploy/vm-s
 runs this module too, so the VM may stop exactly when a deploy may start.
 
 **The margin refuses a start too close to the next span.** ``vm-deploy.sh`` caps each of
-its steps, and the caps sum to 200 minutes, a rollback included. ``MARGIN`` is 210
+its steps, and the caps sum to 80 minutes, a rollback included. ``MARGIN`` is 90
 minutes, so a deploy that starts at the last moment this allows still finishes, or rolls
 back, before the next span opens. A test of the script checks that its caps sum to less
 than ``MARGIN``.
@@ -63,8 +63,8 @@ LEAD = timedelta(minutes=30)
 TAIL = timedelta(minutes=15)
 
 # The least time that must remain before the next refused span for a deploy to start.
-# ``deploy/vm-deploy.sh`` caps its steps at 200 minutes in all, a rollback included.
-MARGIN = timedelta(minutes=210)
+# ``deploy/vm-deploy.sh`` caps its steps at 80 minutes in all, a rollback included.
+MARGIN = timedelta(minutes=90)
 
 # How many days ahead the search for the next span looks. A week covers every weekday,
 # and the extra day covers a span that ends past midnight.

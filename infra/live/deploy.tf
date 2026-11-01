@@ -33,9 +33,9 @@ resource "aws_ssm_document" "deploy" {
       action = "aws:runShellScript"
       name   = "deploy"
       inputs = {
-        # The 210-minute margin the host keeps before a refused span, plus ten minutes.
-        # The host's caps sum to at most 200 minutes.
-        timeoutSeconds = 13200
+        # The 90-minute margin the host keeps before a refused span, plus ten minutes.
+        # The host's caps sum to at most 80 minutes.
+        timeoutSeconds = 6000
         runCommand     = [file("${path.module}/deploy-step.sh")]
       }
     }]

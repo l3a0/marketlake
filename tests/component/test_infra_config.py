@@ -1077,8 +1077,8 @@ def _check_start(address: str, at: time, days: set[int], stop_script: Path) -> i
        the VM up when the grace lets go.
 
     The third bound asks ``decide`` itself rather than restating its rule. ``decide``
-    still allows a stop at exactly ``MARGIN`` before a span, 04:30 on a weekday and
-    16:00 on a Sunday, so a weekday start at 03:30 or a Sunday start at 15:00 with an
+    still allows a stop at exactly ``MARGIN`` before a span, 06:30 on a weekday and
+    18:00 on a Sunday, so a weekday start at 05:30 or a Sunday start at 17:00 with an
     hour's grace would pass the first two bounds and power off before the session, with
     nothing to start the VM again.
     """
@@ -1171,15 +1171,15 @@ def test_bound_2_reads_the_days_of_the_timer(
 
 
 def test_bound_3_fails_a_grace_that_ends_while_a_stop_is_allowed(tmp_path: Path) -> None:
-    """A 04:00 start with a 20-minute grace lets go at 04:20, before 04:30, the last
+    """A 06:00 start with a 20-minute grace lets go at 06:20, before 06:30, the last
     moment ``decide`` allows a stop before the session. A 30-minute grace lets go at
-    04:30 itself, which ``decide`` still allows. An hour lets go at 05:00."""
+    06:30 itself, which ``decide`` still allows. An hour lets go at 07:00."""
     for seconds in [1200, 1800]:
         short = _script(tmp_path, f"UPTIME_SECONDS={seconds}\n")
         with pytest.raises(AssertionError, match=_BOUND_3_FAILS):
-            _check_start("test", time(4, 0), _WEEKDAYS, short)
+            _check_start("test", time(6, 0), _WEEKDAYS, short)
     hour = _script(tmp_path, "UPTIME_SECONDS=3600\n")
-    assert _check_start("test", time(4, 0), _WEEKDAYS, hour) == 25
+    assert _check_start("test", time(6, 0), _WEEKDAYS, hour) == 25
 
 
 def test_uptime_grace_reads_the_assignment_and_skips_the_reads() -> None:
