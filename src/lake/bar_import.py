@@ -483,15 +483,6 @@ def import_vintages(
             )
         )
 
-    if history is None:
-        # Started before the earliest date, because ``exchange_calendars`` moves a start that is
-        # not a session forward to the next one, and ``is_session`` then raises on the date
-        # itself rather than answering no.
-        earliest = min(bar.day for plan in plans for bar in plan.bars)
-        history = ExchangeCalendar(start=earliest - timedelta(days=_SESSION_LOOKAHEAD_DAYS))
-    for plan in plans:
-        plan.report.missing = _missing_sessions(plan, history)
-
     try:
         master = read_master(root)
         spans = read_capture_spans(root)
@@ -517,6 +508,17 @@ def import_vintages(
                 f"capture span session {first.isoformat()}, which capture covers, so nothing "
                 "was imported"
             )
+
+    # After the span bound, which refuses a date past the calendar's end before
+    # ``is_session`` could raise ``DateOutOfBounds`` on it.
+    if history is None:
+        # Started before the earliest date, because ``exchange_calendars`` moves a start that is
+        # not a session forward to the next one, and ``is_session`` then raises on the date
+        # itself rather than answering no.
+        earliest = min(bar.day for plan in plans for bar in plan.bars)
+        history = ExchangeCalendar(start=earliest - timedelta(days=_SESSION_LOOKAHEAD_DAYS))
+    for plan in plans:
+        plan.report.missing = _missing_sessions(plan, history)
 
     paths = LakePaths(root)
     try:

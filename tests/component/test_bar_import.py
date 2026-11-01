@@ -482,6 +482,16 @@ def test_a_header_read_by_position_would_swap_the_columns(tmp_path):
     assert table.column("close").to_pylist() == [11.0]
 
 
+def test_a_date_past_the_calendars_end_refuses_with_one_line(tmp_path):
+    """``exchange_calendars`` ends its calendar a year ahead and raises past it. Catches the
+    calendar check run before the span bound, which would end the run in a traceback."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0), ("2031-01-06", 2.0)])
+
+    assert "2031-01-06" in _refused(root, [source], _listed((source, "GLD")))
+    assert _bars_files(root) == []
+
+
 def test_a_ticker_not_onboarded_refuses_and_names_onboard(tmp_path):
     root = _lake(tmp_path, ("SPY",))
     source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
