@@ -208,7 +208,8 @@ CHECK_BAR_RESPONSE = "bar_response"
 #
 # It stays at a day, and the reason is slack. The two #362 stamps are both local midnight under
 # *different* UTC offsets, one standard and one daylight, in a month that is daylight
-# throughout, so the vendor's offset is not dependable. Marketlake #380 owns that anomaly.
+# throughout, so the vendor's offset is not dependable. ``DAILY_STAMP_ROLLOVER_HOUR`` is how a daily
+# stamp is read whichever offset it carries.
 #
 # **What #416 changed is not this width.** The span check used to read these two instants back
 # as instants, and the vendor clips to the calendar dates they fall on, so the previous
@@ -222,6 +223,19 @@ CHECK_BAR_RESPONSE = "bar_response"
 # The width's cost is response size, three days of candles rather than one. The selection below
 # drops the neighbours.
 DAILY_WINDOW_MARGIN = timedelta(days=1)
+
+# The Eastern hour from which a daily stamp names the next session rather than its own date.
+# Marketlake #380 decided it, and ``docs/design.md`` carries the measurement and the readings it
+# rejected, under its storage section. The boundary sits after the latest stamp inside a session,
+# a candle stamped at the 16:00 close, and before the earliest on the evening before, UTC midnight
+# at 19:00 EST.
+#
+# It is an integer hour rather than a ``datetime.time``, which is how this package pins a wall-clock
+# moment that is not a session time, the form ``tests/support/enforcement.py`` lets through.
+#
+# It applies to daily stamps only. A minute candle can be stamped as late as 19:59 Eastern, which
+# #421's unflagged recording returned, so :func:`session_of` stays the strict reading for minutes.
+DAILY_STAMP_ROLLOVER_HOUR = 18
 
 # The extended-hours flag a ``freq=1m`` fetch sets, and why it is a false rather than left unset.
 #
@@ -377,13 +391,13 @@ class StampNotAnInstant(BarsError):
     digest and the Friday ``pmset`` wake, which are all written after the pieces block.
     ``docs/design.md`` states the rule: one named line and exit 2 rather than a stack.
 
-    **Two readers outside this module call :func:`session_of`, and only one can reach this.**
-    ``lake.settle`` can, on ``expiration_date``, which ``journal`` keeps as the vendor's ISO
-    string verbatim rather than minting it. It catches this and reads the stamp as unreadable,
+    **Three readers outside this module name a session from a stamp, and only one can reach
+    this.** ``lake.settle`` can, on ``expiration_date``, which ``journal`` keeps as the vendor's
+    ISO string verbatim rather than minting it. It catches this and reads the stamp as unreadable,
     which leaves ``ExpirationUnreadable`` as the refusal that view already documents.
-    ``loader._in_view`` cannot, and the reason is ordering rather than anything it does:
-    ``load_bars`` runs ``_sorted_by_instant`` over the same table first, which refuses an
-    unreadable stamp in ``LoadError`` vocabulary before ``_in_view`` sees it.
+    ``loader._in_view`` and ``continuity._closes`` cannot, and the reason is ordering rather than
+    anything they do: ``load_bars`` runs ``_sorted_by_instant`` over the same table first, which
+    refuses an unreadable stamp in ``LoadError`` vocabulary before either sees it.
     """
 
     def __init__(self, bar_ts: str) -> None:
@@ -553,8 +567,9 @@ def session_of(bar_ts: str) -> date:
     the calendar module's, which is what keeps this from naming a session time of its own.
 
     Marketlake #362 measured this against a live recording rather than leaving it assumed. Two
-    daily stamps came back, at 00:00 and 01:00 Eastern, and this reading names the right session
-    for both.
+    daily stamps came back, at 00:00 and 01:00 Eastern, and in daylight time this reading names the
+    right session for both. A daily stamp is read by :func:`daily_session_of` since marketlake
+    #380, for the reason the paragraph below gives.
 
     **Which session each stamp names was fixed from outside the recording.** The stamps alone do
     not settle it: two candles are equally consistent with a stamp naming the session it opens
@@ -563,14 +578,14 @@ def session_of(bar_ts: str) -> date:
     candle's values against a second vendor's SPY daily bar, which agrees to every decimal and
     stamps it on 2026-09-15. That cross-check is recorded on #362.
 
-    **It is not settled for standard-time season.** The two stamps are both local midnight under
-    different UTC offsets, one standard and one daylight, in a month that is daylight throughout.
-    Mirrored into winter the same slip crosses the date backwards: 04:00 UTC in January is 23:00
-    Eastern on the previous day, and this returns that previous date. Marketlake #380 owns it.
-
-    That direction fails closed. A stamp this reading places on the wrong date leaves the
-    selection below with no candle for the session, the span check refuses, and nothing lands.
-    The ticker-day is held with a finding instead of landing a bar under the wrong day.
+    **It is the minute reading, and a daily stamp is read by :func:`daily_session_of`.** The two
+    #362 stamps are both local midnight under different UTC offsets, one standard and one
+    daylight, in a month that is daylight throughout. Mirrored into winter the same slip crosses
+    the date backwards: 04:00 UTC in January is 23:00 Eastern on the previous day, and this
+    returns that previous date. Marketlake #380 measured the cost, which is not always a stall:
+    when the next session's candle carries that spelling, this reading hands it to the session
+    being fetched, and only the close gate stood between it and the partition.
+    :func:`bar_session` picks the reading by frequency.
 
     **A stamp carrying no offset is refused rather than read.** ``StampNotAnInstant`` says why.
     A naive stamp resolves against the process's own timezone, so this would answer by the
@@ -592,18 +607,61 @@ def select_session_rows(rows: Sequence[dict], window: BarWindow) -> list[dict]:
     that session and this filters nothing. It still runs, because a response carrying a candle
     from another session is exactly what the span check is there to refuse, and silently
     keeping it would put another session's minute in this session's partition.
+
+    The session each stamp names is :func:`bar_session`'s at the window's own frequency, so a
+    daily candle is read by the rule :func:`daily_session_of` carries.
     """
-    return [row for row in rows if session_of(str(row["bar_ts"])) == window.session]
+    return [row for row in rows if bar_session(str(row["bar_ts"]), window.freq) == window.session]
+
+
+def daily_session_of(bar_ts: str) -> date:
+    """The session a daily bar's own stamp names, whichever UTC offset the vendor stamped it at.
+
+    A stamp before ``DAILY_STAMP_ROLLOVER_HOUR`` Eastern names its own Eastern date, and one at or
+    after it names the next. ``DAILY_STAMP_ROLLOVER_HOUR`` names the band the boundary sits in. So
+    05:00 UTC, the stamp every landed bar carries, names its own date in both seasons, and 04:00
+    UTC, which is 23:00 the evening before in standard time, names the same session rather than the
+    one before it. Marketlake #380.
+
+    It gives up one convention, a stamp at the end of the session's UTC day: 23:59 UTC is 19:59 EDT
+    and names the next session here. No source this lake reads stamps that way. The vendor's
+    stamps sit near Eastern midnight, and an imported bar is stamped at Eastern midnight.
+
+    The naive-stamp refusal is :func:`_as_instant`'s and the zone is ``MARKET_TZ``, both shared
+    with :func:`session_of`, so neither is a second copy.
+    """
+    eastern = _as_instant(bar_ts).astimezone(MARKET_TZ)
+    if eastern.hour >= DAILY_STAMP_ROLLOVER_HOUR:
+        return eastern.date() + timedelta(days=1)
+    return eastern.date()
+
+
+def bar_session(bar_ts: str, freq: str) -> date:
+    """The session a bar stamp names, read by its frequency's rule.
+
+    A daily stamp is read by :func:`daily_session_of` and a minute stamp by :func:`session_of`.
+    Every reader that turns a landed bar's ``bar_ts`` into a session comes here or to one of the
+    two directly, so the selection that lands a bar and the views that read it back cannot name
+    two different sessions for one stamp.
+
+    It refuses no frequency. ``loader.load_bars`` calls it and decided in writing against a
+    second frequency guard, so anything other than ``1d`` takes the minute reading, which is the
+    strict one, and a frequency nothing fetches is refused where the fetch is made.
+    """
+    if freq == DAILY_FREQ:
+        return daily_session_of(bar_ts)
+    return session_of(bar_ts)
 
 
 def _as_instant(bar_ts: str) -> datetime:
     """One bars stamp as a UTC instant, refusing one that carries no offset.
 
-    This is the module's single rule for turning a ``bar_ts`` string into an instant, and the
-    three readers that need one share it: :func:`session_of` names the session a stamp belongs
-    to, :func:`_instant` places a row against the requested window, and :func:`_bar_close` picks
-    the session's last candle. Writing the rule once is the point. Two of those readers were
-    written apart and drifted, which is what marketlake #385 and #386 are.
+    This is the module's single rule for turning a ``bar_ts`` string into an instant, and the four
+    readers that need one share it: :func:`session_of` and :func:`daily_session_of` name the session
+    a minute stamp and a daily stamp belong to, :func:`_instant` places a row against the requested
+    window, and :func:`_bar_close` picks the session's last candle. Writing the rule once is the
+    point. Two of those readers were written apart and drifted, which is what marketlake #385 and
+    #386 are.
 
     ``StampNotAnInstant`` carries the argument for refusing a naive stamp rather than resolving
     it against the process's timezone.
@@ -732,17 +790,35 @@ def check_bar_span(
         # This comparison covers all seven under all nine, and asks the vendor for nothing it was
         # not already asked for.
         #
-        # The bound dates are read in ``MARKET_TZ`` through the same rule ``session_of`` uses, so
-        # the window and the candle are placed by one clock rather than by the process's own.
+        # The bound dates are read in ``MARKET_TZ``, so the window and the candle are placed by one
+        # clock rather than by the process's own. The bounds are the request's own instants and
+        # keep their plain Eastern dates, because those are what the vendor clips to.
+        #
+        # **A candle is outside only when both readings of its stamp put it outside.** Its plain
+        # Eastern date is where the vendor's clip can place it, and :func:`daily_session_of` is
+        # the session it names. The two differ for a stamp from 18:00 onward, and the vendor's
+        # own clip zone is unmeasured, so a response honouring the bounds can carry the session
+        # after the last date stamped on that last date's evening. 04:00 UTC in standard time
+        # and UTC midnight in any season both do. Reading the candle only by its session refused
+        # that response, which marketlake #380's third plan audit executed through the sweep. A
+        # response that ignored the bounds still reaches years outside them under either reading.
+        # The price is one session of slack at the far edge: under stamps at UTC midnight, or at
+        # 04:00 UTC in standard time, a response reaching exactly one session past the bracket
+        # passes. The selection still lands only the session's own candle.
         first = window.start.astimezone(MARKET_TZ).date()
         last = window.end.astimezone(MARKET_TZ).date()
-        outside = [row for row in built if not first <= session_of(str(row["bar_ts"])) <= last]
+        outside = [
+            row
+            for row in built
+            if not first <= session_of(str(row["bar_ts"])) <= last
+            and not first <= daily_session_of(str(row["bar_ts"])) <= last
+        ]
         # Covered counts the sessions the response actually carried, not just the one that was
         # wanted, so a response reaching outside the bracket files a pair that says so. Setting
         # it from ``selected`` alone would file "1.0 against 1.0" on a refused fetch, and an
         # operator reading the withheld file would see full coverage on a bar that never
         # landed.
-        sessions = {session_of(str(row["bar_ts"])) for row in built}
+        sessions = {daily_session_of(str(row["bar_ts"])) for row in built}
         covered = float(len(sessions)) if outside else (1.0 if selected else 0.0)
         return SpanCoverage(covers=bool(selected) and not outside, covered=covered, requested=1.0)
     outside = [row for row in built if not window.start <= _instant(row) < window.end]
@@ -2558,6 +2634,7 @@ __all__ = [
     "CHECK_BAR_SPAN",
     "CLOSE_CROSS_TOLERANCE",
     "CLOSE_VALUE_ABSENT",
+    "DAILY_STAMP_ROLLOVER_HOUR",
     "DAILY_WINDOW_MARGIN",
     "MINUTE_EXTENDED_HOURS",
     "BackfillPlan",
@@ -2576,9 +2653,11 @@ __all__ = [
     "backfill_bars",
     "read_capture_spans",
     "backfill_bars_from_config",
+    "bar_session",
     "bar_window",
     "check_bar_span",
     "check_close_cross",
+    "daily_session_of",
     "fetch_session_bars",
     "fetch_session_bars_from_config",
     "main",

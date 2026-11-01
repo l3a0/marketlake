@@ -418,6 +418,22 @@ def test_the_adjusted_underlying_is_continuous_where_the_as_traded_one_is_not(fi
     assert moneyness[0] == pytest.approx(moneyness[1])
 
 
+def test_a_daily_bar_stamped_the_evening_before_joins_its_own_session(fixture_lake):
+    """Marketlake #380: the close a session joins is read by the daily stamp's own rule.
+
+    Each bar is stamped at UTC midnight on its session, 20:00 Eastern the evening before, so its
+    own Eastern date is the session before it. Read by that date, every close would join the
+    previous session and the first would join none.
+    """
+    bars = {d: [_bar(d, c, stamp=f"{d}T00:00:00.000+00:00")] for d, c in CLOSES.items()}
+    root = _lake(fixture_lake, _adjusted_chains(), bars=bars, master=_master(), split=True)
+
+    rows = _by_session(continuity_view(TICKER, OLD, lake_root=root))
+
+    assert [rows[day]["underlying_close"] for day in (S1, S2, S3)] == [330.0, 333.0, 222.0]
+    assert [rows[day]["adjusted_underlying_close"] for day in (S1, S2, S3)] == [220.0, 222.0, 222.0]
+
+
 # 4 ---------------------------------------------------------------------------------------
 
 

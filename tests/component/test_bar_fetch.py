@@ -16,14 +16,13 @@ Two properties of the fixtures are worth naming before the tests.
    asked for. The cassette key carries the window, so a drifted fetch would miss every
    recording, and asserting the recorded call says which window rather than only that one
    was found.
-2. **The daily stamps are one of the two instants a recording showed.** Marketlake #362
-   recorded ``freq=1d`` live and found the stamp falls on the session's Eastern date, at or
-   shortly after midnight, rather than at midnight exactly. The two candles it caught were
-   23 hours apart, one at 00:00 Eastern and one at 01:00. These fixtures use the midnight
-   spelling, which is the first of the two, and
-   ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` holds the other
-   against the recording itself. What the code reads off a stamp is the session, which is
-   what survives the hour of wander between them.
+2. **The daily stamps are the vendor's own.** ``_daily_candle`` stamps 05:00 UTC, which every
+   landed daily bar the lake was measured to hold carries. Marketlake #362's recording caught a
+   second spelling, 04:00 UTC, and
+   ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` holds it against the
+   recording itself. What the code reads off a stamp is the session, through
+   ``bars.daily_session_of``, and marketlake #380 is why that reading has an 18:00 Eastern day
+   boundary rather than the stamp's own Eastern date.
 """
 
 from __future__ import annotations
@@ -267,16 +266,15 @@ def _dense_minute_candles(
 
 
 def _daily_candle(session: date = SESSION, *, close: float = SETTLED_CLOSE) -> dict:
-    """One daily candle, stamped at Eastern midnight of its session.
+    """One daily candle, stamped at 05:00 UTC on its session, the way the vendor stamps one.
 
-    Marketlake #362's recording caught two daily stamps, at 00:00 and at 01:00 Eastern of
-    their sessions, so midnight is one of the two observed spellings rather than a fixed
-    convention. What the code reads off the stamp is the session, and that reading gives the
-    right answer at either hour, which is why an exact instant here is a fixture choice and
-    not a rule. The recording itself is replayed by
-    ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session``.
+    Every one of the 44 daily bars the laptop lake held on 2026-11-01 carries that stamp, which
+    is 01:00 Eastern in daylight time and so not a midnight. Marketlake #380 asked for a fixture
+    off midnight, so a comparison tightened from sessions to instants cannot pass on the
+    convenient case alone. #362's recording caught a second spelling, at 04:00 UTC, which
+    ``test_the_recorded_daily_stamps_each_name_their_own_eastern_session`` replays.
     """
-    when = datetime.fromisoformat(f"{session.isoformat()}T00:00:00-04:00")
+    when = datetime(session.year, session.month, session.day, 5, 0, tzinfo=UTC)
     return bars_candle(when, open_=645.0, high=651.0, low=644.0, close=close, volume=70_000_000)
 
 
@@ -1701,24 +1699,48 @@ def test_a_daily_response_lands_the_candle_whose_stamp_maps_to_the_session(
     table = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ))
     row = table.to_pylist()[0]
     assert row["close"] == SETTLED_CLOSE, "the first candle landed rather than the session's"
-    assert bars.session_of(row["bar_ts"]) == SESSION
+    assert bars.daily_session_of(row["bar_ts"]) == SESSION
 
 
-def test_a_stamp_names_its_eastern_session_rather_than_its_utc_date(fixture_lake: FixtureLake):
-    """The session a stamp names is its Eastern date, and the two differ in the evening.
+@pytest.mark.parametrize(
+    ("before", "at"),
+    [
+        ("2026-09-14T17:59:59-04:00", "2026-09-14T18:00:00-04:00"),
+        ("2027-01-14T17:59:59-05:00", "2027-01-14T18:00:00-05:00"),
+    ],
+    ids=["daylight", "standard"],
+)
+def test_a_daily_stamp_names_the_next_session_from_six_in_the_evening(before: str, at: str):
+    """The day boundary a daily stamp is read by is 18:00 Eastern, in both seasons.
 
-    A bar stamped at 22:00 Eastern on the session is 02:00 UTC the next day, so a reading that
-    took the UTC date would file it under the wrong session. #362's recording settled that
-    Schwab stamps a daily candle on the session's own Eastern date, at or shortly after
-    midnight, and this is the rule that reads it whichever hour it lands on: the zone comes
-    from ``lake.calendar``, so nothing here names a session time of its own.
-
-    The sweep is driven with the same stamp, so the rule is pinned where it is used rather
-    than only on the helper.
+    Marketlake #380 placed it after the latest stamp a candle carries inside its own session, the
+    16:00 close, and before the earliest one on the evening before, UTC midnight at 19:00 EST. At
+    18:00 the stamp's UTC date is still its own, so a reading that took the UTC date fails here too.
+    The stamps are spelled with literal offsets rather than built from
+    ``DAILY_STAMP_ROLLOVER_HOUR``, so moving the constant fails here. A minute stamp keeps its own
+    Eastern date at the same instant, because a minute candle can sit at 19:59.
     """
-    evening = datetime.fromisoformat("2026-09-14T22:00:00-04:00")
-    assert evening.astimezone(UTC).date() == date(2026, 9, 15)
-    assert bars.session_of(evening.astimezone(UTC).isoformat()) == SESSION
+    day = date.fromisoformat(before[:10])
+    as_utc = [datetime.fromisoformat(stamp).astimezone(UTC).isoformat() for stamp in (before, at)]
+    close = datetime.fromisoformat(f"{before[:10]}T16:00:00{before[19:]}").astimezone(UTC)
+
+    assert bars.daily_session_of(close.isoformat()) == day, "a close stamp named the next session"
+    assert bars.daily_session_of(as_utc[0]) == day
+    assert bars.daily_session_of(as_utc[1]) == day + timedelta(days=1)
+    assert bars.bar_session(as_utc[1], DAILY_FREQ) == day + timedelta(days=1)
+    assert bars.bar_session(as_utc[1], MINUTE_FREQ) == day
+    assert bars.session_of(as_utc[1]) == day
+
+
+def test_a_daily_stamp_the_evening_before_lands_under_the_next_session(fixture_lake: FixtureLake):
+    """The boundary, driven through the sweep rather than only through the helper.
+
+    UTC midnight on the session is 20:00 Eastern the evening before, which is one of the
+    conventions marketlake #380 lists. The stamp's own Eastern date is the day before the
+    session, so a reading without the boundary lands nothing.
+    """
+    evening = datetime.fromisoformat("2026-09-13T20:00:00-04:00")
+    assert evening.astimezone(UTC).date() == SESSION
 
     root = _lake(fixture_lake)
     candle = bars_candle(evening, open_=645.0, high=651.0, low=644.0, close=SETTLED_CLOSE, volume=1)
@@ -1726,6 +1748,91 @@ def test_a_stamp_names_its_eastern_session_rather_than_its_utc_date(fixture_lake
 
     (landed,) = result.landed
     assert landed.session == SESSION and landed.rows == 1
+
+
+# The first standard-time week after 2026-11-01, where marketlake #380's slip first reaches the
+# live sweep. Monday's bar is fetched once Tuesday has sealed, and its bracket runs from Sunday's
+# date to Tuesday's, so the response carries Tuesday's candle beside Monday's.
+WINTER_MONDAY = date(2026, 11, 2)
+WINTER_FOLLOWING = date(2026, 11, 3)
+
+
+@pytest.mark.parametrize(
+    ("tuesday_utc_hour", "tuesday_close"),
+    [(5, 700.0), (4, SETTLED_CLOSE * (1 + 1e-4))],
+    ids=["stall", "next-session-candle"],
+)
+def test_a_standard_time_daily_stamp_at_the_daylight_offset_lands_under_its_own_session(
+    fixture_lake: FixtureLake, tuesday_utc_hour: int, tuesday_close: float
+):
+    """Marketlake #380: 04:00 UTC in standard time is 23:00 the evening before, and still names
+    its own session.
+
+    Monday's candle is stamped at the daylight offset's midnight, out of season. Read by its own
+    Eastern date it names Sunday, and the two cases are the two ways that went wrong.
+
+    1. ``stall``: Tuesday's candle carries the usual 05:00 UTC stamp, so Monday has no candle and
+       the span check refuses. Nothing lands, every night.
+    2. ``next-session-candle``: Tuesday's candle slips the same way, so it reads as Monday's, the
+       span check covers, and its close sits inside ``CLOSE_CROSS_TOLERANCE`` of Monday's 16:15
+       quote. Tuesday's bar lands in Monday's partition and no gate refuses it.
+
+    Both carry Wednesday's candle too, stamped 04:00 UTC, which is 23:00 Tuesday, the bracket's
+    last date. A retry after Wednesday trades can receive it from a vendor clipping by the stamp's
+    own date. It names Wednesday and still sits on Tuesday's date, so it is not the bounds ignored.
+
+    The window and the quote minute are spelled as literals in standard time, so a test that
+    moved with the production window builder could not pass here by accident.
+    """
+    quotes = {
+        ("SPY", WINTER_MONDAY): [_quote_row(WINTER_MONDAY, minute="21:15")],
+        ("SPY", WINTER_FOLLOWING): [_quote_row(WINTER_FOLLOWING, minute="21:15")],
+    }
+    root = _lake(fixture_lake, quotes=quotes)
+    monday = bars_candle(
+        datetime(2026, 11, 2, 4, 0, tzinfo=UTC),
+        open_=645.0,
+        high=651.0,
+        low=644.0,
+        close=SETTLED_CLOSE,
+        volume=1,
+    )
+    tuesday = bars_candle(
+        datetime(2026, 11, 3, tuesday_utc_hour, 0, tzinfo=UTC),
+        open_=651.0,
+        high=702.0,
+        low=650.0,
+        close=tuesday_close,
+        volume=1,
+    )
+    start = datetime.fromisoformat("2026-11-01T09:30:00-05:00")
+    end = datetime.fromisoformat("2026-11-03T16:00:00-05:00")
+    wednesday = bars_candle(
+        datetime(2026, 11, 4, 4, 0, tzinfo=UTC),
+        open_=700.0,
+        high=703.0,
+        low=699.0,
+        close=701.0,
+        volume=1,
+    )
+    candles = [monday, tuesday, wednesday]
+    cassette = Cassette(
+        interactions=tuple(bars_interactions("SPY", DAILY_FREQ, [(start, end, candles)]))
+    )
+
+    result = fetch_session_bars(
+        lake_root=root,
+        vendor=_RecordingVendor(cassette),
+        clock=ManualClock(datetime(2026, 11, 5, 0, 0, tzinfo=UTC)),
+        calendar=weekday_sessions(WINTER_MONDAY),
+        roster=_roster({"SPY": ["1d"]}),
+        session=WINTER_MONDAY,
+    )
+
+    (landed,) = result.landed
+    assert landed.session == WINTER_MONDAY and landed.rows == 1
+    table = pa.parquet.read_table(_partition(root, "SPY", DAILY_FREQ, WINTER_MONDAY))
+    assert table.column("close").to_pylist() == [SETTLED_CLOSE], "Tuesday's candle landed"
 
 
 def test_a_candle_with_no_stamp_at_all_lands_no_row_either(fixture_lake: FixtureLake):
@@ -1756,10 +1863,8 @@ def test_a_candle_with_no_stamp_at_all_lands_no_row_either(fixture_lake: Fixture
 def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
     """Marketlake #362: the daily convention, held against a recording rather than a guess.
 
-    Nearly every daily fixture in this module stamps an exact Eastern midnight, through
-    ``_daily_candle``, which was a fixture choice made before any ``freq=1d`` response had been
-    seen. The one exception is the 22:00 Eastern candle named below, which exists to separate
-    the Eastern date from the UTC one. This test replays the recording that settled the
+    Nearly every daily fixture in this module stamps 05:00 UTC through ``_daily_candle``, the
+    stamp every landed bar carries. This test replays the recording that first showed the
     convention, so what the suite rests on is an observed fact.
 
     ``tests/cassettes/spy_daily.json`` is sanitized rather than raw, which is the rule
@@ -1770,13 +1875,13 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
 
     Two properties are asserted, and the second is why the first is worth a test.
 
-    1. Each stamp's Eastern date names its own session, so ``session_of`` is right on real
-       stamps and not only on the fixture's.
+    1. Each stamp names its own session through ``daily_session_of``, so the daily reading is
+       right on real stamps and not only on the fixture's.
     2. The two stamps are 23 hours apart, not 24, and only one of them is midnight. Both are
        local midnight under *different* UTC offsets, one standard and one daylight, in a month
        that is daylight throughout, so the vendor's offset is not dependable. Mirrored into
-       standard-time season the same slip would cross the date backwards and this reading would
-       return the wrong one. Marketlake #380 owns that.
+       standard-time season the same slip crosses the Eastern date backwards, which is why
+       marketlake #380 gave the daily reading its 18:00 boundary.
 
     **Which session each stamp names came from outside the recording, and the expectation below
     is not read off ``session_of``.** Two candles alone do not separate a stamp naming the
@@ -1788,11 +1893,9 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
 
     **This test cannot catch a reading that took the UTC date, and no daily recording could.**
     A stamp at 00:00 or 01:00 Eastern is 04:00 or 05:00 the same day in UTC, so both readings
-    give the same answer on every candle here. Mutating ``session_of`` to read the UTC date
-    leaves this test passing. What catches that is
-    ``test_a_stamp_names_its_eastern_session_rather_than_its_utc_date``, which drives a 22:00
-    Eastern stamp because the two dates only diverge in the evening. The two tests hold
-    different halves and neither replaces the other.
+    give the same answer on every candle here. What separates the daily reading from the UTC
+    date is the hours between 18:00 Eastern and UTC midnight, which
+    ``test_a_daily_stamp_names_the_next_session_from_six_in_the_evening`` drives.
     """
     vendor = CassetteVendor(load_cassette(CASSETTES / "spy_daily.json"))
     start = datetime.fromisoformat("2026-09-15T04:00:00+00:00")
@@ -1811,7 +1914,7 @@ def test_the_recorded_daily_stamps_each_name_their_own_eastern_session():
         extended_hours=None,
     )
 
-    sessions = [bars.session_of(str(row["bar_ts"])) for row in rows]
+    sessions = [bars.daily_session_of(str(row["bar_ts"])) for row in rows]
     assert sessions == [date(2026, 9, 15), date(2026, 9, 16)], (
         "a recorded daily stamp did not name its own Eastern session"
     )
@@ -2422,7 +2525,7 @@ def test_the_daily_check_refuses_a_bracket_read_back_as_instants():
     # and QQQ on 2026-09-15.
     outside = [row for row in built if not window.start <= bars._instant(row) < window.end]
     assert [row["close"] for row in outside] == [651.0]
-    assert float(len({bars.session_of(str(row["bar_ts"])) for row in built})) == 3.0
+    assert float(len({bars.daily_session_of(str(row["bar_ts"])) for row in built})) == 3.0
 
 
 def test_daily_containment_does_not_rest_on_the_vendors_own_day_boundary():
@@ -2441,8 +2544,12 @@ def test_daily_containment_does_not_rest_on_the_vendors_own_day_boundary():
     seven under one and four of seven under the other eight. A date comparison covers all seven
     under all nine, and asks the vendor for nothing it was not already asked for.
 
-    This holds the property that buys: every candle stamped anywhere within the bracket's first
-    or last Eastern date is contained, whatever hour the vendor chose to stamp it at.
+    This holds the property that buys: every candle whose stamp names a session on the bracket's
+    first or last Eastern date is contained, whatever hour the vendor chose to stamp it at. A stamp
+    names its session by ``DAILY_STAMP_ROLLOVER_HOUR`` since marketlake #380, so a neighbour stamped
+    the evening before its own date is contained too. So is one stamped from 18:00 on the last date,
+    which names the session after it, because the vendor's clip can place a candle by the stamp's
+    own date, so a stamp still dated inside the bracket is never read as the bounds ignored.
     """
     from lake.session import SessionClock
 
@@ -2451,15 +2558,76 @@ def test_daily_containment_does_not_rest_on_the_vendors_own_day_boundary():
     window = bar_window(DAILY_FREQ, bounds)
     own = {"bar_ts": f"{session.isoformat()}T01:00:00-04:00", "close": 652.0}
 
-    for hour in ("00:00:00", "01:00:00", "09:29:59", "13:00:00", "23:59:59"):
+    stamps = (
+        [
+            (f"2026-09-14T{hour}-04:00", f"2026-09-16T{hour}-04:00")
+            for hour in ("00:00:00", "01:00:00", "09:29:59", "13:00:00", "17:59:59")
+        ]
+        + [
+            (f"2026-09-13T{hour}-04:00", f"2026-09-15T{hour}-04:00")
+            for hour in ("18:00:00", "23:59:59")
+        ]
+        + [("2026-09-14T01:00:00-04:00", f"2026-09-16T{hour}-04:00") for hour in ("18:00", "23:59")]
+    )
+    for before, after in stamps:
+        hour = after[11:19]
         neighbours = [
-            {"bar_ts": f"2026-09-14T{hour}-04:00", "close": 651.0},
-            {"bar_ts": f"2026-09-16T{hour}-04:00", "close": 653.0},
+            {"bar_ts": before, "close": 651.0},
+            {"bar_ts": after, "close": 653.0},
         ]
         built = [neighbours[0], own, neighbours[1]]
         span = bars.check_bar_span(built, bars.select_session_rows(built, window), window)
         assert span.covers is True, f"a neighbour stamped at {hour} was counted outside"
         assert (span.covered, span.requested) == (1.0, 1.0)
+
+
+def test_a_refused_daily_fetch_counts_the_sessions_its_stamps_name():
+    """The ``covered`` a refused daily fetch files counts sessions by the daily reading.
+
+    The session's own candle is stamped 01:00 Eastern and the next one 20:00 the same evening,
+    which is UTC midnight on the next session. Read by their Eastern dates the two would be one
+    session, so a far-off candle beside them would file 2.0 rather than the 3.0 the response
+    carried.
+    """
+    window = bars.BarWindow(
+        session=SESSION,
+        freq=DAILY_FREQ,
+        start=OPEN_ET - DAY_MARGIN,
+        end=CLOSE_ET + DAY_MARGIN,
+        extended_hours=None,
+    )
+    built = [
+        {"bar_ts": "2026-08-14T05:00:00+00:00", "close": 600.0},
+        {"bar_ts": "2026-09-14T05:00:00+00:00", "close": 650.0},
+        {"bar_ts": "2026-09-15T00:00:00+00:00", "close": 651.0},
+    ]
+    span = bars.check_bar_span(built, bars.select_session_rows(built, window), window)
+    assert span.covers is False
+    assert (span.covered, span.requested) == (3.0, 1.0)
+
+
+def test_a_refused_minute_fetch_reads_its_evening_candle_by_its_own_date():
+    """A minute selection keeps the strict reading, so a refused fetch files what it received.
+
+    The response carries the session's open, its last regular minute and a candle at 19:59
+    Eastern, the shape of marketlake #421's unflagged recording. The evening candle names the
+    session under the minute reading, so the span check files 630 minutes against 390. Read by the
+    daily rule it would name the next session and drop out, and the refused fetch would file 390
+    against 390, which reads as full coverage on a bar that never landed.
+    """
+    from lake.session import SessionClock
+
+    bounds = SessionClock(ManualClock(FIRST_NIGHT), weekday_sessions(MONDAY)).bounds(SESSION)
+    window = bar_window(MINUTE_FREQ, bounds)
+    built = [
+        {"bar_ts": "2026-09-14T13:30:00+00:00", "close": 648.0},
+        {"bar_ts": "2026-09-14T19:59:00+00:00", "close": 650.0},
+        {"bar_ts": "2026-09-14T23:59:00+00:00", "close": 651.0},
+    ]
+    selected = bars.select_session_rows(built, window)
+    assert len(selected) == 3, "the evening candle was read by the daily rule"
+    span = bars.check_bar_span(built, selected, window)
+    assert (span.covers, span.covered, span.requested) == (False, 630.0, 390.0)
 
 
 def test_the_daily_bounds_are_dated_in_the_markets_own_zone():
@@ -2966,13 +3134,16 @@ def test_a_stamp_carrying_no_offset_is_refused_by_every_reader_in_the_module():
     process's own timezone, so the same stamp answered 2026-09-16 on a machine set to Eastern
     and 2026-09-15 on one set to UTC, with nothing raised either way.
 
-    All three readers are driven, because one strict reader beside two lenient ones is the
-    second rule the fix exists to remove. The refusal names the offset form to pass, which is
-    what ``docs/design.md`` asks of onboarding's own naive-instant refusal.
+    All four readers are driven, because one strict reader beside lenient ones is the second rule
+    the fix exists to remove. ``daily_session_of`` joined them with marketlake #380. The refusal
+    names the offset form to pass, which is what ``docs/design.md`` asks of onboarding's own
+    naive-instant refusal.
     """
     naive = "2026-09-16T01:00:00"
     with pytest.raises(bars.StampNotAnInstant, match="carries no UTC offset"):
         bars.session_of(naive)
+    with pytest.raises(bars.StampNotAnInstant):
+        bars.daily_session_of(naive)
     with pytest.raises(bars.StampNotAnInstant):
         bars._instant({"bar_ts": naive})
     with pytest.raises(bars.StampNotAnInstant):

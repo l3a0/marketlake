@@ -1082,6 +1082,7 @@ def load_bars(
     ordered = _sorted_by_instant(table, BAR_TS_COLUMN, freq, ticker, _range_text(start, end))
     return _in_view(
         ordered,
+        freq=freq,
         adjust=adjust,
         root=root,
         ticker=ticker,
@@ -1343,6 +1344,7 @@ def _read_bars(
 def _in_view(
     table: pa.Table,
     *,
+    freq: str,
     adjust: str,
     root: Path,
     ticker: str,
@@ -1360,12 +1362,17 @@ def _in_view(
     one-way the same way. ``adjust='none'`` needs neither module, so the import sits on the one
     path that needs it.
 
-    A bar's session comes from ``bars.session_of`` rather than from the ``date=`` level of the
-    partition it was read out of. The path level is free and the two agree on every partition
-    the writer wrote, because ``select_session_rows`` filters every landed row through that same
-    function. ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and reading the
-    path instead would mint a second definition of a bar's session to get the answer the first
-    one already gives.
+    A bar's session comes from ``bars.bar_session`` at the read's own ``freq`` rather than from
+    the ``date=`` level of the partition it was read out of. The path level is free and the two
+    agree on every partition the writer wrote, because ``select_session_rows`` filters every
+    landed row through that same function. The frequency matters because a daily stamp names its
+    session by a later day boundary than a minute stamp does, which marketlake #380 decided. A
+    partition landed before #380 went through the strict reading, and every daily stamp the lake
+    was measured to hold reads alike under both. Nothing checks that a row's session equals its
+    ``date=``, which marketlake #967 holds.
+    ``journal.py`` pins that a bar's session is decided by ``bar_ts``, and reading the path
+    instead would mint a second definition of a bar's session to get the answer the first one
+    already gives.
 
     An adjusted view refuses a row marketlake did not capture before it reads anything else:
     before the actions ledger, before the missing-column refusal and before the
@@ -1387,7 +1394,7 @@ def _in_view(
     # ``lake.bars`` imports ``LoadError`` and ``load_quotes``, so either at module level fails
     # at interpreter start rather than at call time.
     from lake import actions
-    from lake.bars import session_of
+    from lake.bars import bar_session
 
     if INSTRUMENT_ID_COLUMN not in table.column_names:
         raise LoadError(
@@ -1415,7 +1422,7 @@ def _in_view(
                 "actions and hand back the as-traded price under an adjusted name. Read it with "
                 f"adjust={ADJUST_NONE!r}."
             )
-        session = session_of(str(stamp))
+        session = bar_session(str(stamp), freq)
         splits, dividends = events.get(instrument, ((), ()))
 
         # Strictly after, never on or after. An ex-date is the first session that trades at the

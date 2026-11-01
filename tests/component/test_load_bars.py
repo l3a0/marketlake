@@ -327,6 +327,75 @@ def test_split_leaves_the_ex_dates_own_bar_alone(fixture_lake: FixtureLake):
     assert _closes(table) == [300.0, 310.0]
 
 
+def test_a_daily_bar_stamped_the_evening_before_is_adjusted_by_its_own_session(
+    fixture_lake: FixtureLake,
+):
+    """Marketlake #380: the session an ex-date is compared against is the daily stamp's own.
+
+    The three sessions sit in standard time and each bar is stamped 04:00 UTC, midnight at the
+    daylight offset, which is 23:00 Eastern the evening before. Read by that Eastern date the
+    ex-date's own bar would fall before the ex-date and be halved.
+    """
+    days = ("2026-11-02", "2026-11-03", "2026-11-04")
+    root = _lake(
+        fixture_lake,
+        {
+            (DAILY, day): [_bar(day, close, minute="04:00")]
+            for day, close in zip(days, (600.0, 300.0, 310.0), strict=True)
+        },
+    )
+    _split(root, ex_date=days[1])
+
+    table = load_bars(TICKER, DAILY, lake_root=root, adjust=ADJUST_SPLIT)
+
+    assert _closes(table) == [300.0, 300.0, 310.0]
+
+
+def test_a_minute_bar_in_the_evening_is_adjusted_by_its_own_date(fixture_lake: FixtureLake):
+    """The daily rule's later day boundary is not a minute bar's, so the loader reads by ``freq``.
+
+    A minute candle at 18:30 Eastern on the session before the ex-date is still that session's,
+    so a split divides it. Read by the daily rule it would name the ex-date and stay whole.
+    """
+    root = _lake(
+        fixture_lake,
+        {
+            (MINUTE, BEFORE): [_bar(BEFORE, 600.0, freq=MINUTE, minute="22:30")],
+            (MINUTE, EX): [_bar(EX, 300.0, freq=MINUTE, minute="14:00")],
+        },
+    )
+    _split(root)
+
+    table = load_bars(TICKER, MINUTE, lake_root=root, adjust=ADJUST_SPLIT)
+
+    assert _closes(table) == [300.0, 300.0]
+
+
+def test_a_frequency_nothing_fetches_takes_the_strict_reading_and_raises_nothing(
+    fixture_lake: FixtureLake,
+):
+    """``bars.bar_session`` refuses no frequency, because ``load_bars`` decided against a second
+    frequency guard.
+
+    A partition under ``5m``, which no fetch writes, is read in an adjusted view. Its bar at 18:30
+    Eastern on the session before the ex-date keeps its own Eastern date, so the split divides it.
+    Read by the daily rule it would name the ex-date and stay whole, and a refusal would raise.
+    """
+    other = "5m"
+    root = _lake(
+        fixture_lake,
+        {
+            (other, BEFORE): [_bar(BEFORE, 600.0, freq=other, minute="22:30")],
+            (other, EX): [_bar(EX, 300.0, freq=other, minute="14:00")],
+        },
+    )
+    _split(root)
+
+    table = load_bars(TICKER, other, lake_root=root, adjust=ADJUST_SPLIT)
+
+    assert _closes(table) == [300.0, 300.0]
+
+
 def test_two_splits_compound(fixture_lake: FixtureLake):
     """#368 test 7. The factor is a product over every split after the bar, not the latest one."""
     root = _three_daily_sessions(fixture_lake)
