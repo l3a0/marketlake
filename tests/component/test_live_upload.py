@@ -23,8 +23,8 @@ them.
 6. A chains segment and a segment with no manifest entry stay at home.
 7. A segment whose partition is sealed, or whose file is gone from a sealed day, is dropped
    as superseded. A file gone from a day not yet sealed is counted as vanished.
-8. A manifest cut back in place is read from the start again, and nothing already in the
-   bucket is sent twice.
+8. The manifest is read in whole lines, however the reads split them. A manifest cut back
+   in place is read from the start again, and nothing already in the bucket is sent twice.
 9. Only a primary with a prefixed bucket target starts an upload. On that host a target
    with no prefix, or a client that cannot be built, starts none and pages once while the
    loop runs on.
@@ -274,6 +274,15 @@ def test_an_entry_without_fetched_at_leaves_that_field_out_of_the_metadata(tmp_p
     assert put["Metadata"]["source"] == "close-fill"
 
 
+def test_the_metadata_keeps_a_zero_and_drops_a_bool():
+    assert live_upload._metadata({"sha256": "ab", "rows": 0, "source": "capture"}) == {
+        "sha256": "ab",
+        "rows": "0",
+        "source": "capture",
+    }
+    assert live_upload._metadata({"rows": True}) == {}
+
+
 def test_a_segment_already_sent_this_process_is_not_sent_again(tmp_path):
     root = _root(tmp_path)
     _write_segment(root)
@@ -380,6 +389,48 @@ def test_a_key_already_there_whose_head_fails_is_neither_counted_nor_refused(tmp
     assert upload.pass_once() is None
     state = upload.state()
     assert (state.owed, state.already_there, state.refused) == (0, 0, (rel,))
+
+
+def test_an_entry_without_a_usable_sha256_is_refused_without_a_request(tmp_path):
+    """62 hex characters are no SHA-256, and the segment after it still goes up."""
+    root = _root(tmp_path)
+    rel = "journal/date=2026-09-02/surface=quotes/ticker=SPY/seg-20260902T140000000000-1.arrows"
+    (root / rel).parent.mkdir(parents=True)
+    (root / rel).write_bytes(b"x")
+    append_manifest(
+        root, partition=rel, source="capture", sha256="ab" * 31, rows=1, fetched_at=None
+    )
+    good, _ = _write_segment(root, start=NOW + timedelta(minutes=1))
+    fake = FakeS3()
+    upload = _upload(root, fake)
+
+    assert upload.pass_once() is None
+
+    assert fake.put_keys() == [f"lake-live/{good}"]
+    assert upload.state().refused == (rel,)
+
+
+def test_a_path_entered_again_under_another_digest_is_refused(tmp_path):
+    """A segment is never rewritten, so a new digest for a path already sent is refused."""
+    root = _root(tmp_path)
+    rel, _ = _write_segment(root)
+    fake = FakeS3()
+    upload = _upload(root, fake)
+    upload.pass_once()
+    (root / rel).write_bytes(b"rewritten")
+    append_manifest(
+        root,
+        partition=rel,
+        source="capture",
+        sha256=hashlib.sha256(b"rewritten").hexdigest(),
+        rows=3,
+        fetched_at=None,
+    )
+
+    upload.pass_once()
+
+    assert upload.state().refused == (rel,)
+    assert fake.body(f"lake-live/{rel}") != b"rewritten"
 
 
 # -- 3. the upload never takes the lake-root lock ------------------------------------
@@ -673,6 +724,101 @@ def test_a_manifest_cut_back_and_grown_past_the_offset_is_read_from_the_start(tm
     assert fake.put_keys()[2:] == [f"lake-live/{third}"]
 
 
+def test_a_line_split_across_two_reads_is_kept_whole(tmp_path, monkeypatch):
+    """The first read after a start takes the whole manifest, far more than one read holds."""
+    monkeypatch.setattr(live_upload, "_READ_CHUNK", 100)
+    root = _root(tmp_path)
+    rels = [_write_segment(root, start=NOW + timedelta(minutes=n))[0] for n in range(3)]
+    fake = FakeS3()
+
+    assert _upload(root, fake).pass_once() is None
+
+    assert fake.put_keys() == [f"lake-live/{rel}" for rel in rels]
+
+
+def test_a_line_still_being_written_waits_for_its_newline(tmp_path):
+    root = _root(tmp_path)
+    rel, digest = _write_segment(root, manifest=False)
+    line = json.dumps(
+        {"partition": rel, "source": "capture", "sha256": digest, "rows": 3, "fetched_at": None},
+        sort_keys=True,
+    ).encode()
+    path = manifest_path(root)
+    path.write_bytes(line[:40])
+    fake = FakeS3()
+    upload = _upload(root, fake)
+
+    assert upload.pass_once() is None
+    assert fake.calls == []
+    with open(path, "ab") as handle:
+        handle.write(line[40:] + b"\n")
+    assert upload.pass_once() is None
+
+    assert fake.put_keys() == [f"lake-live/{rel}"]
+
+
+def test_a_lake_with_no_manifest_yet_is_not_a_failure(tmp_path):
+    assert _upload(_root(tmp_path), FakeS3()).pass_once() is None
+
+
+def _cut_to(root: Path, lines: int) -> None:
+    """Cut the manifest back in place to its first ``lines`` lines, keeping the inode."""
+    path = manifest_path(root)
+    kept = b"".join(path.read_bytes().splitlines(keepends=True)[:lines])
+    with open(path, "r+b") as handle:
+        handle.truncate(0)
+        handle.write(kept)
+
+
+def test_an_owed_segment_whose_entry_a_cut_removed_is_not_sent(tmp_path):
+    root = _root(tmp_path)
+    _write_segment(root)
+    gone, _ = _write_segment(root, start=NOW + timedelta(minutes=1))
+    fake = FakeS3()
+    fake.fail_with = unreachable()
+    upload = _upload(root, fake)
+    upload.pass_once()
+    _cut_to(root, 1)
+    fake.fail_with = None
+
+    assert upload.pass_once() is None
+
+    assert f"lake-live/{gone}" not in fake.put_keys()
+    assert upload.state().owed == 0
+
+
+def test_a_partition_a_cut_removed_no_longer_supersedes(tmp_path):
+    root = _root(tmp_path)
+    _write_segment(root, ticker="QQQ")
+    _seal(root)
+    fake = FakeS3()
+    upload = _upload(root, fake)
+    upload.pass_once()
+    _cut_to(root, 1)
+    rel, _ = _write_segment(root, start=NOW + timedelta(minutes=1))
+
+    upload.pass_once()
+
+    assert fake.put_keys()[-1] == f"lake-live/{rel}"
+
+
+def test_a_refused_key_is_not_retried_after_a_cut_back(tmp_path):
+    root = _root(tmp_path)
+    rel, _ = _write_segment(root)
+    _write_segment(root, start=NOW + timedelta(minutes=1))
+    fake = FakeS3()
+    fake.store(f"lake-live/{rel}", b"someone else's bytes")
+    upload = _upload(root, fake)
+    upload.pass_once()
+    calls = len(fake.calls)
+    _cut_to(root, 1)
+
+    upload.pass_once()
+
+    assert len(fake.calls) == calls
+    assert upload.state().refused == (rel,)
+
+
 # -- the alarm, on its own ----------------------------------------------------------
 
 
@@ -708,6 +854,58 @@ def test_a_backlog_older_than_ten_minutes_pages_once_and_recovery_prints_a_line(
     lines = [line for line in capsys.readouterr().err.splitlines() if "caught up" in line]
     assert len(lines) == 1
     assert len(transport.sent) == 1
+
+
+def test_the_alarm_ages_the_backlog_by_the_clock_not_the_slot(tmp_path):
+    """A tick runs late in its minute, so the slot can trail the clock by most of one."""
+    root = _root(tmp_path)
+    _write_segment(root)
+    fake = FakeS3()
+    fake.fail_with = unreachable()
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, fake, clock)
+    transport = _Recording()
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+    upload.pass_once()
+
+    clock.advance(630)
+    alarm.check(NOW + timedelta(minutes=10))
+
+    assert [message.event for message in transport.sent] == [BEHIND_EVENT]
+
+
+def test_a_later_entry_for_an_owed_segment_keeps_its_first_read_time(tmp_path, monkeypatch):
+    """Every pass ends cleanly here, so only the owed segment's age can page."""
+    root = _root(tmp_path)
+    rel, digest = _write_segment(root)
+    _unreadable(monkeypatch, root / rel)
+    clock = ManualClock(start=NOW)
+    upload = _upload(root, FakeS3(), clock)
+    transport = _Recording()
+    alarm = UploadAlarm(upload, _publisher(root, transport), clock)
+    assert upload.pass_once() is None
+
+    clock.advance(360)
+    append_manifest(root, partition=rel, source="capture", sha256=digest, rows=3, fetched_at=None)
+    assert upload.pass_once() is None
+    clock.advance(241)
+    assert upload.pass_once() is None
+    alarm.check(clock.now())
+
+    (page,) = transport.sent
+    assert page.body.startswith("1 quotes segments owed, the oldest first read at 10:00 ET")
+
+
+def test_a_refusal_page_names_four_and_counts_the_rest():
+    body = live_upload._refused_body([f"seg{n}" for n in range(6)])
+    assert "6 quotes segments refused" in body
+    assert "seg0, seg1, seg2, seg3 and 2 more. " in body
+    four = live_upload._refused_body([f"seg{n}" for n in range(4)])
+    assert "seg0, seg1, seg2, seg3. " in four
+    assert " more" not in four
+    one = live_upload._refused_body(["seg0"])
+    assert "1 quotes segment refused" in one
+    assert ": seg0. " in one
 
 
 def test_a_thread_that_stopped_pages_once_and_never_reads_as_caught_up(
@@ -936,6 +1134,17 @@ def test_the_thread_waits_longer_after_each_pass_the_bucket_failed(tmp_path, mon
     assert len(fake.puts()) == 6
 
 
+def test_a_clean_pass_resets_the_wait_to_the_poll(tmp_path, monkeypatch):
+    upload = _upload(_root(tmp_path), FakeS3())
+    results = iter(["x", "x", "x", None, "x"])
+    monkeypatch.setattr(upload, "pass_once", lambda: next(results))
+    waits = _record_waits(monkeypatch, upload, 5)
+
+    upload._run()
+
+    assert waits == [5.0, 10.0, 20.0, 5.0, 5.0]
+
+
 def test_the_thread_names_a_failure_again_only_when_its_cause_changes(
     tmp_path, monkeypatch, capsys
 ):
@@ -1036,6 +1245,22 @@ def test_a_primary_with_a_bucket_target_prepares_an_upload_to_the_live_prefix(tm
     assert upload._target == LIVE
     assert live_target(TARGET) == LIVE
     assert LIVE.prefix == TARGET.prefix + LIVE_SUFFIX
+
+
+def test_prepare_passes_its_timings_to_the_upload(tmp_path):
+    root = _root(tmp_path)
+    config = load_config(_bucket_config(tmp_path, root))
+
+    upload = prepare(
+        config,
+        ManualClock(start=NOW),
+        connect=lambda config, target: (target, FakeS3()),
+        poll_seconds=0.25,
+        backoff_cap_seconds=3.0,
+    )
+
+    assert isinstance(upload, LiveUpload)
+    assert (upload._poll, upload._cap) == (0.25, 3.0)
 
 
 @pytest.mark.parametrize(
@@ -1384,6 +1609,10 @@ def test_segment_start_reads_the_stamp_in_utc():
     assert segment_start(rel) == datetime(2026, 9, 2, 14, 0, 3, 123456, tzinfo=UTC)
     assert segment_start("quotes/ticker=SPY/date=2026-09-02.parquet") is None
     assert segment_start("journal/date=2026-09-02/surface=quotes/ticker=SPY/seg-x-1.arrows") is None
+    unprefixed = (
+        "journal/date=2026-09-02/surface=quotes/ticker=SPY/xxx-20260902T140003123456-77.arrows"
+    )
+    assert segment_start(unprefixed) is None
 
 
 def _lagged(fake: FakeS3, start: datetime, seconds: float, *, ticker: str = "SPY") -> str:
@@ -1432,6 +1661,16 @@ def test_the_lag_is_last_modified_less_the_start_its_key_carries():
         "s3://lake-backup/lake-live"
     )
     assert f"{a} 12.5 s" in lines
+
+
+def test_a_listed_key_with_no_stamp_is_left_out_of_the_lags():
+    fake = FakeS3()
+    stamped = _lagged(fake, NOW, 10)
+    fake.store("lake-live/journal/date=2026-09-02/surface=quotes/ticker=SPY/seg-x-1.arrows", b"x")
+
+    lags = live_upload.segment_lags(live_upload.list_live(fake, LIVE, DAY), LIVE)
+
+    assert [one.rel for one in lags] == [stamped]
 
 
 def test_the_lag_command_reads_the_bucket_and_prints_the_summary(tmp_path, monkeypatch, capsys):
