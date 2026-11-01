@@ -14,18 +14,19 @@ tonight is re-fetchable tomorrow while a chain snapshot missed at 10:31 is gone.
 
 Run it with ``python -m lake.bars`` to fetch by hand. ``lake.sweep`` is what schedules it: its
 18:30 weekday job calls :func:`backfill_bars`, walking every session the capture spans still hold
-unlanded rather than the one its clock sits on. Marketlake #422 made that swap, because a daily
-bar is fetched only once the *next* session has sealed, so it is never judged on the night of its
-own session. Marketlake #618 kept that wait and moved what the bar is judged against onto the
-session's own 16:15 quote, which :func:`_captured_close` carries.
+unlanded rather than the one its clock sits on. Marketlake #422 made that swap, when a daily bar
+was fetched only once the *next* session had sealed and so was never judged on the night of its
+own session. Marketlake #618 moved what the bar is judged against onto the session's own 16:15
+quote, which :func:`_captured_close` carries, and marketlake #962 then removed the wait. A daily
+bar now lands at its own session's 18:30 sweep. The walk still covers every unlanded session,
+because that is how a held bar is re-attempted and an evening the sweep missed is recovered.
 
 What one run does, per ticker and per configured frequency, for one session.
 
 1. Skip the ticker-day whose bars partition the manifest already records. A second run lands
    nothing and says so.
-2. On ``1d``, wait for the next session to seal, then read the close the gate would compare
-   against, and skip the ticker-day that has none rather than spending a request on a gate that
-   cannot pass. Marketlake #434.
+2. On ``1d``, read the close the gate would compare against, and skip the ticker-day that has
+   none rather than spending a request on a gate that cannot pass. Marketlake #434.
 3. Fetch the window this module names for that frequency, outside the lake lock.
 4. Build the rows, dropping any candle whose stamp the epoch transform refuses and, on
    ``1d``, any candle belonging to another session.
@@ -282,23 +283,10 @@ CLOSE_CROSS_TOLERANCE = 5e-4
 # other reasons are class names, so this is spelled like one rather than as a sentence.
 CLOSE_VALUE_ABSENT = "CloseValueAbsent"
 
-# The reason an unsettled ticker-day carries while the next session has not sealed. It is the one
-# gate skip that reads nothing, because the wait is decided off the manifest the walk already
-# holds, so there is no exception to name and it is spelled like one for the reason
-# ``CLOSE_VALUE_ABSENT`` gives. Marketlake #618.
-FOLLOWING_UNSEALED = "FollowingUnsealed"
-
 # The column the gate compares the vendor's close against, on the session's own ``option_close``
 # row. Not ``last``, which carries extended-hours trades by 16:15: 760.73 against a 760.88 close
 # on SPY 2026-09-14. Marketlake #618 carries the measurement.
 REFERENCE_COLUMN = "regular_market_last_price"
-
-# How far past a session the calendar-next search looks. It matches ``oi``'s bound rather
-# than being chosen again: that module and ``control_plane`` already disagree, 30 against 14,
-# and marketlake #334 owns collapsing the three spellings into one. A third number would have
-# left that issue two values to settle instead of one. The longest run of consecutive
-# non-sessions the US market produces is four days, so any of the three is ample.
-NEXT_SESSION_SEARCH_DAYS = 30
 
 
 class BarsError(Exception):
@@ -601,7 +589,8 @@ def session_midnight(day: date) -> datetime:
     Eastern date. A constant UTC hour does not do that under the strict date: ``04:00Z`` is
     midnight under daylight time and 23:00 the evening before under standard time, the slip
     marketlake #380 records. A captured daily bar carries the vendor's own stamp, ``05:00Z`` in
-    summer, so consumers key on the session and never on the stamp.
+    summer on every bar landed before marketlake #962 and possibly ``04:00Z`` since, so consumers
+    key on the session and never on the stamp.
     ``lake.bar_import`` is the one caller (marketlake #950).
     """
     return datetime(day.year, day.month, day.day, tzinfo=MARKET_TZ).astimezone(UTC)
@@ -632,9 +621,11 @@ def daily_session_of(bar_ts: str) -> date:
 
     A stamp before ``DAILY_STAMP_ROLLOVER_HOUR`` Eastern names its own Eastern date, and one at or
     after it names the next. ``DAILY_STAMP_ROLLOVER_HOUR`` names the band the boundary sits in. So
-    05:00 UTC, the stamp every landed bar carries, names its own date in both seasons, and 04:00
-    UTC, which is 23:00 the evening before in standard time, names the same session rather than the
-    one before it. Marketlake #380.
+    05:00 UTC, the stamp every bar landed before marketlake #962 carries, names its own date in both
+    seasons. 04:00 UTC, which is 23:00 the evening before in standard time, names the same session
+    rather than the one before it. Marketlake #380. Since marketlake #962 a bar lands as the newest
+    candle of a response fetched on its own session's evening, which marketlake #362's recording
+    stamped at 04:00 UTC, so both stamps reach the lake.
 
     It gives up one convention, a stamp at the end of the session's UTC day: 23:59 UTC is 19:59 EDT
     and names the next session here. No source this lake reads stamps that way. The vendor's
@@ -993,11 +984,12 @@ class BarsReport:
     ``sweep._bars_outcome`` reads neither, because a bars-only count has no place beside the
     values all three walks share.
 
-    **This command meets ``unsettled`` on every daily run, which is the shape rather than a
-    fault.** It fetches the session the clock is in, and that session's bar waits for the next
-    session to seal, which has not been captured yet. So the daily half is skipped
-    here and lands on the next :func:`backfill_bars` run, which is where marketlake #422 already
-    moved the evening job. What changes is that the skip costs no request and files no finding.
+    **``unsettled`` names a session whose own quotes have not sealed.** This command fetches the
+    session the clock is in, or the one it is handed. Run after that session's own compaction, it
+    lands the daily bar, because since marketlake #962 a daily bar waits for no later session.
+    Run before it, during the session or on a night compaction failed, the daily half is reported
+    under ``unsettled`` and lands on a later run once the quotes seal. Either way the skip costs
+    no request and files no finding.
 
     ``attempted`` counts the ticker-days that reached the vendor, so a skipped one is not in it.
     That keeps it the one number either report carries about what the run spent.
@@ -1329,36 +1321,6 @@ def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _Ga
     return _GateClose(close=close)
 
 
-def _calendar_next_session(
-    market: Calendar, session: date, *, horizon: int = NEXT_SESSION_SEARCH_DAYS
-) -> date | None:
-    """The first trading session strictly after ``session``.
-
-    Calendar-next, never the next session that happens to hold data, because it is the session
-    whose seal a daily bar waits for. The wait gives the vendor's candle a full session to take
-    the corrections ``docs/design.md`` schedules the 18:30 sweep around, and a later session
-    holding data would stretch it for no reason. An outage session still seals, as a partition
-    of gap rows, so waiting for it costs nothing. ``Calendar`` offers no next-session helper, so
-    this steps forward a day at a time. ``None`` means the search ran past its guard, which a
-    real calendar never does: the longest run of consecutive non-sessions the US market produces
-    is four days.
-
-    This is the third private spelling of one step. ``oi._calendar_next_session`` and
-    ``control_plane._first_session_on_or_after`` are the other two. marketlake #334 counts them
-    and says a fourth is where this stops being a smell, so this copy is written to be
-    repointed at the shared helper that issue lands rather than to survive.
-
-    Its bound deliberately matches ``oi``'s rather than being chosen again. Those two already
-    disagree, 30 against 14, and #334 names that disagreement as the defect it owns. A third
-    number would have left that issue two values to settle instead of one.
-    """
-    for step in range(1, horizon + 1):
-        candidate = session + timedelta(days=step)
-        if market.is_session(candidate):
-            return candidate
-    return None
-
-
 def fetch_session_bars(
     *,
     lake_root: Path | str,
@@ -1404,11 +1366,12 @@ def fetch_session_bars(
     request is short, and stalling is better than landing a wrong answer quietly.
 
     **The two causes with no close of record no longer repeat at all**, because marketlake #434
-    stopped them reaching the vendor. A daily bar for the session this was given is fetched only
-    once the next session has sealed, which at any hour of that session it has not, so every
-    daily ticker-day here is reported under ``unsettled`` rather than fetched and held. One whose
-    own session is sealed and offers no close is reported under ``abandoned``. Both cost no
-    request and file no finding, and :class:`BarsReport` carries the argument in full.
+    stopped them reaching the vendor. A daily ticker-day whose own session has not sealed yet,
+    which is every one asked for during that session, is reported under ``unsettled`` rather
+    than fetched and held. One whose own session is sealed and offers no close is reported under
+    ``abandoned``. Both cost no request and file no finding, and :class:`BarsReport` carries the
+    argument in full. Once the session has sealed, its daily bar is fetched here on the same
+    evening, since marketlake #962 removed the wait for the next session.
 
     **Two failures are not contained per ticker-day**, and the catch below is narrow rather
     than broad for exactly that reason. ``VendorAuthError`` is a dead refresh token and is not
@@ -1477,10 +1440,9 @@ def _walk(
     a nightly run and a backfill is entirely in which ticker-days each hands over.
 
     **The session's own instants are computed once per session and only past the manifested
-    skip.** A backfill walks many sessions, and each needs its bounds and its calendar-next
-    session, which are pure functions of the day. A run whose every ticker-day is already
-    manifested asks the calendar nothing at all. The bounds serve both the window and the minute
-    the gate reads, and the following session is what a daily bar waits for.
+    skip.** A backfill walks many sessions, and each needs its bounds, which are a pure function
+    of the day. A run whose every ticker-day is already manifested asks the calendar nothing at
+    all. The bounds serve both the window and the minute the gate reads.
 
     **A daily ticker-day whose gate has no close of record never reaches the vendor**, which is
     marketlake #434. :func:`_gate_close` says whether one exists and the manifest says whether that
@@ -1521,17 +1483,11 @@ def _walk(
     # lake already holds, the way the close guard reads the manifest once per run.
     manifested = latest_entries(root)
     bounds_of: dict[date, SessionBounds] = {}
-    following_of: dict[date, date | None] = {}
 
     def bounds(day: date) -> SessionBounds:
         if day not in bounds_of:
             bounds_of[day] = session_clock.bounds(day)
         return bounds_of[day]
-
-    def following_session(day: date) -> date | None:
-        if day not in following_of:
-            following_of[day] = _calendar_next_session(calendar, day)
-        return following_of[day]
 
     attempted = 0
     skipped = 0
@@ -1576,23 +1532,16 @@ def _walk(
         if key in manifested:
             skipped += 1
             continue
-        following = following_session(session)
         window = bar_window(freq, bounds(session))
         reference: float | None = None
-        if freq == DAILY_FREQ and following is not None:
-            # **The wait, decided off the manifest and reading nothing.** A daily bar is fetched
-            # only once the calendar-next session has sealed. Marketlake #618 moved what the bar
-            # is judged against onto its own session's 16:15 quote and kept this wait, which now
-            # gives the vendor's candle a full session to take the corrections the 18:30 sweep is
-            # scheduled around. Schwab serves the candle during the session with its close still
-            # moving, and when that close settles is not measured, so each bar lands on the
-            # evening after its session, as it did before.
-            following_key = (
-                paths.quotes_partition_path(ticker, following).relative_to(root).as_posix()
-            )
-            if following_key not in manifested:
-                unsettled.append(GateSkip(ticker, freq, session, FOLLOWING_UNSEALED))
-                continue
+        if freq == DAILY_FREQ:
+            # **No wait for the next session.** A daily bar is fetched at the first run after its
+            # own session's quotes partition is in the manifest, which on a healthy lake is that
+            # session's own 18:30 sweep. Marketlake #962 removed the wait for the calendar-next
+            # session's seal that stood here. That wait gave the vendor's candle a full session to
+            # take corrections nobody had measured, while the gate below already compares every
+            # daily close with the session's own 16:15 quote and holds one outside the tolerance.
+            #
             # **The close the gate compares against, read before the request rather than after it.**
             # It is the session's own 16:15 quote, which lives in this lake rather than at the
             # vendor, so a bar that cannot pass its gate
@@ -1607,9 +1556,10 @@ def _walk(
             # sealed that session. Sealed and still offering no usable close is a ticker-day
             # nothing this walk can wait for, which is the one an operator has to find. Not
             # sealed is merely pending. The entry asked is the session's own, because that is the
-            # partition the gate reads. Before marketlake #618 it was the following session's,
-            # for the same reason, and keeping that key would call a session whose compaction
-            # was missed, while the next one's ran, a permanent loss.
+            # partition the gate reads. Before marketlake #618 the gate read the following
+            # session's partition and this check asked for that one, for the same reason. Keeping
+            # that key after the gate moved would have called a session whose own compaction was
+            # missed, while the next one's ran, a permanent loss.
             #
             # **The schedule is the wrong test and was the first one written here.** Comparing
             # the clock against ``SessionBounds.compaction`` asks when compaction was *due*,
@@ -1691,7 +1641,6 @@ def _walk(
                 master=master,
                 ticker=ticker,
                 window=window,
-                following=following,
                 reference=reference,
                 partition=partition,
                 key=key,
@@ -1748,7 +1697,6 @@ def _land(
     master: SecurityMaster,
     ticker: str,
     window: BarWindow,
-    following: date | None,
     reference: float | None,
     partition: Path,
     key: str,
@@ -1763,8 +1711,7 @@ def _land(
     ``reference`` is the close of record the daily gate compares against, read by the walk before
     it spent the request rather than read again here. One read cannot contradict itself, which
     two would be free to do. It is ``None`` on every ``1m`` ticker-day, which runs no close
-    cross-check, and on the one daily case the walk passes through unjudged, a session the
-    calendar names nothing after.
+    cross-check.
     """
     fetch_ts = clock.now()
     response = _fetch(vendor, ticker, window)
@@ -1866,24 +1813,6 @@ def _land(
         return
 
     if window.freq == DAILY_FREQ:
-        if following is None:
-            # The one daily ticker-day the gate precondition passes through, because it has no
-            # following session whose seal the bar could wait for, so the walk never read one.
-            # It stays here and stays a held finding on purpose. It records the calendar being
-            # wrong rather than the lake having no data, which is something a person has to go
-            # and look at, and ``_calendar_next_session`` says a real calendar never produces
-            # it: the longest run of consecutive non-sessions the US market gives is four days
-            # against a thirty-day search. So it keeps costing one request on a path that has
-            # fired zero times, rather than earning a fourth outcome nothing would reach.
-            hold(
-                _finding(
-                    ticker,
-                    window,
-                    CHECK_BAR_CLOSE,
-                    exception="NoFollowingSession: the calendar names no session after this one",
-                )
-            )
-            return
         cross = check_close_cross(_bar_close(selected), reference)
         if not cross.agrees:
             hold(
@@ -2267,11 +2196,11 @@ class BackfillReport:
     4. Its daily half could not be judged yet or had no close of record to be gated against.
     5. Its request budget was spent before anything landed, which is marketlake #478's.
 
-    ``unsettled`` names a daily ticker-day whose gate cannot be judged *yet*, which on a healthy
-    lake is the newest session in range and nothing else: its bar waits for the next session to
-    seal, and that session has not been captured. The next run lands it. The reason is
-    ``FOLLOWING_UNSEALED`` there, and a class name on the rarer case of a session whose own
-    compaction has not run.
+    ``unsettled`` names a daily ticker-day whose gate cannot be judged *yet*, because its own
+    session's compaction has not run, so the session's quotes are not sealed. On a healthy lake
+    at the 18:30 sweep it is empty, because since marketlake #962 a daily bar waits for no later
+    session. The first run after the quotes seal lands it. The reason is the class name the
+    gate's read raised, ``PartitionAbsent`` for a session with no quotes partition.
 
     ``deferred`` names a ticker-day the run's request budget stopped it from fetching, which is
     marketlake #478. It is the one entry here that says nothing is wrong: the run did exactly what
@@ -2361,9 +2290,10 @@ def backfill_bars(
     The cost was measured rather than assumed. Against the real calendar the live lake's floor to
     2026-09-16 holds seven sessions and its floor to the 1-min lookback deadline holds twenty-two,
     so a first run over that range would ask for 28 ticker-days and a run at the deadline 88. The
-    gate precondition takes eight off the first of those on the live lake. Six are daily
-    ticker-days with no close of record to be compared against, and two are the newest
-    session's, waiting for the next session to seal.
+    gate precondition took eight off the first of those on the live lake under marketlake #434.
+    Six are daily ticker-days with no close of record to be compared against. The other two were
+    the newest session's, waiting for the next session to seal, and that pair no longer arises
+    since marketlake #962 removed the wait.
 
     **Those figures describe an intact manifest, and that is no longer what bounds the run.**
     Comparing a plan of 88 against the design's 120-a-minute ceiling was the safety argument here,
@@ -2381,8 +2311,9 @@ def backfill_bars(
     ``load_quotes`` raises ``SnapAbsent`` at the 16:15 minute each daily bar is gated against and
     no later run can change that verdict. Those used to be fetched, held under ``CHECK_BAR_CLOSE``
     and filed, on every run for ever. The walk now reads that close first and skips them,
-    reporting them under ``abandoned``: six ticker-days on the live lake, plus the newest
-    session's two under ``unsettled`` every night on a lake with no outage in it.
+    reporting them under ``abandoned``: six ticker-days on the live lake. Under marketlake #434 the
+    newest session's two also sat under ``unsettled`` every night on a lake with no outage in it,
+    and since marketlake #962 they land on their own session's evening instead.
 
     **The minute half is untouched, and the asymmetry is why.** It runs no close cross-check, so
     nothing about it is knowable before the request, and it is the half the roughly 30-day
