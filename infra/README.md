@@ -2466,7 +2466,10 @@ waits for the owner's approval.
    keeps the override too.
 
 The VM still refuses with exit 3 while a job runs, such as the sweep or its upload, and its
-restart still waits up to 15 minutes for the busy checks. The restart still refuses to
+restart still waits up to 15 minutes for the busy checks. On a session day it also waits
+out the close, from the equity close to the close+15 compaction, which is 16:00 to 16:30
+on a regular day and 13:00 to 13:30 on an early close, because the daemon runs the close
+cycles itself and the busy checks cannot see them. The restart still refuses to
 start within 180 seconds of the next refused span opening. Started inside a span, that is
 the span after, so the restart runs once the busy checks clear. Started in the hours before
 a span, a restart that cannot start in time ends `not restarted`, and the same run started
@@ -2515,8 +2518,11 @@ inside a session only for a fix that cannot wait for 18:45.
 - A deploy over the Sunday canary at 20:00 can make the `sunday` check miss and page.
 - A restart during a session loses the minute it lands in, marked `daemon_dead`. The busy
   checks cannot see the cycles, which run inside the daemon.
-- A restart that kills the 16:00 cycle loses that day's `spot_close` for every ticker,
-  for good.
+- The restart waits out the close, but a rollback's restart after a failed restart does
+  not, and a restart that kills the 16:00 cycle loses that day's `spot_close` for every
+  ticker, for good.
+- Started shortly before a span, a failed bootstrap stays in place through the span,
+  because its rollback waits like a restart.
 - A commit that changes a capture schema, such as one touching `src/lake/journal.py`,
   splits each ticker-day in flight. A retyped column then refuses that ticker-day's
   compaction until it is recompacted by hand.

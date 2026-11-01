@@ -41,8 +41,20 @@ than ``MARGIN``.
 Every span is measured in absolute time, as UTC instants, so a span next to a clock change
 is still the right number of real minutes long.
 
-The module reads the clock through the ``Clock`` seam and nothing else. It needs no
-config file and no lake, so it runs before the deploy has checked either.
+**The close hold keeps an overridden deploy's restart off the session's close.** A deploy
+that overrides the window (marketlake #987) can restart the daemon during a session, and
+the busy checks cannot see the close cycles, which run inside the daemon. A restart that
+kills the equity close's cycle loses that day's ``spot_close`` for good, and one that
+kills the close+5 fill can lose the ``option_close``. So ``--close-hold`` prints one line
+instead of the two above, ``close_hold=<start>,<end>`` in epoch seconds, or
+``close_hold=none`` when today is not a session. It runs from today's equity close to its
+close+15 compaction, which the busy check sees once it starts. Both come from
+``SessionClock.bounds``, so an early close moves the hold with it. ``vm-deploy.sh`` reads
+it only under the override and holds the restart out of it.
+
+The module reads the clock through the ``Clock`` seam, and the exchange calendar for the
+close hold, and nothing else. It needs no config file and no lake, so it runs before the
+deploy has checked either.
 """
 
 from __future__ import annotations
@@ -54,8 +66,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 from lake import control_plane
-from lake.calendar import MARKET_TZ
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.clock import Clock
+from lake.session import SessionClock
 
 # How long before a day's earliest scheduled start a deploy must have finished. The
 # restart's own check takes two minutes, and a job that starts against a half-moved tree
@@ -206,19 +219,52 @@ def _minutes(delta: timedelta) -> int:
     return int(delta.total_seconds() // 60)
 
 
-def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+def close_hold(clock: Clock, calendar: Calendar) -> tuple[datetime, datetime] | None:
+    """Today's span from the equity close to the close+15 compaction, or ``None`` off a
+    session, in which an overridden deploy must not restart the daemon (#987)."""
+    session = SessionClock(clock, calendar)
+    today = session.session_date()
+    if not calendar.is_session(today):
+        return None
+    bounds = session.bounds(today)
+    return bounds.equity_close, bounds.compaction
+
+
+def close_hold_line(hold: tuple[datetime, datetime] | None) -> str:
+    if hold is None:
+        return "close_hold=none"
+    start, end = hold
+    return f"close_hold={int(start.timestamp())},{int(end.timestamp())}"
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    clock: Clock | None = None,
+    calendar: Calendar | None = None,
+) -> int:
     """The ``python -m lake.deploy_window`` entry. Returns a process exit code.
 
     ``clock`` stays injectable, since a clock reaches nothing past this process.
     """
-    argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="python -m lake.deploy_window",
         description="Exit 0 when a deploy of the hosted VM may start now, and 3 when not.",
-    ).parse_args(argv)
+    )
+    parser.add_argument(
+        "--close-hold",
+        action="store_true",
+        help="print only today's close hold, which an overridden deploy's restart avoids",
+    )
+    args = parser.parse_args(argv)
     if clock is None:
         from lake.clock import SystemClock  # lazy: only the console reads the wall clock
 
         clock = SystemClock()
+    if args.close_hold:
+        calendar = ExchangeCalendar() if calendar is None else calendar
+        print(close_hold_line(close_hold(clock, calendar)))
+        return ALLOWED
     verdict = decide(clock.now())
     for line in verdict.lines():
         print(line)

@@ -256,3 +256,43 @@ def test_the_entry_takes_no_arguments(capsys):
     with pytest.raises(SystemExit) as raised:
         dw.main(["--now"], clock=ManualClock(et(MONDAY, 12)))
     assert raised.value.code == 2
+
+
+# -- the close hold (#987) -------------------------------------------------------------
+
+
+def _close_hold(now: datetime, capsys) -> tuple[int, list[str]]:
+    code = dw.main(["--close-hold"], clock=ManualClock(now.astimezone(UTC)))
+    return code, capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("now", "start", "end"),
+    [
+        (et(TUESDAY, 10), et(TUESDAY, 16), et(TUESDAY, 16, 30)),
+        (et(TUESDAY, 23, 59), et(TUESDAY, 16), et(TUESDAY, 16, 30)),
+        # The day after Thanksgiving closes at 13:00, and the hold moves with it.
+        (et(date(2026, 11, 27), 9), et(date(2026, 11, 27), 13), et(date(2026, 11, 27), 13, 30)),
+    ],
+    ids=["a session", "late on a session day", "an early close"],
+)
+def test_the_close_hold_runs_from_the_equity_close_to_the_compaction(capsys, now, start, end):
+    code, lines = _close_hold(now, capsys)
+    assert code == dw.ALLOWED
+    assert lines == [f"close_hold={epoch(start)},{epoch(end)}"]
+
+
+@pytest.mark.parametrize(
+    "now",
+    [et(SATURDAY, 12), et(SUNDAY, 17, 20), et(date(2026, 11, 26), 12)],
+    ids=["saturday", "sunday", "thanksgiving"],
+)
+def test_no_session_holds_nothing(capsys, now):
+    assert _close_hold(now, capsys) == (dw.ALLOWED, ["close_hold=none"])
+
+
+def test_the_close_hold_leaves_the_two_line_verdict_alone(capsys):
+    """vm-stop.sh and an ordinary deploy read exactly two lines, so the hold is opt-in."""
+    code, lines = run(et(TUESDAY, 10), capsys)
+    assert code == dw.REFUSED
+    assert len(lines) == 2 and lines[1].startswith("next_span_start=")

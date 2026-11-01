@@ -57,9 +57,18 @@ SWEEP = "com.marketlake.eod-sweep.service"
 DEPLOY_SERVICE = "marketlake-deploy.service"
 UNKNOWN = "outcome unknown: read deploy.log"
 FAILED_STEP = ", with a failed step in deploy.log"
+
 DAEMON_PID = "1001"
 # A line the fake bootstrap and the fake restart.sh print, standing for a config value.
 SENTINEL = "SENTINEL-FROM-THE-HOST"
+
+# The override's suffix and a refusal line of the window's own shape (#987).
+OVERRIDDEN = ", with the deploy window overridden"
+REFUSAL = "a deploy may start next at Sun 2026-11-01 23:30 EST, because less than 210 minutes"
+
+# Each refusal the override must keep runs twice: plainly, and overridden while the window
+# refuses, where it must refuse the same way with the suffix added.
+OVERRIDE_MODES = pytest.mark.parametrize("override", [False, True], ids=["plain", "overridden"])
 
 # The real tools the scripts and their fakes call by name, linked into a directory of
 # their own so the rest of /usr/bin stays off PATH.
@@ -414,6 +423,19 @@ def _assert_untouched(vm: VM) -> None:
     assert not vm.ran("restart.sh"), calls
     merges = [line for line in calls if line.startswith("sudo ") and "merge --ff-only" in line]
     assert not merges, calls
+
+
+def _mode(override: bool) -> tuple[list[str], dict[str, str], str]:
+    """The arguments, environment and line suffix of one of ``OVERRIDE_MODES``."""
+    if not override:
+        return [], {}, ""
+    return ["--override-window"], {"FAKE_WINDOW_RC": "3", "FAKE_WINDOW_LINE": REFUSAL}, OVERRIDDEN
+
+
+def _hold(start: int, end: int) -> str:
+    """A close_hold line from ``start`` to ``end`` seconds after now."""
+    now = int(time.time())
+    return f"close_hold={now + start},{now + end}"
 
 
 # -- the tools -------------------------------------------------------------------------
@@ -974,20 +996,24 @@ def test_a_failed_bootstrap_with_nothing_owed_is_not_deployed(vm):
     ],
     ids=["another branch", "never fetched"],
 )
-def test_a_sha_not_on_main_is_refused(vm, sha, line):
+@OVERRIDE_MODES
+def test_a_sha_not_on_main_is_refused(vm, sha, line, override):
+    args, env, suffix = _mode(override)
     shas = {**vm.c, "never": "0123456789abcdef" * 2 + "01234567"}
-    proc = vm.deploy(shas[sha])
+    proc = vm.deploy(shas[sha], *args, **env)
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert _outcome(proc) == line.format(**shas)
+    assert _outcome(proc) == line.format(**shas) + suffix
     _assert_untouched(vm)
 
 
-def test_a_sha_behind_head_is_refused(vm):
+@OVERRIDE_MODES
+def test_a_sha_behind_head_is_refused(vm, override):
+    args, env, suffix = _mode(override)
     _git(vm.checkout, "reset", "-q", "--hard", vm.c["c2"])
-    proc = vm.deploy(vm.c["c1"])
+    proc = vm.deploy(vm.c["c1"], *args, **env)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert _outcome(proc) == (
-        f"not deployed: {vm.c['c1']} is behind the checkout's HEAD, {vm.c['c2']}"
+        f"not deployed: {vm.c['c1']} is behind the checkout's HEAD, {vm.c['c2']}{suffix}"
     )
     assert vm.head() == vm.c["c2"]
     assert not vm.ran("bootstrap ")
@@ -1098,18 +1124,21 @@ def test_a_head_moved_elsewhere_by_the_merge_is_an_unknown_outcome(vm):
     assert not vm.ran("restart.sh")
 
 
+@OVERRIDE_MODES
 @pytest.mark.parametrize("state", ["stopped", "activating", "failed"])
-def test_a_daemon_that_is_not_active_is_left_alone(vm, state):
+def test_a_daemon_that_is_not_active_is_left_alone(vm, state, override):
+    args, env, suffix = _mode(override)
     vm.stop(DAEMON)
     if state == "activating":
         vm.activating(DAEMON)
     elif state == "failed":
         (vm.state / "failed").mkdir(exist_ok=True)
         (vm.state / "failed" / DAEMON).write_text("")
-    proc = vm.deploy(vm.c["c2"])
+    proc = vm.deploy(vm.c["c2"], *args, **env)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     expected = {"stopped": "inactive"}.get(state, state)
     assert _outcome(proc).startswith(f"not deployed: {DAEMON} is {expected}, not active.")
+    assert _outcome(proc).endswith("for a daemon that is not running" + suffix)
     # It is checked before the window, so no Python starts.
     assert not vm.ran("venv-python")
     _assert_untouched(vm)
@@ -1125,9 +1154,6 @@ def test_the_window_refusal_is_the_last_line(vm):
 
 
 # -- the override (#987) ----------------------------------------------------------------
-
-OVERRIDDEN = ", with the deploy window overridden"
-REFUSAL = "a deploy may start next at Sun 2026-11-01 23:30 EST, because less than 210 minutes"
 
 
 def test_the_override_skips_the_window_refusal(vm):
@@ -1184,6 +1210,94 @@ def test_the_override_keeps_the_restarts_bound(vm):
         f" {vm.c['c1']}{OVERRIDDEN}"
     )
     assert not vm.ran("restart.sh")
+
+
+@pytest.mark.parametrize(
+    ("start", "end"), [(-60, 3600), (100, 3600)], ids=["inside the hold", "within the lead"]
+)
+def test_the_override_holds_the_restart_out_of_the_close(vm, start, end):
+    """The close cycles run inside the daemon, where the busy checks cannot see them, so
+    an overridden restart waits out today's close hold and gives up as for a busy job."""
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(
+        vm.c["c3"],
+        "--override-window",
+        FAKE_WINDOW_RC="3",
+        FAKE_WINDOW_LINE=REFUSAL,
+        FAKE_CLOSE_HOLD=_hold(start, end),
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == (
+        f"not restarted: the tree is at {vm.c['c3']}, and the last recorded deploy is"
+        f" {vm.c['c1']}{OVERRIDDEN}"
+    )
+    assert vm.ran("sleep") == ["sleep 30"] * 30
+    assert not vm.ran("restart.sh")
+    assert "waiting, because the session's close runs until epoch" in vm.deploy_log.read_text()
+
+
+@pytest.mark.parametrize(
+    ("start", "end"), [(-7200, -1), (7200, 9000)], ids=["passed", "hours ahead"]
+)
+def test_a_close_hold_away_from_now_lets_the_restart_run(vm, start, end):
+    vm.record(vm.c["c1"])
+    proc = vm.deploy(
+        vm.c["c3"],
+        "--override-window",
+        FAKE_WINDOW_RC="3",
+        FAKE_WINDOW_LINE=REFUSAL,
+        FAKE_CLOSE_HOLD=_hold(start, end),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr + vm.deploy_log.read_text()
+    assert _outcome(proc) == f"deployed: {vm.c['c3']}{OVERRIDDEN}"
+    assert not vm.ran("sleep 30")
+
+
+def _close_hold_call(vm: VM) -> str:
+    return f"sudo -u {OWNER} -H {vm.checkout}/.venv/bin/python -m lake.deploy_window --close-hold"
+
+
+def test_the_close_hold_is_read_before_the_merge_under_the_override(vm):
+    fetch = f"sudo -u {OWNER} -H timeout 300 git -C {vm.checkout} fetch origin main"
+    proc = vm.deploy(vm.c["c3"], "--override-window")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = vm.calls()
+    assert calls.index(_close_hold_call(vm)) < calls.index(fetch)
+
+
+def test_an_ordinary_deploy_never_reads_the_close_hold(vm):
+    proc = vm.deploy(vm.c["c2"], FAKE_CLOSE_HOLD=_hold(-60, 3600))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _close_hold_call(vm) not in vm.calls()
+
+
+@pytest.mark.parametrize(
+    ("env", "line"),
+    [
+        (
+            {"FAKE_CLOSE_HOLD_RC": "2"},
+            "not deployed: python -m lake.deploy_window --close-hold exited 2",
+        ),
+        (
+            {"FAKE_CLOSE_HOLD": "close_hold=soon"},
+            "not deployed: python -m lake.deploy_window printed no close_hold line",
+        ),
+        (
+            {"FAKE_CLOSE_HOLD": "close_hold=1,"},
+            "not deployed: python -m lake.deploy_window printed no close_hold line",
+        ),
+        (
+            {"FAKE_CLOSE_HOLD": "close_hold=01,2"},
+            "not deployed: python -m lake.deploy_window printed no close_hold line",
+        ),
+    ],
+    ids=["exit 2", "not a number", "no end", "a leading zero"],
+)
+def test_a_close_hold_it_cannot_read_is_not_deployed(vm, env, line):
+    proc = vm.deploy(vm.c["c2"], "--override-window", **env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _outcome(proc) == line + OVERRIDDEN
+    _assert_untouched(vm)
 
 
 def test_the_override_keeps_the_window_exit_check(vm):
@@ -1379,10 +1493,12 @@ def test_a_held_deploy_lock_refuses_the_inner_run(vm):
     _assert_untouched(vm)
 
 
-def test_an_expired_request_is_refused_before_anything_runs(vm):
-    proc = vm.deploy(vm.c["c2"], "--not-after", str(int(time.time()) - 1))
+@OVERRIDE_MODES
+def test_an_expired_request_is_refused_before_anything_runs(vm, override):
+    args, env, suffix = _mode(override)
+    proc = vm.deploy(vm.c["c2"], "--not-after", str(int(time.time()) - 1), *args, **env)
     assert proc.returncode == 3, proc.stdout + proc.stderr
-    assert _outcome(proc) == "not deployed: the request expired"
+    assert _outcome(proc) == "not deployed: the request expired" + suffix
     assert not vm.ran("systemd-run")
 
 
