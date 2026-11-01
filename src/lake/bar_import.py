@@ -81,7 +81,7 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 from lake import bars, outbox
@@ -558,8 +558,7 @@ def import_vintages(
                 ticker = plan.vintage.ticker
                 directory = paths.bars_partition_path(ticker, DAILY_FREQ, plan.bars[0].day).parent
                 keys = {
-                    paths.bars_partition_path(ticker, DAILY_FREQ, bar.day).name
-                    for bar in plan.bars
+                    paths.bars_partition_path(ticker, DAILY_FREQ, bar.day).name for bar in plan.bars
                 }
                 plan.report.temps_removed = _remove_temps(directory, keys, root)
                 summary.tickers.append(plan.report)
@@ -589,7 +588,9 @@ def import_vintages(
                         window_end=None,
                         extended_hours=None,
                     )
-                    written += bars._write_partition(rows, target, provenance=plan.vintage.provenance)
+                    written += bars._write_partition(
+                        rows, target, provenance=plan.vintage.provenance
+                    )
                     entries.append(
                         {
                             "partition": target.relative_to(root).as_posix(),
@@ -613,8 +614,8 @@ def import_vintages(
         raise refuse(f"{exc}, so the bar import stopped") from None
     except OSError as exc:
         raise refuse(
-            f"writing the import under {root} failed ({type(exc).__name__}: {exc.strerror or exc}). "
-            "Fix that and run the bar import again"
+            f"writing the import under {root} failed ({type(exc).__name__}: "
+            f"{exc.strerror or exc}). Fix that and run the bar import again"
         ) from None
     return summary
 

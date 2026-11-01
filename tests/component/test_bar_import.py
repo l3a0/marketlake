@@ -76,6 +76,7 @@ EVENING_ONBOARD = datetime(2026, 8, 26, 17, 30, tzinfo=MARKET_TZ)
 FIRST_SPAN = date(2026, 8, 27)
 AS_OF = date(2012, 4, 10)
 HEADER = ("Price,Close,High,Low,Open,Volume", "Date,,,,,")
+EQUITY = KIND_EQUITY
 
 
 def _lake(
@@ -86,9 +87,7 @@ def _lake(
     spans: bool = True,
 ) -> Path:
     """A lake whose master holds each ticker from ``onboard`` with an open span from then."""
-    root = (
-        FixtureLake(tmp_path / "lake").with_reference("schema_versions", _ledger_table()).build()
-    )
+    root = FixtureLake(tmp_path / "lake").with_reference("schema_versions", _ledger_table()).build()
     master = SecurityMaster()
     ledger = CaptureSpans()
     for ticker in tickers:
@@ -164,9 +163,7 @@ def _bars_files(root: Path) -> list[str]:
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
-    return {
-        p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()
-    }
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
 # -- 1. the vintage lands and reads back -----------------------------------------------
@@ -288,11 +285,13 @@ def test_the_bound_is_the_earliest_span_of_every_instrument_the_ticker_named(tmp
     """
     root = _lake(tmp_path, spans=False)
     old_start = EVENING_ONBOARD.astimezone(UTC)
+    # Saturday 2026-08-29, the first day the ticker names the new instrument.
+    recycled = date(2026, 8, 29)
     new_start = datetime(2026, 8, 28, 21, 0, tzinfo=UTC)
     master = SecurityMaster(
         [
-            Mapping(1, ID_TYPE_TICKER, "GLD", date(2026, 8, 26), date(2026, 8, 29), KIND_EQUITY, old_start),
-            Mapping(2, ID_TYPE_TICKER, "GLD", date(2026, 8, 29), None, KIND_EQUITY, new_start),
+            Mapping(1, ID_TYPE_TICKER, "GLD", date(2026, 8, 26), recycled, EQUITY, old_start),
+            Mapping(2, ID_TYPE_TICKER, "GLD", recycled, None, EQUITY, new_start),
         ]
     )
     spans = CaptureSpans()
