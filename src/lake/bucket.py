@@ -4990,14 +4990,15 @@ def resync(
        step 6's list, refuses whatever its bytes: a chains or quotes partition B does not
        name, or a journal segment no compacted partition and no segment of B covers, may be
        the only copy, and any other such file is one the resync would leave unrecorded. An
-       entry for the capture spans, or a signoff in the quarantine ledger, is a human
-       decision the bucket's copy would silently replace, and refuses only while the file on
+       entry for the capture spans, a signoff in the quarantine ledger, or a ``bars/``
+       partition whose ``source`` starts ``bar-import:``, which no sweep regenerates
+       (marketlake #950), is a human decision the bucket's copy would silently replace, and refuses only while the file on
        disk still holds that tail's sha for its path. An entry for the schema-version ledger
        is a warning instead. Last, a download or a deletion whose path differs only by case
        from another path B names or this lake's tail names refuses.
     6. Deletions: a file only this lake's tail names, on disk, goes when it is a journal
-       segment whose compacted partition B records, a ``bars/`` partition, or a
-       ``trimmed.jsonl`` B names none of, whatever its bytes.
+       segment whose compacted partition B records, a ``bars/`` partition the sweep wrote, or
+       a ``trimmed.jsonl`` B names none of, whatever its bytes.
     7. Checks: every download is in the listing, its stored SHA-256 equals B's entry, and the
        free space left covers the journal reserve. A stored SHA-256 that differs means the
        other host's last upload stopped before its ``manifest.jsonl`` or is still running,

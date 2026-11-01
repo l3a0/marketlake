@@ -126,7 +126,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   for sessions before a ticker's capture began.
   `python -m lake.bar_import vintage <csv>...` lands the quantitative-trading vintages the
   module lists by SHA-256. It runs on the primary only, refuses any key the manifest
-  already names, and marks each bar imported with its source and price basis.
+  names under another source, skips the keys it already imported, and marks each bar
+  imported with its source and price basis. `--dry-run` checks every rule and writes
+  nothing.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   the proxy pool that measures a read's peak Arrow memory, and `status_dom.js`, the DOM
   stub the Cost panel's page test runs the dashboard's script against.
