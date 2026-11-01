@@ -37,6 +37,7 @@ import pytest
 from lake import actions, bars, journal, report
 from lake.bars import (
     CHECK_BAR_CLOSE,
+    CHECK_BAR_MINUTE_CLOSE,
     CHECK_BAR_RESPONSE,
     FOLLOWING_UNSEALED,
     MINUTE_EXTENDED_HOURS,
@@ -1316,7 +1317,7 @@ def test_two_instruments_naming_one_ticker_on_one_day_plan_it_once():
     assert len(plan.days) == len(SESSIONS)
 
 
-def test_the_plan_is_ordered_newest_session_first_then_ticker_then_frequency():
+def test_the_plan_is_ordered_newest_session_first_then_ticker_then_minute_half_first():
     """The newest session in range is walked first, and two runs produce the same order.
 
     A set is what dedupes and a set has no order, so the sort is what keeps the sign-off block and
@@ -1330,8 +1331,11 @@ def test_the_plan_is_ordered_newest_session_first_then_ticker_then_frequency():
     never manifested and so are asked for again on every later run. A budget over that order
     reaches today's bars on no run at all, while an unbudgeted walk lands them on the first.
 
-    The tie-break inside a session is untouched, and the assertion below is what says so: ticker
-    before frequency, both ascending, so ``QQQ`` at ``1m`` still precedes ``SPY`` at ``1d``.
+    The tie-break inside a session is the ticker, ascending, then the ``1m`` half before the
+    ``1d`` one. Marketlake #947 put the minute half first: a daily bar whose quotes hold no usable
+    close is gated against the same session's 1-minute partition, so that partition has to land
+    earlier in the walk. Plain string order puts ``"1d"`` before ``"1m"``, and the fallback would
+    then land a night late.
     """
     plan = _plan(
         spans=_open_span(1, 2),
@@ -1342,14 +1346,16 @@ def test_the_plan_is_ordered_newest_session_first_then_ticker_then_frequency():
     # Determinism, stated as the property rather than as a literal: sessions descend, and within
     # one session the pair ascends. A `sorted(keys)` comparison cannot express that, because the
     # two halves of the key now run in opposite directions.
-    assert keys == sorted(keys, key=lambda key: (-key[0].toordinal(), key[1], key[2]))
+    assert keys == sorted(
+        keys, key=lambda key: (-key[0].toordinal(), key[1], key[2] != MINUTE_FREQ)
+    )
     assert keys[:4] == [
-        (SESSIONS[-1], "QQQ", DAILY_FREQ),
         (SESSIONS[-1], "QQQ", MINUTE_FREQ),
-        (SESSIONS[-1], "SPY", DAILY_FREQ),
+        (SESSIONS[-1], "QQQ", DAILY_FREQ),
         (SESSIONS[-1], "SPY", MINUTE_FREQ),
+        (SESSIONS[-1], "SPY", DAILY_FREQ),
     ]
-    assert keys[-1] == (SESSIONS[0], "SPY", MINUTE_FREQ)
+    assert keys[-1] == (SESSIONS[0], "SPY", DAILY_FREQ)
     # The range's own ends are read off ``sessions``, which keeps its ascending sort, so inverting
     # ``days`` must not move them. A reversal of the whole sorted list would have.
     assert plan.floor == SESSIONS[0]
@@ -2018,3 +2024,258 @@ def test_the_plan_orders_by_the_whole_date_across_a_month_boundary():
     # The range's own ends are unmoved by the inversion, and they straddle the boundary.
     assert plan.floor == first
     assert plan.ceiling == last
+
+
+# -- the 1-minute fallback for a sealed session with no usable close (marketlake #947) ----------
+
+
+def _minute_table(day: date, close: float = SETTLED_CLOSE) -> pa.Table:
+    """A 1-minute partition an earlier run landed, whose last candle closes at ``close``."""
+    open_et, close_et = _bounds(day)
+    built = journal.bars_rows(
+        {"candles": _minute_candles(day, close), "symbol": "SPY", "empty": False},
+        ticker="SPY",
+        freq=MINUTE_FREQ,
+        instrument_id=1,
+        fetch_ts=TONIGHT,
+        fetch_end_ts=TONIGHT,
+        window_start=open_et,
+        window_end=close_et,
+        extended_hours=MINUTE_EXTENDED_HOURS,
+    )
+    return pa.Table.from_batches([journal.bars_data_batch(built)])
+
+
+# The live lake's outage: 2026-09-08 through 2026-09-10 hold gap rows and no data row, and every
+# session after them carries its 16:15 close. 2026-09-17 is sealed so the newest session's wait
+# ends and every daily ticker-day in range reaches the gate.
+OUTAGE = (date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10))
+
+
+def _outage_quotes() -> dict[tuple[str, date], list[dict]]:
+    return {
+        ("SPY", day): [_gap_row(day)] if day in OUTAGE else [_quote_row(day)]
+        for day in (*SESSIONS, date(2026, 9, 17))
+    }
+
+
+def test_a_gap_day_lands_against_the_minute_bars_landed_on_the_same_walk(
+    fixture_lake: FixtureLake,
+):
+    """The outage's three daily bars land in the run that lands their minute bars.
+
+    This is the case marketlake #947 is for. A session whose quotes hold no usable close used to
+    be abandoned for good, so a lookback reaching it carried a hole for ever. Its own 1-minute
+    bars are the reference now, and the walk takes the minute half of a session before its daily
+    half, so a partition the same run lands is there for the daily gate to read. Under plain
+    ``(ticker, freq)`` order ``"1d"`` sorts first, nothing would be abandoned this run, and the
+    three bars would land a night late.
+
+    Every other session is judged against its 16:15 quote as before, and ``gated_by`` says which
+    reference judged each one.
+    """
+    root = _lake(fixture_lake, quotes=_outage_quotes())
+    vendor = RecordingVendor(_cassette())
+    result = _run(root, vendor, roster=_roster({"SPY": [MINUTE_FREQ, DAILY_FREQ]}))
+
+    assert result.abandoned == () and result.unsettled == () and result.held == ()
+    daily = {entry.session: entry.gated_by for entry in result.landed if entry.freq == DAILY_FREQ}
+    assert daily == {
+        day: CHECK_BAR_MINUTE_CLOSE if day in OUTAGE else CHECK_BAR_CLOSE for day in SESSIONS
+    }
+    minute = {entry.gated_by for entry in result.landed if entry.freq == MINUTE_FREQ}
+    assert minute == {None}
+    assert _partition(root, "SPY", DAILY_FREQ, date(2026, 9, 8)).exists()
+
+
+def test_a_minute_partition_an_earlier_run_landed_rescues_an_abandoned_bar(
+    fixture_lake: FixtureLake,
+):
+    """The live lake's six: minute bars on disk for weeks, daily bars abandoned beside them.
+
+    Nothing has to be cleared for them, because the walk keeps no state about an abandoned
+    ticker-day and asks again every night. The roster here takes ``1d`` alone, so the minute
+    partitions can only have come from an earlier run, and the calls show the daily fetch is the
+    only request spent on each.
+    """
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=tuple(("SPY", MINUTE_FREQ, day, _minute_table(day)) for day in OUTAGE),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert result.abandoned == () and result.held == ()
+    rescued = {e.session for e in result.landed if e.gated_by == CHECK_BAR_MINUTE_CLOSE}
+    assert rescued == set(OUTAGE)
+    assert len(vendor.calls) == len(SESSIONS)
+
+
+def test_a_gap_day_with_no_minute_partition_stays_abandoned(fixture_lake: FixtureLake):
+    """No 1-minute partition, no fallback: the ticker-day is abandoned under its quote reason.
+
+    That is what happens once Schwab's roughly 30-day minute lookback has passed without one
+    landing, and the reason it carries is the quote read's, unchanged, so the sweep's census
+    reads the same as before. ``BarsAbsent`` from the minute read is not filed, because it says
+    nothing is there rather than that something is wrong.
+    """
+    root = _lake(fixture_lake, quotes=_outage_quotes())
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert result.abandoned == tuple(
+        GateSkip("SPY", DAILY_FREQ, day, "SnapAbsent") for day in reversed(OUTAGE)
+    )
+    assert result.held == ()
+    assert len(vendor.calls) == len(SESSIONS) - len(OUTAGE)
+
+
+def test_a_minute_close_that_disagrees_holds_the_bar_under_its_own_check(
+    fixture_lake: FixtureLake,
+):
+    """A fallback that disagrees by more than the tolerance holds the bar, and says which check.
+
+    The tolerance is the 16:15 gate's, 5 basis points. The daily candle here closes 1.5% above
+    the minute bars, which is the shape of an adjustment the gate exists to catch. The finding
+    files under ``CHECK_BAR_MINUTE_CLOSE`` with the minute close as what it was compared against,
+    so a reader of the withheld record knows it was not the 16:15 quote that disagreed.
+    """
+    held_day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, held_day, _minute_table(held_day)),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,), daily_closes={held_day: 659.75}))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
+    finding = result.held[0].finding
+    assert (finding.observed_on, finding.computed, finding.against) == (
+        held_day,
+        659.75,
+        SETTLED_CLOSE,
+    )
+    assert not _partition(root, "SPY", DAILY_FREQ, held_day).exists()
+    assert [entry["check"] for entry in _findings(root, held_day)] == [CHECK_BAR_MINUTE_CLOSE]
+
+
+def test_the_minute_close_is_the_last_candle_and_a_close_inside_the_tolerance_lands(
+    fixture_lake: FixtureLake,
+):
+    """The reference is the last candle's close, and 3 basis points of drift still lands.
+
+    The fixture's first candle closes at 648.5, 23 basis points away, so a reference taken from
+    the first row would hold this bar. The daily candle sits 3 basis points above the last
+    candle, inside the measured drift of the 15:59 candle against the official close.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,), daily_closes={day: 650.195}))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert result.held == ()
+    assert day in {e.session for e in result.landed if e.gated_by == CHECK_BAR_MINUTE_CLOSE}
+
+
+def test_a_quarantined_session_never_falls_back_to_its_minute_bars(fixture_lake: FixtureLake):
+    """Only the reasons nothing can change take the fallback.
+
+    A quarantined quotes partition clears through ``python -m lake.signoff``, so its bar waits for
+    that verdict rather than landing past it on another reference. The minute partition is on
+    disk and readable, so the only thing keeping this bar abandoned is the reason.
+    """
+    day = date(2026, 9, 9)
+    quotes = {("SPY", d): [_quote_row(d)] for d in (*SESSIONS, date(2026, 9, 17))}
+    fixture_lake.with_quarantine(
+        {"partition": "quotes/ticker=SPY/date=2026-09-09.parquet", "verdict": "held"}
+    )
+    root = _lake(
+        fixture_lake,
+        quotes=quotes,
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert result.abandoned == (GateSkip("SPY", DAILY_FREQ, day, "PartitionQuarantined"),)
+    assert day not in {entry.session for entry in result.landed}
+
+
+def test_a_quarantined_minute_partition_leaves_the_bar_abandoned(fixture_lake: FixtureLake):
+    """The minute read goes through ``load_bars``, so a quarantine there is honoured too.
+
+    A battery verdict on the minute partition is a reason not to trust it as a reference. The
+    daily bar stays abandoned under its quote reason, and nothing is filed for it.
+    """
+    day = date(2026, 9, 9)
+    fixture_lake.with_quarantine(
+        {"partition": "bars/ticker=SPY/freq=1m/date=2026-09-09.parquet", "verdict": "held"}
+    )
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    assert GateSkip("SPY", DAILY_FREQ, day, "SnapAbsent") in result.abandoned
+    assert result.held == ()
+    assert day not in {entry.session for entry in result.landed}
+
+
+def test_an_unsealed_session_waits_rather_than_falling_back(fixture_lake: FixtureLake):
+    """A quotes file on disk that the manifest does not record is not a sealed session.
+
+    Compaction writes a partition and its manifest entry under one lock hold, so a file with no
+    entry is one a killed run left. Its gap row says nothing permanent yet, so the bar waits
+    under ``unsettled`` instead of landing against the minute bars.
+    """
+    day = date(2026, 9, 9)
+    quotes = {("SPY", d): [_quote_row(d)] for d in (*SESSIONS, date(2026, 9, 17)) if d != day}
+    root = _lake(
+        fixture_lake,
+        quotes=quotes,
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    pq.write_table(
+        _quotes_table([_gap_row(day)]), LakePaths(root).quotes_partition_path("SPY", day)
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,)))
+    result = _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+    # Membership rather than equality: 2026-09-08 waits on this unsealed session too, under
+    # ``FOLLOWING_UNSEALED``, and that wait is another issue's to keep or remove.
+    assert GateSkip("SPY", DAILY_FREQ, day, "SnapAbsent") in result.unsettled
+    assert day not in {entry.session for entry in result.landed}
+
+
+def test_the_backfill_block_names_a_bar_gated_against_the_minute_close(
+    fixture_lake: FixtureLake,
+):
+    """The sign-off block says which landed bars the looser reference judged.
+
+    The landed row is the vendor's official daily candle either way, so ``load_bars`` carries no
+    mark. The by-hand reader of this block and the nightly report are where the record lives.
+    """
+    day = date(2026, 9, 9)
+    root = _lake(
+        fixture_lake,
+        quotes=_outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, day, _minute_table(day)),),
+    )
+    result = _run(
+        root, RecordingVendor(_cassette(freqs=(DAILY_FREQ,))), roster=_roster({"SPY": [DAILY_FREQ]})
+    )
+    rendered = result.render().splitlines()
+    marked = [line for line in rendered if line.endswith(", gated against the 1m close")]
+    assert marked == [
+        "    - SPY 1d 2026-09-09 1 row(s) at bars/ticker=SPY/freq=1d/date=2026-09-09.parquet"
+        ", gated against the 1m close"
+    ]

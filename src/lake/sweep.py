@@ -186,7 +186,8 @@ from lake import aws_cost, control_plane, outbox
 from lake.actions import ActionsError, ExtractionReport, extract_dividends
 from lake.alert import REFUSED, Message, Publisher, undelivered
 from lake.bars import (
-    CLOSE_VALUE_ABSENT,
+    CHECK_BAR_MINUTE_CLOSE,
+    PERMANENT_ABANDON_REASONS,
     BackfillReport,
     BarsReport,
     SpansAbsent,
@@ -212,7 +213,6 @@ from lake.control_plane import (
     pmset_schedule_args,
     read_pmset_schedule,
 )
-from lake.loader import SnapAbsent
 from lake.manifest import ManifestError, is_quarantined, latest_quarantine
 from lake.paths import BARS, CHAINS, QUOTES, default_token_path
 from lake.report import (
@@ -460,20 +460,22 @@ _BARS_REFUSALS = (
     OSError,
 )
 
-# The ``bars abandoned`` reasons that say the sealed partition holds no usable close. The
-# segments it was built from are gone, so nothing can change either one, and a line naming
-# only these is ``INFO``. ``bars.GateSkip`` carries the reason as the class-shaped token, which
-# ``bars`` calls "what separates a quarantine somebody can sign off from a gap nothing can
-# rebuild". The other three want a human. ``PartitionAbsent`` is a manifested partition gone
-# from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and ``PartialRead`` a
-# schema change (marketlake #530). A chains or quotes partition comes back from the bucket
-# through ``python -m lake.bucket restore-range`` (marketlake #784).
+# The ``bars abandoned`` reasons that say the sealed partition holds no usable close are
+# ``bars.PERMANENT_ABANDON_REASONS``, and a census line naming only these is ``INFO``. The set
+# lives in ``bars`` since marketlake #947, because the walk reads it too: a daily bar abandoned for
+# one of these is gated against its session's 1-minute bars instead, so it is counted here only
+# while that partition is missing as well. ``bars.GateSkip`` carries the reason as the
+# class-shaped token, which ``bars`` calls "what separates a quarantine somebody can sign off from
+# a gap nothing can rebuild". The other three want a human. ``PartitionAbsent`` is a manifested
+# partition gone from disk, which wants a restore, ``PartitionQuarantined`` a sign-off, and
+# ``PartialRead`` a schema change (marketlake #530). A chains, quotes or bars partition comes back
+# from the bucket through ``python -m lake.bucket restore-range`` (marketlake #784), which is also
+# what brings back a trimmed 1-minute partition the fallback needs.
 #
 # ``SnapAbsent`` took ``NoSpotClose``'s place when marketlake #618 moved the gate's reference
 # onto the session's own 16:15 row, read by minute. A gap row at that minute is the same
 # permanent absence the old read met at 16:00, and the live lake's six abandoned ticker-days
 # carry it. Without it here the census line would turn to ``ACTION`` on the first night.
-_PERMANENT_ABANDON_REASONS = frozenset({SnapAbsent.__name__, CLOSE_VALUE_ABSENT})
 
 
 def set_sunday_wake(sunday: date) -> None:
@@ -1525,7 +1527,22 @@ def sweep(
                     # a restore, a sign-off, or a schema change (marketlake #530).
                     report.add(
                         f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}",
-                        INFO if set(reasons) <= _PERMANENT_ABANDON_REASONS else ACTION,
+                        INFO if set(reasons) <= PERMANENT_ABANDON_REASONS else ACTION,
+                    )
+                # A daily bar gated against its session's 1-minute close because its 16:15 quote
+                # was missed, which is marketlake #947. It reports no fault: the bar landed, and
+                # the vendor's daily candle is the same official close whichever reference judged
+                # it. The reference is looser, the last regular trade rather than the close, so
+                # the line is the nightly record of which bars it judged. Counted rather than
+                # named, for the reason the abandoned census above gives, and it carries one
+                # ``": "`` so ``report.redacted`` keeps it whole.
+                minute_gated = [
+                    entry for entry in walked.landed if entry.gated_by == CHECK_BAR_MINUTE_CLOSE
+                ]
+                if minute_gated:
+                    report.add(
+                        f"bars gated against the 1m close: {len(minute_gated)} ticker-day(s)",
+                        INFO,
                     )
                 # A ticker-day the run's request budget stopped it from fetching, which is
                 # marketlake #478. It is the only line here that reports no fault: the run spent
