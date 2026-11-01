@@ -74,7 +74,8 @@ CALENDAR = weekday_sessions(date(2026, 8, 24), date(2026, 8, 31))
 # span session is Thursday 2026-08-27 and Wednesday stays importable.
 EVENING_ONBOARD = datetime(2026, 8, 26, 17, 30, tzinfo=MARKET_TZ)
 FIRST_SPAN = date(2026, 8, 27)
-AS_OF = date(2012, 4, 10)
+# Unlike the module's own 2012-04-10, so a vintage that hard-codes its date or basis fails.
+AS_OF = date(2019, 3, 1)
 HEADER = ("Price,Close,High,Low,Open,Volume", "Date,,,,,")
 EQUITY = KIND_EQUITY
 
@@ -121,14 +122,14 @@ def _csv(
     return path
 
 
-def _vintage(path: Path, ticker: str = "GLD") -> tuple[str, Vintage]:
+def _vintage(path: Path, ticker: str = "GLD", basis: str = BASIS_ADJUSTED) -> tuple[str, Vintage]:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return digest, Vintage(
         sha256=digest,
         ticker=ticker,
         source=f"test:{path.name}",
         source_as_of=AS_OF,
-        basis=BASIS_ADJUSTED,
+        basis=basis,
     )
 
 
@@ -196,7 +197,7 @@ def test_a_vintage_lands_and_reads_back_through_load_bars(tmp_path):
     # The ticker's current instrument, the first and only one ``_lake`` registered.
     assert table.column("instrument_id").to_pylist() == [1, 1, 1]
     assert table.column("source").to_pylist() == ["test:gld.csv"] * 3
-    assert table.column("source_as_of").to_pylist() == ["2012-04-10"] * 3
+    assert table.column("source_as_of").to_pylist() == ["2019-03-01"] * 3
     # Eastern midnight as a UTC instant: 04:00Z under daylight time, 05:00Z under standard time.
     assert table.column("bar_ts").to_pylist() == [
         "2006-04-26T04:00:00+00:00",
@@ -333,7 +334,7 @@ def test_a_captured_key_refuses_the_whole_run(tmp_path):
     message = _refused(root, [source], {digest: vintage})
 
     assert captured in message
-    assert "captured" in message
+    assert "captured bars (manifest source 'sweep')" in message
     assert vintage.manifest_source in message
     assert "1 key(s) conflict" in message
     assert "nothing was written" in message
@@ -350,7 +351,7 @@ def test_a_key_another_import_holds_refuses(tmp_path):
 
     message = _refused(root, [source], _listed((source, "GLD")))
 
-    assert held in message and other in message
+    assert held in message and f"the import {other}" in message
     assert _snapshot(root) == before
 
 
@@ -474,6 +475,38 @@ def test_a_bad_input_refuses_before_anything_is_written(tmp_path, rows, header_t
     assert _snapshot(root) == before
 
 
+_HEADER = "Price,Close,High,Low,Open,Volume\nTicker,GLD,GLD,GLD,GLD,GLD\nDate,,,,,\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (_HEADER + "2006-04-26,,2.0,0.5,1.0,5\n", "not a finite number"),
+        (_HEADER + "2006-04-26,nan,2.0,0.5,1.0,5\n", "not a finite number"),
+        (_HEADER + "2006-04-26,inf,2.0,0.5,1.0,5\n", "not a finite number"),
+        (_HEADER + "2006-04-26,1.0\n", "short of its header"),
+        (_HEADER, "holds no rows"),
+        (_HEADER.replace("Date,,,,,\n", "") + "2006-04-26,1.0,2.0,0.5,1.0,5\n", "three header"),
+        (
+            _HEADER.replace("Ticker,GLD,GLD", "Ticker,GLD,USO") + "2006-04-26,1,2,0,1,5\n",
+            "GLD, USO",
+        ),
+    ],
+    ids=["blank", "nan", "inf", "short-line", "no-rows", "no-date-row", "mixed-ticker"],
+)
+def test_a_malformed_file_refuses_with_one_line(tmp_path, text, expected):
+    """An import is write-once, so a non-finite price must never land, and every malformed file
+    refuses with one line rather than a traceback."""
+    root = _lake(tmp_path)
+    source = tmp_path / "src" / "gld.csv"
+    source.parent.mkdir(parents=True)
+    source.write_text(text)
+    before = _snapshot(root)
+
+    assert expected in _refused(root, [source], _listed((source, "GLD")))
+    assert _snapshot(root) == before
+
+
 def test_a_header_read_by_position_would_swap_the_columns(tmp_path):
     """The header is read by name. Catches the open and close columns taken by position."""
     root = _lake(tmp_path)
@@ -507,8 +540,50 @@ def test_a_ticker_not_onboarded_refuses_and_names_onboard(tmp_path):
 
     message = _refused(root, [source], _listed((source, "GLD")))
 
-    assert "GLD" in message and "lake.onboard" in message
+    assert "resolves no instrument for GLD" in message and "lake.onboard" in message
     assert _bars_files(root) == []
+
+
+def test_a_retired_ticker_refuses_rather_than_landing_with_no_instrument(tmp_path):
+    """GLD named an instrument until Saturday 2026-08-29 and has a closed span. Catches the
+    onboarded check dropped, which would land rows with a null ``instrument_id``."""
+    root = _lake(tmp_path, spans=False)
+    start = EVENING_ONBOARD.astimezone(UTC)
+    SecurityMaster(
+        [Mapping(1, ID_TYPE_TICKER, "GLD", date(2026, 8, 26), date(2026, 8, 29), EQUITY, start)]
+    ).write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(1, start, options=False)
+    spans.close_span(1, datetime(2026, 8, 28, 21, 0, tzinfo=UTC))
+    spans.write(spans_path(root))
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+
+    assert "resolves no instrument for GLD" in _refused(root, [source], _listed((source, "GLD")))
+    assert _bars_files(root) == []
+
+
+def test_an_onboard_exactly_at_the_close_leaves_that_session_importable(tmp_path):
+    """A span opening at 16:00 Wednesday covers none of Wednesday, whose window ends at that
+    instant, as ``_span_sessions`` reads it. Catches a non-strict comparison, which would refuse a
+    session no path ever lands."""
+    root = _lake(tmp_path, onboard=datetime(2026, 8, 26, 16, 0, tzinfo=MARKET_TZ))
+    wednesday = _csv(tmp_path / "src" / "wed.csv", [("2026-08-26", 1.0)])
+    thursday = _csv(tmp_path / "src" / "thu.csv", [("2026-08-27", 1.0)])
+    vintages = _listed((wednesday, "GLD"), (thursday, "GLD"))
+
+    assert "2026-08-27" in _refused(root, [thursday], vintages)
+    _run(root, [wednesday], vintages)
+    assert _bars_files(root) == [_rel("GLD", "2026-08-26")]
+
+
+def test_a_raw_basis_source_lands_as_raw(tmp_path):
+    """Catches a vintage whose basis is hard-coded rather than read from its listing."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+
+    _run(root, [source], dict([_vintage(source, basis="raw")]))
+
+    assert load_bars("GLD", "1d", lake_root=root).column("basis").to_pylist() == ["raw"]
 
 
 def test_an_instrument_with_no_span_refuses(tmp_path):
@@ -689,6 +764,21 @@ def test_a_session_or_its_pre_open_margin_refuses(tmp_path, now):
 
     assert "next session" in _refused(root, [source], _listed((source, "GLD")), now=now)
     assert _bars_files(root) == []
+
+
+def test_the_window_is_checked_before_the_lock_is_taken(tmp_path, monkeypatch):
+    """Catches a run that takes the lock, which capture waits on, before checking the window."""
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+
+    @contextmanager
+    def no_lock(path):
+        raise AssertionError("the lock was taken inside the refused window")
+        yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", no_lock)
+
+    assert "Sunday" in _refused(root, [source], _listed((source, "GLD")), now=SUNDAY_20)
 
 
 def test_the_bound_is_checked_again_once_the_lock_is_taken(tmp_path, monkeypatch):
