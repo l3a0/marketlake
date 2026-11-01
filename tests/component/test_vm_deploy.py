@@ -475,7 +475,7 @@ def test_the_caps_sum_to_less_than_the_window_margin():
         + 2 * caps["RESTART_CHECK_SECONDS"]
         + caps["REST_SECONDS"]
     )
-    assert budget == 200 * 60
+    assert budget == 80 * 60
     assert budget < deploy_window.MARGIN.total_seconds()
     # A restart's own check fits inside the share the budget gives it.
     assert caps["HOLD_SECONDS"] < caps["RESTART_CHECK_SECONDS"]
@@ -517,8 +517,8 @@ def test_a_deploy_moves_forward_restarts_and_records(vm):
     fetch = f"sudo -u {OWNER} -H timeout 300 git -C {vm.checkout} fetch origin main"
     assert calls.index(window) < calls.index(fetch) < calls.index(merge)
     assert calls.index(merge) < calls.index(f"bootstrap {vm.c['c3']}")
-    assert vm.ran("timeout -k 60 4500 ") == [
-        f"timeout -k 60 4500 {vm.checkout}/deploy/vm-bootstrap.sh"
+    assert vm.ran("timeout -k 60 900 ") == [
+        f"timeout -k 60 900 {vm.checkout}/deploy/vm-bootstrap.sh"
     ]
     assert vm.ran("restart.sh") == ["restart.sh daemon", "restart.sh dashboard"]
     assert vm.ran("sleep") == ["sleep 120"]
@@ -1432,7 +1432,7 @@ def test_any_other_pairing_of_code_and_line_is_unknown(vm, code, line):
     "eastern",
     [
         datetime(2026, 10, 12, 12, 0),  # a Monday inside the weekday span, in EDT
-        datetime(2026, 10, 12, 6, 0),  # less than the margin before that span
+        datetime(2026, 10, 12, 7, 0),  # less than the margin before that span
         datetime(2026, 12, 13, 21, 0),  # inside the Sunday span, in EST
     ],
     ids=["in a span", "in the margin", "in winter"],

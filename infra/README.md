@@ -1669,10 +1669,10 @@ sudo ~/marketlake/deploy/vm-deploy.sh --sha "$(git -C ~/marketlake rev-parse HEA
 ```
 
 The terminal stays blank until the run ends, because the script prints its one line
-only then. No run on the VM has been timed yet. A run that restarts the daemon takes at
-least the bootstrap plus the 120 seconds it watches the daemon after the restart, and its
-caps bound the longest run, a rollback included, at 200 minutes. Follow the progress from
-a second shell.
+only then. A run that restarts the daemon takes the bootstrap plus the 120 seconds it
+watches the daemon after the restart. On the VM that has come to 134 to 137 seconds in
+all, and a run that restarts nothing takes about 10. Its caps bound the longest run, a
+rollback included, at 80 minutes. Follow the progress from a second shell.
 
 ```bash
 sudo tail -f /var/lib/marketlake/deploy.log
@@ -1681,8 +1681,8 @@ sudo tail -f /var/lib/marketlake/deploy.log
 Ctrl-C stops only the hand run's wait, which prints `outcome unknown: read deploy.log`.
 The deploy keeps running as `marketlake-deploy.service`, so read its outcome in the log.
 
-A deploy may start from 18:45 to 04:30 Eastern on a weekday night, all of Saturday,
-Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. Outside those hours the script
+A deploy may start from 18:45 to 06:30 Eastern on a weekday night, all of Saturday,
+Sunday until 18:00, and from Sunday 23:30 to Monday 06:30. Outside those hours the script
 refuses with exit 3 and names the next moment one may start. The hours keep the merge and
 the restart away from capture, compaction, the sweep and the Sunday job, with enough room
 that a deploy which rolls back still ends before the jobs start.
@@ -1703,8 +1703,8 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. A config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
 | `deployed: <sha>, but the dashboard did not restart` | 1 | Read `journalctl -u com.marketlake.dashboard`, fix the cause, then run `sudo ~/.local/state/marketlake/systemd/restart.sh dashboard`. Capture is unaffected. |
 | `deployed: <sha>, with a failed step in deploy.log, but the dashboard did not restart` | 1 | The two rows above both apply. Fix the dashboard as its row says, then the failed step as its row says. |
-| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
-| `rollback to <sha> failed: <reason>` | 1 | The daemon may be down. Check `systemctl status com.marketlake.daemon`, then recover by the hand procedure below. |
+| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A reason that ends `exited 124` or `exited 137` is a bootstrap that reached its 15-minute cap, usually while SSM, PyPI or astral.sh was unreachable. Nothing needs a pull request then: send the deploy of the same sha again once the outage has passed. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
+| `rollback to <sha> failed: <reason>` | 1 | The daemon may be down. Check `systemctl status com.marketlake.daemon`, then recover by the hand procedure below. When both the reason and the rollback's bootstrap end `exited 124` or `exited 137`, both bootstraps reached their 15-minute cap. The daemon was never restarted and the tree is back at the named sha, so send the deploy again once SSM, PyPI or astral.sh answers, and before the next session, because the next boot starts the daemon on what the killed bootstraps left. |
 | `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
 | `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |
 | `not deployed: <reason>` | 1, 2 or 3 | Exit 3 means not now: run again at the moment the line names, or once the named job has finished. Exit 2 is a refusal, such as a sha not on `main`, a dirty checkout or a daemon that is not running, and the line names what to fix. Exit 1 is a failure, and the log says which step. |
@@ -2123,7 +2123,7 @@ powers the VM off only when all six of its checks pass, in this order.
    cgroup. The deploy runs the same check, from `deploy/busy-check.sh`. It covers the
    close+15 compaction and its trim, the 18:30 sweep and the evening upload after it.
 5. **window.** `python -m lake.deploy_window` allows a start now, which keeps the stop out
-   of 08:00 to 18:45 ET on a weekday and 19:30 to 23:30 ET on Sunday, and out of the 210
+   of 08:00 to 18:45 ET on a weekday and 19:30 to 23:30 ET on Sunday, and out of the 90
    minutes before each.
 6. **deploy.** `marketlake-deploy.service` is not running. The script then takes the deploy
    lock and the install lock without waiting, checks the deploy again, and holds both
@@ -2476,8 +2476,8 @@ gh secret list --env deploy --repo l3a0/marketlake
 
 ### The owner's first deploy
 
-A deploy may start, and so may a pull by hand, from 18:45 to 04:30 ET on a weekday
-night, all of Saturday, Sunday until 16:00, and from Sunday 23:30 to Monday 04:30. The
+A deploy may start, and so may a pull by hand, from 18:45 to 06:30 ET on a weekday
+night, all of Saturday, Sunday until 18:00, and from Sunday 23:30 to Monday 06:30. The
 first deploy takes seven steps, in order.
 
 1. Pull on the VM inside those hours and run the manual first deploy that
