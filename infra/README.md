@@ -2522,6 +2522,10 @@ Its price is the reason the window exists, and `docs/design.md` measures it.
 - A deploy over the Sunday canary at 20:00 can make the `sunday` check miss and page.
 - Started shortly before a span, such as at 07:55 on a weekday, a failed bootstrap stays
   in place through the span, because its rollback waits like a restart.
+- A weekday morning override whose restart cannot start before 07:57 ends `not restarted`.
+  The daemon then runs the old code through the session while new processes import the
+  moved tree, because the session hold refuses another override until 16:30. Start a
+  morning override early enough for the bootstrap to finish first.
 
 ### The `deploy` environment and its secret
 

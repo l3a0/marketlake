@@ -1321,6 +1321,7 @@ NO_HOLD = "not deployed: python -m lake.deploy_window printed no session_hold li
             NO_HOLD,
         ),
         ({"FAKE_SESSION_HOLD": "session_hold=none"}, NO_HOLD),
+        ({"FAKE_SESSION_HOLD": "session_hold=1,2,3\nextra"}, NO_HOLD),
         (
             {
                 "FAKE_SESSION_LINE": "no session holds a deploy today",
@@ -1337,6 +1338,7 @@ NO_HOLD = "not deployed: python -m lake.deploy_window printed no session_hold li
         "a line of another shape",
         "a line carrying more",
         "none under a hold line",
+        "a third line",
         "no session beside a bad value",
     ],
 )

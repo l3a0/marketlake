@@ -46,7 +46,7 @@ overrides the window (marketlake #987) skips the spans above, and on 2026-11-01 
 ruled that it still never runs during a session. The busy checks cannot see the capture
 cycles or the close+5 fill, which run inside the daemon, and a restart that kills the
 equity close's cycle loses that day's ``spot_close`` for good. So ``--session-hold``
-prints two lines instead of the two above.
+prints two lines in place of the verdict's.
 
 1. A line for people, naming today's hold in Eastern time, or saying no session holds a
    deploy today.
