@@ -521,6 +521,136 @@ def test_the_send_names_the_instance_the_document_and_the_window(runner):
     )
 
 
+# -- the override (#987) ---------------------------------------------------------------
+
+OVERRIDDEN = ", with the deploy window overridden"
+ASKED = "this run was started with override_window"
+
+
+def _assert_overridden(
+    runner: Runner,
+    result: subprocess.CompletedProcess[str],
+    rc: int,
+    summary: str,
+    status: str,
+    code: str,
+) -> None:
+    assert result.returncode == rc, result.stdout + result.stderr
+    assert result.stderr == ""
+    assert result.stdout.splitlines()[-3:] == [
+        f"send-deploy: {summary}",
+        f"send-deploy: StatusDetails {status}, ResponseCode {code}",
+        f"send-deploy: {ASKED}",
+    ], result.stdout
+    assert runner.summary.read_text() == (
+        f"### Deploy of {SHA}\n\n{summary}\n\nStatusDetails {status}, ResponseCode {code}\n"
+        f"\n{ASKED[0].upper()}{ASKED[1:]}.\n"
+    )
+
+
+def test_the_override_adds_its_parameter_and_says_so(runner):
+    runner.host_says(f"deployed: {SHA}{OVERRIDDEN}")
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW="true")
+    _assert_overridden(runner, result, 0, f"deployed: {SHA}{OVERRIDDEN}", "Success", "0")
+    send = runner.calls("aws ssm send-command")
+    assert send == [
+        "aws ssm send-command --document-name marketlake-deploy "
+        f"--instance-ids {INSTANCE} "
+        f'--parameters {{"sha":["{SHA}"],"notAfter":["{NOW + 600}"],"overrideWindow":["true"]}} '
+        "--timeout-seconds 600 --query Command.CommandId --output text"
+    ]
+    assert result.stdout.splitlines()[0] == (
+        f"send-deploy: sent {SHA} to the VM, with the deploy window overridden, and waiting"
+        " for it to end"
+    )
+
+
+@pytest.mark.parametrize("value", ["false", ""], ids=["false", "a push"])
+def test_no_override_sends_the_two_parameters_every_version_takes(runner, value):
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW=value)
+    _assert_reported(runner, result, 0, f"deployed: {SHA}", "Success", "0")
+    [send] = runner.calls("aws ssm send-command")
+    assert f'--parameters {{"sha":["{SHA}"],"notAfter":["{NOW + 600}"]}} ' in send
+    assert ASKED not in result.stdout
+
+
+@pytest.mark.parametrize("value", ["TRUE", "True", "1", "yes", "true ", " true", "false\ntrue"])
+def test_an_override_that_is_neither_true_nor_false_sends_nothing(runner, value):
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW=value)
+    _assert_reported(
+        runner,
+        result,
+        1,
+        "not sent: DEPLOY_OVERRIDE_WINDOW is neither true nor false",
+        "none",
+        "none",
+    )
+    assert runner.calls("aws") == []
+
+
+@pytest.mark.parametrize(
+    ("invocation", "last", "rc"),
+    [
+        ("Success:0", f"deployed: {SHA}", 0),
+        ("Success:0", f"deployed: {SHA} (already current)", 0),
+        ("Failed:1", f"deployed: {SHA}, with a failed step in deploy.log", 1),
+        (
+            "Failed:1",
+            f"not restarted: the tree is at {SHA}, and the last recorded deploy is {OTHER}",
+            1,
+        ),
+        ("Failed:3", "not deployed: a sweep is activating", 3),
+        ("Failed:1", "outcome unknown: read deploy.log", 1),
+    ],
+)
+def test_the_overrides_suffix_comes_off_before_the_table(runner, invocation, last, rc):
+    runner.host_says(last + OVERRIDDEN)
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW="true", INVOCATIONS=invocation)
+    status, code = invocation.split(":")
+    _assert_overridden(runner, result, rc, last + OVERRIDDEN, status, code)
+
+
+@pytest.mark.parametrize(
+    ("invocation", "last"),
+    [
+        ("Success:0", f"deployed: {SHA}"),
+        ("Success:0", f"deployed: {SHA} (already current)"),
+        ("Failed:1", f"not restarted: the tree is at {SHA}, and the last recorded deploy is none"),
+    ],
+)
+def test_the_suffix_on_a_run_that_did_not_ask_is_outcome_unknown(runner, invocation, last):
+    runner.host_says(last + OVERRIDDEN)
+    result = runner.run(INVOCATIONS=invocation)
+    status, code = invocation.split(":")
+    assert result.returncode == 1
+    assert _summary(result).startswith("outcome unknown: ")
+    assert (
+        result.stdout.splitlines()[-1]
+        == f"send-deploy: StatusDetails {status}, ResponseCode {code}"
+    )
+
+
+def test_an_override_that_sends_nothing_still_names_the_input_and_claims_no_send(runner):
+    """A stopped VM ends the run before the send, so the notice names the input and says
+    nothing about what reached the VM."""
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW="true", INSTANCES=f"{INSTANCE}\tstopped")
+    summary = (
+        f'not sent: the VM is stopped. {FIND}, and "Start a stopped instance" starts it.'
+        " Re-run this workflow once it runs"
+    )
+    _assert_overridden(runner, result, 1, summary, "none", "none")
+    assert not runner.calls("aws ssm")
+
+
+def test_a_host_older_than_the_override_reports_its_own_line(runner):
+    """Before the VM has deployed #987 once, its script refuses the flag with its usage
+    line, which carries no suffix."""
+    line = "not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]"
+    runner.host_says(line)
+    result = runner.run(DEPLOY_OVERRIDE_WINDOW="true", INVOCATIONS="Failed:2")
+    _assert_overridden(runner, result, 2, line, "Failed", "2")
+
+
 OTHER_INSTANCE = "i-0fedcba9876543210"
 
 

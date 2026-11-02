@@ -14,9 +14,13 @@ lines.
    start. On exit 3 it names the next moment one may, which is the end of the current
    refused span, or the end of a later one when the margin below refuses the gap between
    them.
-2. ``next_span_start=<epoch seconds>``, the start of the first refused span that ends
-   after now. Inside a span that start is in the past. ``vm-deploy.sh`` keeps it, so its
-   wait before the restart needs no Python once the checkout has moved.
+2. ``next_span_start=<epoch seconds>``, the start of the first refused span that has not
+   opened yet. ``vm-deploy.sh`` keeps it, so its wait before the restart needs no Python
+   once the checkout has moved. Outside a span it is the start of the span ahead. Inside
+   a span it is the start of the one after, because a deploy that overrides the window
+   (marketlake #987) starts inside one, and the current span's start, already past, would
+   refuse its restart after the merge had moved the tree. Every other reader acts on the
+   value only after exit 0, where the two readings agree.
 
 **A refused span** covers each day of the week on which the units have schedules. It runs
 from ``LEAD`` before that day's earliest scheduled start to the later of ``TAIL`` after
@@ -37,8 +41,26 @@ than ``MARGIN``.
 Every span is measured in absolute time, as UTC instants, so a span next to a clock change
 is still the right number of real minutes long.
 
-The module reads the clock through the ``Clock`` seam and nothing else. It needs no
-config file and no lake, so it runs before the deploy has checked either.
+**The session hold keeps an overridden deploy out of market hours.** A deploy that
+overrides the window (marketlake #987) skips the spans above, and on 2026-11-01 the owner
+ruled that it still never runs during a session. The busy checks cannot see the capture
+cycles or the close+5 fill, which run inside the daemon, and a restart that kills the
+equity close's cycle loses that day's ``spot_close`` for good. So ``--session-hold``
+prints two lines in place of the verdict's.
+
+1. A line for people, naming today's hold in Eastern time, or saying no session holds a
+   deploy today.
+2. ``session_hold=<refuse_from>,<open>,<end>`` in epoch seconds, or ``session_hold=none``.
+   ``end`` is the close+15 compaction, which the busy check sees once it starts.
+   ``refuse_from`` is ``MARGIN`` before the open, so a deploy that starts before it ends,
+   or rolls back, before the session opens. ``vm-deploy.sh`` refuses an overridden start
+   from ``refuse_from`` to ``end`` and holds its restart out of ``open`` to ``end``.
+
+The times come from ``SessionClock.bounds``, so an early close moves the hold with it.
+
+The module reads the clock through the ``Clock`` seam, and the exchange calendar for the
+session hold, and nothing else. It needs no config file and no lake, so it runs before the
+deploy has checked either.
 """
 
 from __future__ import annotations
@@ -50,8 +72,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 from lake import control_plane
-from lake.calendar import MARKET_TZ
+from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.clock import Clock
+from lake.session import SessionClock
 
 # How long before a day's earliest scheduled start a deploy must have finished. The
 # restart's own check takes two minutes, and a job that starts against a half-moved tree
@@ -169,6 +192,9 @@ def decide(
     if not spans:
         raise ValueError("no unit has a schedule, so no span bounds a deploy")
     first = spans[0]
+    upcoming = next((span.start for span in spans if span.start > now), None)
+    if upcoming is None:
+        raise ValueError("no refused span opens within the lookahead")
     if first.contains(now):
         reason = "the scheduled jobs run until then"
         free_from, rest = first.end, spans[1:]
@@ -191,7 +217,7 @@ def decide(
     return Verdict(
         REFUSED,
         f"a deploy may start next at {_eastern(free_from)}, because {reason}",
-        first.start,
+        upcoming,
     )
 
 
@@ -199,19 +225,56 @@ def _minutes(delta: timedelta) -> int:
     return int(delta.total_seconds() // 60)
 
 
-def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
+def session_hold(clock: Clock, calendar: Calendar) -> tuple[datetime, datetime, datetime] | None:
+    """Today's ``refuse_from``, ``open`` and ``end`` for an overridden deploy (#987), or
+    ``None`` off a session."""
+    session = SessionClock(clock, calendar)
+    today = session.session_date()
+    if not calendar.is_session(today):
+        return None
+    bounds = session.bounds(today)
+    return bounds.open - MARGIN, bounds.open, bounds.compaction
+
+
+def session_hold_lines(hold: tuple[datetime, datetime, datetime] | None) -> tuple[str, str]:
+    if hold is None:
+        return ("no session holds a deploy today", "session_hold=none")
+    refuse_from, opens, end = hold
+    return (
+        f"the session holds a deploy from {_eastern(refuse_from)} until {_eastern(end)}",
+        "session_hold=" + ",".join(str(int(when.timestamp())) for when in hold),
+    )
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    clock: Clock | None = None,
+    calendar: Calendar | None = None,
+) -> int:
     """The ``python -m lake.deploy_window`` entry. Returns a process exit code.
 
     ``clock`` stays injectable, since a clock reaches nothing past this process.
     """
-    argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="python -m lake.deploy_window",
         description="Exit 0 when a deploy of the hosted VM may start now, and 3 when not.",
-    ).parse_args(argv)
+    )
+    parser.add_argument(
+        "--session-hold",
+        action="store_true",
+        help="print today's session hold, which an overridden deploy stays out of",
+    )
+    args = parser.parse_args(argv)
     if clock is None:
         from lake.clock import SystemClock  # lazy: only the console reads the wall clock
 
         clock = SystemClock()
+    if args.session_hold:
+        calendar = ExchangeCalendar() if calendar is None else calendar
+        for line in session_hold_lines(session_hold(clock, calendar)):
+            print(line)
+        return ALLOWED
     verdict = decide(clock.now())
     for line in verdict.lines():
         print(line)

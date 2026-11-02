@@ -1,8 +1,9 @@
 #!/bin/sh
 # The one step of the SSM document marketlake-deploy, which infra/live/deploy.tf reads
 # into the document with file() rather than templatefile(), so OpenTofu substitutes
-# nothing here. The SSM agent substitutes the document's two parameters, which their
-# allowedPattern limits to a 40-digit hex sha and 10 decimal digits, and runs the step as
+# nothing here. The SSM agent substitutes the document's three parameters, which their
+# allowedPattern limits to a 40-digit hex sha and 10 decimal digits and their
+# allowedValues limits to false or true for overrideWindow, and runs the step as
 # root with sh, which is dash on Ubuntu. So this is POSIX sh, not bash.
 #
 # The agent starts a step in its own orchestration directory with its own PATH. The step
@@ -67,5 +68,13 @@ fi
 
 # The sha goes last, so a stray newline after it would cut off nothing. Were --not-after
 # last, a newline after the sha would start a deploy with no expiry.
-# shellcheck disable=SC1083 # the agent replaces both placeholders before the step runs
+#
+# --override-window goes only on a request that asks for it (#987). The checkout's script
+# runs before the deploy moves it, and a script older than the flag refuses it with its
+# usage line, so an ordinary deploy must reach it unchanged.
+# shellcheck disable=SC1083 # the agent replaces the placeholders before the step runs
+if [ "{{ overrideWindow }}" = true ]; then
+  exec "$home/marketlake/deploy/vm-deploy.sh" --override-window --not-after {{ notAfter }} --sha {{ sha }}
+fi
+# shellcheck disable=SC1083
 exec "$home/marketlake/deploy/vm-deploy.sh" --not-after {{ notAfter }} --sha {{ sha }}

@@ -760,7 +760,9 @@ and any module the running daemon imports for the first time all run the new cod
 `deploy/vm-deploy.sh` moves the checkout, installs and restarts only outside the hours the
 scheduled jobs run, which end at 18:45 Eastern on a weekday
 ([#676](https://github.com/l3a0/marketlake/issues/676)). `python -m lake.deploy_window`
-says whether a deploy may start now. On a weekday evening a deploy also waits for the
+says whether a deploy may start now, and a deploy started by hand can override it
+([#987](https://github.com/l3a0/marketlake/issues/987)), as `infra/README.md`'s "Override
+the deploy window" says. On a weekday evening a deploy also waits for the
 upload after the vendor sweep, which runs in the eod-sweep unit from about 18:32 ET and can
 run past 20:00 on a night it retries a failed seal or upload
 ([#833](https://github.com/l3a0/marketlake/issues/833)). The script refuses with exit 3

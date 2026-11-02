@@ -20,6 +20,7 @@ from tests.support.clock import ManualClock
 SATURDAY = date(2026, 10, 10)
 SUNDAY = date(2026, 10, 11)
 MONDAY = date(2026, 10, 12)
+TUESDAY = date(2026, 10, 13)
 FRIDAY = date(2026, 10, 16)
 
 HOST = cp.SystemdHost(python="/p/python", owner="o", home="/h", project_dir="/h/m")
@@ -128,11 +129,11 @@ def test_a_deploy_may_start_outside_the_spans_and_their_margin(capsys, now, late
 @pytest.mark.parametrize(
     ("now", "free", "span", "reason"),
     [
-        (et(MONDAY, 8), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "the scheduled jobs run"),
-        (et(MONDAY, 18, 44, 59), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "the scheduled"),
+        (et(MONDAY, 8), "Mon 2026-10-12 18:45 EDT", et(TUESDAY, 8), "the scheduled jobs run"),
+        (et(MONDAY, 18, 44, 59), "Mon 2026-10-12 18:45 EDT", et(TUESDAY, 8), "the scheduled"),
         (et(MONDAY, 6, 30, 1), "Mon 2026-10-12 18:45 EDT", et(MONDAY, 8), "less than 90"),
         (et(SUNDAY, 18, 0, 1), "Sun 2026-10-11 23:30 EDT", et(SUNDAY, 19, 30), "less than"),
-        (et(SUNDAY, 21), "Sun 2026-10-11 23:30 EDT", et(SUNDAY, 19, 30), "the scheduled"),
+        (et(SUNDAY, 21), "Sun 2026-10-11 23:30 EDT", et(MONDAY, 8), "the scheduled"),
     ],
     ids=["span opens", "span closes", "margin", "sunday margin", "sunday span"],
 )
@@ -141,7 +142,8 @@ def test_a_deploy_may_not_start_inside_a_span_or_its_margin(capsys, now, free, s
     assert code == 3
     assert len(lines) == 2
     assert lines[0].startswith(f"a deploy may start next at {free}, because {reason}")
-    # Inside a span its start is in the past, and vm-deploy.sh keeps it either way.
+    # In the margin it is the span ahead. Inside a span it is the one after, since the
+    # current span's start is past and an overridden deploy's restart reads it (#987).
     assert lines[1] == f"next_span_start={epoch(span)}"
 
 
@@ -163,11 +165,14 @@ def test_a_gap_shorter_than_the_margin_refuses_up_to_the_later_span():
         _job("late", cp.WallClockTime(23, 0), (5,)),
         _job("early", cp.WallClockTime(1, 0), (6,)),
     ]
-    for now in (et(SATURDAY, 23), et(SATURDAY, 21, 30)):
+    for now, upcoming in (
+        (et(SATURDAY, 23), et(SUNDAY, 0, 30)),
+        (et(SATURDAY, 21, 30), et(SATURDAY, 22, 30)),
+    ):
         verdict = dw.decide(now, units, _no_window)
         assert verdict.code == dw.REFUSED
         assert "next at Sun 2026-10-11 01:15 EDT" in verdict.line
-        assert verdict.next_span_start == et(SATURDAY, 22, 30).astimezone(UTC)
+        assert verdict.next_span_start == upcoming.astimezone(UTC)
 
 
 def test_a_span_that_started_yesterday_is_still_found():
@@ -175,6 +180,8 @@ def test_a_span_that_started_yesterday_is_still_found():
     verdict = dw.decide(et(SUNDAY, 0, 1), units, _no_window)
     assert verdict.code == dw.REFUSED
     assert "next at Sun 2026-10-11 00:05 EDT" in verdict.line
+    # The only span left to open is the same job's, a week on.
+    assert verdict.next_span_start == et(SATURDAY + timedelta(7), 23, 20).astimezone(UTC)
 
 
 # -- a clock change --------------------------------------------------------------------
@@ -286,3 +293,67 @@ def test_the_entry_takes_no_arguments(capsys):
     with pytest.raises(SystemExit) as raised:
         dw.main(["--now"], clock=ManualClock(et(MONDAY, 12)))
     assert raised.value.code == 2
+
+
+# -- the session hold (#987) -----------------------------------------------------------
+
+
+def _session_hold(now: datetime, capsys) -> tuple[int, list[str]]:
+    code = dw.main(["--session-hold"], clock=ManualClock(now.astimezone(UTC)))
+    return code, capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("now", "opens", "end", "line"),
+    [
+        (
+            et(TUESDAY, 10),
+            et(TUESDAY, 9, 30),
+            et(TUESDAY, 16, 30),
+            "the session holds a deploy from Tue 2026-10-13 08:00 EDT until Tue 2026-10-13"
+            " 16:30 EDT",
+        ),
+        (
+            et(TUESDAY, 23, 59),
+            et(TUESDAY, 9, 30),
+            et(TUESDAY, 16, 30),
+            "the session holds a deploy from Tue 2026-10-13 08:00 EDT until Tue 2026-10-13"
+            " 16:30 EDT",
+        ),
+        # The day after Thanksgiving closes at 13:00, and the hold ends with it.
+        (
+            et(date(2026, 11, 27), 9),
+            et(date(2026, 11, 27), 9, 30),
+            et(date(2026, 11, 27), 13, 30),
+            "the session holds a deploy from Fri 2026-11-27 08:00 EST until Fri 2026-11-27"
+            " 13:30 EST",
+        ),
+    ],
+    ids=["a session", "late on a session day", "an early close"],
+)
+def test_the_session_hold_runs_from_the_margin_before_the_open_to_the_compaction(
+    capsys, now, opens, end, line
+):
+    code, lines = _session_hold(now, capsys)
+    assert code == dw.ALLOWED
+    refuse_from = opens - dw.MARGIN
+    assert lines == [line, f"session_hold={epoch(refuse_from)},{epoch(opens)},{epoch(end)}"]
+
+
+@pytest.mark.parametrize(
+    "now",
+    [et(SATURDAY, 12), et(SUNDAY, 17, 20), et(date(2026, 11, 26), 12)],
+    ids=["saturday", "sunday", "thanksgiving"],
+)
+def test_no_session_holds_nothing(capsys, now):
+    assert _session_hold(now, capsys) == (
+        dw.ALLOWED,
+        ["no session holds a deploy today", "session_hold=none"],
+    )
+
+
+def test_the_session_hold_leaves_the_two_line_verdict_alone(capsys):
+    """vm-stop.sh and an ordinary deploy read exactly the verdict, so the hold is opt-in."""
+    code, lines = run(et(TUESDAY, 10), capsys)
+    assert code == dw.REFUSED
+    assert len(lines) == 2 and lines[1].startswith("next_span_start=")

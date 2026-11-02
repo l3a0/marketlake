@@ -4,7 +4,13 @@
 #
 # Usage, as root, from any directory:
 #
-#     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]
+#     sudo deploy/vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]
+#
+# --override-window skips the window's refusal in step 3, except during a session, and
+# nothing else, marketlake #987.
+# The owner gives it by hand, or through the deploy workflow's override_window input on a
+# run started by hand. Every line the wrapper prints then ends ", with the deploy window
+# overridden", so nobody reads the outcome as an ordinary deploy's.
 #
 # The owner runs it by hand, and the CI half of #676 runs it through SSM Run Command,
 # by way of infra/live/deploy-step.sh, after the owner approves a merge's deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
@@ -32,10 +38,13 @@
 #     2. refuses with exit 2 unless the daemon's ActiveState is active. A stopped daemon
 #        was stopped on purpose, and the bootstrap's enable --now would start it;
 #     3. refuses with exit 3 at the wrong moment: when python -m lake.deploy_window, run
-#        as the owner from the current venv, says no, when a com.marketlake.* service
+#        as the owner from the current venv, says no, unless --override-window was
+#        given, when a com.marketlake.* service
 #        other than the two residents is in a state other than inactive or failed, or
 #        when the daemon's cgroup holds a process besides its main one, such as a
-#        compaction. It keeps the window's next_span_start for step 6. The two busy
+#        compaction. It keeps the window's next_span_start for step 6. Under
+#        --override-window it refuses inside today's session hold, and keeps the hold
+#        for step 6 too. The two busy
 #        checks live in deploy/busy-check.sh, which deploy/vm-stop.sh sources too;
 #     4. fetches origin main as the owner, and refuses with exit 2 a sha not on
 #        origin/main, a sha behind HEAD, a dirty tree or a branch other than main. It
@@ -47,7 +56,8 @@
 #     6. decides whether a restart is owed: when the record is absent or names another
 #        sha, or when needrestart names a com.marketlake.* service still mapping a
 #        replaced library. After a bootstrap exit 0 or 4 it waits up to 15 minutes for
-#        the busy checks of step 3 to clear, then restarts the daemon, checks that its
+#        the busy checks of step 3 to clear, and under the override for the session to
+#        end, then restarts the daemon, checks that its
 #        MainPID holds for 120 seconds, and restarts the dashboard. After any other exit
 #        it restarts nothing;
 #     7. rolls back after a failed daemon restart, or after a failed bootstrap in a run
@@ -84,7 +94,7 @@
 # a config value, a host path or a line of a step's output. A reason names the failed
 # step and points at deploy.log. Exit 0 comes only with a "deployed:" line for the
 # requested sha, and that line only with exit 0, and the wrapper reads any other pairing
-# as "outcome unknown".
+# as "outcome unknown". The wrapper pairs them before it adds the override's suffix.
 #
 # docs/design.md and issue #676 carry the reasoning for each step.
 #
@@ -116,6 +126,7 @@ DEPLOY_SERVICE="$DEPLOY_UNIT.service"
 UNKNOWN="outcome unknown: read deploy.log"
 FAILED_STEP=", with a failed step in deploy.log"
 NOT_RUN_BEFORE=", which has not run before"
+OVERRIDDEN=", with the deploy window overridden"
 SHA_RE='^[0-9a-f]{40}$'
 # No leading zero, because bash reads one as octal, and 0999 is then an error rather than
 # a number.
@@ -126,6 +137,7 @@ ROOT="${MARKETLAKE_INSTALL_ROOT:-}"
 INNER=0
 SHA=""
 NOT_AFTER=""
+OVERRIDE=0
 RESULT=""
 OUTCOME_CODE=1
 OUTCOME_LINE="$UNKNOWN"
@@ -150,15 +162,20 @@ finish() {
 }
 
 # The wrapper, and an inner run with no result file, print the outcome and exit with its
-# code. An inner run with a result file writes it there and exits 0 on every path it
-# decides, or 1 from a signal trap.
+# code, adding the override's suffix when it was asked for. An inner run with a result
+# file writes it there, without the suffix, and exits 0 on every path it decides, or 1
+# from a signal trap.
 on_exit() {
   if [[ $INNER == 1 && -n "$RESULT" ]]; then
     say "outcome: $OUTCOME_CODE $OUTCOME_LINE"
     out "$OUTCOME_CODE $OUTCOME_LINE" > "$RESULT" 2>/dev/null || true
     return
   fi
-  out "$OUTCOME_LINE"
+  if [[ $OVERRIDE == 1 ]]; then
+    out "$OUTCOME_LINE$OVERRIDDEN"
+  else
+    out "$OUTCOME_LINE"
+  fi
   exit "$OUTCOME_CODE"
 }
 trap on_exit EXIT
@@ -166,7 +183,11 @@ trap 'OUTCOME_CODE=1; OUTCOME_LINE="$UNKNOWN"; exit 1' TERM INT HUP
 
 # -- arguments -------------------------------------------------------------------------
 
-USAGE="not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>]"
+USAGE="not deployed: usage: vm-deploy.sh --sha <40 hex digits> [--not-after <epoch seconds>] [--override-window]"
+# Read before the loop, so a usage error carries the suffix wherever the flag stands.
+for arg in "$@"; do
+  if [[ "$arg" == --override-window ]]; then OVERRIDE=1; fi
+done
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sha|--not-after)
@@ -175,6 +196,9 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --inner)
       INNER=1
+      shift ;;
+    --override-window)
+      OVERRIDE=1
       shift ;;
     *)
       finish 2 "$USAGE" ;;
@@ -301,6 +325,9 @@ if [[ $INNER == 0 ]]; then
   if [[ -n "$NOT_AFTER" ]]; then
     INNER_ARGS+=(--not-after "$NOT_AFTER")
   fi
+  if [[ $OVERRIDE == 1 ]]; then
+    INNER_ARGS+=(--override-window)
+  fi
   systemd-run --unit="$DEPLOY_UNIT" --wait --collect --quiet -p OOMPolicy=continue \
     -p "StandardOutput=append:$DEPLOY_LOG" -p "StandardError=append:$DEPLOY_LOG" \
     "${ENVS[@]}" "$SELF" "${INNER_ARGS[@]}" >&2 || true
@@ -358,6 +385,9 @@ if ! flock -n 8; then
   finish 3 "not deployed: another deploy is running"
 fi
 say "deploying $SHA, invocation $INVOCATION_ID, at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ $OVERRIDE == 1 ]]; then
+  say "--override-window was given, so the window's refusal will not stop this deploy"
+fi
 
 # Read once and kept, because the restart below removes it. Anything but a sha reads as
 # absent, which owes a restart.
@@ -435,11 +465,56 @@ if [[ $LINES != 2 || -z "$WINDOW_LINE" || ! "$NEXT_SPAN_START" =~ $EPOCH_RE ]]; 
 fi
 # The window's line reaches a public log, so only its own shape passes.
 WINDOW_LINE_RE='^a deploy may start next at [A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Z]{3,4}, because [a-z0-9 ]+$'
-if [[ $WINDOW_RC == 3 ]]; then
+# The override skips only the refusal. The window's next_span_start still bounds the
+# restart, and inside a span it names the span after, so the restart can still run.
+if [[ $WINDOW_RC == 3 && $OVERRIDE == 1 ]]; then
+  say "the window refuses a deploy now, and --override-window skips that refusal"
+elif [[ $WINDOW_RC == 3 ]]; then
   if [[ ! "$WINDOW_LINE" =~ $WINDOW_LINE_RE ]]; then
     finish 3 "not deployed: the window refuses a deploy now, see deploy.log"
   fi
   finish 3 "not deployed: $WINDOW_LINE"
+fi
+
+# The override never skips market hours (the owner's ruling on #987). It reads today's
+# session hold and refuses a start from the margin before the open to the close+15
+# compaction, so a deploy it lets start ends before the open. The wait before the restart
+# holds the restart out of the session too. An ordinary deploy never reaches a session.
+SESSION_OPEN=""
+SESSION_END=""
+if [[ $OVERRIDE == 1 ]]; then
+  HOLD_RC=0
+  HOLD_OUT="$(as_owner "$PYTHON" -m lake.deploy_window --session-hold)" || HOLD_RC=$?
+  out "$HOLD_OUT"
+  if [[ $HOLD_RC != 0 ]]; then
+    finish 1 "not deployed: python -m lake.deploy_window --session-hold exited $HOLD_RC"
+  fi
+  HOLD_LINE=""
+  HOLD_VALUE=""
+  LINES=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    LINES=$((LINES + 1))
+    case "$LINES" in
+      1) HOLD_LINE="$line" ;;
+      2) HOLD_VALUE="$line" ;;
+    esac
+  done <<< "$HOLD_OUT"
+  # The hold's line reaches a public log, so only its own shape passes.
+  WHEN_RE='[A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} [A-Z]{3,4}'
+  HOLD_LINE_RE="^the session holds a deploy from $WHEN_RE until $WHEN_RE\$"
+  HOLD_RE='^session_hold=(0|[1-9][0-9]*),(0|[1-9][0-9]*),(0|[1-9][0-9]*)$'
+  if [[ $LINES == 2 && "$HOLD_LINE" =~ $HOLD_LINE_RE && "$HOLD_VALUE" =~ $HOLD_RE ]]; then
+    REFUSE_FROM="${BASH_REMATCH[1]}"
+    SESSION_OPEN="${BASH_REMATCH[2]}"
+    SESSION_END="${BASH_REMATCH[3]}"
+    NOW="$(date +%s)"
+    if [[ $NOW -ge $REFUSE_FROM && $NOW -lt $SESSION_END ]]; then
+      finish 3 "not deployed: $HOLD_LINE, which the override does not skip"
+    fi
+  elif [[ $LINES != 2 || "$HOLD_LINE" != "no session holds a deploy today" \
+    || "$HOLD_VALUE" != session_hold=none ]]; then
+    finish 1 "not deployed: python -m lake.deploy_window printed no session_hold line"
+  fi
 fi
 
 BUSY_RC=0
@@ -576,17 +651,25 @@ fi
 NOT_RESTARTED="not restarted: the tree is at $SHA, and the last recorded deploy is ${RECORDED:-none}"
 
 # Waits for the busy checks to clear, polling, and gives up when the wait runs out or the
-# next refused span is too close for a restart and its check. No Python runs here, since
-# the venv now imports the new commit.
+# next refused span is too close for a restart and its check. Under the override it also
+# waits while a restart and its check would overlap the session. No Python runs here,
+# since the venv now imports the new commit.
 wait_until_clear() {
-  local polls=$((BUSY_WAIT_SECONDS / POLL_SECONDS)) n=0 rc
+  local polls=$((BUSY_WAIT_SECONDS / POLL_SECONDS)) n=0 rc now
   while :; do
-    if [[ $(( $(date +%s) + RESTART_CHECK_SECONDS )) -ge $NEXT_SPAN_START ]]; then
+    now="$(date +%s)"
+    if [[ $(( now + RESTART_CHECK_SECONDS )) -ge $NEXT_SPAN_START ]]; then
       say "the next refused span starts within $RESTART_CHECK_SECONDS seconds"
       return 1
     fi
     rc=0
-    busy_check || rc=$?
+    if [[ -n "$SESSION_OPEN" && $(( now + RESTART_CHECK_SECONDS )) -ge $SESSION_OPEN \
+      && $now -lt $SESSION_END ]]; then
+      rc=1
+      BUSY_REASON="the session runs until epoch $SESSION_END"
+    else
+      busy_check || rc=$?
+    fi
     if [[ $rc == 0 ]]; then
       return 0
     fi

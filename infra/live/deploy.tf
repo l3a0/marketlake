@@ -28,6 +28,14 @@ resource "aws_ssm_document" "deploy" {
         description    = "The epoch second after which the host refuses to start."
         allowedPattern = "^[0-9]{10}$"
       }
+      # Added by #987. It loosens the document, so the name stays, and every older
+      # version is tighter than this one. A send that omits it gets the default.
+      overrideWindow = {
+        type          = "String"
+        description   = "true skips the host's deploy window refusal, and nothing else."
+        allowedValues = ["false", "true"]
+        default       = "false"
+      }
     }
     mainSteps = [{
       action = "aws:runShellScript"

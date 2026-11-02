@@ -1686,6 +1686,8 @@ Sunday until 18:00, and from Sunday 23:30 to Monday 06:30. Outside those hours t
 refuses with exit 3 and names the next moment one may start. The hours keep the merge and
 the restart away from capture, compaction, the sweep and the Sunday job, with enough room
 that a deploy which rolls back still ends before the jobs start.
+`--override-window` after the sha skips that refusal and nothing else, as
+[Override the deploy window](#override-the-deploy-window) says.
 
 It prints exactly one line, and its exit code is 0 to 3. The progress goes to
 `/var/lib/marketlake/deploy.log`, which only root reads.
@@ -1708,6 +1710,7 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
 | `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |
 | `not deployed: <reason>` | 1, 2 or 3 | Exit 3 means not now: run again at the moment the line names, or once the named job has finished. Exit 2 is a refusal, such as a sha not on `main`, a dirty checkout or a daemon that is not running, and the line names what to fix. Exit 1 is a failure, and the log says which step. |
+| Any line above, ending `, with the deploy window overridden` | as that line | The run was given `--override-window`. Read the line without the suffix. A `not restarted` line from an override needs another override run to restart, as [Override the deploy window](#override-the-deploy-window) says, because an ordinary deploy waits for the window. |
 | `outcome unknown: read deploy.log` | 1 | The run was killed, left no result, or found the checkout in a state it could not restore. First run `systemctl is-active marketlake-deploy`, and wait while it prints `active`, because Ctrl-C on a hand run leaves the deploy running. Then compare `git -C ~/marketlake rev-parse HEAD` with `sudo cat /var/lib/marketlake/deployed`. When they differ, deploy `HEAD` again. When `git -C ~/marketlake status --porcelain` lists changes, a merge failed partway and so did its restore, so first run `git -C ~/marketlake reset --hard` and `git -C ~/marketlake clean -fd` inside the hours above. |
 
 **The hand procedure, for a daemon that is not running.** The script refuses with exit 2
@@ -2402,7 +2405,8 @@ The run takes four steps.
    `marketlake:host = capture` in the states
    [Find the VM's address](#find-the-vms-address) lists. When that instance is running,
    the script sends it the SSM document `marketlake-deploy` with the commit and a
-   ten-minute delivery window, waits for the command to end, and prints one summary.
+   ten-minute delivery window, and with `overrideWindow` on a run that overrides the
+   window, waits for the command to end, and prints one summary.
 
 The VM stops itself once each day's work is done, as [The nightly stop](#the-nightly-stop)
 says, so a deploy approved in the evening or at the weekend can find it stopped. The run
@@ -2415,7 +2419,9 @@ section says.
 
 The VM, not the moment of approval, decides whether a deploy is safe. An approval during
 the hours it refuses fails the run with exit 3 and names the time a deploy may start. A
-re-run after that time asks for approval again, and then deploys.
+re-run after that time asks for approval again, and then deploys. A deploy that cannot
+wait for that time overrides the window, as
+[Override the deploy window](#override-the-deploy-window) says.
 
 The repository is public, so the run's log and its summary show only the summary line,
 `StatusDetails` and `ResponseCode`. The VM keeps the full output in
@@ -2430,7 +2436,96 @@ The repository is public, so the run's log and its summary show only the summary
 | `outcome unknown: ...` | 1 | Compare `HEAD` with `/var/lib/marketlake/deployed` on the VM, and read `deploy.log`. When they differ, re-run the deploy for `HEAD`. |
 | `not sent: the VM is stopped. ...` | 1 | The VM stopped itself for the night. Start it as the line says, then re-run the job once it runs. |
 | `not sent: the VM is still starting. ...` | 1 | Wait for it to run, then re-run the job. |
-| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of instances with the tag when it is not exactly one, or a `DescribeInstances` reply that is not an instance id and its state. |
+| `not sent: ...` | 1 | Nothing reached SSM. The line names the cause: a `GITHUB_SHA` that is not a 40-digit commit, an empty `DEPLOY_DOCUMENT`, `DEPLOY_TAG_KEY` or `DEPLOY_TAG_VALUE`, the error code of a failed `DescribeInstances` or `SendCommand`, the count of instances with the tag when it is not exactly one, a `DescribeInstances` reply that is not an instance id and its state, or a `DEPLOY_OVERRIDE_WINDOW` that is neither `true` nor `false`. |
+
+### Override the deploy window
+
+The window can refuse a deploy for hours. On 2026-11-01 the deploy of
+[PR #977](https://github.com/l3a0/marketlake/pull/977) was approved at about 17:20 ET on a
+Sunday and refused until 23:30, under the 210-minute margin then in force. A run started
+by hand can skip that refusal
+([#987](https://github.com/l3a0/marketlake/issues/987)), except during market hours. It
+skips nothing else, and it still waits for the owner's approval.
+
+On a session day the VM refuses an overridden deploy from 90 minutes before the open until
+the close+15 compaction, which is 08:00 to 16:30 Eastern on a regular day and 08:00 to
+13:30 on an early close. A deploy it lets start then ends before the session opens, and
+its restart never lands inside the session. So a weekday override can start from 06:30 to
+08:00 and from 16:30 to 18:45, and a refusal names the hold it hit.
+
+1. **End any deploy run that waits on approval first.** Every deploy run joins the
+   `deploy-vm` concurrency group, and a run waiting on approval holds it. A run started
+   while one waits stays pending behind it, and a push to `main` in the meantime cancels
+   that pending run. Approve the waiting run, which the window refuses at once with exit
+   3, or cancel it.
+2. **Start the run with the input.** Before 19:30 ET on a Sunday the VM is stopped, since
+   `marketlake-start-sunday` starts it only then, so first start it and wait for it to
+   run, as [Start a stopped instance](#start-a-stopped-instance) says. In the Actions tab,
+   run the Deploy workflow on `main` with "Skip the VM's deploy window refusal" ticked, or
+   run this.
+
+   ```bash
+   gh workflow run deploy.yml --repo l3a0/marketlake --ref main -f override_window=true
+   ```
+
+3. **Approve it** in [the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy),
+   as any deploy. A re-run of it keeps the input, so "start the VM, then re-run the job"
+   keeps the override too.
+
+The VM still refuses with exit 3 while a job runs, such as the sweep or its upload, and its
+restart still waits up to 15 minutes for the busy checks. The restart still refuses to
+start within 180 seconds of the next refused span opening. Started inside a span, that is
+the span after, so the restart runs once the busy checks clear. Started in the hours before
+a span, a restart that cannot start in time ends `not restarted`, and the same run started
+again once the span has opened restarts it.
+
+Every last line `vm-deploy.sh` prints then ends `, with the deploy window overridden`, and
+the run's log and summary add "This run was started with override_window". The run's name
+in the Actions list reads "Deploy main, overriding the deploy window", so the approval
+shows which run overrides. A hand run on the VM takes the same flag.
+
+```bash
+sudo ~/marketlake/deploy/vm-deploy.sh --sha <sha> --override-window
+```
+
+The override needs two things in place first. The `marketlake-deploy` document must carry
+its `overrideWindow` parameter, which an infra apply adds, or `SendCommand` fails with
+`InvalidParameters`. And the VM must have deployed a commit that carries the flag once,
+because the deploy runs the checkout's script before it moves it, and an older script
+refuses the flag with its usage line and exit 2. Check the first with the admin profile.
+
+```bash
+aws ssm describe-document --name marketlake-deploy --query 'Document.Parameters[].Name' --profile marketlake-admin --region us-east-1
+```
+
+It lists `overrideWindow` once the apply has run. Check the second on the VM, where this
+prints a count above zero once the checkout carries the flag.
+
+```bash
+grep -c -- --override-window ~/marketlake/deploy/vm-deploy.sh
+```
+
+Drill it once before an evening that needs it. During the allowed hours, start an override
+run for the commit the VM already runs. It skips nothing and restarts nothing, and ends
+`deployed: <sha> (already current), with the deploy window overridden`.
+
+After an override that ends `not restarted`, because its bootstrap ran past the next span's
+opening, restart with another override run once that span has opened and, on a session
+day, once the session hold has ended. An ordinary deploy waits for the window to allow
+it, and the daemon runs the old code until then.
+
+To withdraw the override, revert the pull request that added it. A document left with
+`overrideWindow` does nothing while its default is `false`.
+
+Its price is the reason the window exists, and `docs/design.md` measures it.
+
+- A deploy over the Sunday canary at 20:00 can make the `sunday` check miss and page.
+- Started shortly before a span, such as at 07:55 on a weekday, a failed bootstrap stays
+  in place through the span, because its rollback waits like a restart.
+- A weekday morning override whose restart cannot start before 07:57 ends `not restarted`.
+  The daemon then runs the old code through the session while new processes import the
+  moved tree, because the session hold refuses another override until 16:30. Start a
+  morning override early enough for the bootstrap to finish first.
 
 ### The `deploy` environment and its secret
 

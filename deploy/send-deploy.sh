@@ -8,6 +8,10 @@
 #   DEPLOY_DOCUMENT    the SSM document to send, set once in the workflow's env:
 #   DEPLOY_TAG_KEY     the instance tag that marks the VM, set the same way
 #   DEPLOY_TAG_VALUE   that tag's value
+#   DEPLOY_OVERRIDE_WINDOW  true to ask the VM to skip its deploy window's refusal, from
+#                      the workflow's override_window input on a run started by hand
+#                      (#987). false or empty asks nothing, and any other value sends
+#                      nothing
 #   GITHUB_STEP_SUMMARY  where the summary goes, when it is set
 #
 # In order, it:
@@ -21,12 +25,18 @@
 #      to a tag reports Success when nothing matches;
 #   2. sends the document with sha and notAfter, the send time plus 600 seconds, and a
 #      delivery timeout of the same 600 seconds. The host refuses a start after notAfter
-#      with exit 3, so a command delivered late never deploys;
+#      with exit 3, so a command delivered late never deploys. With the override it adds
+#      overrideWindow=true, and only then, so a run without it sends the two parameters
+#      every version of the document takes;
 #   3. polls GetCommandInvocation until the command ends. It waits through Pending,
 #      InProgress, Delayed and Cancelling, and retries InvocationDoesNotExist, which
 #      comes just after the send, until notAfter;
 #   4. reads StatusDetails, ResponseCode and the last non-empty line of the host's
-#      output, and maps them to one summary.
+#      output, and maps them to one summary. With the override vm-deploy.sh ends every
+#      line ", with the deploy window overridden", and the suffix comes off before the
+#      line is matched against the table. A line without it, such as a refusal from the
+#      document's step or the usage line of a vm-deploy.sh older than the flag, reads as
+#      itself. Without the override, a line with the suffix matches only as itself.
 #
 # The repository is public, so this prints only that summary, StatusDetails and
 # ResponseCode, on stdout and in the step summary. It never prints the host's output,
@@ -51,16 +61,24 @@ export AWS_PAGER=""
 SHA="${GITHUB_SHA:-}"
 STATUS=none
 CODE=none
+OVERRIDE=0
+OVERRIDDEN=", with the deploy window overridden"
 
 # finish <exit code> <summary>
 finish() {
   printf 'send-deploy: %s\n' "$2"
   printf 'send-deploy: StatusDetails %s, ResponseCode %s\n' "$STATUS" "$CODE"
+  if [[ $OVERRIDE == 1 ]]; then
+    printf 'send-deploy: this run was started with override_window\n'
+  fi
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
       printf '### Deploy of %s\n\n' "$SHA"
       printf '%s\n\n' "$2"
       printf 'StatusDetails %s, ResponseCode %s\n' "$STATUS" "$CODE"
+      if [[ $OVERRIDE == 1 ]]; then
+        printf '\nThis run was started with override_window.\n'
+      fi
     } >> "$GITHUB_STEP_SUMMARY"
   fi
   exit "$1"
@@ -77,6 +95,12 @@ for name in DEPLOY_DOCUMENT DEPLOY_TAG_KEY DEPLOY_TAG_VALUE; do
     finish 1 "not sent: $name is empty"
   fi
 done
+# A push has no inputs, so the workflow passes an empty value there.
+case "${DEPLOY_OVERRIDE_WINDOW:-}" in
+  true) OVERRIDE=1 ;;
+  false | "") ;;
+  *) finish 1 "not sent: DEPLOY_OVERRIDE_WINDOW is neither true nor false" ;;
+esac
 
 # A template, because a Mac's mktemp ignores TMPDIR without one.
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/send-deploy.XXXXXX")"
@@ -136,6 +160,9 @@ esac
 
 NOT_AFTER=$(($(date +%s) + DELIVERY_SECONDS))
 PARAMETERS="{\"sha\":[\"$SHA\"],\"notAfter\":[\"$NOT_AFTER\"]}"
+if [[ $OVERRIDE == 1 ]]; then
+  PARAMETERS="{\"sha\":[\"$SHA\"],\"notAfter\":[\"$NOT_AFTER\"],\"overrideWindow\":[\"true\"]}"
+fi
 if ! COMMAND_ID="$(aws ssm send-command \
   --document-name "$DEPLOY_DOCUMENT" \
   --instance-ids "$INSTANCE" \
@@ -148,7 +175,11 @@ fi
 if [[ ! "$COMMAND_ID" =~ ^[0-9a-f-]{36}$ ]]; then
   finish 1 "$UNKNOWN. SendCommand returned no readable command id"
 fi
-printf 'send-deploy: sent %s to the VM, and waiting for it to end\n' "$SHA"
+if [[ $OVERRIDE == 1 ]]; then
+  printf 'send-deploy: sent %s to the VM, with the deploy window overridden, and waiting for it to end\n' "$SHA"
+else
+  printf 'send-deploy: sent %s to the VM, and waiting for it to end\n' "$SHA"
+fi
 
 # -- 3. the wait --------------------------------------------------------------------
 
@@ -209,9 +240,13 @@ if output="$(aws ssm get-command-invocation \
       last="$line"
     fi
   done <<< "$output"
+  base="$last"
+  if [[ $OVERRIDE == 1 && "$last" == *"$OVERRIDDEN" ]]; then
+    base="${last%"$OVERRIDDEN"}"
+  fi
   for i in "${!HOST_LINES[@]}"; do
     pattern="${HOST_LINES[$i]}"
-    if [[ "$last" =~ $pattern ]]; then
+    if [[ "$base" =~ $pattern ]]; then
       HOST_LINE="$last"
       LINE_CODES="${HOST_CODES[$i]}"
       break
