@@ -3391,8 +3391,8 @@ class RunWindowWords:
     """How one job words the two refusals ``_run_window_refusal`` shares.
 
     ``job`` names it, ``in_flight`` names what the scrub would find half-written, and each
-    repair says when to run it instead, which differs because the range restore runs in the
-    evening and the bar import in the morning.
+    repair says when to run it instead, which differs because the range restore waits for the
+    18:30 sweep and the bar import only for the session's close+5.
     """
 
     job: str

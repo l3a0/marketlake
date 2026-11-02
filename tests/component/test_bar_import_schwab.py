@@ -59,7 +59,8 @@ ONBOARD = datetime(2026, 10, 30, 20, 38, tzinfo=MARKET_TZ)
 FIRST_SPAN = date(2026, 11, 2)
 FIRST = date(2026, 9, 4)
 LAST = date(2026, 10, 30)
-# Monday's runbook window, and the request's two bounds, the two sessions' Eastern midnights.
+# A Monday morning before the bound, and the request's two bounds, the two sessions' Eastern
+# midnights.
 MONDAY_0745 = datetime(2026, 11, 2, 7, 45, tzinfo=MARKET_TZ)
 START = datetime(2026, 9, 4, 4, 0, tzinfo=UTC)
 END = datetime(2026, 10, 30, 4, 0, tzinfo=UTC)
@@ -394,6 +395,7 @@ def test_a_last_session_that_is_today_refuses(tmp_path):
     message = _refused(root, now=datetime(2026, 11, 3, 0, 0, tzinfo=UTC))
 
     assert "2026-11-02" in message and "no close gate" in message
+    assert message.endswith("Run it on 2026-11-03 or later")
     assert not (root / "bars").exists()
 
 

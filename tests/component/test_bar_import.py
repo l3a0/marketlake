@@ -65,7 +65,7 @@ from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
 
-# A Monday morning inside the runbook's 07:30 to 09:00 window, a Sunday inside the scrub window,
+# A Monday morning before the bound, a Sunday inside the scrub window,
 # a Monday inside the session, and Monday's bound, the open at 09:30 less the 15-minute in-flight
 # allowance and the 15-minute pre-open margin, written out rather than computed.
 MONDAY_0745 = datetime(2026, 8, 31, 7, 45, tzinfo=MARKET_TZ)
@@ -1022,14 +1022,14 @@ def test_session_midnight_is_eastern_midnight_in_both_seasons():
 UNDO_TARGET = BucketTarget(bucket="lake-backup", prefix="lake")
 
 
-def _undo(root: Path, sources, vintages, *, client=None, now=MONDAY_0745):
+def _undo(root: Path, sources, vintages, *, client=None, now=MONDAY_0745, calendar=CALENDAR):
     return undo_vintages(
         root,
         list(sources),
         client=client if client is not None else FakeS3(),
         target=UNDO_TARGET,
         clock=now if isinstance(now, ManualClock) else ManualClock(now),
-        calendar=CALENDAR,
+        calendar=calendar,
         vintages=vintages,
     )
 
@@ -1162,6 +1162,30 @@ def test_a_bucket_that_cannot_be_read_refuses_the_undo(tmp_path, failure, expect
     assert _snapshot(root) == after
 
 
+@pytest.mark.parametrize(
+    ("calendar", "deadline"),
+    [
+        (CALENDAR, "before 2026-09-01T09:00:00-04:00"),
+        (weekday_sessions(date(2026, 8, 24)), "before the next session's capture start"),
+    ],
+    ids=["next-session-day", "no-session-ahead"],
+)
+def test_an_evening_undo_names_the_next_session_days_bound(tmp_path, calendar, deadline):
+    """Catches a deadline written as a clock time, or as the bound of the day the undo ran.
+
+    Monday's bound is 09:00 that morning, already past at 20:00, so the line must name
+    Tuesday's. With no session in the calendar's lookahead it names none.
+    """
+    root, sources, vintages, _before = _imported(tmp_path)
+    client = FakeS3()
+    client.fail_with = unreachable()
+    evening = datetime(2026, 8, 31, 20, 0, tzinfo=MARKET_TZ)
+
+    message = _undo_refused(root, sources, vintages, client=client, now=evening, calendar=calendar)
+
+    assert f"Run the undo again at once, {deadline}, and before any nightly upload" in message
+
+
 def test_an_undo_stopped_after_the_deletions_is_finished_by_a_rerun(tmp_path, monkeypatch):
     """Catches a cut made before the deletions, which a crash would turn into files nothing
     records, and a rerun that refuses manifested files already gone."""
@@ -1192,7 +1216,7 @@ def test_the_undo_refuses_in_the_run_window(tmp_path):
     # Past the bound no undo can run before capture records a minute, so the line never says
     # to try again that day.
     assert "the undo stops at" in late and "the import stays" in late
-    assert "between the VM's 07:30" not in late
+    assert "close+5" not in late
     assert _snapshot(root) == after
 
 
@@ -1532,7 +1556,8 @@ def test_a_failed_deletion_refuses_with_one_line(tmp_path, monkeypatch):
 
     message = _undo_refused(root, sources, vintages)
 
-    assert "Permission denied" in message and "Run the undo again before 09:00 ET" in message
+    assert "Permission denied" in message
+    assert f"Run the undo again before {MONDAY_BOUND.isoformat()}, and before any" in message
 
 
 def test_a_rewrite_that_does_not_read_back_names_the_bucket_copy(tmp_path, monkeypatch):

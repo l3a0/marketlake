@@ -157,6 +157,7 @@ from lake.bucket import (
     connect,
     list_bucket,
     read_copy_state,
+    session_bound,
 )
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar
 from lake.capture_spans import CaptureSpans, CaptureSpansError
@@ -204,13 +205,19 @@ SHADOW_REFUSAL = (
     "would never reach it. Run it on the primary"
 )
 
-# The window the runbook runs the import in, which both run-window refusals send the operator
-# back to. The nightly stop powers the VM off in the evening, so the morning is the window.
+# When each run-window refusal sends the operator back to. Those two windows are the only times
+# the import refuses, and a stopped VM is started rather than waited for (marketlake #992). An
+# import after that evening's upload can be undone until the next session's bound, so each
+# repair names that as the better time.
 _RUN_WINDOW_WORDS = RunWindowWords(
     job="the bar import",
     in_flight="a partition in flight",
-    sunday_repair="Run it on a weekday between the VM's 07:30 ET start and 09:00 ET",
-    bound_repair="Run it on a weekday between the VM's 07:30 ET start and 09:00 ET",
+    sunday_repair=(
+        "Run it after 23:30, or on a weekday evening once that evening's upload has finished"
+    ),
+    bound_repair=(
+        "Run it after that session's close+5, best once that evening's upload has finished"
+    ),
 )
 
 
@@ -1135,7 +1142,8 @@ def import_schwab(
             raise BarImportRefused(
                 f"{window.ticker}'s last session to import is {window.sessions[-1].isoformat()}, "
                 "and an imported daily bar has no close gate to check it on its own day, so "
-                "nothing was imported. Run it on a later weekday morning"
+                "nothing was imported. Run it on "
+                f"{(window.sessions[-1] + timedelta(days=1)).isoformat()} or later"
             )
 
     plans: list[_Plan] = []
@@ -1263,10 +1271,23 @@ _UNDO_WINDOW_WORDS = RunWindowWords(
 )
 
 
-def _bucket_refusal(exc: Exception, target: BucketTarget) -> BarImportRefused:
+def _undo_deadline(*, clock: Clock, calendar: Calendar) -> str:
+    """When a stopped undo must run again: before the bound and any nightly upload ahead of it.
+
+    The bound is ``bucket.session_bound``'s, the one the window refusal checks, so the text names
+    its date as well as its time. An undo that fails in the evening has until the next session
+    day's bound, not that day's. ``None`` means no session in the calendar's lookahead.
+    """
+    bound = session_bound(clock.now(), clock=clock, calendar=calendar)
+    when = "the next session's capture start" if bound is None else bound.isoformat()
+    return f"before {when}, and before any nightly upload ahead of it"
+
+
+def _bucket_refusal(exc: Exception, target: BucketTarget, deadline: str) -> BarImportRefused:
     """One line naming how the bucket read failed, by ``bucket._failure``, or the error itself.
 
     A ``None`` from ``_failure`` is a bug rather than a bucket failure, so it is not hidden.
+    ``deadline`` is ``_undo_deadline``'s text.
     """
     sorted_failure = _bucket._failure(exc)
     if sorted_failure is None:
@@ -1274,21 +1295,27 @@ def _bucket_refusal(exc: Exception, target: BucketTarget) -> BarImportRefused:
     kind, detail = sorted_failure
     repair = {
         "refused": "Fix the instance profile's bucket policy, then run the undo again",
-        "unreachable": "Run the undo again at once, before 09:00 ET",
-    }.get(kind, "Run the undo again before 09:00 ET")
+        "unreachable": f"Run the undo again at once, {deadline}",
+    }.get(kind, f"Run the undo again {deadline}")
     return BarImportRefused(
         f"the bucket read was {kind} with {detail}, so nothing says the import has not reached "
         f"the bucket and nothing was undone. {repair}: {target}"
     )
 
 
-def _check_bucket(client: object, target: BucketTarget, kept: bytes, tail: Sequence[str]):
+def _check_bucket(
+    client: object,
+    target: BucketTarget,
+    kept: bytes,
+    tail: Sequence[str],
+    deadline: Callable[[], str],
+):
     """The bucket's copy state, after refusing a bucket that holds any of the import."""
     try:
         copy = read_copy_state(client, target, kept)
         listing = list_bucket(client, target)
     except Exception as exc:  # noqa: BLE001 - every bucket failure is sorted by _failure
-        raise _bucket_refusal(exc, target) from None
+        raise _bucket_refusal(exc, target, deadline()) from None
     if copy.present and not copy.is_prefix:
         raise BarImportRefused(
             "the bucket's manifest.jsonl is not a byte prefix of this lake's cut back to before "
@@ -1363,7 +1390,15 @@ def undo_vintages(
             for bar in _read_source(source, vintage)
         ]
 
-    return _undo(root, identities, on_disk, client=client, target=target, window=window)
+    return _undo(
+        root,
+        identities,
+        on_disk,
+        client=client,
+        target=target,
+        window=window,
+        deadline=lambda: _undo_deadline(clock=clock, calendar=calendar),
+    )
 
 
 def _undo(
@@ -1374,12 +1409,14 @@ def _undo(
     client: object,
     target: BucketTarget,
     window: Callable[[], str | None],
+    deadline: Callable[[], str],
 ) -> UndoSummary:
     """The undo's rule for any import, once its identities are known.
 
     ``keys`` names every partition the imports would have written. It is read only when the
     manifest records none of them, to refuse a killed import's unrecorded files. ``window`` is the
-    caller's run-window check, so each refusal says which undo stopped.
+    caller's run-window check, so each refusal says which undo stopped. ``deadline`` is
+    ``_undo_deadline``'s text, read when a refusal needs it.
     """
     path = manifest_path(root)
     try:
@@ -1407,7 +1444,7 @@ def _undo(
             "which reads as a prefix of any bucket copy. Nothing was undone"
         )
 
-    first = _check_bucket(client, target, raw[:cut], tail)
+    first = _check_bucket(client, target, raw[:cut], tail, deadline)
 
     try:
         with lake_lock(root):
@@ -1422,7 +1459,7 @@ def _undo(
                 )
             # The window check above keeps capture off the lock, so this second read costs it
             # nothing.
-            again = _check_bucket(client, target, raw[:cut], tail)
+            again = _check_bucket(client, target, raw[:cut], tail, deadline)
             if (again.present, again.length, again.stored) != (
                 first.present,
                 first.length,
@@ -1465,7 +1502,7 @@ def _undo(
     except OSError as exc:
         raise BarImportRefused(
             f"undoing the import under {root} failed ({type(exc).__name__}: "
-            f"{exc.strerror or exc}). Run the undo again before 09:00 ET, which finishes what "
+            f"{exc.strerror or exc}). Run the undo again {deadline()}. It finishes what "
             "this one started. After that, run the import again instead, which writes the "
             "missing files back, because the nightly upload stops on a recorded file it cannot "
             "find"
@@ -1515,7 +1552,15 @@ def undo_schwab(
         ]
 
     identities = {w.manifest_source for w in windows}
-    return _undo(root, identities, on_disk, client=client, target=target, window=window)
+    return _undo(
+        root,
+        identities,
+        on_disk,
+        client=client,
+        target=target,
+        window=window,
+        deadline=lambda: _undo_deadline(clock=clock, calendar=calendar),
+    )
 
 
 def _source_file(value: str) -> Path:

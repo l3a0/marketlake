@@ -420,7 +420,7 @@ def _refuse_a_date_compaction_loses(
             f"the first snapshot for {ticker} would file under {day.isoformat()}, and "
             f"{partition} is already sealed, so compaction would delete the snapshot as a "
             "crash's leftover (marketlake #935). Onboard on the next session day, before "
-            "its close+15, such as between 07:30 and 09:30 ET on the VM."
+            "its close+15."
         )
 
 
