@@ -205,18 +205,22 @@ SHADOW_REFUSAL = (
     "would never reach it. Run it on the primary"
 )
 
-# When each run-window refusal sends the operator back to. Those two windows are the only times
-# the import refuses, and a stopped VM is started rather than waited for (marketlake #992). An
-# import after that evening's upload can be undone until the next session's bound, so each
-# repair names that as the better time.
+# What each run-window refusal tells the operator. Those two windows are the only times of day
+# the import refuses, and a stopped VM is started rather than waited for (marketlake #992). Every
+# compaction uploads, so an import can be undone only until the next one sends it. After the
+# evening upload that is normally the next session's close+15, past its bound, so each repair
+# names that as the better time. A compaction comes sooner after a VM start, a deploy or a daemon
+# restart past close+15, since the daemon runs one on starting late, and on a weekday holiday.
 _RUN_WINDOW_WORDS = RunWindowWords(
     job="the bar import",
     in_flight="a partition in flight",
     sunday_repair=(
-        "Run it after 23:30, or on a weekday evening once that evening's upload has finished"
+        "Run it after 23:30, best on a weekday evening once the evening upload after the 18:30 "
+        "sweep has finished"
     ),
     bound_repair=(
-        "Run it after that session's close+5, best once that evening's upload has finished"
+        "Run it after that session's close+5, 16:20 on a regular day, best once the evening "
+        "upload after the 18:30 sweep has finished"
     ),
 )
 
@@ -1272,15 +1276,17 @@ _UNDO_WINDOW_WORDS = RunWindowWords(
 
 
 def _undo_deadline(*, clock: Clock, calendar: Calendar) -> str:
-    """When a stopped undo must run again: before the bound and any nightly upload ahead of it.
+    """When a stopped undo must run again: before the next upload, and the bound at the latest.
 
     The bound is ``bucket.session_bound``'s, the one the window refusal checks, so the text names
     its date as well as its time. An undo that fails in the evening has until the next session
-    day's bound, not that day's. ``None`` means no session in the calendar's lookahead.
+    day's bound, not that day's. Every compaction uploads, and one can come first, as the comment
+    on ``_RUN_WINDOW_WORDS`` says, so the bound is only the latest moment. ``None`` means no
+    session in the calendar's lookahead.
     """
     bound = session_bound(clock.now(), clock=clock, calendar=calendar)
     when = "the next session's capture start" if bound is None else bound.isoformat()
-    return f"before {when}, and before any nightly upload ahead of it"
+    return f"before any compaction uploads the import, and before {when} at the latest"
 
 
 def _bucket_refusal(exc: Exception, target: BucketTarget, deadline: str) -> BarImportRefused:
@@ -1294,7 +1300,7 @@ def _bucket_refusal(exc: Exception, target: BucketTarget, deadline: str) -> BarI
         raise exc
     kind, detail = sorted_failure
     repair = {
-        "refused": "Fix the instance profile's bucket policy, then run the undo again",
+        "refused": f"Fix the instance profile's bucket policy, then run the undo again {deadline}",
         "unreachable": f"Run the undo again at once, {deadline}",
     }.get(kind, f"Run the undo again {deadline}")
     return BarImportRefused(
@@ -1503,7 +1509,7 @@ def _undo(
         raise BarImportRefused(
             f"undoing the import under {root} failed ({type(exc).__name__}: "
             f"{exc.strerror or exc}). Run the undo again {deadline()}. It finishes what "
-            "this one started. After that, run the import again instead, which writes the "
+            "this one started. Past that deadline, run the import again instead, which writes the "
             "missing files back, because the nightly upload stops on a recorded file it cannot "
             "find"
         ) from None

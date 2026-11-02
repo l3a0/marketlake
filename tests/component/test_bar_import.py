@@ -757,6 +757,11 @@ def test_the_sunday_scrub_window_refuses(tmp_path):
     message = _refused(root, [source], _listed((source, "GLD")), now=SUNDAY_20)
 
     assert "Sunday" in message and "19:55" in message
+    # The repair names the code's own bound, never the VM's 07:30 start (marketlake #992).
+    assert message.endswith(
+        "Run it after 23:30, best on a weekday evening once the evening upload after the 18:30 "
+        "sweep has finished. Nothing was written"
+    )
     assert _bars_files(root) == []
 
 
@@ -765,7 +770,13 @@ def test_a_session_or_its_pre_open_margin_refuses(tmp_path, now):
     root = _lake(tmp_path)
     source = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
 
-    assert "next session" in _refused(root, [source], _listed((source, "GLD")), now=now)
+    message = _refused(root, [source], _listed((source, "GLD")), now=now)
+
+    assert "next session" in message
+    assert message.endswith(
+        "Run it after that session's close+5, 16:20 on a regular day, best once the evening "
+        "upload after the 18:30 sweep has finished. Nothing was written"
+    )
     assert _bars_files(root) == []
 
 
@@ -1066,7 +1077,7 @@ def test_an_undo_right_after_an_import_leaves_the_lake_as_it_was(tmp_path):
     leftover = temp.with_name(temp.name + ".tmp-4242")
     leftover.write_bytes(b"torn")
     client = FakeS3()
-    # The bucket holds the lake as it stood before the import, the morning's state.
+    # The bucket holds the lake as it stood before the import, as the last upload left it.
     client.store(UNDO_TARGET.key("manifest.jsonl"), before["manifest.jsonl"])
 
     summary = _undo(root, sources, vintages, client=client)
@@ -1162,11 +1173,21 @@ def test_a_bucket_that_cannot_be_read_refuses_the_undo(tmp_path, failure, expect
     assert _snapshot(root) == after
 
 
+# The undo's deadline after a stop at 20:00 on Monday 2026-08-31, with Tuesday's bound written out.
+TUESDAY_DEADLINE = (
+    "before any compaction uploads the import, and before 2026-09-01T09:00:00-04:00 at the latest"
+)
+
+
 @pytest.mark.parametrize(
     ("calendar", "deadline"),
     [
-        (CALENDAR, "before 2026-09-01T09:00:00-04:00"),
-        (weekday_sessions(date(2026, 8, 24)), "before the next session's capture start"),
+        (CALENDAR, TUESDAY_DEADLINE),
+        (
+            weekday_sessions(date(2026, 8, 24)),
+            "before any compaction uploads the import, and before the next session's capture "
+            "start at the latest",
+        ),
     ],
     ids=["next-session-day", "no-session-ahead"],
 )
@@ -1183,7 +1204,51 @@ def test_an_evening_undo_names_the_next_session_days_bound(tmp_path, calendar, d
 
     message = _undo_refused(root, sources, vintages, client=client, now=evening, calendar=calendar)
 
-    assert f"Run the undo again at once, {deadline}, and before any nightly upload" in message
+    assert f"Run the undo again at once, {deadline}: " in message
+
+
+@pytest.mark.parametrize(
+    ("failure", "repair"),
+    [
+        (unreachable(), "Run the undo again at once, "),
+        (
+            client_error("AccessDenied", "HeadObject", 403),
+            "Fix the instance profile's bucket policy, then run the undo again ",
+        ),
+        (client_error("NoSuchBucket", "HeadObject", 404), "Run the undo again "),
+    ],
+    ids=["unreachable", "refused", "failed"],
+)
+def test_every_bucket_failure_names_the_deadline(tmp_path, failure, repair):
+    """Catches a deadline dropped from one kind's repair, each of which says to run it again."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    client = FakeS3()
+    client.fail_with = failure
+    evening = datetime(2026, 8, 31, 20, 0, tzinfo=MARKET_TZ)
+
+    message = _undo_refused(root, sources, vintages, client=client, now=evening)
+
+    assert f". {repair}{TUESDAY_DEADLINE}: " in message
+
+
+def test_a_bucket_read_failing_under_the_lock_names_the_deadline(tmp_path, monkeypatch):
+    """Catches the second bucket read, under the lock, wired to another deadline."""
+    root, sources, vintages, _before = _imported(tmp_path)
+    client = FakeS3()
+    real = bar_import.lake_lock
+
+    @contextmanager
+    def failing_after_lock(path):
+        with real(path):
+            client.fail_with = unreachable()
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", failing_after_lock)
+    evening = datetime(2026, 8, 31, 20, 0, tzinfo=MARKET_TZ)
+
+    message = _undo_refused(root, sources, vintages, client=client, now=evening)
+
+    assert f"Run the undo again at once, {TUESDAY_DEADLINE}: " in message
 
 
 def test_an_undo_stopped_after_the_deletions_is_finished_by_a_rerun(tmp_path, monkeypatch):
@@ -1557,7 +1622,10 @@ def test_a_failed_deletion_refuses_with_one_line(tmp_path, monkeypatch):
     message = _undo_refused(root, sources, vintages)
 
     assert "Permission denied" in message
-    assert f"Run the undo again before {MONDAY_BOUND.isoformat()}, and before any" in message
+    assert (
+        "Run the undo again before any compaction uploads the import, and before "
+        f"{MONDAY_BOUND.isoformat()} at the latest. It finishes" in message
+    )
 
 
 def test_a_rewrite_that_does_not_read_back_names_the_bucket_copy(tmp_path, monkeypatch):

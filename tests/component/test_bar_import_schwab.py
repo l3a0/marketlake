@@ -41,7 +41,7 @@ from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.vendor import BARS_ENDPOINT, VendorError, VendorResponse, bars_params
 from tests.component.test_load_bars import _ledger_table
 from tests.support.bars import write_bars
-from tests.support.bucket import FakeS3
+from tests.support.bucket import FakeS3, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import SCHWAB_API_KEY, SCHWAB_APP_SECRET, write_config
@@ -764,6 +764,26 @@ def test_an_undo_right_after_an_import_leaves_the_lake_as_it_was(tmp_path):
 
     assert _snapshot(root) == before
     assert (summary.lines, summary.partitions) == (80, 80)
+
+
+def test_an_evening_undo_names_the_next_session_days_deadline(tmp_path):
+    """Catches the Schwab undo passing its own deadline rather than the computed bound.
+
+    Monday 2026-11-02's bound is 09:00 that morning, already past at 20:00, so the line names
+    Tuesday's, in Eastern standard time.
+    """
+    root = _lake(tmp_path)
+    _run(root)
+    client = FakeS3()
+    client.fail_with = unreachable()
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, client=client, now=datetime(2026, 11, 2, 20, 0, tzinfo=MARKET_TZ))
+
+    assert (
+        "Run the undo again at once, before any compaction uploads the import, and before "
+        "2026-11-03T09:00:00-05:00 at the latest: " in str(refused.value)
+    )
 
 
 def test_an_undo_of_the_last_ticker_imported_leaves_the_other(tmp_path):
