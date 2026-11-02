@@ -41,7 +41,7 @@ from lake.security_master import KIND_EQUITY, SecurityMaster, master_path
 from lake.vendor import BARS_ENDPOINT, VendorError, VendorResponse, bars_params
 from tests.component.test_load_bars import _ledger_table
 from tests.support.bars import write_bars
-from tests.support.bucket import FakeS3
+from tests.support.bucket import FakeS3, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import SCHWAB_API_KEY, SCHWAB_APP_SECRET, write_config
@@ -59,7 +59,8 @@ ONBOARD = datetime(2026, 10, 30, 20, 38, tzinfo=MARKET_TZ)
 FIRST_SPAN = date(2026, 11, 2)
 FIRST = date(2026, 9, 4)
 LAST = date(2026, 10, 30)
-# Monday's runbook window, and the request's two bounds, the two sessions' Eastern midnights.
+# A Monday morning before the bound, and the request's two bounds, the two sessions' Eastern
+# midnights.
 MONDAY_0745 = datetime(2026, 11, 2, 7, 45, tzinfo=MARKET_TZ)
 START = datetime(2026, 9, 4, 4, 0, tzinfo=UTC)
 END = datetime(2026, 10, 30, 4, 0, tzinfo=UTC)
@@ -394,6 +395,7 @@ def test_a_last_session_that_is_today_refuses(tmp_path):
     message = _refused(root, now=datetime(2026, 11, 3, 0, 0, tzinfo=UTC))
 
     assert "2026-11-02" in message and "no close gate" in message
+    assert message.endswith("Run it on 2026-11-03 or later")
     assert not (root / "bars").exists()
 
 
@@ -762,6 +764,26 @@ def test_an_undo_right_after_an_import_leaves_the_lake_as_it_was(tmp_path):
 
     assert _snapshot(root) == before
     assert (summary.lines, summary.partitions) == (80, 80)
+
+
+def test_an_evening_undo_names_the_next_session_days_deadline(tmp_path):
+    """Catches the Schwab undo passing its own deadline rather than the computed bound.
+
+    Monday 2026-11-02's bound is 09:00 that morning, already past at 20:00, so the line names
+    Tuesday's, in Eastern standard time.
+    """
+    root = _lake(tmp_path)
+    _run(root)
+    client = FakeS3()
+    client.fail_with = unreachable()
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, client=client, now=datetime(2026, 11, 2, 20, 0, tzinfo=MARKET_TZ))
+
+    assert (
+        "Run the undo again at once, before any compaction uploads the import, and before "
+        "2026-11-03T09:00:00-05:00 at the latest: " in str(refused.value)
+    )
 
 
 def test_an_undo_of_the_last_ticker_imported_leaves_the_other(tmp_path):
