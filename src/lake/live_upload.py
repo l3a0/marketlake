@@ -88,9 +88,13 @@ once more, under its own event, the first time a key is refused.
 prefix for one day's quotes segments and prints, for each segment and in summary, its
 ``LastModified`` less the ``start_ts`` its key carries. That is how acceptance item 1 of
 marketlake #943, a segment in the bucket within 90 seconds of its cycle's start, is measured
-on the VM from the bucket alone. It sends one listing request a page and writes nothing.
+on the VM from the bucket alone. It sends one listing request a page and writes nothing. It
+lists current objects, and the bucket's lifecycle rule expires each segment seven days after
+upload, so a day older than that lists no segments. Its empty answer says so, because no later
+read can recover those lags: the sealed partition has no ``LastModified`` for a segment.
 
-Nothing here deletes an object or touches a key under the lake's own prefix.
+Nothing here deletes an object or touches a key under the lake's own prefix. The live prefix
+empties by that lifecycle rule alone, and marketlake #995 and ``docs/design.md`` give its reason.
 """
 
 from __future__ import annotations
@@ -908,7 +912,10 @@ def lag_lines(lags: Sequence[SegmentLag], day: date, target: BucketTarget) -> li
     """What the lag command prints: one line per segment, then the summary line."""
     summary = LagSummary.of(lags)
     if summary.largest is None:
-        return [f"lag: no quotes segments on {day.isoformat()}: {target}"]
+        return [
+            f"lag: no quotes segments on {day.isoformat()}, and the bucket keeps each for only "
+            f"a week: {target}"
+        ]
     lines = [f"{one.rel} {_seconds(one.lag)}" for one in lags]
     lines.append(
         f"lag: {summary.count} quotes segments on {day.isoformat()}, largest "

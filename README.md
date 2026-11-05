@@ -234,9 +234,10 @@ keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 The bucket and the IAM principals the laptop signs as are code in `infra/live/`, and
 [infra/README.md](infra/README.md) says how to apply them.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
-the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
+the five lifecycle rules. Four of them expire noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
-files rewritten every night. `lake/trimmed.jsonl`, the ledger of partitions removed on
+files rewritten every night. The fifth empties the live prefix described below.
+`lake/trimmed.jsonl`, the ledger of partitions removed on
 purpose, takes no rule, so the bucket keeps every version of it, the same as `lake/reference/`.
 Partitions keep every version, because with no Object Lock an overwritten
 partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
@@ -270,10 +271,13 @@ examples below use the placeholder bucket `example-lake-backup`.
 
 On a primary with a bucket target, the daemon also sends each quotes segment to the sibling
 prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as its manifest
-entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). No lifecycle rule names
-that prefix, so every segment under it is kept forever. The `lag` command reads how long
-each of one day's segments took to arrive, from the bucket alone, and writes nothing. On
-the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
+entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). A lifecycle rule
+expires each segment seven days after upload and removes its bytes seven days after that
+([#995](https://github.com/l3a0/marketlake/issues/995)). The day's sealed partition holds the
+same minutes, the runtime's replay reads sealed partitions, and its comparison falls back on
+them once a segment is gone. The `lag` command reads how long each of one day's segments took
+to arrive, from the bucket alone, and writes nothing. A day older than a week lists no
+segments, and the answer says so. On the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
 dev group into the daemon's venv:
 
 ```bash

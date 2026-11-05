@@ -389,47 +389,65 @@ run "command_roles_trust_only_marketlake_command" {
   }
 }
 
-run "lifecycle_rules_are_exactly_the_four" {
+run "lifecycle_rules_are_exactly_the_five" {
   command = plan
 
-  # The whole list is compared, so a rule that expires current versions, archives an
-  # object or expires a partition's old copy fails here. The Sunday scrub sees none of
-  # those three. Three attributes are computed, and the mock provider fills them with
-  # random values, so the comparison sets them to null on both sides. Both sides go
-  # through jsonencode, because a typed list never equals a literal tuple.
+  # The whole list is compared, so a rule that expires current versions outside the live
+  # prefix, archives an object or expires a partition's old copy fails here, and so does
+  # a live rule that matches anything under lake/. The Sunday scrub sees none of those.
+  # Four attributes are computed, and the mock provider fills them with random values,
+  # so the comparison sets them to null on both sides. Both sides go through jsonencode,
+  # because a typed list never equals a literal tuple.
   assert {
     condition = jsonencode([
       for r in aws_s3_bucket_lifecycle_configuration.backup.rule : merge(r, {
-        prefix = null
+        prefix     = null
+        expiration = [for e in r.expiration : merge(e, { expired_object_delete_marker = null })]
         filter = [
           for f in r.filter : merge(f, { object_size_greater_than = null, object_size_less_than = null })
         ]
       })
-      ]) == jsonencode([
-      for rule in [
-        ["manifest", "lake/manifest.jsonl"],
-        ["quarantine", "lake/quarantine.jsonl"],
-        ["actions", "lake/actions/"],
-        ["journal", "lake/journal/"],
-        ] : {
-        id                                = rule[0]
-        status                            = "Enabled"
-        prefix                            = null
-        abort_incomplete_multipart_upload = []
-        expiration                        = []
-        transition                        = []
-        noncurrent_version_transition     = []
-        noncurrent_version_expiration     = [{ noncurrent_days = 30, newer_noncurrent_versions = null }]
-        filter = [{
-          prefix                   = rule[1]
-          and                      = []
-          tag                      = []
-          object_size_greater_than = null
-          object_size_less_than    = null
-        }]
-      }
-    ])
-    error_message = "The backup's lifecycle rules are not exactly the four noncurrent expiries."
+      ]) == jsonencode(concat([
+        for rule in [
+          ["manifest", "lake/manifest.jsonl"],
+          ["quarantine", "lake/quarantine.jsonl"],
+          ["actions", "lake/actions/"],
+          ["journal", "lake/journal/"],
+          ] : {
+          id                                = rule[0]
+          status                            = "Enabled"
+          prefix                            = null
+          abort_incomplete_multipart_upload = []
+          expiration                        = []
+          transition                        = []
+          noncurrent_version_transition     = []
+          noncurrent_version_expiration     = [{ noncurrent_days = 30, newer_noncurrent_versions = null }]
+          filter = [{
+            prefix                   = rule[1]
+            and                      = []
+            tag                      = []
+            object_size_greater_than = null
+            object_size_less_than    = null
+          }]
+        }
+        ], [{
+          id                                = "live"
+          status                            = "Enabled"
+          prefix                            = null
+          abort_incomplete_multipart_upload = []
+          expiration                        = [{ date = null, days = 7, expired_object_delete_marker = null }]
+          transition                        = []
+          noncurrent_version_transition     = []
+          noncurrent_version_expiration     = [{ noncurrent_days = 7, newer_noncurrent_versions = null }]
+          filter = [{
+            prefix                   = "lake-live/"
+            and                      = []
+            tag                      = []
+            object_size_greater_than = null
+            object_size_less_than    = null
+          }]
+    }]))
+    error_message = "The backup's lifecycle rules are not exactly the four noncurrent expiries and the live prefix's rule."
   }
 }
 

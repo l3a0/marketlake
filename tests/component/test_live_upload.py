@@ -1688,6 +1688,20 @@ def test_the_lag_command_reads_the_bucket_and_prints_the_summary(tmp_path, monke
     assert fake.calls[0][1]["Prefix"] == "lake-live/journal/date=2026-09-02/surface=quotes/"
 
 
+def test_the_lag_command_says_why_a_day_may_list_no_segments(tmp_path, monkeypatch, capsys):
+    """A day past the lifecycle rule lists nothing, which must not read as nothing sent."""
+    root = _root(tmp_path)
+    config = _bucket_config(tmp_path, root)
+    monkeypatch.setattr(live_upload, "connect", lambda config, target=None: (target, FakeS3()))
+
+    assert live_upload.main(["lag", "--date", "2026-09-02", "--config", str(config)]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "lag: no quotes segments on 2026-09-02, and the bucket keeps each for only a week: "
+        "s3://lake-backup/lake-live"
+    ]
+
+
 def test_the_lag_command_names_a_bucket_that_failed(tmp_path, monkeypatch, capsys):
     root = _root(tmp_path)
     config = _bucket_config(tmp_path, root)

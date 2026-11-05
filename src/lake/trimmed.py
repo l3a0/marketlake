@@ -273,7 +273,7 @@ def is_designed_absence(
     the same answer. A trim line beside a present file is
     what a crash between the line and the unlink leaves, and that file is present. The rebuild
     in ``lake.bucket.restore_lake`` is the one caller that acts on this answer with no file to
-    check. It asks about every key the bucket lists, since the bucket never deletes and still
+    check. It asks about every key the bucket lists, since its prefix never deletes and still
     holds each trimmed partition, and leaves out each key this calls designed.
 
     The sha comparison is what keeps a re-sealed partition honest. Should a partition be trimmed

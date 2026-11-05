@@ -179,16 +179,20 @@ viewer like `less`. Press `q` to leave it.
 aws s3api get-bucket-lifecycle-configuration --bucket "<backup-bucket>" --profile marketlake-admin
 ```
 
-The code in `infra/live/bucket.tf` expects four rules, with these ids.
+The code in `infra/live/bucket.tf` expects five rules, with these ids.
 
 1. `manifest`
 2. `quarantine`
 3. `actions`
 4. `journal`
+5. `live`
 
-Each one has a `Filter.Prefix` under `lake/` and expires noncurrent versions after 30
-days. A different id or shape shows up in the first plan as an in-place update. On
-2026-10-06 the four rules matched the code.
+Each of the first four has a `Filter.Prefix` under `lake/` and expires noncurrent versions
+after 30 days. The fifth has the prefix `lake-live/` and expires current objects after
+seven days and noncurrent versions seven days after that
+([#995](https://github.com/l3a0/marketlake/issues/995)). A different id or shape shows up in
+the first plan as an in-place update. On 2026-10-06 the first four rules matched the code,
+and the fifth did not exist yet.
 
 List the account's OIDC providers.
 
