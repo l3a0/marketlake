@@ -902,6 +902,22 @@ def test_the_refusal_repeats_every_night_the_damage_survives(lake_root):
     assert all(path.exists() for path in spy)
 
 
+def test_a_refused_day_seals_once_its_good_bytes_are_back(lake_root):
+    """A refusal is not remembered, which is what lets a live copy repair a quotes day."""
+    spy = _captured(lake_root, "SPY")
+    good = spy[2].read_bytes()
+    _flip(spy[2], DROPS_THE_SEGMENT)
+
+    refused, _ = _run(lake_root)
+    spy[2].write_bytes(good)
+    repaired, _ = _run(lake_root, at=_et(16, 31))
+
+    assert len(refused.refused) == 1
+    assert repaired.refused == ()
+    assert [item.ticker for item in repaired.sealed] == ["SPY"]
+    assert not any(path.exists() for path in spy)
+
+
 def test_a_finding_that_cannot_be_written_still_pages(lake_root, monkeypatch, capsys):
     spy = _captured(lake_root, "SPY")
     _flip(spy[2], DROPS_THE_SEGMENT)

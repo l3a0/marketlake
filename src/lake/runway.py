@@ -706,8 +706,8 @@ def listing_busiest_sealed_day(
     1. Today would leave the window empty for a host dead 30 days, the reserve at 0, and the
        check passing on nothing, on the recovery path.
     2. The newest day outside ``Usage.unsealed`` would let one leftover segment pull the end
-       back. The bucket keeps every segment it ever uploaded, and a day that sealed most tickers
-       while compaction refused one is both unsealed and possibly the busiest.
+       back. The lake's own prefix keeps every segment it ever uploaded, and a day that sealed
+       most tickers while compaction refused one is both unsealed and possibly the busiest.
     3. The oldest day would measure the lake's first month rather than its latest.
 
     The price is that a key dated in the future would move the window, and nothing in the lake

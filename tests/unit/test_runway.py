@@ -1506,7 +1506,7 @@ def test_the_newest_day_anchors_the_window_even_with_a_refused_tickers_segment()
     """Mutation this catches: anchoring the window at the newest day outside ``unsealed``.
 
     The newest day sealed SPY and compaction refused QQQ, so the day is both unsealed and the
-    busiest. The bucket keeps every segment it ever uploaded, so a rebuild meets this day.
+    busiest. The lake's prefix keeps every segment it ever uploaded, so a rebuild meets this day.
     Anchored at the day before, the window would leave it out and answer 100.
     """
     listing = {

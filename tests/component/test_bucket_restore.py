@@ -109,8 +109,8 @@ def _uploaded(tmp_path: Path) -> tuple[Path, FakeS3]:
 
     The first upload carries a chains journal segment that capture manifested for
     ``SEGMENT_DAY``. Compaction then seals that day and unlinks the segment, and the
-    nightly upload carries the sealed partition. The bucket never deletes, so it still
-    holds the segment the lake no longer has.
+    nightly upload carries the sealed partition. The lake's prefix never deletes, so it
+    still holds the segment the lake no longer has.
     """
     lake = FixtureLake(tmp_path / "lake").with_chains("SPY", DAY).with_quotes("SPY", DAY)
     lake.with_journal_segment(

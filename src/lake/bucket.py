@@ -3091,7 +3091,7 @@ def restore_lake(
        copy put there by hand has to match.
     3. The plan is every object under the target, less each journal segment whose
        compacted partition the manifest records, and less S3's zero-byte folder
-       markers. The bucket never deletes, so it can hold the segments of a day
+       markers. The lake's prefix never deletes, so it can hold the segments of a day
        compacted after they uploaded, and the restore leaves them out by the scrub's own
        rule, ``_compacted_partition_for_segment``. When skipping designed absences, each key
        that ``trimmed.is_designed_absence`` calls designed against the bucket's two ledgers

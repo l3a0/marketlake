@@ -179,16 +179,20 @@ viewer like `less`. Press `q` to leave it.
 aws s3api get-bucket-lifecycle-configuration --bucket "<backup-bucket>" --profile marketlake-admin
 ```
 
-The code in `infra/live/bucket.tf` expects four rules, with these ids.
+The code in `infra/live/bucket.tf` expects five rules, with these ids.
 
 1. `manifest`
 2. `quarantine`
 3. `actions`
 4. `journal`
+5. `live`
 
-Each one has a `Filter.Prefix` under `lake/` and expires noncurrent versions after 30
-days. A different id or shape shows up in the first plan as an in-place update. On
-2026-10-06 the four rules matched the code.
+Each of the first four has a `Filter.Prefix` under `lake/` and expires noncurrent versions
+after 30 days. The fifth has the prefix `lake-live/` and expires current objects after
+seven days and noncurrent versions 90 days after that
+([#995](https://github.com/l3a0/marketlake/issues/995)). A different id or shape shows up in
+the first plan as an in-place update. On 2026-10-06 the first four rules matched the code,
+and the fifth did not exist yet.
 
 List the account's OIDC providers.
 
@@ -751,6 +755,49 @@ Then release the lock, with the id the error printed in place of `<lock-id>`.
 ```bash
 AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live" force-unlock "<lock-id>"
 ```
+
+### Stop the live rule, or read a live segment back
+
+The `live` lifecycle rule removes segments under `lake-live/` by age
+([#995](https://github.com/l3a0/marketlake/issues/995)). Each segment stays a current object
+for about seven days, then a noncurrent version for about 90 more, and then its bytes are
+gone.
+
+To stop the rule, or to take it back, open a pull request that sets its `status` to
+`Disabled` or reverts it, and change both tests that compare the rule list,
+`lifecycle_rules_are_exactly_the_five` and `test_lifecycle_rules_are_exactly_these_five`. The
+apply then writes the whole list. Never run `aws s3api put-bucket-lifecycle-configuration` by
+hand, because it replaces every rule, including the four under `lake/`. Stopping the rule
+brings nothing back.
+
+An apply waits for the hours
+[Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
+allows, so a stop can take a while. Reading a segment needs neither a stop nor an apply.
+
+A live segment can be the only good copy of a quotes segment, for about 97 days, in three
+cases.
+
+1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
+   A refused day has no partition in the manifest, so compaction seals it once the segment's
+   good bytes are back at its path. Repairing such a day is
+   [#557](https://github.com/l3a0/marketlake/issues/557)'s.
+2. The lake volume was lost before a nightly upload carried the day to the bucket, as
+   segments under `lake/journal/` or as a sealed partition.
+3. A manifested segment left the disk before the seal, so the partition sealed short with no
+   page ([#998](https://github.com/l3a0/marketlake/issues/998)). The day is already sealed, so
+   the first fact below applies.
+
+No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
+[first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds
+the untested commands. After about seven days a segment
+sits behind a delete marker, so only a listing of versions shows it, and its `sha256` metadata
+holds the digest to check the copy against. A day's chains have no live copy. Two facts bound
+any attempt by hand.
+
+1. A segment copied back after the day's partition is manifested is deleted as debris, with a
+   healthy ping.
+2. On a lost volume, a segment copied back after the daemon has started leaves a false gap
+   row beside each real minute.
 
 ## Changing the bootstrap
 
@@ -1758,7 +1805,7 @@ VM's lake by emptying the shadow lake with `deploy/vm-empty-shadow-lake.sh` and 
 restoring from the bucket. Start the VM first if it is stopped, and remove the switch that
 lets it stop, as [The nightly stop](#the-nightly-stop) says, because a restore is not a
 unit the stop can see. Create the switch again once the restore and the bootstrap rerun
-after it have ended. Four facts hold for any restore onto the VM.
+after it have ended. Five facts hold for any restore onto the VM.
 
 1. The instance role reads the bucket from the first boot, so `bucket restore` runs on
    the VM through its instance profile, with no stored key.
@@ -1794,6 +1841,11 @@ after it have ended. Four facts hold for any restore onto the VM.
    [Rerun the bootstrap](#rerun-the-bootstrap) says: raise `lake_volume_gib`, apply, and
    rerun the bootstrap so `resize2fs` grows the filesystem. Then run the restore again. A
    whole-lake restore needs more room, not less.
+5. The restore reads only the lake's own prefix, so a day no nightly upload reached comes
+   back empty, and a day an upload stopped partway through can come back partial. Its quotes
+   may survive under `lake-live/` for about 97 days, and nothing pages when that time runs
+   out. Before the bootstrap rerun starts the daemon, read
+   [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back).
 
 The order depends on the `role` in `config/vm.yaml`.
 

@@ -83,8 +83,10 @@ import {
 
 # Noncurrent versions expire after 30 days under the four paths rewritten every night.
 # Partitions keep every version, because with no Object Lock an overwritten
-# partition's old version is its only good copy. A test compares this whole rule list,
-# so a rule that expires or archives anything else changes the test in the same diff.
+# partition's old version is its only good copy. The fifth rule alone expires current
+# objects, the live segments, and docs/design.md's live upload section says why. A test
+# compares this whole rule list, so a rule that expires or archives anything else
+# changes the test in the same diff.
 resource "aws_s3_bucket_lifecycle_configuration" "backup" {
   bucket = aws_s3_bucket.backup.id
 
@@ -137,6 +139,27 @@ resource "aws_s3_bucket_lifecycle_configuration" "backup" {
 
     noncurrent_version_expiration {
       noncurrent_days = 30
+    }
+  }
+
+  # The bucket is versioned, so the expiry only adds a delete marker and the noncurrent
+  # expiry removes the bytes. A rule with days also clears the marker once it stands
+  # alone, so no second rule is needed, and S3 refuses expired_object_delete_marker
+  # beside days. S3 runs this, so no role needs s3:DeleteObject.
+  rule {
+    id     = "live"
+    status = "Enabled"
+
+    filter {
+      prefix = "lake-live/"
+    }
+
+    expiration {
+      days = 7
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 90
     }
   }
 

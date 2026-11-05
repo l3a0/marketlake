@@ -241,6 +241,51 @@ def _actions(statement: dict[str, Any]) -> list[str]:
     return [action] if isinstance(action, str) else list(action)
 
 
+def test_lifecycle_rules_are_exactly_these_five() -> None:
+    """The one check on this list that a required job runs, and it reads what the plan masks.
+
+    ``test`` is the check the ruleset requires, and the tofu test's job is not. The tofu test
+    also nulls the size filters, and a segment is about 9 KB, so a minimum size above that would
+    expire nothing. So any rule that touches ``lake/`` or changes ``live`` fails here too, and so
+    does a second resource of this type, which would replace the whole list on apply.
+    """
+    thirty = [{"noncurrent_days": 30}]
+    expected = [
+        {
+            "id": rule_id,
+            "status": "Enabled",
+            "filter": [{"prefix": prefix}],
+            "noncurrent_version_expiration": thirty,
+        }
+        for rule_id, prefix in (
+            ("manifest", "lake/manifest.jsonl"),
+            ("quarantine", "lake/quarantine.jsonl"),
+            ("actions", "lake/actions/"),
+            ("journal", "lake/journal/"),
+        )
+    ]
+    # The owner's "weekly should work" sets days, and the owner's ruling of 2026-11-05 on
+    # PR #997 sets noncurrent days to 90, so a segment can still be read back for months.
+    expected.append(
+        {
+            "id": "live",
+            "status": "Enabled",
+            "filter": [{"prefix": "lake-live/"}],
+            "expiration": [{"days": 7}],
+            "noncurrent_version_expiration": [{"noncurrent_days": 90}],
+        }
+    )
+    body = _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]
+    assert body["rule"] == expected
+    assert "dynamic" not in body, "a dynamic block adds rules this comparison cannot see"
+    assert [
+        address
+        for config in ("live", "bootstrap")
+        for address in _resources(config)
+        if address.startswith("aws_s3_bucket_lifecycle_configuration.")
+    ] == ["aws_s3_bucket_lifecycle_configuration.backup"]
+
+
 @pytest.mark.parametrize("address", PREVENT_DESTROY)
 def test_resource_carries_prevent_destroy(address: str) -> None:
     config, resource = address.split("/")

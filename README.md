@@ -234,9 +234,10 @@ keeps its `rsync` copy, its scrub and its weekly restore test exactly as before.
 The bucket and the IAM principals the laptop signs as are code in `infra/live/`, and
 [infra/README.md](infra/README.md) says how to apply them.
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
-the four lifecycle rules. Each rule expires noncurrent versions after 30 days under one of
+the five lifecycle rules. Four of them expire noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
-files rewritten every night. `lake/trimmed.jsonl`, the ledger of partitions removed on
+files rewritten every night. The fifth expires the live prefix's segments by age, as described below.
+`lake/trimmed.jsonl`, the ledger of partitions removed on
 purpose, takes no rule, so the bucket keeps every version of it, the same as `lake/reference/`.
 Partitions keep every version, because with no Object Lock an overwritten
 partition's old version is its only good copy. `infra/live/command.tf` holds the `marketlake-backup` role's policy,
@@ -270,10 +271,15 @@ examples below use the placeholder bucket `example-lake-backup`.
 
 On a primary with a bucket target, the daemon also sends each quotes segment to the sibling
 prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as its manifest
-entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). No lifecycle rule names
-that prefix, so every segment under it is kept forever. The `lag` command reads how long
-each of one day's segments took to arrive, from the bucket alone, and writes nothing. On
-the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
+entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). A lifecycle rule
+expires each segment seven days after upload and removes its bytes 90 days after that
+([#995](https://github.com/l3a0/marketlake/issues/995)). The day's sealed partition holds the
+same minutes, unless a fault left it short
+([#998](https://github.com/l3a0/marketlake/issues/998)), and the owner ruled that the runtime's replay reads sealed partitions and that
+its monitoring compares against them once a segment is gone. The `lag` command reads how long
+each of one day's segments took to arrive, from the bucket alone, and writes nothing. A sealed
+day older than a week lists no segments, and an empty answer names both readings, nothing
+sent and past the week. On the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
 dev group into the daemon's venv:
 
 ```bash
@@ -698,6 +704,10 @@ copy at the file's path under `<dest>/.marketlake-restoring` and run the restore
 finds the manifest's hash there and downloads nothing for that file. A file the manifest does
 not record is checked against the current version's stored checksum instead, so an earlier
 version of one never verifies.
+
+A day no nightly upload reached is not in the bucket's lake at all. Its quotes may survive
+under `lake-live/` for about 97 days, as
+[infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
 
 On a host that keeps a window, the restore reads the bucket's `trimmed.jsonl` before any data
 file, and takes the older version when a stopped upload left the current one newer than its
