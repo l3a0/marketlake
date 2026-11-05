@@ -240,7 +240,7 @@ All jobs run from launchd on the Mac and from systemd on a Linux VM. launchd is 
 
 The capture loop is **parallel per ticker**. Each ticker has its own worker firing at the top of the minute. Workers are staggered by a few tens of milliseconds, so the concurrent volley stays clear of Schwab's burst rejection. Cycle wall-time stays flat as the roster grows *until local resources bind*. The 120 req/min cap is the **vendor** ceiling: \~115 minutely full-chain tickers by request arithmetic alone. The **local** ceiling is aggregate payload bytes, JSON parse, and journal-append throughput, all scaling with the roster's total chain size. That ceiling is measured, not assumed. Slice 1's day-one measurements feed it. The roster ceiling is whichever binds first. The cap is scoped to the **app's `client_id`**: the credentials, not the IP or machine. The budget therefore travels with the token on any future migration. Anything else using the same keys, such as a notebook or an ad-hoc curl, draws from the daemon's 120. The rule is that the daemon's app credentials are used by the daemon alone. One honesty note on provenance: Schwab's official docs throttle-document only *order* operations (0–120/min per account, GETs called "unthrottled" there). The 120/min on market-data GETs is the observed app-level limit every maintained client reports being enforced via 429. It is real but not contractual, so it could shift without notice. Multiplying the budget with extra accounts/apps is considered and rejected. Registration is identity-tied, so the vector barely exists. Quota-farming stresses the one relationship the entire lake depends on. Account standing is the real single point of failure, and lost capture is unrecoverable. Extra credentials also buy headroom in the wrong dimension, because the local parse budget binds before the vendor cap. A roster that truly outgrows 120/min graduates to paid data, not credential arithmetic. Sustained polling at the published cap is untested territory for a single retail app. The stagger, the concurrency cap and the 429 page are the tripwires. None of this binds at two tickers and 3 of 120 req/min. The equity-quote sampler is never the roster ceiling. The quotes endpoint batches a comma-separated symbol list. Its practical cap is in the hundreds per request, URL-length bound. The exact cap is a day-one measurement. The sampler's cost therefore grows as ⌈tickers / batch⌉: one request for dozens of tickers, a handful for a thousand. Payloads stay sub-second throughout. The roster ceiling belongs entirely to the chains, which cost one request and megabytes per ticker per minute. Failure isolation comes free on the chains surface. Skip-not-block applies per ticker, so one hung chain request drops that ticker's minute and touches nothing else. The quote sampler is the stated exception: it is one shared failure unit, and a hung batch drops every ticker's quotes minute, journaled as per-ticker gap rows.
 
-**Table:** The capture schedule, in Eastern time
+**Table:** The job schedule, in Eastern time
 
 | ET | Job | Detail |
 | --- | --- | --- |
@@ -445,7 +445,7 @@ A master from before capture spans existed has no spans table yet. `python -m la
 
 A full SPY chain runs roughly 10–25k contracts per snapshot. That figure is an estimate. Measure it on day one, along with the fetch-latency distribution: p50/p99 across the session, with the 9:30 open and the final 15 minutes broken out. One more day-one measurement: fetch one chain at close+5 and record whether same-day-expired series are still served. Every SPY/QQQ session lists a same-day expiration, so any session works. The answer calibrates the option-close fill's membership guard. The journal's per-row timestamps already carry this, so it is a query, not new instrumentation. The measurement feeds the roster-ceiling claim in the schedule section. In compressed Parquet, per ticker-year:
 
-**Table:** Storage estimates by surface
+**Table:** Storage estimates by surface, per ticker and year
 
 | Surface | Rows / year | Parquet / year |
 | --- | --- | --- |
@@ -645,7 +645,7 @@ Cut from the message design, with the reason pinned so it stays cut:
 
 All `pmset` usage is collected in one place. Four commands, one deliberately unused:
 
-**Table:** The commands, who sets each, and why
+**Table:** The `pmset` commands, who sets each, and why
 
 | Command | Set by / when | Purpose | Notes |
 | --- | --- | --- | --- |

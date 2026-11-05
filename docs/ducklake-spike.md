@@ -70,7 +70,7 @@ Budget roughly ninety minutes. Point everything at a scratch lake. Never point a
 
 **Be honest about what each fidelity tier tests.** The three tiers are not interchangeable.
 
-**Table:** The test tiers, with what each catches and misses
+**Table:** The fidelity tiers, with what each catches and misses
 
 | Tier | Method | Cost | What it catches | What it cannot catch |
 | --- | --- | --- | --- | --- |
