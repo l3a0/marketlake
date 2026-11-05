@@ -558,6 +558,8 @@ public, so the job sends OpenTofu's output to `/dev/null` and writes only addres
 actions and attribute names to the summary. On the first run the summary should show
 these actions, as it did on 2026-10-06.
 
+**Table:** Expected addresses and actions in the pull request's plan
+
 | Address | Action |
 | --- | --- |
 | `aws_iam_instance_profile.instance` | create |
@@ -1393,6 +1395,8 @@ resources in `vm.tf`, and the read half from the instance role's split. The
 `marketlake:backup-target` tag is an argument of `aws_instance.vm`, so it adds no
 resource.
 
+**Table:** Expected addresses and actions when creating the VM
+
 | Address | Action |
 | --- | --- |
 | `aws_ebs_volume.lake` | create |
@@ -1745,6 +1749,8 @@ sudo tail -n 50 /var/lib/marketlake/deploy.log
 
 `/var/lib/marketlake/deployed` holds the sha the running daemon started from. It is absent
 when that is unknown, and an absent record makes the next deploy restart the daemon.
+
+**Table:** What each last line of a deploy means
 
 | Last line | Exit | What to do next |
 | --- | --- | --- |
@@ -2238,6 +2244,8 @@ deploy's install enables every timer again.
 Two healthchecks checks watch the stop and the start. Both are fed through
 `python -m lake.control_plane ping`, which accepts these two slugs and no other.
 
+**Table:** The two checks, with their schedules and routing
+
 | Check | Fed by | Schedule, `America/New_York` | Grace | Routing |
 | --- | --- | --- | --- | --- |
 | `vm-up` | `marketlake-up.timer`, at 07:40 each weekday | OnCalendar `Mon..Fri 07:35` | 15 minutes | Every integration |
@@ -2478,6 +2486,8 @@ wait for that time overrides the window, as
 The repository is public, so the run's log and its summary show only the summary line,
 `StatusDetails` and `ResponseCode`. The VM keeps the full output in
 `/var/lib/marketlake/deploy.log`. This table says what each summary means.
+
+**Table:** What each summary from CI means
 
 | Summary | Exit | What it means |
 | --- | --- | --- |

@@ -45,6 +45,8 @@ Marketlake has two write boundaries with opposite requirements. Testing the wron
 
 DuckLake is the only one being spiked. The rest are pinned here with reasons.
 
+**Table:** The candidates considered
+
 | Option | The case for it | The case against |
 | --- | --- | --- |
 | **DuckLake** | Keeps the Parquet plus DuckDB substrate. ACID across multi-table commits. Time travel. v1.0 is production-tagged. | Metadata lives in a SQL database, not in the file tree. That is precisely what drills 2 through 4 attack. |
@@ -67,6 +69,8 @@ Budget roughly ninety minutes. Point everything at a scratch lake. Never point a
 **Do not race a `kill -9`.** Use deterministic crash points driven by an environment variable. At each point the code calls `os.abort()`. That raises SIGABRT and skips Python's exit handlers, buffer flushes, and destructors, so it has genuine process-death fidelity. Three points are needed: `mid_data_file_write`, `post_data_file_pre_commit`, and `post_commit_pre_unlink`.
 
 **Be honest about what each fidelity tier tests.** The three tiers are not interchangeable.
+
+**Table:** The fidelity tiers, with what each catches and misses
 
 | Tier | Method | Cost | What it catches | What it cannot catch |
 | --- | --- | --- | --- | --- |

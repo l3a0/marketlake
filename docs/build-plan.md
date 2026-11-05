@@ -540,6 +540,8 @@ Computed greeks stay deferred beyond the build, per the design doc.
 
 Every test sits in one of four tiers. The tier is set by the widest boundary the test must cross, not by what it is about.
 
+**Table:** The test tiers
+
 | Tier | Scope | Target | Runs on |
 | --- | --- | --- | --- |
 | Unit | One module, every seam faked. Decided from values alone. | 320 tests, under 10 seconds | every save |
