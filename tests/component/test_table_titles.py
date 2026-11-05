@@ -15,7 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DELIMITER_ROW = re.compile(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$")
 TABLE_TITLE = re.compile(r"^\s*\*\*Table:\*\* \S")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})(.*)$")
 
 
 def untitled_tables(text: str) -> list[int]:
@@ -70,6 +70,21 @@ def test_a_table_after_a_tilde_fence_is_read() -> None:
 
 def test_a_shorter_fence_inside_a_longer_one_does_not_close_it() -> None:
     assert untitled_tables("````\n```\n| A |\n| --- |\n````\n") == []
+
+
+@pytest.mark.parametrize(
+    ("text", "lines"),
+    [
+        ("~~~\n| A |\n| --- |\n~~~\n", []),
+        ("```\n~~~\n| A |\n| --- |\n```\n", []),
+        ("```\n``` x\n| A |\n| --- |\n```\n", []),
+        ("    ```\n\n| A |\n| --- |\n", [3]),
+        ("```a``` is prose\n\n| A |\n| --- |\n", [3]),
+    ],
+    ids=["tilde-fence", "other-character", "closer-with-info", "indented-four", "inline-ticks"],
+)
+def test_what_opens_and_closes_a_fence(text: str, lines: list[int]) -> None:
+    assert untitled_tables(text) == lines
 
 
 @pytest.mark.parametrize(
