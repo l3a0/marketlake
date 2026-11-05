@@ -25,9 +25,12 @@ code that depends on it untested.
 
 ``HeadObject`` on a missing key or a missing version answers a bare 404, as S3 does for a
 key that holds ``s3:ListBucket``, and its error carries no body. A delete marker, which
-``delete_marker`` adds, shows only in the version listing, and a ``HeadObject`` naming it
-answers 405 as S3 does. ``fail_with`` makes every call raise one chosen error, which is how
-a test models a revoked key or a network that is down. ``deny_versioned_get`` refuses a
+``delete_marker`` adds, shows in the version listing, hides its key from ``ListObjectsV2`` and
+lets a conditional write through, as S3 does. ``GetObject`` and a ``HeadObject`` by key alone
+still answer as if it were not there, unlike S3, and no test depends on that. A ``HeadObject``
+naming the marker answers 405 as S3 does. ``fail_with`` makes every call raise one chosen
+error, which is how a test models a revoked key or a network that is down.
+``deny_versioned_get`` refuses a
 ``GetObject`` or a ``HeadObject`` that names a version, the two calls ``s3:GetObjectVersion``
 covers, and ``deny_list_versions`` refuses ``ListObjectVersions``, so a test can model a role
 without those grants. ``deny_versioned_get_object`` refuses only a ``GetObject`` that names a
@@ -194,8 +197,8 @@ class FakeS3:
     def delete_marker(self, key: str) -> str:
         """Add a delete marker to ``key`` and return its version id.
 
-        Only the version listing shows it. A test that wants the key's current version served
-        stores a version after the marker, as S3 too serves the newest version then.
+        A test that wants the key's current version served stores a version after the marker,
+        as S3 too serves the newest version then.
         """
         self._next_version += 1
         version_id = f"v{self._next_version}"
@@ -343,7 +346,11 @@ class FakeS3:
         prefix = kwargs.get("Prefix", "")
         if self._denied(prefix):
             raise client_error("AccessDenied", "ListObjectsV2", 403)
-        keys = [key for key in sorted(self.objects) if key.startswith(prefix)]
+        keys = [
+            key
+            for key in sorted(self.objects)
+            if key.startswith(prefix) and self._current_is_object(key)
+        ]
         start = int(kwargs.get("ContinuationToken", 0))
         size = min(self.page_size, int(kwargs.get("MaxKeys", self.page_size)))
         page = keys[start : start + size]

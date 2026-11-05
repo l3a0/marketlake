@@ -770,28 +770,29 @@ apply then writes the whole list. Never run `aws s3api put-bucket-lifecycle-conf
 hand, because it replaces every rule, including the four under `lake/`. Stopping the rule
 brings nothing back.
 
-A live segment can be the only good copy of a quotes segment in two cases.
+An apply waits for the hours
+[Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
+allows, so a stop can take a while. Reading a segment needs neither a stop nor an apply.
 
-1. Compaction refuses a ticker-day because a segment no longer matches its manifest entry.
-2. The lake volume is lost before a day seals, so the restore has no journal for that day,
-   because it reads only the lake's own prefix.
+A live segment can be the only good copy of a quotes segment, for about two weeks, in two
+cases.
 
-List the day's versions. A version that is not the latest sits behind a delete marker.
+1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
+   A refused day has no partition in the manifest, so compaction seals it once the segment's
+   good bytes are back at its path. Repairing such a day is
+   [#557](https://github.com/l3a0/marketlake/issues/557)'s.
+2. The lake volume was lost before a nightly upload carried the day to the bucket, as
+   segments under `lake/journal/` or as a sealed partition.
 
-```bash
-aws s3api list-object-versions --bucket "<backup-bucket>" --prefix "lake-live/journal/date=YYYY-MM-DD/surface=quotes/ticker=<ticker>/" --profile marketlake-admin
-```
+No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. After about seven days a segment
+sits behind a delete marker, so only a listing of versions shows it, and its `sha256` metadata
+holds the digest to check the copy against. A day's chains have no live copy. Two facts bound
+any attempt by hand.
 
-Download each one by the version id that listing printed, and read its stored digest.
-
-```bash
-aws s3api get-object --bucket "<backup-bucket>" --key "<key>" --version-id "<version-id>" "<download>" --query 'Metadata.sha256' --profile marketlake-admin
-```
-
-Check `shasum -a 256` of the download against that digest. Put the file back at its path under
-the lake's `journal/`, without the `lake-live/` prefix, before the next compaction. Compaction
-then seals the ticker-day from those bytes. A review probe confirmed that against the suite's
-fake bucket, and no real segment has been put back this way. A day's chains have no live copy.
+1. A segment copied back after the day's partition is manifested is deleted as debris, with a
+   healthy ping.
+2. On a lost volume, a segment copied back after the daemon has started leaves a false gap
+   row beside each real minute.
 
 ## Changing the bootstrap
 
@@ -1835,11 +1836,11 @@ after it have ended. Five facts hold for any restore onto the VM.
    [Rerun the bootstrap](#rerun-the-bootstrap) says: raise `lake_volume_gib`, apply, and
    rerun the bootstrap so `resize2fs` grows the filesystem. Then run the restore again. A
    whole-lake restore needs more room, not less.
-5. The restore reads only the lake's own prefix, so a day that never sealed comes back
-   empty. Its quotes may survive under `lake-live/` for about two weeks, and nothing pages
-   when that time runs out.
-   [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back)
-   says how to copy them back before the day's compaction.
+5. The restore reads only the lake's own prefix, so a day no nightly upload reached comes
+   back empty, and a day an upload stopped partway through can come back partial. Its quotes
+   may survive under `lake-live/` for about two weeks, and nothing pages when that time runs
+   out. Before the bootstrap rerun starts the daemon, read
+   [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back).
 
 The order depends on the `role` in `config/vm.yaml`.
 

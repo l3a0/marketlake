@@ -337,6 +337,14 @@ def test_a_restart_sends_an_expired_segment_of_an_unsealed_day_again(tmp_path):
     state = upload.state()
     assert (state.already_there, state.uploaded, state.owed, state.refused) == (0, 1, 0, ())
 
+    # The next restart meets the object above the marker, so the 412 is back.
+    again = _upload(root, fake)
+    assert again.pass_once() is None
+    again.pass_once()
+
+    assert len(fake.versions(f"lake-live/{rel}")) == 2
+    assert again.state().already_there == 1
+
 
 def test_a_key_holding_other_bytes_is_refused_for_good_and_pages_once(tmp_path, capsys):
     root = _root(tmp_path)
@@ -1716,8 +1724,21 @@ def test_the_lag_command_names_both_readings_of_an_empty_day(tmp_path, monkeypat
 
     assert capsys.readouterr().out.splitlines() == [
         "lag: no quotes segments on 2026-09-02: none reached the bucket, or the day is older "
-        "than the week it keeps them: s3://lake-backup/lake-live"
+        "than the week it lists them: s3://lake-backup/lake-live"
     ]
+
+
+def test_an_expired_segment_lists_as_nothing_in_the_lag_command(tmp_path, monkeypatch, capsys):
+    root = _root(tmp_path)
+    config = _bucket_config(tmp_path, root)
+    fake = FakeS3()
+    rel = _lagged(fake, NOW, 30)
+    fake.delete_marker(f"lake-live/{rel}")
+    monkeypatch.setattr(live_upload, "connect", lambda config, target=None: (target, fake))
+
+    assert live_upload.main(["lag", "--date", "2026-09-02", "--config", str(config)]) == 0
+
+    assert "no quotes segments on 2026-09-02" in capsys.readouterr().out
 
 
 def test_the_lag_command_names_a_bucket_that_failed(tmp_path, monkeypatch, capsys):

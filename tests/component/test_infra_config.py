@@ -246,7 +246,8 @@ def test_lifecycle_rules_are_exactly_these_five() -> None:
 
     ``test`` is the check the ruleset requires, and the tofu test's job is not. The tofu test
     also nulls the size filters, and a segment is about 9 KB, so a minimum size above that would
-    expire nothing. So any rule that touches ``lake/`` or changes ``live`` fails here too.
+    expire nothing. So any rule that touches ``lake/`` or changes ``live`` fails here too, and so
+    does a second resource of this type, which would replace the whole list on apply.
     """
     thirty = [{"noncurrent_days": 30}]
     expected = [
@@ -263,6 +264,8 @@ def test_lifecycle_rules_are_exactly_these_five() -> None:
             ("journal", "lake/journal/"),
         )
     ]
+    # The owner's "weekly should work" sets days, and noncurrent days is #995's plan audit's
+    # choice, so a replaced original lasts as long.
     expected.append(
         {
             "id": "live",
@@ -273,6 +276,12 @@ def test_lifecycle_rules_are_exactly_these_five() -> None:
         }
     )
     assert _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]["rule"] == expected
+    assert [
+        address
+        for config in ("live", "bootstrap")
+        for address in _resources(config)
+        if address.startswith("aws_s3_bucket_lifecycle_configuration.")
+    ] == ["aws_s3_bucket_lifecycle_configuration.backup"]
 
 
 @pytest.mark.parametrize("address", PREVENT_DESTROY)

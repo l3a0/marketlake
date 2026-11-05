@@ -68,7 +68,9 @@ sent before and the bucket still holds. One that differs is a permanent refusal 
 and so is ``BadDigest``, because a segment is never rewritten. A refusal is recorded and the
 alarm pages for it. A restart meets no 412 for a segment the lifecycle rule below has expired,
 because S3 lets a conditional write through over a delete marker. So a day still unsealed after
-seven days has its segments sent again, which renews their off-VM copy for another week.
+seven days has its segments sent again, which renews their off-VM copy for another week. A
+segment damaged on disk is refused with ``BadDigest`` instead, and pages once per daemon start,
+and its good bytes keep their first clock.
 
 **When the bucket does not answer.** Any other failure, a 409 from a concurrent
 conditional write included, keeps the segment owed. The pass stops there, since the next
@@ -918,7 +920,7 @@ def lag_lines(lags: Sequence[SegmentLag], day: date, target: BucketTarget) -> li
     if summary.largest is None:
         return [
             f"lag: no quotes segments on {day.isoformat()}: none reached the bucket, or the "
-            f"day is older than the week it keeps them: {target}"
+            f"day is older than the week it lists them: {target}"
         ]
     lines = [f"{one.rel} {_seconds(one.lag)}" for one in lags]
     lines.append(

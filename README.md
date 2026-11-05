@@ -698,8 +698,8 @@ from one of two places, chosen by the line the failure printed.
    has to come from outside the bucket, such as the other host's file when it hashes right.
    The usual cause is a `quarantine.jsonl` or actions ledger version past its 30 days.
 
-A day that never sealed is not in the bucket's lake at all. Its quotes may survive under
-`lake-live/` for about two weeks, as
+A day no nightly upload reached is not in the bucket's lake at all. Its quotes may survive
+under `lake-live/` for about two weeks, as
 [infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
 
 Then check `shasum -a 256` of the copy against the file's latest entry in
