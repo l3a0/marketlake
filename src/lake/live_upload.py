@@ -68,9 +68,10 @@ sent before and the bucket still holds. One that differs is a permanent refusal 
 and so is ``BadDigest``, because a segment is never rewritten. A refusal is recorded and the
 alarm pages for it. A restart meets no 412 for a segment the lifecycle rule below has expired,
 because S3 lets a conditional write through over a delete marker. So a day still unsealed after
-seven days has its segments sent again, which renews their off-VM copy for another week. A
-segment damaged on disk is refused with ``BadDigest`` instead, and pages once per daemon start,
-and its good bytes keep their first clock.
+seven days has its segments sent again, which adds a new version whose bytes last about another
+97 days, while the first copy keeps its own clock. A segment damaged on disk is refused with
+``BadDigest`` instead, and pages once per daemon start, and its good bytes keep their first
+clock.
 
 **When the bucket does not answer.** Any other failure, a 409 from a concurrent
 conditional write included, keeps the segment owed. The pass stops there, since the next
