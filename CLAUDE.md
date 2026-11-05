@@ -87,6 +87,24 @@ The doc survived three adversarial review batteries. That was 89+ agents and 58 
 
 One lesson from the review campaign is worth keeping in view. Reviews armor what exists. They rarely ask whether it should exist. The morning-OI job survived two hardening rounds before one first-principles question deleted it. Ask "why is this needed" before "is this correct."
 
+## What a design here must hold
+
+The owner's global `~/.claude/CLAUDE.md` is the source for these rules, under `## Designing systems`, `## Writing design and architecture documents` and `## Asking the owner`. This section repeats them because the repo is public and a reader or an agent may arrive without that file. The price is that the two copies can drift. The global file wins, and this section is what gets corrected.
+
+**Each rule came from a correction during the architecture review on [l3a0/ithildin-runtime PR #15](https://github.com/l3a0/ithildin-runtime/pull/15) (owner directive, 2026-11-05).** A design or architecture change here meets all of them from its first draft.
+
+1. **Try what already exists first.** Before proposing a new store, encryption key, credential, account or long-running service, try, in this order, data already held, a narrower permission on an existing role, and a managed default or a rule that needs no new credential. Say why each that does not serve fails.
+2. **Depend on a neighbouring system's contract, never on its internals.** State what is read from a neighbour, including how long it stays readable, and name no unpublished step of how the neighbour produces or removes it. The system that owns a step runs it alone and never holds it back for another system. A fallback reads the same published values from another published place, never a default or an older value, and where none is written, a missing input stops the work.
+3. **A machine holds no state.** Each component runs as its own container, inputs and outputs live as blobs in durable storage, and a record points at them. A process resumes by reading what storage holds and retrying what is safe to repeat. An outside write with no answer is looked up first, and resent only where the outside system proves a repeat cannot act twice.
+4. **Fit the workload the product is heading for.** A first version that runs in a few short bursts a day is no argument for a host or a messaging design that only fits bursts. The build still starts at the first load.
+5. **One convention per kind of value.** Every time the system writes is UTC, and a value received from outside stays as it arrived, with its UTC instant beside it. A setting tied to another value that can move is stated relative to it, such as minutes before a market's close.
+6. **Structure a document for a reader with no context.** Give each question its own subheading, break a mechanism into numbered steps, draw it in Mermaid, show a data type as a UML class diagram, and title every table. Link every source the text leans on. Render each diagram before reporting it done.
+7. **Diagrams and figures are prose.** A ruling changes the body and every diagram that shows the old behaviour in one commit. Check every value stated twice against its source, and a number copied from an issue against that issue's latest comment. Re-read a long-lived design branch when `main` moves.
+
+**A question to the owner carries its own answer.** Look up whatever a vendor's page, a connected account or the code can settle. Bring one recommendation, the metric that decides between the options, and the price of each, in plain words that stand alone. A question on money, contracts or law that goes to the board names what is decided, the metric and any price already measured, and carries no recommendation.
+
+**Keep the work where the owner put it.** A change on the same issue as an open pull request goes on that pull request, not on a new one, unless the owner says otherwise.
+
 ## Markdown hygiene
 
 Every `.md` file must pass markdownlint. The rules that bite most: use real headings, never a bold line as a heading (MD036). No trailing whitespace (MD009). No stacked blank lines (MD012). End the file with exactly one newline (MD047). Table delimiter rows use single-space padding, so `| --- |` and never `|---|` (MD060). Escape an "approximately" tilde in prose as `\~`, since a bare tilde can render as strikethrough on some surfaces. Code fences are exempt. After any edit, sweep:
@@ -95,6 +113,8 @@ Every `.md` file must pass markdownlint. The rules that bite most: use real head
 rg -n --pcre2 '(?<![\s~\\`<])~' *.md docs/*.md
 rg -n '\|-{1,}\|' *.md docs/*.md
 ```
+
+Every table has a title, on a line of its own above it, starting with `**Table:**`, because Markdown has no caption (owner directive, 2026-11-05). `tests/test_table_titles.py` fails a table without one.
 
 When a heading changes, verify the Contents anchors still resolve.
 

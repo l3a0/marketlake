@@ -802,6 +802,8 @@ it into its own `token.json`. The design's Auth section carries the reasoning, a
 
 One key in each host's `config.yaml` says what the host does with the token:
 
+**Table:** What each `token_store` setting writes, and who uses it
+
 | `token_store` | `reauth.sh` writes | Used by |
 | --- | --- | --- |
 | absent or `file` | `token.json` | the laptop before the VM exists |
