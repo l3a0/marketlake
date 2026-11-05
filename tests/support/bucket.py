@@ -36,9 +36,10 @@ follows a lookup whose requests all passed. ``on_put`` and ``on_get`` run before
 ``PutObject`` or a ``GetObject`` is answered, so a test can fail or time one kind of call
 alone.
 
-A ``PutObject`` with ``IfNoneMatch="*"`` on a key that holds any version is refused with
-``PreconditionFailed``, HTTP 412, as S3 refuses a conditional write, and stores nothing. That
-is how the live upload's create-only PUT is tested (marketlake #943). Each version keeps the
+A ``PutObject`` with ``IfNoneMatch="*"`` on a key whose current version is an object is
+refused with ``PreconditionFailed``, HTTP 412, as S3 refuses a conditional write, and stores
+nothing. That is how the live upload's create-only PUT is tested (marketlake #943). A key whose
+current version is a delete marker takes the write, as S3 does. Each version keeps the
 ``Metadata`` its PUT carried, and ``HeadObject`` answers with it, as S3 answers with user
 metadata.
 
@@ -201,6 +202,16 @@ class FakeS3:
         self.markers.setdefault(key, []).append((self._next_version, version_id))
         return version_id
 
+    def _current_is_object(self, key: str) -> bool:
+        """Whether the key's newest entry is a stored version rather than a delete marker."""
+        versions = self.objects.get(key)
+        markers = self.markers.get(key)
+        if not versions or not markers:
+            return bool(versions)
+        return max(int(version.version_id[1:]) for version in versions) > max(
+            seq for seq, _ in markers
+        )
+
     def versioned_calls(self) -> list[tuple[str, dict]]:
         """Every call that lists versions or names one, in order."""
         return [
@@ -237,7 +248,7 @@ class FakeS3:
         data = body.read() if hasattr(body, "read") else bytes(body)
         if self.on_put is not None:
             self.on_put(kwargs, data)
-        if kwargs.get("IfNoneMatch") == "*" and self.objects.get(kwargs["Key"]):
+        if kwargs.get("IfNoneMatch") == "*" and self._current_is_object(kwargs["Key"]):
             raise client_error("PreconditionFailed", "PutObject", 412)
         supplied = kwargs.get("ChecksumSHA256")
         if supplied is not None:

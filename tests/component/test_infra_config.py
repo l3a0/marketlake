@@ -241,6 +241,40 @@ def _actions(statement: dict[str, Any]) -> list[str]:
     return [action] if isinstance(action, str) else list(action)
 
 
+def test_lifecycle_rules_are_exactly_these_five() -> None:
+    """The one check on this list that a required job runs, and it reads what the plan masks.
+
+    ``test`` is the check the ruleset requires, and the tofu test's job is not. The tofu test
+    also nulls the size filters, and a segment is about 9 KB, so a minimum size above that would
+    expire nothing. So any rule that touches ``lake/`` or changes ``live`` fails here too.
+    """
+    thirty = [{"noncurrent_days": 30}]
+    expected = [
+        {
+            "id": rule_id,
+            "status": "Enabled",
+            "filter": [{"prefix": prefix}],
+            "noncurrent_version_expiration": thirty,
+        }
+        for rule_id, prefix in (
+            ("manifest", "lake/manifest.jsonl"),
+            ("quarantine", "lake/quarantine.jsonl"),
+            ("actions", "lake/actions/"),
+            ("journal", "lake/journal/"),
+        )
+    ]
+    expected.append(
+        {
+            "id": "live",
+            "status": "Enabled",
+            "filter": [{"prefix": "lake-live/"}],
+            "expiration": [{"days": 7}],
+            "noncurrent_version_expiration": [{"noncurrent_days": 7}],
+        }
+    )
+    assert _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]["rule"] == expected
+
+
 @pytest.mark.parametrize("address", PREVENT_DESTROY)
 def test_resource_carries_prevent_destroy(address: str) -> None:
     config, resource = address.split("/")

@@ -236,7 +236,7 @@ The bucket and the IAM principals the laptop signs as are code in `infra/live/`,
 `infra/live/bucket.tf` holds the versioning, the encryption, the public-access block and
 the five lifecycle rules. Four of them expire noncurrent versions after 30 days under one of
 `lake/manifest.jsonl`, `lake/quarantine.jsonl`, `lake/actions/` and `lake/journal/`, the
-files rewritten every night. The fifth empties the live prefix described below.
+files rewritten every night. The fifth expires the live prefix's segments by age, as described below.
 `lake/trimmed.jsonl`, the ledger of partitions removed on
 purpose, takes no rule, so the bucket keeps every version of it, the same as `lake/reference/`.
 Partitions keep every version, because with no Object Lock an overwritten
@@ -274,10 +274,12 @@ prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as 
 entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). A lifecycle rule
 expires each segment seven days after upload and removes its bytes seven days after that
 ([#995](https://github.com/l3a0/marketlake/issues/995)). The day's sealed partition holds the
-same minutes, the runtime's replay reads sealed partitions, and its comparison falls back on
-them once a segment is gone. The `lag` command reads how long each of one day's segments took
-to arrive, from the bucket alone, and writes nothing. A day older than a week lists no
-segments, and the answer says so. On the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
+same minutes, unless a fault left it short
+([#998](https://github.com/l3a0/marketlake/issues/998)), and the owner ruled that the runtime's replay reads sealed partitions and that
+its monitoring compares against them once a segment is gone. The `lag` command reads how long
+each of one day's segments took to arrive, from the bucket alone, and writes nothing. A sealed
+day older than a week lists no segments, and an empty answer names both readings, nothing
+sent and past the week. On the VM, run it with the daemon's own interpreter, because a plain `uv run` there syncs the
 dev group into the daemon's venv:
 
 ```bash
@@ -695,6 +697,10 @@ from one of two places, chosen by the line the failure printed.
 2. **No version matches.** The console shows the same versions the lookup saw, so the copy
    has to come from outside the bucket, such as the other host's file when it hashes right.
    The usual cause is a `quarantine.jsonl` or actions ledger version past its 30 days.
+
+A day that never sealed is not in the bucket's lake at all. Its quotes may survive under
+`lake-live/` for about two weeks, as
+[infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
 
 Then check `shasum -a 256` of the copy against the file's latest entry in
 `<dest>/.marketlake-restoring/manifest.jsonl`, which a failed restore leaves there. Put the

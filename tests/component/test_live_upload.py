@@ -320,6 +320,24 @@ def test_a_key_the_bucket_already_holds_counts_as_already_there(tmp_path):
     assert (state.already_there, state.uploaded, state.owed, state.refused) == (1, 0, 0, ())
 
 
+def test_a_restart_sends_an_expired_segment_of_an_unsealed_day_again(tmp_path):
+    """Past the lifecycle rule the key's current version is a delete marker, so no 412 comes."""
+    root = _root(tmp_path)
+    rel, _ = _write_segment(root)
+    fake = FakeS3()
+    fake.store(f"lake-live/{rel}", (root / rel).read_bytes())
+    fake.delete_marker(f"lake-live/{rel}")
+
+    upload = _upload(root, fake)
+    assert upload.pass_once() is None
+    upload.pass_once()
+
+    assert [name for name, _ in fake.calls] == ["put_object"]
+    assert len(fake.versions(f"lake-live/{rel}")) == 2
+    state = upload.state()
+    assert (state.already_there, state.uploaded, state.owed, state.refused) == (0, 1, 0, ())
+
+
 def test_a_key_holding_other_bytes_is_refused_for_good_and_pages_once(tmp_path, capsys):
     root = _root(tmp_path)
     rel, _ = _write_segment(root)
@@ -1688,8 +1706,8 @@ def test_the_lag_command_reads_the_bucket_and_prints_the_summary(tmp_path, monke
     assert fake.calls[0][1]["Prefix"] == "lake-live/journal/date=2026-09-02/surface=quotes/"
 
 
-def test_the_lag_command_says_why_a_day_may_list_no_segments(tmp_path, monkeypatch, capsys):
-    """A day past the lifecycle rule lists nothing, which must not read as nothing sent."""
+def test_the_lag_command_names_both_readings_of_an_empty_day(tmp_path, monkeypatch, capsys):
+    """An empty day is either nothing sent or past the lifecycle rule, and the answer says so."""
     root = _root(tmp_path)
     config = _bucket_config(tmp_path, root)
     monkeypatch.setattr(live_upload, "connect", lambda config, target=None: (target, FakeS3()))
@@ -1697,8 +1715,8 @@ def test_the_lag_command_says_why_a_day_may_list_no_segments(tmp_path, monkeypat
     assert live_upload.main(["lag", "--date", "2026-09-02", "--config", str(config)]) == 0
 
     assert capsys.readouterr().out.splitlines() == [
-        "lag: no quotes segments on 2026-09-02, and the bucket keeps each for only a week: "
-        "s3://lake-backup/lake-live"
+        "lag: no quotes segments on 2026-09-02: none reached the bucket, or the day is older "
+        "than the week it keeps them: s3://lake-backup/lake-live"
     ]
 
 

@@ -756,6 +756,43 @@ Then release the lock, with the id the error printed in place of `<lock-id>`.
 AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live" force-unlock "<lock-id>"
 ```
 
+### Stop the live rule, or read a live segment back
+
+The `live` lifecycle rule removes segments under `lake-live/` by age
+([#995](https://github.com/l3a0/marketlake/issues/995)). Each segment stays a current object
+for about seven days, then a noncurrent version for about seven more, and then its bytes are
+gone.
+
+To stop the rule, or to take it back, open a pull request that sets its `status` to
+`Disabled` or reverts it, and change both tests that compare the rule list,
+`lifecycle_rules_are_exactly_the_five` and `test_lifecycle_rules_are_exactly_these_five`. The
+apply then writes the whole list. Never run `aws s3api put-bucket-lifecycle-configuration` by
+hand, because it replaces every rule, including the four under `lake/`. Stopping the rule
+brings nothing back.
+
+A live segment can be the only good copy of a quotes segment in two cases.
+
+1. Compaction refuses a ticker-day because a segment no longer matches its manifest entry.
+2. The lake volume is lost before a day seals, so the restore has no journal for that day,
+   because it reads only the lake's own prefix.
+
+List the day's versions. A version that is not the latest sits behind a delete marker.
+
+```bash
+aws s3api list-object-versions --bucket "<backup-bucket>" --prefix "lake-live/journal/date=YYYY-MM-DD/surface=quotes/ticker=<ticker>/" --profile marketlake-admin
+```
+
+Download each one by the version id that listing printed, and read its stored digest.
+
+```bash
+aws s3api get-object --bucket "<backup-bucket>" --key "<key>" --version-id "<version-id>" "<download>" --query 'Metadata.sha256' --profile marketlake-admin
+```
+
+Check `shasum -a 256` of the download against that digest. Put the file back at its path under
+the lake's `journal/`, without the `lake-live/` prefix, before the next compaction. Compaction
+then seals the ticker-day from those bytes. A review probe confirmed that against the suite's
+fake bucket, and no real segment has been put back this way. A day's chains have no live copy.
+
 ## Changing the bootstrap
 
 Apply any later change to `infra/bootstrap/*.tf` from the laptop first, as in
@@ -1762,7 +1799,7 @@ VM's lake by emptying the shadow lake with `deploy/vm-empty-shadow-lake.sh` and 
 restoring from the bucket. Start the VM first if it is stopped, and remove the switch that
 lets it stop, as [The nightly stop](#the-nightly-stop) says, because a restore is not a
 unit the stop can see. Create the switch again once the restore and the bootstrap rerun
-after it have ended. Four facts hold for any restore onto the VM.
+after it have ended. Five facts hold for any restore onto the VM.
 
 1. The instance role reads the bucket from the first boot, so `bucket restore` runs on
    the VM through its instance profile, with no stored key.
@@ -1798,6 +1835,11 @@ after it have ended. Four facts hold for any restore onto the VM.
    [Rerun the bootstrap](#rerun-the-bootstrap) says: raise `lake_volume_gib`, apply, and
    rerun the bootstrap so `resize2fs` grows the filesystem. Then run the restore again. A
    whole-lake restore needs more room, not less.
+5. The restore reads only the lake's own prefix, so a day that never sealed comes back
+   empty. Its quotes may survive under `lake-live/` for about two weeks, and nothing pages
+   when that time runs out.
+   [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back)
+   says how to copy them back before the day's compaction.
 
 The order depends on the `role` in `config/vm.yaml`.
 

@@ -64,8 +64,11 @@ things.
 
 A 412 is followed by one ``HeadObject`` in checksum mode. A stored SHA-256 that matches the
 entry counts as already uploaded, which is what a daemon restart meets for every segment it
-sent before. One that differs is a permanent refusal for that key, and so is ``BadDigest``,
-because a segment is never rewritten. A refusal is recorded and the alarm pages for it.
+sent before and the bucket still holds. One that differs is a permanent refusal for that key,
+and so is ``BadDigest``, because a segment is never rewritten. A refusal is recorded and the
+alarm pages for it. A restart meets no 412 for a segment the lifecycle rule below has expired,
+because S3 lets a conditional write through over a delete marker. So a day still unsealed after
+seven days has its segments sent again, which renews their off-VM copy for another week.
 
 **When the bucket does not answer.** Any other failure, a 409 from a concurrent
 conditional write included, keeps the segment owed. The pass stops there, since the next
@@ -90,8 +93,9 @@ prefix for one day's quotes segments and prints, for each segment and in summary
 marketlake #943, a segment in the bucket within 90 seconds of its cycle's start, is measured
 on the VM from the bucket alone. It sends one listing request a page and writes nothing. It
 lists current objects, and the bucket's lifecycle rule expires each segment seven days after
-upload, so a day older than that lists no segments. Its empty answer says so, because no later
-read can recover those lags: the sealed partition has no ``LastModified`` for a segment.
+upload, so a sealed day older than that lists no segments, and a segment sent again lists its
+later ``LastModified``. An empty answer names both readings, nothing sent and past the week,
+because the sealed partition has no ``LastModified`` to read a lag from afterwards.
 
 Nothing here deletes an object or touches a key under the lake's own prefix. The live prefix
 empties by that lifecycle rule alone, and marketlake #995 and ``docs/design.md`` give its reason.
@@ -913,8 +917,8 @@ def lag_lines(lags: Sequence[SegmentLag], day: date, target: BucketTarget) -> li
     summary = LagSummary.of(lags)
     if summary.largest is None:
         return [
-            f"lag: no quotes segments on {day.isoformat()}, and the bucket keeps each for only "
-            f"a week: {target}"
+            f"lag: no quotes segments on {day.isoformat()}: none reached the bucket, or the "
+            f"day is older than the week it keeps them: {target}"
         ]
     lines = [f"{one.rel} {_seconds(one.lag)}" for one in lags]
     lines.append(
