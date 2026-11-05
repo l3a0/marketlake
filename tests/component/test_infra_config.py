@@ -275,7 +275,9 @@ def test_lifecycle_rules_are_exactly_these_five() -> None:
             "noncurrent_version_expiration": [{"noncurrent_days": 7}],
         }
     )
-    assert _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]["rule"] == expected
+    body = _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]
+    assert body["rule"] == expected
+    assert "dynamic" not in body, "a dynamic block adds rules this comparison cannot see"
     assert [
         address
         for config in ("live", "bootstrap")

@@ -698,16 +698,16 @@ from one of two places, chosen by the line the failure printed.
    has to come from outside the bucket, such as the other host's file when it hashes right.
    The usual cause is a `quarantine.jsonl` or actions ledger version past its 30 days.
 
-A day no nightly upload reached is not in the bucket's lake at all. Its quotes may survive
-under `lake-live/` for about two weeks, as
-[infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
-
 Then check `shasum -a 256` of the copy against the file's latest entry in
 `<dest>/.marketlake-restoring/manifest.jsonl`, which a failed restore leaves there. Put the
 copy at the file's path under `<dest>/.marketlake-restoring` and run the restore again. It
 finds the manifest's hash there and downloads nothing for that file. A file the manifest does
 not record is checked against the current version's stored checksum instead, so an earlier
 version of one never verifies.
+
+A day no nightly upload reached is not in the bucket's lake at all. Its quotes may survive
+under `lake-live/` for about two weeks, as
+[infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
 
 On a host that keeps a window, the restore reads the bucket's `trimmed.jsonl` before any data
 file, and takes the older version when a stopped upload left the current one newer than its

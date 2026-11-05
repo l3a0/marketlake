@@ -394,7 +394,8 @@ run "lifecycle_rules_are_exactly_the_five" {
 
   # The whole list is compared, so a rule that expires current versions outside the live
   # prefix, archives an object or expires a partition's old copy fails here, and so does
-  # a live rule that matches anything under lake/. The Sunday scrub sees none of those.
+  # a live rule that matches anything under lake/. The Sunday scrub sees neither an
+  # archived object nor an expired old copy.
   # Three attributes are computed, and the mock provider fills them with random values,
   # so the comparison sets them to null on both sides. Both sides go through jsonencode,
   # because a typed list never equals a literal tuple.

@@ -774,7 +774,7 @@ An apply waits for the hours
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
 allows, so a stop can take a while. Reading a segment needs neither a stop nor an apply.
 
-A live segment can be the only good copy of a quotes segment, for about two weeks, in two
+A live segment can be the only good copy of a quotes segment, for about two weeks, in three
 cases.
 
 1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
@@ -783,8 +783,13 @@ cases.
    [#557](https://github.com/l3a0/marketlake/issues/557)'s.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
+3. A manifested segment left the disk before the seal, so the partition sealed short with no
+   page ([#998](https://github.com/l3a0/marketlake/issues/998)). The day is already sealed, so
+   the first fact below applies.
 
-No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. After about seven days a segment
+No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
+[first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds
+the untested commands. After about seven days a segment
 sits behind a delete marker, so only a listing of versions shows it, and its `sha256` metadata
 holds the digest to check the copy against. A day's chains have no live copy. Two facts bound
 any attempt by hand.

@@ -345,6 +345,15 @@ def test_a_restart_sends_an_expired_segment_of_an_unsealed_day_again(tmp_path):
     assert len(fake.versions(f"lake-live/{rel}")) == 2
     assert again.state().already_there == 1
 
+    # A day still unsealed after a second week expires again, so a second marker frees the key.
+    fake.delete_marker(f"lake-live/{rel}")
+    third = _upload(root, fake)
+    assert third.pass_once() is None
+    third.pass_once()
+
+    assert len(fake.versions(f"lake-live/{rel}")) == 3
+    assert third.state().uploaded == 1
+
 
 def test_a_key_holding_other_bytes_is_refused_for_good_and_pages_once(tmp_path, capsys):
     root = _root(tmp_path)
