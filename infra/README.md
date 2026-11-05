@@ -189,7 +189,7 @@ The code in `infra/live/bucket.tf` expects five rules, with these ids.
 
 Each of the first four has a `Filter.Prefix` under `lake/` and expires noncurrent versions
 after 30 days. The fifth has the prefix `lake-live/` and expires current objects after
-seven days and noncurrent versions seven days after that
+seven days and noncurrent versions 90 days after that
 ([#995](https://github.com/l3a0/marketlake/issues/995)). A different id or shape shows up in
 the first plan as an in-place update. On 2026-10-06 the first four rules matched the code,
 and the fifth did not exist yet.
@@ -760,7 +760,7 @@ AWS_PROFILE=marketlake-admin tofu -chdir="$HOME/marketlake-infra-main/infra/live
 
 The `live` lifecycle rule removes segments under `lake-live/` by age
 ([#995](https://github.com/l3a0/marketlake/issues/995)). Each segment stays a current object
-for about seven days, then a noncurrent version for about seven more, and then its bytes are
+for about seven days, then a noncurrent version for about 90 more, and then its bytes are
 gone.
 
 To stop the rule, or to take it back, open a pull request that sets its `status` to
@@ -774,7 +774,7 @@ An apply waits for the hours
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window)
 allows, so a stop can take a while. Reading a segment needs neither a stop nor an apply.
 
-A live segment can be the only good copy of a quotes segment, for about two weeks, in three
+A live segment can be the only good copy of a quotes segment, for about 97 days, in three
 cases.
 
 1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
@@ -1843,7 +1843,7 @@ after it have ended. Five facts hold for any restore onto the VM.
    whole-lake restore needs more room, not less.
 5. The restore reads only the lake's own prefix, so a day no nightly upload reached comes
    back empty, and a day an upload stopped partway through can come back partial. Its quotes
-   may survive under `lake-live/` for about two weeks, and nothing pages when that time runs
+   may survive under `lake-live/` for about 97 days, and nothing pages when that time runs
    out. Before the bootstrap rerun starts the daemon, read
    [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back).
 

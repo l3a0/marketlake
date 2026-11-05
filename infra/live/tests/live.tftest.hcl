@@ -435,12 +435,12 @@ run "lifecycle_rules_are_exactly_the_five" {
           status                            = "Enabled"
           prefix                            = null
           abort_incomplete_multipart_upload = []
-          # The owner's "weekly should work" sets days. Noncurrent days is #995's plan audit's
-          # choice, so a replaced original lasts as long.
+          # The owner's "weekly should work" sets days. The owner's ruling of 2026-11-05 on
+          # PR #997 sets noncurrent days to 90, so a segment can still be read back for months.
           expiration                    = [{ date = null, days = 7, expired_object_delete_marker = false }]
           transition                    = []
           noncurrent_version_transition = []
-          noncurrent_version_expiration = [{ noncurrent_days = 7, newer_noncurrent_versions = null }]
+          noncurrent_version_expiration = [{ noncurrent_days = 90, newer_noncurrent_versions = null }]
           filter = [{
             prefix                   = "lake-live/"
             and                      = []

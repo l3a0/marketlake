@@ -264,15 +264,15 @@ def test_lifecycle_rules_are_exactly_these_five() -> None:
             ("journal", "lake/journal/"),
         )
     ]
-    # The owner's "weekly should work" sets days, and noncurrent days is #995's plan audit's
-    # choice, so a replaced original lasts as long.
+    # The owner's "weekly should work" sets days, and the owner's ruling of 2026-11-05 on
+    # PR #997 sets noncurrent days to 90, so a segment can still be read back for months.
     expected.append(
         {
             "id": "live",
             "status": "Enabled",
             "filter": [{"prefix": "lake-live/"}],
             "expiration": [{"days": 7}],
-            "noncurrent_version_expiration": [{"noncurrent_days": 7}],
+            "noncurrent_version_expiration": [{"noncurrent_days": 90}],
         }
     )
     body = _resources("live")["aws_s3_bucket_lifecycle_configuration.backup"]

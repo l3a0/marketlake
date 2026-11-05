@@ -159,7 +159,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "backup" {
     }
 
     noncurrent_version_expiration {
-      noncurrent_days = 7
+      noncurrent_days = 90
     }
   }
 

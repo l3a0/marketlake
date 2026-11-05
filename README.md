@@ -272,7 +272,7 @@ examples below use the placeholder bucket `example-lake-backup`.
 On a primary with a bucket target, the daemon also sends each quotes segment to the sibling
 prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as its manifest
 entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). A lifecycle rule
-expires each segment seven days after upload and removes its bytes seven days after that
+expires each segment seven days after upload and removes its bytes 90 days after that
 ([#995](https://github.com/l3a0/marketlake/issues/995)). The day's sealed partition holds the
 same minutes, unless a fault left it short
 ([#998](https://github.com/l3a0/marketlake/issues/998)), and the owner ruled that the runtime's replay reads sealed partitions and that
@@ -706,7 +706,7 @@ not record is checked against the current version's stored checksum instead, so 
 version of one never verifies.
 
 A day no nightly upload reached is not in the bucket's lake at all. Its quotes may survive
-under `lake-live/` for about two weeks, as
+under `lake-live/` for about 97 days, as
 [infra/README.md](infra/README.md#stop-the-live-rule-or-read-a-live-segment-back) says.
 
 On a host that keeps a window, the restore reads the bucket's `trimmed.jsonl` before any data
