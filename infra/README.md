@@ -2507,19 +2507,18 @@ no upload reached comes back empty from it.
 
 | Reason | Meaning | Action |
 | --- | --- | --- |
-| `bucket unreachable (...)` | S3 did not answer through three attempts | Run step 4. If it passes, nothing is wrong |
+| `bucket unreachable (...)` | S3 did not answer through three attempts | Run step 4. If it prints `bucket copy current` or `bucket copy owes`, nothing is wrong |
 | `bucket refused (...)` | S3 turned the credentials away | Repair the instance profile or its policy. This stops the upload too |
 | `bucket failed (...)` | S3 answered with another error | Read the code it names |
 | `the bucket holds no usable manifest copy` | The upload has no watermark and sends nothing | The upload's refusal in step 1 names the command. Waiting never clears this |
 | The copy parted at byte 0 | The lake's manifest is gone or empty | Run `findmnt /srv/marketlake` first, since a volume that did not mount reads this way |
-| The copy parted at a later byte | Another host wrote, someone repaired a manifest by hand, or a byte changed on the lake's disk | The upload's refusal in step 1 names the command. Waiting never clears this |
-| `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | No repair is written yet, and it stays a hand job under the lake's lock, as [#447](https://github.com/l3a0/marketlake/issues/447) tracks |
+| The copy parted at a later byte | Another host wrote, someone repaired a manifest by hand, or a byte changed on the lake's disk | Compare the lake's manifest with the bucket's copy before any command. Where the difference is damage on the lake, follow the row below. Waiting never clears this |
+| `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | Do not run `first-upload`, whatever a refusal names, because it re-baselines the bucket onto the damaged bytes. No repair is written yet, and [#447](https://github.com/l3a0/marketlake/issues/447) owns it |
 | Any other exception's name | The check itself failed | Its stack trace is in the `com.marketlake.eod-sweep` journal |
 
-The check never holds the evening upload back. Damage past the watermark has already gone over
-the bucket's copy by the time the page is read, and the last clean copy stays readable as a
-noncurrent version for about 30 days. Damage in bytes the bucket already holds stops the upload,
-so the current copy stays clean.
+The check never holds the evening upload back, so a damaged manifest may already have reached the
+bucket by the time the page is read. A replaced copy stays readable as a noncurrent version for
+about 30 days.
 
 The page says the bucket holds what the manifest records. A partition that sealed short is a
 whole file, reaches the bucket and raises no page, which

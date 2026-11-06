@@ -315,6 +315,18 @@ def test_a_segment_of_another_surface_is_not_owed(lake_root):
     assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
 
 
+def test_a_restore_from_the_bucket_clears_what_was_owed(lake_root):
+    """A restored manifest ends where the copy ends, so the page already sent is the record."""
+    client = _seeded_lake(lake_root)
+    held = client.body("lake/manifest.jsonl")
+    _owe(lake_root, _chains_rel(WEDNESDAY))
+    assert capture_owed(lake_root, TARGET, client).files != ()
+
+    (lake_root / "manifest.jsonl").write_bytes(held)
+
+    assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
+
+
 def test_the_check_reads_the_manifest_copy_and_no_other_object(lake_root):
     client = _seeded_lake(lake_root)
     _owe(lake_root, _chains_rel(WEDNESDAY))
@@ -435,6 +447,16 @@ def test_a_file_from_tonights_session_does_not_page(fixture_lake: FixtureLake, l
 
 def test_a_file_newer_than_the_last_compacted_session_is_named_by_its_own_day(lake_root):
     """A hand check inside a session owes that session's segments, not the last session's."""
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _segment_rel(FOLLOWING))
+
+    pages, lines = _checked(lake_root, client, _et(FOLLOWING, 12, 0), _calendar())
+
+    assert pages == []
+    assert lines == (f"bucket copy owes 1 from {FOLLOWING}",)
+
+
+def test_the_owes_line_names_the_oldest_of_two_days(lake_root):
     client = _seeded_lake(lake_root)
     _owe(lake_root, _segment_rel(WEDNESDAY))
     _owe(lake_root, _chains_rel(FOLLOWING))
@@ -675,7 +697,7 @@ def test_a_byte_that_is_not_utf8_refuses_rather_than_reading_as_not_owed(lake_ro
     ids=["torn tail", "fused last line"],
 )
 def test_a_damaged_last_line_with_nothing_behind_it_still_answers(lake_root, tail):
-    """The bytes a read racing a write can see, so it must not page as damage."""
+    """A torn tail is what a read racing a write sees. A fused line costs its one entry."""
     client = _seeded_lake(lake_root)
     _owe(lake_root, _chains_rel(WEDNESDAY))
     with (lake_root / "manifest.jsonl").open("a") as handle:

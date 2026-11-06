@@ -521,9 +521,10 @@ def refuse_damaged_manifest(lake_root: Path, raw: bytes, entries: Sequence[dict]
     past damage, because stopping them would stop reporting it. A check that answers "nothing
     is owed" from the same read cannot, since an entry it never saw reads as an entry it does
     not owe. So it calls this first: bytes that are not UTF-8 raise :class:`LedgerNotUtf8`, and
-    whole lines behind the point the read stopped at raise :class:`TornLedger`. A torn or fused
-    last line raises nothing, because a read racing a write sees the same bytes, and the next
-    append behind it turns real damage into this refusal.
+    whole lines behind the point the read stopped at raise :class:`TornLedger`. A torn last line
+    raises nothing, because a read racing a write sees the same bytes. A fused last line raises
+    nothing either. It costs the one entry ``append_line`` accepts, and the next append behind
+    it turns the damage into this refusal.
     """
     path = manifest_path(lake_root)
     text = _decode_utf8(path, raw, consequence=_MANIFEST_CONSEQUENCE)
