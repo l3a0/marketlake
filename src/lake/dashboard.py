@@ -2284,7 +2284,7 @@ def _nightly_payload(entry: Mapping[str, object]) -> dict[str, object]:
     ``problems`` withheld the run's ping and ``report`` are the report-tier findings,
     which "send no message of their own." The second is why this panel reads these files
     at all: the design names the disk runway, ``pmset`` drift and a suspected unscheduled
-    closure as the three that ride here, and this panel is their reader. It renders the
+    closure among those that ride here, and this panel is their reader. It renders the
     lines the file carries and writes none of its own. How the nights relate to each
     other is computed across files by :func:`_group_reports`, which reads these payloads
     and nothing else (marketlake #617).

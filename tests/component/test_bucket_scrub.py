@@ -442,6 +442,27 @@ class _HeadsFail(FakeS3):
         raise unreachable()
 
 
+def test_an_empty_lake_and_a_zero_byte_copy_read_as_a_copy_that_carries_no_entry(tmp_path):
+    """A copy holding no whole entry is missing only while the lake holds some."""
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    client = FakeS3()
+    client.store(_key("manifest.jsonl"), b"")
+
+    assert not bucket_scrub(lake, TARGET, client).manifest_missing
+
+
+def test_the_versioning_line_survives_a_copy_that_parted_from_the_lake(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.versioning = "Suspended"
+    client.store(_key("manifest.jsonl"), b"not the lake's manifest\n")
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.manifest_diverged_at == 0
+    assert any(line.startswith("bucket versioning is Suspended") for line in result.notes)
+
+
 def test_the_versioning_line_survives_a_bucket_that_fails_mid_scrub(tmp_path):
     lake, uploaded = _uploaded(tmp_path / "lake")
     client = _HeadsFail(versioning="Suspended")

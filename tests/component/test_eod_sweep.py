@@ -461,6 +461,7 @@ def _run(
     guards: GuardConstants | None = None,
     calendar: Calendar | None = None,
     cost_client=None,
+    bucket_source=None,
 ):
     """One sweep run with every seam injected, returning the outcome and the fakes.
 
@@ -498,6 +499,7 @@ def _run(
         schedule_reader=reader if reader is not None else (lambda: _schedule_text()),
         schedule_setter=setter if setter is not None else _RecordingSetter(),
         cost_client=cost_client,
+        bucket_source=bucket_source,
         guards=guards,
     )
     return outcome, pinger, transport
@@ -1848,6 +1850,7 @@ def test_a_friday_with_no_reader_sets_the_wake_and_reads_nothing_back(fixture_la
         schedule_reader=None,
         schedule_setter=setter,
         cost_client=None,
+        bucket_source=None,
     )
     assert setter.sundays == [SUNDAY]
     assert not any("pmset" in line for line in outcome.nightly.report)
@@ -1875,6 +1878,7 @@ def test_a_friday_with_no_setter_skips_the_whole_branch(fixture_lake: FixtureLak
         schedule_reader=reader,
         schedule_setter=None,
         cost_client=None,
+        bucket_source=None,
     )
     assert reads == []
     assert not any("one-shot" in line for line in outcome.nightly.report)
@@ -3011,6 +3015,7 @@ def test_the_split_walk_is_handed_the_run_s_own_calendar(fixture_lake: FixtureLa
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
         cost_client=None,
+        bucket_source=None,
     )
 
     assert seen == [calendar], "the split walk did not get the calendar the run was given"
@@ -3512,6 +3517,7 @@ def _operator_night(
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
         cost_client=None,
+        bucket_source=None,
         guards=None,
     )
     return root, outcome
@@ -3897,6 +3903,7 @@ def test_a_run_with_no_publisher_files_the_line_and_sends_no_page(
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
         cost_client=None,
+        bucket_source=None,
     )
     (line,) = _runway_lines(outcome)
     assert line.startswith("disk runway short: 0 capture days left")

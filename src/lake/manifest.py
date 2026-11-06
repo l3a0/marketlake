@@ -514,6 +514,23 @@ def latest_entries(lake_root: Path) -> dict[str, dict]:
     return _latest_by_partition(read_manifest(lake_root), manifest_path(lake_root))
 
 
+def refuse_damaged_manifest(lake_root: Path, raw: bytes, entries: Sequence[dict]) -> None:
+    """Raise when the manifest's bytes hide entries behind damage, for a reader that must know.
+
+    ``entries`` is what a tolerant read took from ``raw``. The upload and the scrub keep reading
+    past damage, because stopping them would stop reporting it. A check that answers "nothing
+    is owed" from the same read cannot, since an entry it never saw reads as an entry it does
+    not owe. So it calls this first: bytes that are not UTF-8 raise :class:`LedgerNotUtf8`, and
+    whole lines behind the point the read stopped at raise :class:`TornLedger`. A torn last line
+    raises nothing, because a read racing a write sees the same bytes. A fused last line raises
+    nothing either. It costs the one entry ``append_line`` accepts, and the next append behind
+    it turns the damage into this refusal.
+    """
+    path = manifest_path(lake_root)
+    text = _decode_utf8(path, raw, consequence=_MANIFEST_CONSEQUENCE)
+    _refuse_hidden_entries(path, text, entries, consequence=_MANIFEST_CONSEQUENCE)
+
+
 def _refuse_hidden_entries(
     path: Path,
     text: str,
@@ -1355,7 +1372,8 @@ class BackupScrubResult:
       here rather than on ``rsync``. So does the debris macOS writes to any mounted
       volume on its own, which is why an orphan rides the report rather than paging.
     - ``pending``: the partitions the lake manifested after the backup's last sync,
-      which the backup legitimately does not carry yet.
+      which the backup legitimately does not carry yet. A bucket that stays behind pages
+      from the vendor sweep rather than here, through ``bucket.capture_owed``.
 
     ``versioning`` is a bucket's report line when its versioning is anything but
     enabled. It never withholds the ping. Suspending versioning changes no object, so

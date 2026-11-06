@@ -52,6 +52,9 @@ Seven jobs live here.
    outside ``lake_root``, with what a reader needs beside it, so a session the VM's trim
    removed can be read there with ``lake_root`` pointed at that directory (marketlake #837).
 
+The vendor sweep's read of what the upload still owes, :func:`capture_owed`, sits beside the
+scrub and is no job of its own, because it runs inside ``lake.sweep`` (marketlake #996).
+
 The per-minute live upload is not an eighth. It lives in ``lake.live_upload``, which the
 daemon runs on a thread of its own, and it borrows this module's ``connect``, its checksum
 helpers and its sorting of failures (marketlake #943). Its keys sit under a sibling
@@ -176,7 +179,7 @@ from lake.control_plane import (
     VENDOR_SWEEP,
     WallClockTime,
 )
-from lake.journal import F_FULLFSYNC
+from lake.journal import F_FULLFSYNC, JOURNALED_SURFACES
 from lake.lock import lake_lock
 from lake.manifest import (
     _NAMED_PATHS,
@@ -191,6 +194,7 @@ from lake.manifest import (
     latest_entries,
     manifest_path,
     parse_jsonl,
+    refuse_damaged_manifest,
     sha256_file,
 )
 from lake.paths import (
@@ -213,6 +217,7 @@ from lake.paths import (
     parse_bars_rel,
     parse_date_dir,
     parse_partition_rel,
+    parse_segment_rel,
     temp_write_path,
 )
 from lake.report import CLOSE_GUARD_DIR, parse_nightly_name
@@ -1455,6 +1460,21 @@ class _Uploader:
         self.put(rel, data, b64_sha256(data))
 
 
+def _pending(ledger: Ledger, mark: int) -> list[str]:
+    """Every path whose latest entry sits at or past the watermark ``mark``.
+
+    The nightly upload sends these, and ``capture_owed`` reads what the sweep pages on from
+    the same list, so a change to what uploads moves the alarm with it.
+    """
+    return [rel for rel, position in ledger.last.items() if position >= mark]
+
+
+def _superseded(rel: str, ledger: Ledger) -> bool:
+    """Whether ``rel`` is a ``journal/`` segment whose compacted partition is manifested."""
+    compacted = _compacted_partition_for_segment(rel)
+    return compacted is not None and compacted in ledger.latest
+
+
 def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterator[tuple[str, str]]:
     """The manifested files to upload among ``rels``, as ``(rel, hex sha256)``.
 
@@ -1465,10 +1485,7 @@ def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterato
     the upload rather than letting the watermark claim a file the bucket never got.
     """
     for rel in sorted(rels):
-        if rsync_excluded(rel, is_dir=False):
-            continue
-        compacted = _compacted_partition_for_segment(rel)
-        if compacted is not None and compacted in ledger.latest:
+        if rsync_excluded(rel, is_dir=False) or _superseded(rel, ledger):
             continue
         if not (root / rel).is_file():
             raise ManifestedFileMissing(
@@ -1501,10 +1518,7 @@ def first_upload_files(
     """
     trimmed: Mapping[str, dict] | None = None
     for rel in sorted(rels):
-        if rsync_excluded(rel, is_dir=False):
-            continue
-        compacted = _compacted_partition_for_segment(rel)
-        if compacted is not None and compacted in ledger.latest:
+        if rsync_excluded(rel, is_dir=False) or _superseded(rel, ledger):
             continue
         # The present file is handled before the absence reads anything, the order
         # :func:`manifested_files` keeps, so an entry with no ``sha256`` whose file is missing
@@ -1641,8 +1655,7 @@ def nightly_upload(
     listing = list_bucket(client, target)
     for rel, hexdigest in _heal_files(ledger, mark):
         uploader.heal(rel, hexdigest)
-    pending = [rel for rel, position in ledger.last.items() if position >= mark]
-    for rel, hexdigest in manifested_files(root, ledger, pending):
+    for rel, hexdigest in manifested_files(root, ledger, _pending(ledger, mark)):
         uploader.manifested(rel, hexdigest, listed=rel in listing)
     for rel, path in _unmanifested(root, ledger):
         uploader.unmanifested(rel, path, listing.get(rel))
@@ -1887,30 +1900,58 @@ def _versioning_note(client: Any, target: BucketTarget) -> str | None:
     )
 
 
-def _bucket_scrub(
-    root: Path, ledger: Ledger, target: BucketTarget, client: Any, versioning: str | None
-) -> BackupScrubResult:
-    name = str(target)
+@dataclass(frozen=True)
+class _CopyReach:
+    """How far the bucket's manifest copy reaches into the lake's, or why it cannot be said.
+
+    ``absent`` is a bucket with no usable copy: none at all, or one holding no whole entry
+    while the lake holds some. ``diverged_at`` is the byte where a copy that is not a prefix
+    of the lake's manifest parts from it. With neither set, ``mark`` is the watermark.
+    """
+
+    mark: int = 0
+    absent: bool = False
+    diverged_at: int | None = None
+
+
+def _copy_reach(ledger: Ledger, target: BucketTarget, client: Any) -> _CopyReach:
+    """Read the bucket's manifest copy against the lake's, for the two checks that compare them.
+
+    The Sunday scrub and :func:`capture_owed` share this, so those two cannot disagree on
+    where the bucket's copy ends. A copy whose stored SHA-256 proves it a prefix costs one
+    ``HeadObject``. Anything else is downloaded once to tell a copy that holds no usable
+    checksum from one that really parted from the lake. The nightly upload reads the same two
+    values through its own steps, because it refuses a copy these checks only report.
+    """
     copy = read_copy_state(client, target, ledger.raw)
     if not copy.present:
-        return BackupScrubResult(target=name, manifest_missing=True, versioning=versioning)
+        return _CopyReach(absent=True)
     length = copy.length
     if not copy.is_prefix:
         body = client.get_object(Bucket=target.bucket, Key=target.key(MANIFEST_FILE))["Body"]
         held = body.read()
         if not ledger.raw.startswith(held):
-            return BackupScrubResult(
-                target=name,
-                manifest_diverged_at=_first_difference(ledger.raw, held),
-                versioning=versioning,
-            )
+            return _CopyReach(diverged_at=_first_difference(ledger.raw, held))
         length = len(held)
-
     mark = watermark(ledger.raw, length)
     if mark == 0 and ledger.entries:
+        return _CopyReach(absent=True)
+    return _CopyReach(mark=mark)
+
+
+def _bucket_scrub(
+    root: Path, ledger: Ledger, target: BucketTarget, client: Any, versioning: str | None
+) -> BackupScrubResult:
+    name = str(target)
+    reach = _copy_reach(ledger, target, client)
+    if reach.absent:
         return BackupScrubResult(target=name, manifest_missing=True, versioning=versioning)
+    if reach.diverged_at is not None:
+        return BackupScrubResult(
+            target=name, manifest_diverged_at=reach.diverged_at, versioning=versioning
+        )
     path = manifest_path(root)
-    copied = _latest_by_partition(ledger.entries[:mark], path)
+    copied = _latest_by_partition(ledger.entries[: reach.mark], path)
     latest = ledger.latest
 
     missing: list[str] = []
@@ -1952,6 +1993,96 @@ def _bucket_scrub(
         versioning=versioning,
         matched=tuple(sorted(matched)),
     )
+
+
+# -- what the upload still owes the bucket ---------------------------------------
+
+
+@dataclass(frozen=True)
+class CaptureOwed:
+    """The captured files the bucket's manifest copy does not reach, from :func:`capture_owed`.
+
+    ``files`` holds ``(day, rel)`` for each one, sorted, and the caller decides how old a day
+    has to be before it counts as late, because only the caller holds the calendar.
+    ``unknown`` says why no answer could be read, in words that carry no bucket name, since
+    the caller sends them to a phone. ``files`` is empty when ``unknown`` is set, and empty
+    ``files`` with no ``unknown`` means the bucket's copy reaches every captured file.
+    """
+
+    files: tuple[tuple[date, str], ...] = ()
+    unknown: str | None = None
+
+
+def _captured_day(rel: str, ledger: Ledger) -> date | None:
+    """The day of a sealed partition or an unsealed segment of captured data, else ``None``.
+
+    Captured data is the journaled surfaces, the two whose rows no vendor can supply again in
+    full. A stuck upload holds ``bars/`` back too, and the next session's chains then page for
+    it, because one watermark covers every surface.
+
+    A segment counts only while :func:`_superseded` says its partition is unmanifested. A
+    sealed day's segment entries stay in the manifest after their files go, so counting them
+    would count that day twice in the page. A refused day's segments are that day's only copy
+    on the lake, and so is a day no seal has reached.
+
+    A path under these surfaces that will not parse returns ``None`` too. No writer makes one,
+    and an upload that fails on it stops the watermark, so the next session's files page.
+    """
+    partition = parse_partition_rel(rel)
+    if partition is not None:
+        return partition.day if partition.surface in JOURNALED_SURFACES else None
+    segment = parse_segment_rel(rel)
+    if segment is None or segment.surface not in JOURNALED_SURFACES or _superseded(rel, ledger):
+        return None
+    return parse_date_dir(f"{DATE_PREFIX}{segment.day}")
+
+
+def capture_owed(lake_root: Path, target: BucketTarget, client: Any) -> CaptureOwed:
+    """Name the captured files past the bucket's watermark. Read-only on both sides.
+
+    This is the read behind the vendor sweep's page that repeats while captured data stays
+    off the bucket. It takes :func:`nightly_upload`'s own rule for what is pending, every path
+    whose latest entry sits at or past the watermark, so the page clears when the watermark
+    passes the file, through that upload or a restore from the bucket. It reads no object but
+    the manifest copy, because the Sunday scrub is what checks the objects the watermark claims.
+
+    A bucket that refuses or cannot be reached, a copy that is absent and a copy that parted
+    from the lake each come back as ``unknown``, never as an empty answer, because an alarm
+    that cannot read must not read as healthy. A lake with no manifest and a bucket with a copy
+    is the parted case, at byte 0, which is what a lost or unmounted volume looks like, so only
+    a lake and a bucket that both hold nothing owe nothing. A manifest that holds no whole entry
+    is ``unknown`` too. Bytes that hide entries behind damage raise through
+    ``manifest.refuse_damaged_manifest``, because ``read_ledger`` stops at the damage and an
+    entry it never saw would read as an entry not owed. That read stays tolerant, since the
+    upload needs it. A bug raises too, and the caller contains both for the same reason.
+    """
+    root = Path(lake_root)
+    ledger = read_ledger(root)
+    refuse_damaged_manifest(root, ledger.raw, ledger.entries)
+    if ledger.raw and not ledger.entries:
+        return CaptureOwed(unknown="the lake's manifest holds no whole entry")
+    try:
+        reach = _copy_reach(ledger, target, client)
+    except Exception as exc:
+        failure = _failure(exc)
+        if failure is None:
+            raise
+        kind, detail = failure
+        return CaptureOwed(unknown=f"bucket {kind} ({detail})")
+    if reach.absent:
+        if not ledger.entries:
+            return CaptureOwed()
+        return CaptureOwed(unknown="the bucket holds no usable manifest copy")
+    if reach.diverged_at is not None:
+        return CaptureOwed(
+            unknown=f"the bucket's manifest copy parted from the lake's at byte {reach.diverged_at}"
+        )
+    owed: list[tuple[date, str]] = []
+    for rel in _pending(ledger, reach.mark):
+        day = _captured_day(rel, ledger)
+        if day is not None:
+            owed.append((day, rel))
+    return CaptureOwed(files=tuple(sorted(owed)))
 
 
 # -- reading the bucket back --------------------------------------------------
@@ -5908,6 +6039,7 @@ __all__ = [
     "ASSUME_ROLE",
     "BAD_DIGEST",
     "BUCKET_SHADOW",
+    "CaptureOwed",
     "FIRST_UPLOAD_COMMAND",
     "FULL_OBJECT",
     "IN_FLIGHT_ALLOWANCE",
@@ -5961,6 +6093,7 @@ __all__ = [
     "bucket_divergence",
     "bucket_reader",
     "bucket_scrub",
+    "capture_owed",
     "build_parser",
     "client_from_config",
     "connect",
