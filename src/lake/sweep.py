@@ -47,6 +47,19 @@ and every night it stays that short, with no state kept between runs. Running fi
 the page goes out even when a later raise loses the report file, and it puts the line at
 the top of the digest, which is truncated at ``DIGEST_BYTE_CAP``. Marketlake #438.
 
+**The bucket check runs beside the runway check**, ahead of step 1 and on a holiday too, on
+a primary whose ``backup_target`` is a bucket. It reads how far the bucket's manifest copy
+reaches through ``bucket.capture_owed``, and it pages every run while a captured file dated
+before the last compacted session stays past that point. A failed upload pages once, on the
+transition of the ``compaction`` and ``evening-upload`` checks, and a check that stays down
+sends nothing more. So this job is what keeps saying so, and a run holds no state between
+nights: the page clears when the upload moves the watermark, and on nothing else. A read
+that could not answer pages too, under its own title, because an alarm that cannot look must
+not read as healthy. ``python -m lake.sweep --bucket-check`` runs this step alone and sends
+what it finds, which is how an operator confirms a repair and how the drill reaches the
+phone. ``infra/README.md``'s "Captured data not in the bucket" holds the repair and the
+drill. Marketlake #996.
+
 **The cost read runs after the ping and outside the session's walks**, on a holiday too,
 because it reads AWS's export rather than the lake's own data. After the ping, so its S3
 timeouts cannot delay it, and before the nightly file is built, so its line still reaches
@@ -149,18 +162,19 @@ compaction's.
 
 **Every seam is injected and only ``main`` builds one.** That is ``control_plane.main``'s rule
 and its reason, which is that a ``main`` accepting them lets a test omit one and reach the real
-effect. So :func:`sweep` requires eight and defaults none: the clock, the calendar, the vendor
-source, the pinger, the publisher, the schedule reader, the schedule setter and the cost
-export's client source. Required means a caller must say, not that the answer cannot be
-``None``. The schedule setter and reader may each be ``None`` on a host with no wake to set
-or read back, which is Linux, and ``sweep_from_config`` picks that from
+effect. So :func:`sweep` requires nine and defaults none: the clock, the calendar, the vendor
+source, the pinger, the publisher, the schedule reader, the schedule setter, the cost
+export's client source and the bucket source. Required means a caller must say, not that the
+answer cannot be ``None``. The schedule setter and reader may each be ``None`` on a host with
+no wake to set or read back, which is Linux, and ``sweep_from_config`` picks that from
 ``control_plane.is_macos``. A ``None`` setter skips the Friday branch, and a ``None`` reader
 skips only its read-back. The cost source is ``None`` on a host with no ``cost_export``, and
 ``sweep_from_config`` then never calls ``bucket.connect``. Otherwise it is a thunk, like the
 vendor source, called inside the cost step's containment. Built in ``sweep_from_config``
 instead, a refused bucket setting would end the run inside ``input_errors_exit`` with no
-ping, no nightly file and no hand-off. The whole module runs
-offline in a test, with no network and no shelling out.
+ping, no nightly file and no hand-off. The bucket source follows the cost source for that
+reason, and it is ``None`` on a shadow host and on a path target, where no bucket copy is
+owed. The whole module runs offline in a test, with no network and no shelling out.
 
 The ``exec`` is not a seam ``main`` accepts either. ``main`` builds the argument list itself
 and calls ``os.execv`` through the module, so a test patches ``os.execv``, and
@@ -176,7 +190,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -199,7 +213,7 @@ from lake.battery import BatteryReport, judge, wrote_line
 from lake.calendar import MARKET_TZ, Calendar, ExchangeCalendar, NotASession
 from lake.capture_spans import CaptureSpansError
 from lake.clock import Clock, SystemClock
-from lake.config import GuardConstants
+from lake.config import BucketTarget, Config, GuardConstants
 from lake.control_plane import (
     EOD_SWEEP_SLUG,
     PMSET_BINARY,
@@ -218,6 +232,7 @@ from lake.report import (
     ACTION,
     BARS_PIECE,
     DIVIDENDS_PIECE,
+    HEALTHY,
     INFO,
     SPLITS_PIECE,
     Nightly,
@@ -265,6 +280,23 @@ DISK_RUNWAY_TITLE = "Capture at risk: lake disk runway short"
 # grows the lake volume through a reviewed pull request.
 DISK_RUNWAY_REPAIR = "infra/README.md, Rerun the bootstrap, A larger lake volume"
 
+# The bucket check's two pages, per the design's message table. Both take the house form for
+# a path that can lose captured minutes: what stays off the bucket is on the VM's volume alone
+# once its live copies expire. Both go out every run, for the reason ``_check_bucket_copy``
+# gives, at the default ``alert.PAGE_PRIORITY``.
+BUCKET_BEHIND_EVENT = "sweep_bucket_behind"
+BUCKET_BEHIND_TITLE = "Capture at risk: captured data not in the bucket"
+BUCKET_UNCHECKED_EVENT = "sweep_bucket_unchecked"
+BUCKET_UNCHECKED_TITLE = "Capture at risk: bucket copy not checked"
+
+# Where both pages send the operator, by heading rather than by URL.
+BUCKET_REPAIR = "infra/README.md, Captured data not in the bucket"
+
+# How far back the bucket check looks for the last compacted session. The longest run of days
+# with no session this exchange has had is well under this. A calendar that names none in the
+# window leaves today as the bar, which pages early rather than staying quiet.
+_LAST_SESSION_SEARCH_DAYS = 14
+
 # Bytes in a GiB. The report line and the page print GiB because the Lake panel's
 # ``bytes()`` divides by 1024, so the three surfaces print the same figure for one disk.
 _GIB = 1 << 30
@@ -276,6 +308,11 @@ DIGEST_BYTE_CAP = 1000
 
 # Python's ``date.weekday()`` numbering. The setter runs on Friday alone.
 _PY_FRIDAY = 4
+
+# Connects to the backup bucket, as ``(target, client)``. It is a thunk for the reason the
+# module docstring gives the cost source, so a refused bucket setting lands inside
+# ``_check_bucket_copy`` rather than ending the run.
+BucketSource = Callable[[], tuple[BucketTarget, Any]]
 
 # Builds the vendor. It is a thunk rather than a factory taking a token path, so a holiday
 # run never calls it and so never reads the token at all. ``main`` builds the real one.
@@ -881,16 +918,24 @@ def _page_disk_runway(publisher: Publisher, runway: Runway, *, now: datetime) ->
     """
     count, space = _runway_figures(runway)
     body = f"{count}: {space}. Grow the lake volume: {DISK_RUNWAY_REPAIR}."
-    delivery = publisher.publish(
-        Message(event=DISK_RUNWAY_EVENT, title=DISK_RUNWAY_TITLE, body=body), now=now
+    _page(
+        publisher,
+        Message(event=DISK_RUNWAY_EVENT, title=DISK_RUNWAY_TITLE, body=body),
+        name="disk-runway",
+        now=now,
     )
+
+
+def _page(publisher: Publisher, message: Message, *, name: str, now: datetime) -> None:
+    """Send one page and echo it to stderr, unless the publisher refused it for a secret."""
+    delivery = publisher.publish(message, now=now)
     if delivery.reason == REFUSED:
-        print("sweep: disk-runway page refused: it carried a secret", file=sys.stderr)
+        print(f"sweep: {name} page refused: it carried a secret", file=sys.stderr)
         return
-    print(f"sweep: {DISK_RUNWAY_TITLE}: {body}", file=sys.stderr)
+    print(f"sweep: {message.title}: {message.body}", file=sys.stderr)
     if not delivery.sent:
         kept = "written down" if delivery.recorded else "lost"
-        print(f"sweep: disk-runway page not sent: {delivery.reason}, {kept}", file=sys.stderr)
+        print(f"sweep: {name} page not sent: {delivery.reason}, {kept}", file=sys.stderr)
 
 
 def _check_disk_runway(
@@ -948,6 +993,98 @@ def _check_disk_runway(
             _page_disk_runway(publisher, runway, now=now)
     except Exception as exc:  # noqa: BLE001 - a runway that cannot be read must not cost the record
         report.add(f"disk runway unreadable: {type(exc).__name__}: {exc}", ACTION)
+
+
+def _last_compacted_session(now: datetime, calendar: Calendar) -> date:
+    """The latest session whose compaction moment has passed, or today when none is found.
+
+    The moment is the one the runway check waits for, the option close plus
+    ``COMPACTION_DELAY``. So at 18:30 on a session it is that session, on a holiday it is the
+    session before, and on a catch-up run the morning after a missed evening it is the session
+    the upload last had a chance at.
+    """
+    today = now.astimezone(MARKET_TZ).date()
+    for back in range(_LAST_SESSION_SEARCH_DAYS):
+        day = today - timedelta(days=back)
+        if calendar.is_session(day) and calendar.option_close(day) + COMPACTION_DELAY <= now:
+            return day
+    return today
+
+
+def _check_bucket_copy(
+    lake_root: Path,
+    *,
+    bucket_source: BucketSource | None,
+    now: datetime,
+    calendar: Calendar,
+    publisher: Publisher | None,
+    report: ReportLines,
+) -> None:
+    """Page while a captured file dated before the last compacted session stays off the bucket.
+
+    A file from the last compacted session itself counts for nothing yet. That session's
+    upload may still be the one the ``compaction`` and ``evening-upload`` checks are about to
+    answer for, and those two page first. So the first page here lands the next weekday, and
+    it lands every weekday after that until the upload moves the watermark. A healthy night
+    writes one ``HEALTHY`` line, because an alarm that reads zero needs a record that it
+    looked.
+
+    The answer comes from the bucket and the lake's manifest on every run, and nothing is
+    kept between runs. The check neither withholds the ping nor reaches ``problems``, for the
+    reasons ``_check_disk_runway`` gives: a held ping would report missing bars, and its
+    transition would page once. The upload's own failure has already spent that transition,
+    which is why this page repeats. The sweep is its own process, so it cannot spend a capture
+    page's place under ``alert.DEFAULT_DAILY_CAP``.
+
+    Everything raises into one containment, the settings refused while connecting and a
+    damaged lake manifest included, because a raise here would take the digest, the ping and
+    the hand-off with it, and the hand-off is the upload that might clear the debt. What it
+    catches becomes the same page as a bucket that could not answer, under the exception's
+    type alone, since the page reaches ntfy.sh.
+    """
+    if bucket_source is None:
+        return
+    from lake.bucket import CaptureOwed, capture_owed  # lazy: only a bucket target needs it
+
+    try:
+        target, client = bucket_source()
+        owed = capture_owed(lake_root, target, client)
+    except Exception as exc:  # noqa: BLE001 - an alarm that cannot run must say so, not stop the job
+        owed = CaptureOwed(unknown=type(exc).__name__)
+    if owed.unknown is not None:
+        report.add(f"bucket copy not checked: {owed.unknown}", ACTION)
+        if publisher is not None:
+            body = (
+                f"The sweep could not read the bucket's manifest copy: {owed.unknown}. "
+                f"Captured data may be off the bucket: {BUCKET_REPAIR}."
+            )
+            _page(
+                publisher,
+                Message(event=BUCKET_UNCHECKED_EVENT, title=BUCKET_UNCHECKED_TITLE, body=body),
+                name="bucket-check",
+                now=now,
+            )
+        return
+    last = _last_compacted_session(now, calendar)
+    late = [day for day, _ in owed.files if day < last]
+    if not late:
+        report.add(f"bucket copy current: nothing owed from before {last.isoformat()}", HEALTHY)
+        return
+    count = len(late)
+    noun = "file" if count == 1 else "files"
+    oldest = late[0].isoformat()
+    report.add(f"bucket copy behind: {count} captured {noun}, oldest {oldest}", ACTION)
+    if publisher is not None:
+        body = (
+            f"{count} captured {noun} off the bucket, oldest {oldest}. The upload is not "
+            f"landing, and the live copies expire about 97 days after upload: {BUCKET_REPAIR}."
+        )
+        _page(
+            publisher,
+            Message(event=BUCKET_BEHIND_EVENT, title=BUCKET_BEHIND_TITLE, body=body),
+            name="bucket-check",
+            now=now,
+        )
 
 
 def _checkpoint_edge(
@@ -1229,6 +1366,7 @@ def sweep(
     schedule_reader: ScheduleReader | None,
     schedule_setter: ScheduleSetter | None,
     cost_client: aws_cost.ClientSource | None,
+    bucket_source: BucketSource | None,
     guards: GuardConstants | None = None,
     window_sessions: int | str | None = None,
     window_sessions_chains: int | str | None = None,
@@ -1246,7 +1384,8 @@ def sweep(
     That is what lets a test drive the run without a page reaching anywhere, and it is the
     same allowance ``escalate_ping_failure`` already makes. ``schedule_setter`` and
     ``schedule_reader`` may be ``None`` on a host with no wake, and the module docstring
-    says what each skips. ``cost_client`` is ``None`` on a host with no cost export.
+    says what each skips. ``cost_client`` is ``None`` on a host with no cost export, and
+    ``bucket_source`` on a shadow host or a path target.
 
     The order below is the design's, and two placements in it were decided rather than
     inherited. The ping comes before the report file, because ``pinged`` is part of what the
@@ -1293,6 +1432,19 @@ def sweep(
     version_check = check_running_version(root)
     if not version_check.ok:
         report.add(version_check.summary, ACTION)
+
+    # **Marketlake #996: captured data the bucket does not hold**, ahead of every walk and on
+    # a holiday too, so the page goes out even when a later raise loses the report file, the
+    # reason the runway check below gives. It reads the bucket and not the upload's outcome,
+    # so it still speaks on the night the upload stopped speaking.
+    _check_bucket_copy(
+        root,
+        bucket_source=bucket_source,
+        now=now,
+        calendar=calendar,
+        publisher=publisher,
+        report=report,
+    )
 
     # **Marketlake #438: the disk runway**, once the day's journal has been compacted. Before
     # then the growing journal is already missing from free space and the full journal
@@ -1721,6 +1873,24 @@ def sweep(
     )
 
 
+def bucket_source_from_config(config: Config, role: str) -> BucketSource | None:
+    """The thunk that connects to the backup bucket, or ``None`` where no copy is owed.
+
+    A shadow host backs nothing up, and a path target has no bucket to read, so neither sends
+    a page. ``role`` is the one ``outbox.senders`` resolved, never the raw key, because an
+    absent key reads as primary. Compaction's ``main`` picks its backup by the same two tests.
+    """
+    if role != outbox.PRIMARY or not isinstance(config.backup_target, BucketTarget):
+        return None
+
+    def build() -> tuple[BucketTarget, Any]:
+        from lake.bucket import connect  # lazy: only a bucket target needs it
+
+        return connect(config)
+
+    return build
+
+
 def sweep_from_config(
     *,
     clock: Clock | None = None,
@@ -1775,12 +1945,51 @@ def sweep_from_config(
         schedule_setter=schedule_setter if schedule_setter is not None else default_setter,
         # ``None`` when ``cost_export`` is absent, so ``bucket.connect`` is never called.
         cost_client=aws_cost.client_source(config),
+        bucket_source=bucket_source_from_config(config, sends.role),
         guards=config.guards,
         window_sessions=config.lake_window_sessions,
         window_sessions_chains=config.lake_window_sessions_chains,
         window_sessions_quotes=config.lake_window_sessions_quotes,
         window_sessions_bars=config.lake_window_sessions_bars,
     )
+
+
+def bucket_check_from_config(
+    *, clock: Clock | None = None, config_path: str | Path | None = None
+) -> int:
+    """Run the bucket check alone, by hand, and send what it finds. Returns an exit code.
+
+    This is :func:`_check_bucket_copy` with the real config, client and publisher, so a page
+    it sends took the road the evening's page takes. It walks nothing and pings nothing. An
+    operator runs it to see a repair clear, and the drill points it at a scratch copy of the
+    manifest to reach the phone. Zero means nothing is owed or no bucket copy is owed on this
+    host, and one means a line needs a person, which is the answer :func:`main` gives.
+    """
+    from lake.config import load_config
+
+    config = load_config(config_path)
+    run_clock = SystemClock() if clock is None else clock
+    sends = outbox.senders(config, process="sweep", clock=run_clock)
+    source = bucket_source_from_config(config, sends.role)
+    if source is None:
+        print("sweep: no bucket copy is owed on this host, so there is nothing to check")
+        return 0
+    report = ReportLines()
+    _check_bucket_copy(
+        Path(config.lake_root),
+        bucket_source=source,
+        now=run_clock.now(),
+        calendar=ExchangeCalendar(),
+        publisher=Publisher(
+            lake_root=config.lake_root,
+            transport=sends.transport,
+            secrets=config.page_secrets(),
+        ),
+        report=report,
+    )
+    for line in report.lines:
+        print(f"sweep: {line}")
+    return 0 if set(report.kinds) == {HEALTHY} else 1
 
 
 def evening_upload_command(config_path: str | Path | None) -> list[str]:
@@ -1817,6 +2026,14 @@ def _build_parser():
     parser.add_argument("--config", help="Path to config.yaml (defaults to the standard location).")
     parser.add_argument(
         "--tickers", help="Path to tickers.yaml (defaults to the standard location)."
+    )
+    parser.add_argument(
+        "--bucket-check",
+        action="store_true",
+        help=(
+            "Run only the check that pages while captured data stays off the bucket, and send "
+            "what it finds. No walk, no ping, no report file and no hand-off."
+        ),
     )
     # No flag names the session, for the reason ``bars._build_parser`` gives. A date flag
     # reads as a convenience and is a backfill selector, and marketlake #319 owns the span of
@@ -1865,6 +2082,10 @@ def main(
 
     from lake.config import input_errors_exit
 
+    if args.bucket_check:
+        with input_errors_exit("sweep"):
+            return bucket_check_from_config(clock=clock, config_path=args.config)
+
     with input_errors_exit("sweep"):
         outcome = sweep_from_config(
             clock=clock,
@@ -1896,6 +2117,12 @@ def main(
 
 
 __all__ = [
+    "BUCKET_BEHIND_EVENT",
+    "BUCKET_BEHIND_TITLE",
+    "BUCKET_REPAIR",
+    "BUCKET_UNCHECKED_EVENT",
+    "BUCKET_UNCHECKED_TITLE",
+    "BucketSource",
     "DIGEST_BYTE_CAP",
     "DISK_RUNWAY_EVENT",
     "DISK_RUNWAY_REPAIR",
@@ -1906,6 +2133,8 @@ __all__ = [
     "ScheduleSetter",
     "SweepOutcome",
     "VendorSource",
+    "bucket_check_from_config",
+    "bucket_source_from_config",
     "count_gaps",
     "count_quarantined",
     "digest_body",

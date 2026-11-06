@@ -1355,7 +1355,8 @@ class BackupScrubResult:
       here rather than on ``rsync``. So does the debris macOS writes to any mounted
       volume on its own, which is why an orphan rides the report rather than paging.
     - ``pending``: the partitions the lake manifested after the backup's last sync,
-      which the backup legitimately does not carry yet.
+      which the backup legitimately does not carry yet. A bucket that stays behind pages
+      from the vendor sweep rather than here, through ``bucket.capture_owed``.
 
     ``versioning`` is a bucket's report line when its versioning is anything but
     enabled. It never withholds the ping. Suspending versioning changes no object, so

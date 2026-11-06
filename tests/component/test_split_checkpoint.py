@@ -753,6 +753,7 @@ def _sweep(
         schedule_reader=lambda: _schedule_text(),
         schedule_setter=_RecordingSetter(),
         cost_client=None,
+        bucket_source=None,
         window_sessions=window,
         guards=guards,
         **surfaces,

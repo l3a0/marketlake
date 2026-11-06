@@ -2445,6 +2445,106 @@ printf 'ssh_public_key = "%s"\n' "$(cat ~/.ssh/marketlake_vm.pub)" >> ~/.config/
 Run each once. A second run adds a second line for the same name, which OpenTofu
 refuses. After the home address changes, edit the `owner_ssh_cidr` line in place.
 
+### Captured data not in the bucket
+
+A failed upload pages once, when the `compaction` and `evening-upload` checks go down, and a
+check that stays down sends nothing more. So the 18:30 vendor sweep reads how far the
+bucket's `manifest.jsonl` reaches and pages every weekday until the bucket catches up, and
+[the design](../docs/design.md#deployment-laptop-now-dedicated-later) carries the reasoning under "A bucket that stays
+behind keeps paging".
+
+**Table:** The two pages from the bucket check, and what each means
+
+| Title | Meaning |
+| --- | --- |
+| `Capture at risk: captured data not in the bucket` | The upload has not carried these files. The body gives the count and the oldest date |
+| `Capture at risk: bucket copy not checked` | The check could not read the bucket's manifest copy, so nothing says whether the bucket is current. The body gives the reason |
+
+A quotes day that stays off the bucket keeps its live segments for about 97 days after they
+were uploaded. A chains day has no live copy, so the lake volume is its only copy from the
+first night.
+
+1. Find why the upload stopped. Read the close+15 run and the run after the vendor sweep.
+
+   ```bash
+   TZ=America/New_York journalctl -u com.marketlake.daemon --since today | grep -E 'compact|Traceback'
+   ```
+
+   ```bash
+   TZ=America/New_York journalctl -u com.marketlake.eod-sweep --since today
+   ```
+
+2. Repair the cause. A compaction refusal names its own repair, and a bucket refusal names
+   the file or the setting that stopped it. [#557](https://github.com/l3a0/marketlake/issues/557) owns a damaged segment that has
+   no way back yet.
+3. Let the next close+15 run or the next evening run upload. Each one sends every file past
+   the watermark, so no command needs to name a day.
+4. Confirm it cleared, as `ubuntu` on the VM. Exit 0 and a line that starts
+   `sweep: bucket copy current` mean nothing is late. This reads the bucket, walks nothing and
+   pings nothing, and a file still late sends the page again.
+
+   ```bash
+   ~/marketlake/.venv/bin/python -m lake.sweep --bucket-check
+   ```
+
+The page says the bucket holds what the manifest records. A partition that sealed short is a
+whole file, reaches the bucket and raises no page, which
+[#998](https://github.com/l3a0/marketlake/issues/998) owns.
+
+#### Drill the page and the two checks
+
+Nothing has recorded either `compaction` or `evening-upload` reaching the phone, and the
+`live` lifecycle rule relies on both. So run these three parts once, after the deploy that
+carries `--bucket-check`, and post each push's arrival time on [#996](https://github.com/l3a0/marketlake/issues/996) and on
+[PR #997](https://github.com/l3a0/marketlake/pull/997). None of them touches the lake or
+writes to the bucket.
+
+**Part 1, the page.** Run this as `ubuntu` on the VM at any hour it is up. It copies the
+manifest to a scratch directory, adds one file the bucket has never held, and points a copy of
+the config at the scratch directory, so the real bucket read and the real ntfy send run
+against a lake nothing else reads. `mktemp -d` makes the directory private, which the config
+copy's secrets need.
+
+```bash
+D="$(mktemp -d)" && cp /srv/marketlake/manifest.jsonl "$D/" && echo '{"partition": "chains/ticker=DRILL/date=2026-01-02.parquet", "source": "drill", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "rows": 0, "fetched_at": null}' >> "$D/manifest.jsonl" && sed "s|^lake_root:.*|lake_root: $D|" ~/.config/marketlake/config.yaml > "$D/config.yaml"
+```
+
+```bash
+~/marketlake/.venv/bin/python -m lake.sweep --config "$D/config.yaml" --bucket-check; rm -rf "$D"
+```
+
+It exits 1 and prints `sweep: bucket copy behind: 1 captured file, oldest 2026-01-02`. The
+phone shows `Capture at risk: captured data not in the bucket` at priority 5.
+
+**Part 2, `compaction`.** On a weekday, point `backup_target` somewhere the upload cannot
+use, after the 16:20 fill and before the 16:30 run. The seal still runs, and the upload then
+stops before any PUT, so the ping never goes. No capture cycle runs in that window. The
+daemon read its live upload's target at startup, so the edit does not reach it.
+
+```bash
+cp -p ~/.config/marketlake/config.yaml ~/.config/marketlake/config.yaml.drill && sed -i 's|^backup_target: s3://\([^/]*\)/.*|backup_target: s3://\1/lake-drill|' ~/.config/marketlake/config.yaml
+```
+
+Put it back once the run has ended, which takes a few minutes. Do this before 18:30, because
+the sweep and the evening upload read the same key.
+
+```bash
+mv ~/.config/marketlake/config.yaml.drill ~/.config/marketlake/config.yaml
+```
+
+The check goes down after its deadline, about 17:00, plus its grace. Record the push. The
+evening upload then carries the day, so nothing stays behind, and the next session's ping
+clears the check.
+
+**Part 3, `evening-upload`.** On another weekday, run the same two commands around the 18:30
+sweep: the edit at about 18:25, and the restore once
+`journalctl -u com.marketlake.eod-sweep` shows the run has ended, a few minutes later. The
+sweep sends `Capture at risk: bucket copy not checked`, which drills that page too, and the
+upload it hands off to stops before its ping. The check goes down after its deadline, about
+20:30, plus its grace. Record both pushes. The next close+15 run carries the evening's bars,
+so a restore that night would be a day behind on bars and actions, and on nothing captured.
+Hold any deploy while the edit stands, because a deploy renders `config.yaml` again.
+
 ## Deploy from CI
 
 Since the cutover the VM is the primary capture host, so code merged to `main` has to
