@@ -436,12 +436,13 @@ def test_a_file_from_tonights_session_does_not_page(fixture_lake: FixtureLake, l
 def test_a_file_newer_than_the_last_compacted_session_is_named_by_its_own_day(lake_root):
     """A hand check inside a session owes that session's segments, not the last session's."""
     client = _seeded_lake(lake_root)
-    _owe(lake_root, _segment_rel(FOLLOWING))
+    _owe(lake_root, _segment_rel(WEDNESDAY))
+    _owe(lake_root, _chains_rel(FOLLOWING))
 
-    pages, lines = _checked(lake_root, client, _et(FOLLOWING, 12, 0), _calendar())
+    pages, lines = _checked(lake_root, client, _et(WEDNESDAY, 12, 0), _calendar())
 
     assert pages == []
-    assert lines == (f"bucket copy owes 1 from {FOLLOWING}",)
+    assert lines == (f"bucket copy owes 2 from {FOLLOWING}",)
 
 
 def test_a_file_from_the_session_before_tonights_pages(fixture_lake: FixtureLake):
