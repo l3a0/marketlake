@@ -2465,12 +2465,12 @@ were uploaded. A chains day has no live copy, so the lake volume is its only cop
 first night.
 
 The page lands at about 18:30 and the VM usually stops by 19:00, so
-[Start a stopped instance](#start-a-stopped-instance) comes first on a page read the next
-morning. A repair or a hand recompaction finished before 18:30 can send one page that the
+[Start a stopped instance](#start-a-stopped-instance) comes first on a page read after that,
+the same evening or at the weekend. A repair or a hand recompaction finished before 18:30 can send one page that the
 evening upload then clears.
 
-**The lake volume holds the only copy of the late files, so never replace or empty it to clear
-this page.** [Restore the lake](#restore-the-lake) is for a volume that is truly lost, and a day
+**The lake volume holds the only copy of the late files a restore can read, so never replace or
+empty it to clear this page.** [Restore the lake](#restore-the-lake) is for a volume that is truly lost, and a day
 no upload reached comes back empty from it.
 
 1. Find why the upload stopped. Read the close+15 run and the run after the vendor sweep, five
@@ -2486,12 +2486,18 @@ no upload reached comes back empty from it.
 
 2. Repair the cause. A compaction refusal names its own repair, and a bucket refusal names
    the file or the setting that stopped it. [#557](https://github.com/l3a0/marketlake/issues/557) owns a damaged segment that has
-   no way back yet, so that page repeats until it does.
+   no way back yet, so that page repeats until it does. Where a cause has no repair and the
+   oldest date is about 60 days old, stop the live rule, as
+   [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back)
+   says, because a stop takes a pull request and an apply, and it brings back nothing already
+   gone.
 3. Let the next close+15 run or the next evening run upload. Each one sends every file past
    the watermark, so no command needs to name a day.
 4. Confirm it cleared, as `ubuntu` on the VM. Exit 0 and a line that starts
-   `sweep: bucket copy current` mean nothing is late. This reads the bucket, walks nothing and
-   pings nothing, and a file still late sends the page again.
+   `sweep: bucket copy current` mean no captured file is owed. Exit 1 with no page and a line
+   that starts `sweep: bucket copy owes` means only files not yet late are owed, which is
+   normal from the session's first cycle until the next upload. This reads the bucket, walks
+   nothing and pings nothing, and a file still late sends the page again.
 
    ```bash
    ~/marketlake/.venv/bin/python -m lake.sweep --bucket-check
@@ -2506,13 +2512,14 @@ no upload reached comes back empty from it.
 | `bucket failed (...)` | S3 answered with another error | Read the code it names |
 | `the bucket holds no usable manifest copy` | The upload has no watermark and sends nothing | The upload's refusal in step 1 names the command. Waiting never clears this |
 | The copy parted at byte 0 | The lake's manifest is gone or empty | Run `findmnt /srv/marketlake` first, since a volume that did not mount reads this way |
-| The copy parted at a later byte | Another host wrote, or someone repaired a manifest by hand | The upload's refusal in step 1 names the command. Waiting never clears this |
+| The copy parted at a later byte | Another host wrote, someone repaired a manifest by hand, or a byte changed on the lake's disk | The upload's refusal in step 1 names the command. Waiting never clears this |
 | `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | No repair is written yet, and it stays a hand job under the lake's lock, as [#447](https://github.com/l3a0/marketlake/issues/447) tracks |
 | Any other exception's name | The check itself failed | Its stack trace is in the `com.marketlake.eod-sweep` journal |
 
-The check never holds the evening upload back, so a damaged manifest has already gone over the
-bucket's copy by the time the page is read. The last clean copy stays readable as a noncurrent
-version for about 30 days.
+The check never holds the evening upload back. Damage past the watermark has already gone over
+the bucket's copy by the time the page is read, and the last clean copy stays readable as a
+noncurrent version for about 30 days. Damage in bytes the bucket already holds stops the upload,
+so the current copy stays clean.
 
 The page says the bucket holds what the manifest records. A partition that sealed short is a
 whole file, reaches the bucket and raises no page, which
@@ -2536,7 +2543,7 @@ against a lake nothing else reads. `mktemp -d` makes the directory private, whic
 copy's secrets need.
 
 ```bash
-D="$(mktemp -d)" && cp /srv/marketlake/manifest.jsonl "$D/" && echo '{"partition": "chains/ticker=DRILL/date=2026-01-02.parquet", "source": "drill", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "rows": 0, "fetched_at": null}' >> "$D/manifest.jsonl" && sed "s|^lake_root:.*|lake_root: $D|" ~/.config/marketlake/config.yaml > "$D/config.yaml"
+D="$(mktemp -d)" && wc -l /srv/marketlake/manifest.jsonl && cp /srv/marketlake/manifest.jsonl "$D/" && echo '{"partition": "chains/ticker=DRILL/date=2026-01-02.parquet", "source": "drill", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "rows": 0, "fetched_at": null}' >> "$D/manifest.jsonl" && sed "s|^lake_root:.*|lake_root: $D|" ~/.config/marketlake/config.yaml > "$D/config.yaml"
 ```
 
 ```bash
@@ -2544,7 +2551,8 @@ D="$(mktemp -d)" && cp /srv/marketlake/manifest.jsonl "$D/" && echo '{"partition
 ```
 
 It exits 1 and prints `sweep: bucket copy behind: 1 captured file, oldest 2026-01-02`. The
-phone shows `Capture at risk: captured data not in the bucket` at priority 5.
+phone shows `Capture at risk: captured data not in the bucket` at priority 5. Post the line count
+the first command printed too, because the read's memory grows with it and no alarm watches it.
 
 **Part 2, `compaction`.** On a regular session day, not a half day, point `backup_target`
 somewhere the upload cannot use, after the 16:20 fill and before the 16:30 run. The seal still runs, and the upload then

@@ -1032,10 +1032,11 @@ def _check_bucket_copy(
     A file from the last compacted session itself sends no page yet. That session's upload may
     still be the one the ``compaction`` and ``evening-upload`` checks are about to answer for,
     and those two page first. So the first page here lands on the next session's evening, and
-    it lands every weekday after that until the upload moves the watermark. Such a file still
-    files an ``INFO`` line, so the bucket never reads as current while it holds less than the
-    manifest. A night with nothing owed writes one ``HEALTHY`` line, because an alarm that reads
-    zero needs a record that it looked.
+    it lands every weekday after that until the watermark passes the file. A file not yet late
+    still files an ``INFO`` line, which names the oldest such day, so the bucket never reads as
+    current while it holds fewer captured files than the manifest records. A night with nothing
+    owed writes one ``HEALTHY`` line, because an alarm that reads zero needs a record that it
+    looked.
 
     The answer comes from the bucket and the lake's manifest on every run, and nothing is
     kept between runs. The check neither withholds the ping nor reaches ``problems``, for the
@@ -1082,7 +1083,8 @@ def _check_bucket_copy(
     late = [day for day, _ in owed.files if day < last]
     if not late:
         if owed.files:
-            report.add(f"bucket copy owes {len(owed.files)} from {last.isoformat()}", INFO)
+            count, oldest = len(owed.files), owed.files[0][0].isoformat()
+            report.add(f"bucket copy owes {count} from {oldest}", INFO)
         else:
             report.add("bucket copy current", HEALTHY)
         return
@@ -1980,8 +1982,8 @@ def bucket_check_from_config(
     This is :func:`_check_bucket_copy` with the real config, client and publisher, so a page
     it sends took the road the evening's page takes. It walks nothing and pings nothing. An
     operator runs it to see a repair clear, and the drill points it at a scratch copy of the
-    manifest to reach the phone. Zero means nothing is owed or no bucket copy is owed on this
-    host, and one means a line needs a person, which is the answer :func:`main` gives.
+    manifest to reach the phone. Zero means no captured file is owed, or no bucket copy is owed
+    on this host. One means anything but that all-clear, which includes files not yet late.
     """
     from lake.config import load_config
 

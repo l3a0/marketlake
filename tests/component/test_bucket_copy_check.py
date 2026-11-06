@@ -278,16 +278,34 @@ def test_a_segment_whose_partition_sealed_is_not_owed(lake_root):
     assert capture_owed(lake_root, TARGET, client).files == ((WEDNESDAY, _chains_rel(WEDNESDAY)),)
 
 
-def test_a_path_that_will_not_parse_is_left_to_the_stuck_watermark(lake_root):
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "chains/ticker=SPY/date=2026-13-45.parquet",
+        "journal/date=2026-13-45/surface=chains/ticker=SPY/seg-a-1.arrows",
+    ],
+    ids=["partition", "segment"],
+)
+def test_a_path_that_will_not_parse_is_left_to_the_stuck_watermark(lake_root, rel):
     """No writer makes one, so the choice is to read past it rather than page on it.
 
     The upload owes it all the same, so a failed upload stops the watermark there, and the next
     session's files page.
     """
     client = _seeded_lake(lake_root)
-    _owe(lake_root, "chains/ticker=SPY/date=2026-13-45.parquet")
+    _owe(lake_root, rel)
 
     assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
+
+
+def test_a_bars_entry_past_the_watermark_reads_as_current(lake_root):
+    """The line speaks for captured files, and a stuck upload pages through the next chains."""
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, f"bars/ticker=SPY/freq=1d/date={EARLIER.isoformat()}.parquet")
+
+    _, lines = _checked(lake_root, client, _evening(NEXT_MONDAY), _calendar())
+
+    assert lines == ("bucket copy current",)
 
 
 def test_a_segment_of_another_surface_is_not_owed(lake_root):
@@ -406,12 +424,24 @@ def test_a_file_from_tonights_session_does_not_page(fixture_lake: FixtureLake, l
     root = _lake(fixture_lake)
     client = _seed(root)
     _owe(root, _chains_rel(MONDAY, "QQQ"))
+    _owe(root, _chains_rel(MONDAY, "IWM"))
 
     outcome, _, transport = _run(root, now=EVENING, bucket_source=_source(client))
 
     assert _pages(transport) == []
-    assert outcome.nightly.report[0] == f"bucket copy owes 1 from {MONDAY}"
+    assert outcome.nightly.report[0] == f"bucket copy owes 2 from {MONDAY}"
     assert outcome.nightly.report_kinds[0] == INFO
+
+
+def test_a_file_newer_than_the_last_compacted_session_is_named_by_its_own_day(lake_root):
+    """A hand check inside a session owes that session's segments, not the last session's."""
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _segment_rel(FOLLOWING))
+
+    pages, lines = _checked(lake_root, client, _et(FOLLOWING, 12, 0), _calendar())
+
+    assert pages == []
+    assert lines == (f"bucket copy owes 1 from {FOLLOWING}",)
 
 
 def test_a_file_from_the_session_before_tonights_pages(fixture_lake: FixtureLake):
@@ -638,12 +668,17 @@ def test_a_byte_that_is_not_utf8_refuses_rather_than_reading_as_not_owed(lake_ro
         capture_owed(lake_root, TARGET, client)
 
 
-def test_a_torn_tail_with_nothing_behind_it_still_answers(lake_root):
-    """The state a read racing a write can see, so it must not page as damage."""
+@pytest.mark.parametrize(
+    "tail",
+    ['{"partition": "torn', '{"partition": "torn{"partition": "fused"}\n'],
+    ids=["torn tail", "fused last line"],
+)
+def test_a_damaged_last_line_with_nothing_behind_it_still_answers(lake_root, tail):
+    """The bytes a read racing a write can see, so it must not page as damage."""
     client = _seeded_lake(lake_root)
     _owe(lake_root, _chains_rel(WEDNESDAY))
     with (lake_root / "manifest.jsonl").open("a") as handle:
-        handle.write('{"partition": "torn')
+        handle.write(tail)
 
     assert capture_owed(lake_root, TARGET, client).files == ((WEDNESDAY, _chains_rel(WEDNESDAY)),)
 
@@ -721,7 +756,10 @@ def test_a_caught_raise_leaves_its_stack_trace_in_the_jobs_journal(lake_root, ca
     )
 
     assert lines.lines == ("bucket copy not checked: BucketSettingsInvalid",)
-    assert "bucket_region is missing" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Traceback" in err
+    assert "in refused" in err
+    assert "bucket_region is missing" in err
 
 
 @pytest.mark.parametrize("late", [True, False], ids=["behind page", "not-checked page"])

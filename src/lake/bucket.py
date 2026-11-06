@@ -2026,7 +2026,7 @@ def _captured_day(rel: str, ledger: Ledger) -> date | None:
     on the lake, and so is a day no seal has reached.
 
     A path under these surfaces that will not parse returns ``None`` too. No writer makes one,
-    and the upload still owes it, so the watermark stops and the next session's files page.
+    and an upload that fails on it stops the watermark, so the next session's files page.
     """
     partition = parse_partition_rel(rel)
     if partition is not None:
@@ -2042,9 +2042,9 @@ def capture_owed(lake_root: Path, target: BucketTarget, client: Any) -> CaptureO
 
     This is the read behind the vendor sweep's page that repeats while captured data stays
     off the bucket. It takes :func:`nightly_upload`'s own rule for what is pending, every path
-    whose latest entry sits at or past the watermark, so the page clears on the upload that
-    clears the debt and on nothing else. It reads no object but the manifest copy, because
-    the Sunday scrub is what checks the objects the watermark claims.
+    whose latest entry sits at or past the watermark, so the page clears when the watermark
+    passes the file, through that upload or a restore from the bucket. It reads no object but
+    the manifest copy, because the Sunday scrub is what checks the objects the watermark claims.
 
     A bucket that refuses or cannot be reached, a copy that is absent and a copy that parted
     from the lake each come back as ``unknown``, never as an empty answer, because an alarm
