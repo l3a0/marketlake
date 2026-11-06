@@ -2513,7 +2513,7 @@ no upload reached comes back empty from it.
 | `the bucket holds no usable manifest copy` | The upload has no watermark and sends nothing | The upload's refusal in step 1 names the command. Waiting never clears this |
 | The copy parted at byte 0 | The lake's manifest is gone or empty | Run `findmnt /srv/marketlake` first, since a volume that did not mount reads this way |
 | The copy parted at a later byte | Another host wrote, someone repaired a manifest by hand, or a byte changed on the lake's disk | Compare the lake's manifest with the bucket's copy before any command. Where the difference is damage on the lake, follow the row below. Waiting never clears this |
-| `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | Do not run `first-upload`, whatever a refusal names, because it re-baselines the bucket onto the damaged bytes. No repair is written yet, and [#447](https://github.com/l3a0/marketlake/issues/447) owns it |
+| `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | Do not run `first-upload`, whatever a refusal names, because where it runs it re-baselines the bucket onto the damaged bytes. No repair is written yet, and [#447](https://github.com/l3a0/marketlake/issues/447) owns it |
 | Any other exception's name | The check itself failed | Its stack trace is in the `com.marketlake.eod-sweep` journal |
 
 The check never holds the evening upload back, so a damaged manifest may already have reached the

@@ -29,6 +29,7 @@ from lake.bucket import (
     CaptureOwed,
     capture_owed,
     first_upload,
+    restore_lake,
 )
 from lake.compact import compact
 from lake.config import BucketTarget, load_config
@@ -315,16 +316,17 @@ def test_a_segment_of_another_surface_is_not_owed(lake_root):
     assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
 
 
-def test_a_restore_from_the_bucket_clears_what_was_owed(lake_root):
+def test_a_restore_from_the_bucket_clears_what_was_owed(lake_root, tmp_path):
     """A restored manifest ends where the copy ends, so the page already sent is the record."""
     client = _seeded_lake(lake_root)
-    held = client.body("lake/manifest.jsonl")
     _owe(lake_root, _chains_rel(WEDNESDAY))
     assert capture_owed(lake_root, TARGET, client).files != ()
 
-    (lake_root / "manifest.jsonl").write_bytes(held)
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    restore_lake(restored, TARGET, client=client)
 
-    assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
+    assert capture_owed(restored, TARGET, client) == CaptureOwed()
 
 
 def test_the_check_reads_the_manifest_copy_and_no_other_object(lake_root):
