@@ -2469,22 +2469,24 @@ The page lands at about 18:30 and the VM usually stops by 19:00, so
 morning. A repair or a hand recompaction finished before 18:30 can send one page that the
 evening upload then clears.
 
-1. Find why the upload stopped. Read the close+15 run and the run after the vendor sweep.
+**The lake volume holds the only copy of the late files, so never replace or empty it to clear
+this page.** [Restore the lake](#restore-the-lake) is for a volume that is truly lost, and a day
+no upload reached comes back empty from it.
+
+1. Find why the upload stopped. Read the close+15 run and the run after the vendor sweep, five
+   days back, because a Friday failure is read on a Monday.
 
    ```bash
-   TZ=America/New_York journalctl -u com.marketlake.daemon --since yesterday
+   TZ=America/New_York journalctl -u com.marketlake.daemon --since "-5 days" | grep -E -A25 'compact|Traceback'
    ```
 
    ```bash
-   TZ=America/New_York journalctl -u com.marketlake.eod-sweep --since yesterday
+   TZ=America/New_York journalctl -u com.marketlake.eod-sweep --since "-5 days"
    ```
 
 2. Repair the cause. A compaction refusal names its own repair, and a bucket refusal names
    the file or the setting that stopped it. [#557](https://github.com/l3a0/marketlake/issues/557) owns a damaged segment that has
-   no way back yet. A reason of `TornLedger` or `LedgerNotUtf8` means the lake's own
-   `manifest.jsonl` is damaged, and a reason that says the copy parted at byte 0 means the
-   lake's manifest is gone or the volume is not mounted. Both are the lake's fault rather than
-   the bucket's, so stop and read [Restore the lake](#restore-the-lake) before any upload.
+   no way back yet, so that page repeats until it does.
 3. Let the next close+15 run or the next evening run upload. Each one sends every file past
    the watermark, so no command needs to name a day.
 4. Confirm it cleared, as `ubuntu` on the VM. Exit 0 and a line that starts
@@ -2494,6 +2496,23 @@ evening upload then clears.
    ```bash
    ~/marketlake/.venv/bin/python -m lake.sweep --bucket-check
    ```
+
+**Table:** Each reason on `Capture at risk: bucket copy not checked`, and what to do
+
+| Reason | Meaning | Action |
+| --- | --- | --- |
+| `bucket unreachable (...)` | S3 did not answer through three attempts | Run step 4. If it passes, nothing is wrong |
+| `bucket refused (...)` | S3 turned the credentials away | Repair the instance profile or its policy. This stops the upload too |
+| `bucket failed (...)` | S3 answered with another error | Read the code it names |
+| `the bucket holds no usable manifest copy` | The upload has no watermark and sends nothing | The upload's refusal in step 1 names the command. Waiting never clears this |
+| The copy parted at byte 0 | The lake's manifest is gone or empty | Run `findmnt /srv/marketlake` first, since a volume that did not mount reads this way |
+| The copy parted at a later byte | Another host wrote, or someone repaired a manifest by hand | The upload's refusal in step 1 names the command. Waiting never clears this |
+| `TornLedger`, `LedgerNotUtf8`, `ManifestError`, or no whole entry | The lake's own `manifest.jsonl` is damaged | No repair is written yet, and it stays a hand job under the lake's lock, as [#447](https://github.com/l3a0/marketlake/issues/447) tracks |
+| Any other exception's name | The check itself failed | Its stack trace is in the `com.marketlake.eod-sweep` journal |
+
+The check never holds the evening upload back, so a damaged manifest has already gone over the
+bucket's copy by the time the page is read. The last clean copy stays readable as a noncurrent
+version for about 30 days.
 
 The page says the bucket holds what the manifest records. A partition that sealed short is a
 whole file, reaches the bucket and raises no page, which
@@ -2553,8 +2572,10 @@ the next session's ping clears the check.
 
 **Part 3, `evening-upload`.** On another session day, run the same two commands around the
 18:30 sweep: the edit at about 18:25, and the restore once
-`journalctl -u com.marketlake.eod-sweep` shows the run has ended, a few minutes later. The
-sweep sends `Capture at risk: bucket copy not checked`, which drills that page too, and the
+`journalctl -u com.marketlake.eod-sweep` shows the run has ended, a few minutes later. Stay
+logged in until the restore's `grep` prints the real prefix, because the VM can power off from
+18:45 once no terminal is logged in, and this edit would then reach the next morning's daemon.
+The sweep sends `Capture at risk: bucket copy not checked`, which drills that page too, and the
 upload it hands off to stops before its ping. The check goes down after its deadline, about
 20:30, plus its grace. Record both pushes. The next close+15 run carries the evening's bars,
 so a restore that night would be a day behind on bars and actions, and on nothing captured.

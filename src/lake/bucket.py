@@ -2022,8 +2022,11 @@ def _captured_day(rel: str, ledger: Ledger) -> date | None:
 
     A segment counts only while :func:`_superseded` says its partition is unmanifested. A
     sealed day's segment entries stay in the manifest after their files go, so counting them
-    would page on every healthy night. A refused day's segments are that day's only copy on
-    the lake, and so is a day no seal has reached.
+    would count that day twice in the page. A refused day's segments are that day's only copy
+    on the lake, and so is a day no seal has reached.
+
+    A path under these surfaces that will not parse returns ``None`` too. No writer makes one,
+    and the upload still owes it, so the watermark stops and the next session's files page.
     """
     partition = parse_partition_rel(rel)
     if partition is not None:

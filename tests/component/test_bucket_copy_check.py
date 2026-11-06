@@ -33,7 +33,8 @@ from lake.bucket import (
 from lake.compact import compact
 from lake.config import BucketTarget, load_config
 from lake.manifest import LedgerNotUtf8, TornLedger, append_manifest
-from lake.report import ACTION, HEALTHY, ReportLines
+from lake.paths import LakePaths
+from lake.report import ACTION, HEALTHY, INFO, ReportLines
 from lake.sweep import (
     BUCKET_BEHIND_EVENT,
     BUCKET_BEHIND_TITLE,
@@ -53,7 +54,7 @@ from tests.component.test_eod_sweep import (
     _stub_free,
 )
 from tests.support.bucket import FakeS3, client_error, unreachable
-from tests.support.calendar import weekday_sessions
+from tests.support.calendar import FakeCalendar, SessionTimes, weekday_sessions
 from tests.support.clock import ManualClock
 from tests.support.config import write_config
 from tests.support.lake import FixtureLake
@@ -253,11 +254,14 @@ def test_a_segment_of_a_day_that_never_sealed_is_owed(lake_root):
     """A seal that raises on every run seals nothing, so no partition exists to count.
 
     The day's segments are then what the upload owes. Reading partitions alone would leave
-    the page silent on the night the most is at stake.
+    the page silent on the night the most is at stake. The paths come from the builder capture
+    writes through, so a change to their shape reaches this test.
     """
     client = _seeded_lake(lake_root)
-    _owe(lake_root, _segment_rel(WEDNESDAY))
-    _owe(lake_root, _segment_rel(WEDNESDAY, "quotes"))
+    paths = LakePaths(lake_root)
+    for surface in ("chains", "quotes"):
+        built = paths.segment_path(surface, "SPY", WEDNESDAY, "a", 1)
+        _owe(lake_root, built.relative_to(lake_root).as_posix())
 
     assert [day for day, _ in capture_owed(lake_root, TARGET, client).files] == [
         WEDNESDAY,
@@ -272,6 +276,18 @@ def test_a_segment_whose_partition_sealed_is_not_owed(lake_root):
     _owe(lake_root, _chains_rel(WEDNESDAY))
 
     assert capture_owed(lake_root, TARGET, client).files == ((WEDNESDAY, _chains_rel(WEDNESDAY)),)
+
+
+def test_a_path_that_will_not_parse_is_left_to_the_stuck_watermark(lake_root):
+    """No writer makes one, so the choice is to read past it rather than page on it.
+
+    The upload owes it all the same, so a failed upload stops the watermark there, and the next
+    session's files page.
+    """
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, "chains/ticker=SPY/date=2026-13-45.parquet")
+
+    assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
 
 
 def test_a_segment_of_another_surface_is_not_owed(lake_root):
@@ -394,8 +410,8 @@ def test_a_file_from_tonights_session_does_not_page(fixture_lake: FixtureLake, l
     outcome, _, transport = _run(root, now=EVENING, bucket_source=_source(client))
 
     assert _pages(transport) == []
-    assert outcome.nightly.report[0] == "bucket copy current"
-    assert outcome.nightly.report_kinds[0] == HEALTHY
+    assert outcome.nightly.report[0] == f"bucket copy owes 1 from {MONDAY}"
+    assert outcome.nightly.report_kinds[0] == INFO
 
 
 def test_a_file_from_the_session_before_tonights_pages(fixture_lake: FixtureLake):
@@ -514,19 +530,47 @@ def test_a_holiday_pages_and_measures_from_the_session_before_it(fixture_lake: F
     assert outcome.digest.body == HOLIDAY_BODY
 
 
-def test_a_calendar_naming_no_recent_session_pages_early_rather_than_going_quiet(
-    fixture_lake: FixtureLake,
+@pytest.mark.parametrize(
+    ("days_back", "reason"),
+    [(13, None), (14, "LookupError")],
+    ids=["the last day the walk reaches", "the first day past it"],
+)
+def test_the_walk_reaches_thirteen_days_back_and_then_says_it_could_not_answer(
+    lake_root, days_back, reason
 ):
-    """The fallback bar is today, so the failure of the search reads loud."""
-    root = _lake(fixture_lake)
-    client = _seed(root)
-    _owe(root, _chains_rel(EARLIER, "QQQ"))
-    # A Saturday in a week the calendar does not list, three weeks past its last session.
-    far = _evening(date(2026, 10, 17))
+    client = _seeded_lake(lake_root)
+    today = date(2026, 9, 25)
+    session = today - timedelta(days=days_back)
+    _owe(lake_root, _chains_rel(session, "QQQ"))
+    calendar = FakeCalendar(
+        {session: SessionTimes(open=_et(session, 9, 30), close=_et(session, 16, 0))}
+    )
 
-    _, _, transport = _run(root, now=far, bucket_source=_source(client))
+    pages, lines = _checked(lake_root, client, _evening(today), calendar, BUCKET_UNCHECKED_EVENT)
 
-    assert len(_pages(transport)) == 1
+    if reason is None:
+        assert pages == []
+        assert lines == (f"bucket copy owes 1 from {session}",)
+    else:
+        assert len(pages) == 1
+        assert lines == (f"bucket copy not checked: {reason}",)
+
+
+def test_a_calendar_that_raises_stays_inside_the_containment(lake_root):
+    """A raise here would take the digest, the ping and the hand-off with it."""
+
+    class Refusing:
+        def is_session(self, day):
+            raise RuntimeError("past the calendar's end")
+
+    client = _seeded_lake(lake_root)
+
+    pages, lines = _checked(
+        lake_root, client, _evening(NEXT_MONDAY), Refusing(), BUCKET_UNCHECKED_EVENT
+    )
+
+    assert len(pages) == 1
+    assert lines == ("bucket copy not checked: RuntimeError",)
 
 
 # -- when the check itself fails ----------------------------------------------
@@ -658,6 +702,55 @@ def test_no_bucket_source_sends_nothing_and_files_no_line(fixture_lake: FixtureL
     assert _pages(transport) == []
     assert _pages(transport, BUCKET_UNCHECKED_EVENT) == []
     assert not any("bucket copy" in line for line in outcome.nightly.report)
+
+
+def test_a_caught_raise_leaves_its_stack_trace_in_the_jobs_journal(lake_root, capsys):
+    """The page carries the type alone, so stderr is the only place the reason survives."""
+
+    def refused():
+        raise bucket.BucketSettingsInvalid("bucket_region is missing, set it in config.yaml")
+
+    lines = ReportLines()
+    sweep._check_bucket_copy(
+        lake_root,
+        bucket_source=refused,
+        now=EVENING,
+        calendar=_calendar(),
+        publisher=None,
+        report=lines,
+    )
+
+    assert lines.lines == ("bucket copy not checked: BucketSettingsInvalid",)
+    assert "bucket_region is missing" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("late", [True, False], ids=["behind page", "not-checked page"])
+@pytest.mark.parametrize("secret", [False, True], ids=["no transport", "carries a secret"])
+def test_a_page_that_did_not_go_says_so_on_stderr_under_its_own_name(
+    lake_root, capsys, late, secret
+):
+    client = _seeded_lake(lake_root)
+    if late:
+        _owe(lake_root, _chains_rel(EARLIER, "QQQ"))
+    else:
+        client.fail_with = client_error("AccessDenied", "HeadObject", 403)
+    publisher = Publisher(
+        lake_root=lake_root,
+        transport=FakeTransport() if secret else None,
+        secrets=("Capture",) if secret else (),
+    )
+
+    sweep._check_bucket_copy(
+        lake_root,
+        bucket_source=_source(client),
+        now=_evening(NEXT_MONDAY),
+        calendar=_calendar(),
+        publisher=publisher,
+        report=ReportLines(),
+    )
+
+    wanted = "bucket-check page refused" if secret else "bucket-check page not sent"
+    assert f"sweep: {wanted}" in capsys.readouterr().err
 
 
 def test_the_page_goes_out_before_any_walk_can_raise(fixture_lake: FixtureLake, monkeypatch):
@@ -843,6 +936,29 @@ def test_the_hand_check_pages_and_exits_one_when_files_are_late(
     assert f"sweep: bucket copy behind: 1 captured file, oldest {EARLIER}" in (
         capsys.readouterr().out
     )
+
+
+def test_the_hand_check_measures_from_the_clock_it_is_given(
+    tmp_path, lake_root, monkeypatch, capsys
+):
+    """Tonight's file is not late, and the real clock would call it late."""
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _chains_rel(FOLLOWING, "QQQ"))
+    path = _bucket_config(tmp_path, lake_root)
+    transport = FakeTransport()
+    monkeypatch.setattr(bucket, "connect", lambda config: (TARGET, client))
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
+    monkeypatch.setattr(sweep, "ExchangeCalendar", _calendar)
+
+    code = sweep.main(
+        ["--config", str(path), "--bucket-check"],
+        clock=ManualClock(_evening(FOLLOWING)),
+    )
+
+    # Owed and not late sends no page, and it is not the all-clear either.
+    assert code == 1
+    assert transport.messages == []
+    assert capsys.readouterr().out == f"sweep: bucket copy owes 1 from {FOLLOWING}\n"
 
 
 def test_the_hand_check_exits_one_when_the_bucket_will_not_answer(

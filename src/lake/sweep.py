@@ -54,7 +54,8 @@ before the last compacted session stays past that point. A failed upload pages o
 transition of the ``compaction`` and ``evening-upload`` checks, nothing in this repository
 repeats that page, and whether the healthchecks account sends reminders was not determined.
 So this job is what keeps saying so, and a run holds no state between nights: the page clears
-when the upload moves the watermark, and on nothing else. A read
+when the watermark passes the file, through the upload, or through a restore from the bucket,
+whose manifest ends where the copy ends. A read
 that could not answer pages too, under its own title, because an alarm that cannot look must
 not read as healthy. ``python -m lake.sweep --bucket-check`` runs this step alone and sends
 what it finds, which is how an operator confirms a repair and how the drill reaches the
@@ -188,6 +189,7 @@ import os
 import shlex
 import subprocess
 import sys
+import traceback
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -297,9 +299,9 @@ BUCKET_REPAIR = "infra/README.md, Captured data not in the bucket"
 # at the key and 90 as a noncurrent version, in ``infra/live/bucket.tf``.
 LIVE_COPY_DAYS = 97
 
-# How far back the bucket check looks for the last compacted session. The longest run of days
-# with no session this exchange has had is well under this. A calendar that names none in the
-# window leaves today as the bar, which pages early rather than staying quiet.
+# How far back the bucket check looks for the last compacted session, counting today, so the
+# walk reaches 13 days back. The longest run of days with no session from 2006 to 2029 is 4. A
+# calendar that names none in the window raises, which pages that the check could not answer.
 _LAST_SESSION_SEARCH_DAYS = 14
 
 # Bytes in a GiB. The report line and the page print GiB because the Lake panel's
@@ -1001,7 +1003,7 @@ def _check_disk_runway(
 
 
 def _last_compacted_session(now: datetime, calendar: Calendar) -> date:
-    """The latest session whose compaction moment has passed, or today when none is found.
+    """The latest session whose compaction moment has passed. Raises when none is found.
 
     The moment is the one the runway check waits for, the option close plus
     ``COMPACTION_DELAY``. So at 18:30 on a session it is that session, on a holiday it is the
@@ -1013,7 +1015,7 @@ def _last_compacted_session(now: datetime, calendar: Calendar) -> date:
         day = today - timedelta(days=back)
         if calendar.is_session(day) and calendar.option_close(day) + COMPACTION_DELAY <= now:
             return day
-    return today
+    raise LookupError(f"no compacted session in the {_LAST_SESSION_SEARCH_DAYS} days to {today}")
 
 
 def _check_bucket_copy(
@@ -1027,12 +1029,13 @@ def _check_bucket_copy(
 ) -> None:
     """Page while a captured file dated before the last compacted session stays off the bucket.
 
-    A file from the last compacted session itself counts for nothing yet. That session's
-    upload may still be the one the ``compaction`` and ``evening-upload`` checks are about to
-    answer for, and those two page first. So the first page here lands on the next session's
-    evening, and it lands every weekday after that until the upload moves the watermark. A
-    healthy night writes one ``HEALTHY`` line, because an alarm that reads zero needs a record
-    that it looked.
+    A file from the last compacted session itself sends no page yet. That session's upload may
+    still be the one the ``compaction`` and ``evening-upload`` checks are about to answer for,
+    and those two page first. So the first page here lands on the next session's evening, and
+    it lands every weekday after that until the upload moves the watermark. Such a file still
+    files an ``INFO`` line, so the bucket never reads as current while it holds less than the
+    manifest. A night with nothing owed writes one ``HEALTHY`` line, because an alarm that reads
+    zero needs a record that it looked.
 
     The answer comes from the bucket and the lake's manifest on every run, and nothing is
     kept between runs. The check neither withholds the ping nor reaches ``problems``, for the
@@ -1045,7 +1048,8 @@ def _check_bucket_copy(
     refused while connecting and a damaged lake manifest included, because a raise here would
     take the digest, the ping and the hand-off with it, and the hand-off is the upload that
     might clear the debt. What it catches becomes the same page as a bucket that could not
-    answer, under the exception's type alone, since the page reaches ntfy.sh.
+    answer, under the exception's type alone, since the page reaches ntfy.sh. The stack trace
+    goes to stderr, where the job's journal keeps it for whoever repairs it.
 
     It speaks only while this job runs. A run stopped before it, by a config or roster that
     will not load, leaves the debt to the ``eod-sweep`` check's own page.
@@ -1059,6 +1063,7 @@ def _check_bucket_copy(
         owed = capture_owed(lake_root, target, client)
         last = _last_compacted_session(now, calendar)
     except Exception as exc:  # noqa: BLE001 - an alarm that cannot run must say so, not stop the job
+        print(traceback.format_exc(), file=sys.stderr, end="")
         owed = CaptureOwed(unknown=type(exc).__name__)
     if owed.unknown is not None:
         report.add(f"bucket copy not checked: {owed.unknown}", ACTION)
@@ -1076,7 +1081,10 @@ def _check_bucket_copy(
         return
     late = [day for day, _ in owed.files if day < last]
     if not late:
-        report.add("bucket copy current", HEALTHY)
+        if owed.files:
+            report.add(f"bucket copy owes {len(owed.files)} from {last.isoformat()}", INFO)
+        else:
+            report.add("bucket copy current", HEALTHY)
         return
     count = len(late)
     noun = "file" if count == 1 else "files"
