@@ -1,9 +1,9 @@
 """The vendor sweep's page while captured data stays off the bucket (marketlake #996).
 
-A failed upload pages once, on the transition of the ``compaction`` and ``evening-upload``
-checks, and a check that stays down sends nothing more. The live copy of a quotes segment now
-lasts about 97 days, and chains have none, so a sealed day that stays off the bucket can end
-with the VM's volume as its only copy. This file drives the page that keeps saying so.
+A failed upload pages on the transition of the ``compaction`` and ``evening-upload`` checks,
+and nothing in this repository repeats that page. The live copy of a quotes segment now lasts
+about 97 days, and chains have none, so a sealed day that stays off the bucket can end with
+the VM's volume as its only copy. This file drives the page that keeps saying so.
 
 The first test is the issue's own: a run whose upload lands no PUT, then the sweep on each
 following weekday, with a page each time and none once the upload clears. It goes through the
@@ -32,7 +32,7 @@ from lake.bucket import (
 )
 from lake.compact import compact
 from lake.config import BucketTarget, load_config
-from lake.manifest import append_manifest
+from lake.manifest import LedgerNotUtf8, TornLedger, append_manifest
 from lake.report import ACTION, HEALTHY, ReportLines
 from lake.sweep import (
     BUCKET_BEHIND_EVENT,
@@ -43,7 +43,15 @@ from lake.sweep import (
     HOLIDAY_BODY,
 )
 from tests.component.test_compaction import _chains, _segment, _snap
-from tests.component.test_eod_sweep import EVENING, FOLLOWING, MONDAY, NEXT_MONDAY, _lake, _run
+from tests.component.test_eod_sweep import (
+    EVENING,
+    FOLLOWING,
+    MONDAY,
+    NEXT_MONDAY,
+    _lake,
+    _run,
+    _stub_free,
+)
 from tests.support.bucket import FakeS3, client_error, unreachable
 from tests.support.calendar import weekday_sessions
 from tests.support.clock import ManualClock
@@ -63,6 +71,7 @@ BUCKET_KEYS = (
 THURSDAY = date(2026, 9, 17)
 WEDNESDAY = date(2026, 9, 16)
 EARLIER = date(2026, 9, 11)
+WEEK_BEFORE = date(2026, 9, 7)
 
 
 def _et(day: date, hour: int, minute: int) -> datetime:
@@ -197,9 +206,8 @@ def test_an_upload_that_lands_no_put_pages_each_weekday_until_the_upload_clears_
     outcome, _, transport = _run(root, now=_evening(NEXT_MONDAY), bucket_source=_source(client))
     assert _pages(transport) == []
     assert _pages(transport, BUCKET_UNCHECKED_EVENT) == []
-    assert any(
-        line.startswith("bucket copy current") and kind == HEALTHY
-        for line, kind in zip(outcome.nightly.report, outcome.nightly.report_kinds, strict=True)
+    assert ("bucket copy current", HEALTHY) in zip(
+        outcome.nightly.report, outcome.nightly.report_kinds, strict=True
     )
 
 
@@ -298,11 +306,30 @@ def test_a_copy_with_no_stored_checksum_is_read_to_find_where_it_ends(lake_root)
 # -- when it cannot answer ----------------------------------------------------
 
 
-def test_an_empty_lake_owes_nothing_and_sends_no_request(lake_root):
+def test_an_empty_lake_and_an_empty_bucket_owe_nothing(lake_root):
+    assert capture_owed(lake_root, TARGET, FakeS3()) == CaptureOwed()
+
+
+def test_an_empty_lake_and_a_zero_byte_copy_owe_nothing(lake_root):
+    """A copy holding no whole entry reads as absent only while the lake holds some."""
     client = FakeS3()
+    client.store("lake/manifest.jsonl", b"")
 
     assert capture_owed(lake_root, TARGET, client) == CaptureOwed()
-    assert client.calls == []
+
+
+@pytest.mark.parametrize("gone", [True, False], ids=["absent", "emptied"])
+def test_a_lake_that_lost_its_manifest_is_unknown_rather_than_healthy(lake_root, gone):
+    """An unmounted volume or a lost manifest, with the bucket still holding a full copy."""
+    client = _seeded_lake(lake_root)
+    if gone:
+        (lake_root / "manifest.jsonl").unlink()
+    else:
+        (lake_root / "manifest.jsonl").write_bytes(b"")
+
+    assert capture_owed(lake_root, TARGET, client).unknown == (
+        "the bucket's manifest copy parted from the lake's at byte 0"
+    )
 
 
 def test_a_bucket_with_no_manifest_copy_is_unknown_rather_than_healthy(lake_root):
@@ -367,7 +394,8 @@ def test_a_file_from_tonights_session_does_not_page(fixture_lake: FixtureLake, l
     outcome, _, transport = _run(root, now=EVENING, bucket_source=_source(client))
 
     assert _pages(transport) == []
-    assert outcome.nightly.report[0] == f"bucket copy current: nothing owed from before {MONDAY}"
+    assert outcome.nightly.report[0] == "bucket copy current"
+    assert outcome.nightly.report_kinds[0] == HEALTHY
 
 
 def test_a_file_from_the_session_before_tonights_pages(fixture_lake: FixtureLake):
@@ -410,6 +438,57 @@ def test_a_catch_up_morning_measures_from_the_session_it_follows(fixture_lake: F
     _owe(root, _chains_rel(EARLIER, "QQQ"))
     _, _, transport = _run(root, now=morning + timedelta(minutes=1), bucket_source=_source(client))
     assert len(_pages(transport)) == 1
+
+
+def _checked(
+    root: Path, client: FakeS3, now: datetime, calendar, event: str = BUCKET_BEHIND_EVENT
+) -> tuple[list, tuple]:
+    """The check alone, for the cases about the clock, which the whole sweep adds nothing to."""
+    transport = FakeTransport()
+    lines = ReportLines()
+    sweep._check_bucket_copy(
+        root,
+        bucket_source=_source(client),
+        now=now,
+        calendar=calendar,
+        publisher=Publisher(lake_root=root, transport=transport),
+        report=lines,
+    )
+    return _pages(transport, event), lines.lines
+
+
+@pytest.mark.parametrize(
+    ("minute", "pages"),
+    [(29, 0), (30, 1), (31, 1)],
+    ids=["a minute before the moment", "at the moment", "a minute after"],
+)
+def test_a_session_counts_from_its_close_plus_fifteen_minutes(lake_root, minute, pages):
+    """The design's moment, the option close at 16:15 plus 15 minutes, written as literals.
+
+    Before it the last compacted session is Friday, so a Friday file is not late yet. From it
+    the last compacted session is Monday, so the same file is.
+    """
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _chains_rel(EARLIER, "QQQ"))
+    calendar = weekday_sessions(WEEK_BEFORE, MONDAY)
+
+    page_list, _ = _checked(lake_root, client, _et(MONDAY, 16, minute), calendar)
+
+    assert len(page_list) == pages
+
+
+def test_a_monday_holiday_reaches_back_over_the_weekend(lake_root):
+    """Friday is the session before it, three days back, so a Friday file is not late yet."""
+    client = _seeded_lake(lake_root)
+    calendar = weekday_sessions(WEEK_BEFORE, MONDAY, holidays=(MONDAY,))
+    _owe(lake_root, _chains_rel(EARLIER, "QQQ"))
+
+    page_list, _ = _checked(lake_root, client, _evening(MONDAY), calendar)
+    assert page_list == []
+
+    _owe(lake_root, _chains_rel(date(2026, 9, 10), "QQQ"))
+    page_list, _ = _checked(lake_root, client, _evening(MONDAY), calendar)
+    assert len(page_list) == 1
 
 
 def test_a_holiday_pages_and_measures_from_the_session_before_it(fixture_lake: FixtureLake):
@@ -488,6 +567,69 @@ def test_a_source_that_raises_pages_by_type_alone(fixture_lake: FixtureLake):
     assert outcome.hand_off is True
 
 
+def _torn_with_entries_behind(root: Path) -> None:
+    """A fragment with one entry fused onto it, then a whole entry no read gets past."""
+    with (root / "manifest.jsonl").open("a") as handle:
+        handle.write('{"partition": "torn')
+    _owe(root, _chains_rel(WEDNESDAY))
+    _owe(root, _chains_rel(THURSDAY))
+
+
+def test_entries_hidden_behind_a_tear_refuse_rather_than_read_as_not_owed(lake_root):
+    """``read_ledger`` stops at the tear, so the two files behind it would read as no debt."""
+    client = _seeded_lake(lake_root)
+    _torn_with_entries_behind(lake_root)
+
+    with pytest.raises(TornLedger):
+        capture_owed(lake_root, TARGET, client)
+
+
+def test_a_byte_that_is_not_utf8_refuses_rather_than_reading_as_not_owed(lake_root):
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _chains_rel(WEDNESDAY))
+    path = lake_root / "manifest.jsonl"
+    path.write_bytes(path.read_bytes().replace(b"date=2026-09-16", b"date=2026-09-\xff6"))
+
+    with pytest.raises(LedgerNotUtf8):
+        capture_owed(lake_root, TARGET, client)
+
+
+def test_a_torn_tail_with_nothing_behind_it_still_answers(lake_root):
+    """The state a read racing a write can see, so it must not page as damage."""
+    client = _seeded_lake(lake_root)
+    _owe(lake_root, _chains_rel(WEDNESDAY))
+    with (lake_root / "manifest.jsonl").open("a") as handle:
+        handle.write('{"partition": "torn')
+
+    assert capture_owed(lake_root, TARGET, client).files == ((WEDNESDAY, _chains_rel(WEDNESDAY)),)
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    [b'{"partition": "torn', b"\xef\xbb\xbf" + b'{"partition": "x"}\n'],
+    ids=["torn first line", "byte-order mark"],
+)
+def test_a_manifest_with_no_whole_entry_is_unknown(lake_root, first_line):
+    (lake_root / "manifest.jsonl").write_bytes(first_line)
+
+    assert capture_owed(lake_root, TARGET, FakeS3()).unknown == (
+        "the lake's manifest holds no whole entry"
+    )
+
+
+def test_a_hidden_entry_pages_through_the_sweeps_containment(lake_root):
+    client = _seeded_lake(lake_root)
+    _torn_with_entries_behind(lake_root)
+
+    page_list, lines = _checked(
+        lake_root, client, _evening(NEXT_MONDAY), _calendar(), BUCKET_UNCHECKED_EVENT
+    )
+
+    assert len(page_list) == 1
+    assert "TornLedger" in page_list[0].body
+    assert lines == ("bucket copy not checked: TornLedger",)
+
+
 def test_a_damaged_lake_manifest_pages_rather_than_raising(lake_root):
     client = _seeded_lake(lake_root)
     with (lake_root / "manifest.jsonl").open("a") as handle:
@@ -533,6 +675,74 @@ def test_the_page_goes_out_before_any_walk_can_raise(fixture_lake: FixtureLake, 
         _run(root, now=EVENING, transport=transport, bucket_source=_source(client))
 
     assert len(_pages(transport)) == 1
+
+
+def test_a_short_runway_still_leads_the_report(fixture_lake: FixtureLake, monkeypatch):
+    """The digest is cut at its byte cap, so an ``ACTION`` line stays above this healthy one."""
+    root = _lake(fixture_lake)
+    client = _seed(root)
+    _stub_free(monkeypatch, 0)
+
+    outcome, _, _ = _run(root, now=EVENING, bucket_source=_source(client))
+
+    assert outcome.nightly.report[0].startswith("disk runway")
+    assert "bucket copy current" in outcome.nightly.report
+
+
+@pytest.mark.parametrize("late", [True, False], ids=["late file", "no answer"])
+def test_a_run_with_no_publisher_files_the_line_and_sends_nothing(lake_root, late):
+    """``sweep`` allows ``None`` for a test run, so the check must not reach through it."""
+    client = _seeded_lake(lake_root)
+    if late:
+        _owe(lake_root, _chains_rel(EARLIER, "QQQ"))
+    else:
+        client.fail_with = client_error("AccessDenied", "HeadObject", 403)
+    lines = ReportLines()
+
+    sweep._check_bucket_copy(
+        lake_root,
+        bucket_source=_source(client),
+        now=_evening(NEXT_MONDAY),
+        calendar=_calendar(),
+        publisher=None,
+        report=lines,
+    )
+
+    assert lines.kinds == (ACTION,)
+
+
+def test_the_pages_match_the_designs_message_table_literally():
+    # Compared against literals, because a constant compared to itself passes whatever it says.
+    assert BUCKET_BEHIND_EVENT == "sweep_bucket_behind"
+    assert BUCKET_BEHIND_TITLE == "Capture at risk: captured data not in the bucket"
+    assert BUCKET_UNCHECKED_EVENT == "sweep_bucket_unchecked"
+    assert BUCKET_UNCHECKED_TITLE == "Capture at risk: bucket copy not checked"
+    design = (Path(__file__).parents[2] / "docs" / "design.md").read_text()
+    assert f"`{BUCKET_BEHIND_TITLE}`" in design
+    assert f"`{BUCKET_UNCHECKED_TITLE}`" in design
+
+
+def test_the_pages_live_copy_figure_is_the_live_rules_two_lives():
+    """The number the phone shows, read from the rule that sets it."""
+    rules = (Path(__file__).parents[2] / "infra" / "live" / "bucket.tf").read_text()
+    live = rules[rules.index('prefix = "lake-live/"') :]
+    expires = int(re.search(r"expiration \{\s*days\s*=\s*(\d+)", live).group(1))
+    noncurrent = int(re.search(r"noncurrent_days\s*=\s*(\d+)", live).group(1))
+
+    assert expires + noncurrent == sweep.LIVE_COPY_DAYS
+
+
+def test_the_body_tells_chains_from_quotes(fixture_lake: FixtureLake):
+    """Chains have no live copy, so the 97 days must never read as their margin."""
+    root = _lake(fixture_lake)
+    client = _seed(root)
+    _owe(root, _chains_rel(EARLIER, "QQQ"))
+
+    _, _, transport = _run(root, now=EVENING, bucket_source=_source(client))
+
+    (page,) = _pages(transport)
+    assert "Chains have no other copy" in page.body
+    assert f"quotes' live copies expire about {sweep.LIVE_COPY_DAYS} days" in page.body
 
 
 def test_the_body_carries_no_path_or_bucket_name(fixture_lake: FixtureLake):
@@ -599,6 +809,17 @@ def test_the_evening_run_carries_the_source_from_the_config(tmp_path, lake_root,
     assert callable(seen["bucket_source"])
 
 
+def test_a_shadow_hosts_evening_run_gets_no_source(tmp_path, lake_root, monkeypatch):
+    path = _bucket_config(tmp_path, lake_root, role="shadow")
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(sweep, "sweep", lambda **kwargs: seen.update(kwargs))
+    monkeypatch.setattr(sweep, "load_tickers", lambda _path: None)
+
+    sweep.sweep_from_config(config_path=path)
+
+    assert seen["bucket_source"] is None
+
+
 def test_the_hand_check_pages_and_exits_one_when_files_are_late(
     tmp_path, lake_root, monkeypatch, capsys
 ):
@@ -619,7 +840,40 @@ def test_the_hand_check_pages_and_exits_one_when_files_are_late(
     assert code == 1
     assert len(_pages(transport)) == 1
     assert pinger.urls == []
-    assert f"bucket copy behind: 1 captured file, oldest {EARLIER}" in capsys.readouterr().out
+    assert f"sweep: bucket copy behind: 1 captured file, oldest {EARLIER}" in (
+        capsys.readouterr().out
+    )
+
+
+def test_the_hand_check_exits_one_when_the_bucket_will_not_answer(
+    tmp_path, lake_root, monkeypatch, capsys
+):
+    """The runbook takes exit 0 as a repair confirmed, so a failed read must not exit 0."""
+    client = _seeded_lake(lake_root)
+    client.fail_with = client_error("AccessDenied", "HeadObject", 403)
+    path = _bucket_config(tmp_path, lake_root)
+    transport = FakeTransport()
+    monkeypatch.setattr(bucket, "connect", lambda config: (TARGET, client))
+    monkeypatch.setattr("lake.alert.NtfyTransport", lambda topic: transport)
+
+    code = sweep.main(
+        ["--config", str(path), "--bucket-check"],
+        clock=ManualClock(_evening(NEXT_MONDAY)),
+    )
+
+    assert code == 1
+    assert len(_pages(transport, BUCKET_UNCHECKED_EVENT)) == 1
+    assert "sweep: bucket copy not checked: bucket refused" in capsys.readouterr().out
+
+
+def test_the_hand_check_answers_a_bad_config_with_one_line_and_exit_two(tmp_path, capsys):
+    path = tmp_path / "config.yaml"
+    path.write_text("lake_root: [not, a, path\n")
+
+    with pytest.raises(SystemExit) as exited:
+        sweep.main(["--config", str(path), "--bucket-check"])
+
+    assert exited.value.code == 2
 
 
 def test_the_hand_check_sends_nothing_and_exits_zero_on_a_current_bucket(
@@ -638,7 +892,7 @@ def test_the_hand_check_sends_nothing_and_exits_zero_on_a_current_bucket(
 
     assert code == 0
     assert transport.messages == []
-    assert "bucket copy current" in capsys.readouterr().out
+    assert capsys.readouterr().out == "sweep: bucket copy current\n"
 
 
 def test_the_hand_check_on_a_shadow_says_so_and_never_connects(

@@ -179,7 +179,7 @@ from lake.control_plane import (
     VENDOR_SWEEP,
     WallClockTime,
 )
-from lake.journal import F_FULLFSYNC
+from lake.journal import F_FULLFSYNC, JOURNALED_SURFACES
 from lake.lock import lake_lock
 from lake.manifest import (
     _NAMED_PATHS,
@@ -194,6 +194,7 @@ from lake.manifest import (
     latest_entries,
     manifest_path,
     parse_jsonl,
+    refuse_damaged_manifest,
     sha256_file,
 )
 from lake.paths import (
@@ -1459,6 +1460,21 @@ class _Uploader:
         self.put(rel, data, b64_sha256(data))
 
 
+def _pending(ledger: Ledger, mark: int) -> list[str]:
+    """Every path whose latest entry sits at or past the watermark ``mark``.
+
+    The nightly upload sends these, and ``capture_owed`` reads what the sweep pages on from
+    the same list, so a change to what uploads moves the alarm with it.
+    """
+    return [rel for rel, position in ledger.last.items() if position >= mark]
+
+
+def _superseded(rel: str, ledger: Ledger) -> bool:
+    """Whether ``rel`` is a ``journal/`` segment whose compacted partition is manifested."""
+    compacted = _compacted_partition_for_segment(rel)
+    return compacted is not None and compacted in ledger.latest
+
+
 def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterator[tuple[str, str]]:
     """The manifested files to upload among ``rels``, as ``(rel, hex sha256)``.
 
@@ -1469,10 +1485,7 @@ def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterato
     the upload rather than letting the watermark claim a file the bucket never got.
     """
     for rel in sorted(rels):
-        if rsync_excluded(rel, is_dir=False):
-            continue
-        compacted = _compacted_partition_for_segment(rel)
-        if compacted is not None and compacted in ledger.latest:
+        if rsync_excluded(rel, is_dir=False) or _superseded(rel, ledger):
             continue
         if not (root / rel).is_file():
             raise ManifestedFileMissing(
@@ -1505,10 +1518,7 @@ def first_upload_files(
     """
     trimmed: Mapping[str, dict] | None = None
     for rel in sorted(rels):
-        if rsync_excluded(rel, is_dir=False):
-            continue
-        compacted = _compacted_partition_for_segment(rel)
-        if compacted is not None and compacted in ledger.latest:
+        if rsync_excluded(rel, is_dir=False) or _superseded(rel, ledger):
             continue
         # The present file is handled before the absence reads anything, the order
         # :func:`manifested_files` keeps, so an entry with no ``sha256`` whose file is missing
@@ -1645,8 +1655,7 @@ def nightly_upload(
     listing = list_bucket(client, target)
     for rel, hexdigest in _heal_files(ledger, mark):
         uploader.heal(rel, hexdigest)
-    pending = [rel for rel, position in ledger.last.items() if position >= mark]
-    for rel, hexdigest in manifested_files(root, ledger, pending):
+    for rel, hexdigest in manifested_files(root, ledger, _pending(ledger, mark)):
         uploader.manifested(rel, hexdigest, listed=rel in listing)
     for rel, path in _unmanifested(root, ledger):
         uploader.unmanifested(rel, path, listing.get(rel))
@@ -1908,10 +1917,11 @@ class _CopyReach:
 def _copy_reach(ledger: Ledger, target: BucketTarget, client: Any) -> _CopyReach:
     """Read the bucket's manifest copy against the lake's, for the two checks that compare them.
 
-    The Sunday scrub and :func:`capture_owed` share this, so the two cannot disagree on where
-    the bucket's copy ends. A copy whose stored SHA-256 proves it a prefix costs one
+    The Sunday scrub and :func:`capture_owed` share this, so those two cannot disagree on
+    where the bucket's copy ends. A copy whose stored SHA-256 proves it a prefix costs one
     ``HeadObject``. Anything else is downloaded once to tell a copy that holds no usable
-    checksum from one that really parted from the lake.
+    checksum from one that really parted from the lake. The nightly upload reads the same two
+    values through its own steps, because it refuses a copy these checks only report.
     """
     copy = read_copy_state(client, target, ledger.raw)
     if not copy.present:
@@ -1987,10 +1997,6 @@ def _bucket_scrub(
 
 # -- what the upload still owes the bucket ---------------------------------------
 
-# The two surfaces whose rows no vendor can supply again. ``bars`` comes back from the vendor
-# and ``actions`` from the lake's own rows, so neither joins the evening's page.
-_CAPTURED_SURFACES = frozenset({CHAINS, QUOTES})
-
 
 @dataclass(frozen=True)
 class CaptureOwed:
@@ -2010,18 +2016,20 @@ class CaptureOwed:
 def _captured_day(rel: str, ledger: Ledger) -> date | None:
     """The day of a sealed partition or an unsealed segment of captured data, else ``None``.
 
-    A segment counts only while its partition is unmanifested, which is the rule
-    :func:`manifested_files` uploads by. A sealed day's segment entries are superseded and
-    their files are gone, so counting them would page on every healthy night. A refused day's
-    segments are that day's only copy on the lake, and so is a day no seal has reached.
+    Captured data is the journaled surfaces, the two whose rows no vendor can supply again in
+    full. A stuck upload holds ``bars/`` back too, and the next session's chains then page for
+    it, because one watermark covers every surface.
+
+    A segment counts only while :func:`_superseded` says its partition is unmanifested. A
+    sealed day's segment entries stay in the manifest after their files go, so counting them
+    would page on every healthy night. A refused day's segments are that day's only copy on
+    the lake, and so is a day no seal has reached.
     """
     partition = parse_partition_rel(rel)
     if partition is not None:
-        return partition.day if partition.surface in _CAPTURED_SURFACES else None
+        return partition.day if partition.surface in JOURNALED_SURFACES else None
     segment = parse_segment_rel(rel)
-    if segment is None or segment.surface not in _CAPTURED_SURFACES:
-        return None
-    if _compacted_partition_for_segment(rel) in ledger.latest:
+    if segment is None or segment.surface not in JOURNALED_SURFACES or _superseded(rel, ledger):
         return None
     return parse_date_dir(f"{DATE_PREFIX}{segment.day}")
 
@@ -2037,13 +2045,19 @@ def capture_owed(lake_root: Path, target: BucketTarget, client: Any) -> CaptureO
 
     A bucket that refuses or cannot be reached, a copy that is absent and a copy that parted
     from the lake each come back as ``unknown``, never as an empty answer, because an alarm
-    that cannot read must not read as healthy. A bug and a damaged lake manifest raise, and
-    the caller contains them for the same reason. An empty lake owes nothing and sends no
-    request.
+    that cannot read must not read as healthy. A lake with no manifest and a bucket with a copy
+    is the parted case, at byte 0, which is what a lost or unmounted volume looks like, so only
+    a lake and a bucket that both hold nothing owe nothing. A manifest that holds no whole entry
+    is ``unknown`` too. Bytes that hide entries behind damage raise through
+    ``manifest.refuse_damaged_manifest``, because ``read_ledger`` stops at the damage and an
+    entry it never saw would read as an entry not owed. That read stays tolerant, since the
+    upload needs it. A bug raises too, and the caller contains both for the same reason.
     """
-    ledger = read_ledger(Path(lake_root))
-    if not ledger.entries:
-        return CaptureOwed()
+    root = Path(lake_root)
+    ledger = read_ledger(root)
+    refuse_damaged_manifest(root, ledger.raw, ledger.entries)
+    if ledger.raw and not ledger.entries:
+        return CaptureOwed(unknown="the lake's manifest holds no whole entry")
     try:
         reach = _copy_reach(ledger, target, client)
     except Exception as exc:
@@ -2053,15 +2067,15 @@ def capture_owed(lake_root: Path, target: BucketTarget, client: Any) -> CaptureO
         kind, detail = failure
         return CaptureOwed(unknown=f"bucket {kind} ({detail})")
     if reach.absent:
+        if not ledger.entries:
+            return CaptureOwed()
         return CaptureOwed(unknown="the bucket holds no usable manifest copy")
     if reach.diverged_at is not None:
         return CaptureOwed(
             unknown=f"the bucket's manifest copy parted from the lake's at byte {reach.diverged_at}"
         )
     owed: list[tuple[date, str]] = []
-    for rel, position in ledger.last.items():
-        if position < reach.mark:
-            continue
+    for rel in _pending(ledger, reach.mark):
         day = _captured_day(rel, ledger)
         if day is not None:
             owed.append((day, rel))

@@ -109,6 +109,8 @@ REQUIRED = [
     (sweep._friday_wake, "schedule_setter"),
     (sweep._friday_wake, "schedule_reader"),
     (sweep.sweep, "cost_client"),
+    (sweep.sweep, "bucket_source"),
+    (sweep._check_bucket_copy, "bucket_source"),
     (reauth.reauth, "login_flow"),
     (reauth.reauth_from_config, "login_flow"),
     (reauth.reauth_from_config, "store_client_factory"),
@@ -119,6 +121,7 @@ REQUIRED = [
     (bucket.nightly_upload, "client"),
     (bucket.first_upload, "client"),
     (bucket.bucket_scrub, "client"),
+    (bucket.capture_owed, "client"),
     (bucket.BucketBackup, "client"),
     (live_upload.prepare, "connect"),
     (live_upload.LiveUpload, "client"),
@@ -168,6 +171,7 @@ FORBIDDEN = [
     (control_plane.main, "bucket_client"),
     (sweep.main, "execv"),
     (sweep.main, "cost_client"),
+    (sweep.main, "bucket_source"),
 ]
 
 

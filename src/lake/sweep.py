@@ -47,13 +47,14 @@ and every night it stays that short, with no state kept between runs. Running fi
 the page goes out even when a later raise loses the report file, and it puts the line at
 the top of the digest, which is truncated at ``DIGEST_BYTE_CAP``. Marketlake #438.
 
-**The bucket check runs beside the runway check**, ahead of step 1 and on a holiday too, on
-a primary whose ``backup_target`` is a bucket. It reads how far the bucket's manifest copy
+**The bucket check runs right after the runway check**, ahead of step 1 and on a holiday too,
+on a primary whose ``backup_target`` is a bucket. It reads how far the bucket's manifest copy
 reaches through ``bucket.capture_owed``, and it pages every run while a captured file dated
 before the last compacted session stays past that point. A failed upload pages once, on the
-transition of the ``compaction`` and ``evening-upload`` checks, and a check that stays down
-sends nothing more. So this job is what keeps saying so, and a run holds no state between
-nights: the page clears when the upload moves the watermark, and on nothing else. A read
+transition of the ``compaction`` and ``evening-upload`` checks, nothing in this repository
+repeats that page, and whether the healthchecks account sends reminders was not determined.
+So this job is what keeps saying so, and a run holds no state between nights: the page clears
+when the upload moves the watermark, and on nothing else. A read
 that could not answer pages too, under its own title, because an alarm that cannot look must
 not read as healthy. ``python -m lake.sweep --bucket-check`` runs this step alone and sends
 what it finds, which is how an operator confirms a repair and how the drill reaches the
@@ -291,6 +292,10 @@ BUCKET_UNCHECKED_TITLE = "Capture at risk: bucket copy not checked"
 
 # Where both pages send the operator, by heading rather than by URL.
 BUCKET_REPAIR = "infra/README.md, Captured data not in the bucket"
+
+# How long a live quotes segment's bytes last after upload, in days: the ``live`` rule's seven
+# at the key and 90 as a noncurrent version, in ``infra/live/bucket.tf``.
+LIVE_COPY_DAYS = 97
 
 # How far back the bucket check looks for the last compacted session. The longest run of days
 # with no session this exchange has had is well under this. A calendar that names none in the
@@ -1024,10 +1029,10 @@ def _check_bucket_copy(
 
     A file from the last compacted session itself counts for nothing yet. That session's
     upload may still be the one the ``compaction`` and ``evening-upload`` checks are about to
-    answer for, and those two page first. So the first page here lands the next weekday, and
-    it lands every weekday after that until the upload moves the watermark. A healthy night
-    writes one ``HEALTHY`` line, because an alarm that reads zero needs a record that it
-    looked.
+    answer for, and those two page first. So the first page here lands on the next session's
+    evening, and it lands every weekday after that until the upload moves the watermark. A
+    healthy night writes one ``HEALTHY`` line, because an alarm that reads zero needs a record
+    that it looked.
 
     The answer comes from the bucket and the lake's manifest on every run, and nothing is
     kept between runs. The check neither withholds the ping nor reaches ``problems``, for the
@@ -1036,11 +1041,14 @@ def _check_bucket_copy(
     which is why this page repeats. The sweep is its own process, so it cannot spend a capture
     page's place under ``alert.DEFAULT_DAILY_CAP``.
 
-    Everything raises into one containment, the settings refused while connecting and a
-    damaged lake manifest included, because a raise here would take the digest, the ping and
-    the hand-off with it, and the hand-off is the upload that might clear the debt. What it
-    catches becomes the same page as a bucket that could not answer, under the exception's
-    type alone, since the page reaches ntfy.sh.
+    The connection, the read and the calendar walk raise into one containment, the settings
+    refused while connecting and a damaged lake manifest included, because a raise here would
+    take the digest, the ping and the hand-off with it, and the hand-off is the upload that
+    might clear the debt. What it catches becomes the same page as a bucket that could not
+    answer, under the exception's type alone, since the page reaches ntfy.sh.
+
+    It speaks only while this job runs. A run stopped before it, by a config or roster that
+    will not load, leaves the debt to the ``eod-sweep`` check's own page.
     """
     if bucket_source is None:
         return
@@ -1049,14 +1057,15 @@ def _check_bucket_copy(
     try:
         target, client = bucket_source()
         owed = capture_owed(lake_root, target, client)
+        last = _last_compacted_session(now, calendar)
     except Exception as exc:  # noqa: BLE001 - an alarm that cannot run must say so, not stop the job
         owed = CaptureOwed(unknown=type(exc).__name__)
     if owed.unknown is not None:
         report.add(f"bucket copy not checked: {owed.unknown}", ACTION)
         if publisher is not None:
             body = (
-                f"The sweep could not read the bucket's manifest copy: {owed.unknown}. "
-                f"Captured data may be off the bucket: {BUCKET_REPAIR}."
+                f"The sweep could not compare the lake's manifest with the bucket's copy: "
+                f"{owed.unknown}. Captured data may be off the bucket: {BUCKET_REPAIR}."
             )
             _page(
                 publisher,
@@ -1065,10 +1074,9 @@ def _check_bucket_copy(
                 now=now,
             )
         return
-    last = _last_compacted_session(now, calendar)
     late = [day for day, _ in owed.files if day < last]
     if not late:
-        report.add(f"bucket copy current: nothing owed from before {last.isoformat()}", HEALTHY)
+        report.add("bucket copy current", HEALTHY)
         return
     count = len(late)
     noun = "file" if count == 1 else "files"
@@ -1077,7 +1085,8 @@ def _check_bucket_copy(
     if publisher is not None:
         body = (
             f"{count} captured {noun} off the bucket, oldest {oldest}. The upload is not "
-            f"landing, and the live copies expire about 97 days after upload: {BUCKET_REPAIR}."
+            f"landing. Chains have no other copy, and quotes' live copies expire about "
+            f"{LIVE_COPY_DAYS} days after upload: {BUCKET_REPAIR}."
         )
         _page(
             publisher,
@@ -1433,19 +1442,6 @@ def sweep(
     if not version_check.ok:
         report.add(version_check.summary, ACTION)
 
-    # **Marketlake #996: captured data the bucket does not hold**, ahead of every walk and on
-    # a holiday too, so the page goes out even when a later raise loses the report file, the
-    # reason the runway check below gives. It reads the bucket and not the upload's outcome,
-    # so it still speaks on the night the upload stopped speaking.
-    _check_bucket_copy(
-        root,
-        bucket_source=bucket_source,
-        now=now,
-        calendar=calendar,
-        publisher=publisher,
-        report=report,
-    )
-
     # **Marketlake #438: the disk runway**, once the day's journal has been compacted. Before
     # then the growing journal is already missing from free space and the full journal
     # reserve comes off as well, so a catch-up run mid-session would read 9 to 13 sessions
@@ -1464,6 +1460,20 @@ def sweep(
         _check_disk_runway(
             root, day=day, now=now, calendar=calendar, publisher=publisher, report=report
         )
+
+    # **Marketlake #996: captured data the bucket does not hold**, ahead of every walk and on
+    # a holiday too, so the page goes out even when a later raise loses the report file, the
+    # reason the module docstring gives the runway check. It reads the bucket and not the
+    # upload's outcome, so it still speaks on the night the upload stopped speaking. It sits
+    # after the runway check so a runway ``ACTION`` line still leads the digest.
+    _check_bucket_copy(
+        root,
+        bucket_source=bucket_source,
+        now=now,
+        calendar=calendar,
+        publisher=publisher,
+        report=report,
+    )
 
     if session:
         closed = calendar.session_close(day) <= now
@@ -2128,6 +2138,7 @@ __all__ = [
     "DISK_RUNWAY_REPAIR",
     "DISK_RUNWAY_TITLE",
     "HOLIDAY_BODY",
+    "LIVE_COPY_DAYS",
     "NIGHTLY_EVENT",
     "NIGHTLY_PRIORITY",
     "ScheduleSetter",

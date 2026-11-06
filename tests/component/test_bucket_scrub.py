@@ -442,6 +442,17 @@ class _HeadsFail(FakeS3):
         raise unreachable()
 
 
+def test_the_versioning_line_survives_a_copy_that_parted_from_the_lake(tmp_path):
+    lake, client = _uploaded(tmp_path / "lake")
+    client.versioning = "Suspended"
+    client.store(_key("manifest.jsonl"), b"not the lake's manifest\n")
+
+    result = bucket_scrub(lake, TARGET, client)
+
+    assert result.manifest_diverged_at == 0
+    assert any(line.startswith("bucket versioning is Suspended") for line in result.notes)
+
+
 def test_the_versioning_line_survives_a_bucket_that_fails_mid_scrub(tmp_path):
     lake, uploaded = _uploaded(tmp_path / "lake")
     client = _HeadsFail(versioning="Suspended")
