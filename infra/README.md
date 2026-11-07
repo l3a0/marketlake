@@ -1731,21 +1731,28 @@ not start a second sweep on a VM short of memory while it reads `activating`.
 #### When the swap step fails
 
 The bootstrap prints `the swap step failed:` and the reason, carries on, and ends on exit 4
-once the units are installed. A deploy then ends `with a failed step in deploy.log`.
-Capture runs without swap, but the next sweep can run out of memory as it did in
-[#1006](https://github.com/l3a0/marketlake/issues/1006). So fix this before that day's 18:30 sweep, after the 16:15 ET close, with a hand
-rerun of the bootstrap, as [Rerun the bootstrap](#rerun-the-bootstrap) says. A deploy
-arrives too late, because `lake.deploy_window` refuses one before 18:45 ET on a weekday,
-unless the owner [overrides the window](#override-the-deploy-window).
+once the units are installed. A deploy then ends `with a failed step in deploy.log`, or
+`not restarted`, whose log holds the line. A first boot's output goes to
+`/var/log/cloud-init-output.log`. Capture runs without swap, but the next sweep can run out
+of memory as it did in [#1006](https://github.com/l3a0/marketlake/issues/1006). Fix this
+before the next 18:30 sweep, outside a session, with a hand rerun, as
+[Rerun the bootstrap](#rerun-the-bootstrap) says. On a session day's afternoon a deploy
+cannot help, because the window refuses it until 18:45. Only the owner can
+[override the window](#override-the-deploy-window).
 
-A swap failure also leaves the deploy record absent, and a hand rerun does not clear that,
-so each deploy restarts the daemon until the next one passes every step and writes the
-record.
+A deploy that restarts the daemon after a swap failure leaves the record absent, and a hand
+rerun does not clear that, so each deploy restarts the daemon until one passes every step
+and writes the record. A deploy with no restart owed keeps the record it found.
 
 When the line says `swapon failed on /swapfile`, read `swapon`'s own error, just above that
-line in `deploy.log` or on the screen. Remove the file only when the error names the swap
-header or signature, because the bootstrap never rebuilds a file at that name. The next run
-then makes a new one.
+line in `deploy.log` or on the screen. After a first boot, find it with this command.
+
+```bash
+grep -n '^swapon:' /var/log/cloud-init-output.log
+```
+
+Remove the file only when the error names the swap header or signature, because the
+bootstrap never rebuilds a file at that name. The next run then makes a new one.
 
 ```bash
 sudo rm /swapfile
@@ -1754,9 +1761,12 @@ sudo rm /swapfile
 When the line says `/swapfile is not a regular file`, something else stands at the path.
 Read what it is with `ls -ld /swapfile` before removing it.
 
-When the line names `/etc/fstab`, the file is as it was and swap stays on until the VM next
-stops, so a later start has no swap until a rerun adds the line. A line that ends
-`the last install reloads systemd` needs nothing, because the swap line is on disk.
+When the line says `could not build the new fstab text`, or names a failed write of
+`/etc/fstab`, the file is as it was. Swap stays on until the VM next stops, so a later start
+has no swap until a rerun adds the line.
+
+When the line says `daemon-reload failed after writing`, the swap line landed and carries
+`nofail`. It needs nothing, because the last install reloads systemd.
 
 ### Turn the swap off
 

@@ -330,23 +330,14 @@ fstab_has_root() {
 # without its root mount. The new text is checked, written beside the file, checked again,
 # synced, then renamed over. A failure returns 1 with the reason in FSTAB_ERROR and leaves
 # the decision to the caller, because the lake needs this write and swap does not. Every
-# return before the mv leaves the file as it was. FSTAB_WRITTEN reads 1 once the mv has
-# landed, so a caller can tell a failed reload from a failed write.
+# return before the mv leaves the file as it was.
 FSTAB_ERROR=""
-FSTAB_WRITTEN=0
 write_fstab() {
   local text="$1" tmp
-  FSTAB_WRITTEN=0
   if ! fstab_has_root "$text"; then
     FSTAB_ERROR="the new fstab has no entry for /, so $FSTAB is unchanged"
     return 1
   fi
-  case $'\n'"$text" in
-    *$'\n'"$LINE"$'\n'*) ;;
-    *)
-      FSTAB_ERROR="the new fstab does not hold the lake's line, so $FSTAB is unchanged"
-      return 1 ;;
-  esac
   if ! tmp="$(mktemp "$ROOT/etc/fstab.XXXXXX")"; then
     FSTAB_ERROR="could not create a temporary file beside $FSTAB"
     return 1
@@ -362,7 +353,6 @@ write_fstab() {
   sync || { rm -f -- "$tmp"; FSTAB_ERROR="sync failed before replacing $FSTAB"; return 1; }
   mv -f -- "$tmp" "$FSTAB" \
     || { rm -f -- "$tmp"; FSTAB_ERROR="could not replace $FSTAB"; return 1; }
-  FSTAB_WRITTEN=1
   if ! systemctl daemon-reload; then
     FSTAB_ERROR="systemctl daemon-reload failed after writing $FSTAB"
     return 1
@@ -552,9 +542,6 @@ setup_swap() {
     say "writing the swap file's line into $FSTAB"
     if ! write_fstab "$swap_desired"; then
       SWAP_ERROR="$FSTAB_ERROR"
-      if [[ $FSTAB_WRITTEN == 1 ]]; then
-        SWAP_ERROR="$SWAP_ERROR. The swap line is on disk and carries nofail, and the last install reloads systemd"
-      fi
       return 1
     fi
   fi

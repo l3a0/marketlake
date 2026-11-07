@@ -47,7 +47,7 @@ The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O err
 make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
 ``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that exists, an empty one
 included, because util-linux 2.39.3 exits 0 on a table with no entries. On a missing file it
-exits 1 whatever the knob says, so a test cannot pass against a check looser than the real one.
+exits 1 whatever the knob says.
 ``FINDMNT_TREE_RC`` is the exit of ``findmnt -R``. ``FSTAB_SOURCE`` overrides what
 ``findmnt --fstab`` reads. ``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC``
 fail those tools, and ``INSTALLER_RC`` fails the uv installer the fake ``curl`` writes. That

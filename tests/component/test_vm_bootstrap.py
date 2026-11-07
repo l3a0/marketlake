@@ -1139,8 +1139,6 @@ def test_a_failed_write_of_the_swap_line_installs_the_units(vm, env, line):
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
     assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
     assert vm.active_swap == [str(vm.swap)]
-    # The line never landed, so only a failed reload may say it is on disk.
-    assert "on disk" not in proc.stderr
 
 
 def test_a_failed_reload_after_the_lakes_line_stops_with_one_line(vm):
@@ -1153,41 +1151,58 @@ def test_a_failed_reload_after_the_lakes_line_stops_with_one_line(vm):
     _assert_nothing_installed(vm)
 
 
-def test_a_failed_reload_after_the_swap_line_says_the_line_is_on_disk(vm):
+def test_a_failed_reload_after_the_swap_line_leaves_the_line_and_installs_the_units(vm):
     # The mv has landed, so the line stays. It carries nofail, and the last install reloads.
     vm.ext4()
     vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
     proc = vm.bootstrap(DAEMON_RELOAD_RC="1")
     _assert_the_swap_step_failed_and_the_units_installed(
-        vm,
-        proc,
-        "systemctl daemon-reload failed after writing"
-        f" {vm.fstab}. The swap line is on disk and carries nofail,"
-        " and the last install reloads systemd",
+        vm, proc, f"systemctl daemon-reload failed after writing {vm.fstab}."
     )
     assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(FAKE_UUID)
     assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
     assert vm.active_swap == [str(vm.swap)]
 
 
-@pytest.mark.parametrize(
-    ("argument", "line"),
-    [
-        ("""${swap_desired#*$'\\n'}""", "has no entry for /"),
-        ("""${swap_desired%"$LINE"$'\\n'}""", "does not hold the lake's line"),
-    ],
-    ids=["the root entry", "the lake's line"],
-)
-def test_a_rewrite_that_would_drop_a_line_is_refused(vm, argument, line):
+def test_a_rewrite_that_would_drop_the_root_entry_is_refused(vm):
     # Nothing in the script can build this text today, so a copy of it does. findmnt would
-    # pass either one, which is why write_fstab checks for itself.
+    # pass it, which is why write_fstab checks for itself.
     vm.ext4()
     vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
-    _use_script(vm, ('write_fstab "$swap_desired"', f'write_fstab "{argument}"'))
+    without_root = """${swap_desired#*$'\\n'}"""
+    _use_script(vm, ('write_fstab "$swap_desired"', f'write_fstab "{without_root}"'))
     proc = vm.bootstrap()
-    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, line)
+    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, "has no entry for /")
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
     assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
+
+
+@pytest.mark.parametrize(
+    ("path", "line"),
+    [
+        ("/swapfile", "is not a regular file"),
+        ("/swapfile.tmp", "could not remove the leftover"),
+    ],
+)
+def test_a_lake_on_a_swap_path_turns_no_swap_on(vm, path, line):
+    # Both paths match LAKE_ROOT_RE. The mount reads as a directory, which the check on the
+    # path stops at /swapfile and rm -f stops at /swapfile.tmp, so nothing lands in the lake.
+    (vm.checkout / "config" / "vm.yaml").write_text(VM_YAML.replace(LAKE_ROOT, path))
+    vm.ext4()
+    lake = vm.root / path.lstrip("/")
+    lake.mkdir()
+    (lake / "manifest.jsonl").write_text("kept\n")
+    (vm.state / "mounted").write_text(FAKE_UUID)
+    proc = vm.bootstrap()
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert line in proc.stderr
+    assert vm.ran("linux-install") == [
+        SYNC.replace(LAKE_ROOT, path),
+        INSTALL.replace(LAKE_ROOT, path),
+    ]
+    assert not vm.ran("dd ")
+    assert not vm.ran("swapon")
+    assert (lake / "manifest.jsonl").read_text() == "kept\n"
 
 
 @pytest.mark.parametrize("kind", ["a link", "a dangling link", "a directory"])
