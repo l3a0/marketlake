@@ -56,8 +56,9 @@ the directories ``chattr +i`` has marked.
 Each fake logs its argv to ``$LOG``, except ``cat``, which the other fakes call too.
 ``python3`` runs the test's own interpreter, which has PyYAML, and logs only its first
 argument, since the second is a whole program. ``chmod``, ``find``, ``mv`` and ``rm`` log
-and then run the real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, which a
-Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to its line when it inherits
+and then run the real tool, inside the test root, and ``rm`` drops GNU's
+``--one-file-system``, which a Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to
+its line when it inherits
 an open descriptor 9, which is the one the scripts lock the install lock through, so a
 test sees a wait that holds the lock.
 ``mktemp`` with no template makes its file in ``$TMPDIR``, as GNU's does and a Mac's does
