@@ -1591,6 +1591,67 @@ def test_a_gap_row_takes_the_type_the_segments_hold(lake_root):
     assert pq.read_schema(partition).field(COLUMN).type == pa.float64()
 
 
+def _lost_beside(lake_root: Path, kept: Path) -> None:
+    rel = kept.with_name("seg-c-4242.arrows").relative_to(lake_root).as_posix()
+    append_manifest(
+        lake_root,
+        partition=rel,
+        source="capture",
+        sha256="a" * 64,
+        rows=2,
+        fetched_at=_et(DAY, 10, 5).isoformat(),
+    )
+
+
+def test_a_gap_row_takes_a_type_from_a_later_segment(lake_root):
+    """A mid-day rotation can add a column, so the first segment may not hold it."""
+    older = CHAINS_SCHEMA.remove(CHAINS_SCHEMA.get_field_index(COLUMN))
+    retyped = _retyped(COLUMN, pa.float64())
+    first = _segment(lake_root, older, _table(older, _rows(2, snap_ts=_snap(DAY, 0))), start_ts="a")
+    _segment(lake_root, retyped, _table(retyped, _rows(2, snap_ts=_snap(DAY, 1))), start_ts="b")
+    _lost_beside(lake_root, first)
+
+    outcome = _repair(lake_root)
+
+    assert (outcome.rows, len(outcome.gaps)) == (5, 1)
+
+
+def test_a_gap_row_seals_a_day_captured_before_a_column_was_added(lake_root):
+    older = CHAINS_SCHEMA.remove(CHAINS_SCHEMA.get_field_index(COLUMN))
+    kept = _segment(lake_root, older, _table(older, _rows(2, snap_ts=_snap(DAY, 0))), start_ts="a")
+    _lost_beside(lake_root, kept)
+
+    outcome = _repair(lake_root)
+
+    assert (outcome.rows, len(outcome.gaps)) == (3, 1)
+
+
+def test_a_gap_row_alone_seals_a_day_whose_only_file_is_torn(lake_root):
+    rows = _rows(2, snap_ts=_snap(DAY, 0))
+    kept = _segment(lake_root, CHAINS_SCHEMA, _table(CHAINS_SCHEMA, rows), start_ts="a")
+    _lost_beside(lake_root, kept)
+    kept.write_bytes(kept.read_bytes()[:4])
+
+    outcome = _repair(lake_root)
+
+    assert (outcome.rows, len(outcome.gaps)) == (1, 1)
+
+
+def test_a_gap_row_keeps_the_value_in_a_column_the_segments_retyped(lake_root):
+    """A column with values is not the seal's to rename, so the merge answers for it."""
+    name = "schema_version"
+    other = pa.string()
+    retyped = _retyped(name, other)
+    table = _table(CHAINS_SCHEMA, _rows(2, snap_ts=_snap(DAY, 0))).set_column(
+        CHAINS_SCHEMA.get_field_index(name), retyped.field(name), pa.array(["1", "1"], type=other)
+    )
+    kept = _segment(lake_root, retyped, table, start_ts="a")
+    _lost_beside(lake_root, kept)
+
+    with pytest.raises(compact_module.SegmentSchemaConflict):
+        _repair(lake_root)
+
+
 def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):
     # The over-reach this whole design is built against. The flag authorizes one human
     # repair of one ticker-day, and the scheduled run has no way to ask for it. A sweep

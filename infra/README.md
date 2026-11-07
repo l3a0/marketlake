@@ -803,14 +803,13 @@ cases.
    holds a row. The upload carries on. A repair needs every segment of the day back and a
    hand-run `recompact_ticker_day` before the next compaction, because compaction deletes a
    segment copied back after the seal, unread. A lone returned chains segment repairs nothing,
-   so keep it outside `journal/`, and never pass `allow_shrink` on a partial set, which
-   replaces the partition with fewer rows. On a day with marker rows the
-   no-shrink guard refuses that rebuild, and `allow_shrink` passes it by dropping those rows. A
+   so keep it outside `journal/`. A rebuild drops the day's marker rows, and
+   [#999](https://github.com/l3a0/marketlake/issues/999) owns the procedure. A
    chains segment no upload carried has no copy, so its minute stays a gap. If a resync stopped
    part-way on this host, run it again, because that puts the bucket's partition back before or
-   after the seal. A ticker-day with no segment left gets no damage page or finding, and
+   after the seal. A ticker-day with no segment left gets no damage page or finding at first.
    `ManifestedFileMissing` and the Sunday scrub name it until the next daemon start marks the
-   day and the next compaction seals it. A ticker disabled since gets no marker, so a person
+   day and the next compaction seals it, which pages once. A ticker disabled since gets no marker, so a person
    has to clear that day.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its

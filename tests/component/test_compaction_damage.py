@@ -1542,18 +1542,20 @@ def test_a_segment_with_no_entry_leaves_nothing_to_miss(lake_root):
     assert [(item.ticker, item.rows) for item in result.sealed] == [("SPY", 4 * ROWS_PER_SEGMENT)]
 
 
-def test_a_rebuild_past_a_marker_row_needs_the_operators_say_so(lake_root):
-    """Marker segments have no copy, so the rebuild holds fewer rows than the seal did."""
+def _sealed_with_markers_then_restored(lake_root: Path, minutes: list[int]) -> None:
     spy = _captured(lake_root, "SPY")
     saved = {path: path.read_bytes() for path in spy}
     spy[2].unlink()
-    _marked(lake_root, "SPY", [30, 31, 32])
-    result, _ = _run(lake_root)
-    (sealed,) = result.sealed
-    assert sealed.rows == 4 * ROWS_PER_SEGMENT + 1 + 3
+    _marked(lake_root, "SPY", minutes)
+    _run(lake_root)
     spy[0].parent.mkdir(parents=True, exist_ok=True)
     for path, data in saved.items():
         path.write_bytes(data)
+
+
+def test_a_rebuild_with_fewer_rows_than_the_seal_needs_the_operators_say_so(lake_root):
+    """Marker segments have no copy, so three of them outweigh the lost segment's two rows."""
+    _sealed_with_markers_then_restored(lake_root, [30, 31, 32])
     clock = ManualClock(_et(17, 0))
 
     with pytest.raises(RowCountRegression):
@@ -1563,6 +1565,18 @@ def test_a_rebuild_past_a_marker_row_needs_the_operators_say_so(lake_root):
     )
 
     assert outcome.rows == 5 * ROWS_PER_SEGMENT
+
+
+def test_a_rebuild_with_as_many_rows_drops_a_marker_with_no_say_so(lake_root):
+    """The guard compares counts alone, so a chains day's many rows pass it."""
+    _sealed_with_markers_then_restored(lake_root, [30])
+
+    outcome = recompact_ticker_day(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=ManualClock(_et(17, 0))
+    )
+
+    assert outcome.rows == 5 * ROWS_PER_SEGMENT
+    assert [kind for kind, _ in _row_kinds(_partition(lake_root, "SPY"))].count("gap") == 0
 
 
 def test_every_lost_minute_gets_its_own_row(lake_root):
@@ -1653,7 +1667,10 @@ def test_the_lost_page_stays_under_the_body_limit_however_wide_the_loss():
     assert f"and {600 - PAGE_SEGMENT_CAP} more" in body
 
 
-@pytest.mark.parametrize("stamp", ["not-a-time", 5, None, "2026-08-24T10:07:17"])
+@pytest.mark.parametrize(
+    "stamp",
+    ["not-a-time", 5, None, "2026-08-24T10:07:17", "0001-01-01T00:00:00+14:00"],
+)
 def test_a_stamp_that_names_no_instant_is_none(stamp):
     assert compact_module._instant(stamp) is None
 

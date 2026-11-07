@@ -12,10 +12,6 @@ Two producers hand slots to one writer.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
    capture slot, because the loop thread itself woke late.
 
-Compaction marks one further case itself, outside this writer. A manifested segment gone
-from disk at the seal gets a ``segment_lost`` row in the merge, through the same
-``journal.gap_rows``, so the row lands in the one commit that seals the day.
-
 They never overlap, because ``run_loop`` reads the minute it starts in once, hands it
 to startup marking, and keeps it as the previous slot its first tick counts from.
 Startup marking owns every owed minute through it, and the loop reports only minutes
@@ -23,6 +19,11 @@ after it. The two differ only in the reason they stamp. A
 startup marker says ``daemon_dead``, which is true: some other incarnation ended. A
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
+
+Compaction marks one further case itself, outside this writer and either of the two. A
+manifested segment gone from disk at the seal usually gets a ``segment_lost`` row in the merge,
+through the same ``journal.gap_rows``, so the row lands in the one commit that seals the day.
+It skips a minute these two already marked.
 
 Both passes read the roster when they run, never a roster frozen at daemon start. The
 roster is the only statement of what is in scope right now, and the capture cycle reads

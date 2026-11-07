@@ -75,10 +75,11 @@ The job's rules, each glossed at first use.
    the directory listed, and the row count agrees with whatever those files hold. So before
    any read the ticker-day's manifest entries are compared to that listing. A segment the
    manifest records and the disk does not hold is lost, and holding the day would only
-   stop the upload for a file that may never return. So the run writes a ``segment_lost``
-   gap row for its minute into the seal, seals the rest, files a finding and pages once
-   (marketlake #998). The gap row is what keeps the loss visible, because once the partition
-   is manifested the scrub and the upload both stop asking after the segment.
+   stop the upload for a file that may never return. So the run seals the rest, files a
+   finding and pages once, and usually writes a ``segment_lost`` gap row for its minute into
+   the seal, as ``_lost_minutes`` says (marketlake #998). Those are what keep the loss
+   visible, because once the partition is manifested the scrub and the upload both stop
+   asking after the segment.
    The comparison runs only while the partition has no entry. Once it has one, its segments'
    entries are superseded and their files are gone by design, and the no-shrink guard
    answers for the count. A ticker-day with no segment left reaches no comparison, because
@@ -1179,9 +1180,9 @@ def _instant(value: object) -> datetime | None:
     """
     try:
         parsed = datetime.fromisoformat(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        return None if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except (TypeError, ValueError, OverflowError):
         return None
-    return None if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _gap_table(batch: pa.RecordBatch, tables: Sequence[pa.Table]) -> pa.Table:
@@ -1190,17 +1191,20 @@ def _gap_table(batch: pa.RecordBatch, tables: Sequence[pa.Table]) -> pa.Table:
     ``gap_rows`` builds the schema the running code pins, and a day captured before a retype
     holds an older one. A null column at the newer type would make the merge refuse a day
     whose segments agree with each other, which would hold the day this exists to seal. Every
-    value in such a column is null, so naming it at the segments' type changes no value.
+    value in such a column is null, so naming it at the segments' type changes no value. A
+    column with values keeps its type, and the merge answers for any disagreement. Each column
+    takes its type from the first segment that holds it, because a mid-day rotation can add one.
     """
     table = pa.Table.from_batches([batch])
-    if not tables:
-        return table
-    target = tables[0].schema
+    held: dict[str, pa.Field] = {}
+    for item in tables:
+        for field in item.schema:
+            held.setdefault(field.name, field)
     for index, field in enumerate(table.schema):
-        if field.name not in target.names or target.field(field.name).type == field.type:
+        wanted = held.get(field.name)
+        if wanted is None or wanted.type == field.type:
             continue
         if table.column(index).null_count == table.num_rows:
-            wanted = target.field(field.name)
             table = table.set_column(index, wanted, pa.nulls(table.num_rows, wanted.type))
     return table
 
@@ -1251,8 +1255,9 @@ def _file_lost(
 
     The same order as ``_refuse_damaged``: the record first, then the finding, and a finding
     that cannot be written is named on stderr rather than raised. The seal has committed by
-    now, so any gap rows hold the loss whatever happens here. A loss that marked no minute has
-    only this finding and the page, and a run killed before them leaves neither.
+    now, so any gap rows hold the loss whatever happens here. The page goes out at the end of
+    the sweep, so a run killed anywhere after this leaves the finding with no page, and one
+    killed before it leaves neither.
     """
     if found is not None:
         found.append(finding)
@@ -1977,7 +1982,8 @@ def _seal(
     caller already holds. It is required rather than defaulted, because a caller that
     forgot it would skip the check on every segment and nothing would say so. Until the
     partition has an entry, every segment the manifest records for this ticker-day and
-    ``segments`` leaves out is lost. Its minute gets a gap row in the merge, and a finding
+    ``segments`` leaves out is lost. Its minute usually gets a gap row in the merge, as
+    ``_lost_minutes`` says, and a finding
     lands in ``lost`` once the seal commits, because nothing later would ask after it. Every
     segment is then read before anything is written, so a shadow-append raises with the
     ticker-day untouched, and every segment the read proves damaged raises
@@ -2614,7 +2620,8 @@ def compact(
     it, because its segments disagree about a column type or because one no longer
     matches the hash taken when it closed, and then it is filed, reported under ``refused``,
     and left exactly as the capture wrote it. A manifested segment gone from disk refuses
-    nothing alone: the day seals with a gap row for the lost minute, a finding and a page.
+    nothing alone: the day seals, usually with a gap row for the lost minute, and a finding
+    and a page name it.
     The window re-tune then
     profiles the latest sealed day's chains partitions. The trimmed ledger's entry is
     repaired next, then the backup runs, and the ping only after it. The trim runs after the
@@ -2899,7 +2906,8 @@ def recompact_ticker_day(
     damage.
 
     A ticker-day with no partition entry and a manifested segment gone from disk seals here
-    the way the sweep seals it, with a gap row for the lost minute and a finding. A sealed
+    the way the sweep seals it, usually with a gap row for the lost minute, and with a
+    finding, and it writes the page to stderr rather than sending it. A sealed
     day's segment entries are superseded, so its rebuild marks nothing, and the no-shrink
     guard answers for its count (marketlake #998).
     """
