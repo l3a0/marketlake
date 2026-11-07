@@ -790,9 +790,13 @@ cases.
    [#557](https://github.com/l3a0/marketlake/issues/557)'s.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
-3. A manifested segment left the disk before the seal, so the partition sealed short with no
-   page ([#998](https://github.com/l3a0/marketlake/issues/998)). The day is already sealed, so
-   the first fact below applies.
+3. A manifested segment left the disk before the seal. Compaction refuses the ticker-day as
+   it does in the first case and sends the `Damaged segment at the merge` page, and a finding
+   under `reports/damaged_segments/` names the segment. Until the file is back at its path,
+   the nightly upload stops with `ManifestedFileMissing`, so the `compaction` and
+   `evening-upload` checks page too ([#998](https://github.com/l3a0/marketlake/issues/998)). A chains
+   segment has no copy to return, so that day waits on
+   [#557](https://github.com/l3a0/marketlake/issues/557).
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds
@@ -803,8 +807,9 @@ any attempt by hand.
 
 1. A segment copied back after the day's partition is manifested is deleted as debris, with a
    healthy ping.
-2. On a lost volume, a segment copied back after the daemon has started leaves a false gap
-   row beside each real minute.
+2. A segment copied back after the daemon has started leaves a false gap row beside each real
+   minute, because startup marking fills the hole it finds. That holds on a lost volume and on
+   a day refused for a missing segment.
 
 ## Changing the bootstrap
 
@@ -2643,9 +2648,8 @@ The check never holds the evening upload back, so a damaged manifest may already
 bucket by the time the page is read. A replaced copy stays readable as a noncurrent version for
 about 30 days.
 
-The page says the bucket holds what the manifest records. A partition that sealed short is a
-whole file, reaches the bucket and raises no page, which
-[#998](https://github.com/l3a0/marketlake/issues/998) owns.
+The page says the bucket holds what the manifest records. A capture whose manifest append a
+crash lost is known only by its file, so this check says nothing about it.
 
 #### Drill the page and the two checks
 

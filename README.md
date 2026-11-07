@@ -274,7 +274,7 @@ prefix `<prefix>-live/`, which is `lake-live/` for a `/lake` target, as soon as 
 entry lands ([#943](https://github.com/l3a0/marketlake/issues/943)). A lifecycle rule
 expires each segment seven days after upload and removes its bytes 90 days after that
 ([#995](https://github.com/l3a0/marketlake/issues/995)). The day's sealed partition holds the
-same minutes, unless a fault left it short
+same minutes, because compaction refuses a day with a manifested segment missing
 ([#998](https://github.com/l3a0/marketlake/issues/998)), and the owner ruled that the runtime's replay reads sealed partitions and that
 its monitoring compares against them once a segment is gone. The `lag` command reads how long
 each of one day's segments took to arrive, from the bucket alone, and writes nothing. A sealed
