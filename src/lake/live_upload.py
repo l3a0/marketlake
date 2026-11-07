@@ -616,7 +616,8 @@ class LiveUpload:
         """Settle a manifested segment whose file is gone.
 
         Compaction deletes a day's segments once it has sealed the day, so a file gone from
-        a sealed day is one the nightly upload carries inside a partition. Compaction
+        a sealed day is one the nightly upload carries inside a partition, or a lost segment
+        the seal went on without (marketlake #998). Compaction
         records the seal in the manifest before it deletes, so the manifest is read again
         first, in case the seal landed after this pass read it. A file gone from a day the
         manifest has not sealed is missing from the lake. It stays out of the bucket, is

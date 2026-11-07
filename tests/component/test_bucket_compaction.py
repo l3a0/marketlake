@@ -13,12 +13,20 @@ from pathlib import Path
 
 import pytest
 
-from lake import bucket
+from lake import bucket, report
 from lake import compact as compact_module
-from lake.bucket import BucketBackup, UploadDeadline, WatermarkMissing, first_upload
+from lake.bucket import (
+    BucketBackup,
+    ChecksumRefused,
+    ManifestedFileMissing,
+    UploadDeadline,
+    WatermarkMissing,
+    first_upload,
+)
 from lake.chain_plan import ChainPlanError
 from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG, compact
 from lake.config import BucketTarget
+from lake.manifest import append_manifest, sha256_file
 from lake.paths import LakePaths
 from tests.component.test_compaction import (
     DAY,
@@ -87,6 +95,90 @@ def test_the_sealed_day_goes_up_and_the_ping_comes_after_the_manifest(lake_root)
     rel = partition.relative_to(lake_root).as_posix()
     assert result.backed_up and result.pinged
     assert events == [f"put lake/{rel}", "put lake/manifest.jsonl", "ping"]
+
+
+def _manifested(lake_root: Path, *paths: Path) -> None:
+    for path in paths:
+        append_manifest(
+            lake_root,
+            partition=path.relative_to(lake_root).as_posix(),
+            source="capture",
+            sha256=sha256_file(path),
+            rows=2,
+            fetched_at=_clock_at(DAY, 10, 1).now().isoformat(),
+        )
+
+
+def test_a_gone_segment_seals_with_a_gap_and_the_upload_carries_on(lake_root):
+    """The owner's ruling: a gone segment never holds the day or the bucket copy back.
+
+    The partition's entry supersedes the gone segment's, so the upload has nothing to stop on.
+    """
+    client = _seeded(lake_root)
+    kept = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    gone = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
+    )
+    _manifested(lake_root, kept, gone)
+    gone.unlink()
+    events: list[str] = []
+
+    result = _job(lake_root, client, events)
+
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+    assert result.refused == ()
+    assert result.backed_up and result.pinged
+    assert f"put lake/{partition.relative_to(lake_root).as_posix()}" in events
+    assert "put lake/manifest.jsonl" in events
+    assert events[-1] == "ping"
+    assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
+
+
+def test_a_changed_segment_files_its_finding_and_stops_the_upload_before_the_ping(lake_root):
+    """A refusal keeps the segment, and the upload then refuses bytes that miss their digest."""
+    client = _seeded(lake_root)
+    path = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    append_manifest(
+        lake_root,
+        partition=path.relative_to(lake_root).as_posix(),
+        source="capture",
+        sha256="a" * 64,
+        rows=2,
+        fetched_at=None,
+    )
+    events: list[str] = []
+
+    with pytest.raises(ChecksumRefused):
+        _job(lake_root, client, events)
+
+    assert "ping" not in events
+    assert "put lake/manifest.jsonl" not in events
+    assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
+
+
+def test_a_gone_segment_beside_a_changed_one_stops_the_upload_at_the_gone_file(lake_root):
+    """A refusal keeps the day unsealed, so the gone segment's entry stays owed."""
+    client = _seeded(lake_root)
+    changed = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 2)), start_ts="c"
+    )
+    gone = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
+    )
+    _manifested(lake_root, gone, changed)
+    gone.unlink()
+    changed.write_bytes(changed.read_bytes() + b"\x00")
+    events: list[str] = []
+
+    with pytest.raises(ManifestedFileMissing, match=gone.name):
+        _job(lake_root, client, events)
+
+    assert "ping" not in events
+    assert "put lake/manifest.jsonl" not in events
 
 
 def test_an_empty_bucket_raises_before_the_ping(lake_root):

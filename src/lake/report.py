@@ -66,9 +66,10 @@ whole ticker-day. A segment the read proves damaged refuses it the same way, whi
 only check a segment with no manifest entry gets. That finding is damage rather than
 drift, and a reader counting drift must not pick it up, so it goes under
 ``reports/damaged_segments/`` and not ``reports/schema_drift/``. It names the segment and
-both hashes, or the read's failure where no hash was recorded, and it files on every run
-the damage survives, for the reason a refused merge does: nothing was sealed, so no
-manifest entry makes a later silence readable.
+both hashes, the read's failure where no hash was recorded, or the recorded hash alone for a
+segment gone from disk. A refused day files on every run the damage survives, for the reason a
+refused merge does: nothing was sealed, so no manifest entry makes a later silence readable.
+A day sealed with lost segments files once, because its partition's entry answers that.
 
 The third producer is the vendor sweep's gates. A check that refuses to land a row holds
 that row out of its ledger, and a fail-closed decision leaving no record reads exactly like
@@ -467,7 +468,7 @@ def write_schema_drift(
 
 @dataclass(frozen=True)
 class DamagedSegment:
-    """One segment compaction refused: its digest moved, or its read proved it damaged.
+    """One segment a seal could not use: its digest moved, its read failed, or its file is gone.
 
     ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
     entry carries, which the capture cycle hashed from the file right after closing it, or
@@ -487,23 +488,35 @@ class DamagedSegment:
     entry, as gap and close-guard markers never do. ``actual`` is still taken, so a later
     read can tell whether the file changed again. ``error`` is ``None`` for a digest
     mismatch.
+
+    A manifested segment can also be gone from disk (marketlake #998). It has no bytes to
+    hash, so ``actual`` is ``None``, which is what marks this case, ``expected`` is the digest
+    its entry recorded, and ``error`` says the file is missing. Compaction refuses no
+    ticker-day for that alone, apart from a retype ``compact._gap_table`` names. It usually
+    marks the segment's minute as a gap and seals the rest, and a refusal names a gone segment
+    only beside one that refused the day.
     """
 
     segment: str
     expected: str | None
-    actual: str
+    actual: str | None
     error: str | None = None
 
 
 @dataclass(frozen=True)
 class SegmentDamage:
-    """One ticker-day compaction refused because a segment's bytes were damaged.
+    """One ticker-day compaction refused for a damaged segment, or sealed with a gone one.
+
+    A refusal keeps the ticker-day. A day that only lost segments seals, usually with a gap
+    row for each lost minute, and ``gaps`` names the minutes marked, each as its ISO-8601
+    ``snap_ts``, in UTC. The rest of this says what a refusal holds.
 
     ``partition`` is the Parquet the refusal did not write. ``segments`` names every segment
-    of the ticker-day, all still on disk, because the refusal keeps the whole ticker-day
-    rather than sealing the healthy segments: the next run would find the partition
-    manifested and delete the kept one as debris. ``damaged`` names the ones that failed,
-    each with both digests or with the read's failure, as ``DamagedSegment`` says.
+    of the ticker-day still on disk, because the refusal keeps the whole ticker-day rather
+    than sealing the healthy segments: the next run would find the partition manifested and
+    delete the kept one as debris. ``damaged`` names the ones that failed, each with both
+    digests, with the read's failure, or as missing, as ``DamagedSegment`` says. A missing
+    segment is in ``damaged`` and not in ``segments``.
     """
 
     surface: str
@@ -512,6 +525,7 @@ class SegmentDamage:
     partition: str
     segments: tuple[str, ...]
     damaged: tuple[DamagedSegment, ...]
+    gaps: tuple[str, ...] = ()
 
 
 def damaged_segments_dir(lake_root: Path | str, day: date) -> Path:
@@ -532,7 +546,9 @@ def write_damaged_segments(
 ) -> Path:
     """File one refused ticker-day's damage, and hand back the path it landed at.
 
-    **It files on every run the damage survives.** The refused ticker-day has no partition
+    **A refused day files on every run the damage survives.** A day sealed with lost segments
+    files once, because the seal is the last run that finds them. The refused ticker-day has
+    no partition
     and no manifest entry, so a second night's silence would be consistent with a repair,
     with damage already filed, and with a ticker-day that is gone. That is the refused
     merge's reason, and the cadence is the same.
@@ -561,6 +577,7 @@ def write_damaged_segments(
             }
             for item in damage.damaged
         ],
+        "gaps": list(damage.gaps),
     }
     # A report is written inside a lake that exists, or not at all, for the reason
     # ``write_close_guard`` gives.

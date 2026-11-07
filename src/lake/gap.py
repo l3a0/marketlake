@@ -20,6 +20,11 @@ startup marker says ``daemon_dead``, which is true: some other incarnation ended
 skipped-slot marker says ``slot_overrun``, because the daemon is alive on those minutes
 and recording it as dead would make the marker lie about its own reason.
 
+Compaction marks one further case itself, outside this writer and either of the two. A
+manifested segment gone from disk at the seal usually gets a ``segment_lost`` row in the merge,
+through the same ``journal.gap_rows``, so the row lands in the one commit that seals the day.
+It skips a minute these two already marked.
+
 Both passes read the roster when they run, never a roster frozen at daemon start. The
 roster is the only statement of what is in scope right now, and the capture cycle reads
 it fresh every minute. A pass that read a stale one would disagree with capture in both

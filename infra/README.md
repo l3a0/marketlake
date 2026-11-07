@@ -787,12 +787,33 @@ cases.
 1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
    A refused day has no partition in the manifest, so compaction seals it once the segment's
    good bytes are back at its path. Repairing such a day is
-   [#557](https://github.com/l3a0/marketlake/issues/557)'s.
+   [#557](https://github.com/l3a0/marketlake/issues/557)'s. While the bucket's manifest does
+   not yet carry the segment's entry, and the bucket does not hold its digest, the upload stops
+   with `ChecksumRefused`. `bars/` and `chains/` partitions still go up. The `journal/` keys
+   sorted after it, every pending `quotes/` partition, the refused day's included, `reference/`
+   and `reports/` stay off the bucket for every ticker, the bucket's manifest stays where it
+   was, the trim does not run, and the `compaction` and `evening-upload` checks page.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
-3. A manifested segment left the disk before the seal, so the partition sealed short with no
-   page ([#998](https://github.com/l3a0/marketlake/issues/998)). The day is already sealed, so
-   the first fact below applies.
+3. A manifested segment left the disk before the seal. Compaction seals the day and sends the
+   `Damaged segment at the merge` page once, and a finding under `reports/damaged_segments/`
+   names the segment and any minute marked ([#998](https://github.com/l3a0/marketlake/issues/998)).
+   The minute usually gets a `segment_lost` gap row. It keeps a `daemon_dead` row if a daemon
+   start reached the hole first, and gets none if the cycle's fetch crossed into a minute that
+   holds a row. The upload carries on, apart from a day compaction refuses, such as one with a
+   damaged segment, because that keeps the gone file's entry pending. A repair needs every segment of the day back and a
+   hand-run `recompact_ticker_day` before the next compaction, because compaction deletes a
+   segment copied back after the seal, unread. A lone returned chains segment repairs nothing,
+   so keep it outside `journal/`. A rebuild replaces the partition with what the returned set
+   holds, so it loses every other row, gap rows included, and the no-shrink guard compares row
+   counts alone, so it cannot tell which rows go.
+   [#999](https://github.com/l3a0/marketlake/issues/999) owns the procedure. A
+   chains segment no upload carried has no copy, so its minute stays a gap. If a resync stopped
+   part-way on this host, run it again, because that puts the bucket's partition back before or
+   after the seal. A ticker-day with no segment left gets no damage page or finding at first.
+   `ManifestedFileMissing` and the Sunday scrub name it until the next daemon start marks the
+   day and the next compaction seals it, which pages once. A ticker disabled since gets no marker, so a person
+   has to clear that day.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds
@@ -2643,9 +2664,8 @@ The check never holds the evening upload back, so a damaged manifest may already
 bucket by the time the page is read. A replaced copy stays readable as a noncurrent version for
 about 30 days.
 
-The page says the bucket holds what the manifest records. A partition that sealed short is a
-whole file, reaches the bucket and raises no page, which
-[#998](https://github.com/l3a0/marketlake/issues/998) owns.
+The page says the bucket holds what the manifest records. A capture whose manifest append a
+crash lost is known only by its file, so this check says nothing about it.
 
 #### Drill the page and the two checks
 
