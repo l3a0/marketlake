@@ -29,6 +29,15 @@ change it the way the real tools would change a volume.
 util-linux's does. ``$STATE/submounts`` lists the mount points below the lake root, which
 ``findmnt -R`` prints after the lake root's own line.
 
+``$STATE/swaps`` lists the swap files turned on, one path a line, which ``swapon --show``
+prints. ``dd`` with ``of=`` writes a few bytes in place of the size it was asked for.
+``mkswap`` writes the signature ``SWAPSPACE2`` over a file, and refuses one that is in use.
+``swapon`` refuses a file with no signature and one already on, as the real tool does, so
+a test cannot pass against a script that turns on a half-made file or runs twice on a
+live one. ``$STATE/sysctl`` gathers what ``sysctl -p`` applied. ``DD_WRITE_RC``,
+``MKSWAP_RC``, ``SYSCTL_RC``, ``SWAPON_RC`` and ``SWAPON_SHOW_RC`` fail those tools, and
+``dd`` still leaves its bytes behind when it fails, as a full disk would.
+
 The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O error would
 make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
 ``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that holds an entry. On
@@ -98,11 +107,17 @@ exit 0
 FAKE_DD = r"""#!/bin/bash
 printf 'dd %s\n' "$*" >> "$LOG"
 block=""
+out=""
 for arg in "$@"; do
   case "$arg" in
     skip=*) block="${arg#skip=}" ;;
+    of=*) out="${arg#of=}" ;;
   esac
 done
+if [[ -n "$out" ]]; then
+  printf 'zeros\n' > "$out"
+  exit "${DD_WRITE_RC:-0}"
+fi
 if [[ -n "${DD_FAIL_BLOCK:-}" && "$block" == "$DD_FAIL_BLOCK" ]]; then
   echo "dd: error reading block $block: Input/output error" >&2
   exit 1
@@ -251,6 +266,41 @@ EOF
 # mktemp with no template makes its file in $TMPDIR, as GNU's does. A Mac's ignores
 # $TMPDIR there, so a test checking the temporary directory would check nothing. The
 # path is logged, so a test can find the file whatever made it.
+FAKE_MKSWAP = r"""#!/bin/bash
+printf 'mkswap %s\n' "$*" >> "$LOG"
+if [[ -n "${MKSWAP_RC:-}" ]]; then exit "$MKSWAP_RC"; fi
+if [[ -f "$STATE/swaps" ]] && /usr/bin/grep -qxF -- "$1" "$STATE/swaps"; then
+  echo "mkswap: error: $1 is mounted; will not make swapspace" >&2
+  exit 1
+fi
+printf 'SWAPSPACE2\n' > "$1"
+"""
+
+FAKE_SWAPON = r"""#!/bin/bash
+printf 'swapon %s\n' "$*" >> "$LOG"
+if [[ "${1:-}" == --show=NAME ]]; then
+  if [[ -n "${SWAPON_SHOW_RC:-}" ]]; then exit "$SWAPON_SHOW_RC"; fi
+  if [[ -f "$STATE/swaps" ]]; then cat "$STATE/swaps"; fi
+  exit 0
+fi
+if [[ -n "${SWAPON_RC:-}" ]]; then exit "$SWAPON_RC"; fi
+if [[ -f "$STATE/swaps" ]] && /usr/bin/grep -qxF -- "$1" "$STATE/swaps"; then
+  echo "swapon: $1: swapon failed: Device or resource busy" >&2
+  exit 255
+fi
+if [[ "$(/usr/bin/head -c 10 "$1" 2>/dev/null)" != SWAPSPACE2 ]]; then
+  echo "swapon: $1: read swap header failed" >&2
+  exit 255
+fi
+echo "$1" >> "$STATE/swaps"
+"""
+
+FAKE_SYSCTL = r"""#!/bin/bash
+printf 'sysctl %s\n' "$*" >> "$LOG"
+if [[ -n "${SYSCTL_RC:-}" ]]; then exit "$SYSCTL_RC"; fi
+cat "${*: -1}" >> "$STATE/sysctl"
+"""
+
 FAKE_MKTEMP = r"""#!/bin/bash
 if [[ $# -eq 0 ]]; then set -- "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"; fi
 path="$(/usr/bin/mktemp "$@")" || exit $?
@@ -355,6 +405,9 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "chattr": FAKE_CHATTR,
         "systemd-escape": FAKE_ESCAPE,
         "curl": FAKE_CURL,
+        "mkswap": FAKE_MKSWAP,
+        "swapon": FAKE_SWAPON,
+        "sysctl": FAKE_SYSCTL,
         "mktemp": FAKE_MKTEMP,
         "chown": FAKE_LOGGED.format(name="chown", rc=0),
         "sync": FAKE_LOGGED.format(name="sync", rc=0),

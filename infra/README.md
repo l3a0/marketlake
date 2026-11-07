@@ -1552,19 +1552,21 @@ Each failure prints one line naming the step, and the exit code says how the run
 
 1. Exit 0 means every step passed.
 2. Exit 2 means the bootstrap itself refused, which happens only before the first
-   install, such as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`.
-   It also refuses three states of the lake volume, and formats nothing in any of them.
+   install, such as on a bad `bootstrap.conf`, an `/etc/fstab` with no entry for `/`, or
+   a link or directory at `/swapfile`. It also refuses three states of the lake volume,
+   and formats nothing in any of them.
    1. The volume holds something other than ext4.
    2. A read of 4 KiB block 0 or 32768 failed or came back short.
    3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
       line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
-3. Exit 1 covers every failure of a disk step or an install. A disk step that fails
-   stops the run at once, and so does the first install, the one that syncs the
-   environment, even when it refused with its own exit 2. The last install, the one
-   that starts the units, runs whatever the config steps returned. When it fails, its
-   line says whether a rerun installs and starts the units, and the run ends with exit 1.
+3. Exit 1 covers every failure of a disk step, the swap step or an install. A disk step
+   or the swap step that fails stops the run at once, and so does the first install, the
+   one that syncs the environment, even when it refused with its own exit 2. The last
+   install, the one that starts the units, runs whatever the config steps returned. When
+   it fails, its line says whether a rerun installs and starts the units, and the run
+   ends with exit 1.
 4. Exit 4 means the last install installed and started the units, but a render, token
    pull or roster apply failed, even when the step itself refused with its own exit 2.
    Each of those skips only the steps that need it. A deploy reads exit 4 as units in
@@ -1684,6 +1686,23 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
    ```bash
    sudo dd if=/dev/zero of=<dev> bs=4096 seek=<block> count=1 conv=fsync
    ```
+
+### See how much swap the VM uses
+
+The bootstrap gives the VM a 1 GiB swap file at `/swapfile`, so a shortage of memory slows
+a job rather than the kernel killing it. Read its use on the VM.
+
+```bash
+swapon --show
+free -m
+vmstat 1 5
+```
+
+`swapon --show` lists the file and how much of it is in use. In `vmstat`, the `si` and
+`so` columns count what moves in from swap and out to it each second, and both read 0
+while nothing is short of memory. A little swap in use with those columns at 0 means the
+pages sit idle. If jobs page every evening, the design's "A shortage of memory slows a
+job" names the next step, a `t4g.medium`.
 
 ### Deploy a commit
 

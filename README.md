@@ -167,9 +167,9 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   units from the checkout and installs them. `deploy/vm-bootstrap.sh` calls it at the
   VM's first boot, and every deploy calls it.
 - `deploy/vm-bootstrap.sh` takes the VM from a fresh boot to a running daemon: it mounts
-  the lake volume, installs `uv`, syncs the environment, renders `config.yaml`, pulls
-  the token, applies the roster, and only then installs and starts the units. It is safe
-  to run again over SSH.
+  the lake volume, turns on a swap file, installs `uv`, syncs the environment, renders
+  `config.yaml`, pulls the token, applies the roster, and only then installs and starts
+  the units. It is safe to run again over SSH.
 - `deploy/vm-deploy.sh` deploys one commit on `main` to the VM: outside the jobs' hours
   and forward only, it runs the bootstrap, restarts the daemon when that is owed, and
   rolls back a restart that does not hold.

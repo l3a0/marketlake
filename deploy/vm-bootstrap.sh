@@ -24,38 +24,42 @@
 #   6. mounts it through systemctl start of its mount unit, which runs e2fsck first;
 #   7. proves the right volume is mounted by its UUID, and only then chowns the lake root
 #      to the owner and grows the filesystem to the volume's size;
-#   8. installs the pinned uv as the owner when the installed one differs;
-#   9. runs deploy/linux-install.sh --sync-only, which builds the venv the next step runs
+#   8. makes a 1 GiB swap file on the root volume when it is missing, sets
+#      vm.swappiness to 1, turns the file on and lists it in fstab, so a shortage of
+#      memory slows a job rather than the kernel killing it;
+#   9. installs the pinned uv as the owner when the installed one differs;
+#  10. runs deploy/linux-install.sh --sync-only, which builds the venv the next step runs
 #      from and installs no unit, retrying a transient failure;
-#  10. renders config.yaml, pulls the Schwab token and applies the roster, each as the
+#  11. renders config.yaml, pulls the Schwab token and applies the roster, each as the
 #      owner and in that order. Each attempt holds the install lock, and the wait before
 #      a retry does not;
-#  11. runs deploy/linux-install.sh again without the flag, whatever step 10 returned,
+#  12. runs deploy/linux-install.sh again without the flag, whatever step 11 returned,
 #      retrying a transient failure the same way. That install enables and starts the
 #      residents and the timers, so on a render that succeeded they start with their
 #      config already in place.
 #
-# Every disk step and step 9's install stop the run at once with one line, because a
-# later step on a wrong disk would write the lake where nothing keeps it. A failure in
-# step 10 prints one line and skips only the steps that need what failed. A final failure
-# in step 11 prints one line too. The run then ends on one of four exits:
+# Every disk step, the swap step and step 10's install stop the run at once with one
+# line, because a later step on a wrong disk would write the lake where nothing keeps it.
+# A failure in step 11 prints one line and skips only the steps that need what failed. A
+# final failure in step 12 prints one line too. The run then ends on one of four exits:
 #
 #   0  every step passed;
-#   1  a disk step or an install failed, including step 11's after a step 10 failure;
+#   1  a disk step, the swap step or an install failed, including step 12's after a
+#      step 11 failure;
 #   2  the script refused, declining on purpose before the first install;
-#   4  step 11 installed the units, and a step 10 failure is listed above.
+#   4  step 12 installed the units, and a step 11 failure is listed above.
 #
 # Exit 4 lets deploy/vm-deploy.sh tell a run that installed the units apart from one that
 # stopped before them, since it restarts the daemon only after the units are in place.
 # No line prints a config value, and the script never runs with set -x.
 #
-# docs/design.md and issue #686 carry the reasoning for each step.
+# docs/design.md and issues #686 and #1006 carry the reasoning for each step.
 #
 # MARKETLAKE_INSTALL_ROOT prefixes every system path this script reads or writes:
-# bootstrap.conf, /etc/fstab, /dev/disk/by-id, the mount-point directory and the lock.
-# Names that live inside a table, such as the fstab line's mount point and the mount
-# unit's name, stay unprefixed. It is for tests only, and is refused unless
-# MARKETLAKE_INSTALL_TEST=1 is set.
+# bootstrap.conf, /etc/fstab, /dev/disk/by-id, the mount-point directory, the lock, the
+# swap file and the sysctl file. Names that live inside a table, such as the fstab lines'
+# mount point and swap path and the mount unit's name, stay unprefixed. It is for tests
+# only, and is refused unless MARKETLAKE_INSTALL_TEST=1 is set.
 #
 # Written for bash 3.2 as well as a current bash, because the test suite runs it on a Mac.
 set -euo pipefail
@@ -74,7 +78,7 @@ stop() {
   exit 1
 }
 
-# FAILED marks a failed step 10, and INSTALL_FAILED a failed step 11. The end check
+# FAILED marks a failed step 11, and INSTALL_FAILED a failed step 12. The end check
 # reads both, so a run where both failed exits 1 rather than 4.
 FAILED=0
 fail() {
@@ -304,6 +308,22 @@ fi
 
 # -- fstab -----------------------------------------------------------------------------
 
+# The root entry lives in the same file, so a truncated write could leave the next boot
+# without its root mount. The new file is checked, synced, then renamed over.
+write_fstab() {
+  local text="$1" tmp
+  tmp="$(mktemp "$ROOT/etc/fstab.XXXXXX")" || stop "could not create a temporary file beside $FSTAB"
+  printf '%s' "$text" > "$tmp" || { rm -f -- "$tmp"; stop "could not write $tmp"; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; stop "could not chmod $tmp"; }
+  if ! findmnt --verify --tab-file "$tmp" >/dev/null; then
+    rm -f -- "$tmp"
+    stop "findmnt --verify refused the new fstab, so $FSTAB is unchanged"
+  fi
+  sync || { rm -f -- "$tmp"; stop "sync failed before replacing $FSTAB"; }
+  mv -f -- "$tmp" "$FSTAB" || { rm -f -- "$tmp"; stop "could not replace $FSTAB"; }
+  systemctl daemon-reload || stop "systemctl daemon-reload failed after writing $FSTAB"
+}
+
 # The line is keyed on the mount point, so a rerun replaces a stale line rather than
 # adding a second one. The 2 lets e2fsck -p keep a damaged filesystem unmounted.
 LINE="UUID=$UUID $LAKE_ROOT ext4 defaults,nofail 0 2"
@@ -352,19 +372,8 @@ fi
 if [[ "$DESIRED" == "$CURRENT" ]]; then
   say "$FSTAB already mounts the lake volume at $LAKE_ROOT"
 else
-  # The root entry lives in the same file, so a truncated write could leave the next
-  # boot without its root mount. The new file is checked, synced, then renamed over.
   say "writing the lake volume's line into $FSTAB"
-  TMP="$(mktemp "$ROOT/etc/fstab.XXXXXX")" || stop "could not create a temporary file beside $FSTAB"
-  printf '%s' "$DESIRED" > "$TMP" || { rm -f -- "$TMP"; stop "could not write $TMP"; }
-  chmod 0644 "$TMP" || { rm -f -- "$TMP"; stop "could not chmod $TMP"; }
-  if ! findmnt --verify --tab-file "$TMP" >/dev/null; then
-    rm -f -- "$TMP"
-    stop "findmnt --verify refused the new fstab, so $FSTAB is unchanged"
-  fi
-  sync || { rm -f -- "$TMP"; stop "sync failed before replacing $FSTAB"; }
-  mv -f -- "$TMP" "$FSTAB" || { rm -f -- "$TMP"; stop "could not replace $FSTAB"; }
-  systemctl daemon-reload || stop "systemctl daemon-reload failed after writing $FSTAB"
+  write_fstab "$DESIRED"
 fi
 
 # -- mount, prove, chown, grow ---------------------------------------------------------
@@ -393,6 +402,100 @@ chown "$OWNER": "$MOUNT_DIR" || stop "could not chown $MOUNT_DIR to $OWNER"
 # to shrink a mounted filesystem, and prints that there is nothing to do when the sizes
 # already match.
 resize2fs "$DEV" || stop "resize2fs failed on $DEV, so nothing is installed"
+
+# -- swap ------------------------------------------------------------------------------
+
+# With no swap the kernel kills a job that runs the VM out of memory, and the sweep's ping
+# and the evening upload go with it. With swap the job pages and finishes late. A
+# swappiness of 1 keeps the capture daemon in memory until memory has really run out.
+#
+# This runs after the mount, so a run that stops at a wrong disk has made nothing, and
+# before uv, so the sync below can page too. A replacement instance rebuilds the file
+# here, so the file is no state to keep. docs/design.md carries the price.
+#
+# The path sits directly under /, and LAKE_ROOT_RE needs at least one component, so the
+# lake's volume is never mounted over it. Only something standing at the path could carry
+# the file elsewhere: a link into the lake, or a directory mv would write inside.
+SWAP_PATH=/swapfile
+SWAP_FILE="$ROOT$SWAP_PATH"
+SWAP_TMP="$SWAP_FILE.tmp"
+SWAP_MIB=1024
+SWAP_LINE="$SWAP_PATH none swap sw,nofail 0 0"
+if [[ -L "$SWAP_FILE" || ( -e "$SWAP_FILE" && ! -f "$SWAP_FILE" ) ]]; then
+  refuse "$SWAP_FILE is not a regular file, so nothing is installed"
+fi
+
+# A file at the path is complete, because the file is built under another name and renamed
+# only after mkswap. A run cut off partway leaves that other name, and the next run starts
+# it again. dd rather than fallocate, because swapon(8) names it as the portable way to
+# make a file with no holes, and the kernel refuses a swap file with holes.
+if [[ -f "$SWAP_FILE" ]]; then
+  say "$SWAP_PATH already exists"
+  if ! SWAP_SECURE="$(find "$SWAP_FILE" -maxdepth 0 -perm 0600)"; then
+    stop "could not read the mode of $SWAP_FILE"
+  fi
+  if [[ -z "$SWAP_SECURE" ]]; then
+    # Swap holds pages of the jobs' memory, so only root may read it.
+    say "narrowing $SWAP_PATH to mode 0600"
+    chmod 0600 "$SWAP_FILE" || stop "could not chmod $SWAP_FILE"
+  fi
+else
+  say "making a $SWAP_MIB MiB swap file at $SWAP_PATH"
+  rm -f -- "$SWAP_TMP" || stop "could not remove the leftover $SWAP_TMP"
+  dd if=/dev/zero of="$SWAP_TMP" bs=1M count="$SWAP_MIB" conv=fsync status=none \
+    || { rm -f -- "$SWAP_TMP"; stop "could not write $SWAP_TMP"; }
+  chmod 0600 "$SWAP_TMP" || { rm -f -- "$SWAP_TMP"; stop "could not chmod $SWAP_TMP"; }
+  mkswap "$SWAP_TMP" >/dev/null || { rm -f -- "$SWAP_TMP"; stop "mkswap failed on $SWAP_TMP"; }
+  mv -f -- "$SWAP_TMP" "$SWAP_FILE" \
+    || { rm -f -- "$SWAP_TMP"; stop "could not rename $SWAP_TMP to $SWAP_FILE"; }
+fi
+
+# The setting lands before swapon, so the kernel never pages at its default of 60. sysctl
+# runs on every pass, because writing a value the kernel already holds changes nothing,
+# and a run that stopped between the write and the apply still gets applied.
+SWAPPINESS_CONF="$ROOT/etc/sysctl.d/60-marketlake-swap.conf"
+SWAPPINESS_LINE="vm.swappiness = 1"
+if [[ ! -f "$SWAPPINESS_CONF" || "$(cat -- "$SWAPPINESS_CONF")" != "$SWAPPINESS_LINE" ]]; then
+  say "setting vm.swappiness in $SWAPPINESS_CONF"
+  mkdir -p "$(dirname "$SWAPPINESS_CONF")" || stop "could not create the directory of $SWAPPINESS_CONF"
+  TMP="$(mktemp "$SWAPPINESS_CONF.XXXXXX")" || stop "could not create a temporary file beside $SWAPPINESS_CONF"
+  printf '%s\n' "$SWAPPINESS_LINE" > "$TMP" || { rm -f -- "$TMP"; stop "could not write $TMP"; }
+  chmod 0644 "$TMP" || { rm -f -- "$TMP"; stop "could not chmod $TMP"; }
+  mv -f -- "$TMP" "$SWAPPINESS_CONF" || { rm -f -- "$TMP"; stop "could not replace $SWAPPINESS_CONF"; }
+fi
+sysctl -q -p "$SWAPPINESS_CONF" || stop "sysctl could not apply $SWAPPINESS_CONF"
+
+# swapon exits nonzero on a file already in use, so a run while it is on must not call it.
+ACTIVE="$(swapon --show=NAME --noheadings)" || stop "could not list the active swap"
+case $'\n'"$ACTIVE"$'\n' in
+  *$'\n'"$SWAP_FILE"$'\n'*)
+    say "swap is already on at $SWAP_PATH" ;;
+  *)
+    say "turning on swap at $SWAP_PATH"
+    swapon "$SWAP_FILE" || stop "swapon failed on $SWAP_FILE" ;;
+esac
+
+# DESIRED holds what fstab now holds, whichever way the fstab step went. That step puts the
+# lake's line last on every run, so this line goes just above it. Below it, each run would
+# trade the two lines' places and rewrite the file. A line for the path with other options
+# is replaced, and a commented one stays, because its first field carries the #.
+SWAP_DESIRED=""
+while IFS= read -r line; do
+  read -r first _ <<< "$line" || true
+  if [[ "${first:-}" == "$SWAP_PATH" ]]; then
+    continue
+  fi
+  if [[ "$line" == "$LINE" ]]; then
+    SWAP_DESIRED="$SWAP_DESIRED$SWAP_LINE"$'\n'
+  fi
+  SWAP_DESIRED="$SWAP_DESIRED$line"$'\n'
+done <<< "${DESIRED%$'\n'}"
+if [[ "$SWAP_DESIRED" == "$DESIRED" ]]; then
+  say "$FSTAB already lists $SWAP_PATH"
+else
+  say "writing the swap file's line into $FSTAB"
+  write_fstab "$SWAP_DESIRED"
+fi
 
 # -- uv --------------------------------------------------------------------------------
 
@@ -577,7 +680,7 @@ fi
 # into the restart loop a missing config.yaml causes, and each restart reads the config
 # again, so they come up on their own once it is rendered. The run then exits 4. A
 # failure here is not a stop, so the end check below still prints its line last. The
-# words differ from step 9's on purpose, so each line names its own install.
+# words differ from step 10's on purpose, so each line names its own install.
 say "installing and starting the units"
 install_retried
 case "$INSTALL_RC" in

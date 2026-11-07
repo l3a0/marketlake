@@ -42,7 +42,9 @@ NEW_UUID = "11111111-2222-3333-4444-555555555555"
 OTHER_UUID = "99999999-8888-7777-6666-555555555555"
 UV_VERSION = "0.11.2"
 ROOT_LINE = "LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n"
-# The two installs the bootstrap runs, as the fake logs them: step 9 syncs the venv the
+SWAP_LINE = "/swapfile none swap sw,nofail 0 0\n"
+SWAPPINESS_FILE = "vm.swappiness = 1\n"
+# The two installs the bootstrap runs, as the fake logs them: step 10 syncs the venv the
 # config steps run from, and the last one installs and starts the units once they ran.
 SYNC = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT} --sync-only"
 INSTALL = f"linux-install --owner {OWNER} --lake-mount {LAKE_ROOT}"
@@ -155,6 +157,23 @@ class VM:
     def lock(self) -> Path:
         return self.root / cp.INSTALL_LOCK.lstrip("/")
 
+    @property
+    def swap(self) -> Path:
+        return self.root / "swapfile"
+
+    @property
+    def swap_tmp(self) -> Path:
+        return self.root / "swapfile.tmp"
+
+    @property
+    def swappiness(self) -> Path:
+        return self.root / "etc" / "sysctl.d" / "60-marketlake-swap.conf"
+
+    @property
+    def active_swap(self) -> list[str]:
+        path = self.state / "swaps"
+        return path.read_text().splitlines() if path.exists() else []
+
     # -- state -------------------------------------------------------------------------
 
     def set_uv(self, version: str | None) -> None:
@@ -178,6 +197,14 @@ class VM:
         """Mount a filesystem with this UUID at the lake root, with its directory."""
         self.lake.mkdir(parents=True, exist_ok=True)
         (self.state / "mounted").write_text(uuid)
+
+    def swap_ready(self) -> None:
+        """Give the VM the swap file, on and set up, as a run before this one left it."""
+        self.swap.write_text("SWAPSPACE2\n")
+        self.swap.chmod(0o600)
+        self.swappiness.parent.mkdir(parents=True)
+        self.swappiness.write_text(SWAPPINESS_FILE)
+        (self.state / "swaps").write_text(f"{self.swap}\n")
 
     def immutable(self) -> list[str]:
         path = self.state / "immutable"
@@ -328,6 +355,8 @@ def test_a_first_boot_formats_a_fresh_volume_and_installs(vm):
         f"findmnt --fstab --tab-file {vm.fstab} -n -o SOURCE --mountpoint {LAKE_ROOT}",
         f"chown {OWNER}: {lake}",
         f"resize2fs {dev}",
+        f"mkswap {vm.swap_tmp}",
+        f"swapon {vm.swap}",
         SYNC,
         "flock -w 600 9",
         "venv-python -m lake.vm_config render",
@@ -343,9 +372,10 @@ def test_a_first_boot_formats_a_fresh_volume_and_installs(vm):
     install_say = "vm-bootstrap: installing and starting the units"
     assert _in_order(says, [sync_say, install_say]), says
     assert vm.immutable() == [lake]
-    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(NEW_UUID)
+    assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(NEW_UUID)
     assert vm.fstab.stat().st_mode & 0o777 == 0o644
-    assert sorted(path.name for path in vm.fstab.parent.iterdir()) == ["fstab", "marketlake"]
+    in_etc = sorted(path.name for path in vm.fstab.parent.iterdir())
+    assert in_etc == ["fstab", "marketlake", "sysctl.d"]
     assert (vm.state / "mounted").read_text() == NEW_UUID
     # Every Python step runs as the owner, and each one reading stdin got its own file.
     venv = str(vm.checkout / ".venv" / "bin" / "python")
@@ -370,7 +400,17 @@ def test_a_second_run_changes_nothing(vm):
     second = vm.bootstrap()
     assert second.returncode == 0, second.stdout + second.stderr
     calls = vm.calls()
-    for tool in ("mkfs.ext4", "dd ", "chattr", "lsattr", "chmod", "mount ", "curl", "udevadm"):
+    for tool in (
+        "mkfs.ext4",
+        "dd ",
+        "chattr",
+        "lsattr",
+        "chmod",
+        "mount ",
+        "curl",
+        "udevadm",
+        "mkswap",
+    ):
         assert not vm.ran(tool), (tool, calls)
     assert "chown root:root" not in "\n".join(calls)
     assert not [line for line in calls if line.startswith("findmnt --verify")], calls
@@ -392,8 +432,8 @@ def test_an_existing_ext4_mounts_without_mkfs(vm):
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not vm.ran("mkfs.ext4")
-    assert not vm.ran("dd ")
-    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+    assert not [line for line in vm.ran("dd ") if "of=" not in line]
+    assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(FAKE_UUID)
     assert (vm.state / "mounted").read_text() == FAKE_UUID
 
 
@@ -641,6 +681,7 @@ def test_the_line_is_keyed_on_the_mount_point(vm):
         + f"#UUID=old {LAKE_ROOT} ext4 defaults 0 0\n"
         + "/swap.img none swap sw 0 0\n"
         + f"UUID={OTHER_UUID} {LAKE_ROOT}/sub ext4 defaults 0 2\n"
+        + SWAP_LINE
         + _lake_line(FAKE_UUID)
     )
     assert "systemctl daemon-reload" in vm.calls()
@@ -683,7 +724,8 @@ def test_an_fstab_with_no_root_entry_is_refused(vm, fstab):
 
 def test_an_identical_fstab_is_not_rewritten(vm):
     vm.ext4()
-    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    vm.swap_ready()
+    vm.fstab.write_text(ROOT_LINE + SWAP_LINE + _lake_line(FAKE_UUID))
     stamp = vm.fstab.stat().st_mtime_ns
     proc = vm.bootstrap()
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -691,6 +733,215 @@ def test_an_identical_fstab_is_not_rewritten(vm):
     assert not [line for line in vm.calls() if line.startswith("findmnt --verify")]
     assert "systemctl daemon-reload" not in vm.calls()
     assert not vm.ran("sync")
+
+
+# -- swap ------------------------------------------------------------------------------
+
+
+def test_a_first_run_makes_the_swap_file_and_turns_it_on(vm):
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.swap.read_text() == "SWAPSPACE2\n"
+    assert vm.swap.stat().st_mode & 0o777 == 0o600
+    assert not vm.swap_tmp.exists()
+    assert vm.active_swap == [str(vm.swap)]
+    # The file is built under its other name, whole, and only then given the real one.
+    calls = vm.calls()
+    steps = [
+        f"rm -f -- {vm.swap_tmp}",
+        f"dd if=/dev/zero of={vm.swap_tmp} bs=1M count=1024 conv=fsync status=none",
+        f"chmod 0600 {vm.swap_tmp}",
+        f"mkswap {vm.swap_tmp}",
+        "swapon --show=NAME --noheadings",
+        f"swapon {vm.swap}",
+    ]
+    assert _in_order(calls, steps), calls
+    assert vm.ran("mkswap") == [f"mkswap {vm.swap_tmp}"]
+    assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(NEW_UUID)
+
+
+def test_the_swap_step_runs_once_the_lake_is_proven_and_before_uv(vm):
+    vm.set_uv(None)
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = vm.calls()
+    assert vm.index(f"resize2fs {vm.device}") < min(calls.index(line) for line in vm.ran("swapon"))
+    assert vm.index(f"swapon {vm.swap}") < calls.index(vm.ran("curl")[0])
+
+
+def test_a_stopped_disk_step_makes_no_swap(vm):
+    proc = vm.bootstrap(RESIZE2FS_RC="1")
+    assert proc.returncode == 1
+    assert not vm.swap.exists()
+    assert not vm.ran("swapon")
+    assert not vm.ran("sysctl")
+
+
+def test_swappiness_is_written_and_applied_before_swap_turns_on(vm):
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.swappiness.read_text() == SWAPPINESS_FILE
+    assert vm.swappiness.stat().st_mode & 0o777 == 0o644
+    assert [path.name for path in vm.swappiness.parent.iterdir()] == [vm.swappiness.name]
+    assert (vm.state / "sysctl").read_text() == SWAPPINESS_FILE
+    assert vm.index(f"sysctl -q -p {vm.swappiness}") < vm.index(f"swapon {vm.swap}")
+
+
+def test_a_second_run_leaves_the_swap_alone_while_it_is_in_use(vm):
+    first = vm.bootstrap()
+    assert first.returncode == 0, first.stdout + first.stderr
+    swap = vm.swap.stat().st_mtime_ns
+    swappiness = vm.swappiness.stat().st_mtime_ns
+    second = vm.bootstrap()
+    assert second.returncode == 0, second.stdout + second.stderr
+    # The one call to swapon lists what is on. The fake's swapon and mkswap both refuse a
+    # file in use, as the real tools do, so a second turn-on would have failed the run.
+    assert vm.ran("swapon") == ["swapon --show=NAME --noheadings"]
+    assert not vm.ran("mkswap")
+    assert not vm.ran(f"rm -f -- {vm.swap_tmp}")
+    assert not vm.ran("mktemp")
+    assert vm.active_swap == [str(vm.swap)]
+    assert vm.swap.stat().st_mtime_ns == swap
+    assert vm.swappiness.stat().st_mtime_ns == swappiness
+    # The kernel loses a sysctl at every boot, so the setting is applied on each run.
+    assert vm.ran("sysctl") == [f"sysctl -q -p {vm.swappiness}"]
+
+
+def test_the_fstab_lists_the_swap_file_once_after_two_runs(vm):
+    for _ in range(2):
+        proc = vm.bootstrap()
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.fstab.read_text().count(SWAP_LINE) == 1
+    assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(NEW_UUID)
+
+
+def test_an_interrupted_build_is_started_again(vm):
+    # A run cut off partway leaves bytes under the other name and nothing at the real one.
+    vm.swap_tmp.write_text("half a file")
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.swap.read_text() == "SWAPSPACE2\n"
+    assert not vm.swap_tmp.exists()
+    assert vm.active_swap == [str(vm.swap)]
+
+
+def test_a_finished_file_that_is_off_is_turned_on_and_not_rebuilt(vm):
+    vm.swap.write_text("SWAPSPACE2\n")
+    vm.swap.chmod(0o600)
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not vm.ran("dd if=/dev/zero")
+    assert not vm.ran("mkswap")
+    assert vm.ran(f"swapon {vm.swap}") == [f"swapon {vm.swap}"]
+    assert vm.active_swap == [str(vm.swap)]
+
+
+def test_another_active_swap_does_not_read_as_this_one(vm):
+    vm.swap.write_text("SWAPSPACE2\n")
+    vm.swap.chmod(0o600)
+    (vm.state / "swaps").write_text(f"{vm.swap}.old\n/swap.img\n")
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.ran(f"swapon {vm.swap}") == [f"swapon {vm.swap}"]
+
+
+def test_a_swap_file_others_can_read_is_narrowed(vm):
+    vm.swap.write_text("SWAPSPACE2\n")
+    vm.swap.chmod(0o644)
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.swap.stat().st_mode & 0o777 == 0o600
+    assert vm.ran(f"chmod 0600 {vm.swap}") == [f"chmod 0600 {vm.swap}"]
+
+
+def test_another_swappiness_file_is_replaced(vm):
+    vm.swappiness.parent.mkdir(parents=True)
+    vm.swappiness.write_text("vm.swappiness = 60\n")
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.swappiness.read_text() == SWAPPINESS_FILE
+    assert (vm.state / "sysctl").read_text() == SWAPPINESS_FILE
+
+
+def test_a_stale_swap_line_is_replaced_and_others_stay(vm):
+    vm.ext4()
+    vm.fstab.write_text(
+        ROOT_LINE
+        + "/swapfile none swap defaults 0 0\n"
+        + "#/swapfile none swap sw 0 0\n"
+        + "/swap.img none swap sw 0 0\n"
+    )
+    proc = vm.bootstrap()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert vm.fstab.read_text() == (
+        ROOT_LINE
+        + "#/swapfile none swap sw 0 0\n"
+        + "/swap.img none swap sw 0 0\n"
+        + SWAP_LINE
+        + _lake_line(FAKE_UUID)
+    )
+
+
+@pytest.mark.parametrize(
+    ("env", "line", "file_left"),
+    [
+        ({"DD_WRITE_RC": "1"}, "could not write", False),
+        ({"MKSWAP_RC": "1"}, "mkswap failed", False),
+        ({"SYSCTL_RC": "1"}, "sysctl could not apply", True),
+        ({"SWAPON_SHOW_RC": "1"}, "could not list the active swap", True),
+        ({"SWAPON_RC": "255"}, "swapon failed", True),
+    ],
+    ids=["dd", "mkswap", "sysctl", "the list of active swap", "swapon"],
+)
+def test_a_failed_swap_command_stops_before_the_install(vm, env, line, file_left):
+    proc = vm.bootstrap(**env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert line in _one_line(proc, "vm-bootstrap: ")
+    # A file at the real name is always a whole one, and no half-made one is left behind.
+    assert vm.swap.exists() == file_left
+    assert not vm.swap_tmp.exists()
+    assert vm.active_swap == []
+    # The fstab holds the lake's line alone, so the next boot names no file that failed.
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(NEW_UUID)
+    _assert_nothing_installed(vm, chowned=True)
+    assert not vm.ran("curl")
+
+
+def test_a_refused_swap_line_stops_before_the_install(vm):
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    proc = vm.bootstrap(FINDMNT_VERIFY_RC="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "findmnt --verify refused" in _one_line(proc, "vm-bootstrap: ")
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+    assert sorted(path.name for path in vm.fstab.parent.iterdir()) == [
+        "fstab",
+        "marketlake",
+        "sysctl.d",
+    ]
+    _assert_nothing_installed(vm, chowned=True)
+
+
+@pytest.mark.parametrize("kind", ["a link", "a dangling link", "a directory"])
+def test_anything_but_a_file_at_the_swap_path_is_refused(vm, kind):
+    # A link could lead into the lake, and mv would write inside a directory, so either
+    # could put the swap file on the lake's volume.
+    if kind == "a directory":
+        vm.swap.mkdir()
+    else:
+        vm.lake.mkdir(parents=True)
+        target = vm.lake / "swapfile"
+        if kind == "a link":
+            target.write_text("SWAPSPACE2\n")
+        vm.swap.symlink_to(target)
+    proc = vm.bootstrap()
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "is not a regular file" in _one_line(proc, "vm-bootstrap: ")
+    assert not vm.ran("dd if=/dev/zero")
+    assert not vm.ran("swapon")
+    assert not vm.ran("sysctl")
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(NEW_UUID)
+    _assert_nothing_installed(vm, chowned=True)
 
 
 # -- the mount and the resize ----------------------------------------------------------
@@ -1035,6 +1286,8 @@ PREFLIGHT = [
     ("no home", lambda vm: None, {"FAKE_GETENT_HOME": ""}, "has no home directory"),
     ("not key=value", _conf("$(touch /tmp/x)\n"), {}, "not KEY=VALUE"),
     ("relative root", _vm_yaml("lake_root: srv/marketlake\n"), {}, "absolute path"),
+    # The volume mounted at / would put /swapfile on the lake's volume.
+    ("the root itself", _vm_yaml("lake_root: /\n"), {}, "absolute path"),
     ("spaced root", _vm_yaml("lake_root: /srv/market lake\n"), {}, "absolute path"),
     ("dotted root", _vm_yaml("lake_root: /srv/../etc\n"), {}, ". or .."),
     ("a dot component", _vm_yaml("lake_root: /srv/./marketlake\n"), {}, ". or .."),
