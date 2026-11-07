@@ -255,6 +255,8 @@ A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the 
 
 The rule reads command text only. A browser click, an MCP call, a terminal tool that types into the owner's terminal, a query read from a file (`-F query=@file`), a path built at runtime, or a REST `PUT` or `DELETE` on `environments/<name>` gets past it, and the directive is what covers those routes. The deny rule does not match `gh run cancel`, because sessions cancel ordinary CI runs. The directive still forbids cancelling a run that waits on approval, which counts as rejecting it.
 
+**A change to the deny rule reaches a session only through the main checkout.** The desktop app starts a worktree session with `--project-config-root` set to the main checkout, so the session loads that checkout's `.claude/settings.json` and ignores the copy in its own worktree. An edit on a branch therefore changes nothing until it has merged to `main` and the main checkout has pulled it, and only a session started after that can rely on the new rule. On 2026-11-07 the branch of [PR #1010](https://github.com/l3a0/marketlake/pull/1010) had dropped the `pending_deployments` entries while the main checkout still held them, so the rule refused a session's approval of [run 42340631065](https://github.com/l3a0/marketlake/actions/runs/42340631065).
+
 ## Pull requests
 
 **Review every PR before the owner does (owner directive, 2026-09-06).** A PR the owner has not seen reviewed is not finished work. This holds whether the PR is yours or someone else's, whether it is one line or a thousand, and whether or not a review was asked for. The owner's time is the scarce thing, so a PR reaches them already checked rather than waiting to be read cold.
