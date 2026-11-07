@@ -33,7 +33,7 @@ manages, called its state, and both states sit in one S3 bucket under separate k
    assume two roles: `marketlake-backup`, which reads the bucket, and
    `marketlake-token-writer`, which writes the Schwab token's parameter.
    `.github/workflows/infra.yml` plans it on each pull request from a branch here, and
-   applies it after a merge to `main` once the owner approves the run. Either starts on
+   applies it after a merge to `main` once the run is approved. Either starts on
    its own only when the pull request or merge changes the workflow or a file under
    `infra/` other than Markdown, since no configuration reads Markdown. A manual run can
    also replace the VM, as [The hosted VM](#the-hosted-vm) says.
@@ -365,8 +365,8 @@ matches the plan just read. On 2026-10-06 the first apply reported 1 imported, 8
 ### 8. Create the `infra` environment
 
 Only the owner runs this step. An agent session may approve a waiting run in the `deploy`
-and `infra` environments on the conditions that rule names. It never approves anything
-live, never rejects or cancels a deployment, and never edits an environment or its
+and `infra` environments on the conditions that rule names. It approves in no other
+environment, never rejects or cancels a deployment, and never edits an environment or its
 protection rules. That rule is the "Deployment approvals" section of
 [`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06).
 
@@ -580,13 +580,13 @@ list it on the pull request's issue.
 
 ### 11. Merge, approve, and confirm nothing is left to change
 
-Merge the pull request. Then the owner approves the `tofu apply (live)` run in the
+Merge the pull request. Then approve the `tofu apply (live)` run in the
 Actions tab, outside 09:25 to 16:15 ET, so an apply never runs while the market is open
 and the daemon is capturing.
 
 A run that waits for approval waits in the `infra` environment. To approve it, open the
 run in the Actions tab, click **Review deployments**, tick `infra`, then click **Approve
-and deploy**. Only the owner clicks these, as step 8 says.
+and deploy**. Step 8 says who may approve.
 
 After the first green apply, two runs confirm that nothing is left to change.
 
@@ -1584,7 +1584,7 @@ Three things call for a rerun.
    without a `config.yaml`. Put a missing parameter, or fix a missing tag in
    `infra/live/vm.tf` through an approved apply, as the render's line says. Then rerun.
 2. **Code merged after the apply.** A merge reaches the VM through
-   [Deploy from CI](#deploy-from-ci) once the owner approves its run, or by hand, as
+   [Deploy from CI](#deploy-from-ci) once its run is approved, or by hand, as
    [Deploy a commit](#deploy-a-commit) says. The deploy runs the bootstrap and restarts
    the daemon when it is owed, because the install restarts nothing. Timers start fresh
    processes and pick up new code by themselves.
@@ -2701,8 +2701,8 @@ Hold any deploy while the edit stands, because a deploy renders `config.yaml` ag
 
 Since the cutover the VM is the primary capture host, so code merged to `main` has to
 reach it, and a deploy at the wrong moment loses captured minutes for good.
-`.github/workflows/deploy.yml` asks the VM to deploy each push to `main`, once the owner
-approves the run in
+`.github/workflows/deploy.yml` asks the VM to deploy each push to `main`, once the run is
+approved in
 [the `deploy` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=deploy)
 ([#676](https://github.com/l3a0/marketlake/issues/676)). Nobody logs in and no key is
 stored. The design's "Infrastructure, defined" carries the reasoning.
@@ -2848,8 +2848,9 @@ requires the owner's approval, as
 [the `infra` environment](https://github.com/l3a0/marketlake/deployments/activity_log?environments_filter=infra)
 does, until the job has run cleanly enough times to drop it.
 [#851](https://github.com/l3a0/marketlake/issues/851) holds that decision. Only the owner
-creates it, edits it or approves its runs, per the "Deployment approvals" section of
-[`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06). GitHub
+creates it or edits it, and the "Deployment approvals" section of
+[`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06) says who
+approves its runs. GitHub
 creates a missing environment, with no protection rules, the first time a job names it.
 So the owner creates `deploy`, or protects the one a run created, with the same settings
 [step 8](#8-create-the-infra-environment) gives `infra`. The `PUT` below does either.

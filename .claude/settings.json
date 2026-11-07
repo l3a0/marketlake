@@ -1,6 +1,9 @@
 {
   "permissions": {
     "deny": [
+      "Bash(curl *pending_deployments*)",
+      "Bash(gh api *pending_deployments*rejected*)",
+      "Bash(gh api *rejected*pending_deployments*)",
       "Bash(gh api *deployment_protection_rule*)",
       "Bash(curl *deployment_protection_rule*)",
       "Bash(gh api *approveDeployments*)",
