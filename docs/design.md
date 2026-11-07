@@ -933,7 +933,7 @@ The document, defined in `infra/live/deploy.tf`, is a schema 2.2 command documen
 
 The deploy opens one new route to root on the VM, and its bounds are named here. Root already runs the owner's scripts, since the user-data shim runs `vm-bootstrap.sh` from the owner's clone, `marketlake-stop.service` runs `deploy/vm-stop.sh` from it every ten minutes ([#868](https://github.com/l3a0/marketlake/issues/868)), and the owner account has passwordless sudo. The deploy adds a route from a commit on `main` to root with no login. Three things bound it.
 
-1. Each run waits for an approval, by the owner or by a session under [the rule on deployment approvals](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06), which requires a closed review of every pull request the run ships.
+1. Each run waits for an approval, by the owner or by a session under [the rule on deployment approvals](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06), which requires a closed review of every commit the run ships. Sessions post under the owner's login, so that review proves only that the owner or a session wrote it.
 2. The document's three parameters admit only a sha, an epoch second, and `false` or `true` for the override, which changes when a deploy may start and never what it deploys.
 3. The host refuses any commit that is not on `origin/main` and ahead of the checkout's `HEAD`.
 

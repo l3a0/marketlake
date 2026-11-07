@@ -365,8 +365,8 @@ matches the plan just read. On 2026-10-06 the first apply reported 1 imported, 8
 ### 8. Create the `infra` environment
 
 Only the owner runs this step. An agent session may approve a waiting run in the `deploy`
-and `infra` environments on the conditions that rule names. It approves in no other
-environment, never rejects or cancels a deployment, and never edits an environment or its
+and `infra` environments on the conditions that rule names. It never approves anything
+that can place an order or touch real money, approves in no other environment, never rejects or cancels a deployment, and never edits an environment or its
 protection rules. That rule is the "Deployment approvals" section of
 [`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06).
 
@@ -590,8 +590,8 @@ and deploy**. Step 8 says who may approve.
 
 After the first green apply, two runs confirm that nothing is left to change.
 
-1. A manual run of `infra.yml` on `main` waits for the owner's approval like any other
-   apply, and its apply should find nothing to change.
+1. A manual run of `infra.yml` on `main` waits for the owner's approval, and its apply
+   should find nothing to change.
 2. A laptop plan of `infra/bootstrap/` from `main`'s merge commit, in the same worktree,
    should report no changes.
 
@@ -647,7 +647,7 @@ named `infra` runs the same apply, and its run is just as green.
 A later merge that changes `infra.yml`, or anything under `infra/` other than Markdown,
 while a run waits starts a newer run. After its approval, the older run checks `main`
 again, finds the newer commit, and skips itself as stale. The newer run applies
-everything once the owner approves it. So approving waiting runs out of order never
+everything once it is approved. So approving waiting runs out of order never
 applies an older commit last. A merge that changes only Markdown under `infra/` starts
 no run, and the older run reads it as fresh and applies.
 
@@ -738,6 +738,11 @@ git worktree remove "$HOME/marketlake-infra-main"
 A change made in the console shows up as a difference in the next plan. Adopt it into
 code or revert it. A manual run of `infra.yml` from `main` reverts it behind the same
 approval, with no code change.
+
+A green apply that turns out wrong is undone by a revert pull request, applied like any
+other change, with the same review and the same approval window. So an apply that breaks
+capture at 08:30 ET cannot be reverted through CI until 16:15 ET. A revert does not bring
+back a replaced instance, deleted data or lost minutes.
 
 A failed apply keeps the state of what it changed and releases its lock, so the next run
 plans only what is left. The cost and usage export is the one exception, because an

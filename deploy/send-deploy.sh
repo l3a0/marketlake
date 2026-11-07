@@ -1,7 +1,7 @@
 #!/bin/bash
 # Marketlake: ask the hosted VM to deploy one commit, from GitHub Actions (#676).
 #
-# .github/workflows/deploy.yml runs this on the runner, after the owner approves the run
+# .github/workflows/deploy.yml runs this on the runner, after the run is approved
 # in the `deploy` environment and the job has assumed the deploy role. It reads:
 #
 #   GITHUB_SHA         the commit to deploy, 40 hex digits
