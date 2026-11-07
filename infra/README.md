@@ -1761,12 +1761,10 @@ sudo rm /swapfile
 When the line says `/swapfile is not a regular file`, something else stands at the path.
 Read what it is with `ls -ld /swapfile` before removing it.
 
-When the line says `could not build the new fstab text`, or names a failed write of
-`/etc/fstab`, the file is as it was. Swap stays on until the VM next stops, so a later start
-has no swap until a rerun adds the line.
-
-When the line says `daemon-reload failed after writing`, the swap line landed and carries
-`nofail`. It needs nothing, because the last install reloads systemd.
+When the line says `daemon-reload failed after writing /etc/fstab`, the swap line is on disk
+and carries `nofail`, and swap is on. The last install reloads systemd, so swap needs nothing
+more. Any other line about the fstab leaves the file as it was, and swap stays on until the
+VM next stops, so a later start has no swap until a rerun adds the line.
 
 ### Turn the swap off
 
