@@ -66,7 +66,8 @@ whole ticker-day. A segment the read proves damaged refuses it the same way, whi
 only check a segment with no manifest entry gets. That finding is damage rather than
 drift, and a reader counting drift must not pick it up, so it goes under
 ``reports/damaged_segments/`` and not ``reports/schema_drift/``. It names the segment and
-both hashes, or the read's failure where no hash was recorded, and it files on every run
+both hashes, the read's failure where no hash was recorded, or the recorded hash alone for a
+segment gone from disk, and it files on every run
 the damage survives, for the reason a refused merge does: nothing was sealed, so no
 manifest entry makes a later silence readable.
 

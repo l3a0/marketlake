@@ -1307,6 +1307,7 @@ def test_a_manifested_segment_gone_from_disk_refuses_the_ticker_day(lake_root, s
     assert page.title == DAMAGED_SEGMENT_TITLE
     assert rel in page.body
     assert "1 manifested segment(s) are missing from disk" in page.body
+    assert "The segments on disk are kept" in page.body
     (finding,) = _findings(lake_root)
     assert finding["surface"] == surface
     assert finding["segments"] == [_rel(lake_root, path) for path in spy]
@@ -1353,7 +1354,8 @@ def test_a_gone_segment_of_one_ticker_day_says_nothing_about_another(lake_root):
 
     ``SPYG`` sorts right after ``SPY`` and shares its prefix, so a comparison that left off
     the closing slash would refuse the healthy ticker-day for its neighbour's missing file.
-    The quotes and the later day pass only if the surface and the date are in the comparison.
+    The quotes pass only if the surface is in the comparison. The next two tests do the same
+    for the date.
     """
     spy = _captured(lake_root, "SPY")
     quotes = _captured_quotes(lake_root, "SPY")
@@ -1371,6 +1373,95 @@ def test_a_gone_segment_of_one_ticker_day_says_nothing_about_another(lake_root):
     (refused,) = result.refused
     assert refused.ticker == "SPYG"
     assert [item.segment for item in refused.damaged] == [_rel(lake_root, gone)]
+
+
+NEXT_DAY = date(2026, 8, 25)
+
+
+def _at(day: date, hour: int, minute: int) -> datetime:
+    return datetime.combine(day, time(hour, minute), tzinfo=MARKET_TZ)
+
+
+def _captured_on(lake_root: Path, day: date) -> list[Path]:
+    """Three chains segments for SPY on ``day``, each with its manifest entry."""
+    paths = []
+    for minute in range(3):
+        at = _at(day, 10, minute)
+        outcome = capture.journal_snapshot(
+            lake_root,
+            journal.CHAINS_SURFACE,
+            "SPY",
+            body=_CHAIN,
+            cycle_start=at,
+            fetch_ts=at,
+            fetch_end_ts=at,
+            pid=PID,
+        )
+        paths.append(outcome.path)
+    return paths
+
+
+def _run_on(lake_root: Path, day: date) -> CompactionResult:
+    calendar = FakeCalendar(
+        {
+            item: SessionTimes(open=_at(item, 9, 30), close=_at(item, 16, 0))
+            for item in (DAY, NEXT_DAY)
+        }
+    )
+    return compact(
+        lake_root,
+        clock=ManualClock(_at(day, 16, 30)),
+        calendar=calendar,
+        backup=FakeBackup([]),
+        backup_target=TARGET,
+        plan_path=lake_root.parent / "chain_plan.json",
+    )
+
+
+def test_a_sealed_days_entries_say_nothing_about_the_next_day(lake_root):
+    """A sealed day's segment entries stay in the manifest with their files gone.
+
+    A comparison that lost the date would count them against the next day, and every
+    ticker would be refused from its second sealed day on.
+    """
+    _captured_on(lake_root, DAY)
+    assert [item.day for item in _run_on(lake_root, DAY).sealed] == [DAY]
+    _captured_on(lake_root, NEXT_DAY)
+
+    result = _run_on(lake_root, NEXT_DAY)
+
+    assert result.refused == ()
+    assert [item.day for item in result.sealed] == [NEXT_DAY]
+
+
+def test_a_gone_segment_on_one_day_leaves_the_next_day_alone(lake_root):
+    gone = _captured_on(lake_root, DAY)[1]
+    _captured_on(lake_root, NEXT_DAY)
+    gone.unlink()
+
+    result = _run_on(lake_root, NEXT_DAY)
+
+    assert [item.day for item in result.refused] == [DAY]
+    assert [item.day for item in result.sealed] == [NEXT_DAY]
+
+
+def test_a_ticker_day_with_no_segment_left_reaches_no_refusal(lake_root):
+    """The sweep skips a ticker-day it lists no segment for, so only the scrub names it.
+
+    A bucket target also stops at the upload, while the entries have not reached the bucket.
+    """
+    spy = _captured(lake_root, "SPY")
+    for path in spy:
+        path.unlink()
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert (result.sealed, result.refused) == ((), ())
+    assert events == ["backup", "ping"]
+    assert transport.messages == []
+    assert _findings(lake_root) == []
+    assert scrub(lake_root).missing == tuple(sorted(_rel(lake_root, path) for path in spy))
 
 
 def test_a_segment_with_no_entry_leaves_nothing_to_miss(lake_root):

@@ -792,11 +792,15 @@ cases.
    segments under `lake/journal/` or as a sealed partition.
 3. A manifested segment left the disk before the seal. Compaction refuses the ticker-day as
    it does in the first case and sends the `Damaged segment at the merge` page, and a finding
-   under `reports/damaged_segments/` names the segment. Until the file is back at its path,
-   the nightly upload stops with `ManifestedFileMissing`, so the `compaction` and
-   `evening-upload` checks page too ([#998](https://github.com/l3a0/marketlake/issues/998)). A chains
-   segment has no copy to return, so that day waits on
-   [#557](https://github.com/l3a0/marketlake/issues/557).
+   under `reports/damaged_segments/` names the segment ([#998](https://github.com/l3a0/marketlake/issues/998)).
+   While the segment's entry has not reached the bucket, every night's upload stops at it with
+   `ManifestedFileMissing`. Later days' `quotes/` partitions and `reports/` stay off the bucket
+   for every ticker, the bucket's manifest stays where it was, the trim does not run, and the
+   `compaction` and `evening-upload` checks page. A chains segment no upload carried has no
+   copy to return, so the upload stays stopped until
+   [#557](https://github.com/l3a0/marketlake/issues/557) repairs the day. If a resync stopped part-way on
+   this host, run it again first, because that clears the refusal. A ticker-day with no segment
+   left gets no page or finding, and only `ManifestedFileMissing` and the Sunday scrub name it.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds

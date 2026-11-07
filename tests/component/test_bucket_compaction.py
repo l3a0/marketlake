@@ -100,9 +100,9 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
     """The price of refusing a short seal (marketlake #998).
 
     The refused ticker-day has no partition entry, so the segment's entry is not superseded
-    and the upload refuses it. That raise is what keeps the day from reading as healthy, and
-    it holds the watermark until the file returns. The finding lands first, because the
-    sweep comes before the backup.
+    and the upload refuses it while that entry has not reached the bucket. That raise is what
+    keeps the day from reading as healthy, and it holds the watermark until the file returns.
+    The finding lands first, because the sweep comes before the backup.
     """
     client = _seeded(lake_root)
     kept = _segment(
@@ -131,6 +131,41 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
     assert "ping" not in events
     assert "put lake/manifest.jsonl" not in events
     assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
+
+
+def test_a_gone_segment_already_in_the_bucket_is_refused_and_still_pings(lake_root):
+    """An entry behind the watermark is not pending, so the upload does not raise for it.
+
+    The refusal is then the only thing the run reports, and the bucket holds the file.
+    """
+    client = _seeded(lake_root)
+    kept = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    gone = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
+    )
+    for path in (kept, gone):
+        append_manifest(
+            lake_root,
+            partition=path.relative_to(lake_root).as_posix(),
+            source="capture",
+            sha256=sha256_file(path),
+            rows=2,
+            fetched_at=None,
+        )
+    clock = _clock_at(DAY, 16, 25)
+    bucket.nightly_upload(lake_root, TARGET, client=client, clock=clock, calendar=_calendar())
+    gone.unlink()
+    events: list[str] = []
+
+    result = _job(lake_root, client, events)
+
+    assert [item.partition for item in result.refused] == [
+        LakePaths(lake_root).chains_partition_path("SPY", DAY).relative_to(lake_root).as_posix()
+    ]
+    assert result.backed_up and result.pinged
+    assert events[-1] == "ping"
 
 
 def test_an_empty_bucket_raises_before_the_ping(lake_root):

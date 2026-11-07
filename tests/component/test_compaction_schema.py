@@ -59,6 +59,7 @@ from lake.compact import (
     SCHEMA_DRIFT_EVENT,
     SCHEMA_DRIFT_TITLE,
     CompactionResult,
+    DamagedSegments,
     RecompactionRefused,
     RetypeRefused,
     compact,
@@ -1546,6 +1547,23 @@ def test_the_same_ticker_day_without_the_flag_is_still_refused(lake_root, monkey
 
 
 # -- the automatic sweep never widens ----------------------------------------
+
+
+def test_the_widening_flag_does_not_pass_a_manifested_segment_gone_from_disk(lake_root):
+    """The flag answers a type conflict, and sealing here would seal short and unlink."""
+    morning, afternoon = _conflicted_day(lake_root)
+    gone = morning.with_name("seg-c-4242.arrows")
+    rel = gone.relative_to(lake_root).as_posix()
+    append_manifest(
+        lake_root, partition=rel, source="capture", sha256="a" * 64, rows=2, fetched_at=None
+    )
+
+    with pytest.raises(DamagedSegments) as info:
+        _repair(lake_root, allow_retype=True)
+
+    assert [item.segment for item in info.value.damaged] == [rel]
+    assert morning.exists() and afternoon.exists()
+    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
 
 
 def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):

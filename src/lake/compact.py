@@ -78,7 +78,8 @@ The job's rules, each glossed at first use.
    partition is manifested the scrub and the upload both stop asking after the segment.
    The comparison runs only while the partition has no entry. Once it has one, its segments'
    entries are superseded and their files are gone by design, and the no-shrink guard
-   answers for the count.
+   answers for the count. A ticker-day with no segment left reaches no comparison, because
+   the sweep skips it, so only the upload's refusal and the scrub name it.
 4. *Drift is reported, and costs one ticker-day at most.* Segments in one ticker-day
    can disagree about columns only when the daemon restarted onto different code
    mid-session, because every production segment takes its schema from
@@ -139,6 +140,8 @@ The job's rules, each glossed at first use.
 7. *Backup, then ping.* After the sweep has finished with every eligible ticker-day, the
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
+   The exception is a segment gone from disk. While its entry has not reached the bucket,
+   the upload refuses it, which ends the run before the ping (marketlake #998).
    The health-check ping fires only after the backup succeeds, so the
    one ping attests both, except on a ``shadow`` host, which runs no backup and whose
    ping attests only the seal. An unmounted target raises before any ping, and so does a
@@ -502,7 +505,9 @@ class DamagedSegments(Exception):
     A manifested segment that is gone from disk is refused the same way too (marketlake #998).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
-    ticker-day, the backup, and the ping.
+    ticker-day, the backup, and the ping. A gone segment can still cost the backup and the
+    ping, because the upload refuses it while its entry has not reached the bucket, but no
+    other ticker-day's seal.
 
     Sealing the healthy segments and keeping the damaged one is not an option. The next
     run would find the partition manifested and delete every remaining segment as debris
@@ -1123,9 +1128,13 @@ def _missing_segments(
     later check would ask, because the scrub and the upload both treat a segment as superseded
     once its partition is manifested (marketlake #998).
 
-    The caller runs this only while the partition has no entry. Every other way a manifested
-    segment leaves the disk happens after that entry lands, so nothing automatic explains the
-    absence here. A person or a disk fault does.
+    The caller runs this only while the partition has no entry. Compaction unlinks a segment
+    only once that entry has landed, so compaction never explains the absence here. A person
+    or a disk fault does, or a resync stopped between its deletions and its manifest rewrite,
+    and running that resync again clears the refusal.
+
+    ``entries`` comes from a read that stops at a torn line, so an entry hidden behind one is
+    not compared, the same limit the hash check has. Marketlake #447 owns that damage.
 
     Every segment of the ticker-day is named rather than the first, for the reason
     ``_damaged_segments`` gives. ``directory`` carries a closing slash into the comparison,
