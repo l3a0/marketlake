@@ -201,22 +201,23 @@ Branch before the first edit, not just before the commit. The moment a task will
 
 ## Deployment approvals (owner directive, 2026-10-06)
 
-**A session never approves, rejects or cancels a deployment, and never edits or deletes an environment or its protection rules, such as required reviewers and wait timers.** Editing the environment skips the approval entirely. This holds in every GitHub environment, including the `infra` environment that [PR #698](https://github.com/l3a0/marketlake/pull/698) adds, which holds the applies that [#704](https://github.com/l3a0/marketlake/issues/704) does not run on its own. It also holds by every route a session could take:
+**A session may approve a waiting run in the `deploy` and `infra` environments once three things hold (owner directive, 2026-11-07).**
 
-1. The `gh` CLI, including `gh api` and `gh api graphql`.
-2. `curl` or any other HTTP client.
-3. The GitHub web UI, driven through a browser tool.
-4. Any MCP tool.
+1. The run's commit passed CI.
+2. A review of that commit closed with `## Review complete` and no open veto.
+3. The session reports the run's link and what it approved.
 
-When a deployment waits on approval, the session tells the owner which run is waiting, as a link to the run per the writing-style rule above, and leaves it waiting. `gh run view <id>` shows the waiting job without touching the approval.
+An `infra` apply that stops or replaces the VM runs outside capture hours. A session never approves anything live, never rejects or cancels a deployment, never edits or deletes an environment or its protection rules, and never starts a Deploy run with `override_window`.
 
-**Give the owner the command that approves each waiting run (owner directive, 2026-10-16).** Beside each run's link, the session writes the command that approves it, in its own `bash` fence, for the owner to copy and run. The session never runs the command itself, by any route, and that includes a terminal tool that types into the owner's own terminal. The command posts to the run's `pending_deployments` path with the id of the environment the run waits in, and resolves that id from the environment's name:
+When a deployment waits on approval, the session tells the owner which run is waiting, as a link to the run per the writing-style rule above, and leaves it waiting unless the three conditions above hold. `gh run view <id>` shows the waiting job without touching the approval.
+
+**Give the owner the command that approves each waiting run (owner directive, 2026-10-16).** Beside each run's link, the session writes the command that approves it, in its own `bash` fence, for the owner to copy and run, unless the session approves that run under the rule above. The command posts to the run's `pending_deployments` path with the id of the environment the run waits in, and resolves that id from the environment's name:
 
 ```bash
 gh api --method POST repos/l3a0/marketlake/actions/runs/<run>/pending_deployments -F "environment_ids[]=$(gh api repos/l3a0/marketlake/environments --jq '.environments[] | select(.name == "<environment>") | .id')" -f state=approved -f comment='Approved by the owner'
 ```
 
-Fill in the run's id and the environment's name, such as `infra` or `deploy`. GitHub requires the `comment` field. To put the command in an issue or pull request comment, post with `gh issue comment` or `gh pr comment` and `--body-file`, since the deny rule below refuses any `gh api` command whose text names `pending_deployments`, a comment body included. A run queued behind another in the same concurrency group reports `pending` in `gh run view <id> --json status` rather than `waiting`, so give its command once it reaches `waiting`. The plain `gh run view <id>` prints the same marker for both. When the order of approvals matters, as with an infra apply whose tags the deploy reads when it renders the VM's config, list the commands in that order and say why. On 2026-10-16 a report linked three waiting runs, and the owner asked for the commands rather than approving each one in the browser.
+Fill in the run's id and the environment's name, such as `infra` or `deploy`. GitHub requires the `comment` field. To put the command in an issue or pull request comment, post with `gh issue comment` or `gh pr comment` and `--body-file`. A run queued behind another in the same concurrency group reports `pending` in `gh run view <id> --json status` rather than `waiting`, so give its command once it reaches `waiting`. The plain `gh run view <id>` prints the same marker for both. When the order of approvals matters, as with an infra apply whose tags the deploy reads when it renders the VM's config, list the commands in that order and say why. On 2026-10-16 a report linked three waiting runs, and the owner asked for the commands rather than approving each one in the browser.
 
 **Check two things before handing over a deploy's commands (owner directive, 2026-10-16).** A list of approve commands can still send the owner to approve a run that does nothing, or one that reaches a VM that has already powered off.
 
@@ -244,12 +245,12 @@ Both commands need the owner's admin session, so they are the owner's to run. On
 
 The VM refuses an override from the margin before a session opens until the close+15 compaction, which is 08:00 to 16:30 ET on a regular session day, so a report never offers one inside that span. The deny rule below does not match `gh workflow run`, so this directive alone covers the dispatch.
 
-Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. The approval is the human check on what a session wrote, and a session that approves its own change removes that check.
+Sessions act through the owner's GitHub token, so GitHub cannot tell a session's approval from the owner's. So a run a session approves has no human check, and the review closing clean is the only gate on it. That is the price of the rule above.
 
 A tracked deny rule in [.claude/settings.json](.claude/settings.json) backs the directive up. It refuses a `gh api` or `curl` command that names any of these REST paths or GraphQL mutations:
 
-- `pending_deployments` and `deployment_protection_rule`, the REST paths that approve or reject a waiting deployment.
-- `approveDeployments` and `rejectDeployments`, the GraphQL mutations that do the same.
+- `deployment_protection_rule`, the REST path that answers a custom protection rule.
+- `approveDeployments` and `rejectDeployments`, the GraphQL mutations that approve or reject a waiting deployment.
 - `updateEnvironment` and `deleteEnvironment`, the GraphQL mutations that change an environment's reviewers or remove the environment.
 
 The rule reads command text only. A browser click, an MCP call, a terminal tool that types into the owner's terminal, a query read from a file (`-F query=@file`), a path built at runtime, or a REST `PUT` or `DELETE` on `environments/<name>` gets past it, and the directive is what covers those routes. The deny rule does not match `gh run cancel`, because sessions cancel ordinary CI runs. The directive still forbids cancelling a run that waits on approval, which counts as rejecting it.

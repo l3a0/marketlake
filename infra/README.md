@@ -364,8 +364,9 @@ matches the plan just read. On 2026-10-06 the first apply reported 1 imported, 8
 
 ### 8. Create the `infra` environment
 
-Only the owner runs this step, and only the owner approves a deployment. An agent session
-never approves, rejects or cancels a deployment, and never edits an environment or its
+Only the owner runs this step. An agent session may approve a waiting run in the `deploy`
+and `infra` environments on the conditions that rule names. It never approves anything
+live, never rejects or cancels a deployment, and never edits an environment or its
 protection rules. That rule is the "Deployment approvals" section of
 [`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06).
 
