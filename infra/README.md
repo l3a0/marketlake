@@ -1421,8 +1421,9 @@ describe the instance can read it. The boot takes two steps.
 2. The bootstrap mounts the lake volume at `/srv/marketlake`, formatting it only when
    `blkid` finds no filesystem and no ext4 superblock sits where the bootstrap's own
    `mkfs` puts one. It writes the volume's `/etc/fstab` line, and stops when it
-   cannot read the old file or when the new one would hold no entry for `/`. It installs
-   the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
+   cannot read the old file or when the new one would hold no entry for `/`. It makes a
+   1 GiB swap file at `/swapfile` and turns it on, and a failure there leaves the rest of
+   the boot running and ends the run on exit 4. It installs the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
    times on any error. Then it syncs the environment with
    `deploy/linux-install.sh --sync-only`, which starts nothing. From that environment it
    renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
@@ -1434,7 +1435,7 @@ describe the instance can read it. The boot takes two steps.
    to the metadata service times out after a second. Last, it runs
    `deploy/linux-install.sh` again without the flag, which installs and starts the
    units, so the residents start with their config already in place. That install runs
-   even when a config step failed.
+   even when the swap step or a config step failed.
 
 Each line the bootstrap prints starts `vm-bootstrap:`, and a run that finished prints
 `vm-bootstrap: done` last. A failed first boot shows in `/var/log/cloud-init-output.log`
@@ -1552,24 +1553,27 @@ Each failure prints one line naming the step, and the exit code says how the run
 
 1. Exit 0 means every step passed.
 2. Exit 2 means the bootstrap itself refused, which happens only before the first
-   install, such as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`.
-   It also refuses three states of the lake volume, and formats nothing in any of them.
+   install, such as on a bad `bootstrap.conf`, an `/etc/fstab` with no entry for `/`, or
+   a `lake_root` of `/swapfile`. It also refuses three states of the lake volume, and
+   formats nothing in any of them.
    1. The volume holds something other than ext4.
    2. A read of 4 KiB block 0 or 32768 failed or came back short.
    3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
       line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
-3. Exit 1 covers every failure of a disk step or an install. A disk step that fails
-   stops the run at once, and so does the first install, the one that syncs the
-   environment, even when it refused with its own exit 2. The last install, the one
-   that starts the units, runs whatever the config steps returned. When it fails, its
-   line says whether a rerun installs and starts the units, and the run ends with exit 1.
-4. Exit 4 means the last install installed and started the units, but a render, token
-   pull or roster apply failed, even when the step itself refused with its own exit 2.
-   Each of those skips only the steps that need it. A deploy reads exit 4 as units in
-   place, so it still restarts the daemon when a restart is owed, and it writes no record
-   of the deploy until a run passes every step.
+3. Exit 1 covers every failure of a disk step or an install, and a failed write of the
+   swap file's `/etc/fstab` line. A disk step that fails stops the run at once, and so
+   does the first install, the one that syncs the environment, even when it refused with
+   its own exit 2. The last install, the one that starts the units, runs whatever the
+   swap step and the config steps returned. When it fails, its line says whether a rerun
+   installs and starts the units, and the run ends with exit 1.
+4. Exit 4 means the last install installed and started the units, but the swap step, a
+   render, a token pull or a roster apply failed, even when the step itself refused with
+   its own exit 2. Each of those skips only the steps that need it, and
+   [When the swap step fails](#when-the-swap-step-fails) covers the first. A deploy reads
+   exit 4 as units in place, so it still restarts the daemon when a restart is owed, and
+   it writes no record of the deploy until a run passes every step.
 
 So read every line, not only the last.
 
@@ -1685,6 +1689,80 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
    sudo dd if=/dev/zero of=<dev> bs=4096 seek=<block> count=1 conv=fsync
    ```
 
+### See how much swap the VM uses
+
+The bootstrap gives the VM a 1 GiB swap file at `/swapfile`, so a shortage of memory slows
+a job rather than the kernel killing it. Past about 2,858 MiB of demand, memory and swap
+together, the kernel kills again. Do not run the sweep by hand during a session, because a
+job that pages then could delay capture cycles, and that delay is unmeasured.
+
+Read the swap's use on the VM.
+
+```bash
+swapon --show
+free -m
+vmstat 1 5
+```
+
+`swapon --show` lists the file and how much of it is in use. In `vmstat`, the `si` and
+`so` columns count what moves in from swap and out to it each second, and both read 0
+while nothing is short of memory. A little swap in use with those columns at 0 means the
+pages sit idle. These reads show only the present, and the nightly stop empties swap, so a
+morning reading says nothing about the evening before.
+
+Move to a `t4g.medium` when swap is written on 3 of 5 sessions. Item 3 of [#1006](https://github.com/l3a0/marketlake/issues/1006) supplies the reading, and the instance size stays the owner's choice.
+
+After the first nightly stop and start with the swap file, run these three reads. The
+first lists the file, the second prints 1, and the third prints the file's one line.
+
+```bash
+swapon --show
+sysctl vm.swappiness
+grep swapfile /etc/fstab
+```
+
+The `eod-sweep` check pages when no ping came by about 19:00. One cause is the unit still
+active, paging. `systemctl is-active com.marketlake.eod-sweep.service` prints `active`, and
+the `si` and `so` columns read above 0. Then the sweep is slow rather than dead, so let it
+finish.
+
+#### When the swap step fails
+
+The bootstrap prints `the swap step failed:` and the reason, installs the units anyway, and
+ends on exit 4. A deploy then ends `with a failed step in deploy.log`. Capture runs without
+swap, so this can wait for the evening. Fix what the line names, then rerun the bootstrap
+or wait for the next deploy.
+
+When the line says `swapon failed on /swapfile`, the file there has no swap signature, and
+the bootstrap never rebuilds a file at that name. Remove it, and the next run makes a new
+one.
+
+```bash
+sudo rm /swapfile
+```
+
+When the line says `/swapfile is not a regular file`, something else stands at the path.
+Read what it is with `ls -ld /swapfile` before removing it.
+
+### Turn the swap off
+
+Run this with memory free. `swapoff` moves every page back into memory, and under a
+shortage that can trigger the kernel's kill. So first check that `free -m` shows more
+`available` memory than `used` swap, and that no job is running. Run the commands in this
+order.
+
+```bash
+sudo swapoff /swapfile
+sudo sed -i '\#^/swapfile #d' /etc/fstab
+sudo rm /etc/sysctl.d/60-marketlake-swap.conf
+sudo sysctl vm.swappiness=60
+sudo rm /swapfile
+sudo systemctl daemon-reload
+```
+
+The next deploy restores all of it, until a commit drops the step. A rollback leaves swap
+on, which does nothing until memory runs short.
+
 ### Deploy a commit
 
 A merge to `main` reaches the VM only through a deploy, and a deploy at the wrong moment
@@ -1755,7 +1833,7 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | Last line | Exit | What to do next |
 | --- | --- | --- |
 | `deployed: <sha>` or `deployed: <sha> (already current)` | 0 | Nothing. |
-| `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. A config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
+| `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. The swap step or a config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
 | `deployed: <sha>, but the dashboard did not restart` | 1 | Read `journalctl -u com.marketlake.dashboard`, fix the cause, then run `sudo ~/.local/state/marketlake/systemd/restart.sh dashboard`. Capture is unaffected. |
 | `deployed: <sha>, with a failed step in deploy.log, but the dashboard did not restart` | 1 | The two rows above both apply. Fix the dashboard as its row says, then the failed step as its row says. |
 | `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A reason that ends `exited 124` or `exited 137` is a bootstrap that reached its 15-minute cap, usually while SSM, PyPI or astral.sh was unreachable. Nothing needs a pull request then: send the deploy of the same sha again once the outage has passed. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
@@ -2329,7 +2407,9 @@ above. Each refusal names its check, so act on the last one before the page.
   session is a command left running after logout, and `loginctl list-sessions` lists the
   sessions.
 - **busy.** A job ran long. Read its own journal, such as
-  `journalctl -u com.marketlake.eod-sweep`. Its own check pages if it failed.
+  `journalctl -u com.marketlake.eod-sweep`. Its own check pages if it failed. A job that
+  pages runs long too, as [See how much swap the VM uses](#see-how-much-swap-the-vm-uses)
+  says.
 - **window.** Every run read the refused hours. That is expected before 18:45 on a weekday
   and before 23:30 on Sunday. After them, check the VM's clock with `timedatectl`.
 - **deploy.** A deploy ran or held a lock. `systemctl is-active marketlake-deploy` prints

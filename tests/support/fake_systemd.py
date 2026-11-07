@@ -579,6 +579,10 @@ exit "$rc"
 FAKE_MV = r"""#!/bin/bash
 printf 'mv %s\n' "$*" >> "$LOG"
 if [[ -n "${MV_RC:-}" ]]; then exit "$MV_RC"; fi
+if [[ -n "${MV_FAIL:-}" && "${*: -1}" == "$MV_FAIL" ]]; then
+  echo "mv: cannot move onto $MV_FAIL: Input/output error" >&2
+  exit 1
+fi
 exec /bin/mv "$@"
 """
 

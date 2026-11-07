@@ -29,6 +29,17 @@ change it the way the real tools would change a volume.
 util-linux's does. ``$STATE/submounts`` lists the mount points below the lake root, which
 ``findmnt -R`` prints after the lake root's own line.
 
+``$STATE/swaps`` lists the swap files turned on, one path a line, which ``swapon --show``
+prints. ``dd`` with ``of=`` writes a few bytes in place of the size it was asked for.
+``mkswap`` writes the signature ``SWAPSPACE2`` over a file, and refuses one that is in use.
+``swapon`` refuses a file with no signature and one already on, as the real tool does, so
+a test cannot pass against a script that turns on a half-made file or runs twice on a
+live one. ``$STATE/sysctl`` gathers what ``sysctl -p`` applied. ``DD_WRITE_RC``,
+``MKSWAP_RC``, ``SYSCTL_RC``, ``SWAPON_RC`` and ``SWAPON_SHOW_RC`` fail those tools, and
+``dd`` still leaves its bytes behind when it fails, as a full disk would. ``CHMOD_FAIL``
+and ``MV_FAIL`` each name a path that tool fails on, its last argument, as ``CAT_FAIL`` does
+for ``cat``. ``FIND_RC`` fails ``find``.
+
 The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O error would
 make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
 ``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that holds an entry. On
@@ -44,9 +55,10 @@ the directories ``chattr +i`` has marked.
 
 Each fake logs its argv to ``$LOG``, except ``cat``, which the other fakes call too.
 ``python3`` runs the test's own interpreter, which has PyYAML, and logs only its first
-argument, since the second is a whole program. ``chmod`` and ``rm`` log and then run the
-real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, which a
-Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to its line when it inherits
+argument, since the second is a whole program. ``chmod``, ``find``, ``mv`` and ``rm`` log
+and then run the real tool, inside the test root, and ``rm`` drops GNU's
+``--one-file-system``, which a Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to
+its line when it inherits
 an open descriptor 9, which is the one the scripts lock the install lock through, so a
 test sees a wait that holds the lock.
 ``mktemp`` with no template makes its file in ``$TMPDIR``, as GNU's does and a Mac's does
@@ -59,7 +71,7 @@ import sys
 from pathlib import Path
 
 from tests.support.fake_bin import install
-from tests.support.fake_systemd import NEXT_RC, install_fakes
+from tests.support.fake_systemd import FAKE_MV, NEXT_RC, install_fakes
 
 __all__ = ["NEXT_RC", "install_disk_fakes"]
 
@@ -98,11 +110,17 @@ exit 0
 FAKE_DD = r"""#!/bin/bash
 printf 'dd %s\n' "$*" >> "$LOG"
 block=""
+out=""
 for arg in "$@"; do
   case "$arg" in
     skip=*) block="${arg#skip=}" ;;
+    of=*) out="${arg#of=}" ;;
   esac
 done
+if [[ -n "$out" ]]; then
+  printf 'zeros\n' > "$out"
+  exit "${DD_WRITE_RC:-0}"
+fi
 if [[ -n "${DD_FAIL_BLOCK:-}" && "$block" == "$DD_FAIL_BLOCK" ]]; then
   echo "dd: error reading block $block: Input/output error" >&2
   exit 1
@@ -248,6 +266,41 @@ chmod 755 "\$FAKE_HOME/.local/bin/uv"
 EOF
 """
 
+FAKE_MKSWAP = r"""#!/bin/bash
+printf 'mkswap %s\n' "$*" >> "$LOG"
+if [[ -n "${MKSWAP_RC:-}" ]]; then exit "$MKSWAP_RC"; fi
+if [[ -f "$STATE/swaps" ]] && /usr/bin/grep -qxF -- "$1" "$STATE/swaps"; then
+  echo "mkswap: error: $1 is mounted; will not make swapspace" >&2
+  exit 1
+fi
+printf 'SWAPSPACE2\n' > "$1"
+"""
+
+FAKE_SWAPON = r"""#!/bin/bash
+printf 'swapon %s\n' "$*" >> "$LOG"
+if [[ "${1:-}" == --show=NAME ]]; then
+  if [[ -n "${SWAPON_SHOW_RC:-}" ]]; then exit "$SWAPON_SHOW_RC"; fi
+  if [[ -f "$STATE/swaps" ]]; then cat "$STATE/swaps"; fi
+  exit 0
+fi
+if [[ -n "${SWAPON_RC:-}" ]]; then exit "$SWAPON_RC"; fi
+if [[ -f "$STATE/swaps" ]] && /usr/bin/grep -qxF -- "$1" "$STATE/swaps"; then
+  echo "swapon: $1: swapon failed: Device or resource busy" >&2
+  exit 255
+fi
+if [[ "$(/usr/bin/head -c 10 "$1" 2>/dev/null)" != SWAPSPACE2 ]]; then
+  echo "swapon: $1: read swap header failed" >&2
+  exit 255
+fi
+echo "$1" >> "$STATE/swaps"
+"""
+
+FAKE_SYSCTL = r"""#!/bin/bash
+printf 'sysctl %s\n' "$*" >> "$LOG"
+if [[ -n "${SYSCTL_RC:-}" ]]; then exit "$SYSCTL_RC"; fi
+cat "${*: -1}" >> "$STATE/sysctl"
+"""
+
 # mktemp with no template makes its file in $TMPDIR, as GNU's does. A Mac's ignores
 # $TMPDIR there, so a test checking the temporary directory would check nothing. The
 # path is logged, so a test can find the file whatever made it.
@@ -266,7 +319,17 @@ exit {rc}
 
 FAKE_CHMOD = """#!/bin/bash
 printf 'chmod %s\\n' "$*" >> "$LOG"
+if [[ -n "${CHMOD_FAIL:-}" && "${*: -1}" == "$CHMOD_FAIL" ]]; then
+  echo "chmod: changing permissions of $CHMOD_FAIL: Input/output error" >&2
+  exit 1
+fi
 exec /bin/chmod "$@"
+"""
+
+FAKE_FIND = """#!/bin/bash
+printf 'find %s\\n' "$*" >> "$LOG"
+if [[ -n "${FIND_RC:-}" ]]; then exit "$FIND_RC"; fi
+exec /usr/bin/find "$@"
 """
 
 FAKE_RM = """#!/bin/bash
@@ -355,12 +418,17 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "chattr": FAKE_CHATTR,
         "systemd-escape": FAKE_ESCAPE,
         "curl": FAKE_CURL,
+        "mkswap": FAKE_MKSWAP,
+        "swapon": FAKE_SWAPON,
+        "sysctl": FAKE_SYSCTL,
         "mktemp": FAKE_MKTEMP,
         "chown": FAKE_LOGGED.format(name="chown", rc=0),
         "sync": FAKE_LOGGED.format(name="sync", rc=0),
         "udevadm": FAKE_LOGGED.format(name="udevadm", rc='"${UDEVADM_RC:-0}"'),
         "resize2fs": FAKE_LOGGED.format(name="resize2fs", rc='"${RESIZE2FS_RC:-0}"'),
         "chmod": FAKE_CHMOD,
+        "find": FAKE_FIND,
+        "mv": FAKE_MV,
         "rm": FAKE_RM,
         "sleep": FAKE_SLEEP,
         "cat": FAKE_CAT,
