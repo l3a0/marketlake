@@ -492,9 +492,8 @@ class DamagedSegment:
     A manifested segment can also be gone from disk (marketlake #998). It has no bytes to
     hash, so ``actual`` is ``None``, which is what marks this case, ``expected`` is the digest
     its entry recorded, and ``error`` says the file is missing. Compaction refuses no
-    ticker-day for that alone. It usually marks the segment's minute as a gap, seals the rest,
-    and
-    a refusal names a gone segment only beside one that refused the day.
+    ticker-day for that alone. It usually marks the segment's minute as a gap and seals the
+    rest, and a refusal names a gone segment only beside one that refused the day.
     """
 
     segment: str
