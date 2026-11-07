@@ -36,7 +36,9 @@ prints. ``dd`` with ``of=`` writes a few bytes in place of the size it was asked
 a test cannot pass against a script that turns on a half-made file or runs twice on a
 live one. ``$STATE/sysctl`` gathers what ``sysctl -p`` applied. ``DD_WRITE_RC``,
 ``MKSWAP_RC``, ``SYSCTL_RC``, ``SWAPON_RC`` and ``SWAPON_SHOW_RC`` fail those tools, and
-``dd`` still leaves its bytes behind when it fails, as a full disk would.
+``dd`` still leaves its bytes behind when it fails, as a full disk would. ``CHMOD_FAIL``
+and ``MV_FAIL`` each name a path that tool fails on, its last argument, as ``CAT_FAIL`` does
+for ``cat``. ``FIND_RC`` fails ``find``.
 
 The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O error would
 make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
@@ -53,8 +55,8 @@ the directories ``chattr +i`` has marked.
 
 Each fake logs its argv to ``$LOG``, except ``cat``, which the other fakes call too.
 ``python3`` runs the test's own interpreter, which has PyYAML, and logs only its first
-argument, since the second is a whole program. ``chmod`` and ``rm`` log and then run the
-real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, which a
+argument, since the second is a whole program. ``chmod``, ``find``, ``mv`` and ``rm`` log and then run
+the real tool, inside the test root, and ``rm`` drops GNU's ``--one-file-system``, which a
 Mac's ``rm`` does not know. ``sleep`` adds ``with fd 9 open`` to its line when it inherits
 an open descriptor 9, which is the one the scripts lock the install lock through, so a
 test sees a wait that holds the lock.
@@ -68,7 +70,7 @@ import sys
 from pathlib import Path
 
 from tests.support.fake_bin import install
-from tests.support.fake_systemd import NEXT_RC, install_fakes
+from tests.support.fake_systemd import FAKE_MV, NEXT_RC, install_fakes
 
 __all__ = ["NEXT_RC", "install_disk_fakes"]
 
@@ -263,9 +265,6 @@ chmod 755 "\$FAKE_HOME/.local/bin/uv"
 EOF
 """
 
-# mktemp with no template makes its file in $TMPDIR, as GNU's does. A Mac's ignores
-# $TMPDIR there, so a test checking the temporary directory would check nothing. The
-# path is logged, so a test can find the file whatever made it.
 FAKE_MKSWAP = r"""#!/bin/bash
 printf 'mkswap %s\n' "$*" >> "$LOG"
 if [[ -n "${MKSWAP_RC:-}" ]]; then exit "$MKSWAP_RC"; fi
@@ -301,6 +300,9 @@ if [[ -n "${SYSCTL_RC:-}" ]]; then exit "$SYSCTL_RC"; fi
 cat "${*: -1}" >> "$STATE/sysctl"
 """
 
+# mktemp with no template makes its file in $TMPDIR, as GNU's does. A Mac's ignores
+# $TMPDIR there, so a test checking the temporary directory would check nothing. The
+# path is logged, so a test can find the file whatever made it.
 FAKE_MKTEMP = r"""#!/bin/bash
 if [[ $# -eq 0 ]]; then set -- "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"; fi
 path="$(/usr/bin/mktemp "$@")" || exit $?
@@ -316,7 +318,17 @@ exit {rc}
 
 FAKE_CHMOD = """#!/bin/bash
 printf 'chmod %s\\n' "$*" >> "$LOG"
+if [[ -n "${CHMOD_FAIL:-}" && "${*: -1}" == "$CHMOD_FAIL" ]]; then
+  echo "chmod: changing permissions of $CHMOD_FAIL: Input/output error" >&2
+  exit 1
+fi
 exec /bin/chmod "$@"
+"""
+
+FAKE_FIND = """#!/bin/bash
+printf 'find %s\\n' "$*" >> "$LOG"
+if [[ -n "${FIND_RC:-}" ]]; then exit "$FIND_RC"; fi
+exec /usr/bin/find "$@"
 """
 
 FAKE_RM = """#!/bin/bash
@@ -414,6 +426,8 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "udevadm": FAKE_LOGGED.format(name="udevadm", rc='"${UDEVADM_RC:-0}"'),
         "resize2fs": FAKE_LOGGED.format(name="resize2fs", rc='"${RESIZE2FS_RC:-0}"'),
         "chmod": FAKE_CHMOD,
+        "find": FAKE_FIND,
+        "mv": FAKE_MV,
         "rm": FAKE_RM,
         "sleep": FAKE_SLEEP,
         "cat": FAKE_CAT,
