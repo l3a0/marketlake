@@ -800,8 +800,8 @@ cases.
    names the segment and any minute marked ([#998](https://github.com/l3a0/marketlake/issues/998)).
    The minute usually gets a `segment_lost` gap row. It keeps a `daemon_dead` row if a daemon
    start reached the hole first, and gets none if the cycle's fetch crossed into a minute that
-   holds a row. The upload carries on, apart from a day refused for a retype of a column a gap
-   row fills, which the design's compaction failure rule covers. A repair needs every segment of the day back and a
+   holds a row. The upload carries on, apart from a day compaction refuses, such as one with a
+   damaged segment, because that keeps the gone file's entry pending. A repair needs every segment of the day back and a
    hand-run `recompact_ticker_day` before the next compaction, because compaction deletes a
    segment copied back after the seal, unread. A lone returned chains segment repairs nothing,
    so keep it outside `journal/`. A rebuild replaces the partition with what the returned set
