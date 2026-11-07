@@ -789,24 +789,22 @@ cases.
    good bytes are back at its path. Repairing such a day is
    [#557](https://github.com/l3a0/marketlake/issues/557)'s. While the bucket's manifest does
    not yet carry the segment's entry, and the bucket does not hold its digest, the upload stops
-   with `ChecksumRefused`, at the cost the third case gives.
+   with `ChecksumRefused`. `bars/` and `chains/` partitions still go up. The `journal/` keys
+   sorted after it, every pending `quotes/` partition, the refused day's included, `reference/`
+   and `reports/` stay off the bucket for every ticker, the bucket's manifest stays where it
+   was, the trim does not run, and the `compaction` and `evening-upload` checks page.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
-3. A manifested segment left the disk before the seal. Compaction refuses the ticker-day as
-   it does in the first case and sends the `Damaged segment at the merge` page, and a finding
-   under `reports/damaged_segments/` names the segment ([#998](https://github.com/l3a0/marketlake/issues/998)).
-   While the bucket's manifest does not yet carry the segment's entry, every night's upload
-   stops at it with `ManifestedFileMissing`. `bars/` and `chains/` partitions still go up. The
-   `journal/` keys sorted after it, every pending `quotes/` partition, the refused day's
-   included, `reference/` and `reports/` stay off the bucket for every ticker, the bucket's
-   manifest stays where it was, the trim does not run, and the `compaction` and
-   `evening-upload` checks page. The Sunday scrub names the segment and withholds the `sunday`
-   ping, whether or not the entry reached the bucket. A chains segment no upload carried has no
-   copy to return, so the upload stays stopped until
-   [#557](https://github.com/l3a0/marketlake/issues/557) repairs the day. If a resync stopped part-way on
-   this host, run it again first, because that clears the refusal. A ticker-day with no segment
-   left gets no damage page or finding, and only `ManifestedFileMissing` and the Sunday scrub
-   name it.
+3. A manifested segment left the disk before the seal. Compaction seals the day with a
+   `segment_lost` gap row for that minute and sends the `Damaged segment at the merge` page
+   once, and a finding under `reports/damaged_segments/` names the segment and the minute
+   ([#998](https://github.com/l3a0/marketlake/issues/998)). The upload carries on. With every segment of
+   the day back in place, a hand-run `recompact_ticker_day` rebuilds the day past the gap row.
+   A chains segment no upload carried has no copy, so its minute stays a gap. If a resync
+   stopped part-way on this host, run it again before the next compaction, because a sealed
+   day keeps its gap rows. A ticker-day with no segment left gets no damage page or finding,
+   and `ManifestedFileMissing` and the Sunday scrub name it until the next daemon start marks
+   the day and the next compaction seals it.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds
@@ -817,9 +815,8 @@ any attempt by hand.
 
 1. A segment copied back after the day's partition is manifested is deleted as debris, with a
    healthy ping.
-2. A segment copied back after the daemon has started leaves a false gap row beside each real
-   minute, because startup marking fills the hole it finds. That holds on a lost volume and on
-   a day refused for a missing segment.
+2. On a lost volume, a segment copied back after the daemon has started leaves a false gap
+   row beside each real minute.
 
 ## Changing the bootstrap
 

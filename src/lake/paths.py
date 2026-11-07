@@ -113,8 +113,8 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 #    finding never reaches the ledger that would settle it, so it files again on every
 #    night it survives, and that repetition is what says the condition is still live.
 # 5. One file per ticker-day compaction refused because a segment no longer matched the
-#    sha256 its manifest entry recorded when it closed, its read proved it damaged, or it was
-#    gone from disk though the manifest recorded it, under
+#    sha256 its manifest entry recorded when it closed or its read proved it damaged, or
+#    sealed with gap rows because a manifested segment was gone from disk, under
 #    `reports/damaged_segments/date=D/`. It files on every run the damage survives, for
 #    the refused merge's reason, and it is not drift, so it stays out of item 3's tree.
 # 6. One file per vendor-sweep run on a host with a cost export, under

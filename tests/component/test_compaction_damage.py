@@ -37,8 +37,9 @@ These cover the check's contract:
 6. The page stays inside the design's body limit however many segments are damaged.
 7. The human-invoked repair raises the refusal rather than sealing past it.
 8. The writer itself: where the file lands, what it holds, and that it never overwrites.
-9. A manifested segment gone from disk refuses the ticker-day the same way, because neither
-   the hash nor the read can see a file that is not there (marketlake #998). The comparison
+9. A manifested segment gone from disk reaches neither the hash nor the read, so the seal
+   compares the manifest with the disk (marketlake #998). The lost minute gets a gap row, the
+   rest seals, one page and one finding go out, and the upload carries on. The comparison
    reads only that ticker-day's entries, and the repair of a sealed day leaves the count to
    the no-shrink guard.
 """
@@ -73,7 +74,14 @@ from lake.compact import (
     compact,
     recompact_ticker_day,
 )
-from lake.manifest import RowCountRegression, latest_entries, manifest_path, scrub, sha256_file
+from lake.manifest import (
+    RowCountRegression,
+    append_manifest,
+    latest_entries,
+    manifest_path,
+    scrub,
+    sha256_file,
+)
 from lake.paths import LakePaths
 from lake.report import DamagedSegment, SegmentDamage
 from lake.tickers import Roster
@@ -1230,6 +1238,7 @@ def test_the_writer_files_one_json_per_finding_and_never_overwrites(lake_root):
                 "error": None,
             }
         ],
+        "gaps": [],
     }
     with pytest.raises(FileExistsError):
         report.write_damaged_segments(lake_root, damage, now=now, pid=42)
@@ -1268,37 +1277,59 @@ def _captured_quotes(lake_root: Path, ticker: str, *, count: int = 5) -> list[Pa
     return paths
 
 
+def _row_kinds(partition: Path) -> list[tuple[str, str | None]]:
+    """Each row's ``row_kind`` and ``error_class``, in file order."""
+    table = pq.read_table(partition, columns=["row_kind", "error_class"])
+    kinds = table.column("row_kind").to_pylist()
+    return list(zip(kinds, table.column("error_class").to_pylist(), strict=True))
+
+
+def _gap_minutes(partition: Path) -> list[str]:
+    table = pq.read_table(partition, columns=["snap_ts", "error_class"])
+    return [
+        snap
+        for snap, kind in zip(
+            table.column("snap_ts").to_pylist(),
+            table.column("error_class").to_pylist(),
+            strict=True,
+        )
+        if kind == compact_module.SEGMENT_LOST
+    ]
+
+
 @pytest.mark.parametrize(
     "surface, write",
     [(journal.CHAINS_SURFACE, _captured), (journal.QUOTES_SURFACE, _captured_quotes)],
 )
-def test_a_manifested_segment_gone_from_disk_refuses_the_ticker_day(lake_root, surface, write):
-    """The issue's probe. Without the check SPY seals short, pings, and the scrub stays empty."""
+def test_a_manifested_segment_gone_from_disk_marks_its_minute_and_seals(lake_root, surface, write):
+    """The issue's probe, under the owner's ruling to mark the gap and continue."""
     spy = write(lake_root, "SPY")
     qqq = write(lake_root, "QQQ")
+    rows_per_segment = journal.read_segment(spy[0]).num_rows
     gone = spy.pop(2)
     rel = _rel(lake_root, gone)
     recorded = latest_entries(lake_root)[rel]["sha256"]
     gone.unlink()
-    before = {path: path.read_bytes() for path in spy}
     publisher, transport = _paging(lake_root)
 
     result, events = _run(lake_root, publisher=publisher)
 
-    # The other ticker-day on the same date sealed, and this one wrote nothing.
-    assert [item.ticker for item in result.sealed] == ["QQQ"]
-    assert not any(path.exists() for path in qqq)
-    partition = LakePaths(lake_root).partition_path(surface, "SPY", DAY)
-    assert not partition.exists()
-    assert _rel(lake_root, partition) not in latest_entries(lake_root)
-    # What remains stays byte for byte, so the day can still seal once the file is back.
-    assert {path: path.read_bytes() for path in spy} == before
+    # Both ticker-days sealed, and the run went on to the end.
+    assert result.refused == ()
     assert events == ["backup", "ping"]
-    (refused,) = result.refused
-    assert refused.reason == REFUSED_SEGMENT_DAMAGED
-    assert refused.partition == _rel(lake_root, partition)
-    assert refused.segments == tuple(_rel(lake_root, path) for path in spy)
-    assert refused.damaged == (
+    assert sorted(item.ticker for item in result.sealed) == ["QQQ", "SPY"]
+    assert not any(path.exists() for path in (*spy, *qqq))
+    (sealed,) = [item for item in result.sealed if item.ticker == "SPY"]
+    assert sealed.rows == 4 * rows_per_segment + 1
+    partition = LakePaths(lake_root).partition_path(surface, "SPY", DAY)
+    kinds = _row_kinds(partition)
+    assert kinds.count((journal.ROW_KIND_GAP, compact_module.SEGMENT_LOST)) == 1
+    assert sum(kind == journal.ROW_KIND_DATA for kind, _ in kinds) == 4 * rows_per_segment
+    # The minute of the third capture, 10:02 Eastern, spelled the way a loop row is.
+    minute = "2026-08-24T14:02:00+00:00"
+    assert _gap_minutes(partition) == [minute]
+    assert sealed.gaps == (minute,)
+    assert sealed.lost == (
         DamagedSegment(
             segment=rel, expected=recorded, actual=None, error=compact_module.SEGMENT_MISSING
         ),
@@ -1306,11 +1337,13 @@ def test_a_manifested_segment_gone_from_disk_refuses_the_ticker_day(lake_root, s
     (page,) = transport.messages
     assert page.title == DAMAGED_SEGMENT_TITLE
     assert rel in page.body
+    assert "sealed with gaps" in page.body
     assert "1 manifested segment(s) are missing from disk" in page.body
-    assert "The segments on disk are kept" in page.body
+    assert "1 minute(s) are marked segment_lost" in page.body
     (finding,) = _findings(lake_root)
     assert finding["surface"] == surface
     assert finding["segments"] == [_rel(lake_root, path) for path in spy]
+    assert finding["gaps"] == [minute]
     assert finding["damaged"] == [
         {
             "segment": rel,
@@ -1319,12 +1352,12 @@ def test_a_manifested_segment_gone_from_disk_refuses_the_ticker_day(lake_root, s
             "error": compact_module.SEGMENT_MISSING,
         }
     ]
-    # The refusal is what keeps the later checks asking. No partition entry supersedes the
-    # segment's, so the scrub names it.
-    assert scrub(lake_root).missing == (rel,)
+    # The partition's entry supersedes the segment's, so nothing stops on it again.
+    assert scrub(lake_root).missing == ()
 
 
-def test_a_gone_segment_keeps_the_retune_off_the_day(lake_root):
+def test_a_gone_segment_leaves_the_retune_free_to_read_the_day(lake_root):
+    """The day sealed, so a refusal's reason for skipping the re-tune does not apply."""
     spy = _captured(lake_root, "SPY")
     _captured(lake_root, "QQQ")
     spy[2].unlink()
@@ -1332,10 +1365,11 @@ def test_a_gone_segment_keeps_the_retune_off_the_day(lake_root):
     result, _ = _run(lake_root)
 
     assert result.retune is not None
-    assert result.retune.skipped_reason == "a chains ticker-day on this day was refused: SPY"
+    assert "refused" not in (result.retune.skipped_reason or "")
 
 
-def test_every_gone_segment_is_named_beside_the_damage_in_one_run(lake_root):
+def test_a_changed_segment_refuses_the_day_and_names_a_gone_one_beside_it(lake_root):
+    """A refusal keeps the day, so the gone segments wait with it and are named in it."""
     spy = _captured(lake_root, "SPY")
     gone = sorted(_rel(lake_root, path) for path in (spy[1], spy[3]))
     spy[1].unlink()
@@ -1344,35 +1378,35 @@ def test_every_gone_segment_is_named_beside_the_damage_in_one_run(lake_root):
 
     result, _ = _run(lake_root)
 
+    assert result.sealed == ()
     (refused,) = result.refused
     assert [item.segment for item in refused.damaged] == [*gone, _rel(lake_root, spy[2])]
     assert [item.actual is None for item in refused.damaged] == [True, True, False]
+    assert not _partition(lake_root, "SPY").exists()
 
 
 def test_a_gone_segment_of_one_ticker_day_says_nothing_about_another(lake_root):
     """Only the entries under this surface, ticker and day count.
 
     ``SPYG`` sorts right after ``SPY`` and shares its prefix, so a comparison that left off
-    the closing slash would refuse the healthy ticker-day for its neighbour's missing file.
-    The quotes pass only if the surface is in the comparison. The next two tests do the same
-    for the date.
+    the closing slash would call its neighbour's file lost from the healthy ticker-day. The
+    quotes pass only if the surface is in the comparison. The next two tests do the same for
+    the date.
     """
-    spy = _captured(lake_root, "SPY")
-    quotes = _captured_quotes(lake_root, "SPY")
-    spyg = _captured(lake_root, "SPYG")
-    gone = spyg[2]
+    _captured(lake_root, "SPY")
+    _captured_quotes(lake_root, "SPY")
+    gone = _captured(lake_root, "SPYG")[2]
     gone.unlink()
 
     result, _ = _run(lake_root)
 
-    assert sorted((item.surface, item.ticker) for item in result.sealed) == [
-        (journal.CHAINS_SURFACE, "SPY"),
-        (journal.QUOTES_SURFACE, "SPY"),
+    assert result.refused == ()
+    lost = {(item.surface, item.ticker): item.lost for item in result.sealed}
+    assert lost[(journal.CHAINS_SURFACE, "SPY")] == ()
+    assert lost[(journal.QUOTES_SURFACE, "SPY")] == ()
+    assert [item.segment for item in lost[(journal.CHAINS_SURFACE, "SPYG")]] == [
+        _rel(lake_root, gone)
     ]
-    assert not any(path.exists() for path in (*spy, *quotes))
-    (refused,) = result.refused
-    assert refused.ticker == "SPYG"
-    assert [item.segment for item in refused.damaged] == [_rel(lake_root, gone)]
 
 
 NEXT_DAY = date(2026, 8, 25)
@@ -1421,8 +1455,8 @@ def _run_on(lake_root: Path, day: date) -> CompactionResult:
 def test_a_sealed_days_entries_say_nothing_about_the_next_day(lake_root):
     """A sealed day's segment entries stay in the manifest with their files gone.
 
-    A comparison that lost the date would count them against the next day, and every
-    ticker would be refused from its second sealed day on.
+    A comparison that lost the date would call all of them lost on the next day, and every
+    ticker would carry false findings from its second sealed day on.
     """
     _captured_on(lake_root, DAY)
     assert [item.day for item in _run_on(lake_root, DAY).sealed] == [DAY]
@@ -1430,8 +1464,7 @@ def test_a_sealed_days_entries_say_nothing_about_the_next_day(lake_root):
 
     result = _run_on(lake_root, NEXT_DAY)
 
-    assert result.refused == ()
-    assert [item.day for item in result.sealed] == [NEXT_DAY]
+    assert [(item.day, item.lost) for item in result.sealed] == [(NEXT_DAY, ())]
 
 
 def test_a_gone_segment_on_one_day_leaves_the_next_day_alone(lake_root):
@@ -1441,8 +1474,7 @@ def test_a_gone_segment_on_one_day_leaves_the_next_day_alone(lake_root):
 
     result = _run_on(lake_root, NEXT_DAY)
 
-    assert [item.day for item in result.refused] == [DAY]
-    assert [item.day for item in result.sealed] == [NEXT_DAY]
+    assert [(item.day, len(item.lost)) for item in result.sealed] == [(DAY, 1), (NEXT_DAY, 0)]
 
 
 def test_a_ticker_day_with_no_segment_left_reaches_no_refusal(lake_root):
@@ -1510,23 +1542,102 @@ def test_a_segment_with_no_entry_leaves_nothing_to_miss(lake_root):
     assert [(item.ticker, item.rows) for item in result.sealed] == [("SPY", 4 * ROWS_PER_SEGMENT)]
 
 
-def test_a_refused_day_seals_whole_once_its_file_is_back(lake_root):
-    """A refusal is not remembered, which is what lets a live copy repair a quotes day."""
-    spy = _captured(lake_root, "SPY")
-    good = spy[2].read_bytes()
-    spy[2].unlink()
+def test_a_day_sealed_with_gaps_pages_once(lake_root):
+    """The day is sealed, so nothing repeats and nothing is left to page about."""
+    _captured(lake_root, "SPY")[2].unlink()
     publisher, transport = _paging(lake_root)
 
     first, _ = _run(lake_root, publisher=publisher)
     second, _ = _run(lake_root, publisher=publisher, at=_et(16, 31))
-    spy[2].write_bytes(good)
-    repaired, _ = _run(lake_root, publisher=publisher, at=_et(16, 32))
 
-    assert len(first.refused) == len(second.refused) == 1
-    assert len(_findings(lake_root)) == 2
-    assert [page.title for page in transport.messages] == [DAMAGED_SEGMENT_TITLE] * 2
-    assert repaired.refused == ()
-    assert [(item.ticker, item.rows) for item in repaired.sealed] == [("SPY", 5 * ROWS_PER_SEGMENT)]
+    assert len(first.sealed) == 1
+    assert (second.sealed, second.refused) == ((), ())
+    assert len(transport.messages) == 1
+    assert len(_findings(lake_root)) == 1
+
+
+def test_a_sealed_day_rebuilds_past_its_gap_rows_once_every_segment_is_back(lake_root):
+    """Sealing at once closes off no repair, which is why no copy is looked for first.
+
+    A live copy of a quotes segment stays readable for about 97 days. With every segment back
+    in place, the hand-run repair rebuilds the day from them, and the no-shrink guard passes
+    because a lost segment held at least the one row its gap row stands for.
+    """
+    spy = _captured_quotes(lake_root, "SPY")
+    saved = {path: path.read_bytes() for path in spy}
+    whole = sum(journal.read_segment(path).num_rows for path in spy)
+    spy[2].unlink()
+    _run(lake_root)
+    partition = LakePaths(lake_root).partition_path(journal.QUOTES_SURFACE, "SPY", DAY)
+    assert len(_gap_minutes(partition)) == 1
+    spy[0].parent.mkdir(parents=True)
+    for path, data in saved.items():
+        path.write_bytes(data)
+
+    outcome = recompact_ticker_day(
+        lake_root, journal.QUOTES_SURFACE, "SPY", DAY, clock=ManualClock(_et(17, 0))
+    )
+
+    assert (outcome.rows, outcome.lost) == (whole, ())
+    assert _gap_minutes(partition) == []
+
+
+def _marked(lake_root: Path, ticker: str, minutes: list[int]) -> None:
+    """A startup pass's marker segment for ``minutes`` past 10:00, with no manifest entry."""
+    batch = journal.gap_rows(
+        journal.CHAINS_SURFACE,
+        ticker=ticker,
+        slots=[_et(10, minute) for minute in minutes],
+        error_class="daemon_dead",
+    )
+    with journal.SegmentWriter.open(
+        lake_root, journal.CHAINS_SURFACE, ticker, DAY, "20260824T235959000000", PID
+    ) as writer:
+        writer.write_cycle(batch)
+
+
+def test_a_minute_startup_marking_reached_first_gets_no_second_row(lake_root):
+    """Two rows for one minute would read as two records of it."""
+    spy = _captured(lake_root, "SPY")
+    spy[2].unlink()
+    _marked(lake_root, "SPY", [2])
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert [item.segment for item in sealed.lost] == [_rel(lake_root, spy[2])]
+    assert sealed.gaps == ()
+    assert sealed.rows == 4 * ROWS_PER_SEGMENT + 1
+
+
+def test_a_ticker_day_with_no_segment_left_seals_once_a_daemon_start_marks_it(lake_root):
+    """The stop on a wholly lost day ends at the next daemon start, with nothing to do by hand."""
+    spy = _captured(lake_root, "SPY")
+    for path in spy:
+        path.unlink()
+    _marked(lake_root, "SPY", list(range(5)))
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert (sealed.rows, len(sealed.lost), sealed.gaps) == (5, 5, ())
+    assert scrub(lake_root).missing == ()
+
+
+def test_a_lost_entry_with_no_fetch_time_marks_nothing_and_is_still_named(lake_root):
+    """No minute can be named for it, and the finding is what keeps it visible."""
+    spy = _captured(lake_root, "SPY")
+    rel = _rel(lake_root, spy[0]).replace("seg-", "seg-0-")
+    append_manifest(
+        lake_root, partition=rel, source="capture", sha256="a" * 64, rows=2, fetched_at=None
+    )
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert [item.segment for item in sealed.lost] == [rel]
+    assert sealed.gaps == ()
+    assert sealed.rows == 5 * ROWS_PER_SEGMENT
 
 
 def test_the_page_and_the_summary_count_a_gone_segment_on_its_own(lake_root):
@@ -1554,36 +1665,43 @@ def test_the_refusal_names_a_gone_segment_with_what_it_recorded(lake_root):
     rel = _rel(lake_root, spy[2])
     recorded = latest_entries(lake_root)[rel]["sha256"]
     spy[2].unlink()
+    _flip(spy[3], DROPS_THE_SEGMENT)
 
     with pytest.raises(DamagedSegments) as info:
         recompact_ticker_day(
             lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=ManualClock(_et(17, 0))
         )
 
-    assert str(info.value).endswith(f"{rel} (missing from disk, recorded {recorded})")
+    assert f"{rel} (missing from disk, recorded {recorded})" in str(info.value)
 
 
-@pytest.mark.parametrize("allow_shrink", [False, True])
-def test_the_repair_refuses_a_gone_segment_on_a_day_with_no_partition(lake_root, allow_shrink):
-    """No recorded count exists for the guard, so ``allow_shrink`` cannot pass this."""
+def test_the_summary_names_a_day_sealed_with_gaps(lake_root):
+    spy = _captured(lake_root, "SPY")
+    spy[1].unlink()
+
+    result, _ = _run(lake_root)
+
+    (line,) = [line for line in result.render().splitlines() if line.startswith("  lost")]
+    assert line == (
+        "  lost     chains/ticker=SPY/date=2026-08-24.parquet gaps=1, "
+        f"missing from disk: {spy[1].name}"
+    )
+
+
+def test_the_repair_marks_a_gone_segment_the_way_the_sweep_does(lake_root, capsys):
+    """An operator reaches for the repair on an unsealed day, and it must not seal in silence."""
     spy = _captured(lake_root, "SPY")
     gone = spy.pop(2)
     gone.unlink()
-    before = {path: path.read_bytes() for path in spy}
 
-    with pytest.raises(DamagedSegments) as info:
-        recompact_ticker_day(
-            lake_root,
-            journal.CHAINS_SURFACE,
-            "SPY",
-            DAY,
-            clock=ManualClock(_et(17, 0)),
-            allow_shrink=allow_shrink,
-        )
+    outcome = recompact_ticker_day(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=ManualClock(_et(17, 0))
+    )
 
-    assert [item.segment for item in info.value.damaged] == [_rel(lake_root, gone)]
-    assert {path: path.read_bytes() for path in spy} == before
-    assert not _partition(lake_root, "SPY").exists()
+    assert outcome.rows == 4 * ROWS_PER_SEGMENT + 1
+    assert [item.segment for item in outcome.lost] == [_rel(lake_root, gone)]
+    assert len(_findings(lake_root)) == 1
+    assert "sealed with gaps" in capsys.readouterr().err
 
 
 def test_the_repair_of_a_sealed_day_leaves_the_count_to_the_no_shrink_guard(lake_root):

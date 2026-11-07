@@ -26,7 +26,7 @@ from lake.bucket import (
 from lake.chain_plan import ChainPlanError
 from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG, compact
 from lake.config import BucketTarget
-from lake.manifest import append_manifest, latest_entries, sha256_file
+from lake.manifest import append_manifest, sha256_file
 from lake.paths import LakePaths
 from tests.component.test_compaction import (
     DAY,
@@ -97,13 +97,22 @@ def test_the_sealed_day_goes_up_and_the_ping_comes_after_the_manifest(lake_root)
     assert events == [f"put lake/{rel}", "put lake/manifest.jsonl", "ping"]
 
 
-def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(lake_root):
-    """The price of refusing a short seal (marketlake #998).
+def _manifested(lake_root: Path, *paths: Path) -> None:
+    for path in paths:
+        append_manifest(
+            lake_root,
+            partition=path.relative_to(lake_root).as_posix(),
+            source="capture",
+            sha256=sha256_file(path),
+            rows=2,
+            fetched_at=_clock_at(DAY, 10, 1).now().isoformat(),
+        )
 
-    The refused ticker-day has no partition entry, so the segment's entry is not superseded
-    and the upload refuses it while that entry has not reached the bucket. That raise is what
-    keeps the day from reading as healthy, and it holds the watermark until the file returns.
-    The finding lands first, because the sweep comes before the backup.
+
+def test_a_gone_segment_seals_with_a_gap_and_the_upload_carries_on(lake_root):
+    """The owner's ruling: a gone segment never holds the day or the bucket copy back.
+
+    The partition's entry supersedes the gone segment's, so the upload has nothing to stop on.
     """
     client = _seeded(lake_root)
     kept = _segment(
@@ -112,32 +121,18 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
     gone = _segment(
         lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
     )
-    later = _segment(
-        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 2)), start_ts="c"
-    )
-    for path in (kept, gone, later):
-        append_manifest(
-            lake_root,
-            partition=path.relative_to(lake_root).as_posix(),
-            source="capture",
-            sha256=sha256_file(path),
-            rows=2,
-            fetched_at=None,
-        )
+    _manifested(lake_root, kept, gone)
     gone.unlink()
     events: list[str] = []
 
-    with pytest.raises(ManifestedFileMissing, match=gone.name):
-        _job(lake_root, client, events)
+    result = _job(lake_root, client, events)
 
     partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
-    assert partition.relative_to(lake_root).as_posix() not in latest_entries(lake_root)
-    # The walk is sorted, so what sorts before the missing file went up and what sorts after
-    # it did not, though it is the refused day's only copy.
-    assert f"put lake/{kept.relative_to(lake_root).as_posix()}" in events
-    assert f"put lake/{later.relative_to(lake_root).as_posix()}" not in events
-    assert "ping" not in events
-    assert "put lake/manifest.jsonl" not in events
+    assert result.refused == ()
+    assert result.backed_up and result.pinged
+    assert f"put lake/{partition.relative_to(lake_root).as_posix()}" in events
+    assert "put lake/manifest.jsonl" in events
+    assert events[-1] == "ping"
     assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
 
 
@@ -165,39 +160,25 @@ def test_a_changed_segment_files_its_finding_and_stops_the_upload_before_the_pin
     assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
 
 
-def test_a_gone_segment_already_in_the_bucket_is_refused_and_still_pings(lake_root):
-    """An entry behind the watermark is not pending, so the upload does not raise for it.
-
-    The refusal is then the only thing the run reports, and the bucket holds the file.
-    """
+def test_a_gone_segment_beside_a_changed_one_stops_the_upload_at_the_gone_file(lake_root):
+    """A refusal keeps the day unsealed, so the gone segment's entry stays owed."""
     client = _seeded(lake_root)
-    kept = _segment(
-        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    changed = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 2)), start_ts="c"
     )
     gone = _segment(
         lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
     )
-    for path in (kept, gone):
-        append_manifest(
-            lake_root,
-            partition=path.relative_to(lake_root).as_posix(),
-            source="capture",
-            sha256=sha256_file(path),
-            rows=2,
-            fetched_at=None,
-        )
-    clock = _clock_at(DAY, 16, 25)
-    bucket.nightly_upload(lake_root, TARGET, client=client, clock=clock, calendar=_calendar())
+    _manifested(lake_root, gone, changed)
     gone.unlink()
+    changed.write_bytes(changed.read_bytes() + b"\x00")
     events: list[str] = []
 
-    result = _job(lake_root, client, events)
+    with pytest.raises(ManifestedFileMissing, match=gone.name):
+        _job(lake_root, client, events)
 
-    assert [item.partition for item in result.refused] == [
-        LakePaths(lake_root).chains_partition_path("SPY", DAY).relative_to(lake_root).as_posix()
-    ]
-    assert result.backed_up and result.pinged
-    assert events[-1] == "ping"
+    assert "ping" not in events
+    assert "put lake/manifest.jsonl" not in events
 
 
 def test_an_empty_bucket_raises_before_the_ping(lake_root):

@@ -73,14 +73,17 @@ The job's rules, each glossed at first use.
 
    Neither check can see a segment that is no longer there, because both walk the files
    the directory listed, and the row count agrees with whatever those files hold. So before
-   any read the ticker-day's manifest entries are compared to that listing, and a segment
-   the manifest records and the disk does not hold refuses the ticker-day the same way
-   (marketlake #998). A seal with that segment missing would come out short, and once its
-   partition is manifested the scrub and the upload both stop asking after the segment.
+   any read the ticker-day's manifest entries are compared to that listing. A segment the
+   manifest records and the disk does not hold is lost, and holding the day would only
+   stop the upload for a file that may never return. So the run writes a ``segment_lost``
+   gap row for its minute into the seal, seals the rest, files a finding and pages once
+   (marketlake #998). The gap row is what keeps the loss visible, because once the partition
+   is manifested the scrub and the upload both stop asking after the segment.
    The comparison runs only while the partition has no entry. Once it has one, its segments'
    entries are superseded and their files are gone by design, and the no-shrink guard
    answers for the count. A ticker-day with no segment left reaches no comparison, because
-   the sweep skips it, so only the upload's refusal and the scrub name it.
+   the sweep skips it, so only the upload's refusal and the scrub name it until the next
+   daemon start marks the day, which gives the sweep a marker segment to seal from.
 4. *Drift is reported, and costs one ticker-day at most.* Segments in one ticker-day
    can disagree about columns only when the daemon restarted onto different code
    mid-session, because every production segment takes its schema from
@@ -141,10 +144,10 @@ The job's rules, each glossed at first use.
 7. *Backup, then ping.* After the sweep has finished with every eligible ticker-day, the
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
-   The exception is on a bucket target, while the bucket's manifest does not yet carry the
-   segment's entry. A segment gone from disk then refuses the upload, and so does one changed
-   on disk unless the bucket already holds its digest. That ends the run before the ping
-   (marketlake #998).
+   The exception is a refused day on a bucket target, while the bucket's manifest does not
+   yet carry the segment's entry. A segment changed on disk then refuses the upload unless
+   the bucket already holds its digest, and so does one gone from disk beside it. That ends
+   the run before the ping (marketlake #998).
    The health-check ping fires only after the backup succeeds, so the
    one ping attests both, except on a ``shadow`` host, which runs no backup and whose
    ping attests only the seal. An unmounted target raises before any ping, and so does a
@@ -197,7 +200,7 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -328,6 +331,9 @@ REFUSED_TYPES_DISAGREE = "types_disagree"
 REFUSED_SEGMENT_DAMAGED = "segment_damaged"
 # What a finding, the page and the run's summary say of a manifested segment gone from disk.
 SEGMENT_MISSING = "missing from disk"
+# The ``error_class`` on a gap row for a minute whose segment left the disk before the seal.
+# It is data in the lake, like ``daemon_dead``, so it keeps its spelling.
+SEGMENT_LOST = "segment_lost"
 
 
 # -- the named failures ------------------------------------------------------
@@ -498,18 +504,17 @@ class SegmentSchemaConflict(Exception):
 
 
 class DamagedSegments(Exception):
-    """Raised when a ticker-day's segment no longer matches its hash, reads as damaged, or is gone.
+    """Raised when a ticker-day's segment no longer matches its hash or reads as damaged.
 
     Every capture segment has a manifest entry whose sha256 the cycle hashed from the file
     right after closing it, or under the lake-root lock when that hash raised. ``_seal``
     compares each segment that has one before reading any of them, and this names what
     failed. A segment the read proves damaged is refused the
     same way, which is how one with no entry and so no hash reaches it (marketlake #552).
-    A manifested segment that is gone from disk is refused the same way too (marketlake #998).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
-    ticker-day, the backup, and the ping. A damaged or gone segment can still cost a bucket
-    target's backup and ping, as rule 7 of this module says, but no other ticker-day's seal.
+    ticker-day, the backup, and the ping. A damaged segment can still cost a bucket target's
+    backup and ping, as rule 7 of this module says, but no other ticker-day's seal.
 
     Sealing the healthy segments and keeping the damaged one is not an option. The next
     run would find the partition manifested and delete every remaining segment as debris
@@ -517,7 +522,8 @@ class DamagedSegments(Exception):
 
     ``segments`` names every segment of the ticker-day still on disk. ``damaged`` names the
     ones that failed, each with the digest its entry recorded and the digest of the bytes on
-    disk now, or with none for a segment that is gone.
+    disk now. It also names any segment gone from disk, with no digest of bytes. A gone
+    segment refuses nothing alone, but a refused day is not sealed, so it waits here too.
     """
 
     def __init__(
@@ -561,6 +567,8 @@ class SealedPartition:
     segment paths merged into it and then unlinked. ``recovered`` is true when the
     partition already had a manifest entry, so the run verified it and deleted the
     debris instead of rewriting it. ``rows`` and ``sha256`` then come from the entry.
+    ``lost`` names the manifested segments that were gone from disk at the seal, and ``gaps``
+    the minutes marked for them, which ``rows`` counts.
     """
 
     surface: str
@@ -571,6 +579,8 @@ class SealedPartition:
     sha256: str
     segments: tuple[str, ...]
     recovered: bool = False
+    lost: tuple[DamagedSegment, ...] = ()
+    gaps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -600,10 +610,10 @@ class RefusedTickerDay:
     ``REFUSED_TYPES_DISAGREE`` is a merge the segments' column types refused, filed under
     ``reports/schema_drift/``, and ``conflicts`` names each column, rendered
     ``name: earlier -> later``. ``REFUSED_SEGMENT_DAMAGED`` is a segment whose bytes no
-    longer match the hash taken when it closed, whose read proved them damaged, or which is
-    gone from disk though the manifest records it, filed under ``reports/damaged_segments/``,
-    and ``damaged`` names each such segment with both digests, the read's failure, or as
-    missing. Each leaves the other's field empty.
+    longer match the hash taken when it closed, or whose read proved them damaged, filed
+    under ``reports/damaged_segments/``, and ``damaged`` names each such segment with both
+    digests or the read's failure, and any segment gone from disk beside it as missing. Each
+    leaves the other's field empty.
 
     Both join one list because the re-tune needs to know every chains ticker-day the day
     is missing, whatever the reason, and a refused ticker's absent rows would otherwise
@@ -759,6 +769,10 @@ class CompactionResult:
             lines.append(f"  {BACKUP_SKIPPED}")
         for item in self.sealed:
             lines.append(f"  sealed   {item.partition} rows={item.rows} from {len(item.segments)}")
+            if item.lost:
+                lines.append(
+                    f"  lost     {item.partition} gaps={len(item.gaps)}, {_damage_kinds(item.lost)}"
+                )
         for item in self.verified:
             lines.append(
                 f"  verified {item.partition} rows={item.rows} debris={len(item.segments)}"
@@ -1126,14 +1140,14 @@ def _missing_segments(
 
     The hash check and the read both walk ``segments``, which is what the directory listed,
     so a segment that left the disk reaches neither of them. The manifest is the one record
-    that says it existed, and sealing without it writes a partition short by its rows. No
-    later check would ask, because the scrub and the upload both treat a segment as superseded
-    once its partition is manifested (marketlake #998).
+    that says it existed. No later check would ask, because the scrub and the upload both
+    treat a segment as superseded once its partition is manifested, so ``_seal`` marks its
+    minute as a gap rather than seal past it in silence (marketlake #998).
 
     The caller runs this only while the partition has no entry. Compaction unlinks a segment
     only once that entry has landed, so compaction never explains the absence here. A person
-    or a disk fault does, or a resync stopped between its deletions and its manifest rewrite,
-    and running that resync again clears the refusal.
+    or a disk fault does, or a resync stopped between its deletions and its manifest rewrite.
+    Run that resync again before compaction, because a day that seals here keeps its gap rows.
 
     ``entries`` comes from a read that stops at a torn line, so an entry hidden behind one is
     not compared, and an emptied or deleted manifest offers nothing to compare. The hash check
@@ -1154,6 +1168,70 @@ def _missing_segments(
         )
         for rel in sorted(rel for rel in entries if rel.startswith(prefix) and rel not in listed)
     )
+
+
+def _lost_minutes(
+    lost: Sequence[DamagedSegment],
+    tables: Sequence[pa.Table],
+    entries: Mapping[str, Mapping[str, object]],
+) -> tuple[datetime, ...]:
+    """The minutes to mark for lost segments, in UTC, oldest first.
+
+    A capture cycle writes one segment per surface and ticker, so one lost segment is one lost
+    minute, and its entry's ``fetched_at`` is the cycle's dispatch time, so flooring it gives
+    that minute. The price is that a cycle dispatched past the top of its minute, or a close
+    fill, marks the minute it was fetched in rather than the slot it filled.
+
+    A minute another row already records gets no marker, because startup gap marking may have
+    reached the hole first, and a second row for one minute would read as two captures. An
+    entry with no usable ``fetched_at`` marks nothing, because no minute can be named for it,
+    and the finding still names the segment. Zeroing seconds and microseconds is flooring,
+    which the clock-seam scanner allows.
+    """
+    if not lost:
+        return ()
+    present = {
+        datetime.fromisoformat(value).astimezone(UTC)
+        for table in tables
+        for value in table.column("snap_ts").to_pylist()
+        if value is not None
+    }
+    minutes: set[datetime] = set()
+    for item in lost:
+        stamp = entries[item.segment].get("fetched_at")
+        try:
+            fetched = datetime.fromisoformat(str(stamp))
+        except ValueError:
+            continue
+        if fetched.tzinfo is None:
+            continue
+        minutes.add(fetched.astimezone(UTC).replace(second=0, microsecond=0))
+    return tuple(sorted(minutes - present))
+
+
+def _file_lost(
+    root: Path,
+    finding: SegmentDamage,
+    *,
+    clock: Clock,
+    found: list[SegmentDamage] | None,
+) -> None:
+    """File one day sealed with lost segments, and never let the write cost the run.
+
+    The same order as ``_refuse_damaged``: the record first, then the finding, and a finding
+    that cannot be written is named on stderr rather than raised. The seal has committed by
+    now, and its gap rows hold the loss whatever happens here.
+    """
+    if found is not None:
+        found.append(finding)
+    try:
+        write_damaged_segments(root, finding, now=clock.now())
+    except OSError as exc:
+        print(
+            f"compaction: lost segment on {finding.partition} could not be filed: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
 
 
 def _refuse_damaged(
@@ -1415,6 +1493,22 @@ def _damage_body(found: Sequence[SegmentDamage]) -> str:
     )
 
 
+def _lost_body(found: Sequence[SegmentDamage]) -> str:
+    """Compose the page for days sealed with lost segments.
+
+    The same caps as ``_damage_body``, for the same reason, and the digests stay in the files.
+    """
+    days = sorted({item.day.isoformat() for item in found})
+    segments = sorted(bad.segment for item in found for bad in item.damaged)
+    gaps = sum(len(item.gaps) for item in found)
+    return (
+        f"{len(found)} ticker-day(s) over {_capped(days, PAGE_SEGMENT_CAP)} sealed with gaps: "
+        f"{len(segments)} manifested segment(s) are {SEGMENT_MISSING} and {gaps} minute(s) are "
+        f"marked {SEGMENT_LOST}. {_capped(segments, PAGE_SEGMENT_CAP)}. The upload carries on. "
+        f"Findings under {REPORTS_DIR}/{DAMAGED_SEGMENTS_DIR}/."
+    )
+
+
 def _page(
     publisher: Publisher | None,
     *,
@@ -1468,6 +1562,26 @@ def _page_damage(
         title=DAMAGED_SEGMENT_TITLE,
         body=_damage_body(found),
         what="damaged-segment",
+        now=now,
+    )
+
+
+def _page_lost(
+    publisher: Publisher | None, found: Sequence[SegmentDamage], *, now: datetime
+) -> None:
+    """Page once for the whole run, naming the segments the seal marked as gaps.
+
+    It shares the damaged-segment page's title, because an operator reads both the same way:
+    a segment did not reach the seal whole. It does not repeat, because the day is sealed.
+    """
+    if not found:
+        return
+    _page(
+        publisher,
+        event=DAMAGED_SEGMENT_EVENT,
+        title=DAMAGED_SEGMENT_TITLE,
+        body=_lost_body(found),
+        what="lost-segment",
         now=now,
     )
 
@@ -1820,6 +1934,7 @@ def _seal(
     entries: Mapping[str, Mapping[str, object]],
     found: list[SchemaDrift] | None = None,
     allow_retype: bool = False,
+    lost: list[SegmentDamage] | None = None,
 ) -> SealedPartition:
     """Merge one ticker-day's segments into its partition, verify, manifest, unlink.
 
@@ -1829,9 +1944,9 @@ def _seal(
     ticker-day untouched. ``entries`` is the manifest's latest entry per path, which the
     caller already holds. It is required rather than defaulted, because a caller that
     forgot it would skip the check on every segment and nothing would say so. Until the
-    partition has an entry, the same check names every segment the manifest records for
-    this ticker-day and ``segments`` leaves out, because sealing without one seals short
-    and nothing later would ask after it. Every
+    partition has an entry, every segment the manifest records for this ticker-day and
+    ``segments`` leaves out is lost. Its minute gets a gap row in the merge, and a finding
+    lands in ``lost`` once the seal commits, because nothing later would ask after it. Every
     segment is then read before anything is written, so a shadow-append raises with the
     ticker-day untouched, and every segment the read proves damaged raises
     ``DamagedSegments`` the same way, after the rest have been read. The
@@ -1889,17 +2004,18 @@ def _seal(
     # the sum it is checked against comes from the same reads, and a damaged segment can
     # read as no rows, fail to open, or carry a wrong value that decodes cleanly.
     #
-    # The missing-segment half covers a hand-run repair as well as the sweep, and it stands
-    # down once the partition has an entry. A repair of a sealed day rebuilds from whatever
-    # was put back, its segments' entries are superseded, and the no-shrink guard below is
-    # what answers for the count, with ``allow_shrink`` as the operator's say-so.
+    #
+    # The missing-segment check stands down once the partition has an entry. A repair of a
+    # sealed day rebuilds from whatever was put back, its segments' entries are superseded,
+    # and the no-shrink guard below is what answers for the count, with ``allow_shrink`` as
+    # the operator's say-so.
     missing = (
         ()
         if rel in entries
         else _missing_segments(root, paths.segment_dir(surface, ticker, day), segments, entries)
     )
     damaged = (*missing, *_damaged_segments(root, segments, entries))
-    if damaged:
+    if len(damaged) > len(missing):
         raise DamagedSegments(
             surface=surface,
             ticker=ticker,
@@ -1945,8 +2061,18 @@ def _seal(
             day=day,
             partition=rel,
             segments=named_segments,
-            damaged=tuple(unreadable),
+            damaged=(*missing, *unreadable),
         )
+    lost_minutes = _lost_minutes(missing, tables, entries)
+    if lost_minutes:
+        # The rows a startup pass would write for a hole, under a reason that says what
+        # happened. They go into the merge rather than a marker segment, so they land in the
+        # one commit that makes the gone segment's entry superseded.
+        marker = journal.gap_rows(
+            surface, ticker=ticker, slots=lost_minutes, error_class=SEGMENT_LOST
+        )
+        tables.append(pa.Table.from_batches([marker]))
+        expected += marker.num_rows
     if tables and allow_retype:
         # A human has authorized the widening for this one ticker-day and is standing
         # behind the claim that the two types are two recordings of the same thing. The
@@ -2073,6 +2199,22 @@ def _seal(
     # difference.
     if drift is not None:
         _file_drift(root, drift, clock=clock, found=found)
+    gaps = tuple(minute.isoformat() for minute in lost_minutes)
+    if missing:
+        _file_lost(
+            root,
+            SegmentDamage(
+                surface=surface,
+                ticker=ticker,
+                day=day,
+                partition=rel,
+                segments=named_segments,
+                damaged=missing,
+                gaps=gaps,
+            ),
+            clock=clock,
+            found=lost,
+        )
     for path in segments:
         path.unlink()
     return SealedPartition(
@@ -2083,6 +2225,8 @@ def _seal(
         rows=expected,
         sha256=entry["sha256"],
         segments=named_segments,
+        lost=missing,
+        gaps=gaps,
     )
 
 
@@ -2430,10 +2574,11 @@ def compact(
     ``journal/`` whose option-close deadline has passed on the injected clock. Each
     eligible ticker-day ends one of three ways. It is sealed. Or, if its partition is
     already manifested, it is sha-verified and its debris deleted. Or the sweep refuses
-    it, because its segments disagree about a column type, because one no longer
-    matches the hash taken when it closed, or because one the manifest records is gone from
-    disk, and then it is filed, reported under ``refused``, and what remains of it is left
-    exactly as the capture wrote it. The window re-tune then
+    it, because its segments disagree about a column type or because one no longer
+    matches the hash taken when it closed, and then it is filed, reported under ``refused``,
+    and left exactly as the capture wrote it. A manifested segment gone from disk refuses
+    nothing alone: the day seals with a gap row for the lost minute, a finding and a page.
+    The window re-tune then
     profiles the latest sealed day's chains partitions. The trimmed ledger's entry is
     repaired next, then the backup runs, and the ping only after it. The trim runs after the
     ping, and only when ``role`` is primary, ``window_sessions`` judges to a window, and the
@@ -2451,9 +2596,8 @@ def compact(
     step that deletes a sealed partition, and it deletes only what the window, the bucket
     and the checkpoint allow. A run with nothing to do still backs up and pings, because a
     job that correctly no-ops is healthy. A refused ticker-day is the one
-    thing that repeats rather than settling. Its segments are still there, or its manifest
-    entries are, so every run refuses it again and files again, and ``changed`` stays true
-    until a human clears it.
+    thing that repeats rather than settling. Its segments are still there, so every run
+    refuses it again and files again, and ``changed`` stays true until a human clears it.
 
     ``pinger`` is optional so a caller without a health check, like a test, can skip
     it. When given, ``ping_url`` is required. ``slug`` names the check ``ping_url`` feeds. A
@@ -2496,6 +2640,7 @@ def compact(
         problem: str | None = None
         drifted: list[SchemaDrift] = []
         damage: list[SegmentDamage] = []
+        lost: list[SegmentDamage] = []
         chains_by_day: dict[date, list[SealedPartition]] = {}
         # The page goes out in a ``finally``, so no raise anywhere can swallow it. The
         # sweep itself raises on a row-count regression, a failed verify, a partition that
@@ -2535,6 +2680,7 @@ def compact(
                                 guard=True,
                                 entries=latest,
                                 found=drifted,
+                                lost=lost,
                             )
                         except SegmentSchemaConflict as conflict:
                             # The whole behaviour change. Two segments disagreeing about
@@ -2580,7 +2726,10 @@ def compact(
             try:
                 _page_drift(publisher, drifted, now=clock.now())
             finally:
-                _page_damage(publisher, damage, now=clock.now())
+                try:
+                    _page_damage(publisher, damage, now=clock.now())
+                finally:
+                    _page_lost(publisher, lost, now=clock.now())
 
         retune: RetuneResult | None = None
         if chains_by_day:
@@ -2712,10 +2861,10 @@ def recompact_ticker_day(
     conflict into a repair rather than a second report of it. No flag does that for the
     damage.
 
-    A ticker-day with no partition entry has no recorded count for the no-shrink guard to
-    compare, so a manifested segment gone from disk is refused here as damage too, and
-    ``allow_shrink`` does not pass it. A sealed day has that count, so the guard answers
-    for it and the flag passes it (marketlake #998).
+    A ticker-day with no partition entry and a manifested segment gone from disk seals here
+    the way the sweep seals it, with a gap row for the lost minute and a finding. A sealed
+    day's segment entries are superseded, so its rebuild marks nothing, and the no-shrink
+    guard answers for its count (marketlake #998).
     """
     root = Path(lake_root)
     paths = LakePaths(root)
@@ -2728,6 +2877,7 @@ def recompact_ticker_day(
                 "a recompaction needs the day's segments"
             )
         drifted: list[SchemaDrift] = []
+        lost: list[SegmentDamage] = []
         try:
             outcome = _seal(
                 root,
@@ -2741,14 +2891,19 @@ def recompact_ticker_day(
                 entries=latest_entries(root),
                 found=drifted,
                 allow_retype=allow_retype,
+                lost=lost,
             )
             _prune_empty(ticker_dir.parent.parent)
         finally:
             # No publisher, so this pages nobody and only writes the drift to stderr. A
             # repair prints the partition and the row count and nothing else, so without
             # this line an operator reads a clean-looking success over a ticker-day whose
-            # merged schema was not the pinned one.
-            _page_drift(None, drifted, now=clock.now())
+            # merged schema was not the pinned one. A day sealed with lost segments gets the
+            # same line, for the same reason.
+            try:
+                _page_drift(None, drifted, now=clock.now())
+            finally:
+                _page_lost(None, lost, now=clock.now())
         return outcome
 
 
@@ -2943,6 +3098,7 @@ __all__ = [
     "PAGE_SEGMENT_CAP",
     "PartitionMismatch",
     "REFUSED_SEGMENT_DAMAGED",
+    "SEGMENT_LOST",
     "REFUSED_TYPES_DISAGREE",
     "RecompactionRefused",
     "RefusedTickerDay",

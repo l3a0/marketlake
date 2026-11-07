@@ -491,7 +491,9 @@ class DamagedSegment:
 
     A manifested segment can also be gone from disk (marketlake #998). It has no bytes to
     hash, so ``actual`` is ``None``, which is what marks this case, ``expected`` is the digest
-    its entry recorded, and ``error`` says the file is missing.
+    its entry recorded, and ``error`` says the file is missing. Compaction refuses no
+    ticker-day for that alone. It marks the segment's minute as a gap and seals the rest, and
+    a refusal names a gone segment only beside one that refused the day.
     """
 
     segment: str
@@ -502,7 +504,11 @@ class DamagedSegment:
 
 @dataclass(frozen=True)
 class SegmentDamage:
-    """One ticker-day compaction refused because a segment was damaged or is gone.
+    """One ticker-day compaction refused for a damaged segment, or sealed with a gone one.
+
+    A refusal keeps the ticker-day. A day that only lost segments seals with a gap row for
+    each lost minute, and ``gaps`` names those minutes, each as its ISO-8601 ``snap_ts``, in
+    UTC. The rest of this says what a refusal holds.
 
     ``partition`` is the Parquet the refusal did not write. ``segments`` names every segment
     of the ticker-day still on disk, because the refusal keeps the whole ticker-day rather
@@ -518,6 +524,7 @@ class SegmentDamage:
     partition: str
     segments: tuple[str, ...]
     damaged: tuple[DamagedSegment, ...]
+    gaps: tuple[str, ...] = ()
 
 
 def damaged_segments_dir(lake_root: Path | str, day: date) -> Path:
@@ -567,6 +574,7 @@ def write_damaged_segments(
             }
             for item in damage.damaged
         ],
+        "gaps": list(damage.gaps),
     }
     # A report is written inside a lake that exists, or not at all, for the reason
     # ``write_close_guard`` gives.

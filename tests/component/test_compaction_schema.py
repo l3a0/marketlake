@@ -59,7 +59,6 @@ from lake.compact import (
     SCHEMA_DRIFT_EVENT,
     SCHEMA_DRIFT_TITLE,
     CompactionResult,
-    DamagedSegments,
     RecompactionRefused,
     RetypeRefused,
     compact,
@@ -1549,21 +1548,24 @@ def test_the_same_ticker_day_without_the_flag_is_still_refused(lake_root, monkey
 # -- the automatic sweep never widens ----------------------------------------
 
 
-def test_the_widening_flag_does_not_pass_a_manifested_segment_gone_from_disk(lake_root):
-    """The flag answers a type conflict, and sealing here would seal short and unlink."""
-    morning, afternoon = _conflicted_day(lake_root)
-    gone = morning.with_name("seg-c-4242.arrows")
-    rel = gone.relative_to(lake_root).as_posix()
+def test_the_widening_repair_marks_a_gone_segment_rather_than_seal_past_it(lake_root):
+    """The flag answers a type conflict and says nothing about a lost minute."""
+    morning, _ = _conflicted_day(lake_root)
+    rel = morning.with_name("seg-c-4242.arrows").relative_to(lake_root).as_posix()
     append_manifest(
-        lake_root, partition=rel, source="capture", sha256="a" * 64, rows=2, fetched_at=None
+        lake_root,
+        partition=rel,
+        source="capture",
+        sha256="a" * 64,
+        rows=2,
+        fetched_at=_et(DAY, 10, 5).isoformat(),
     )
 
-    with pytest.raises(DamagedSegments) as info:
-        _repair(lake_root, allow_retype=True)
+    outcome = _repair(lake_root, allow_retype=True)
 
-    assert [item.segment for item in info.value.damaged] == [rel]
-    assert morning.exists() and afternoon.exists()
-    assert not LakePaths(lake_root).chains_partition_path("SPY", DAY).exists()
+    assert [item.segment for item in outcome.lost] == [rel]
+    assert len(outcome.gaps) == 1
+    assert outcome.rows == 5 + 1
 
 
 def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):
