@@ -921,6 +921,30 @@ def test_a_failed_here_string_leaves_the_fstab_alone(vm):
     assert vm.fstab.read_bytes() == before
 
 
+SWAP_INSERT = """      swap_desired="$swap_desired$SWAP_LINE"$'\\n'\n"""
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        [(SWAP_INSERT, "      :\n")],
+        [(SWAP_INSERT, "      :\n"), (LOOP_END, LOOP_END + SWAP_INSERT)],
+    ],
+    ids=["the swap line missing", "the swap line below the lake's"],
+)
+def test_the_new_text_must_end_in_the_swap_line_then_the_lakes(vm, edits):
+    # The here-string case above leaves the text empty, which a looser check would catch
+    # too. These copies build a text that holds one of the two lines where it belongs.
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    _use_script(vm, *edits)
+    proc = vm.bootstrap()
+    _assert_the_swap_step_failed_and_the_units_installed(
+        vm, proc, "could not build the new fstab text"
+    )
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+
+
 def test_a_rollout_to_a_running_vm_adds_the_swap_line(vm):
     # A deploy reaches a VM whose lake is mounted and whose fstab holds its line already,
     # so the lake's step writes nothing and the swap line is the only write of the run.
@@ -1115,6 +1139,8 @@ def test_a_failed_write_of_the_swap_line_installs_the_units(vm, env, line):
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
     assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
     assert vm.active_swap == [str(vm.swap)]
+    # The line never landed, so only a failed reload may say it is on disk.
+    assert "on disk" not in proc.stderr
 
 
 def test_a_failed_reload_after_the_lakes_line_stops_with_one_line(vm):
