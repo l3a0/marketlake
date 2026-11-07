@@ -1624,6 +1624,50 @@ def test_a_ticker_day_with_no_segment_left_seals_once_a_daemon_start_marks_it(la
     assert scrub(lake_root).missing == ()
 
 
+def _lost_entry(lake_root: Path, rel: str, fetched_at: str | None) -> None:
+    append_manifest(
+        lake_root, partition=rel, source="capture", sha256="a" * 64, rows=2, fetched_at=fetched_at
+    )
+
+
+def test_a_lost_minute_is_the_fetch_time_floored_to_the_minute(lake_root):
+    spy = _captured(lake_root, "SPY")
+    rel = _rel(lake_root, spy[0]).replace("seg-", "seg-0-")
+    _lost_entry(lake_root, rel, "2026-08-24T10:07:17.500000-04:00")
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert sealed.gaps == ("2026-08-24T14:07:00+00:00",)
+
+
+def test_a_fetch_time_with_no_zone_names_no_minute(lake_root):
+    """A bare clock reading could land on the wrong day, so it marks nothing."""
+    spy = _captured(lake_root, "SPY")
+    rel = _rel(lake_root, spy[0]).replace("seg-", "seg-0-")
+    _lost_entry(lake_root, rel, "2026-08-24T10:07:17")
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert [item.segment for item in sealed.lost] == [rel]
+    assert sealed.gaps == ()
+
+
+def test_a_read_refusal_names_a_gone_segment_beside_it(lake_root):
+    """The same as the hash refusal, for a segment only the read can prove damaged."""
+    spy = _unmanifested(lake_root)
+    rel = _rel(lake_root, spy[0]).replace("seg-", "seg-0-")
+    _lost_entry(lake_root, rel, "2026-08-24T10:07:00-04:00")
+    _flip(spy[2], DROPS_THE_SEGMENT)
+
+    result, _ = _run(lake_root)
+
+    (refused,) = result.refused
+    assert rel in [item.segment for item in refused.damaged]
+    assert len(refused.damaged) == 2
+
+
 def test_a_lost_entry_with_no_fetch_time_marks_nothing_and_is_still_named(lake_root):
     """No minute can be named for it, and the finding is what keeps it visible."""
     spy = _captured(lake_root, "SPY")
