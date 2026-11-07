@@ -1542,6 +1542,141 @@ def test_a_segment_with_no_entry_leaves_nothing_to_miss(lake_root):
     assert [(item.ticker, item.rows) for item in result.sealed] == [("SPY", 4 * ROWS_PER_SEGMENT)]
 
 
+def test_a_rebuild_past_a_marker_row_needs_the_operators_say_so(lake_root):
+    """Marker segments have no copy, so the rebuild holds fewer rows than the seal did."""
+    spy = _captured(lake_root, "SPY")
+    saved = {path: path.read_bytes() for path in spy}
+    spy[2].unlink()
+    _marked(lake_root, "SPY", [30, 31, 32])
+    result, _ = _run(lake_root)
+    (sealed,) = result.sealed
+    assert sealed.rows == 4 * ROWS_PER_SEGMENT + 1 + 3
+    spy[0].parent.mkdir(parents=True, exist_ok=True)
+    for path, data in saved.items():
+        path.write_bytes(data)
+    clock = ManualClock(_et(17, 0))
+
+    with pytest.raises(RowCountRegression):
+        recompact_ticker_day(lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=clock)
+    outcome = recompact_ticker_day(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, clock=clock, allow_shrink=True
+    )
+
+    assert outcome.rows == 5 * ROWS_PER_SEGMENT
+
+
+def test_every_lost_minute_gets_its_own_row(lake_root):
+    spy = _captured(lake_root, "SPY")
+    spy[1].unlink()
+    spy[3].unlink()
+    publisher, transport = _paging(lake_root)
+
+    result, _ = _run(lake_root, publisher=publisher)
+
+    (sealed,) = result.sealed
+    minutes = ["2026-08-24T14:01:00+00:00", "2026-08-24T14:03:00+00:00"]
+    assert list(sealed.gaps) == minutes
+    assert _gap_minutes(_partition(lake_root, "SPY")) == minutes
+    (page,) = transport.messages
+    assert "2 manifested segment(s) are missing from disk and 2 minute(s)" in page.body
+
+
+def test_two_lost_segments_in_one_minute_get_one_row(lake_root):
+    spy = _captured(lake_root, "SPY")
+    for suffix in ("seg-0-", "seg-1-"):
+        rel = _rel(lake_root, spy[0]).replace("seg-", suffix)
+        _lost_entry(lake_root, rel, "2026-08-24T10:07:17-04:00")
+
+    result, _ = _run(lake_root)
+
+    (sealed,) = result.sealed
+    assert len(sealed.lost) == 2
+    assert sealed.gaps == ("2026-08-24T14:07:00+00:00",)
+
+
+def test_a_finding_that_cannot_be_written_still_pages_a_lost_segment(
+    lake_root, monkeypatch, capsys
+):
+    _captured(lake_root, "SPY")[2].unlink()
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("reports is read-only")
+
+    monkeypatch.setattr(compact_module, "write_damaged_segments", refuse)
+    publisher, transport = _paging(lake_root)
+
+    result, events = _run(lake_root, publisher=publisher)
+
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    assert events == ["backup", "ping"]
+    assert [page.title for page in transport.messages] == [DAMAGED_SEGMENT_TITLE]
+    assert "could not be filed: PermissionError" in capsys.readouterr().err
+
+
+def test_a_refused_day_and_a_lost_segment_send_a_page_each(lake_root):
+    _flip(_captured(lake_root, "QQQ")[2], DROPS_THE_SEGMENT)
+    _captured(lake_root, "SPY")[2].unlink()
+    publisher, transport = _paging(lake_root)
+
+    result, _ = _run(lake_root, publisher=publisher)
+
+    assert [item.ticker for item in result.refused] == ["QQQ"]
+    assert [item.ticker for item in result.sealed] == ["SPY"]
+    (damage, lost) = transport.messages
+    assert "refused" in damage.body
+    assert "sealed with gaps" in lost.body
+
+
+def test_a_damage_page_that_raises_cannot_swallow_the_lost_page(lake_root, monkeypatch):
+    _captured(lake_root, "SPY")[2].unlink()
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the damage page broke")
+
+    monkeypatch.setattr(compact_module, "_page_damage", broken)
+    publisher, transport = _paging(lake_root)
+
+    with pytest.raises(RuntimeError, match="damage page broke"):
+        _run(lake_root, publisher=publisher)
+
+    (page,) = transport.messages
+    assert "sealed with gaps" in page.body
+
+
+def test_the_lost_page_stays_under_the_body_limit_however_wide_the_loss():
+    found = [_damage(date(2026, 7, 1 + index), 20) for index in range(30)]
+
+    body = compact_module._lost_body(found)
+
+    assert len(body.encode("utf-8")) < 1000
+    assert "600 manifested segment(s)" in body
+    assert f"and {600 - PAGE_SEGMENT_CAP} more" in body
+
+
+@pytest.mark.parametrize("stamp", ["not-a-time", 5, None, "2026-08-24T10:07:17"])
+def test_a_stamp_that_names_no_instant_is_none(stamp):
+    assert compact_module._instant(stamp) is None
+
+
+def test_an_unreadable_snap_ts_beside_a_lost_segment_costs_nothing(lake_root):
+    """A bad stamp seals when nothing is lost, so a loss must not turn it into a stopped run."""
+    spy = _captured(lake_root, "SPY")
+    spy[2].unlink()
+    _captured(lake_root, "ZZZ")
+    batch = journal.gap_rows(
+        journal.CHAINS_SURFACE, ticker="SPY", slots=["not-a-time"], error_class="daemon_dead"
+    )
+    with journal.SegmentWriter.open(
+        lake_root, journal.CHAINS_SURFACE, "SPY", DAY, "20260824T235959000000", PID
+    ) as writer:
+        writer.write_cycle(batch)
+
+    result, events = _run(lake_root)
+
+    assert sorted(item.ticker for item in result.sealed) == ["SPY", "ZZZ"]
+    assert events == ["backup", "ping"]
+
+
 def test_a_day_sealed_with_gaps_pages_once(lake_root):
     """The day is sealed, so nothing repeats and nothing is left to page about."""
     _captured(lake_root, "SPY")[2].unlink()
@@ -1560,8 +1695,7 @@ def test_a_sealed_day_rebuilds_past_its_gap_rows_once_every_segment_is_back(lake
     """Sealing at once closes off no repair, which is why no copy is looked for first.
 
     A live copy of a quotes segment stays readable for about 97 days. With every segment back
-    in place, the hand-run repair rebuilds the day from them, and the no-shrink guard passes
-    because a lost segment held at least the one row its gap row stands for.
+    in place, the hand-run repair rebuilds the day from them, on a day with no marker rows.
     """
     spy = _captured_quotes(lake_root, "SPY")
     saved = {path: path.read_bytes() for path in spy}
@@ -1608,6 +1742,9 @@ def test_a_minute_startup_marking_reached_first_gets_no_second_row(lake_root):
     assert [item.segment for item in sealed.lost] == [_rel(lake_root, spy[2])]
     assert sealed.gaps == ()
     assert sealed.rows == 4 * ROWS_PER_SEGMENT + 1
+    (finding,) = _findings(lake_root)
+    assert [item["segment"] for item in finding["damaged"]] == [_rel(lake_root, spy[2])]
+    assert finding["gaps"] == []
 
 
 def test_a_ticker_day_with_no_segment_left_seals_once_a_daemon_start_marks_it(lake_root):
@@ -1675,13 +1812,18 @@ def test_a_lost_entry_with_no_fetch_time_marks_nothing_and_is_still_named(lake_r
     append_manifest(
         lake_root, partition=rel, source="capture", sha256="a" * 64, rows=2, fetched_at=None
     )
+    publisher, transport = _paging(lake_root)
 
-    result, _ = _run(lake_root)
+    result, _ = _run(lake_root, publisher=publisher)
 
     (sealed,) = result.sealed
     assert [item.segment for item in sealed.lost] == [rel]
     assert sealed.gaps == ()
     assert sealed.rows == 5 * ROWS_PER_SEGMENT
+    (finding,) = _findings(lake_root)
+    assert [item["segment"] for item in finding["damaged"]] == [rel]
+    (page,) = transport.messages
+    assert "0 minute(s) are marked segment_lost" in page.body
 
 
 def test_the_page_and_the_summary_count_a_gone_segment_on_its_own(lake_root):

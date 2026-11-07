@@ -115,8 +115,9 @@ DATE_PARTITIONED = frozenset({CHAINS, QUOTES})
 # 5. One file per ticker-day compaction refused because a segment no longer matched the
 #    sha256 its manifest entry recorded when it closed or its read proved it damaged, or
 #    sealed with gap rows because a manifested segment was gone from disk, under
-#    `reports/damaged_segments/date=D/`. It files on every run the damage survives, for
-#    the refused merge's reason, and it is not drift, so it stays out of item 3's tree.
+#    `reports/damaged_segments/date=D/`. A refused day files on every run the damage
+#    survives, for the refused merge's reason, and a day sealed with gap rows files once. It
+#    is not drift, so it stays out of item 3's tree.
 # 6. One file per vendor-sweep run on a host with a cost export, under
 #    `reports/aws_cost/date=D/`, written by ``lake.aws_cost``. It is the night's summary of
 #    the AWS cost and usage export, keyed on the Eastern date of the run (marketlake #913).

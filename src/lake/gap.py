@@ -12,6 +12,10 @@ Two producers hand slots to one writer.
 2. Skipped-slot marking runs from ``on_skipped`` when a live loop sleeps through a
    capture slot, because the loop thread itself woke late.
 
+Compaction marks one further case itself, outside this writer. A manifested segment gone
+from disk at the seal gets a ``segment_lost`` row in the merge, through the same
+``journal.gap_rows``, so the row lands in the one commit that seals the day.
+
 They never overlap, because ``run_loop`` reads the minute it starts in once, hands it
 to startup marking, and keeps it as the previous slot its first tick counts from.
 Startup marking owns every owed minute through it, and the loop reports only minutes

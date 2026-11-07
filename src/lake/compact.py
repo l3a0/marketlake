@@ -46,8 +46,8 @@ The job's rules, each glossed at first use.
 3. *Verify before manifest, manifest before delete.* Each ticker-day's segments are read
    to their last complete batch, concatenated, and written as one Parquet file. The file
    is then read back, once, and that one read serves every check. Its row count is
-   compared to the sum across the segments, its footer to the schema that was written,
-   and its digest is what the manifest records. Only after that does the manifest entry
+   compared to the sum across the segments and any gap rows, its footer to the schema that
+   was written, and its digest is what the manifest records. Only after that does the manifest entry
    land, and only after the manifest append are the segments unlinked. A crash at any
    point re-runs with nothing lost.
 
@@ -1147,7 +1147,8 @@ def _missing_segments(
     The caller runs this only while the partition has no entry. Compaction unlinks a segment
     only once that entry has landed, so compaction never explains the absence here. A person
     or a disk fault does, or a resync stopped between its deletions and its manifest rewrite.
-    Run that resync again before compaction, because a day that seals here keeps its gap rows.
+    Run that resync again, before or after the seal, because it puts the bucket's partition
+    back either way.
 
     ``entries`` comes from a read that stops at a torn line, so an entry hidden behind one is
     not compared, and an emptied or deleted manifest offers nothing to compare. The hash check
@@ -1170,6 +1171,40 @@ def _missing_segments(
     )
 
 
+def _instant(value: object) -> datetime | None:
+    """A stored stamp as an instant in UTC, or ``None`` when it does not name one.
+
+    A stamp with no zone names no instant, and on the wrong side of midnight it would mark the
+    wrong day.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return None if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _gap_table(batch: pa.RecordBatch, tables: Sequence[pa.Table]) -> pa.Table:
+    """The seal's gap rows, with their null columns at the types the segments hold.
+
+    ``gap_rows`` builds the schema the running code pins, and a day captured before a retype
+    holds an older one. A null column at the newer type would make the merge refuse a day
+    whose segments agree with each other, which would hold the day this exists to seal. Every
+    value in such a column is null, so naming it at the segments' type changes no value.
+    """
+    table = pa.Table.from_batches([batch])
+    if not tables:
+        return table
+    target = tables[0].schema
+    for index, field in enumerate(table.schema):
+        if field.name not in target.names or target.field(field.name).type == field.type:
+            continue
+        if table.column(index).null_count == table.num_rows:
+            wanted = target.field(field.name)
+            table = table.set_column(index, wanted, pa.nulls(table.num_rows, wanted.type))
+    return table
+
+
 def _lost_minutes(
     lost: Sequence[DamagedSegment],
     tables: Sequence[pa.Table],
@@ -1180,32 +1215,28 @@ def _lost_minutes(
     A capture cycle writes one segment per surface and ticker, so one lost segment is one lost
     minute, and its entry's ``fetched_at`` is the cycle's dispatch time, so flooring it gives
     that minute. The price is that a cycle dispatched past the top of its minute, or a close
-    fill, marks the minute it was fetched in rather than the slot it filled.
+    fill, floors to the minute it was fetched in rather than the slot it filled.
 
     A minute another row already records gets no marker, because startup gap marking may have
-    reached the hole first, and a second row for one minute would read as two captures. An
-    entry with no usable ``fetched_at`` marks nothing, because no minute can be named for it,
-    and the finding still names the segment. Zeroing seconds and microseconds is flooring,
-    which the clock-seam scanner allows.
+    reached the hole first, and a second row for one minute would read as two captures. So a
+    late cycle whose fetched minute holds a row leaves its slot unmarked, and only the finding
+    names the segment. An entry with no usable ``fetched_at`` is the same, because no minute
+    can be named for it. A stored stamp that does not parse names no minute either, so it
+    cannot end the run. Zeroing seconds and microseconds is flooring, which the clock-seam
+    scanner allows.
     """
     if not lost:
         return ()
     present = {
-        datetime.fromisoformat(value).astimezone(UTC)
+        _instant(value)
         for table in tables
-        for value in table.column("snap_ts").to_pylist()
-        if value is not None
+        for value in table.column("snap_ts").unique().to_pylist()
     }
     minutes: set[datetime] = set()
     for item in lost:
-        stamp = entries[item.segment].get("fetched_at")
-        try:
-            fetched = datetime.fromisoformat(str(stamp))
-        except ValueError:
-            continue
-        if fetched.tzinfo is None:
-            continue
-        minutes.add(fetched.astimezone(UTC).replace(second=0, microsecond=0))
+        fetched = _instant(entries[item.segment].get("fetched_at"))
+        if fetched is not None:
+            minutes.add(fetched.replace(second=0, microsecond=0))
     return tuple(sorted(minutes - present))
 
 
@@ -1220,7 +1251,8 @@ def _file_lost(
 
     The same order as ``_refuse_damaged``: the record first, then the finding, and a finding
     that cannot be written is named on stderr rather than raised. The seal has committed by
-    now, and its gap rows hold the loss whatever happens here.
+    now, so any gap rows hold the loss whatever happens here. A loss that marked no minute has
+    only this finding and the page, and a run killed before them leaves neither.
     """
     if found is not None:
         found.append(finding)
@@ -1951,7 +1983,8 @@ def _seal(
     ticker-day untouched, and every segment the read proves damaged raises
     ``DamagedSegments`` the same way, after the rest have been read. The
     Parquet lands and is read back once. That read yields the row count, checked against
-    the sum across the segments, the footer, checked against the schema that was written,
+    the sum across the segments and any gap rows, the footer, checked against the schema that
+    was written,
     and the digest the manifest entry carries. The entry is appended. Only then are the
     segments unlinked.
 
@@ -2003,7 +2036,6 @@ def _seal(
     # Before pyarrow touches any of the bytes. A row count cannot see this damage, because
     # the sum it is checked against comes from the same reads, and a damaged segment can
     # read as no rows, fail to open, or carry a wrong value that decodes cleanly.
-    #
     #
     # The missing-segment check stands down once the partition has an entry. A repair of a
     # sealed day rebuilds from whatever was put back, its segments' entries are superseded,
@@ -2066,12 +2098,14 @@ def _seal(
     lost_minutes = _lost_minutes(missing, tables, entries)
     if lost_minutes:
         # The rows a startup pass would write for a hole, under a reason that says what
-        # happened. They go into the merge rather than a marker segment, so they land in the
-        # one commit that makes the gone segment's entry superseded.
-        marker = journal.gap_rows(
-            surface, ticker=ticker, slots=lost_minutes, error_class=SEGMENT_LOST
+        # happened and with no session phase. They go into the merge rather than a marker
+        # segment, so they land in the one commit that makes the gone segment's entry
+        # superseded.
+        marker = _gap_table(
+            journal.gap_rows(surface, ticker=ticker, slots=lost_minutes, error_class=SEGMENT_LOST),
+            tables,
         )
-        tables.append(pa.Table.from_batches([marker]))
+        tables.append(marker)
         expected += marker.num_rows
     if tables and allow_retype:
         # A human has authorized the widening for this one ticker-day and is standing
@@ -2242,8 +2276,11 @@ def _recover(
     """Finish an interrupted cleanup: sha-verify the manifested partition, delete debris.
 
     Debris segments are the only reachable leftover once the sweep bound is close+5.
-    They come from a crash between the manifest append and the last unlink. Any mismatch
-    raises ``PartitionMismatch`` with the debris intact, so a human can decide.
+    They come from a crash between the manifest append and the last unlink, or from a lost
+    segment put back after its day sealed with a gap row. This deletes that file unread like
+    any other, so a repair needs every segment back and ``recompact_ticker_day`` before this
+    runs (marketlake #999). Any mismatch raises ``PartitionMismatch`` with the debris intact,
+    so a human can decide.
     """
     partition = paths.partition_path(surface, ticker, day)
     rel = partition.relative_to(root).as_posix()

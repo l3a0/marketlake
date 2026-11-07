@@ -1568,6 +1568,29 @@ def test_the_widening_repair_marks_a_gone_segment_rather_than_seal_past_it(lake_
     assert outcome.rows == 5 + 1
 
 
+def test_a_gap_row_takes_the_type_the_segments_hold(lake_root):
+    """A day captured before a retype agrees with itself, so its gap row must not disagree."""
+    retyped = _retyped(COLUMN, pa.float64())
+    kept = _segment(
+        lake_root, retyped, _table(retyped, _rows(2, snap_ts=_snap(DAY, 0))), start_ts="a"
+    )
+    rel = kept.with_name("seg-c-4242.arrows").relative_to(lake_root).as_posix()
+    append_manifest(
+        lake_root,
+        partition=rel,
+        source="capture",
+        sha256="a" * 64,
+        rows=2,
+        fetched_at=_et(DAY, 10, 5).isoformat(),
+    )
+
+    outcome = _repair(lake_root)
+
+    assert (outcome.rows, len(outcome.gaps)) == (3, 1)
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+    assert pq.read_schema(partition).field(COLUMN).type == pa.float64()
+
+
 def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):
     # The over-reach this whole design is built against. The flag authorizes one human
     # repair of one ticker-day, and the scheduled run has no way to ask for it. A sweep

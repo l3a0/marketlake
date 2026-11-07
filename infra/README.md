@@ -795,16 +795,20 @@ cases.
    was, the trim does not run, and the `compaction` and `evening-upload` checks page.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
-3. A manifested segment left the disk before the seal. Compaction seals the day with a
-   `segment_lost` gap row for that minute and sends the `Damaged segment at the merge` page
-   once, and a finding under `reports/damaged_segments/` names the segment and the minute
-   ([#998](https://github.com/l3a0/marketlake/issues/998)). The upload carries on. With every segment of
-   the day back in place, a hand-run `recompact_ticker_day` rebuilds the day past the gap row.
-   A chains segment no upload carried has no copy, so its minute stays a gap. If a resync
-   stopped part-way on this host, run it again before the next compaction, because a sealed
-   day keeps its gap rows. A ticker-day with no segment left gets no damage page or finding,
-   and `ManifestedFileMissing` and the Sunday scrub name it until the next daemon start marks
-   the day and the next compaction seals it.
+3. A manifested segment left the disk before the seal. Compaction seals the day and sends the
+   `Damaged segment at the merge` page once, and a finding under `reports/damaged_segments/`
+   names the segment and any minute marked ([#998](https://github.com/l3a0/marketlake/issues/998)).
+   The minute usually gets a `segment_lost` gap row. It keeps a `daemon_dead` row if a daemon
+   start reached the hole first, and gets none if the cycle's fetch crossed into a minute that
+   holds a row. The upload carries on. A repair needs every segment of the day back and a
+   hand-run `recompact_ticker_day` before the next compaction. On a day with marker rows the
+   no-shrink guard refuses that rebuild, and `allow_shrink` passes it by dropping those rows. A
+   chains segment no upload carried has no copy, so its minute stays a gap. If a resync stopped
+   part-way on this host, run it again, because that puts the bucket's partition back before or
+   after the seal. A ticker-day with no segment left gets no damage page or finding, and
+   `ManifestedFileMissing` and the Sunday scrub name it until the next daemon start marks the
+   day and the next compaction seals it. A ticker disabled since gets no marker, so a person
+   has to clear that day.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds

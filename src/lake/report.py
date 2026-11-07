@@ -67,9 +67,9 @@ only check a segment with no manifest entry gets. That finding is damage rather 
 drift, and a reader counting drift must not pick it up, so it goes under
 ``reports/damaged_segments/`` and not ``reports/schema_drift/``. It names the segment and
 both hashes, the read's failure where no hash was recorded, or the recorded hash alone for a
-segment gone from disk, and it files on every run
-the damage survives, for the reason a refused merge does: nothing was sealed, so no
-manifest entry makes a later silence readable.
+segment gone from disk. A refused day files on every run the damage survives, for the reason a
+refused merge does: nothing was sealed, so no manifest entry makes a later silence readable.
+A day sealed with lost segments files once, because its partition's entry answers that.
 
 The third producer is the vendor sweep's gates. A check that refuses to land a row holds
 that row out of its ledger, and a fail-closed decision leaving no record reads exactly like
@@ -468,7 +468,7 @@ def write_schema_drift(
 
 @dataclass(frozen=True)
 class DamagedSegment:
-    """One segment compaction refused: its digest moved, its read failed, or its file is gone.
+    """One segment a seal could not use: its digest moved, its read failed, or its file is gone.
 
     ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
     entry carries, which the capture cycle hashed from the file right after closing it, or
@@ -545,7 +545,9 @@ def write_damaged_segments(
 ) -> Path:
     """File one refused ticker-day's damage, and hand back the path it landed at.
 
-    **It files on every run the damage survives.** The refused ticker-day has no partition
+    **A refused day files on every run the damage survives.** A day sealed with lost segments
+    files once, because the seal is the last run that finds them. The refused ticker-day has
+    no partition
     and no manifest entry, so a second night's silence would be consistent with a repair,
     with damage already filed, and with a ticker-day that is gone. That is the refused
     merge's reason, and the cadence is the same.
