@@ -365,9 +365,7 @@ matches the plan just read. On 2026-10-06 the first apply reported 1 imported, 8
 ### 8. Create the `infra` environment
 
 Only the owner runs this step. An agent session may approve a waiting run in the `deploy`
-and `infra` environments on the conditions that rule names. It never approves anything
-that can place an order or touch real money, approves in no other environment, never rejects or cancels a deployment, and never edits an environment or its
-protection rules. That rule is the "Deployment approvals" section of
+and `infra` environments only on the conditions that rule names. That rule is the "Deployment approvals" section of
 [`CLAUDE.md`](../CLAUDE.md#deployment-approvals-owner-directive-2026-10-06).
 
 The environment must exist before the first apply job starts, because GitHub creates a
@@ -740,9 +738,10 @@ code or revert it. A manual run of `infra.yml` from `main` reverts it behind the
 approval, with no code change.
 
 A green apply that turns out wrong is undone by a revert pull request, applied like any
-other change, with the same review and the same approval window. So an apply that breaks
-capture at 08:30 ET cannot be reverted through CI until 16:15 ET. A revert does not bring
-back a replaced instance, deleted data or lost minutes.
+other change, with the same review and the same approval window. A revert not approved
+by 09:25 ET waits until 16:15 ET on a session day, so an apply that breaks capture at
+08:30 ET can leave it broken for the session. A revert does not bring back a replaced
+instance, deleted data or lost minutes.
 
 A failed apply keeps the state of what it changed and releases its lock, so the next run
 plans only what is left. The cost and usage export is the one exception, because an
@@ -1808,6 +1807,12 @@ Start the VM by hand first if it is stopped, as
 [Start a stopped instance](#start-a-stopped-instance) says. The stop then leaves it up for
 the deploy, because [The nightly stop](#the-nightly-stop)'s check 6 refuses while the
 deploy's unit runs or holds the deploy lock.
+
+A green deploy that turns out wrong is undone by a revert pull request and a forward
+deploy, because the script refuses a commit behind the checkout's `HEAD`. The window
+refuses that deploy from 08:00 to 18:45 ET on a weekday, and an override is refused until
+16:30 ET, so a wrong deploy found during a session stays on the VM until then. A revert
+does not bring back lost minutes.
 
 Pass the full 40-digit sha of a commit on `main`. A pull request's page shows only 7
 digits, so read the full sha of `main`'s tip from the VM.
