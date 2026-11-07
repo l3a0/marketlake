@@ -36,15 +36,18 @@ prints. ``dd`` with ``of=`` writes a few bytes in place of the size it was asked
 a test cannot pass against a script that turns on a half-made file or runs twice on a
 live one. ``$STATE/sysctl`` gathers what ``sysctl -p`` applied. ``DD_WRITE_RC``,
 ``MKSWAP_RC``, ``SYSCTL_RC``, ``SWAPON_RC`` and ``SWAPON_SHOW_RC`` fail those tools, and
-``dd`` still leaves its bytes behind when it fails, as a full disk would. ``CHMOD_FAIL``
-and ``MV_FAIL`` each name a path that tool fails on, its last argument, as ``CAT_FAIL`` does
-for ``cat``. ``FIND_RC`` fails ``find``.
+``dd`` still leaves its bytes behind when it fails, as a full disk would. ``CHMOD_FAIL`` is
+a shell pattern and ``MV_FAIL`` a path, each naming the last argument that tool fails on, as
+``CAT_FAIL`` does for ``cat``. ``FIND_RC`` fails ``find`` and ``SYNC_RC`` fails ``sync``.
+``MKTEMP_FAIL`` and ``MKTEMP_READONLY`` are shell patterns too, since a temporary path is
+random. The first fails ``mktemp`` on a template that matches. The second makes a matching
+file read-only, so the script's write into it fails.
 
 The other knobs: ``DD_FAIL_BLOCK`` names a block whose read fails, as an I/O error would
 make it, and ``DD_SHORT_BLOCK`` names one whose read stops a byte into the magic.
-``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that holds an entry. On
-an empty or missing file it exits 1 whatever the knob says, so a test cannot pass against a
-check looser than the real one.
+``FINDMNT_VERIFY_RC`` is the exit of ``findmnt --verify`` on a file that exists, an empty one
+included, because util-linux 2.39.3 exits 0 on a table with no entries. On a missing file it
+exits 1 whatever the knob says.
 ``FINDMNT_TREE_RC`` is the exit of ``findmnt -R``. ``FSTAB_SOURCE`` overrides what
 ``findmnt --fstab`` reads. ``UDEVADM_RC``, ``RESIZE2FS_RC``, ``MKFS_RC`` and ``CURL_RC``
 fail those tools, and ``INSTALLER_RC`` fails the uv installer the fake ``curl`` writes. That
@@ -165,9 +168,10 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 if [[ $verify == 1 ]]; then
-  # A table with no entry at all is the one thing the fake always refuses.
-  if [[ ! -s "$tab" ]]; then
-    echo "fake findmnt: $tab holds no entry" >&2
+  # A file it cannot read is the one thing the fake always refuses. An empty table passes,
+  # as util-linux 2.39.3's does, because its verify loop finds no entry to complain about.
+  if [[ ! -e "$tab" ]]; then
+    echo "fake findmnt: can't read $tab" >&2
     exit 1
   fi
   exit "${FINDMNT_VERIFY_RC:-0}"
@@ -306,8 +310,15 @@ cat "${*: -1}" >> "$STATE/sysctl"
 # path is logged, so a test can find the file whatever made it.
 FAKE_MKTEMP = r"""#!/bin/bash
 if [[ $# -eq 0 ]]; then set -- "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX"; fi
+if [[ -n "${MKTEMP_FAIL:-}" && "$1" == $MKTEMP_FAIL ]]; then
+  echo "mktemp: failed to create file via template $1" >&2
+  exit 1
+fi
 path="$(/usr/bin/mktemp "$@")" || exit $?
 printf 'mktemp %s\n' "$path" >> "$LOG"
+if [[ -n "${MKTEMP_READONLY:-}" && "$path" == $MKTEMP_READONLY ]]; then
+  /bin/chmod 0444 "$path"
+fi
 echo "$path"
 """
 
@@ -319,8 +330,8 @@ exit {rc}
 
 FAKE_CHMOD = """#!/bin/bash
 printf 'chmod %s\\n' "$*" >> "$LOG"
-if [[ -n "${CHMOD_FAIL:-}" && "${*: -1}" == "$CHMOD_FAIL" ]]; then
-  echo "chmod: changing permissions of $CHMOD_FAIL: Input/output error" >&2
+if [[ -n "${CHMOD_FAIL:-}" && "${*: -1}" == $CHMOD_FAIL ]]; then
+  echo "chmod: changing permissions of ${*: -1}: Input/output error" >&2
   exit 1
 fi
 exec /bin/chmod "$@"
@@ -423,7 +434,7 @@ def install_disk_fakes(bin_dir: Path) -> None:
         "sysctl": FAKE_SYSCTL,
         "mktemp": FAKE_MKTEMP,
         "chown": FAKE_LOGGED.format(name="chown", rc=0),
-        "sync": FAKE_LOGGED.format(name="sync", rc=0),
+        "sync": FAKE_LOGGED.format(name="sync", rc='"${SYNC_RC:-0}"'),
         "udevadm": FAKE_LOGGED.format(name="udevadm", rc='"${UDEVADM_RC:-0}"'),
         "resize2fs": FAKE_LOGGED.format(name="resize2fs", rc='"${RESIZE2FS_RC:-0}"'),
         "chmod": FAKE_CHMOD,

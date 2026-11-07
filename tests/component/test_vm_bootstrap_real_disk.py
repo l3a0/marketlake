@@ -118,6 +118,47 @@ def test_a_lake_with_a_zeroed_primary_superblock_is_not_formatted(vm, real_disk)
         assert image.read(BLOCK) == bytes(BLOCK)
 
 
+def test_findmnt_verify_passes_an_empty_table(tmp_path):
+    # Runs only where findmnt exists, so on CI's Linux runner and not on a Mac. FAKE_FINDMNT
+    # copies this answer. It is why the bootstrap checks for the root entry itself.
+    table = tmp_path / "fstab"
+    table.write_text("")
+    proc = subprocess.run(
+        [require_tool("findmnt"), "--verify", "--tab-file", str(table)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_findmnt_verify_passes_a_table_with_the_swap_line(tmp_path):
+    # Runs only where findmnt exists, so on CI's Linux runner and not on a Mac. A rollout
+    # depends on this answer, because the swap line's source is a regular file. Each line
+    # names a file rather than a UUID or a LABEL, because an unresolved tag on a line
+    # without noauto is an error, and those names resolve only on the VM itself.
+    swap = tmp_path / "swapfile"
+    swap.write_bytes(b"")
+    root = tmp_path / "root.img"
+    root.write_bytes(b"")
+    lake = tmp_path / "lake.img"
+    lake.write_bytes(b"")
+    # A boot-required target that is missing is an error, and the runner has no lake mount.
+    mount = tmp_path / "lake"
+    mount.mkdir()
+    table = tmp_path / "fstab"
+    table.write_text(
+        f"{root} / ext4 discard,errors=remount-ro 0 1\n"
+        f"{swap} none swap sw,nofail 0 0\n"
+        f"{lake} {mount} ext4 defaults,nofail 0 2\n"
+    )
+    proc = subprocess.run(
+        [require_tool("findmnt"), "--verify", "--tab-file", str(table)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_a_lake_whose_primary_fails_its_checksum_is_not_formatted(vm, real_disk):
     _format(vm)
     # One byte of the volume label, at 0x78 in the superblock, so the magic survives and

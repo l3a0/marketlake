@@ -886,6 +886,65 @@ def test_a_stale_swap_line_is_replaced_and_others_stay(vm):
     )
 
 
+def _use_script(vm, *edits):
+    """Replace the checkout's bootstrap with a copy that carries these edits."""
+    source = BOOTSTRAP.read_text()
+    for old, replacement in edits:
+        assert source.count(old) == 1, old
+        source = source.replace(old, replacement)
+    script = vm.checkout / "deploy" / BOOTSTRAP.name
+    script.unlink()
+    script.write_text(source)
+    script.chmod(0o755)
+
+
+LOOP_START = '  local swap_desired="" line first\n'
+LOOP_END = """  done <<< "${DESIRED%$'\\n'}"\n"""
+
+
+def test_a_failed_here_string_leaves_the_fstab_alone(vm):
+    # set -e is off in setup_swap, so a here-string that cannot open a descriptor ends the
+    # loop with nothing read and an empty text. This copy of the script runs out of
+    # descriptors around the loop, so the fstab step's answer is the one under test.
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    before = vm.fstab.read_bytes()
+    _use_script(
+        vm,
+        (LOOP_START, LOOP_START + '  local limit\n  limit="$(ulimit -Sn)"\n  ulimit -Sn 3\n'),
+        (LOOP_END, LOOP_END + '  ulimit -Sn "$limit"\n'),
+    )
+    proc = vm.bootstrap()
+    _assert_the_swap_step_failed_and_the_units_installed(
+        vm, proc, "could not build the new fstab text"
+    )
+    assert vm.fstab.read_bytes() == before
+
+
+SWAP_INSERT = """      swap_desired="$swap_desired$SWAP_LINE"$'\\n'\n"""
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        [(SWAP_INSERT, "      :\n")],
+        [(SWAP_INSERT, "      :\n"), (LOOP_END, LOOP_END + SWAP_INSERT)],
+    ],
+    ids=["the swap line missing", "the swap line below the lake's"],
+)
+def test_the_new_text_must_end_in_the_swap_line_then_the_lakes(vm, edits):
+    # The here-string case above leaves the text empty, which a looser check would catch
+    # too. These copies build a text that holds one of the two lines where it belongs.
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    _use_script(vm, *edits)
+    proc = vm.bootstrap()
+    _assert_the_swap_step_failed_and_the_units_installed(
+        vm, proc, "could not build the new fstab text"
+    )
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+
+
 def test_a_rollout_to_a_running_vm_adds_the_swap_line(vm):
     # A deploy reaches a VM whose lake is mounted and whose fstab holds its line already,
     # so the lake's step writes nothing and the swap line is the only write of the run.
@@ -903,7 +962,7 @@ def test_a_rollout_to_a_running_vm_adds_the_swap_line(vm):
     assert vm.index(f"swapon {vm.swap}") < vm.index("sync")
 
 
-def _assert_the_units_installed_without_swap(vm, proc, line):
+def _assert_the_swap_step_failed_and_the_units_installed(vm, proc, line):
     """The swap step failed, printed one line, and the run went on to install the units."""
     assert proc.returncode == 4, proc.stdout + proc.stderr
     lines = [text for text in proc.stderr.splitlines() if text.startswith("vm-bootstrap: ")]
@@ -913,8 +972,12 @@ def _assert_the_units_installed_without_swap(vm, proc, line):
     assert lines[1] == STEP_FAILED
     assert vm.ran("linux-install") == [SYNC, INSTALL]
     assert not vm.swap_tmp.exists()
+
+
+def _assert_the_units_installed_without_swap(vm, proc, line):
+    """As above, with swap off and an fstab that names no file that failed."""
+    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, line)
     assert vm.active_swap == []
-    # The next boot names no file that failed, and the lake's line is in place.
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(NEW_UUID)
 
 
@@ -1023,23 +1086,123 @@ def test_a_failed_chmod_of_the_swappiness_file_is_not_applied(vm):
     assert not vm.ran("sysctl")
 
 
-def test_a_refused_swap_line_stops_before_the_install(vm):
-    # The one failure in the swap step that stops the run. write_fstab replaces the file
-    # that holds the root and lake lines, so a refusal there is a doubt about what the next
-    # boot reads, which swap being optional does not answer.
+def _in_etc(vm):
+    return sorted(path.name for path in vm.fstab.parent.iterdir())
+
+
+def test_a_refused_swap_line_leaves_the_fstab_and_installs_the_units(vm):
+    # Every failure before the mv leaves the file as it was, so a refusal costs swap at the
+    # next boot and nothing else. Swap stays on until then.
     vm.ext4()
     vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
     proc = vm.bootstrap(FINDMNT_VERIFY_RC="1")
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "findmnt --verify refused" in _one_line(proc, "vm-bootstrap: ")
+    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, "findmnt --verify refused")
     assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
-    assert sorted(path.name for path in vm.fstab.parent.iterdir()) == [
-        "fstab",
-        "marketlake",
-        "sysctl.d",
-    ]
+    assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
     assert vm.active_swap == [str(vm.swap)]
-    _assert_nothing_installed(vm, chowned=True)
+
+
+# How to fail each of write_fstab's steps before the mv, and the line each prints. ``{fstab}``
+# stands for the path, because the fixture makes it.
+WRITE_FAILURES = [
+    ({"MKTEMP_FAIL": "*/etc/fstab.*"}, "could not create a temporary file beside"),
+    ({"MKTEMP_READONLY": "*/etc/fstab.*"}, "could not write"),
+    ({"CHMOD_FAIL": "*/etc/fstab.*"}, "could not chmod"),
+    ({"SYNC_RC": "1"}, "sync failed before replacing"),
+    ({"MV_FAIL": "{fstab}"}, "could not replace"),
+]
+WRITE_FAILURE_IDS = ["mktemp", "printf", "chmod", "sync", "mv"]
+
+
+def _for_this_fstab(vm, env):
+    return {name: value.format(fstab=vm.fstab) for name, value in env.items()}
+
+
+@pytest.mark.parametrize(("env", "line"), WRITE_FAILURES, ids=WRITE_FAILURE_IDS)
+def test_a_failed_write_of_the_lakes_line_stops_with_one_line(vm, env, line):
+    vm.ext4()
+    proc = vm.bootstrap(**_for_this_fstab(vm, env))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert line in _one_line(proc, "vm-bootstrap: ")
+    assert vm.fstab.read_text() == ROOT_LINE
+    assert _in_etc(vm) == ["fstab", "marketlake"]
+    assert not vm.swap.exists()
+    _assert_nothing_installed(vm)
+
+
+@pytest.mark.parametrize(("env", "line"), WRITE_FAILURES, ids=WRITE_FAILURE_IDS)
+def test_a_failed_write_of_the_swap_line_installs_the_units(vm, env, line):
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    proc = vm.bootstrap(**_for_this_fstab(vm, env))
+    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, line)
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+    assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
+    assert vm.active_swap == [str(vm.swap)]
+
+
+def test_a_failed_reload_after_the_lakes_line_stops_with_one_line(vm):
+    vm.ext4()
+    proc = vm.bootstrap(DAEMON_RELOAD_RC="1")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "systemctl daemon-reload failed" in _one_line(proc, "vm-bootstrap: ")
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+    assert _in_etc(vm) == ["fstab", "marketlake"]
+    _assert_nothing_installed(vm)
+
+
+def test_a_failed_reload_after_the_swap_line_leaves_the_line_and_installs_the_units(vm):
+    # The mv has landed, so the line stays. It carries nofail, and the last install reloads.
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    proc = vm.bootstrap(DAEMON_RELOAD_RC="1")
+    _assert_the_swap_step_failed_and_the_units_installed(
+        vm, proc, f"systemctl daemon-reload failed after writing {vm.fstab}."
+    )
+    assert vm.fstab.read_text() == ROOT_LINE + SWAP_LINE + _lake_line(FAKE_UUID)
+    assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
+    assert vm.active_swap == [str(vm.swap)]
+
+
+def test_a_rewrite_that_would_drop_the_root_entry_is_refused(vm):
+    # Nothing in the script can build this text today, so a copy of it does. findmnt would
+    # pass it, which is why write_fstab checks for itself.
+    vm.ext4()
+    vm.fstab.write_text(ROOT_LINE + _lake_line(FAKE_UUID))
+    without_root = """${swap_desired#*$'\\n'}"""
+    _use_script(vm, ('write_fstab "$swap_desired"', f'write_fstab "{without_root}"'))
+    proc = vm.bootstrap()
+    _assert_the_swap_step_failed_and_the_units_installed(vm, proc, "has no entry for /")
+    assert vm.fstab.read_text() == ROOT_LINE + _lake_line(FAKE_UUID)
+    assert _in_etc(vm) == ["fstab", "marketlake", "sysctl.d"]
+
+
+@pytest.mark.parametrize(
+    ("path", "line"),
+    [
+        ("/swapfile", "is not a regular file"),
+        ("/swapfile.tmp", "could not remove the leftover"),
+    ],
+)
+def test_a_lake_on_a_swap_path_turns_no_swap_on(vm, path, line):
+    # Both paths match LAKE_ROOT_RE. The mount reads as a directory, which the check on the
+    # path stops at /swapfile and rm -f stops at /swapfile.tmp, so nothing lands in the lake.
+    (vm.checkout / "config" / "vm.yaml").write_text(VM_YAML.replace(LAKE_ROOT, path))
+    vm.ext4()
+    lake = vm.root / path.lstrip("/")
+    lake.mkdir()
+    (lake / "manifest.jsonl").write_text("kept\n")
+    (vm.state / "mounted").write_text(FAKE_UUID)
+    proc = vm.bootstrap()
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert line in proc.stderr
+    assert vm.ran("linux-install") == [
+        SYNC.replace(LAKE_ROOT, path),
+        INSTALL.replace(LAKE_ROOT, path),
+    ]
+    assert not vm.ran("dd ")
+    assert not vm.ran("swapon")
+    assert (lake / "manifest.jsonl").read_text() == "kept\n"
 
 
 @pytest.mark.parametrize("kind", ["a link", "a dangling link", "a directory"])
@@ -1064,21 +1227,6 @@ def test_anything_but_a_file_at_the_swap_path_is_left_alone(vm, kind):
     else:
         assert not target.exists()
     assert vm.swap.is_symlink() == (kind != "a directory")
-
-
-@pytest.mark.parametrize("path", ["/swapfile", "/swapfile.tmp"])
-def test_a_lake_root_on_a_swap_path_is_refused_before_any_disk_step(vm, path):
-    # Both paths match LAKE_ROOT_RE, and a lake mounted at either would take the swap file
-    # onto the lake's volume. The check on the path itself would catch it too, but only
-    # after the bootstrap had formatted and mounted a volume there.
-    (vm.checkout / "config" / "vm.yaml").write_text(VM_YAML.replace(LAKE_ROOT, path))
-    proc = vm.bootstrap()
-    assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert f"must not be {path}" in _one_line(proc, "vm-bootstrap: ")
-    assert not vm.ran("blkid")
-    assert not vm.ran("dd ")
-    assert not vm.ran("swapon")
-    assert vm.fstab.read_text() == ROOT_LINE
 
 
 # -- the mount and the resize ----------------------------------------------------------
@@ -1374,15 +1522,20 @@ def test_a_lock_that_never_frees_skips_the_python_steps(vm):
     [
         ({"RENDER_RCS": "2"}, "the config render exited 2, which is not retried"),
         ({"ROSTER_RCS": "2"}, "the roster apply exited 2"),
+        (
+            {"SWAPON_RC": "255"},
+            "the swap step failed: swapon failed on {swap}."
+            " The run carries on, and a rerun tries again",
+        ),
     ],
-    ids=["render", "roster"],
+    ids=["render", "roster", "swap"],
 )
-def test_a_failed_config_step_and_a_failed_last_install_exit_1(vm, env, line):
+def test_a_failed_step_and_a_failed_last_install_exit_1(vm, env, line):
     """Exit 4 promises the units are installed, so a failed last install outranks it."""
     proc = vm.bootstrap(INSTALL_RCS="0 2", **env)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     errors = proc.stderr.splitlines()
-    assert f"vm-bootstrap: {line}" in errors
+    assert f"vm-bootstrap: {line.format(swap=vm.swap)}" in errors
     assert any("the install that starts the units did not finish" in e for e in errors)
     assert errors[-1] == FINISHED
     assert STEP_FAILED not in errors

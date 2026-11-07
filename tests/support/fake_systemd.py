@@ -39,7 +39,8 @@ out a fresh pid on every ``MainPID`` read, as a daemon that dies and restarts do
 restart does: ``new`` brings a new pid, ``same`` leaves the pid alone, ``never`` leaves no
 process, and ``crash`` hands out a fresh pid on every read. ``RESTART_DELAY`` is how many
 ``MainPID`` reads after a restart answer 0 before the new pid shows. ``FAIL_SHOW`` names
-units whose ``show`` exits 1, as a D-Bus timeout makes it.
+units whose ``show`` exits 1, as a D-Bus timeout makes it. ``DAEMON_RELOAD_RC`` is the exit of
+``daemon-reload``.
 
 Fakes also stand in for ``id``, ``getent``, ``sudo -u`` and ``flock``, the last two of
 which macOS lacks, and for ``git``, ``sleep``, ``who`` and ``loginctl``. The fake ``who``
@@ -197,6 +198,7 @@ now=0
 if [[ "${1:-}" == "--now" ]]; then now=1; shift; fi
 case "$cmd" in
   daemon-reload)
+    if [[ -n "${DAEMON_RELOAD_RC:-}" ]]; then exit "$DAEMON_RELOAD_RC"; fi
     rm -rf "$STATE/reloaded"
     mkdir -p "$STATE/reloaded"
     for f in "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer; do

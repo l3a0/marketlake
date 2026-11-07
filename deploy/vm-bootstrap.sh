@@ -26,15 +26,15 @@
 #      to the owner and grows the filesystem to the volume's size;
 #   8. makes a 1 GiB swap file on the root volume when it is missing, sets
 #      vm.swappiness to 1, turns the file on and lists it in fstab, so a shortage of
-#      memory slows a job rather than the kernel killing it. A failure here prints one
-#      line and the run carries on, because capture runs without swap;
+#      memory slows a job rather than the kernel killing it. Capture runs without swap,
+#      so a failure anywhere in this step prints one line and the run carries on;
 #   9. installs the pinned uv as the owner when the installed one differs;
 #  10. runs deploy/linux-install.sh --sync-only, which builds the venv the next step runs
 #      from and installs no unit, retrying a transient failure;
 #  11. renders config.yaml, pulls the Schwab token and applies the roster, each as the
 #      owner and in that order. Each attempt holds the install lock, and the wait before
 #      a retry does not;
-#  12. runs deploy/linux-install.sh again without the flag, whatever step 11 returned,
+#  12. runs deploy/linux-install.sh again without the flag, whatever steps 8 and 11 returned,
 #      retrying a transient failure the same way. That install enables and starts the
 #      residents and the timers, so on a render that succeeded they start with their
 #      config already in place.
@@ -46,7 +46,7 @@
 #
 #   0  every step passed;
 #   1  a disk step or an install failed, including step 12's after a failure in step 8
-#      or step 11, or the write of an fstab line in step 8 failed;
+#      or step 11;
 #   2  the script refused, declining on purpose before the first install;
 #   4  step 12 installed the units, and a failure in step 8 or step 11 is listed above.
 #
@@ -197,14 +197,6 @@ fi
 case "/$LAKE_ROOT/" in
   */./*|*/../*) refuse "lake_root in $VM_YAML must not hold a . or .. component" ;;
 esac
-# The swap step writes these two paths on the root volume. /swapfile matches LAKE_ROOT_RE,
-# so this refusal is what keeps a lake's mount off them.
-SWAP_PATH=/swapfile
-SWAP_TMP_PATH="$SWAP_PATH.tmp"
-case "$LAKE_ROOT" in
-  "$SWAP_PATH"|"$SWAP_TMP_PATH")
-    refuse "lake_root in $VM_YAML must not be $LAKE_ROOT, a path the swap step writes" ;;
-esac
 MOUNT_DIR="$ROOT$LAKE_ROOT"
 
 # -- the lake volume -------------------------------------------------------------------
@@ -317,22 +309,54 @@ fi
 
 # -- fstab -----------------------------------------------------------------------------
 
+# findmnt --verify accepts a file holding only the lake's line and an empty file, so this
+# check is what keeps a rewrite from dropping the root entry and the next boot with it.
+fstab_has_root() {
+  local line first second
+  while IFS= read -r line; do
+    read -r first second _ <<< "$line"
+    case "${first:-}" in
+      \#*) ;;
+      *)
+        if [[ "${second:-}" == / ]]; then
+          return 0
+        fi ;;
+    esac
+  done <<< "$1"
+  return 1
+}
+
 # The root entry lives in the same file, so a truncated write could leave the next boot
-# without its root mount. The new file is checked, synced, then renamed over. A failure
-# stops the run even when the swap step called this, because the file it could not replace
-# holds the root and lake lines the next boot needs.
+# without its root mount. The new text is checked, written beside the file, checked again,
+# synced, then renamed over. A failure returns 1 with the reason in FSTAB_ERROR and leaves
+# the decision to the caller, because the lake needs this write and swap does not. Every
+# return before the mv leaves the file as it was.
+FSTAB_ERROR=""
 write_fstab() {
   local text="$1" tmp
-  tmp="$(mktemp "$ROOT/etc/fstab.XXXXXX")" || stop "could not create a temporary file beside $FSTAB"
-  printf '%s' "$text" > "$tmp" || { rm -f -- "$tmp"; stop "could not write $tmp"; }
-  chmod 0644 "$tmp" || { rm -f -- "$tmp"; stop "could not chmod $tmp"; }
+  if ! fstab_has_root "$text"; then
+    FSTAB_ERROR="the new fstab has no entry for /, so $FSTAB is unchanged"
+    return 1
+  fi
+  if ! tmp="$(mktemp "$ROOT/etc/fstab.XXXXXX")"; then
+    FSTAB_ERROR="could not create a temporary file beside $FSTAB"
+    return 1
+  fi
+  printf '%s' "$text" > "$tmp" \
+    || { rm -f -- "$tmp"; FSTAB_ERROR="could not write $tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; FSTAB_ERROR="could not chmod $tmp"; return 1; }
   if ! findmnt --verify --tab-file "$tmp" >/dev/null; then
     rm -f -- "$tmp"
-    stop "findmnt --verify refused the new fstab, so $FSTAB is unchanged"
+    FSTAB_ERROR="findmnt --verify refused the new fstab, so $FSTAB is unchanged"
+    return 1
   fi
-  sync || { rm -f -- "$tmp"; stop "sync failed before replacing $FSTAB"; }
-  mv -f -- "$tmp" "$FSTAB" || { rm -f -- "$tmp"; stop "could not replace $FSTAB"; }
-  systemctl daemon-reload || stop "systemctl daemon-reload failed after writing $FSTAB"
+  sync || { rm -f -- "$tmp"; FSTAB_ERROR="sync failed before replacing $FSTAB"; return 1; }
+  mv -f -- "$tmp" "$FSTAB" \
+    || { rm -f -- "$tmp"; FSTAB_ERROR="could not replace $FSTAB"; return 1; }
+  if ! systemctl daemon-reload; then
+    FSTAB_ERROR="systemctl daemon-reload failed after writing $FSTAB"
+    return 1
+  fi
 }
 
 # The line is keyed on the mount point, so a rerun replaces a stale line rather than
@@ -364,27 +388,14 @@ if [[ -z "${CURRENT%$'\n'}" ]]; then
   DESIRED=""
 fi
 DESIRED="$DESIRED$LINE"$'\n'
-# findmnt --verify accepts a file holding only the lake's line, so this check is what
-# keeps a rewrite from dropping the root entry and the next boot with it.
-HAS_ROOT=0
-while IFS= read -r line; do
-  read -r first second _ <<< "$line" || true
-  case "${first:-}" in
-    \#*) ;;
-    *)
-      if [[ "${second:-}" == / ]]; then
-        HAS_ROOT=1
-      fi ;;
-  esac
-done <<< "$DESIRED"
-if [[ $HAS_ROOT == 0 ]]; then
+if ! fstab_has_root "$DESIRED"; then
   refuse "$FSTAB has no entry for /, so it is not rewritten and nothing is installed"
 fi
 if [[ "$DESIRED" == "$CURRENT" ]]; then
   say "$FSTAB already mounts the lake volume at $LAKE_ROOT"
 else
   say "writing the lake volume's line into $FSTAB"
-  write_fstab "$DESIRED"
+  write_fstab "$DESIRED" || stop "$FSTAB_ERROR"
 fi
 
 # -- mount, prove, chown, grow ---------------------------------------------------------
@@ -428,9 +439,11 @@ resize2fs "$DEV" || stop "resize2fs failed on $DEV, so nothing is installed"
 # Capture runs without swap, so a failure here never holds back the install. setup_swap
 # returns 1 with the reason in SWAP_ERROR, and its caller removes a half-made file and
 # prints the one line. set -e is off inside a function called from ||, so every command
-# below carries its own check.
+# below carries its own check. That holds for the fstab line too, since a failed write
+# leaves the file as it was.
+SWAP_PATH=/swapfile
 SWAP_FILE="$ROOT$SWAP_PATH"
-SWAP_TMP="$ROOT$SWAP_TMP_PATH"
+SWAP_TMP="$SWAP_FILE.tmp"
 SWAP_MIB=1024
 SWAP_LINE="$SWAP_PATH none swap sw,nofail 0 0"
 SWAPPINESS_CONF="$ROOT/etc/sysctl.d/60-marketlake-swap.conf"
@@ -439,7 +452,8 @@ SWAP_ERROR=""
 
 setup_swap() {
   # Only something standing at the path could carry the file off the root volume: a link
-  # into the lake, or a directory mv would write inside.
+  # into the lake, or a directory mv would write inside, which is what a lake mounted at
+  # this path would read as.
   if [[ -L "$SWAP_FILE" || ( -e "$SWAP_FILE" && ! -f "$SWAP_FILE" ) ]]; then
     SWAP_ERROR="$SWAP_FILE is not a regular file"
     return 1
@@ -507,7 +521,7 @@ setup_swap() {
   # options is replaced, and a commented one stays, because its first field carries the #.
   local swap_desired="" line first
   while IFS= read -r line; do
-    read -r first _ <<< "$line" || true
+    read -r first _ <<< "$line"
     if [[ "${first:-}" == "$SWAP_PATH" ]]; then
       continue
     fi
@@ -516,17 +530,26 @@ setup_swap() {
     fi
     swap_desired="$swap_desired$line"$'\n'
   done <<< "${DESIRED%$'\n'}"
+  # A here-string that cannot open a descriptor ends the loop with nothing read, and set -e
+  # does not see it here. So the text has to prove it ends in the two lines it must hold.
+  if [[ "$swap_desired" != *"$SWAP_LINE"$'\n'"$LINE"$'\n' ]]; then
+    SWAP_ERROR="could not build the new fstab text"
+    return 1
+  fi
   if [[ "$swap_desired" == "$DESIRED" ]]; then
     say "$FSTAB already lists $SWAP_PATH"
   else
     say "writing the swap file's line into $FSTAB"
-    write_fstab "$swap_desired"
+    if ! write_fstab "$swap_desired"; then
+      SWAP_ERROR="$FSTAB_ERROR"
+      return 1
+    fi
   fi
 }
 
 setup_swap || {
   rm -f -- "$SWAP_TMP" || true
-  fail "the swap step failed: $SWAP_ERROR. The units still install, and a rerun tries again"
+  fail "the swap step failed: $SWAP_ERROR. The run carries on, and a rerun tries again"
 }
 
 # -- uv --------------------------------------------------------------------------------
