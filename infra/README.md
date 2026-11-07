@@ -800,14 +800,14 @@ cases.
    names the segment and any minute marked ([#998](https://github.com/l3a0/marketlake/issues/998)).
    The minute usually gets a `segment_lost` gap row. It keeps a `daemon_dead` row if a daemon
    start reached the hole first, and gets none if the cycle's fetch crossed into a minute that
-   holds a row. The upload carries on. A repair needs every segment of the day back and a
+   holds a row. The upload carries on, apart from a day refused for a retype of a column a gap
+   row fills, which the design's compaction failure rule covers. A repair needs every segment of the day back and a
    hand-run `recompact_ticker_day` before the next compaction, because compaction deletes a
    segment copied back after the seal, unread. A lone returned chains segment repairs nothing,
-   so keep it outside `journal/`. A rebuild loses the day's marker rows, and the no-shrink
-   guard compares row counts alone, so it may refuse a whole set or pass a partial one. Pass
-   `allow_shrink` only with every segment back, because on a partial set it drops minutes and
-   leaves no gap row for them. [#999](https://github.com/l3a0/marketlake/issues/999) owns the
-   procedure. A
+   so keep it outside `journal/`. A rebuild replaces the partition with what the returned set
+   holds, so it loses every other row, gap rows included, and the no-shrink guard compares row
+   counts alone, so it cannot tell which rows go.
+   [#999](https://github.com/l3a0/marketlake/issues/999) owns the procedure. A
    chains segment no upload carried has no copy, so its minute stays a gap. If a resync stopped
    part-way on this host, run it again, because that puts the bucket's partition back before or
    after the seal. A ticker-day with no segment left gets no damage page or finding at first.

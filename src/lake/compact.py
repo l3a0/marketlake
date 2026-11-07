@@ -1193,7 +1193,8 @@ def _gap_table(batch: pa.RecordBatch, tables: Sequence[pa.Table]) -> pa.Table:
     whose segments agree with each other, which would hold the day this exists to seal. Every
     value in such a column is null, so naming it at the segments' type changes no value. A
     column with values keeps its type, so a retype of one of those makes the merge refuse the
-    day as a type conflict, and that day waits with no lost-segment finding. Each column
+    day as a type conflict. That day waits with no lost-segment finding, and on a bucket
+    target its gone file stops the upload before the ping. Each column
     takes its type from the first segment that holds it, because a mid-day rotation can add one.
     """
     table = pa.Table.from_batches([batch])
