@@ -1533,6 +1533,8 @@ mean the filesystem needs repair. Hold deploys and restarts until the recovery l
 prints. That line says the token file now holds a token at least as new as the
 process's. A restart drops the token the daemon holds, so it starts again from the stale
 file. That costs one refresh, or a re-auth after a line saying the refresh token rotated.
+A session can approve a deploy, so add the stop entry that `CLAUDE.md`'s "Deployment
+approvals" names for as long as the hold lasts.
 
 At the next open, data segments appear under `/srv/marketlake`. A shadow's pings land as
 lines in the outbox under `/srv/marketlake/journal/outbox/`, and a primary's reach
@@ -1810,9 +1812,10 @@ deploy's unit runs or holds the deploy lock.
 
 A green deploy that turns out wrong is undone by a revert pull request and a forward
 deploy, because the script refuses a commit behind the checkout's `HEAD`. The window
-refuses that deploy from 08:00 to 18:45 ET on a weekday, and an override is refused until
-16:30 ET, so a wrong deploy found during a session stays on the VM until then. A revert
-does not bring back lost minutes.
+refuses that deploy from 06:30 to 18:45 ET on a weekday, and an override from 08:00 until
+the close+15 compaction, 16:30 ET on a regular day. So a wrong deploy found during a
+session stays on the VM until then, unless the daemon is down, where the hand procedure
+below applies. A revert does not bring back lost minutes.
 
 Pass the full 40-digit sha of a commit on `main`. A pull request's page shows only 7
 digits, so read the full sha of `main`'s tip from the VM.
@@ -2705,7 +2708,9 @@ The sweep sends `Capture at risk: bucket copy not checked`, which drills that pa
 upload it hands off to stops before its ping. The check goes down after its deadline, about
 20:30, plus its grace. Record both pushes. The next close+15 run carries the evening's bars,
 so a restore that night would be a day behind on bars and actions, and on nothing captured.
-Hold any deploy while the edit stands, because a deploy renders `config.yaml` again.
+Hold any deploy while the edit stands, because a deploy renders `config.yaml` again. A
+session can approve a deploy, so add the stop entry that `CLAUDE.md`'s "Deployment
+approvals" names for as long as the hold lasts.
 
 ## Deploy from CI
 
