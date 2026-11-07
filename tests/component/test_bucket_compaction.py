@@ -17,6 +17,7 @@ from lake import bucket, report
 from lake import compact as compact_module
 from lake.bucket import (
     BucketBackup,
+    ChecksumRefused,
     ManifestedFileMissing,
     UploadDeadline,
     WatermarkMissing,
@@ -128,6 +129,30 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
 
     partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
     assert partition.relative_to(lake_root).as_posix() not in latest_entries(lake_root)
+    assert "ping" not in events
+    assert "put lake/manifest.jsonl" not in events
+    assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
+
+
+def test_a_changed_segment_files_its_finding_and_stops_the_upload_before_the_ping(lake_root):
+    """A refusal keeps the segment, and the upload then refuses bytes that miss their digest."""
+    client = _seeded(lake_root)
+    path = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    append_manifest(
+        lake_root,
+        partition=path.relative_to(lake_root).as_posix(),
+        source="capture",
+        sha256="a" * 64,
+        rows=2,
+        fetched_at=None,
+    )
+    events: list[str] = []
+
+    with pytest.raises(ChecksumRefused):
+        _job(lake_root, client, events)
+
     assert "ping" not in events
     assert "put lake/manifest.jsonl" not in events
     assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1

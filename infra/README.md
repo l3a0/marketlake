@@ -794,8 +794,8 @@ cases.
    it does in the first case and sends the `Damaged segment at the merge` page, and a finding
    under `reports/damaged_segments/` names the segment ([#998](https://github.com/l3a0/marketlake/issues/998)).
    While the segment's entry has not reached the bucket, every night's upload stops at it with
-   `ManifestedFileMissing`. Later days' `quotes/` partitions and `reports/` stay off the bucket
-   for every ticker, the bucket's manifest stays where it was, the trim does not run, and the
+   `ManifestedFileMissing`. The day's later segments and later days' `quotes/` partitions and
+   `reports/` stay off the bucket for every ticker, the bucket's manifest stays where it was, the trim does not run, and the
    `compaction` and `evening-upload` checks page. A chains segment no upload carried has no
    copy to return, so the upload stays stopped until
    [#557](https://github.com/l3a0/marketlake/issues/557) repairs the day. If a resync stopped part-way on

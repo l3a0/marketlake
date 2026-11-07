@@ -140,8 +140,9 @@ The job's rules, each glossed at first use.
 7. *Backup, then ping.* After the sweep has finished with every eligible ticker-day, the
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
-   The exception is a segment gone from disk. While its entry has not reached the bucket,
-   the upload refuses it, which ends the run before the ping (marketlake #998).
+   The exception is a segment gone from disk or changed on disk. While its entry has not
+   reached the bucket, the upload refuses it, which ends the run before the ping (marketlake
+   #998).
    The health-check ping fires only after the backup succeeds, so the
    one ping attests both, except on a ``shadow`` host, which runs no backup and whose
    ping attests only the seal. An unmounted target raises before any ping, and so does a
@@ -505,9 +506,9 @@ class DamagedSegments(Exception):
     A manifested segment that is gone from disk is refused the same way too (marketlake #998).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
-    ticker-day, the backup, and the ping. A gone segment can still cost the backup and the
-    ping, because the upload refuses it while its entry has not reached the bucket, but no
-    other ticker-day's seal.
+    ticker-day, the backup, and the ping. A damaged or gone segment can still cost the
+    backup and the ping, because the upload refuses it while its entry has not reached the
+    bucket, but no other ticker-day's seal.
 
     Sealing the healthy segments and keeping the damaged one is not an option. The next
     run would find the partition manifested and delete every remaining segment as debris
@@ -2559,7 +2560,9 @@ def compact(
                             continue
                         except DamagedSegments as damaged:
                             # Contained for the reason the conflict above is, and the page
-                            # below is what makes containing it safe. Before this check the
+                            # below is what makes containing it safe. The upload can still
+                            # refuse the segment after the sweep, which costs the ping and
+                            # no other ticker-day's seal. Before this check the
                             # damaged segment read as a torn tail or a wrong value, the day
                             # sealed short or wrong, and the segment was unlinked.
                             refused.append(
@@ -2701,9 +2704,9 @@ def recompact_ticker_day(
 
     ``SegmentSchemaConflict`` is raised here rather than contained, and so is
     ``DamagedSegments``. The scheduled sweep contains both because a raise there costs
-    every other ticker-day, the backup, and the ping. This call has no other ticker-day to
-    protect, so the operator gets the failure named on their own terminal with a non-zero
-    exit, and the segments stay as they were. Passing ``allow_retype`` is what turns the
+    every other ticker-day, and the backup and the ping with them. This call has no other
+    ticker-day to protect, so the operator gets the failure named on their own terminal with
+    a non-zero exit, and the segments stay as they were. Passing ``allow_retype`` is what turns the
     conflict into a repair rather than a second report of it. No flag does that for the
     damage.
 
