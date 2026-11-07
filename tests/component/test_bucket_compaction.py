@@ -13,12 +13,19 @@ from pathlib import Path
 
 import pytest
 
-from lake import bucket
+from lake import bucket, report
 from lake import compact as compact_module
-from lake.bucket import BucketBackup, UploadDeadline, WatermarkMissing, first_upload
+from lake.bucket import (
+    BucketBackup,
+    ManifestedFileMissing,
+    UploadDeadline,
+    WatermarkMissing,
+    first_upload,
+)
 from lake.chain_plan import ChainPlanError
 from lake.compact import COMPACTION_SLUG, EVENING_UPLOAD_SLUG, compact
 from lake.config import BucketTarget
+from lake.manifest import append_manifest, latest_entries, sha256_file
 from lake.paths import LakePaths
 from tests.component.test_compaction import (
     DAY,
@@ -87,6 +94,43 @@ def test_the_sealed_day_goes_up_and_the_ping_comes_after_the_manifest(lake_root)
     rel = partition.relative_to(lake_root).as_posix()
     assert result.backed_up and result.pinged
     assert events == [f"put lake/{rel}", "put lake/manifest.jsonl", "ping"]
+
+
+def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(lake_root):
+    """The price of refusing a short seal (marketlake #998).
+
+    The refused ticker-day has no partition entry, so the segment's entry is not superseded
+    and the upload refuses it. That raise is what keeps the day from reading as healthy, and
+    it holds the watermark until the file returns. The finding lands first, because the
+    sweep comes before the backup.
+    """
+    client = _seeded(lake_root)
+    kept = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 0)), start_ts="a"
+    )
+    gone = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
+    )
+    for path in (kept, gone):
+        append_manifest(
+            lake_root,
+            partition=path.relative_to(lake_root).as_posix(),
+            source="capture",
+            sha256=sha256_file(path),
+            rows=2,
+            fetched_at=None,
+        )
+    gone.unlink()
+    events: list[str] = []
+
+    with pytest.raises(ManifestedFileMissing, match=gone.name):
+        _job(lake_root, client, events)
+
+    partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
+    assert partition.relative_to(lake_root).as_posix() not in latest_entries(lake_root)
+    assert "ping" not in events
+    assert "put lake/manifest.jsonl" not in events
+    assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1
 
 
 def test_an_empty_bucket_raises_before_the_ping(lake_root):

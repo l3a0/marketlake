@@ -467,7 +467,7 @@ def write_schema_drift(
 
 @dataclass(frozen=True)
 class DamagedSegment:
-    """One segment compaction refused: its digest moved, or its read proved it damaged.
+    """One segment compaction refused: its digest moved, its read failed, or its file is gone.
 
     ``segment`` is the lake-relative path. ``expected`` is the digest the segment's manifest
     entry carries, which the capture cycle hashed from the file right after closing it, or
@@ -487,23 +487,28 @@ class DamagedSegment:
     entry, as gap and close-guard markers never do. ``actual`` is still taken, so a later
     read can tell whether the file changed again. ``error`` is ``None`` for a digest
     mismatch.
+
+    A manifested segment can also be gone from disk (marketlake #998). It has no bytes to
+    hash, so ``actual`` is ``None``, which is what marks this case, ``expected`` is the digest
+    its entry recorded, and ``error`` says the file is missing.
     """
 
     segment: str
     expected: str | None
-    actual: str
+    actual: str | None
     error: str | None = None
 
 
 @dataclass(frozen=True)
 class SegmentDamage:
-    """One ticker-day compaction refused because a segment's bytes were damaged.
+    """One ticker-day compaction refused because a segment was damaged or is gone.
 
     ``partition`` is the Parquet the refusal did not write. ``segments`` names every segment
-    of the ticker-day, all still on disk, because the refusal keeps the whole ticker-day
-    rather than sealing the healthy segments: the next run would find the partition
-    manifested and delete the kept one as debris. ``damaged`` names the ones that failed,
-    each with both digests or with the read's failure, as ``DamagedSegment`` says.
+    of the ticker-day still on disk, because the refusal keeps the whole ticker-day rather
+    than sealing the healthy segments: the next run would find the partition manifested and
+    delete the kept one as debris. ``damaged`` names the ones that failed, each with both
+    digests, with the read's failure, or as missing, as ``DamagedSegment`` says. A missing
+    segment is in ``damaged`` and not in ``segments``.
     """
 
     surface: str
