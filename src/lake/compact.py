@@ -1192,7 +1192,8 @@ def _gap_table(batch: pa.RecordBatch, tables: Sequence[pa.Table]) -> pa.Table:
     holds an older one. A null column at the newer type would make the merge refuse a day
     whose segments agree with each other, which would hold the day this exists to seal. Every
     value in such a column is null, so naming it at the segments' type changes no value. A
-    column with values keeps its type, and the merge answers for any disagreement. Each column
+    column with values keeps its type, so a retype of one of those makes the merge refuse the
+    day as a type conflict, and that day waits with no lost-segment finding. Each column
     takes its type from the first segment that holds it, because a mid-day rotation can add one.
     """
     table = pa.Table.from_batches([batch])
@@ -1606,7 +1607,7 @@ def _page_damage(
 def _page_lost(
     publisher: Publisher | None, found: Sequence[SegmentDamage], *, now: datetime
 ) -> None:
-    """Page once for the whole run, naming the segments the seal marked as gaps.
+    """Page once for the whole run, naming the segments the seal went on without.
 
     It shares the damaged-segment page's title, because an operator reads both the same way:
     a segment did not reach the seal whole. It does not repeat, because the day is sealed.
@@ -2283,7 +2284,7 @@ def _recover(
 
     Debris segments are the only reachable leftover once the sweep bound is close+5.
     They come from a crash between the manifest append and the last unlink, or from a lost
-    segment put back after its day sealed with a gap row. This deletes that file unread like
+    segment put back after its day sealed. This deletes that file unread like
     any other, so a repair needs every segment back and ``recompact_ticker_day`` before this
     runs (marketlake #999). Any mismatch raises ``PartitionMismatch`` with the debris intact,
     so a human can decide.
@@ -2621,7 +2622,8 @@ def compact(
     matches the hash taken when it closed, and then it is filed, reported under ``refused``,
     and left exactly as the capture wrote it. A manifested segment gone from disk refuses
     nothing alone: the day seals, usually with a gap row for the lost minute, and a finding
-    and a page name it.
+    and a page name it. The one exception is a day captured before a retype of a column a gap
+    row fills, which ``_gap_table`` says.
     The window re-tune then
     profiles the latest sealed day's chains partitions. The trimmed ledger's entry is
     repaired next, then the backup runs, and the ping only after it. The trim runs after the

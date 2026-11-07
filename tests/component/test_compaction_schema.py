@@ -1637,8 +1637,8 @@ def test_a_gap_row_alone_seals_a_day_whose_only_file_is_torn(lake_root):
     assert (outcome.rows, len(outcome.gaps)) == (1, 1)
 
 
-def test_a_gap_row_keeps_the_value_in_a_column_the_segments_retyped(lake_root):
-    """A column with values is not the seal's to rename, so the merge answers for it."""
+def test_a_retype_of_a_column_a_gap_row_fills_refuses_the_day(lake_root):
+    """A column with values is not the seal's to rename, so the merge refuses the day."""
     name = "schema_version"
     other = pa.string()
     retyped = _retyped(name, other)
@@ -1648,8 +1648,10 @@ def test_a_gap_row_keeps_the_value_in_a_column_the_segments_retyped(lake_root):
     kept = _segment(lake_root, retyped, table, start_ts="a")
     _lost_beside(lake_root, kept)
 
-    with pytest.raises(compact_module.SegmentSchemaConflict):
+    with pytest.raises(compact_module.SegmentSchemaConflict) as info:
         _repair(lake_root)
+
+    assert info.value.conflicts == ("schema_version: string -> int64",)
 
 
 def test_the_automatic_sweep_still_refuses_a_retyped_ticker_day(lake_root, monkeypatch):

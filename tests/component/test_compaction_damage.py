@@ -1548,6 +1548,8 @@ def _sealed_with_markers_then_restored(lake_root: Path, minutes: list[int]) -> N
     spy[2].unlink()
     _marked(lake_root, "SPY", minutes)
     _run(lake_root)
+    gaps = [kind for kind, _ in _row_kinds(_partition(lake_root, "SPY"))].count("gap")
+    assert gaps == len(minutes) + 1
     spy[0].parent.mkdir(parents=True, exist_ok=True)
     for path, data in saved.items():
         path.write_bytes(data)
