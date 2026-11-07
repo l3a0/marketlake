@@ -1,10 +1,21 @@
 {
   "permissions": {
     "deny": [
-      "Bash(gh api *pending_deployments*)",
       "Bash(curl *pending_deployments*)",
+      "Bash(gh api *pending_deployments*rejected*)",
+      "Bash(gh api *rejected*pending_deployments*)",
       "Bash(gh api *deployment_protection_rule*)",
       "Bash(curl *deployment_protection_rule*)",
+      "Bash(gh api *dispatches*)",
+      "Bash(curl *dispatches*)",
+      "Bash(gh secret *set *)",
+      "Bash(gh secret *delete *)",
+      "Bash(gh secret *remove *)",
+      "Bash(gh variable *set *)",
+      "Bash(gh variable *delete *)",
+      "Bash(gh variable *remove *)",
+      "Bash(gh workflow *replace_instance*)",
+      "Bash(gh workflow *override_window*)",
       "Bash(gh api *approveDeployments*)",
       "Bash(curl *approveDeployments*)",
       "Bash(gh api *rejectDeployments*)",

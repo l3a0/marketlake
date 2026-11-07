@@ -15,7 +15,7 @@ D0 through D21, and points at the MVP milestone that holds current work.
 The slice build closed on 2026-10-05. Current work is the
 [open MVP milestone](https://github.com/l3a0/marketlake/milestones?state=open), which the build plan names.
 The AWS resources the hosted VM needs are code under `infra/`, written for
-[OpenTofu](https://opentofu.org/) and applied from CI behind the owner's approval,
+[OpenTofu](https://opentofu.org/) and applied from CI behind an approval in GitHub,
 except the bootstrap that CI itself stands on, which the owner applies from the laptop
 ([#664](https://github.com/l3a0/marketlake/issues/664)). Today that covers the backup
 bucket, the instance role, the laptop's one IAM user, `marketlake-command`, with the two
@@ -40,7 +40,7 @@ trims older bars partitions once their day's chains are gone
 ([#795](https://github.com/l3a0/marketlake/issues/795)). To read a trimmed range, the reading restore brings it from the bucket into a directory
 outside the live lake ([#837](https://github.com/l3a0/marketlake/issues/837)).
 A merge to `main` reaches the VM through `.github/workflows/deploy.yml`, which asks the VM
-to deploy the commit once the owner approves the run
+to deploy the commit once the run is approved
 ([#676](https://github.com/l3a0/marketlake/issues/676)). The VM can power itself off once
 each day's work is done, through `deploy/vm-stop.sh` every 10 minutes, and does so only
 once the owner creates its switch file
@@ -248,7 +248,7 @@ a stopped upload leaves under a newer one ([#838](https://github.com/l3a0/market
 The role also held `s3:PutObject` while the laptop was the primary, and step 8 of
 [#638](https://github.com/l3a0/marketlake/issues/638)'s cutover dropped it once the VM
 uploaded as the primary. Making the laptop primary again first puts that action back
-through a reviewed pull request and an `infra` apply the owner approves.
+through a reviewed pull request and an approved `infra` apply.
 
 The laptop holds one AWS key, the IAM user `marketlake-command`'s, which can do nothing but
 assume two roles: `marketlake-backup` to read the bucket, and `marketlake-token-writer` for the
@@ -1076,9 +1076,9 @@ steps, and the order matters.
 
 The hosted deployment's AWS resources are code under `infra/`, in two OpenTofu
 configurations. The owner applies `infra/bootstrap/` from the laptop, and
-`.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the owner
-approves the run. `.github/workflows/deploy.yml` deploys `main` to the VM after each merge,
-once the owner approves that run too. [infra/README.md](infra/README.md) is the runbook,
+`.github/workflows/infra.yml` applies `infra/live/` after a merge to `main` once the run
+is approved. `.github/workflows/deploy.yml` deploys `main` to the VM after each merge,
+once that run is approved too. [infra/README.md](infra/README.md) is the runbook,
 from the first bootstrap through recovery, and lists the secrets and the variables both
 workflows read.
 

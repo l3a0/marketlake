@@ -13,7 +13,7 @@
 # overridden", so nobody reads the outcome as an ordinary deploy's.
 #
 # The owner runs it by hand, and the CI half of #676 runs it through SSM Run Command,
-# by way of infra/live/deploy-step.sh, after the owner approves a merge's deploy. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
+# by way of infra/live/deploy-step.sh, after a merge's deploy is approved. It prints exactly one line on stdout, the outcome, and exits 0 to 3. infra/README.md
 # lists every line with what the owner does next. The progress goes to
 # /var/lib/marketlake/deploy.log, mode 0600, because a line from the bootstrap can carry a
 # config value and SSM keeps only the start of stdout.
