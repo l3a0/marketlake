@@ -801,7 +801,10 @@ cases.
    The minute usually gets a `segment_lost` gap row. It keeps a `daemon_dead` row if a daemon
    start reached the hole first, and gets none if the cycle's fetch crossed into a minute that
    holds a row. The upload carries on. A repair needs every segment of the day back and a
-   hand-run `recompact_ticker_day` before the next compaction. On a day with marker rows the
+   hand-run `recompact_ticker_day` before the next compaction, because compaction deletes a
+   segment copied back after the seal, unread. A lone returned chains segment repairs nothing,
+   so keep it outside `journal/`, and never pass `allow_shrink` on a partial set, which
+   replaces the partition with fewer rows. On a day with marker rows the
    no-shrink guard refuses that rebuild, and `allow_shrink` passes it by dropping those rows. A
    chains segment no upload carried has no copy, so its minute stays a gap. If a resync stopped
    part-way on this host, run it again, because that puts the bucket's partition back before or
