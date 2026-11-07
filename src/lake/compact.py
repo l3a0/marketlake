@@ -60,8 +60,9 @@ The job's rules, each glossed at first use.
    it. A segment that no longer matches refuses the whole ticker-day, the way rule 4's
    type conflict does: every segment stays byte-identical on disk, a finding is filed
    under ``reports/damaged_segments/``, one page per run names it, and the rest of the
-   run goes on. A segment with no manifest entry, a gap or close-guard marker or a
-   capture whose append a crash lost, has no hash to compare and is read as before.
+   sweep goes on. Rule 7 says when the backup and the ping do not. A segment with no
+   manifest entry, a gap or close-guard marker or a capture whose append a crash lost, has
+   no hash to compare and is read as before.
    The read is the check for those. An access failure on that read, a file denied,
    missing, or not a regular file, ends the run the way the hash check's read does, and
    nothing is sealed or unlinked (marketlake #591). When the read proves the bytes were
@@ -140,9 +141,10 @@ The job's rules, each glossed at first use.
 7. *Backup, then ping.* After the sweep has finished with every eligible ticker-day, the
    lake is synced to the backup target. A ticker-day the sweep refused does not hold that
    up, which is the whole point of catching the refusals where rules 3 and 4 catch them.
-   The exception is a segment gone from disk or changed on disk. While its entry has not
-   reached the bucket, the upload refuses it, which ends the run before the ping (marketlake
-   #998).
+   The exception is on a bucket target, while the bucket's manifest does not yet carry the
+   segment's entry. A segment gone from disk then refuses the upload, and so does one changed
+   on disk unless the bucket already holds its digest. That ends the run before the ping
+   (marketlake #998).
    The health-check ping fires only after the backup succeeds, so the
    one ping attests both, except on a ``shadow`` host, which runs no backup and whose
    ping attests only the seal. An unmounted target raises before any ping, and so does a
@@ -506,9 +508,8 @@ class DamagedSegments(Exception):
     A manifested segment that is gone from disk is refused the same way too (marketlake #998).
     The sweep catches it the way it catches ``SegmentSchemaConflict`` and for the same
     reason: nothing in this module repairs it, so ending the run would cost every other
-    ticker-day, the backup, and the ping. A damaged or gone segment can still cost the
-    backup and the ping, because the upload refuses it while its entry has not reached the
-    bucket, but no other ticker-day's seal.
+    ticker-day, the backup, and the ping. A damaged or gone segment can still cost a bucket
+    target's backup and ping, as rule 7 of this module says, but no other ticker-day's seal.
 
     Sealing the healthy segments and keeping the damaged one is not an option. The next
     run would find the partition manifested and delete every remaining segment as debris
@@ -1135,7 +1136,8 @@ def _missing_segments(
     and running that resync again clears the refusal.
 
     ``entries`` comes from a read that stops at a torn line, so an entry hidden behind one is
-    not compared, the same limit the hash check has. Marketlake #447 owns that damage.
+    not compared, and an emptied or deleted manifest offers nothing to compare. The hash check
+    has the same limit, and marketlake #447 owns that damage.
 
     Every segment of the ticker-day is named rather than the first, for the reason
     ``_damaged_segments`` gives. ``directory`` carries a closing slash into the comparison,

@@ -787,20 +787,26 @@ cases.
 1. Compaction refused its ticker-day because a segment no longer matches its manifest entry.
    A refused day has no partition in the manifest, so compaction seals it once the segment's
    good bytes are back at its path. Repairing such a day is
-   [#557](https://github.com/l3a0/marketlake/issues/557)'s.
+   [#557](https://github.com/l3a0/marketlake/issues/557)'s. While the bucket's manifest does
+   not yet carry the segment's entry, and the bucket does not hold its digest, the upload stops
+   with `ChecksumRefused`, at the cost the third case gives.
 2. The lake volume was lost before a nightly upload carried the day to the bucket, as
    segments under `lake/journal/` or as a sealed partition.
 3. A manifested segment left the disk before the seal. Compaction refuses the ticker-day as
    it does in the first case and sends the `Damaged segment at the merge` page, and a finding
    under `reports/damaged_segments/` names the segment ([#998](https://github.com/l3a0/marketlake/issues/998)).
-   While the segment's entry has not reached the bucket, every night's upload stops at it with
-   `ManifestedFileMissing`. The day's later segments and later days' `quotes/` partitions and
-   `reports/` stay off the bucket for every ticker, the bucket's manifest stays where it was, the trim does not run, and the
-   `compaction` and `evening-upload` checks page. A chains segment no upload carried has no
+   While the bucket's manifest does not yet carry the segment's entry, every night's upload
+   stops at it with `ManifestedFileMissing`. `bars/` and `chains/` partitions still go up. The
+   `journal/` keys sorted after it, every pending `quotes/` partition, the refused day's
+   included, `reference/` and `reports/` stay off the bucket for every ticker, the bucket's
+   manifest stays where it was, the trim does not run, and the `compaction` and
+   `evening-upload` checks page. The Sunday scrub names the segment and withholds the `sunday`
+   ping, whether or not the entry reached the bucket. A chains segment no upload carried has no
    copy to return, so the upload stays stopped until
    [#557](https://github.com/l3a0/marketlake/issues/557) repairs the day. If a resync stopped part-way on
    this host, run it again first, because that clears the refusal. A ticker-day with no segment
-   left gets no page or finding, and only `ManifestedFileMissing` and the Sunday scrub name it.
+   left gets no damage page or finding, and only `ManifestedFileMissing` and the Sunday scrub
+   name it.
 
 No tested procedure reads one back yet, and [#999](https://github.com/l3a0/marketlake/issues/999) owns it. Its
 [first comment](https://github.com/l3a0/marketlake/issues/999#issuecomment-6652469966) holds

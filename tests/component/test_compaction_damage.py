@@ -1464,6 +1464,41 @@ def test_a_ticker_day_with_no_segment_left_reaches_no_refusal(lake_root):
     assert scrub(lake_root).missing == tuple(sorted(_rel(lake_root, path) for path in spy))
 
 
+@pytest.mark.parametrize("damage", ["torn", "emptied"])
+def test_an_entry_the_manifest_read_does_not_return_is_not_compared(lake_root, damage):
+    """A stated limit, which marketlake #447 owns, so a fix there changes this test.
+
+    The read stops at a torn line, so the entries behind it are hidden, and an emptied
+    manifest holds none. Either way the gone segment reads as never recorded, and the day
+    seals short. The hash check has the same limit.
+    """
+    spy = _captured(lake_root, "SPY", count=2)
+    manifest = manifest_path(lake_root)
+    with manifest.open("ab") as file:
+        file.write(b'{"torn')
+    at = _et(10, 2)
+    outcome = capture.journal_snapshot(
+        lake_root,
+        journal.CHAINS_SURFACE,
+        "SPY",
+        body=_CHAIN,
+        cycle_start=at,
+        fetch_ts=at,
+        fetch_end_ts=at,
+        pid=PID,
+    )
+    if damage == "emptied":
+        manifest.write_bytes(b"")
+    outcome.path.unlink()
+
+    result, events = _run(lake_root)
+
+    assert result.refused == ()
+    assert [(item.ticker, item.rows) for item in result.sealed] == [("SPY", 2 * ROWS_PER_SEGMENT)]
+    assert events == ["backup", "ping"]
+    assert not any(path.exists() for path in spy)
+
+
 def test_a_segment_with_no_entry_leaves_nothing_to_miss(lake_root):
     """A file the manifest never recorded cannot be missed, so the ticker-day seals."""
     spy = _unmanifested(lake_root)

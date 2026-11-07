@@ -112,7 +112,10 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
     gone = _segment(
         lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 1)), start_ts="b"
     )
-    for path in (kept, gone):
+    later = _segment(
+        lake_root, "chains", "SPY", DAY, _chains(2, snap_ts=_snap(DAY, 2)), start_ts="c"
+    )
+    for path in (kept, gone, later):
         append_manifest(
             lake_root,
             partition=path.relative_to(lake_root).as_posix(),
@@ -129,6 +132,10 @@ def test_a_gone_segment_files_its_finding_and_stops_the_upload_before_the_ping(l
 
     partition = LakePaths(lake_root).chains_partition_path("SPY", DAY)
     assert partition.relative_to(lake_root).as_posix() not in latest_entries(lake_root)
+    # The walk is sorted, so what sorts before the missing file went up and what sorts after
+    # it did not, though it is the refused day's only copy.
+    assert f"put lake/{kept.relative_to(lake_root).as_posix()}" in events
+    assert f"put lake/{later.relative_to(lake_root).as_posix()}" not in events
     assert "ping" not in events
     assert "put lake/manifest.jsonl" not in events
     assert len(list(report.damaged_segments_dir(lake_root, DAY).glob("*.json"))) == 1

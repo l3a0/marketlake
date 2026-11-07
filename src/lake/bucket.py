@@ -1484,7 +1484,8 @@ def manifested_files(root: Path, ledger: Ledger, rels: Sequence[str]) -> Iterato
     they upload like any partition. Any other manifested file missing from disk refuses
     the upload rather than letting the watermark claim a file the bucket never got. That
     includes a refused day's segment gone from disk (marketlake #998). The walk is sorted, so
-    nothing sorted after the missing file is yielded, and the caller sends no manifest.
+    nothing sorted after the missing file is yielded, and the caller sends neither the files
+    with no manifest entry nor the manifest.
     """
     for rel in sorted(rels):
         if rsync_excluded(rel, is_dir=False) or _superseded(rel, ledger):
