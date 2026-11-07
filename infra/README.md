@@ -1422,8 +1422,8 @@ describe the instance can read it. The boot takes two steps.
    `blkid` finds no filesystem and no ext4 superblock sits where the bootstrap's own
    `mkfs` puts one. It writes the volume's `/etc/fstab` line, and stops when it
    cannot read the old file or when the new one would hold no entry for `/`. It makes a
-   1 GiB swap file at `/swapfile` and turns it on, and a failure there leaves the rest of
-   the boot running and ends the run on exit 4. It installs the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
+   1 GiB swap file at `/swapfile` and turns it on, and a failure anywhere in that step
+   prints one line and the boot carries on. It installs the `uv` version `.tool-versions` pins, with a download that `curl` retries up to 5
    times on any error. Then it syncs the environment with
    `deploy/linux-install.sh --sync-only`, which starts nothing. From that environment it
    renders `config.yaml` from `config/vm.yaml`, the parameters and the tag, pulls the
@@ -1553,19 +1553,17 @@ Each failure prints one line naming the step, and the exit code says how the run
 
 1. Exit 0 means every step passed.
 2. Exit 2 means the bootstrap itself refused, which happens only before the first
-   install, such as on a bad `bootstrap.conf`, an `/etc/fstab` with no entry for `/`, or
-   a `lake_root` of `/swapfile`. It also refuses three states of the lake volume, and
-   formats nothing in any of them.
+   install, such as on a bad `bootstrap.conf` or an `/etc/fstab` with no entry for `/`.
+   It also refuses three states of the lake volume, and formats nothing in any of them.
    1. The volume holds something other than ext4.
    2. A read of 4 KiB block 0 or 32768 failed or came back short.
    3. `blkid` finds no filesystem, but an ext4 superblock sits in block 0 or 32768. The
       line prints a read-only `e2fsck -n` command, and
       [When the lake volume holds an unreadable ext4](#when-the-lake-volume-holds-an-unreadable-ext4)
       says what to do.
-3. Exit 1 covers every failure of a disk step or an install, and a failed write of the
-   swap file's `/etc/fstab` line. A disk step that fails stops the run at once, and so
-   does the first install, the one that syncs the environment, even when it refused with
-   its own exit 2. The last install, the one that starts the units, runs whatever the
+3. Exit 1 covers every failure of a disk step or an install. A disk step that fails
+   stops the run at once, and so does the first install, the one that syncs the
+   environment, even when it refused with its own exit 2. The last install, the one that starts the units, runs whatever the
    swap step and the config steps returned. When it fails, its line says whether a rerun
    installs and starts the units, and the run ends with exit 1.
 4. Exit 4 means the last install installed and started the units, but the swap step, a
@@ -1710,32 +1708,44 @@ while nothing is short of memory. A little swap in use with those columns at 0 m
 pages sit idle. These reads show only the present, and the nightly stop empties swap, so a
 morning reading says nothing about the evening before.
 
-Move to a `t4g.medium` when swap is written on 3 of 5 sessions. Item 3 of [#1006](https://github.com/l3a0/marketlake/issues/1006) supplies the reading, and the instance size stays the owner's choice.
+The design's paragraph "A shortage of memory slows a job rather than killing it", in its
+[Deployment section](../docs/design.md#deployment-laptop-now-dedicated-later), holds the
+proposal for when to move to a `t4g.medium`.
 
-After the first nightly stop and start with the swap file, run these three reads. The
-first lists the file, the second prints 1, and the third prints the file's one line.
+After a rollout or a replacement, once the VM has been through a nightly stop and start,
+run these three reads. The first lists the file, the second prints 1, and the third prints
+the file's one line.
 
 ```bash
 swapon --show
-sysctl vm.swappiness
+sysctl -n vm.swappiness
 grep swapfile /etc/fstab
 ```
 
 The `eod-sweep` check pages when no ping came by about 19:00. One cause is the unit still
-active, paging. `systemctl is-active com.marketlake.eod-sweep.service` prints `active`, and
-the `si` and `so` columns read above 0. Then the sweep is slow rather than dead, so let it
-finish.
+active, paging. `systemctl is-active com.marketlake.eod-sweep.service` prints `activating`
+for the whole run of a oneshot job, and the `si` and `so` columns read above 0. Then the
+sweep is slow rather than dead, so let it finish. `inactive` or `failed` means it ended. Do
+not start a second sweep on a VM short of memory while it reads `activating`.
 
 #### When the swap step fails
 
-The bootstrap prints `the swap step failed:` and the reason, installs the units anyway, and
-ends on exit 4. A deploy then ends `with a failed step in deploy.log`. Capture runs without
-swap, so this can wait for the evening. Fix what the line names, then rerun the bootstrap
-or wait for the next deploy.
+The bootstrap prints `the swap step failed:` and the reason, carries on, and ends on exit 4
+once the units are installed. A deploy then ends `with a failed step in deploy.log`.
+Capture runs without swap, but the next sweep can run out of memory as it did in
+[#1006](https://github.com/l3a0/marketlake/issues/1006). So fix this before that day's 18:30 sweep, after the 16:15 ET close, with a hand
+rerun of the bootstrap, as [Rerun the bootstrap](#rerun-the-bootstrap) says. A deploy
+arrives too late, because `lake.deploy_window` refuses one before 18:45 ET on a weekday,
+unless the owner [overrides the window](#override-the-deploy-window).
 
-When the line says `swapon failed on /swapfile`, the file there has no swap signature, and
-the bootstrap never rebuilds a file at that name. Remove it, and the next run makes a new
-one.
+A swap failure also leaves the deploy record absent, and a hand rerun does not clear that,
+so each deploy restarts the daemon until the next one passes every step and writes the
+record.
+
+When the line says `swapon failed on /swapfile`, read `swapon`'s own error, just above that
+line in `deploy.log` or on the screen. Remove the file only when the error names the swap
+header or signature, because the bootstrap never rebuilds a file at that name. The next run
+then makes a new one.
 
 ```bash
 sudo rm /swapfile
@@ -1744,15 +1754,25 @@ sudo rm /swapfile
 When the line says `/swapfile is not a regular file`, something else stands at the path.
 Read what it is with `ls -ld /swapfile` before removing it.
 
+When the line names `/etc/fstab`, the file is as it was and swap stays on until the VM next
+stops, so a later start has no swap until a rerun adds the line. A line that ends
+`the last install reloads systemd` needs nothing, because the swap line is on disk.
+
 ### Turn the swap off
 
-Run this with memory free. `swapoff` moves every page back into memory, and under a
-shortage that can trigger the kernel's kill. So first check that `free -m` shows more
-`available` memory than `used` swap, and that no job is running. Run the commands in this
-order.
+Run this outside a session, with memory free. `swapoff` moves every page back into memory,
+and under a shortage that can trigger the kernel's kill. So first check that `free -m` shows
+more `available` memory than `used` swap, and that no job is running.
+
+Run `swapoff` alone, and stop if it errors, unless swap was never on.
 
 ```bash
 sudo swapoff /swapfile
+```
+
+Then paste the other lines, in this order.
+
+```bash
 sudo sed -i '\#^/swapfile #d' /etc/fstab
 sudo rm /etc/sysctl.d/60-marketlake-swap.conf
 sudo sysctl vm.swappiness=60
@@ -1836,7 +1856,7 @@ when that is unknown, and an absent record makes the next deploy restart the dae
 | `deployed: <sha>, with a failed step in deploy.log` | 1 | Read the log. The swap step or a config step of the bootstrap failed, or the record could not be written. Fix the cause, as [Rerun the bootstrap](#rerun-the-bootstrap) says for each step, then deploy the same sha again. |
 | `deployed: <sha>, but the dashboard did not restart` | 1 | Read `journalctl -u com.marketlake.dashboard`, fix the cause, then run `sudo ~/.local/state/marketlake/systemd/restart.sh dashboard`. Capture is unaffected. |
 | `deployed: <sha>, with a failed step in deploy.log, but the dashboard did not restart` | 1 | The two rows above both apply. Fix the dashboard as its row says, then the failed step as its row says. |
-| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A reason that ends `exited 124` or `exited 137` is a bootstrap that reached its 15-minute cap, usually while SSM, PyPI or astral.sh was unreachable. Nothing needs a pull request then: send the deploy of the same sha again once the outage has passed. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed a config step or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
+| `rolled back to <sha>: <reason>` | 1 | The daemon runs the named sha again. Fix the reason in a pull request. A reason that ends `exited 124` or `exited 137` is a bootstrap that reached its 15-minute cap, usually while SSM, PyPI or astral.sh was unreachable. Nothing needs a pull request then: send the deploy of the same sha again once the outage has passed. A line that adds `, which has not run before` names a sha the record had not named, so watch the next session's pages. A line that ends `, with a failed step in deploy.log` means the rollback's bootstrap failed the swap step or a config step, or its record could not be written, so read the log and fix that as the first row says. A rollback to a commit before [#953](https://github.com/l3a0/marketlake/issues/953) renders `config.yaml` without `lake_window_sessions_bars`, so its code trims the kept bars again. After rolling forward to a commit that carries the key, run [Bring back the bars trimmed before the VM kept them all](#bring-back-the-bars-trimmed-before-the-vm-kept-them-all) again. A rollback between two commits that both carry the key trims nothing. |
 | `rollback to <sha> failed: <reason>` | 1 | The daemon may be down. Check `systemctl status com.marketlake.daemon`, then recover by the hand procedure below. When both the reason and the rollback's bootstrap end `exited 124` or `exited 137`, both bootstraps reached their 15-minute cap. The daemon was never restarted and the tree is back at the named sha, so send the deploy again once SSM, PyPI or astral.sh answers, and before the next session, because the next boot starts the daemon on what the killed bootstraps left. |
 | `not restarted: the tree is at <sha>, and the last recorded deploy is <sha or none>` | 1 | The restart is still owed. The log says whether a busy job outlasted the 15-minute wait, the next refused hours were too close, or the bootstrap failed. A failed bootstrap on a checkout that moved leaves it moved only when the wait kept the rollback from running. Once that has cleared, deploy the same sha again. |
 | `not deployed: the merge of <sha> failed, and the tree was restored` | 1 | The merge wrote part of the commit and failed, and the script reset the checkout to where it was. Nothing restarted. Read the log for git's error, such as a full disk, fix it, and deploy again. |

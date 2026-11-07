@@ -118,6 +118,19 @@ def test_a_lake_with_a_zeroed_primary_superblock_is_not_formatted(vm, real_disk)
         assert image.read(BLOCK) == bytes(BLOCK)
 
 
+def test_findmnt_verify_passes_an_empty_table(tmp_path):
+    # Runs only where findmnt exists, so on CI's Linux runner and not on a Mac. FAKE_FINDMNT
+    # copies this answer. It is why the bootstrap checks for the root entry itself.
+    table = tmp_path / "fstab"
+    table.write_text("")
+    proc = subprocess.run(
+        [require_tool("findmnt"), "--verify", "--tab-file", str(table)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_a_lake_whose_primary_fails_its_checksum_is_not_formatted(vm, real_disk):
     _format(vm)
     # One byte of the volume label, at 0x78 in the superblock, so the magic survives and
