@@ -1814,8 +1814,9 @@ A green deploy that turns out wrong is undone by a revert pull request and a for
 deploy, because the script refuses a commit behind the checkout's `HEAD`. The window
 refuses that deploy from 06:30 to 18:45 ET on a weekday, and an override from 08:00 until
 the close+15 compaction, 16:30 ET on a regular day. So a wrong deploy found during a
-session stays on the VM until then, unless the daemon is down, where the hand procedure
-below applies. A revert does not bring back lost minutes.
+session stays on the VM until then. The script refuses a daemon that is not running, and
+the hand procedure below takes over from 18:45 ET. A revert does not bring back lost
+minutes.
 
 Pass the full 40-digit sha of a commit on `main`. A pull request's page shows only 7
 digits, so read the full sha of `main`'s tip from the VM.
