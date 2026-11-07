@@ -142,11 +142,14 @@ def test_findmnt_verify_passes_a_table_with_the_swap_line(tmp_path):
     root.write_bytes(b"")
     lake = tmp_path / "lake.img"
     lake.write_bytes(b"")
+    # A boot-required target that is missing is an error, and the runner has no lake mount.
+    mount = tmp_path / "lake"
+    mount.mkdir()
     table = tmp_path / "fstab"
     table.write_text(
         f"{root} / ext4 discard,errors=remount-ro 0 1\n"
         f"{swap} none swap sw,nofail 0 0\n"
-        f"{lake} /srv/marketlake ext4 defaults,nofail 0 2\n"
+        f"{lake} {mount} ext4 defaults,nofail 0 2\n"
     )
     proc = subprocess.run(
         [require_tool("findmnt"), "--verify", "--tab-file", str(table)],
