@@ -2567,9 +2567,10 @@ def reauth_reminder(
     file itself is the problem.
 
     The gate is the hour, not the exact minute. launchd fires a calendar job late, and
-    a coalesced missed occurrence fires whenever the machine wakes, so the attempt grid
-    ``sunday_run`` builds from its own start almost never lands on the minute. Matching
-    the minute sent nothing at all on those evenings. Holding the count at three is
+    a coalesced missed occurrence fires whenever the machine wakes. So the first attempt
+    of ``sunday_run`` almost never lands on the minute, and neither does an attempt that
+    starts late because the one before it overran its half hour. Matching the minute
+    sent nothing at all on those evenings. Holding the count at three is
     ``sunday_run``'s job, which sends at most one reminder an hour.
     """
     eastern = now.astimezone(MARKET_TZ)
@@ -3257,8 +3258,18 @@ def sunday_run(
     under the lake root, and the kept pass dies with this process.
     """
     start = clock.now().astimezone(MARKET_TZ)
-    in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
+    scheduled = SUNDAY_MAINTENANCE.on(start.date())
+    in_the_window = start.weekday() == _PY_SUNDAY and scheduled <= start
     stop = CANARY_DEADLINE.on(start.date()) if in_the_window else start
+    # The attempts sit on the half-hour grid that starts at the scheduled time, not on
+    # one measured from the moment the process read the clock. The timer fires at 20:00
+    # and the job reads the clock seconds later, so a grid from that reading put the
+    # last attempt at 23:00 and a few seconds, past the deadline, and the loop stopped
+    # at 22:30 (#1016). Flooring to the slot the start falls in also keeps a late start
+    # from running a burst of attempts for the slots it slept through. The price is a
+    # short first gap: a start at 20:29:50 retries at 20:30:00. Reaching that needs a
+    # wake that came late, and every once-an-evening rule below still holds.
+    grid = scheduled + retry * ((start - scheduled) // retry) if in_the_window else start
 
     outcomes: list[SundayOutcome] = []
     reminded: set[int] = set()
@@ -3329,14 +3340,22 @@ def sunday_run(
         outcomes.append(outcome)
         if outcome.pinged:
             return outcomes
-        # The cadence is measured from the first attempt, so a slow scrub shifts no
-        # later attempt off the design's half-hour grid.
-        following = start + retry * len(outcomes)
-        if following > stop:
+        # The cadence is counted from the grid. An attempt that overran its slot starts
+        # the next one as soon as it ends, and the attempts after that return to the grid.
+        # No attempt starts after the deadline, whatever the overrun, because one starting
+        # past 23:00 cannot ping before the check's 23:30 deadline and would run on into
+        # the hours the Sunday scrub window gives other jobs.
+        following = grid + retry * len(outcomes)
+        ended = clock.now().astimezone(MARKET_TZ)
+        if max(following, ended) > stop:
             return outcomes
-        waited = (following - clock.now().astimezone(MARKET_TZ)).total_seconds()
-        if waited > 0:
-            clock.sleep(waited)
+        # A sleep can end a few milliseconds short of its target, because the clock
+        # times it on the monotonic timer while ``now`` reads the wall clock (#572). A
+        # retry that woke at 20:59:59.998 would read hour 20 and owe no reminder, so the
+        # clock is read again and any remainder waited out, as the daemon's minute wait
+        # does.
+        while (now := clock.now().astimezone(MARKET_TZ)) < following:
+            clock.sleep((following - now).total_seconds())
 
 
 # -- the setup artifacts ------------------------------------------------------------

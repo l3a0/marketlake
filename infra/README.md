@@ -2065,7 +2065,7 @@ keeps the lock across the checks and the delete, so a concurrent bootstrap canno
 units halfway through. It then deletes everything in the lake root except `lost+found`,
 without crossing into another filesystem.
 
-Under either role, avoid Sunday 20:00 to 23:00 ET, while the Sunday job runs
+Under either role, avoid Sunday 19:55 to 23:30 ET, while the Sunday job may still be running
 ([#683](https://github.com/l3a0/marketlake/issues/683)). A replacement also drops
 `chain_plan.json`, which lives on the root volume in the config directory. Capture uses
 the default plan until the next close+15 re-tune writes one, and a replacement during a
