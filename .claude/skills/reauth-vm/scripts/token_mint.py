@@ -32,8 +32,12 @@ def main(argv: list[str]) -> int:
     path = Path(argv[1]) if len(argv) > 1 else Path.home() / ".config/marketlake/token.json"
     try:
         stamp = json.loads(path.read_text(encoding="utf-8"))["creation_timestamp"]
-        minted = datetime.fromtimestamp(int(stamp), UTC_ZONE)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # The rule lake.token_epoch applies: a bool or a numeric string is not a shape
+        # schwab-py writes, so it is refused rather than read as a mint time.
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            raise TypeError
+        minted = datetime.fromtimestamp(float(stamp), UTC_ZONE)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:
         # The type name alone: a JSON error's message can quote the file's text.
         print(f"token_mint: cannot read the mint time of {path}: {type(exc).__name__}")
         return 1
