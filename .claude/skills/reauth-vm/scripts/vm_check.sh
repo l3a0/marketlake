@@ -5,8 +5,8 @@
 #
 # With "pull" it runs `python -m lake.token_store pull` on the VM as ubuntu,
 # which copies the SSM token parameter into the VM's token.json when that file
-# is absent or unreadable, or the parameter was minted later. A repeat writes nothing, so running it twice is
-# safe. Then it prints the VM token's mint time, the Sunday job's lines with
+# is absent or unreadable, or the parameter was minted later. A repeat writes
+# nothing, so running it twice is safe. Then it prints the VM token's mint time, the Sunday job's lines with
 # their Eastern times, and whether the daemon and the Sunday job are running.
 # Every probe after the pull reports its own failure and the script goes on,
 # because the later probes are what explain an earlier one.
