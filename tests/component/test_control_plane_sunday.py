@@ -22,7 +22,7 @@ import stat
 import subprocess
 import urllib.error
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -673,6 +673,61 @@ def test_a_ritual_never_done_retries_to_the_deadline_and_never_pings(fixture_lak
     assert pinger.urls == []
 
 
+class _TimedCanary:
+    """A failing canary that records the clock's reading at each attempt."""
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+        self.at: list[datetime] = []
+
+    def __call__(self) -> bool:
+        self.at.append(self.clock.now())
+        return False
+
+
+def _late_retry_attempts(lake_root, start):
+    clock = ManualClock(start=start)
+    canary = _TimedCanary(clock)
+    outcomes = cp.sunday_run(
+        lake_root=lake_root,
+        backup_target=_backup_of(lake_root),
+        clock=clock,
+        calendar=CALENDAR,
+        schedule_reader=lambda: REPEAT_ONLY,
+        pinger=FakePinger(),
+        ping_url=URL,
+        mint_reader=_Mints(FRESH_MINT),
+        canary=canary,
+        token_pull=None,
+    )
+    assert len(outcomes) == len(canary.at)
+    return canary.at
+
+
+def test_a_start_a_few_seconds_late_still_retries_at_23_00(fixture_lake):
+    # The timer fires at 20:00:00 and the process reads the clock a few seconds later.
+    # Measured from that reading, the seventh attempt would fall at 23:00:05, past the
+    # deadline, and a re-login after 22:30 would page at 23:30 (#1016). The attempts sit
+    # on the 20:00 half-hour grid instead, so the last one still starts at 23:00.
+    attempts = _late_retry_attempts(_clean_lake(fixture_lake), et(2026, 8, 30, 20, 0, 5))
+    assert attempts == [et(2026, 8, 30, 20, 0, 5)] + [
+        et(2026, 8, 30, 20, 30) + timedelta(minutes=30) * n for n in range(6)
+    ]
+
+
+def test_a_start_well_after_20_00_joins_the_grid_without_catching_up(fixture_lake):
+    # A machine that woke late runs its first attempt at once and then waits for the
+    # next half hour on the grid. No attempt is owed for the slots it slept through.
+    attempts = _late_retry_attempts(_clean_lake(fixture_lake), et(2026, 8, 30, 21, 10))
+    assert attempts == [
+        et(2026, 8, 30, 21, 10),
+        et(2026, 8, 30, 21, 30),
+        et(2026, 8, 30, 22, 0),
+        et(2026, 8, 30, 22, 30),
+        et(2026, 8, 30, 23, 0),
+    ]
+
+
 def test_a_failing_canary_retries_the_same_way(fixture_lake):
     outcomes, pinger, _ = _retry_run(
         _clean_lake(fixture_lake),
@@ -1096,9 +1151,10 @@ def test_a_failed_pull_with_coverage_passing_sends_nothing(fixture_lake):
 
 
 def test_a_slow_pull_does_not_move_its_attempt_into_the_next_hour(fixture_lake):
-    # Each pull takes 15 minutes. The attempts start at 20:50, 21:20, 21:50, 22:20 and
-    # 22:50, so they owe reminders in the 20, 21 and 22 o'clock hours. An attempt that took
-    # its moment after the pull would read 21:05, 21:35, 22:05, 22:35 and 23:05, and the
+    # Each pull takes 15 minutes. The attempts start at 20:50, then 21:05 for the 21:00
+    # slot the first one overran, then 21:30, 22:00, 22:30 and 23:00 on the grid. So they
+    # owe reminders in the 20, 21 and 22 o'clock hours. An attempt that took its moment
+    # after the pull would read 21:05, 21:20, 21:45, 22:15, 22:45 and 23:15, and the
     # 20:00 hour's reminder would never go out.
     root = _clean_lake(fixture_lake)
     clock = ManualClock(start=et(2026, 8, 30, 20, 50))
@@ -1121,7 +1177,7 @@ def test_a_slow_pull_does_not_move_its_attempt_into_the_next_hour(fixture_lake):
         token_pull=slow_pull,
         reminder_sink=sent.append,
     )
-    assert len(outcomes) == 5
+    assert len(outcomes) == 6
     assert len(sent) == 3
 
 

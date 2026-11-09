@@ -3257,8 +3257,16 @@ def sunday_run(
     under the lake root, and the kept pass dies with this process.
     """
     start = clock.now().astimezone(MARKET_TZ)
-    in_the_window = start.weekday() == _PY_SUNDAY and SUNDAY_MAINTENANCE.on(start.date()) <= start
+    scheduled = SUNDAY_MAINTENANCE.on(start.date())
+    in_the_window = start.weekday() == _PY_SUNDAY and scheduled <= start
     stop = CANARY_DEADLINE.on(start.date()) if in_the_window else start
+    # The attempts sit on the half-hour grid that starts at the scheduled time, not on
+    # one measured from the moment the process read the clock. The timer fires at 20:00
+    # and the job reads the clock seconds later, so a grid from that reading put the
+    # last attempt at 23:00 and a few seconds, past the deadline, and the loop stopped
+    # at 22:30 (#1016). Flooring to the slot the start falls in also keeps a late start
+    # from running a burst of attempts for the slots it slept through.
+    grid = scheduled + retry * ((start - scheduled) // retry) if in_the_window else start
 
     outcomes: list[SundayOutcome] = []
     reminded: set[int] = set()
@@ -3329,9 +3337,9 @@ def sunday_run(
         outcomes.append(outcome)
         if outcome.pinged:
             return outcomes
-        # The cadence is measured from the first attempt, so a slow scrub shifts no
-        # later attempt off the design's half-hour grid.
-        following = start + retry * len(outcomes)
+        # The cadence is counted from the grid, so a slow scrub shifts no later attempt
+        # off the design's half-hour grid.
+        following = grid + retry * len(outcomes)
         if following > stop:
             return outcomes
         waited = (following - clock.now().astimezone(MARKET_TZ)).total_seconds()

@@ -117,7 +117,7 @@ It exits 0 when every step worked, 1 when the pull or the mint read failed, and 
 
 ## 6. Confirm the canary passes
 
-The Sunday job starts at 20:00 ET and retries a failed attempt every 30 minutes, pulling the token before each one. No attempt may start after 23:00, and the job starts a few seconds after 20:00, so the last attempt runs at about 22:30. On a night the market is closed, the proof that capture can use the new token is an attempt after the pull that passes. Run `vm_check.sh <address>` again, without `pull`, once the next attempt has had time to run.
+The Sunday job starts at 20:00 ET and retries a failed attempt every 30 minutes, pulling the token before each one. The retries sit on the half hours counted from 20:00, so the last one starts at 23:00 even though the job reads the clock a few seconds after 20:00. On a night the market is closed, the proof that capture can use the new token is an attempt after the pull that passes. Run `vm_check.sh <address>` again, without `pull`, once the next attempt has had time to run.
 
 - **What prints when:** a failed canary call prints `sunday: canary call failed: <error>` at once. Every other line, each attempt's `token pull:` line and the closing `sunday: attempts=<n> pinged=<bool> slug=sunday` among them, prints together only when the whole job ends.
 - **Before the pull:** a `canary call failed: VendorAuthError` or `canary call returned http 401` from an attempt that started before the pull is expected. Compare its time with the pull's. On 2026-11-08 the re-auth landed at 20:31 ET, and the attempt that started at about 20:30 failed at 20:32.
