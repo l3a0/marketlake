@@ -1182,7 +1182,7 @@ def _capture_spans(paths: LakePaths, tickers: Iterable[str]) -> dict[str, tuple[
     ``missing``. That is the one status the promise above exists to prevent.
     """
     try:
-        return _read_capture_spans(paths, tickers)
+        return _with_planned_chains(paths, _read_capture_spans(paths, tickers))
     except Exception:
         # The guard is broad here, and only here. The master and the spans file are
         # optional reference files read off disk, so their contents are data that may be
@@ -1258,6 +1258,13 @@ def _read_capture_spans(
         for instrument_id in sorted(master.instruments_named(ticker, id_type=ID_TYPE_TICKER)):
             found = spans.spans_of(instrument_id)
             kept = [span for span in found if _valid_span(span)]
+            # A null ``options`` passes the pinned type, and read as false it would put
+            # every chain minute out of scope. Reading it as on reports a gap rather than
+            # hiding one, the direction every other fallback here takes.
+            kept = [
+                span if isinstance(span.options, bool) else replace(span, options=True)
+                for span in kept
+            ]
             unusable += len(found) - len(kept)
             if not kept:
                 complete = False
@@ -1286,9 +1293,47 @@ def _valid_span(span: CaptureSpan) -> bool:
     return isinstance(span.end, datetime) and span.end.utcoffset() is not None
 
 
-def _in_scope(instant: datetime, spans: tuple[CaptureSpan, ...]) -> bool:
-    """Whether ``instant`` falls inside any of a ticker's capture spans."""
-    return any(span.contains(instant) for span in spans)
+def _with_planned_chains(
+    paths: LakePaths, spans_by_ticker: dict[str, tuple[CaptureSpan, ...]]
+) -> dict[str, tuple[CaptureSpan, ...]]:
+    """Each ticker's spans, with an open span read as options on where capture fetches chains.
+
+    A span's ``options`` flag is set when the span opens and nothing changes it while the
+    span stays open. Capture plans chains from the roster instead, and the daemon stamps
+    that plan into the journal metadata each cycle. So a ticker re-onboarded with options
+    on keeps an open span with options off while capture fetches its chains every minute.
+    ``roster.check_lake`` allows that mismatch on purpose, because it only captures more.
+    Read from the span alone, those chain minutes would owe nothing, and a chain outage
+    the watchdog pages on would show on the dashboard as out of scope.
+
+    So an open span counts as options on when the stamp lists chains for its ticker. A
+    closed span answers from its own flag, because the stamp says only what capture plans
+    now. A lake with no stamp leaves every span as it was read.
+    """
+    planned = read_metadata(paths.root).tickers
+    adjusted: dict[str, tuple[CaptureSpan, ...]] = {}
+    for ticker, spans in spans_by_ticker.items():
+        if CHAINS in planned.get(ticker, ()):
+            spans = tuple(
+                replace(span, options=True) if span.end is None else span for span in spans
+            )
+        adjusted[ticker] = spans
+    return adjusted
+
+
+def _in_scope(instant: datetime, spans: tuple[CaptureSpan, ...], surface: str) -> bool:
+    """Whether any of a ticker's capture spans owed ``surface`` a capture at ``instant``.
+
+    On quotes that is any span containing the instant. On chains the span must also have
+    options on, because an equity-only span owed no chain. A chain partition from an
+    earlier options-on span keeps the ticker on the chains rows, and without this rule
+    every later minute would read missing (marketlake #1005). ``CaptureSpan.owes`` holds
+    the rule, and gap marking's startup pass asks it too. The spans reach here through
+    ``_with_planned_chains``, so an open span counts as options on wherever capture fetches
+    the ticker's chains.
+    """
+    chains = surface == CHAINS
+    return any(span.owes(instant, chains=chains) for span in spans)
 
 
 def _epoch_at(spans: tuple[CaptureSpan, ...], instant: datetime) -> datetime | None:
@@ -1472,9 +1517,10 @@ def _surface_stale(
     Three states owe nothing and so are never stale.
 
     1. A lake with no closed session behind it at all has no minute to measure against.
-    2. A ticker out of scope is either retired or not yet onboarded, and neither is owed
-       a cycle now. The Today strip marks those same slots out of scope, so a verdict
-       here that ignored scope would contradict the strip one panel over.
+    2. A ticker out of scope is retired, not yet onboarded, or, on chains, inside a span
+       with options off, and none of those is owed a cycle now. The Today strip marks
+       those same slots out of scope, so a verdict here that ignored scope would
+       contradict the strip one panel over.
     3. A ticker whose ``capture_start`` epoch falls after the owed minute was never owed
        a cycle by it, which is the ticker onboarded after today's close. Scope does not
        cover that one, because the clock has passed the epoch and the ticker really is
@@ -1731,7 +1777,7 @@ def _latest_cycle(
     if last_data_ms is not None:
         minutes_since = round((_slot_ms(ctx.now) - last_data_ms) / 60_000, 1)
     capture_start = _epoch_at(spans, owed_through if owed_through is not None else ctx.now)
-    in_scope = not spans or _in_scope(ctx.now, spans)
+    in_scope = not spans or _in_scope(ctx.now, spans, surface)
     return {
         "ticker": ticker,
         "surface": surface,
@@ -1838,6 +1884,7 @@ def _slot_status(
     slot: datetime,
     judgeable_ms: int,
     spans: tuple[CaptureSpan, ...],
+    surface: str,
 ) -> tuple[str, int, tuple[str, ...]]:
     """One slot's status, its data-row count, and every reason it carried.
 
@@ -1848,13 +1895,14 @@ def _slot_status(
     lives.
 
     ``judgeable_ms`` is the last slot key a verdict is owed for. ``spans`` empty means no
-    scope clamp, so every slot is in scope.
+    scope clamp, so every slot is in scope. ``surface`` decides what a span owes, per
+    ``_in_scope``.
     """
     rows = 0 if agg is None else agg.data_rows
     error_classes: tuple[str, ...] = () if agg is None else agg.error_classes
     if agg is not None and agg.data_rows > 0:
         return agg.status, rows, error_classes
-    if spans and not _in_scope(slot, spans):
+    if spans and not _in_scope(slot, spans, surface):
         return STATUS_OUT_OF_SCOPE, 0, ()
     if agg is not None:
         return agg.status, rows, error_classes
@@ -1880,7 +1928,8 @@ def _strip(
        still wins above it, so a real cycle is never hidden, but a gap marker there is
        out of scope, because the design pins an out-of-scope minute as never a gap. This
        covers a slot before the first span, after a closed one, and between two spans
-       following a retirement and a rejoin.
+       following a retirement and a rejoin. On chains, a span with options off counts as
+       no span, because it owed no chain.
     3. A slot with gap rows is a gap.
     4. A slot whose verdict grace has not run out against the injected instant is
        pending. That covers a slot still in the future and the recent past alike, so a
@@ -1898,7 +1947,9 @@ def _strip(
     counts = dict.fromkeys(STATUSES, 0)
     for slot in slots:
         key = _slot_ms(slot)
-        status, rows, error_classes = _slot_status(by_slot.get(key), slot, judgeable_ms, spans)
+        status, rows, error_classes = _slot_status(
+            by_slot.get(key), slot, judgeable_ms, spans, surface
+        )
         counts[status] += 1
         cells.append(
             {
@@ -2125,7 +2176,7 @@ def _history_cell(
     judgeable_ms = _slot_ms(now - SLOT_VERDICT_GRACE)
     counts = dict.fromkeys(STATUSES, 0)
     for slot in slots:
-        status, _, _ = _slot_status(by_slot.get(_slot_ms(slot)), slot, judgeable_ms, spans)
+        status, _, _ = _slot_status(by_slot.get(_slot_ms(slot)), slot, judgeable_ms, spans, surface)
         counts[status] += 1
     judged = len(slots) - counts[STATUS_OUT_OF_SCOPE] - counts[STATUS_PENDING]
     captured = counts[STATUS_CAPTURED] + counts[STATUS_SUSPECT]

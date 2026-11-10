@@ -436,6 +436,45 @@ def test_an_options_ticker_is_marked_on_both_surfaces(tmp_path):
     assert {span.surface for span in report.spans} == {"chains", "quotes"}
 
 
+def test_a_span_with_options_off_owes_no_chain_after_the_ticker_gains_options(tmp_path):
+    # SPY was captured equity-only through Tuesday, retired after the close, and rejoined
+    # with options on Wednesday. The roster now walks its chains, and Tuesday's dark
+    # session is owed on quotes alone, because the span that covered it captured no
+    # options (marketlake #1005, where the dashboard was taught the same rule through
+    # CaptureSpan.owes).
+    master = SecurityMaster()
+    spans = CaptureSpans()
+    iid = master.register(
+        kind="equity", capture_start=_SCOPE_START, valid_from=_SCOPE_START.date(), ticker="SPY"
+    )
+    spans.open_span(iid, _SCOPE_START, False)
+    spans.close_span(iid, et(2026, 9, 1, 16, 20))
+    spans.open_span(iid, et(2026, 9, 2, 9, 30), True)
+    _capture(tmp_path, "SPY", date(2026, 8, 31), surfaces=("chains", "quotes"))
+    _capture(
+        tmp_path,
+        "SPY",
+        date(2026, 9, 2),
+        surfaces=("chains", "quotes"),
+        through=et(2026, 9, 2, 9, 59),
+    )
+    restart = et(2026, 9, 2, 10, 0)
+    marker = gap.GapMarker(
+        lake_root=tmp_path,
+        roster=lambda: Roster((SPY,)),
+        session_clock=SessionClock(
+            clock=ManualClock(start=restart), calendar=weekday_sessions(WEEK)
+        ),
+        master=lambda: master,
+        spans=lambda: spans,
+        pid=4242,
+    )
+    marker.on_start(restart)
+
+    assert len(_slots(tmp_path, "quotes", "SPY", date(2026, 9, 1))) == FULL_SESSION_SLOTS
+    assert _slots(tmp_path, "chains", "SPY", date(2026, 9, 1)) == []
+
+
 def test_the_surfaces_rule_matches_the_one_capture_plans_with(tmp_path):
     assert gap.surfaces_for(SPY) == ("chains", "quotes")
     assert gap.surfaces_for(EQUITY_ONLY) == ("quotes",)
