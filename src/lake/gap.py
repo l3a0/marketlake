@@ -580,8 +580,8 @@ class GapMarker:
         """
         if spanlist is None:
             return False
-        wants_options = surface == journal.CHAINS_SURFACE
-        return any(span.contains(slot) and (not wants_options or span.options) for span in spanlist)
+        chains = surface == journal.CHAINS_SURFACE
+        return any(span.owes(slot, chains=chains) for span in spanlist)
 
     def _capture_start(self, ticker: str) -> datetime | None:
         """The instrument's capture start, or ``None`` when the master cannot say.

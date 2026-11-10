@@ -13,8 +13,9 @@
     --gap: #c0392b;
     --missing: #7f8c8d;
     --pending: rgba(127, 127, 127, 0.18);
-    /* Out of scope is a slot before the ticker's capture_start epoch. It means "not
-       expected", not "lost", so it gets a hue of its own rather than a shade of the
+    /* Out of scope is a slot no capture span owed: before the ticker's capture_start
+       epoch, after a retirement, or on chains under a span with options off. It means
+       "not expected", not "lost", so it gets a hue of its own rather than a shade of the
        greys that carry missing and pending. */
     --out-of-scope: #4f74c8;
     /* The shadow-append alarm. A hue no status cell uses, so it never reads as a gap. */
@@ -237,7 +238,7 @@
       <i class="gap"></i><span title="A gap row records the missed minute and its reason.">gap</span>
       <i class="missing"></i><span title="A judged slot with no row at all, not even a gap marker.">missing</span>
       <i class="pending"></i><span title="A slot whose cycle may still be running, so it is not judged yet.">pending</span>
-      <i class="out_of_scope"></i><span title="A slot before the ticker's capture_start epoch, the instant capture began for that ticker. Minutes before it are out of scope, never gaps.">out of scope</span>
+      <i class="out_of_scope"></i><span title="A slot no capture span owed: before the ticker's capture_start epoch, after the ticker was retired, or on chains while the ticker was captured without options. Out-of-scope minutes are never gaps.">out of scope</span>
     </div>
     <div id="strips"></div>
   </div>
@@ -549,9 +550,10 @@
     }
     cell.appendChild(el("span", fmt(row.capture_start, stampFmt)));
     if (row.in_scope === false) {
-      var tag = el("span", " (not started)", "muted");
-      tag.title = "The clock has not reached this ticker's capture_start epoch. Capture " +
-        "has not begun for it, so an empty row is what this ticker should look like.";
+      var tag = el("span", " (not owed now)", "muted");
+      tag.title = "No capture span owes this surface a cycle now. Capture has not begun " +
+        "for the ticker, the ticker was retired, or, on chains, it is captured without " +
+        "options. An empty row is what this ticker should look like.";
       cell.appendChild(tag);
     }
     return cell;
@@ -605,7 +607,7 @@
     }
     if (row.in_scope === false) {
       if (cell.firstChild) { cell.appendChild(el("span", ", ", "muted")); }
-      cell.appendChild(el("span", "capture has not started"));
+      cell.appendChild(el("span", "not owed now"));
     }
     if (row.lookback_exhausted) {
       if (cell.firstChild) { cell.appendChild(el("span", ", ", "muted")); }

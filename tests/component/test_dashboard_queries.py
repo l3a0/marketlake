@@ -462,6 +462,178 @@ def test_a_retired_ticker_is_never_late(root: Path):
     assert [row["stale"] for row in spy] == [False, False]
 
 
+def _onboard_twice(
+    root: Path, ticker: str, *, options_after: bool, options_before: bool = True
+) -> None:
+    """The GLD and USO history of marketlake #1005, on one fixture ticker.
+
+    The first onboard ran with options on from Thursday's open and was retired after
+    Friday's option close, so the ticker's Thursday and Friday chain partitions sit inside
+    an options-on span. The rejoin opened Friday evening and is still open, with
+    ``options_after`` deciding whether it carries options. ``options_before`` turns the
+    retired span's options off instead, for the reverse history.
+    """
+    master = SecurityMaster()
+    instrument_id = master.register(
+        kind=KIND_EQUITY,
+        capture_start=et(THURSDAY, 9, 30),
+        valid_from=date(2026, 1, 2),
+        ticker=ticker,
+    )
+    master.write(master_path(root))
+    spans = CaptureSpans()
+    spans.open_span(instrument_id, et(THURSDAY, 9, 30), options_before)
+    spans.close_span(instrument_id, et(FRIDAY, 16, 20))
+    spans.open_span(instrument_id, et(FRIDAY, 20, 0), options_after)
+    spans.write(spans_path(root))
+
+
+@pytest.mark.parametrize("options_after", [False, True])
+def test_an_equity_only_span_owes_no_chain_after_an_options_on_one(root: Path, options_after: bool):
+    """Marketlake #1005. Chain data from an earlier span must not make a later one owe chains.
+
+    QQQ's chain partitions keep it on the chains rows. Under an options-off span every
+    Monday minute reads out of scope and the row is not stale. Under an options-on span
+    the same lake owes Monday's chains, so the minutes read missing and the row reads
+    stale. The pair is what shows the verdict follows the flag rather than the data.
+    """
+    _onboard_twice(root, "QQQ", options_after=options_after)
+    evening = service_over(root, now=et(MONDAY, 17, 0))
+
+    row = next(
+        row
+        for row in evening.run_query("now", {})["surfaces"]
+        if (row["ticker"], row["surface"]) == ("QQQ", "chains")
+    )
+    monday = evening.run_query("today", {"date": MONDAY.isoformat(), "ticker": "QQQ"})["strips"][0]
+    history = evening.run_query("history", {})
+    cell = _cell(history, "QQQ", "chains", MONDAY)
+
+    # The row stays listed either way, showing the last chain the earlier span captured.
+    assert row["last_data_snap_ts"] == et(FRIDAY, 16, 15).isoformat()
+    assert row["in_scope"] is options_after
+    assert row["stale"] is options_after
+    assert monday["surface"] == "chains"
+    if options_after:
+        assert monday["counts"]["out_of_scope"] == 0
+        assert monday["counts"]["missing"] > 0
+        assert cell["judged"] == cell["slot_count"]
+        assert cell["captured_pct"] == 0.0
+    else:
+        assert monday["counts"]["out_of_scope"] == len(monday["slots"])
+        assert monday["counts"]["missing"] == 0
+        assert monday["counts"]["gap"] == 0
+        assert cell["counts"]["out_of_scope"] == cell["slot_count"]
+        assert cell["judged"] == 0
+        assert cell["captured_pct"] is None
+
+
+def test_an_equity_only_ticker_keeps_the_chain_days_it_captured(root: Path):
+    """The fix narrows what is owed and leaves what is listed alone.
+
+    Friday sits inside the options-on span, so its one captured chain minute still reads
+    captured and the rest of Friday's owed minutes still read missing. A retired chains
+    surface stays reachable for the days it captured, as ``lake_roster`` promises.
+    """
+    _onboard_twice(root, "QQQ", options_after=False)
+    history = service_over(root, now=et(MONDAY, 17, 0)).run_query("history", {})
+
+    friday = _cell(history, "QQQ", "chains", FRIDAY)
+    assert friday["counts"]["captured"] == 1
+    assert friday["counts"]["missing"] > 0
+    assert friday["counts"]["out_of_scope"] == 0
+
+
+def _stamp(root: Path, **options: bool) -> None:
+    """The daemon's roster stamp, naming each ticker with whether capture fetches its chains."""
+    stamp_cycle(
+        root,
+        at=et(MONDAY, 9, 40),
+        token_minted_at=MINTED,
+        roster=Roster.from_mapping(
+            {ticker: {"options": on, "chain_cadence": "1m"} for ticker, on in options.items()}
+        ),
+    )
+
+
+@pytest.mark.parametrize("stamped_chains", [None, False, True])
+def test_an_equity_only_span_owes_chains_only_when_capture_fetches_them(
+    root: Path, stamped_chains: bool | None
+):
+    """The options flag reaches chains alone, and the daemon's plan can widen it.
+
+    SPY's open span has options off. Its quotes are owed either way, so the rest of
+    Monday's session reads missing and the row is stale. Its chains depend on what capture
+    fetches, which the daemon stamps. With no stamp, or a stamp listing SPY on quotes
+    alone, the chains read out of scope wherever no data landed, including 09:32, whose
+    gap marker is never a gap outside scope. A stamp listing SPY's chains is a ticker
+    re-onboarded with options on, which keeps its options-off span open while capture
+    fetches chains. Those minutes are owed, so the 09:32 marker reads as the gap capture
+    recorded and the row reads stale.
+    """
+    write_master(root, "SPY", et(MONDAY, 9, 30), options=False)
+    if stamped_chains is not None:
+        _stamp(root, SPY=stamped_chains)
+    service = service_over(root, now=et(MONDAY, 17, 0))
+
+    strips = {
+        strip["surface"]: strip
+        for strip in service.run_query("today", {"date": MONDAY.isoformat(), "ticker": "SPY"})[
+            "strips"
+        ]
+    }
+    surfaces = {
+        row["surface"]: row
+        for row in service.run_query("now", {})["surfaces"]
+        if row["ticker"] == "SPY"
+    }
+    history = service.run_query("history", {})
+    monday = _cell(history, "SPY", "chains", MONDAY)
+    monday_quotes = _cell(history, "SPY", "quotes", MONDAY)
+
+    assert strips["quotes"]["counts"]["out_of_scope"] == 0
+    assert strips["quotes"]["counts"]["missing"] > 0
+    assert surfaces["quotes"]["in_scope"] is True
+    assert surfaces["quotes"]["stale"] is True
+    assert monday_quotes["counts"]["out_of_scope"] == 0
+    assert monday_quotes["counts"]["missing"] > 0
+    assert strips["chains"]["counts"]["captured"] == 2
+    if stamped_chains:
+        assert strips["chains"]["slots"][2]["status"] == "gap"
+        assert strips["chains"]["slots"][2]["error_class"] == ["http_429"]
+        assert strips["chains"]["counts"]["missing"] > 0
+        assert strips["chains"]["counts"]["out_of_scope"] == 0
+        assert monday["counts"]["missing"] > 0
+        assert surfaces["chains"]["in_scope"] is True
+        assert surfaces["chains"]["stale"] is True
+    else:
+        assert strips["chains"]["slots"][2]["status"] == "out_of_scope"
+        assert strips["chains"]["counts"]["missing"] == 0
+        assert strips["chains"]["counts"]["gap"] == 0
+        assert monday["counts"]["missing"] == 0
+        assert surfaces["chains"]["in_scope"] is False
+        assert surfaces["chains"]["stale"] is False
+
+
+def test_the_daemons_plan_widens_only_the_open_span(root: Path):
+    """A stamp says what capture fetches now, so it says nothing of a retired span.
+
+    QQQ was captured equity-only through Friday, retired, and rejoined Friday evening with
+    options on, and the daemon stamps its chains. Friday's chains still read from the
+    retired span's own flag, so its one captured minute reads captured and the rest read
+    out of scope rather than missing.
+    """
+    _onboard_twice(root, "QQQ", options_before=False, options_after=True)
+    _stamp(root, QQQ=True)
+    friday = _cell(
+        service_over(root, now=et(MONDAY, 17, 0)).run_query("history", {}), "QQQ", "chains", FRIDAY
+    )
+
+    assert friday["counts"]["captured"] == 1
+    assert friday["counts"]["missing"] == 0
+    assert friday["counts"]["out_of_scope"] > 0
+
+
 def test_a_recent_cycle_inside_the_threshold_is_not_late(root: Path):
     """A small positive gap is the case a zero threshold would paint stale."""
     # SPY quotes' newest data cycle is 09:31, one minute before this instant.
@@ -2116,12 +2288,13 @@ def test_a_partition_read_in_full_counts_no_loss(fixture_lake: FixtureLake):
 # -- the capture_start clamp -------------------------------------------------
 
 
-def write_master(root: Path, ticker: str, capture_start: datetime) -> Path:
+def write_master(root: Path, ticker: str, capture_start: datetime, *, options: bool = True) -> Path:
     """A security master and a matching open capture span under ``root``.
 
     The span starts at ``capture_start`` and stays open, reproducing the exact clamp
     an old-style single-epoch registration gave: every instant at or after it is in
-    scope, nothing before it is.
+    scope, nothing before it is. ``options`` defaults on, because both fixture tickers
+    carry options in the roster.
     """
     master = SecurityMaster()
     instrument_id = master.register(
@@ -2132,7 +2305,7 @@ def write_master(root: Path, ticker: str, capture_start: datetime) -> Path:
     )
     path = master.write(master_path(root))
     spans = CaptureSpans()
-    spans.open_span(instrument_id, capture_start, False)
+    spans.open_span(instrument_id, capture_start, options)
     spans.write(spans_path(root))
     return path
 
@@ -2148,7 +2321,7 @@ def write_closed_span(root: Path, ticker: str, capture_start: datetime, end: dat
     )
     path = master.write(master_path(root))
     spans = CaptureSpans()
-    spans.open_span(instrument_id, capture_start, False)
+    spans.open_span(instrument_id, capture_start, True)
     spans.close_span(instrument_id, end)
     spans.write(spans_path(root))
     return path
@@ -2248,7 +2421,7 @@ def test_a_ticker_the_master_no_longer_maps_today_still_clamps(root: Path):
     master.write(master_path(root))
     assert master.resolve("SPY", on=MONDAY, id_type=ID_TYPE_TICKER) is None
     spans = CaptureSpans()
-    spans.open_span(instrument_id, et(THURSDAY, 9, 30), False)
+    spans.open_span(instrument_id, et(THURSDAY, 9, 30), True)
     spans.close_span(instrument_id, et(THURSDAY, 16, 0))
     spans.write(spans_path(root))
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2303,7 +2476,7 @@ def test_an_instrument_with_no_span_row_costs_the_whole_ticker_its_clamp(root: P
     # from 09:36. Keeping only the survivor would lend its scope to days it never owned
     # and turn the fixture's 09:32 gap marker into an out-of-scope minute.
     _recycled_master(root, first_start=et(MONDAY, 9, 30), second_start=et(MONDAY, 9, 36))
-    CaptureSpans([CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False)]).write(
+    CaptureSpans([CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, True)]).write(
         spans_path(root)
     )
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2326,9 +2499,9 @@ def test_a_span_opening_after_the_close_does_not_excuse_an_earlier_dark_one(root
     CaptureSpans(
         [
             CaptureSpan(
-                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 16, 15).astimezone(UTC), False
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 16, 15).astimezone(UTC), True
             ),
-            CaptureSpan(2, et(MONDAY, 17, 0).astimezone(UTC), None, False),
+            CaptureSpan(2, et(MONDAY, 17, 0).astimezone(UTC), None, True),
         ]
     ).write(spans_path(root))
     row = next(
@@ -2375,9 +2548,9 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
     table = CaptureSpans(
         [
             CaptureSpan(
-                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), False
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), True
             ),
-            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, True),
         ]
     ).to_table()
     starts = table.column("span_start").to_pylist()
@@ -2397,6 +2570,25 @@ def test_one_unusable_span_costs_the_whole_ticker_its_clamp(root: Path):
     assert chains["counts"]["out_of_scope"] == 0
     assert chains["slots"][2]["status"] == "gap"
     assert chains["slots"][2]["error_class"] == ["http_429"]
+
+
+def test_a_span_with_a_null_options_flag_still_owes_chains(root: Path):
+    # The pinned type lets ``options`` be null. Read as false it would put every chain
+    # minute out of scope and the row could never go stale, so the dashboard reads it as
+    # on, and the 09:32 gap marker inside the span stays a gap.
+    write_master(root, "SPY", et(MONDAY, 9, 31))
+    table = CaptureSpans.read(spans_path(root)).to_table()
+    table = table.set_column(
+        table.schema.get_field_index("options"), "options", pa.array([None], pa.bool_())
+    )
+    pq.write_table(table, spans_path(root))
+
+    chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
+        "strips"
+    ][0]
+    assert chains["surface"] == "chains"
+    assert chains["slots"][2]["status"] == "gap"
+    assert chains["counts"]["missing"] > 0
 
 
 def test_the_same_two_instruments_undrifted_do_clamp(root: Path):
@@ -2428,9 +2620,9 @@ def test_the_same_two_instruments_undrifted_do_clamp(root: Path):
     CaptureSpans(
         [
             CaptureSpan(
-                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), False
+                1, et(MONDAY, 9, 30).astimezone(UTC), et(MONDAY, 9, 34).astimezone(UTC), True
             ),
-            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, True),
         ]
     ).write(spans_path(root))
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2475,8 +2667,8 @@ def test_a_recycled_ticker_unions_both_instruments_spans(root: Path):
     master.write(master_path(root))
     CaptureSpans(
         [
-            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, False),
-            CaptureSpan(1, et(THURSDAY, 9, 30).astimezone(UTC), et(THURSDAY, 16, 0), False),
+            CaptureSpan(2, et(MONDAY, 9, 36).astimezone(UTC), None, True),
+            CaptureSpan(1, et(THURSDAY, 9, 30).astimezone(UTC), et(THURSDAY, 16, 0), True),
         ]
     ).write(spans_path(root))
     service = service_over(root)
@@ -2530,9 +2722,9 @@ def test_a_non_ticker_mapping_of_the_same_spelling_stays_out_of_the_union(root: 
     ).write(master_path(root))
     CaptureSpans(
         [
-            CaptureSpan(1, et(MONDAY, 9, 36).astimezone(UTC), None, False),
+            CaptureSpan(1, et(MONDAY, 9, 36).astimezone(UTC), None, True),
             CaptureSpan(
-                2, et(THURSDAY, 9, 30).astimezone(UTC), et(THURSDAY, 16, 0).astimezone(UTC), False
+                2, et(THURSDAY, 9, 30).astimezone(UTC), et(THURSDAY, 16, 0).astimezone(UTC), True
             ),
         ]
     ).write(spans_path(root))
@@ -2585,13 +2777,13 @@ def test_the_unusable_span_warning_counts_spans_rather_than_tickers(root: Path, 
                 instrument_id,
                 et(THURSDAY, 9, 30).astimezone(UTC),
                 et(THURSDAY, 16, 0).astimezone(UTC),
-                False,
+                True,
             ),
             CaptureSpan(
                 instrument_id,
                 et(FRIDAY, 9, 30).astimezone(UTC),
                 et(FRIDAY, 16, 0).astimezone(UTC),
-                False,
+                True,
             ),
         ]
     ).to_table()
@@ -2646,7 +2838,7 @@ def write_retyped_master(
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(_retype(master.to_table(), casts), path)
     spans = CaptureSpans()
-    spans.open_span(instrument_id, capture_start, False)
+    spans.open_span(instrument_id, capture_start, True)
     spans.write(spans_path(root))
     return path
 
@@ -2666,7 +2858,7 @@ def write_retyped_spans(
     )
     master.write(master_path(root))
     spans = CaptureSpans()
-    spans.open_span(instrument_id, capture_start, False)
+    spans.open_span(instrument_id, capture_start, True)
     path = spans_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(_retype(spans.to_table(), casts), path)
@@ -2801,9 +2993,9 @@ def test_a_rejoined_ticker_renders_out_of_scope_only_for_the_time_away(root: Pat
     )
     master.write(master_path(root))
     spans = CaptureSpans()
-    spans.open_span(instrument_id, et(MONDAY, 9, 36), False)
+    spans.open_span(instrument_id, et(MONDAY, 9, 36), True)
     spans.close_span(instrument_id, et(MONDAY, 12, 0))
-    spans.open_span(instrument_id, et(MONDAY, 15, 0), False)
+    spans.open_span(instrument_id, et(MONDAY, 15, 0), True)
     spans.write(spans_path(root))
 
     chains = service_over(root).run_query("today", {"date": "2026-08-24", "ticker": "SPY"})[
@@ -2863,7 +3055,7 @@ def write_master_valid_from(
     )
     path = master.write(master_path(root))
     spans = CaptureSpans()
-    spans.open_span(instrument_id, capture_start, False)
+    spans.open_span(instrument_id, capture_start, True)
     spans.write(spans_path(root))
     return path
 

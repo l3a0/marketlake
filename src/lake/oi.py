@@ -443,7 +443,7 @@ def _covered_with_options(
     if not found:
         return False
     close = market.option_close(session)
-    return any(span.options and span.contains(close) for span in found)
+    return any(span.owes(close, chains=True) for span in found)
 
 
 def _occ_index(master: SecurityMaster, on: date) -> dict[str, tuple[int, ...]]:

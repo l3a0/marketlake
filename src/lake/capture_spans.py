@@ -16,7 +16,9 @@ Scope is one question asked against this list: an instant is *in scope* for an
 instrument when it falls inside one of the instrument's spans. Minutes before the first
 span, after a closed span's end, and between two spans are out of scope, never gaps.
 This is the same clamping rule ``capture_start`` gave before, widened so a retired or
-rejoined ticker is recorded exactly.
+rejoined ticker is recorded exactly. What a span owed differs by surface, and
+``CaptureSpan.owes`` answers that: every quote minute it contains, and a chain minute only
+when its ``options`` flag is on.
 
 Spans store their two ends in UTC. Comparisons against a market-time instant still work
 without conversion, because comparing two timezone-aware datetimes normalizes the
@@ -153,6 +155,17 @@ class CaptureSpan:
         if instant < self.start:
             return False
         return self.end is None or instant < self.end
+
+    def owes(self, instant: datetime, *, chains: bool) -> bool:
+        """Whether this span owed a capture at ``instant``, on the chains surface when ``chains``.
+
+        A span owes every minute it contains on quotes. On chains it owes them only when
+        options were on, because a span with options off owed no chain. Gap marking's
+        startup pass, the dashboard and the open-interest view ask it. Gap marking's
+        skipped-slot pass marks by the roster instead, and the dashboard reads an open
+        span as options on wherever the daemon's stamp lists the ticker's chains.
+        """
+        return self.contains(instant) and (not chains or self.options)
 
 
 class CaptureSpans:
