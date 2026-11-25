@@ -100,7 +100,7 @@ The job's rules, each glossed at first use.
    backup, and the ping.
 
    The second does not survive it. A column two segments hold at different types is
-   refused by ``concat_tables`` before the comparison runs, so that ticker-day has no
+   refused by ``merge_by_name`` before the comparison runs, so that ticker-day has no
    merged schema to compare and no partition to write. The refusal is named
    ``SegmentSchemaConflict``, the sweep catches it, files the same kind of finding, and
    carries on to the next ticker-day. Its segments stay on disk untouched, so the next
@@ -265,6 +265,7 @@ from lake.runner import (
     RsyncBackup,
     escalate_ping_failure,
 )
+from lake.segment_join import merge_by_name, pinned_order
 from lake.session import SessionClock
 
 if TYPE_CHECKING:  # ``lake.trim`` reads ``_durable`` from here, so it is imported where used.
@@ -469,7 +470,7 @@ class RetypeRefused(RecompactionRefused):
 class SegmentSchemaConflict(Exception):
     """Raised when two segments in one ticker-day hold a column at different types.
 
-    ``concat_tables`` refuses that merge outright, so the ticker-day has no partition to
+    ``merge_by_name`` refuses that merge outright, so the ticker-day has no partition to
     write and the pinned-schema comparison downstream never runs. This names the refusal
     where it happens, which is what lets the sweep contain it. Catching the bare
     ``pa.ArrowTypeError`` in the caller would contain anything else ``_seal`` raised for
@@ -959,36 +960,10 @@ def _durable_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _pinned_order(table: pa.Table, pinned: pa.Schema) -> pa.Table:
-    """The merged table with its pinned columns back in the pinned schema's order.
-
-    Promotion appends. A segment written before a column was added has no place to put
-    it, so ``concat_tables`` adds the promoted column at the end of the merged table
-    rather than where the pinned schema holds it. The columns are then right and the
-    order is not, and a comparison that read order as drift would file a finding on every
-    legitimate column addition. Reordering first is what makes the comparison a plain
-    equality.
-
-    Order itself is not a correctness concern. Every read in ``src/`` is by name, and the
-    documented multi-day path is DuckDB's ``union_by_name``. This exists to make the
-    check cheap, not to fix a read.
-
-    A column the pinned schema does not name keeps its place at the end rather than being
-    dropped, so the reorder moves columns and never loses one.
-    """
-    present = set(table.schema.names)
-    named = set(pinned.names)
-    order = [name for name in pinned.names if name in present]
-    order += [name for name in table.schema.names if name not in named]
-    if order == table.schema.names:
-        return table
-    return table.select(order)
-
-
 def _type_conflicts(tables: Sequence[pa.Table]) -> tuple[str, ...]:
     """Every column the segments hold at more than one type, in the merged column order.
 
-    Read after ``concat_tables`` has already refused, so this explains a refusal rather
+    Read after ``merge_by_name`` has already refused, so this explains a refusal rather
     than deciding there is one. Each column is rendered ``name: earlier -> later``, the
     same shape ``SchemaDrift.retyped`` uses, with the earlier type the one the first
     segment carrying the column held it at. The segments arrive in filename order and the
@@ -2017,7 +1992,7 @@ def _seal(
     segments disagreed and leave no report at all.
 
     One drift stops the merge instead of surviving it. A column the segments hold at
-    different types is refused by ``concat_tables``, and this raises
+    different types is refused by ``merge_by_name``, and this raises
     ``SegmentSchemaConflict`` rather than letting Arrow's own error out. The sweep catches
     that name and ``DamagedSegments`` and nothing else, so a failure raised anywhere else
     in here still costs the run, which is what the other named failures in this module are
@@ -2134,7 +2109,7 @@ def _seal(
         # that failure loud. It is named here and contained by the caller, so it costs its
         # own ticker-day and nothing more.
         try:
-            merged = pa.concat_tables(tables, promote_options="default")
+            merged = merge_by_name(tables)
         except pa.ArrowTypeError as exc:
             raise SegmentSchemaConflict(
                 surface=surface,
@@ -2163,7 +2138,7 @@ def _seal(
     # surface that gets past the path always has a schema. The two sets were equal until
     # bars were pinned, which is why this now names the direction rather than an equality.
     pinned = journal.schema_for(surface)
-    merged = _pinned_order(merged, pinned)
+    merged = pinned_order(merged, pinned)
     carries_pinned = merged.schema.equals(pinned)
     # Two things file a record here, and either one alone is enough. A merged schema that
     # is not the pinned one is the check this seal has always run. A widening an operator

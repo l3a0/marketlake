@@ -1,4 +1,5 @@
-"""The read layer's doors onto the lake's sealed partitions.
+"""The read layer's doors onto the lake's sealed partitions. ``lake.unsealed`` is the one onto
+a day before its seal.
 
 The lake has been write-only. Capture seals a ticker-day into one immutable Parquet
 partition at close+15, the manifest checksums it, and until now nothing in ``src/lake``
@@ -67,7 +68,9 @@ Four defaults are settled by marketlake #135, which is authoritative for this de
 
 1. The return is a ``pyarrow.Table``.
 2. Sealed partitions only. Today's data is not sealed until close+15, and reading live
-   journal segments carries a locking problem that belongs elsewhere.
+   journal segments carries a locking problem that belongs elsewhere. ``lake.unsealed`` is
+   where a consumer reads segments before the seal. It meets no lock, because a segment named
+   by its digest was closed before it was hashed.
 3. ``snap`` is an ET wall-clock minute. The lake stores ``snap_ts`` in UTC, so this
    converts. A reader asking for ``10:31`` means the session minute.
 4. Data rows only. A gap row records a minute that was missed and why, with every vendor
@@ -502,7 +505,11 @@ _CAPTURED = Provenance(ORIGIN_CAPTURED, BASIS_RAW)
 
 
 class LoadError(Exception):
-    """Base for every reason a read of sealed data does not produce a table."""
+    """Base for every reason a read does not produce a table, sealed or unsealed.
+
+    The sealed doors are this module's. ``lake.unsealed.UnsealedRefused`` is the base of every
+    refusal on a day before its seal.
+    """
 
 
 class PartitionAbsent(LoadError):

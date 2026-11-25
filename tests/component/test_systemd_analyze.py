@@ -14,8 +14,8 @@ skips where it is absent and fails where it is absent under ``CI``, through
 2. ``calendar`` computes each timer's next elapses under an explicit ``TZ`` across the
    2026-11-01 clock change, and every one must land on the job's Eastern wall-clock time.
 
-CI's runner moves to a newer systemd than the VM's 255 in late 2026. The units use only
-settings older than 255, so the runner is not pinned.
+CI's runner is pinned to Ubuntu 24.04, the VM's release, so it reads the units with the VM's
+systemd 255 (#1029).
 """
 
 from __future__ import annotations
