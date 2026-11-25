@@ -32,8 +32,8 @@ The four measurements, each glossed at first use.
 4. *The OI-refresh moment.* Open interest, OI, is the count of contracts outstanding.
    Schwab loads a session's settled OI at some moment early in the next session. This
    finds the first cycle whose OI differs from the session's first cycle, and reports
-   that slot, how many contracts changed, and whether the change looks atomic (a single
-   settled state that then holds). This was meant to calibrate the OI view's quorum
+   that slot, how many contracts changed, and whether the change looks atomic (its state is
+   already the last cycle's). This was meant to calibrate the OI view's quorum
    fraction and plateau count and does not, because open interest does not move inside a
    stored session: the refresh lands between sessions, outside captured hours, so this
    reports no refresh on every session the lake holds. marketlake #313 records the

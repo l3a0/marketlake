@@ -330,6 +330,21 @@ def test_a_refresh_before_the_open_interest_goes_is_never_atomic(lake_root, last
     assert refresh.atomic is False
 
 
+@pytest.mark.parametrize("bare", [0, 2])
+def test_a_contract_with_no_open_interest_takes_only_itself_out(lake_root, bare):
+    # The same-day contract holds none in the first cycle, or in the last. The other contract's
+    # refresh is still seen, and still atomic.
+    oi = (1000, 1200, 1200)
+    for index, snap in enumerate((_OPEN, _T1, _T2)):
+        rows = _cycle(snap, 0.5, far_oi=oi[index])
+        if index == bare:
+            rows[1]["open_interest"] = None
+        _segment(lake_root, f"{index}", rows, journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert (refresh.observed, refresh.changed_contracts, refresh.atomic) == (True, 1, True)
+
+
 def test_a_refresh_that_goes_on_moving_is_not_atomic(lake_root):
     for name, snap, far_oi in (("a", _OPEN, 1000), ("b", _T1, 1200), ("c", _T2, 1300)):
         _segment(lake_root, name, _cycle(snap, 0.5, far_oi=far_oi), journal.CHAINS_SCHEMA)

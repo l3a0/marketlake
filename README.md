@@ -765,11 +765,12 @@ consumer may depend on. Anything it does not state may change without notice.
 3. Download each object to its lake-relative path under a directory, and put that directory's
    `quarantine.jsonl` beside them as [What the door reads](#what-the-door-reads) says.
 4. Call the door with the paths and digests, and take the row with the latest `fetch_end_ts`.
-5. Judge that row. The door judges its schema version, its kind, its ticker, its day, when its
-   response landed and its `extra`, and no other value in it, nor whether its stamps agree. So a
-   price can be null, not finite or not positive, and it can be old in a row captured a second ago.
-   `fetch_end_ts` dates the capture, and Schwab's own stamps date the price. An empty table says
-   that no named data row was captured by `at`.
+5. Judge that row. The door judges its schema version, its kind, its ticker, its day, its `extra`
+   and that its response landed by `at`, however long before. It judges no other value in it, nor
+   whether its stamps agree. So a price can be null, not finite or not positive, and it can be old
+   in a row captured a second ago. `fetch_end_ts` dates the capture, and Schwab's own stamps date
+   the price. The caller sets its own limit on the age of each. An empty table says that no named
+   data row was captured by `at`.
 
 ```python
 from lake.unsealed import load_unsealed_quotes, segment_prefix
@@ -893,8 +894,9 @@ row, and the door cannot say whether capture missed it, the upload is late or th
 lost. The caller's own age limit decides.
 
 A caller may name any subset, such as the last few. The answer's columns are then those the named
-segments hold, and any column the door lifts a named row's value into from `extra`, which comes
-last. So a column that arrived later in the day can be absent rather than null.
+segments hold, and behind them any column none of them holds that the door lifts a value into from
+`extra`. So a column that arrived later in the day can be absent rather than null, or sit in another
+place than `load_quotes` gives it. Read a column by name.
 
 To reproduce a decision, pass the mapping it used. Once that refuses, because the segments expired
 or the sealed day was withheld, the decision's own snapshot is the record.
@@ -925,9 +927,9 @@ exception.
 listing did not, and lack one it did, as
 [the next section](#where-the-door-and-the-sealed-day-differ) says, and nothing in it says when a
 row became readable. So a replay can take a newer row than the decision could see, or an older one,
-with no refusal. Only the decision's own mapping reproduces it, or its own snapshot once that
-refuses. A backtest has no mapping, so it cuts earlier than the instant it decides at, by the lag it
-allows.
+with no refusal. Where the two differ, only the decision's own mapping reproduces it, or its own
+snapshot once that refuses. A backtest has no mapping, so it cuts earlier than the instant it decides
+at, by the lag it allows. That cut covers a late row, and not one that never reached the bucket.
 
 ### Where the door and the sealed day differ
 
@@ -1009,10 +1011,10 @@ It imports `lake.unsealed`, `lake.loader`, `lake.paths.is_reader_file` and
 - **Pin pyarrow to the version `uv.lock` holds at that commit.** The capture host installs that
   one, and marketlake's suite runs on no other. `pyproject.toml` admits older ones, and on some of
   them `load_quotes` raises.
-- **This contract promises no record of the commit the capture host runs.** A merge to `main` can
-  wait days for its deploy, so `main` is not that commit. The repository's public Deploy runs print
-  `deployed: <sha>` for a deploy CI made. A deploy made by hand over SSH, or a replaced instance's
-  first boot, is not among them.
+- **Watch `main` to learn that a raise is due.** Every deployed commit is on `main` first, so a
+  change there to `src/lake/segment_join.py`, `uv.lock` or `SCHEMA_VERSION` comes before the host
+  runs it. A merge can wait days for its deploy, and this contract promises no record of the commit
+  the host runs.
 
 ## Install on a Linux host
 

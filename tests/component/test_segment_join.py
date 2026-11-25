@@ -6,8 +6,8 @@ whole table written out, which shares nothing with the code. The schema is this 
 column the lake pins later moves none of it.
 
 ``lake.segment_join`` is also a published contract (marketlake #1004), so the last tests hold that
-the seal, the door and the measurements each import the one join. A caller that imported it and
-joined another way would leave the import unused, which ruff's F401 refuses.
+the seal, the door and the measurements each import the one join. A caller that stopped calling it
+would leave the import unused, which ruff's F401 refuses.
 """
 
 from __future__ import annotations
@@ -185,7 +185,8 @@ def test_a_torn_segment_gives_the_rows_before_the_tear(lake_root, surface):
 def test_the_first_segments_metadata_is_the_partitions(lake_root, surface):
     _segment(lake_root, surface, 31, PINNED.with_metadata({b"k": b"first"}), 1.5, 10, "data")
     _segment(lake_root, surface, 32, PINNED.with_metadata({b"k": b"later"}), 2.5, 20, "data")
-    assert _sealed(lake_root, surface).schema.metadata[b"k"] == b"first"
+    # All of it, because a partition's metadata is part of what the seal writes.
+    assert _sealed(lake_root, surface).schema.metadata == {b"k": b"first"}
 
 
 @pytest.mark.parametrize("first", ["pinned", "retyped"])

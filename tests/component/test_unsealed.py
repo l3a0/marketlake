@@ -34,7 +34,7 @@ from lake.chain_plan import ChainPlan
 from lake.compact import CompactionResult, compact
 from lake.journal import QUOTES_SCHEMA
 from lake.loader import SnapAbsent, load_quotes
-from lake.manifest import latest_entries
+from lake.manifest import append_manifest, latest_entries
 from lake.paths import LakePaths
 from lake.schema_versions import (
     RecordedVersion,
@@ -1236,10 +1236,19 @@ def test_the_newest_row_is_the_one_a_replay_reaches(lake_root, at, bid):
 )
 def test_a_replay_can_take_another_row_than_the_decision_did(lake_root, case, bid, replayed):
     # 13:39's row was captured by ``at``. Its segment was not listed yet, or it left the capture
-    # host after the decision read it. The sealed day holds it in the first case and not in the
-    # second, which is why a decision's own mapping is what reproduces it.
+    # host after the decision read it. The sealed day holds it in the first case and a gap row in
+    # the second, which is why a decision's own mapping is what reproduces it.
     _ledger(lake_root, 2)
     rels = [_minute(lake_root, minute, bid=float(minute)) for minute in (38, 39)]
+    for rel, minute in zip(rels, (38, 39), strict=True):
+        append_manifest(
+            lake_root,
+            partition=rel,
+            source="capture",
+            sha256=_digest(lake_root, rel),
+            rows=1,
+            fetched_at=_utc(13, minute, 1).isoformat(),
+        )
     at = _utc(13, 39, 5)
     segments = _named(lake_root, *(rels[:1] if case == "unlisted" else rels))
     decided = _newest(_read(lake_root, segments, at))
@@ -1248,6 +1257,9 @@ def test_a_replay_can_take_another_row_than_the_decision_did(lake_root, case, bi
     _seal(lake_root)
     assert decided["bid"] == bid
     assert _replay(lake_root, at)["bid"] == replayed
+    day = pq.read_table(LakePaths(lake_root).quotes_partition_path("SPY", DAY))
+    lost = [row["error_class"] for row in day.to_pylist() if row["row_kind"] == "gap"]
+    assert lost == (["segment_lost"] if case == "lost since" else [])
 
 
 @pytest.mark.parametrize("name", ["row_kind", "fetch_end_ts"])

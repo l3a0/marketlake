@@ -13,7 +13,7 @@ dashboard projects each segment into one fixed schema first.
 this result, with only a row count and a footer check after it, and captured data cannot be
 recaptured. So an edit made for a reader is reviewed as an edit to that path.
 
-**A change here is also a change to a published contract.** A consumer pins this package at one
+**A change to what this module does is a change to a published contract.** A consumer pins this package at one
 commit and reads unsealed rows through ``lake.unsealed``. Its rows equal the seal's only while
 this module matches the deployed one, so a change has to reach a consumer's pin as well as the
 capture host, and ``README.md``'s ``## Read an unsealed day`` says so.
