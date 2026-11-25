@@ -2023,6 +2023,14 @@ DAMAGE = [
     pytest.param(b'{"partition": "x"}\n', NOT_WHOLE, id="no-source"),
     pytest.param(b'{"source": "y"}\n', NOT_WHOLE, id="no-partition"),
     pytest.param(b"\xff\n", NOT_WHOLE, id="not-utf8"),
+    # Each of these parses as bytes, and the manifest's reader stops at it or splits it.
+    pytest.param(
+        b'\xef\xbb\xbf{"partition": "x", "source": "y"}\n', NOT_WHOLE, id="byte-order-mark"
+    ),
+    pytest.param(
+        '{"partition": "x\u2028x", "source": "y"}\n'.encode(), NOT_WHOLE, id="line-separator"
+    ),
+    pytest.param(b'{"partition": "x",\r"source": "y"}\n', NOT_WHOLE, id="carriage-return"),
 ]
 WHOLE = b'{"partition": "reference/odd.parquet", "source": "y"}\n'
 

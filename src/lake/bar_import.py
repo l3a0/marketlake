@@ -153,7 +153,6 @@ from __future__ import annotations
 import argparse
 import csv
 import io
-import json
 import math
 import re
 import sys
@@ -198,6 +197,7 @@ from lake.manifest import (
     append_entries,
     latest_entries,
     manifest_path,
+    parse_jsonl,
     sha256_bytes,
 )
 from lake.paths import (
@@ -813,9 +813,10 @@ def _holder(rel: str, held: str) -> str:
 def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[str], list[str]]:
     """Where each line of the manifest starts, its source and its partition.
 
-    Refuses a torn last line, whose ``cost`` the refusal names, and a line that is not an entry. A
-    read of the manifest stops at the first line it cannot parse, so entries recorded past one are
-    hidden from every reader while the file holds them.
+    Refuses a torn last line, whose ``cost`` the refusal names, and a line that is not one entry to
+    ``parse_jsonl``, the manifest's own reader. That reader stops at the first line it cannot
+    parse, so entries recorded past one are hidden while the file holds them. It also refuses a
+    blank line and an entry with no source or partition, which no writer leaves.
     """
     if raw and not raw.endswith(b"\n"):
         raise BarImportRefused(f"manifest.jsonl ends in a torn line, so {cost} and {outcome}")
@@ -827,7 +828,7 @@ def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[s
         offsets.append(at)
         at += len(line) + 1
         try:
-            entry = json.loads(line)
+            (entry,) = parse_jsonl(line.decode("utf-8"))
             sources.append(str(entry["source"]))
             partitions.append(str(entry["partition"]))
         except (ValueError, KeyError, TypeError):
@@ -838,10 +839,10 @@ def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[s
 
 
 def _refuse_damaged_manifest(root: Path) -> None:
-    """Refuse an import that would append behind damage.
+    """Refuse an import that would append to a manifest the undo refuses.
 
-    Its entries would be hidden from every reader, capture's later ones with them, and the undo
-    refuses on the same damage, so nothing could take the import back.
+    Behind a line the reader stops at, its entries and capture's later ones would be hidden, and
+    nothing could take the import back.
     """
     _whole_lines(
         manifest_path(root).read_bytes(),
