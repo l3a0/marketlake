@@ -2031,6 +2031,14 @@ DAMAGE = [
         '{"partition": "x\u2028x", "source": "y"}\n'.encode(), NOT_WHOLE, id="line-separator"
     ),
     pytest.param(b'{"partition": "x",\r"source": "y"}\n', NOT_WHOLE, id="carriage-return"),
+    pytest.param(
+        b'{"partition": "x", "source": "y"}\r{"par\n', NOT_WHOLE, id="a-fragment-behind-a-return"
+    ),
+    pytest.param(
+        b'{"partition": "x", "source": "y"}\r{"partition": "z", "source": "y"}\n',
+        NOT_WHOLE,
+        id="two-on-one-line",
+    ),
 ]
 WHOLE = b'{"partition": "reference/odd.parquet", "source": "y"}\n'
 

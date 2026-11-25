@@ -828,7 +828,8 @@ def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[s
         offsets.append(at)
         at += len(line) + 1
         try:
-            (entry,) = parse_jsonl(line.decode("utf-8"))
+            (text,) = line.decode("utf-8").splitlines()
+            (entry,) = parse_jsonl(text)
             sources.append(str(entry["source"]))
             partitions.append(str(entry["partition"]))
         except (ValueError, KeyError, TypeError):
