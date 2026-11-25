@@ -510,7 +510,8 @@ def test_a_bad_input_refuses_before_anything_is_written(tmp_path, rows, header_t
     source = _csv(tmp_path / "src" / "gld.csv", rows, header_ticker=header_ticker)
     before = _snapshot(root)
 
-    assert expected in _refused(root, [source], _listed((source, "GLD")))
+    message = _refused(root, [source], _listed((source, "GLD")))
+    assert expected in message and message.endswith("nothing was imported")
     assert _snapshot(root) == before
 
 
@@ -542,7 +543,8 @@ def test_a_malformed_file_refuses_with_one_line(tmp_path, text, expected):
     source.write_text(text)
     before = _snapshot(root)
 
-    assert expected in _refused(root, [source], _listed((source, "GLD")))
+    message = _refused(root, [source], _listed((source, "GLD")))
+    assert expected in message and message.endswith("so nothing was imported")
     assert _snapshot(root) == before
 
 
@@ -646,6 +648,34 @@ def test_an_unrecorded_file_another_writer_left_refuses(tmp_path):
 
     assert _rel("GLD", "2006-04-26") in message and "unrecorded" in message
     assert foreign.read_bytes() == before
+
+
+def test_an_unrecorded_file_another_import_left_refuses(tmp_path, monkeypatch):
+    """Import A is killed before its append, and import B, another file over the same sessions,
+    runs next. Catches the repair of a killed run overwriting a file whose metadata names another
+    source, since only this import's own killed run leaves one it may replace."""
+    root = _lake(tmp_path)
+    first = _csv(tmp_path / "src" / "a.csv", [("2006-04-25", 1.0), ("2006-04-26", 2.0)])
+    second = _csv(tmp_path / "src" / "b.csv", [("2006-04-25", 3.0), ("2006-04-26", 4.0)])
+    vintages = _listed((first, "GLD"), (second, "GLD"))
+
+    def crash(*_args, **_kwargs):
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import, "append_entries", crash)
+        with pytest.raises(Crash):
+            _run(root, [first], vintages)
+    before = _snapshot(root)
+
+    message = _refused(root, [second], vintages)
+
+    owner = hashlib.sha256(first.read_bytes()).hexdigest()
+    assert message.startswith(
+        f"{_rel('GLD', '2006-04-25')} is an unrecorded file whose metadata names sha256:{owner}"
+    )
+    assert "2 key(s) conflict, nothing was written" in message
+    assert _snapshot(root) == before
 
 
 def test_a_torn_unrecorded_file_is_replaced(tmp_path):
@@ -1860,9 +1890,10 @@ def test_a_three_row_entry_with_a_window_drops_the_rows_outside_it(tmp_path):
 
 
 def test_a_three_row_files_prices_are_read_inside_its_window_only(tmp_path):
-    """A row outside the window lands nothing, so its price cells are not judged."""
+    """A row outside the window lands nothing, so its price cells are not judged. The row inside
+    it is longer than its header, which this layout has always landed."""
     root = _lake(tmp_path)
-    rows = f"{BEFORE},nan,2.0,0.5,1.5,5\n{TUE},1.0,2.0,0.5,1.5,5\n"
+    rows = f"{BEFORE},nan,2.0,0.5,1.5,5\n{TUE},1.0,2.0,0.5,1.5,5,x,x\n"
     source = _text(tmp_path / "src" / "gld.csv", _HEADER + rows)
     vintages = _entry(source, splits=None, layout="three-row")
 
@@ -1971,6 +2002,28 @@ SPLIT_CELL = "0.125"
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
         (
+            _days(*FULL, d12={"Stock_Splits": "0.124"}),
+            SPLIT,
+            "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": "0.126"}),
+            SPLIT,
+            "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": "-0.125"}),
+            (),
+            "line 5 holds a split on 2012-04-12 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": "1.0"}),
+            (),
+            "line 5 holds a split on 2012-04-12 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
             _days(*FULL, d11={"Stock_Splits": SPLIT_CELL}),
             SPLIT,
             "line 4 holds a split on 2012-04-11 in its Stock Splits column, which GLD's entry "
@@ -2013,6 +2066,10 @@ SPLIT_CELL = "0.125"
         "missing",
         "unlisted",
         "another-factor",
+        "just-below-the-factor",
+        "just-above-the-factor",
+        "negative",
+        "one",
         "another-date",
         "outside-the-window",
         "none-listed",
@@ -2031,8 +2088,20 @@ def test_a_split_the_entry_does_not_record_refuses(tmp_path, rows, splits, expec
     message = _refused(root, [source], _entry(source, splits=splits))
 
     assert message == f"{source} {expected}, so nothing was imported"
-    assert not any(factor in message for factor in ("0.125", "0.25", "0.5"))
+    factors = ("0.125", "0.124", "0.126", "0.25", "0.5", "1.0")
+    assert not any(factor in message for factor in factors)
     assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    ("layout", "splits"),
+    [("one_row", None), ("one-row", None), ("three-row", ())],
+    ids=["misspelled-layout", "one-row-without-splits", "three-row-with-splits"],
+)
+def test_an_entry_that_would_skip_a_check_cannot_be_built(layout, splits):
+    """Catches a list entry that forgets ``splits``, or whose layout falls to the other reader."""
+    with pytest.raises(ValueError, match="test:gld.csv"):
+        Vintage("ab" * 32, "GLD", "test:gld.csv", AS_OF, BASIS_ADJUSTED, layout, None, splits)
 
 
 def test_the_listed_splits_land_and_tell_two_swapped_digests_apart(tmp_path):
@@ -2167,13 +2236,17 @@ def test_a_bad_date_outside_the_window_refuses(tmp_path, rows, expected):
 
 @pytest.mark.parametrize(
     ("names", "column"),
-    [(ONE_ROW_NAMES, "Volume"), (ONE_ROW_NAMES[::-1], "Date")],
-    ids=["file-order", "date-last"],
+    [
+        (ONE_ROW_NAMES, "Volume"),
+        (ONE_ROW_NAMES[::-1], "Date"),
+        ((*(n for n in ONE_ROW_NAMES if n != "Dividends"), "Dividends"), "Dividends"),
+    ],
+    ids=["file-order", "date-last", "unread-last"],
 )
 @pytest.mark.parametrize("row", [5, 1], ids=["outside", "inside"])
 def test_a_row_short_by_its_last_cell_refuses(tmp_path, names, column, row):
-    """Catches a width taken from the price columns alone, and a date read before the width,
-    which would raise on the order whose last column is the date."""
+    """Catches a width taken from the columns read, and a date read before the width, which would
+    raise on the order whose last column is the date."""
     root = _lake(tmp_path)
     source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL), names=names)
     lines = source.read_text().splitlines()
@@ -2185,6 +2258,55 @@ def test_a_row_short_by_its_last_cell_refuses(tmp_path, names, column, row):
         f"{source} line {row + 2} has 9 field(s) and ends before {column}, so nothing was imported"
     )
     assert _snapshot(root) == before
+
+
+def test_a_row_short_by_two_cells_names_the_first_it_lacks(tmp_path):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    source.write_text(source.read_text().rstrip("\n").rsplit(",", 2)[0] + "\n")
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 7 has 8 field(s) and ends before Stock Splits, so nothing was imported"
+    )
+
+
+def test_a_row_inside_the_window_on_a_day_with_no_session_refuses(tmp_path):
+    """Saturday 2012-04-14 between Friday and Monday. Catches the check made only for a file with
+    no window, which would land a write-once partition no session owns."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(FRI, "2012-04-14", AFTER))
+    before = _snapshot(root)
+    vintages = _entry(source, window=(date(2012, 4, 10), date(2012, 4, 16)))
+
+    assert _refused(root, [source], vintages) == (
+        f"{source}: 2012-04-14 is not a session, so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize(("day", "line"), [("d11", 4), ("d16", 7)], ids=["inside", "outside"])
+def test_a_row_longer_than_its_header_refuses(tmp_path, day, line):
+    """An unquoted thousands separator in the last column, which would land 1,000,300 as 1."""
+    root = _lake(tmp_path)
+    rows = _days(*FULL, **{day: {"Volume": "1,000,300"}})
+    source = _one_row(tmp_path / "src" / "gld.csv", rows)
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line {line} has 12 field(s), more than its header names, so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_a_row_of_blank_cells_refuses(tmp_path):
+    """Catches a blank row skipped the way an empty line is."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    source.write_text(source.read_text() + "," * 9 + "\n")
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 8 has no YYYY-MM-DD date in its Date column, so nothing was imported"
+    )
 
 
 def test_bytes_that_are_not_utf8_refuse_and_quote_nothing(tmp_path):
@@ -2204,8 +2326,12 @@ def test_one_row_columns_in_another_order_and_an_empty_line_read_back(tmp_path):
     source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE, WED), names=ONE_ROW_NAMES[::-1])
     source.write_text(source.read_text().replace("2012-04-10\n", "2012-04-10\n\n"))
 
-    _run(root, [source], _entry(source))
+    summary = _run(root, [source], _entry(source))
 
+    assert summary.render().endswith(", 0 row(s) outside the window")
+    assert _dry(root, [source], _entry(source)).endswith(
+        ", 0 row(s) outside the window. Nothing was written"
+    )
     table = load_bars("GLD", "1d", lake_root=root)
     assert table.column("open").to_pylist() == [39.373456, 40.373456]
     assert table.column("high").to_pylist() == [41.373456, 42.373456]
@@ -2214,17 +2340,17 @@ def test_one_row_columns_in_another_order_and_an_empty_line_read_back(tmp_path):
     assert table.column("volume").to_pylist() == [1000300, 1000301]
 
 
-def test_the_smallest_and_the_largest_volume_land(tmp_path):
+def test_the_smallest_and_the_largest_volume_land_and_so_does_a_tiny_price(tmp_path):
     root = _lake(tmp_path)
-    rows = _days(TUE, WED, d10={"Volume": "1"}, d11={"Volume": "9223372036854775807"})
+    tiny = {"Volume": "1", "Low": "0.000001"}
+    rows = _days(TUE, WED, d10=tiny, d11={"Volume": "9223372036854775807"})
     source = _one_row(tmp_path / "src" / "gld.csv", rows)
 
     _run(root, [source], _entry(source))
 
-    assert load_bars("GLD", "1d", lake_root=root).column("volume").to_pylist() == [
-        1,
-        9223372036854775807,
-    ]
+    table = load_bars("GLD", "1d", lake_root=root)
+    assert table.column("volume").to_pylist() == [1, 9223372036854775807]
+    assert table.column("low").to_pylist() == [0.000001, 39.623456]
 
 
 # -- the sessions the window names
@@ -2255,6 +2381,27 @@ def test_a_file_starting_weeks_into_its_window_counts_them_all(tmp_path):
     (ticker,) = _run(root, [source], vintages).tickers
 
     assert (ticker.landed, ticker.missing) == (1, 15)
+
+
+def test_a_file_that_starts_before_another_files_window_lands_beside_it(tmp_path):
+    """A row of 2006 and a window from 2012 in one run. Catches a history calendar started at the
+    window alone, which raises ``DateOutOfBounds`` on the earlier file."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    gld = _csv(tmp_path / "src" / "gld.csv", [("2006-04-26", 1.0)])
+    uso = _one_row(tmp_path / "src" / "uso.csv", _days(TUE, WED))
+
+    summary = _run(root, [gld, uso], {**_listed((gld, "GLD")), **_entry(uso, "USO")})
+
+    assert [ticker.landed for ticker in summary.tickers] == [1, 2]
+
+
+def test_an_empty_listed_file_refuses(tmp_path):
+    root = _lake(tmp_path)
+    source = _text(tmp_path / "src" / "gld.csv", "")
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 1 names its Date column 0 time(s), so nothing was imported"
+    )
 
 
 def test_a_file_with_no_row_inside_its_window_refuses(tmp_path):
@@ -2413,6 +2560,43 @@ def test_an_in_window_key_of_another_import_is_not_a_killed_imports(tmp_path):
     _run(root, sources[1:], vintages)
     assert _undo(root, sources, vintages).lines == 4
     assert _snapshot(root) == before
+
+
+def test_a_file_the_undo_cannot_read_says_nothing_was_undone(tmp_path):
+    """The undo reads the file on every run, so its refusals end in its own words. The entry's
+    splits changed after the import, as a later deploy could change them."""
+    root, sources, vintages = _pair(tmp_path)
+    _run(root, sources, vintages)
+    after = _snapshot(root)
+    changed = {**vintages, **_entry(sources[1], "USO", splits=())}
+
+    assert _undo_refused(root, sources, changed) == (
+        f"{sources[1]} line 5 holds a split on 2012-04-12 in its Stock Splits column, which USO's "
+        "entry does not list, so nothing was undone"
+    )
+    assert _snapshot(root) == after
+
+
+def test_a_key_the_undo_cannot_look_for_refuses_with_one_line(tmp_path, monkeypatch):
+    """GLD recorded and USO's directory unsearchable. Catches a traceback in place of a refusal."""
+    root, sources, vintages = _pair(tmp_path)
+    _run(root, sources[:1], vintages)
+    after = _snapshot(root)
+    real = Path.exists
+
+    def unsearchable(self, *args, **kwargs):
+        if "ticker=USO" in self.parts:
+            raise PermissionError(13, "Permission denied")
+        return real(self, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "exists", unsearchable)
+        message = _undo_refused(root, sources, vintages)
+
+    assert message == (
+        f"{_rel('USO', TUE)} cannot be looked for (PermissionError), so nothing was undone"
+    )
+    assert _snapshot(root) == after
 
 
 def test_a_rerun_of_a_windowed_import_writes_nothing_and_exits_zero(tmp_path, monkeypatch, capsys):

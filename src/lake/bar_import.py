@@ -121,7 +121,7 @@ The runbook runs it first.
 **An undo** (``undo`` and ``schwab-undo``, by the owner's decision of 2026-11-01 on #950,
 which ``_undo`` holds for both) works only until the
 import reaches the bucket. The runtime reads the bucket, so removing files on the VM alone would
-withdraw nothing from it, and once the nightly upload has sent an import no command withdraws
+withdraw nothing from it, and once any upload has sent an import no command withdraws
 it. So the undo refuses unless the manifest's last lines are exactly the import's entries, and
 the bucket's ``manifest.jsonl`` is absent or a byte prefix of the manifest cut back to before
 them, and the bucket lists none of the import's keys. It also refuses on any of the import's keys
@@ -288,6 +288,17 @@ class Vintage:
     layout: str = LAYOUT_THREE_ROW
     window: tuple[date, date] | None = None
     splits: tuple[tuple[date, float], ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse an entry that would skip a check by leaving a field out or misspelling it.
+
+        A layout neither constant names would read as three rows, and a one-row entry with no
+        ``splits`` as one that lists none.
+        """
+        if self.layout not in (LAYOUT_THREE_ROW, LAYOUT_ONE_ROW):
+            raise ValueError(f"{self.source} names the layout {self.layout!r}, which is not one")
+        if (self.splits is not None) != (self.layout == LAYOUT_ONE_ROW):
+            raise ValueError(f"{self.source} states splits if and only if its layout is one-row")
 
     @property
     def provenance(self) -> Provenance:
@@ -491,12 +502,14 @@ class _Header:
     splits: int | None = None
 
 
-def _three_row_header(path: Path, lines: Sequence[Sequence[str]], vintage: Vintage) -> _Header:
+def _three_row_header(
+    path: Path, lines: Sequence[Sequence[str]], vintage: Vintage, outcome: str
+) -> _Header:
     """``Price`` and the column names, then ``Ticker`` and the ticker per column, then ``Date``."""
     if len(lines) < 3 or [line[:1] for line in lines[:3]] != [["Price"], ["Ticker"], ["Date"]]:
         raise BarImportRefused(
             f"{path} does not open with yfinance's three header rows, Price, Ticker and Date, "
-            "so nothing was imported"
+            f"so {outcome}"
         )
     names = lines[0]
     columns: dict[str, int] = {}
@@ -504,21 +517,21 @@ def _three_row_header(path: Path, lines: Sequence[Sequence[str]], vintage: Vinta
         found = [index for index, name in enumerate(names) if name == header]
         if len(found) != 1:
             raise BarImportRefused(
-                f"{path} names its {header} column {len(found)} time(s) in its Price row, so "
-                "nothing was imported"
+                f"{path} names its {header} column {len(found)} time(s) in its Price row, "
+                f"so {outcome}"
             )
         columns[field_name] = found[0]
     named = sorted({cell for cell in lines[1][1:] if cell})
     if named != [vintage.ticker]:
         raise BarImportRefused(
             f"{path} names {', '.join(named) or 'no ticker'} in its Ticker row, and its SHA-256 "
-            f"is listed as {vintage.ticker}'s vintage, so nothing was imported"
+            f"is listed as {vintage.ticker}'s vintage, so {outcome}"
         )
     # A three-row file's row needs only to reach its last price column.
     return _Header(width=max(columns.values()) + 1, first_row=3, day=0, prices=columns)
 
 
-def _one_row_header(path: Path, lines: Sequence[Sequence[str]]) -> _Header:
+def _one_row_header(path: Path, lines: Sequence[Sequence[str]], outcome: str) -> _Header:
     """One row of column names, each of the seven read here named exactly once."""
     names = lines[0] if lines else []
     columns: dict[str, int] = {}
@@ -526,8 +539,7 @@ def _one_row_header(path: Path, lines: Sequence[Sequence[str]]) -> _Header:
         found = [index for index, name in enumerate(names) if name == header]
         if len(found) != 1:
             raise BarImportRefused(
-                f"{path} line 1 names its {header} column {len(found)} time(s), so nothing was "
-                "imported"
+                f"{path} line 1 names its {header} column {len(found)} time(s), so {outcome}"
             )
         columns[header] = found[0]
     return _Header(
@@ -556,12 +568,14 @@ def _volume(cell: str) -> int | None:
     return value if 1 <= value <= _MAX_VOLUME else None
 
 
-def _check_splits(path: Path, found: Mapping[date, tuple[int, float]], vintage: Vintage) -> None:
+def _check_splits(
+    path: Path, found: Mapping[date, tuple[int, float]], vintage: Vintage, outcome: str
+) -> None:
     """Refuse unless the file's non-zero splits are the entry's, naming dates and no factor.
 
     ``found`` maps each split's date to its line and its factor.
     """
-    listed = dict(vintage.splits or ())
+    listed = dict(vintage.splits)
     for day in sorted({*found, *listed}):
         if day not in listed:
             why = (
@@ -580,29 +594,36 @@ def _check_splits(path: Path, found: Mapping[date, tuple[int, float]], vintage: 
             )
         else:
             continue
-        raise BarImportRefused(f"{path} {why}, so nothing was imported")
+        raise BarImportRefused(f"{path} {why}, so {outcome}")
 
 
-def _read_source(path: Path, data: bytes, vintage: Vintage) -> tuple[list[_SourceBar], int]:
+def _read_source(
+    path: Path, data: bytes, vintage: Vintage, outcome: str
+) -> tuple[list[_SourceBar], int]:
     """The rows of ``data`` inside the entry's window and the count outside it, or a refusal.
 
     ``data`` is the bytes whose digest the list names, read from ``path`` once, and ``path`` is
     only for the refusal's words. The layouts differ in their header, in the columns they read and
     in their refusals' words, and one loop reads the rows of both. A row's date is parsed
     wherever it falls, its split is too, and its prices and volume are read only inside the
-    window. A one-row file's refusals quote no price, volume or split value.
+    window. A one-row file's refusals quote no price, volume or split value. ``outcome`` ends
+    each refusal, because the undo reads the file too.
     """
     try:
         lines = list(csv.reader(io.StringIO(data.decode("utf-8"), newline="")))
     except (UnicodeDecodeError, csv.Error) as exc:
         raise BarImportRefused(
-            f"{path} cannot be read as CSV ({type(exc).__name__}), so nothing was imported"
+            f"{path} cannot be read as CSV ({type(exc).__name__}), so {outcome}"
         ) from None
     one_row = vintage.layout == LAYOUT_ONE_ROW
-    header = _one_row_header(path, lines) if one_row else _three_row_header(path, lines, vintage)
+    header = (
+        _one_row_header(path, lines, outcome)
+        if one_row
+        else _three_row_header(path, lines, vintage, outcome)
+    )
 
     def refused(number: int, why: str) -> BarImportRefused:
-        return BarImportRefused(f"{path} line {number} {why}, so nothing was imported")
+        return BarImportRefused(f"{path} line {number} {why}, so {outcome}")
 
     first, last = vintage.window or (date.min, date.max)
     seen: set[date] = set()
@@ -615,6 +636,9 @@ def _read_source(path: Path, data: bytes, vintage: Vintage) -> tuple[list[_Sourc
         # A one-row file's Date may sit past a short row's end, so its width is checked first.
         if one_row and len(line) < header.width:
             raise refused(number, f"has {len(line)} field(s) and ends before {lines[0][len(line)]}")
+        # An extra cell, such as an unquoted thousands separator makes, shifts what follows it.
+        if one_row and len(line) > header.width:
+            raise refused(number, f"has {len(line)} field(s), more than its header names")
         cell = line[header.day]
         day = parse_date_dir(DATE_PREFIX + cell)
         if day is None:
@@ -629,7 +653,7 @@ def _read_source(path: Path, data: bytes, vintage: Vintage) -> tuple[list[_Sourc
                 raise refused(number, f"repeats {day.isoformat()} in its {_DATE_COLUMN} column")
             raise BarImportRefused(
                 f"{path} holds {day.isoformat()} twice, and an import lands one partition per "
-                "session, so nothing was imported"
+                f"session, so {outcome}"
             )
         seen.add(day)
         if len(line) < header.width:
@@ -667,13 +691,13 @@ def _read_source(path: Path, data: bytes, vintage: Vintage) -> tuple[list[_Sourc
                 )
         rows.append(_SourceBar(day=day, **values, volume=volume))
     if one_row:
-        _check_splits(path, splits, vintage)
+        _check_splits(path, splits, vintage, outcome)
     if not rows:
         if vintage.window is None:
-            raise BarImportRefused(f"{path} holds no rows, so nothing was imported")
+            raise BarImportRefused(f"{path} holds no rows, so {outcome}")
         raise BarImportRefused(
             f"{path} holds no row inside its window, {first.isoformat()} to {last.isoformat()}, "
-            "so nothing was imported"
+            f"so {outcome}"
         )
     return rows, outside
 
@@ -1043,7 +1067,7 @@ def import_vintages(
                 f"two sources name {vintage.ticker}, and one partition per ticker-day means the "
                 "first source imported holds each day, so nothing was imported"
             )
-        rows, outside = _read_source(path, data, vintage)
+        rows, outside = _read_source(path, data, vintage, "nothing was imported")
         plans.append(
             _Plan(
                 ticker=vintage.ticker,
@@ -1619,7 +1643,7 @@ def undo_vintages(
         return [
             paths.bars_partition_path(vintage.ticker, DAILY_FREQ, bar.day)
             for source, data, vintage in chosen
-            for bar in _read_source(source, data, vintage)[0]
+            for bar in _read_source(source, data, vintage, "nothing was undone")[0]
         ]
 
     return _undo(
@@ -1666,7 +1690,15 @@ def _undo(
 
     def refuse_unrecorded() -> None:
         for key, rel in wanted:
-            if rel not in named and key.exists():
+            if rel in named:
+                continue
+            try:
+                found = key.exists()
+            except OSError as exc:
+                raise BarImportRefused(
+                    f"{rel} cannot be looked for ({type(exc).__name__}), so nothing was undone"
+                ) from None
+            if found:
                 raise BarImportRefused(
                     f"{rel} is on disk and no manifest line names it, which a killed import "
                     "leaves. Run the import again to record it, then run the undo"
