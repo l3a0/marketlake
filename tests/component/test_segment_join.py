@@ -5,8 +5,9 @@ be recaptured. So each way a day's segments can disagree is sealed here and comp
 whole table written out, which shares nothing with the code. The schema is this file's own, so a
 column the lake pins later moves none of it.
 
-``lake.segment_join`` is also a published contract (marketlake #1004), so two tests keep the seal,
-the door and the measurements on the one join rather than on copies of it.
+``lake.segment_join`` is also a published contract (marketlake #1004), so the last tests hold that
+the seal, the door and the measurements each import the one join. A caller that imported it and
+joined another way would leave the import unused, which ruff's F401 refuses.
 """
 
 from __future__ import annotations
@@ -165,31 +166,43 @@ def test_a_null_column_takes_the_other_segments_type(lake_root, surface):
 
 def test_a_torn_segment_gives_the_rows_before_the_tear(lake_root, surface):
     _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data")
-    torn = _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    torn = journal.segment_path(lake_root, surface, "SPY", DAY, "20260824T133200", 4242)
+    with journal.SegmentWriter(torn, PINNED) as writer:
+        for minute, bid in ((32, 2.5), (33, 3.5)):
+            row = {"snap_ts": _snap(minute), "bid": bid, "size": 20, "row_kind": "data"}
+            writer.write_cycle(pa.Table.from_pylist([row], schema=PINNED))
     torn.write_bytes(torn.read_bytes()[:-60])
-    _segment(lake_root, surface, 33, PINNED, 3.5, 30, "data")
-    rows = [(_snap(31), 1.5, 10, "data"), (_snap(33), 3.5, 30, "data")]
+    assert journal.read_segment(torn).num_rows == 1
+    _segment(lake_root, surface, 34, PINNED, 4.5, 40, "data")
+    rows = [
+        (_snap(31), 1.5, 10, "data"),
+        (_snap(32), 2.5, 20, "data"),
+        (_snap(34), 4.5, 40, "data"),
+    ]
     _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
 
 
 def test_the_first_segments_metadata_is_the_partitions(lake_root, surface):
     _segment(lake_root, surface, 31, PINNED.with_metadata({b"k": b"first"}), 1.5, 10, "data")
     _segment(lake_root, surface, 32, PINNED.with_metadata({b"k": b"later"}), 2.5, 20, "data")
-    assert _sealed(lake_root, surface).schema.metadata == {b"k": b"first"}
+    assert _sealed(lake_root, surface).schema.metadata[b"k"] == b"first"
 
 
+@pytest.mark.parametrize("first", ["pinned", "retyped"])
 @pytest.mark.parametrize("kind", [pa.float64(), pa.int32(), pa.string()])
-def test_a_retyped_column_seals_nothing_and_keeps_both_segments(lake_root, surface, kind):
+def test_a_retyped_column_seals_nothing_and_keeps_both_segments(lake_root, surface, kind, first):
     value = "20" if kind == pa.string() else 20
+    pinned_at, retyped_at = (31, 32) if first == "pinned" else (32, 31)
     paths = [
-        _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data"),
-        _segment(lake_root, surface, 32, _retyped("size", kind), 2.5, value, "data"),
+        _segment(lake_root, surface, pinned_at, PINNED, 1.5, 10, "data"),
+        _segment(lake_root, surface, retyped_at, _retyped("size", kind), 2.5, value, "data"),
     ]
     before = [path.read_bytes() for path in paths]
     result = _seal(lake_root)
     assert result.sealed == ()
     assert [item.surface for item in result.refused] == [surface]
     assert [path.read_bytes() for path in paths] == before
+    assert not LakePaths(lake_root).partition_path(surface, "SPY", DAY).exists()
 
 
 # -- the two functions -------------------------------------------------------
@@ -204,11 +217,11 @@ def test_the_join_fills_a_missing_column_with_nulls_in_the_order_given():
 
 
 @pytest.mark.parametrize("kind", [pa.float64(), pa.int32(), pa.string(), pa.bool_()])
-def test_the_join_refuses_a_column_at_two_types(kind):
-    with pytest.raises(pa.ArrowTypeError):
-        segment_join.merge_by_name(
-            [pa.table({"a": pa.array([1])}), pa.table({"a": pa.array([None], type=kind)})]
-        )
+def test_the_join_refuses_a_column_at_two_types_in_either_order(kind):
+    tables = [pa.table({"a": pa.array([1])}), pa.table({"a": pa.array([None], type=kind)})]
+    for ordered in (tables, tables[::-1]):
+        with pytest.raises(pa.ArrowTypeError):
+            segment_join.merge_by_name(ordered)
 
 
 def test_the_order_is_the_pinned_one_with_the_rest_kept_behind_it():
@@ -223,10 +236,10 @@ def test_the_order_is_the_pinned_one_with_the_rest_kept_behind_it():
 
 
 @pytest.mark.parametrize("module", [compact_module, unsealed, measure])
-def test_each_by_name_reader_joins_through_the_one_function(module):
+def test_each_by_name_reader_imports_the_one_join(module):
     assert module.merge_by_name is segment_join.merge_by_name
 
 
 @pytest.mark.parametrize("module", [compact_module, unsealed])
-def test_the_seal_and_the_door_order_through_the_one_function(module):
+def test_the_seal_and_the_door_import_the_one_order(module):
     assert module.pinned_order is segment_join.pinned_order

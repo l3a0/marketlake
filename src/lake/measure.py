@@ -203,9 +203,10 @@ class SameDayExpiry:
 class OiRefresh:
     """The intra-session OI-refresh moment, if one was observed.
 
-    ``observed`` is false when there were too few cycles to detect a change, or the OI
-    never moved that session. ``atomic`` is true when the refreshed cycle already held
-    the session's settled OI on the contracts it shares with the final cycle.
+    ``observed`` is false when there were too few cycles to detect a change, or no contract
+    that holds open interest in the first cycle moved that session. ``atomic`` is true when
+    the refreshed cycle shares a contract holding open interest with the final cycle, and
+    already held its settled OI on every one it shares.
     """
 
     refresh_slot: str | None
@@ -280,10 +281,10 @@ def _oi_map(cycle_rows: list[dict]) -> dict[str, object]:
 
     A contract whose open interest is null is left out, because comparing a value with a null
     would report a refresh the vendor never made. A null is what the vendor sent, or what the
-    join fills on the rows of a segment that lacks the column. Two prices follow. A day whose
-    first cycle holds no open interest shows no refresh at all. A day whose last cycle holds
-    none still shows a refresh between two cycles that do, and it never reads as atomic, since
-    nothing is left to compare the refreshed state with.
+    join fills on the rows of a segment that lacks the column. The prices are per contract. One
+    that holds no open interest in the first cycle shows no refresh. One that holds none in the
+    last cycle has no say in whether a refresh was atomic, and where every contract is like
+    that, none reads as atomic.
     """
     return {
         row["occ_symbol"]: row["open_interest"]

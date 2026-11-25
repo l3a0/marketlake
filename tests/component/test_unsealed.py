@@ -417,6 +417,13 @@ def test_a_moved_an_added_and_a_dropped_column_read_as_the_seal_reads_them(lake_
     _same(answer, _sealed_rows(lake_root))
 
 
+def test_a_lifted_column_joins_the_ones_the_named_segments_hold(lake_root):
+    _ledger(lake_root, 1, without={1: ("bid_size",)})
+    subset = _read(lake_root, _named(lake_root, _promoted(lake_root)[0]))
+    assert subset.column_names[-1] == "bid_size"
+    assert subset.column("bid_size").to_pylist() == [31]
+
+
 def test_the_columns_are_those_the_named_segments_hold(lake_root):
     # ``bid_size`` arrives with the second segment. A subset before it has no such column, and
     # the sealed doors take theirs from the whole day.
@@ -1224,16 +1231,23 @@ def test_the_newest_row_is_the_one_a_replay_reaches(lake_root, at, bid):
     assert newest == _replay(lake_root, at)
 
 
-def test_a_replay_sees_a_row_that_reached_the_bucket_after_the_decision(lake_root):
-    # 13:39's row was captured by ``at``, and its segment was not yet listed. The sealed day
-    # cannot say so, which is why a decision's mapping is what reproduces it.
+@pytest.mark.parametrize(
+    ("case", "bid", "replayed"), [("unlisted", 38.0, 39.0), ("lost since", 39.0, 38.0)]
+)
+def test_a_replay_can_take_another_row_than_the_decision_did(lake_root, case, bid, replayed):
+    # 13:39's row was captured by ``at``. Its segment was not listed yet, or it left the capture
+    # host after the decision read it. The sealed day holds it in the first case and not in the
+    # second, which is why a decision's own mapping is what reproduces it.
     _ledger(lake_root, 2)
     rels = [_minute(lake_root, minute, bid=float(minute)) for minute in (38, 39)]
     at = _utc(13, 39, 5)
-    decided = _newest(_read(lake_root, _named(lake_root, rels[0]), at))
+    segments = _named(lake_root, *(rels[:1] if case == "unlisted" else rels))
+    decided = _newest(_read(lake_root, segments, at))
+    if case == "lost since":
+        (lake_root / rels[1]).unlink()
     _seal(lake_root)
-    assert decided["bid"] == 38.0
-    assert _replay(lake_root, at)["bid"] == 39.0
+    assert decided["bid"] == bid
+    assert _replay(lake_root, at)["bid"] == replayed
 
 
 @pytest.mark.parametrize("name", ["row_kind", "fetch_end_ts"])

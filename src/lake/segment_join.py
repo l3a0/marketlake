@@ -49,7 +49,7 @@ def pinned_order(table: pa.Table, pinned: pa.Schema) -> pa.Table:
 
     No read inside the lake depends on the order. Every read in ``src/`` is by name, and the
     documented multi-day path is DuckDB's ``union_by_name``. ``lake.unsealed`` returns this
-    order to its callers, so it is also a published one.
+    order to its callers, with any column its projection adds behind it.
 
     A column the pinned schema does not name keeps its place at the end rather than being
     dropped, so the reorder moves columns and never loses one.

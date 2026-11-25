@@ -330,6 +330,15 @@ def test_a_refresh_before_the_open_interest_goes_is_never_atomic(lake_root, last
     assert refresh.atomic is False
 
 
+def test_a_refresh_that_goes_on_moving_is_not_atomic(lake_root):
+    for name, snap, far_oi in (("a", _OPEN, 1000), ("b", _T1, 1200), ("c", _T2, 1300)):
+        _segment(lake_root, name, _cycle(snap, 0.5, far_oi=far_oi), journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.refresh_slot == _T1.isoformat()
+    assert refresh.atomic is False
+
+
 def test_zero_open_interest_is_a_value(lake_root):
     _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=0), journal.CHAINS_SCHEMA)
     _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=700), journal.CHAINS_SCHEMA)
