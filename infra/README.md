@@ -1741,7 +1741,8 @@ across boots, because `journalctl -k` reads only the current boot:
 journalctl _TRANSPORT=kernel --since "30 days ago" | grep -i 'out of memory: killed'
 ```
 
-No line means no kill. The reads above show only the present, and the nightly stop empties swap, so a
+No line means no kill in the boots `journalctl --list-boots` shows, since a replacement
+discards the older ones. The reads above show only the present, and the nightly stop empties swap, so a
 morning reading says nothing about the evening before.
 
 The design's paragraph "The VM is a `t4g.medium`", in its
