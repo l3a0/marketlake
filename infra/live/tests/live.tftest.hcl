@@ -718,13 +718,13 @@ run "instance_is_built_as_the_issue_describes" {
       aws_instance.vm.subnet_id,
       tolist(aws_instance.vm.vpc_security_group_ids),
       ] == [
-      "t4g.small",
+      "t4g.medium",
       aws_iam_instance_profile.instance.name,
       "marketlake-vm",
       data.aws_subnet.default.id,
       tolist([aws_security_group.vm.id]),
     ]
-    error_message = "The instance is not a t4g.small with marketlake-instance, the marketlake-vm key, the zone's subnet and its group."
+    error_message = "The instance is not a t4g.medium with marketlake-instance, the marketlake-vm key, the zone's subnet and its group."
   }
 
   assert {

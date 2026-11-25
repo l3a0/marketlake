@@ -3458,7 +3458,7 @@ def test_a_dead_token_on_one_surface_alone_spawns_no_pull(tmp_path):
 def test_a_pull_that_does_not_start_costs_the_pull_and_not_the_daemon(tmp_path, capsys):
     """The cycle hook has no guard around it, so the spawn guards itself.
 
-    A fork the 2 GiB VM refuses would otherwise end the loop, and the service manager
+    A fork the VM refuses would otherwise end the loop, and the service manager
     would restart it into the same refusal. The spawn prints one line, the loop keeps
     ticking, and the next pull is tried five minutes of slots later.
     """

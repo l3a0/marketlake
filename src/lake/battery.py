@@ -1111,7 +1111,7 @@ def read_entitlement(
 
     **The memory goes to the strings, so the read streams.** Decoding the five columns of a
     whole ticker-day at once peaked at 1,295.8 MiB of Arrow memory on SPY 2026-09-28, 5,397,364
-    rows, and the 18:30 sweep runs on a 2 GiB host (marketlake #670). So the read decodes
+    rows, and the 18:30 sweep then ran on a 2 GiB host (marketlake #670). So the read decodes
     ``batch_size`` rows at a time and keeps only the float64 seconds of each batch's session
     rows. The same day then peaked at 89.7 MiB. Each batch runs the steps the whole read ran,
     in the same order: the data-row filter, the flag count, the session filter, then the stamp

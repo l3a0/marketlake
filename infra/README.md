@@ -1362,9 +1362,8 @@ runs the daemon.
    ```
 
    Without a default VPC, the pull request's plan fails at the `data "aws_vpc"` lookup,
-   before anything is created. The zone is a literal in the code. The measurement VM,
-   `marketlake-measure`, runs in it, so the zone is known to offer `t4g.small` in this
-   account.
+   before anything is created. The zone is a literal in the code. On
+   2026-11-25 `aws ec2 describe-instance-type-offerings` listed `t4g.medium` there.
 
    The image lookup in `infra/live/vm.tf` names Ubuntu's images by a pattern. On
    2026-10-07 this command printed `ubuntu-noble-24.04-arm64-server-20261004`, so the
@@ -1718,9 +1717,9 @@ sudo e2fsck -n -b 32768 -B 4096 <dev>
 ### See how much swap the VM uses
 
 The bootstrap gives the VM a 1 GiB swap file at `/swapfile`, so a shortage of memory slows
-a job rather than the kernel killing it. Past about 2,858 MiB of demand, memory and swap
-together, the kernel kills again. Do not run the sweep by hand during a session, because a
-job that pages then could delay capture cycles, and that delay is unmeasured.
+a job rather than the kernel killing it. Past what memory and swap hold together, which
+`free -m` prints, the kernel kills again. Do not run the sweep by hand during a session,
+because a job that pages then could delay capture cycles, and that delay is unmeasured.
 
 Read the swap's use on the VM.
 
@@ -1732,13 +1731,14 @@ vmstat 1 5
 
 `swapon --show` lists the file and how much of it is in use. In `vmstat`, the `si` and
 `so` columns count what moves in from swap and out to it each second, and both read 0
-while nothing is short of memory. A little swap in use with those columns at 0 means the
-pages sit idle. These reads show only the present, and the nightly stop empties swap, so a
+while nothing moves pages. A little swap in use with those columns at 0 means the
+pages sit idle. Swap in use is not a shortage by itself, because reading gigabytes of files
+pushes idle memory out. A low `available` in `free -m` is. These reads show only the present, and the nightly stop empties swap, so a
 morning reading says nothing about the evening before.
 
-The design's paragraph "A shortage of memory slows a job rather than killing it", in its
+The design's paragraph "The VM is a `t4g.medium`", in its
 [Deployment section](../docs/design.md#deployment-laptop-now-dedicated-later), holds the
-proposal for when to move to a `t4g.medium`.
+readings behind that size, and the proposal for when to move to a `t4g.large` follows it.
 
 After a rollout or a replacement, once the VM has been through a nightly stop and start,
 run these three reads. The first lists the file, the second prints 1, and the third prints
@@ -2445,16 +2445,16 @@ purpose.
 
 #### When a start fails on capacity
 
-AWS refuses a start with `InsufficientInstanceCapacity` when the zone has no `t4g.small` to
+AWS refuses a start with `InsufficientInstanceCapacity` when the zone has no `t4g.medium` to
 give. The zone is fixed, because the lake volume lives in `us-east-1c`, so the fast
 fallback is another arm64 type in the same zone. Change the type by hand while the
 instance is stopped, then start it.
 
 ```bash
-aws ec2 modify-instance-attribute --instance-id "<instance-id>" --instance-type Value=t4g.medium --profile marketlake-admin --region us-east-1
+aws ec2 modify-instance-attribute --instance-id "<instance-id>" --instance-type Value=t4g.large --profile marketlake-admin --region us-east-1
 ```
 
-The image is arm64, so the type must be too, such as `t4g.medium` or `m7g.medium`. The
+The image is arm64, so the type must be too, such as `t4g.large` or `m7g.medium`. The
 price is drift from `instance_type` in `infra/live/`, which the next apply reverts with a
 stop and a start. Approve that apply outside the hours in
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window).

@@ -81,11 +81,11 @@ variable "ssh_public_key" {
 }
 
 variable "instance_type" {
-  # Unmeasured until #633's sizing verdict lands. A change stops and starts the
-  # instance.
+  # Sized by memory. docs/design.md's paragraph "The VM is a t4g.medium" holds the
+  # readings. A change stops and starts the instance.
   description = "The VM's instance type."
   type        = string
-  default     = "t4g.small"
+  default     = "t4g.medium"
   nullable    = false
 }
 

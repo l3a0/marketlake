@@ -4,9 +4,8 @@
 
 locals {
   # A literal rather than a variable, because the lake volume carries prevent_destroy,
-  # and changing its zone would replace it. The measurement VM runs in this zone, so it
-  # is proven to offer t4g.small in this account. Whether it has a default subnet is
-  # still the owner's to confirm before the first apply.
+  # and changing its zone would replace it. On 2026-11-25 this zone offered t4g.medium,
+  # and the precondition on the lake volume refuses a type it does not offer.
   zone = "us-east-1c"
 }
 
