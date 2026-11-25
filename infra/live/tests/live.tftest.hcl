@@ -627,6 +627,25 @@ run "a_zone_without_the_instance_type_fails_the_plan" {
   expect_failures = [aws_ebs_volume.lake]
 }
 
+# The zone lookup and the instance must both read instance_type. Otherwise a resize could
+# check one type and launch another.
+run "zone_lookup_and_instance_follow_instance_type" {
+  command = plan
+
+  variables {
+    instance_type = "m7g.medium"
+  }
+
+  assert {
+    condition = jsonencode([
+      aws_instance.vm.instance_type,
+      data.aws_ec2_instance_type_offerings.instance_type.location_type,
+      [for f in data.aws_ec2_instance_type_offerings.instance_type.filter : [f.name, f.values]],
+    ]) == jsonencode(["m7g.medium", "availability-zone", [["instance-type", ["m7g.medium"]]]])
+    error_message = "The zone lookup and the instance do not follow instance_type."
+  }
+}
+
 run "security_group_allows_ssh_from_the_owner_and_all_egress" {
   command = plan
 
@@ -718,13 +737,13 @@ run "instance_is_built_as_the_issue_describes" {
       aws_instance.vm.subnet_id,
       tolist(aws_instance.vm.vpc_security_group_ids),
       ] == [
-      "t4g.small",
+      "t4g.medium",
       aws_iam_instance_profile.instance.name,
       "marketlake-vm",
       data.aws_subnet.default.id,
       tolist([aws_security_group.vm.id]),
     ]
-    error_message = "The instance is not a t4g.small with marketlake-instance, the marketlake-vm key, the zone's subnet and its group."
+    error_message = "The instance is not a t4g.medium with marketlake-instance, the marketlake-vm key, the zone's subnet and its group."
   }
 
   assert {

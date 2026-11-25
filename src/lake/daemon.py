@@ -1138,7 +1138,7 @@ def _start_token_pull(runner: PullRunner, args: Sequence[str], slot: datetime) -
     """Start one token pull, and never take the daemon down.
 
     This runs from ``on_cycle``, which no wrapper guards, unlike the session-relative
-    jobs ``_dispatched`` wraps. A fork the 2 GiB VM refuses would otherwise end the loop,
+    jobs ``_dispatched`` wraps. A fork the VM refuses would otherwise end the loop,
     and the service manager would restart it into the same refusal. So a failed spawn
     prints one line and the next pull is tried a spacing later. A spawn that started
     prints one line too, so the daemon's log says why a ``token_store:`` line follows.

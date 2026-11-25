@@ -167,7 +167,7 @@ leaves only a minute's resolve pass reading its two columns whole. Compaction wr
 groups of up to 1,048,576 rows. A fetch that decoded its kept group whole, in every column,
 before filtering it peaked at 869.9 MiB of Arrow memory to return the 13,028 rows of SPY's
 2026-09-24 close of record, and the whole read at 1,283.8 MiB. The 18:30 sweep's split
-detection makes this read once per sealed session, on a host with about 1,135 MiB to spare.
+detection makes this read once per sealed session, on a host that then had about 1,135 MiB to spare.
 So a filtered read decodes ``_READ_BATCH_ROWS`` rows at a time and filters each batch
 before the next. ``_read`` states the rules that keep that read answering what a whole read
 answered.
