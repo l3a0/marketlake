@@ -526,13 +526,28 @@ _HEADER = "Price,Close,High,Low,Open,Volume\nTicker,GLD,GLD,GLD,GLD,GLD\nDate,,,
         (_HEADER + "2006-04-26,inf,2.0,0.5,1.0,5\n", "not a finite number"),
         (_HEADER + "2006-04-26,1.0\n", "short of its header"),
         (_HEADER, "holds no rows"),
+        (_HEADER.replace("Close", "Other"), "names its Close column 0 time(s) in its Price row, "),
+        (
+            _HEADER.replace("Volume", "Close"),
+            "names its Close column 2 time(s) in its Price row, ",
+        ),
         (_HEADER.replace("Date,,,,,\n", "") + "2006-04-26,1.0,2.0,0.5,1.0,5\n", "three header"),
         (
             _HEADER.replace("Ticker,GLD,GLD", "Ticker,GLD,USO") + "2006-04-26,1,2,0,1,5\n",
             "GLD, USO",
         ),
     ],
-    ids=["blank", "nan", "inf", "short-line", "no-rows", "no-date-row", "mixed-ticker"],
+    ids=[
+        "blank",
+        "nan",
+        "inf",
+        "short-line",
+        "no-rows",
+        "no-close",
+        "two-closes",
+        "no-date-row",
+        "mixed-ticker",
+    ],
 )
 def test_a_malformed_file_refuses_with_one_line(tmp_path, text, expected):
     """An import is write-once, so a non-finite price must never land, and every malformed file
@@ -2002,14 +2017,19 @@ SPLIT_CELL = "0.125"
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
         (
-            _days(*FULL, d12={"Stock_Splits": "0.124"}),
+            _days(*FULL, d12={"Stock_Splits": "0.12499999"}),
             SPLIT,
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
         (
-            _days(*FULL, d12={"Stock_Splits": "0.126"}),
+            _days(*FULL, d12={"Stock_Splits": "0.12500001"}),
             SPLIT,
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}),
+            (*SPLIT, (date(2012, 4, 13), 0.5)),
+            "holds no split on 2012-04-13 in its Stock Splits column, which GLD's entry lists",
         ),
         (
             _days(*FULL, d12={"Stock_Splits": "-0.125"}),
@@ -2068,6 +2088,7 @@ SPLIT_CELL = "0.125"
         "another-factor",
         "just-below-the-factor",
         "just-above-the-factor",
+        "second-of-two",
         "negative",
         "one",
         "another-date",
@@ -2088,7 +2109,7 @@ def test_a_split_the_entry_does_not_record_refuses(tmp_path, rows, splits, expec
     message = _refused(root, [source], _entry(source, splits=splits))
 
     assert message == f"{source} {expected}, so nothing was imported"
-    factors = ("0.125", "0.124", "0.126", "0.25", "0.5", "1.0")
+    factors = ("0.125", "0.124", "0.25", "0.5", "1.0")
     assert not any(factor in message for factor in factors)
     assert _snapshot(root) == before
 
@@ -2285,15 +2306,21 @@ def test_a_row_inside_the_window_on_a_day_with_no_session_refuses(tmp_path):
 
 
 @pytest.mark.parametrize(("day", "line"), [("d11", 4), ("d16", 7)], ids=["inside", "outside"])
-def test_a_row_longer_than_its_header_refuses(tmp_path, day, line):
+@pytest.mark.parametrize(
+    ("cell", "cells"),
+    [("1,000,300", 12), ("100,300", 11), ("100300,", 11)],
+    ids=["two-more", "one-more", "one-blank-more"],
+)
+def test_a_row_longer_than_its_header_refuses(tmp_path, day, line, cell, cells):
     """An unquoted thousands separator in the last column, which would land 1,000,300 as 1."""
     root = _lake(tmp_path)
-    rows = _days(*FULL, **{day: {"Volume": "1,000,300"}})
+    rows = _days(*FULL, **{day: {"Volume": cell}})
     source = _one_row(tmp_path / "src" / "gld.csv", rows)
     before = _snapshot(root)
 
     assert _refused(root, [source], _entry(source)) == (
-        f"{source} line {line} has 12 field(s), more than its header names, so nothing was imported"
+        f"{source} line {line} has {cells} field(s), more than its header names, so nothing was "
+        "imported"
     )
     assert _snapshot(root) == before
 
@@ -2562,23 +2589,52 @@ def test_an_in_window_key_of_another_import_is_not_a_killed_imports(tmp_path):
     assert _snapshot(root) == before
 
 
-def test_a_file_the_undo_cannot_read_says_nothing_was_undone(tmp_path):
-    """The undo reads the file on every run, so its refusals end in its own words. The entry's
-    splits changed after the import, as a later deploy could change them."""
-    root, sources, vintages = _pair(tmp_path)
-    _run(root, sources, vintages)
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (
+            {"splits": ()},
+            "line 5 holds a split on 2012-04-12 in its Stock Splits column, which USO's entry "
+            "does not list",
+        ),
+        (
+            {"window": (date(2012, 4, 9), date(2012, 4, 13))},
+            "line 2 has no finite number above zero in its Open column",
+        ),
+        (
+            {"window": (date(2012, 5, 1), date(2012, 5, 2))},
+            "holds no row inside its window, 2012-05-01 to 2012-05-02",
+        ),
+        (
+            {"layout": "three-row", "splits": None},
+            "does not open with yfinance's three header rows, Price, Ticker and Date",
+        ),
+    ],
+    ids=["splits", "wider-window", "other-window", "other-layout"],
+)
+def test_a_file_the_undo_cannot_read_says_nothing_was_undone(tmp_path, change, expected):
+    """The undo reads the file on every run, so its refusals end in its own words. The entry
+    changed after the import, as a later deploy could change it. The file's row before the window
+    holds a bad price, which a wider window meets."""
+    root = _lake(tmp_path, ("USO",))
+    rows = _days(*FULL, d09={"Open": "0"}, d12={"Stock_Splits": SPLIT_CELL})
+    source = _one_row(tmp_path / "src" / "uso.csv", rows)
+    _run(root, [source], _entry(source, "USO", splits=SPLIT))
     after = _snapshot(root)
-    changed = {**vintages, **_entry(sources[1], "USO", splits=())}
 
-    assert _undo_refused(root, sources, changed) == (
-        f"{sources[1]} line 5 holds a split on 2012-04-12 in its Stock Splits column, which USO's "
-        "entry does not list, so nothing was undone"
-    )
+    message = _undo_refused(root, [source], _entry(source, "USO", **{"splits": SPLIT, **change}))
+
+    assert message == f"{source} {expected}, so nothing was undone"
     assert _snapshot(root) == after
 
 
-def test_a_key_the_undo_cannot_look_for_refuses_with_one_line(tmp_path, monkeypatch):
-    """GLD recorded and USO's directory unsearchable. Catches a traceback in place of a refusal."""
+@pytest.mark.parametrize(
+    ("error", "name"),
+    [(PermissionError(13, "Permission denied"), "PermissionError"), (OSError(5, "I/O"), "OSError")],
+    ids=["permission", "io"],
+)
+def test_a_key_the_undo_cannot_look_for_refuses_with_one_line(tmp_path, monkeypatch, error, name):
+    """GLD recorded and USO's directory unreadable. Catches a traceback in place of a refusal."""
     root, sources, vintages = _pair(tmp_path)
     _run(root, sources[:1], vintages)
     after = _snapshot(root)
@@ -2586,16 +2642,14 @@ def test_a_key_the_undo_cannot_look_for_refuses_with_one_line(tmp_path, monkeypa
 
     def unsearchable(self, *args, **kwargs):
         if "ticker=USO" in self.parts:
-            raise PermissionError(13, "Permission denied")
+            raise error
         return real(self, *args, **kwargs)
 
     with monkeypatch.context() as patched:
         patched.setattr(Path, "exists", unsearchable)
         message = _undo_refused(root, sources, vintages)
 
-    assert message == (
-        f"{_rel('USO', TUE)} cannot be looked for (PermissionError), so nothing was undone"
-    )
+    assert message == (f"{_rel('USO', TUE)} cannot be looked for ({name}), so nothing was undone")
     assert _snapshot(root) == after
 
 
