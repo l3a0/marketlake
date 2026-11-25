@@ -432,8 +432,8 @@ def leftover_temps(directory: Path | str, names: Collection[str]) -> list[Path]:
 
     ``temp_write_path`` names it ``<name>.tmp-<pid>``, so this is the one reading of that name.
     The directory is listed once, rather than once per name, because the bar import asks about
-    1,500 keys in one directory, and a ticker is free text to a glob, so it is never globbed. An
-    absent directory holds none.
+    thousands of keys in one directory, and a ticker is free text to a glob, so it is never
+    globbed. An absent directory holds none.
     """
     directory = Path(directory)
     try:

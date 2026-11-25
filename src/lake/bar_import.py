@@ -7,6 +7,18 @@ This module is the import path, and ``vintage`` is its first subcommand. ``schwa
 second (marketlake #951). Each builds a ``_Plan`` per ticker and hands it to ``_land``, which
 holds every rule that does not depend on the source.
 
+**The two kinds of vintage file.** ``vintage`` reads two layouts, and each ``Vintage`` names its
+own. #950's files are quantitative-trading's, in yfinance's three header rows. marketlake #1025's
+are Yahoo Finance downloads of GLD and USO in one header row, which fill the sessions from
+2012-04-10 to 2026-09-03 between #950's and the Schwab import's. They hold more than that gap, so
+their entries carry a ``window`` and the rows outside it are counted and left out. Their prices
+and volume are Yahoo's, adjusted for the splits it knew on the download date, so USO's before its
+one-for-eight reverse split of 2020-04-29 read eight times what traded and its volume an eighth.
+No ledger entry records that split, because ``load_bars``' adjusted views refuse an imported row
+and a reader that applied one to these rows itself would take the factor twice. Yahoo's terms
+forbid republishing the bytes, so the one-row layout's refusals quote no price, volume or split
+value.
+
 **The Schwab import** lands the ``SCHWAB_SESSIONS`` sessions ending the session before a
 ticker's first capture span session, from one ``vendor.get_daily_bars`` response per ticker,
 fetched before the lock. The capture path cannot reach those sessions by design, since
@@ -32,12 +44,13 @@ revised a volume. The ticker is in it so one ticker's undo cuts only that ticker
 ``load_bars``, the nightly upload, the trim and both restores handle it with no new path. Each
 row is built by ``journal.bars_rows``, the capture path's own builder, so ``schema_version``,
 ``extra`` and the spelling of ``bar_ts`` match a captured bar. A vintage's row comes from a
-one-candle body built from the file's four prices, and the rest of this paragraph is about
-it. The five
-stamps of the fetch, ``fetch_ts``, ``fetch_end_ts``, ``window_start``, ``window_end`` and
-``extended_hours``, are null, since no fetch happened, and no reader of a bars partition uses
-them. ``volume`` is left out, so it is null, because the vintages' volume unit is unverified and
-an import is write-once. ``bar_ts`` is the session's Eastern midnight, by
+one-candle body built from the file's numbers, and the rest of this paragraph is about it. The
+five stamps of the fetch, ``fetch_ts``, ``fetch_end_ts``, ``window_start``, ``window_end`` and
+``extended_hours``, are null, since they record a request this lake made and both kinds of file
+were fetched outside it, and no reader of a bars partition uses them. A three-row file's volume
+is left out, so it is null, because #950's volume unit is unverified and an import is write-once.
+A one-row file's volume lands as Yahoo gave it, shares traded and split-adjusted like the prices,
+on the evidence in marketlake #1025. ``bar_ts`` is the session's Eastern midnight, by
 ``bars.session_midnight``. ``bars._write_partition`` writes each file with the source's
 ``Provenance``, which ``load_bars`` reads back as the ``origin``, ``basis``, ``source`` and
 ``source_as_of`` columns.
@@ -65,13 +78,18 @@ nothing and pass a different source in silence. The import instant goes in the e
    ``lake_root``, and no vintage file sits inside it, where the scrub reads it as an orphan and
    the nightly upload sends it to the bucket.
 3. A vintage's SHA-256 is one ``VINTAGES`` lists, which names its ticker, and no two sources
-   name one ticker. The Schwab import refuses a ticker named twice for the same reason.
-4. A vintage file is read by column name, because the vintages' order is ``Close,High,Low,Open``.
-   Its ``Ticker`` row must name the listed ticker. A duplicate date and a date the exchange did
-   not trade both refuse. A session the calendar names and the file lacks is counted, not
-   refused. The calendar is built with an explicit start, because ``exchange_calendars`` starts
-   20 years before today and raises ``DateOutOfBounds`` before that, and about 130 of each
-   vintage's rows already fall there.
+   name one ticker. The Schwab import refuses a ticker named twice for the same reason. The file
+   is read once, and the bytes hashed are the bytes parsed, so a file swapped between a hash and
+   a second read cannot land under the listed digest.
+4. A vintage file is read by column name, because the layouts order their columns differently.
+   A three-row file's ``Ticker`` row must name the listed ticker. A one-row file names none, so
+   its whole ``Stock Splits`` column must equal the entry's ``splits``, which is the one check
+   inside the file against two digests listed under each other's ticker. Every row's date is
+   parsed, and a duplicate refuses, inside the window or not. A row inside the window on a date
+   the exchange did not trade refuses. A session the calendar names and the file lacks is
+   counted, not refused, over the window where the entry has one. The calendar is built with an
+   explicit start, because ``exchange_calendars`` starts 20 years before today and raises
+   ``DateOutOfBounds`` before that, and about 130 of each #950 file's rows already fall there.
 5. No date on or after the ticker's first capture span session. That is the first session
    ``bars.span_covers`` accepts for any span of any instrument the ticker has named, which is
    ``bars._span_sessions``' rule without its ceiling of today's close. A key landed for such a
@@ -85,6 +103,9 @@ nothing and pass a different source in silence. The import instant goes in the e
    first asks the bucket, by ``_Plan.rewrite_check``, and refuses once the bucket holds the key.
 7. The Schwab import's own rules, its window, the not-final guard and the checks on its
    response, are the Schwab paragraph's above and ``_schwab_bars``'.
+8. Every line of the manifest is a whole entry, checked under the lock and in the dry run, so no
+   entry is appended behind damage that hides it. ``_import_tail`` refuses an undo on the same
+   damage.
 
 **A stop leaves nothing unrecorded.** A refusal or a write failure part-way through a ticker
 records the partitions it already renamed into place, in one manifest append, and then says
@@ -103,10 +124,13 @@ The runbook runs it first.
 **An undo** (``undo`` and ``schwab-undo``, by the owner's decision of 2026-11-01 on #950,
 which ``_undo`` holds for both) works only until the
 import reaches the bucket. The runtime reads the bucket, so removing files on the VM alone would
-withdraw nothing from it, and once the nightly upload has sent an import no command withdraws
+withdraw nothing from it, and once any upload has sent an import no command withdraws
 it. So the undo refuses unless the manifest's last lines are exactly the import's entries, and
 the bucket's ``manifest.jsonl`` is absent or a byte prefix of the manifest cut back to before
-them, and the bucket lists none of the import's keys. It reads the bucket before the lock and
+them, and the bucket lists none of the import's keys. It also refuses on any of the import's keys
+that is on disk and that no manifest line names, which an import killed part-way leaves, because
+the cut would leave that file behind for the next upload. The import's rerun records it. Every
+one of these checks runs before anything is cut. It reads the bucket before the lock and
 again under it, because an upload that runs while the undo waits appends nothing to this lake's
 manifest. Under the lock it also re-reads the manifest, deletes the import's files and their
 leftover temps, flushes the directories, and only then cuts the manifest back in place with
@@ -128,8 +152,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+import io
 import math
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -172,7 +197,8 @@ from lake.manifest import (
     append_entries,
     latest_entries,
     manifest_path,
-    sha256_file,
+    parse_jsonl,
+    sha256_bytes,
 )
 from lake.paths import (
     DATE_PREFIX,
@@ -199,6 +225,22 @@ _SESSION_LOOKAHEAD_DAYS = 10
 
 # The vintage's columns this import reads, by the header's name for each.
 _PRICE_COLUMNS = {"open": "Open", "high": "High", "low": "Low", "close": "Close"}
+
+# How a source file's header is laid out, which each ``Vintage`` names. ``LAYOUT_THREE_ROW`` is
+# yfinance's ``Price``, ``Ticker`` and ``Date`` rows, which #950's files open with.
+# ``LAYOUT_ONE_ROW`` is one row of column names, with no ticker in the file.
+LAYOUT_THREE_ROW = "three-row"
+LAYOUT_ONE_ROW = "one-row"
+
+# The one-row layout's columns this import reads beside the prices.
+_DATE_COLUMN = "Date"
+_VOLUME_COLUMN = "Volume"
+_SPLITS_COLUMN = "Stock Splits"
+
+# A volume cell's digits, bounded before ``int`` reads them, since Python refuses to parse more
+# than 4,300, and the largest value the bars schema's int64 ``volume`` holds.
+_VOLUME_DIGITS = re.compile(r"[0-9]{1,19}")
+_MAX_VOLUME = 2**63 - 1
 
 SHADOW_REFUSAL = (
     "this host's role is shadow, and only the primary uploads to the bucket, so an import here "
@@ -235,7 +277,10 @@ class Vintage:
 
     ``source`` names the file without a commit or a local path, which change between runs.
     ``source_as_of`` is the date the source recorded its values, which ``read_provenance``
-    requires for an ``adjusted`` basis.
+    requires for an ``adjusted`` basis. ``layout`` is one of the two layout constants.
+    ``window`` is the first and last session to land, or ``None`` for every row. ``splits`` is
+    the one-row file's whole record of splits, a date and a factor each in date order, checked
+    against the file on every read, or ``None`` where the layout carries no such column.
     """
 
     sha256: str
@@ -243,6 +288,20 @@ class Vintage:
     source: str
     source_as_of: date
     basis: str
+    layout: str = LAYOUT_THREE_ROW
+    window: tuple[date, date] | None = None
+    splits: tuple[tuple[date, float], ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse an entry that would skip a check by leaving a field out or misspelling it.
+
+        A layout neither constant names would read as three rows, and a one-row entry with no
+        ``splits`` as one that lists none.
+        """
+        if self.layout not in (LAYOUT_THREE_ROW, LAYOUT_ONE_ROW):
+            raise ValueError(f"{self.source} names the layout {self.layout!r}, which is not one")
+        if (self.splits is not None) != (self.layout == LAYOUT_ONE_ROW):
+            raise ValueError(f"{self.source} states splits if and only if its layout is one-row")
 
     @property
     def provenance(self) -> Provenance:
@@ -273,8 +332,25 @@ def _vintage(sha256: str, ticker: str, path: str) -> Vintage:
     )
 
 
+def _yahoo(sha256: str, ticker: str, name: str, splits: tuple[tuple[date, float], ...]) -> Vintage:
+    # yfinance 1.8.0 with ``auto_adjust=False``, so the prices and the volume carry Yahoo's split
+    # adjustment as of the download. The window is the gap between #950's last session and the
+    # Schwab import's first (marketlake #1025).
+    return Vintage(
+        sha256=sha256,
+        ticker=ticker,
+        source=f"yahoo:{name}",
+        source_as_of=date(2026, 11, 22),
+        basis=BASIS_ADJUSTED,
+        layout=LAYOUT_ONE_ROW,
+        window=(date(2012, 4, 10), date(2026, 9, 3)),
+        splits=splits,
+    )
+
+
 # Every accepted vintage, reviewed in the pull request that adds it, so every run writes the
-# same metadata. The digests are quantitative-trading's ``data/checksums.sha256`` at 5787cd23.
+# same metadata. #950's digests are quantitative-trading's ``data/checksums.sha256`` at 5787cd23.
+# The Yahoo digests are the two files' own, in marketlake #1025's table.
 VINTAGES: Mapping[str, Vintage] = {
     v.sha256: v
     for v in (
@@ -288,6 +364,20 @@ VINTAGES: Mapping[str, Vintage] = {
             "USO",
             "data/inputdata_etf/uso.csv",
         ),
+        # Downloaded at 2026-11-22T17:12:02Z.
+        _yahoo(
+            "72bb286f57f637c9ef517b98631a68f7e8f2d7869af4935441b555b11f60d561",
+            "USO",
+            "uso_daily_yahoo_2026-11-22.csv",
+            ((date(2020, 4, 29), 0.125),),
+        ),
+        # Downloaded at 2026-11-22T17:12:03Z.
+        _yahoo(
+            "b6675ed455acf0174854377f8a51061fb18c0b1bf0a9a0f7632ac557b6fcb4f9",
+            "GLD",
+            "gld_daily_yahoo_2026-11-22.csv",
+            (),
+        ),
     )
 }
 
@@ -298,7 +388,8 @@ class _SourceBar:
 
     ``row`` is the partition's row when the source already built it, as the Schwab import does
     with ``journal.bars_rows`` from the vendor's own candle. ``None`` has ``_land`` build the row
-    from the four prices, stamped at the session's Eastern midnight, as a vintage needs.
+    from the four prices and ``volume``, stamped at the session's Eastern midnight, as a vintage
+    needs. ``volume`` is read only then, and ``None`` leaves the column null.
     """
 
     day: date
@@ -306,6 +397,7 @@ class _SourceBar:
     high: float
     low: float
     close: float
+    volume: int | None = None
     row: Mapping[str, object] | None = field(default=None, compare=False)
 
 
@@ -328,14 +420,15 @@ class TickerImport:
     dry_run: bool = False
     # What the line calls the source when it counts the sessions missing from it.
     holder: str = "the file"
-    # A response's candles that land nowhere: those naming a session outside the window, and
-    # those the row builder could not read. ``None`` for a source with no such candles.
+    # What a source holds outside its window, rows of a file or candles of a response, and the
+    # candles the row builder could not read. ``dropped`` is ``None`` for a source with no
+    # window, and ``unreadable`` is ``None`` for a file.
     dropped: int | None = None
     unreadable: int | None = None
 
     def _candles(self) -> str:
-        if self.dropped is None and self.unreadable is None:
-            return ""
+        if self.unreadable is None:
+            return "" if self.dropped is None else f", {self.dropped} row(s) outside the window"
         return (
             f", {self.dropped or 0} candle(s) outside the window dropped, "
             f"{self.unreadable or 0} candle(s) the row builder could not read"
@@ -373,8 +466,9 @@ class ImportSummary:
 class _Plan:
     """One ticker's rows from one source, and everything ``_land`` needs to land them.
 
-    ``path`` is what a refusal names as the source. ``instrument_id``, ``todo`` and
-    ``rewrites`` are filled as the rules are decided.
+    ``path`` is what a refusal names as the source. ``window`` is the sessions the source should
+    hold, or ``None`` for its own first to last. ``instrument_id``, ``todo`` and ``rewrites`` are
+    filled as the rules are decided.
 
     ``rewrite_check`` is asked about the recorded keys ``_decide`` found missing before any is
     written again, and returns a refusal or ``None``. A vintage has none, because its pinned file
@@ -389,29 +483,36 @@ class _Plan:
     path: Path
     bars: list[_SourceBar]
     report: TickerImport
+    window: tuple[date, date] | None = None
     instrument_id: int | None = None
     todo: list[_SourceBar] = field(default_factory=list)
     rewrites: list[str] = field(default_factory=list)
     rewrite_check: Callable[[Sequence[str]], str | None] | None = None
 
 
-def _read_source(path: Path, vintage: Vintage) -> list[_SourceBar]:
-    """The file's rows, or a refusal naming the first thing wrong with them.
+@dataclass(frozen=True)
+class _Header:
+    """Where a file's rows start, how many cells each needs, and where its columns are.
 
-    The header is yfinance's three rows: ``Price`` and the column names, then ``Ticker`` and
-    the ticker per column, then ``Date``. Columns are found by name.
+    ``volume`` and ``splits`` are ``None`` in the three-row layout, which reads neither.
     """
-    try:
-        with path.open(newline="") as handle:
-            lines = list(csv.reader(handle))
-    except (OSError, UnicodeDecodeError, csv.Error) as exc:
-        raise BarImportRefused(
-            f"{path} cannot be read as CSV ({type(exc).__name__}), so nothing was imported"
-        ) from None
+
+    width: int
+    first_row: int
+    day: int
+    prices: Mapping[str, int]
+    volume: int | None = None
+    splits: int | None = None
+
+
+def _three_row_header(
+    path: Path, lines: Sequence[Sequence[str]], vintage: Vintage, outcome: str
+) -> _Header:
+    """``Price`` and the column names, then ``Ticker`` and the ticker per column, then ``Date``."""
     if len(lines) < 3 or [line[:1] for line in lines[:3]] != [["Price"], ["Ticker"], ["Date"]]:
         raise BarImportRefused(
             f"{path} does not open with yfinance's three header rows, Price, Ticker and Date, "
-            "so nothing was imported"
+            f"so {outcome}"
         )
     names = lines[0]
     columns: dict[str, int] = {}
@@ -419,59 +520,196 @@ def _read_source(path: Path, vintage: Vintage) -> list[_SourceBar]:
         found = [index for index, name in enumerate(names) if name == header]
         if len(found) != 1:
             raise BarImportRefused(
-                f"{path} names its {header} column {len(found)} time(s) in its Price row, so "
-                "nothing was imported"
+                f"{path} names its {header} column {len(found)} time(s) in its Price row, "
+                f"so {outcome}"
             )
         columns[field_name] = found[0]
     named = sorted({cell for cell in lines[1][1:] if cell})
     if named != [vintage.ticker]:
         raise BarImportRefused(
             f"{path} names {', '.join(named) or 'no ticker'} in its Ticker row, and its SHA-256 "
-            f"is listed as {vintage.ticker}'s vintage, so nothing was imported"
+            f"is listed as {vintage.ticker}'s vintage, so {outcome}"
         )
-    width = max(columns.values()) + 1
+    # A three-row file's row needs only to reach its last price column.
+    return _Header(width=max(columns.values()) + 1, first_row=3, day=0, prices=columns)
+
+
+def _one_row_header(path: Path, lines: Sequence[Sequence[str]], outcome: str) -> _Header:
+    """One row of column names, each of the seven read here named exactly once."""
+    names = lines[0] if lines else []
+    columns: dict[str, int] = {}
+    for header in (_DATE_COLUMN, *_PRICE_COLUMNS.values(), _VOLUME_COLUMN, _SPLITS_COLUMN):
+        found = [index for index, name in enumerate(names) if name == header]
+        if len(found) != 1:
+            raise BarImportRefused(
+                f"{path} line 1 names its {header} column {len(found)} time(s), so {outcome}"
+            )
+        columns[header] = found[0]
+    return _Header(
+        width=len(names),
+        first_row=1,
+        day=columns[_DATE_COLUMN],
+        prices={name: columns[header] for name, header in _PRICE_COLUMNS.items()},
+        volume=columns[_VOLUME_COLUMN],
+        splits=columns[_SPLITS_COLUMN],
+    )
+
+
+def _finite(cell: str) -> float | None:
+    try:
+        value = float(cell)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _volume(cell: str) -> int | None:
+    """The cell's whole shares, or ``None`` unless it is ASCII digits from 1 to 2**63 - 1."""
+    if not _VOLUME_DIGITS.fullmatch(cell):
+        return None
+    value = int(cell)
+    return value if 1 <= value <= _MAX_VOLUME else None
+
+
+def _check_splits(
+    path: Path, found: Mapping[date, tuple[int, float]], vintage: Vintage, outcome: str
+) -> None:
+    """Refuse unless the file's non-zero splits are the entry's, naming dates and no factor.
+
+    ``found`` maps each split's date to its line and its factor.
+    """
+    listed = dict(vintage.splits)
+    for day in sorted({*found, *listed}):
+        if day not in listed:
+            why = (
+                f"line {found[day][0]} holds a split on {day.isoformat()} in its {_SPLITS_COLUMN} "
+                f"column, which {vintage.ticker}'s entry does not list"
+            )
+        elif day not in found:
+            why = (
+                f"holds no split on {day.isoformat()} in its {_SPLITS_COLUMN} column, which "
+                f"{vintage.ticker}'s entry lists"
+            )
+        elif found[day][1] != listed[day]:
+            why = (
+                f"line {found[day][0]} holds another {_SPLITS_COLUMN} factor for "
+                f"{day.isoformat()} than {vintage.ticker}'s entry lists"
+            )
+        else:
+            continue
+        raise BarImportRefused(f"{path} {why}, so {outcome}")
+
+
+def _read_source(
+    path: Path, data: bytes, vintage: Vintage, outcome: str
+) -> tuple[list[_SourceBar], int]:
+    """The rows of ``data`` inside the entry's window and the count outside it, or a refusal.
+
+    ``data`` is the bytes whose digest the list names, read from ``path`` once, and ``path`` is
+    only for the refusal's words. The layouts differ in their header, in the columns they read and
+    in their refusals' words, and one loop reads the rows of both. A row's date is parsed
+    wherever it falls, its split is too, and its prices and volume are read only inside the
+    window. A one-row file's refusals quote no price, volume or split value. ``outcome`` ends
+    each refusal, because the undo reads the file too.
+    """
+    try:
+        lines = list(csv.reader(io.StringIO(data.decode("utf-8"), newline="")))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise BarImportRefused(
+            f"{path} cannot be read as CSV ({type(exc).__name__}), so {outcome}"
+        ) from None
+    one_row = vintage.layout == LAYOUT_ONE_ROW
+    header = (
+        _one_row_header(path, lines, outcome)
+        if one_row
+        else _three_row_header(path, lines, vintage, outcome)
+    )
+
+    def refused(number: int, why: str) -> BarImportRefused:
+        return BarImportRefused(f"{path} line {number} {why}, so {outcome}")
+
+    first, last = vintage.window or (date.min, date.max)
     seen: set[date] = set()
+    splits: dict[date, tuple[int, float]] = {}
     rows: list[_SourceBar] = []
-    for number, line in enumerate(lines[3:], start=4):
+    outside = 0
+    for number, line in enumerate(lines[header.first_row :], start=header.first_row + 1):
         if not line:
             continue
-        day = parse_date_dir(DATE_PREFIX + line[0])
+        # A one-row file's Date may sit past a short row's end, so its width is checked first.
+        if one_row and len(line) < header.width:
+            raise refused(number, f"has {len(line)} field(s) and ends before {lines[0][len(line)]}")
+        # An extra cell, such as an unquoted thousands separator makes, shifts what follows it.
+        if one_row and len(line) > header.width:
+            raise refused(number, f"has {len(line)} field(s), more than its header names")
+        cell = line[header.day]
+        day = parse_date_dir(DATE_PREFIX + cell)
         if day is None:
-            raise BarImportRefused(
-                f"{path} line {number} starts with {line[0]!r}, which is not a YYYY-MM-DD date, "
-                "so nothing was imported"
+            raise refused(
+                number,
+                f"has no YYYY-MM-DD date in its {_DATE_COLUMN} column"
+                if one_row
+                else f"starts with {cell!r}, which is not a YYYY-MM-DD date",
             )
         if day in seen:
+            if one_row:
+                raise refused(number, f"repeats {day.isoformat()} in its {_DATE_COLUMN} column")
             raise BarImportRefused(
                 f"{path} holds {day.isoformat()} twice, and an import lands one partition per "
-                "session, so nothing was imported"
+                f"session, so {outcome}"
             )
         seen.add(day)
-        if len(line) < width:
-            raise BarImportRefused(
-                f"{path} line {number} has {len(line)} field(s), short of its header, so "
-                "nothing was imported"
-            )
+        if len(line) < header.width:
+            raise refused(number, f"has {len(line)} field(s), short of its header")
+        if header.splits is not None:
+            factor = _finite(line[header.splits])
+            if factor is None:
+                raise refused(
+                    number,
+                    f"has no finite number in its {_SPLITS_COLUMN} column on {day.isoformat()}",
+                )
+            if factor != 0:
+                splits[day] = (number, factor)
+        if not first <= day <= last:
+            outside += 1
+            continue
         values: dict[str, float] = {}
-        for field_name, index in columns.items():
-            try:
-                value = float(line[index])
-            except ValueError:
-                value = math.nan
-            if not math.isfinite(value):
-                raise BarImportRefused(
-                    f"{path} line {number} has {line[index]!r} for {_PRICE_COLUMNS[field_name]}, "
-                    "which is not a finite number, so nothing was imported"
+        for field_name, index in header.prices.items():
+            name = _PRICE_COLUMNS[field_name]
+            value = _finite(line[index])
+            if one_row and (value is None or value <= 0):
+                raise refused(number, f"has no finite number above zero in its {name} column")
+            if value is None:
+                raise refused(
+                    number, f"has {line[index]!r} for {name}, which is not a finite number"
                 )
             values[field_name] = value
-        rows.append(_SourceBar(day=day, **values))
+        volume = None
+        if header.volume is not None:
+            volume = _volume(line[header.volume])
+            if volume is None:
+                raise refused(
+                    number,
+                    f"has no whole number from 1 to 2**63 - 1 in its {_VOLUME_COLUMN} column",
+                )
+        rows.append(_SourceBar(day=day, **values, volume=volume))
+    if one_row:
+        _check_splits(path, splits, vintage, outcome)
     if not rows:
-        raise BarImportRefused(f"{path} holds no rows, so nothing was imported")
-    return rows
+        if vintage.window is None:
+            raise BarImportRefused(f"{path} holds no rows, so {outcome}")
+        raise BarImportRefused(
+            f"{path} holds no row inside its window, {first.isoformat()} to {last.isoformat()}, "
+            f"so {outcome}"
+        )
+    return rows, outside
 
 
 def _missing_sessions(plan: _Plan, history: Calendar) -> int:
-    """Refuse a date the exchange did not trade, and count the sessions the file lacks."""
+    """Refuse a date the exchange did not trade, and count the sessions the file lacks.
+
+    The count runs over the plan's window, or over the file's own first to last date.
+    """
     days = {bar.day for bar in plan.bars}
     for day in sorted(days):
         if not history.is_session(day):
@@ -479,7 +717,7 @@ def _missing_sessions(plan: _Plan, history: Calendar) -> int:
                 f"{plan.path}: {day.isoformat()} is not a session, so nothing was imported"
             )
     missing = 0
-    day, last = min(days), max(days)
+    day, last = plan.window or (min(days), max(days))
     while day <= last:
         if day not in days and history.is_session(day):
             missing += 1
@@ -570,6 +808,48 @@ def _holder(rel: str, held: str) -> str:
     if held.startswith(BAR_IMPORT_SOURCE_PREFIX):
         return f"{rel} is already held by the import {held}"
     return f"{rel} is already held by captured bars (manifest source {held!r})"
+
+
+def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[str], list[str]]:
+    """Where each line of the manifest starts, its source and its partition.
+
+    Refuses a torn last line, whose ``cost`` the refusal names, and a line that is not one entry to
+    ``parse_jsonl``, the manifest's own reader. That reader stops at the first line it cannot
+    parse, so entries recorded past one are hidden while the file holds them. It also refuses a
+    blank line and an entry with no source or partition, which no writer leaves.
+    """
+    if raw and not raw.endswith(b"\n"):
+        raise BarImportRefused(f"manifest.jsonl ends in a torn line, so {cost} and {outcome}")
+    offsets: list[int] = []
+    sources: list[str] = []
+    partitions: list[str] = []
+    at = 0
+    for number, line in enumerate(raw.split(b"\n")[:-1], start=1):
+        offsets.append(at)
+        at += len(line) + 1
+        try:
+            (text,) = line.decode("utf-8").splitlines()
+            (entry,) = parse_jsonl(text)
+            sources.append(str(entry["source"]))
+            partitions.append(str(entry["partition"]))
+        except (ValueError, KeyError, TypeError):
+            raise BarImportRefused(
+                f"line {number} of manifest.jsonl is not a whole entry, so {outcome}"
+            ) from None
+    return offsets, sources, partitions
+
+
+def _refuse_damaged_manifest(root: Path) -> None:
+    """Refuse an import that would append to a manifest the undo refuses.
+
+    Behind a line the reader stops at, its entries and capture's later ones would be hidden, and
+    nothing could take the import back.
+    """
+    _whole_lines(
+        manifest_path(root).read_bytes(),
+        "an entry appended to it would be lost",
+        "nothing was imported",
+    )
 
 
 def _decide(
@@ -672,6 +952,7 @@ def _land(
 
     if dry_run:
         try:
+            _refuse_damaged_manifest(root)
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
         except ManifestError as exc:
             raise BarImportRefused(f"{exc}, so nothing was imported") from None
@@ -688,6 +969,7 @@ def _land(
             why = window()
             if why is not None:
                 raise refuse(why)
+            _refuse_damaged_manifest(root)
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
             _check_rewrites(plans, refuse)
             for plan in plans:
@@ -722,6 +1004,8 @@ def _land(
                                 "low": bar.low,
                                 "close": bar.close,
                             }
+                            if bar.volume is not None:
+                                candle["volume"] = bar.volume
                             rows = bars_rows(
                                 {"candles": [candle]},
                                 ticker=plan.ticker,
@@ -780,7 +1064,8 @@ def import_vintages(
     """Import each listed vintage in ``sources`` into ``lake_root``'s bars surface.
 
     ``calendar`` places the run window and the first capture span session. ``history`` judges
-    the sources' dates and defaults to the exchange calendar built from the earliest of them.
+    the sources' dates and defaults to the exchange calendar, started ahead of the earliest of
+    them and of any window.
     ``vintages`` defaults to ``VINTAGES``. ``dry_run`` checks every rule and writes nothing. The
     module docstring gives the rules in order.
     """
@@ -811,23 +1096,25 @@ def import_vintages(
             outcome="nothing was imported",
         )
         try:
-            digest = sha256_file(path)
+            # Read once, so the bytes parsed are the bytes whose digest the list names.
+            data = path.read_bytes()
         except OSError as exc:
             raise BarImportRefused(
                 f"{path} cannot be read ({type(exc).__name__}), so nothing was imported"
             ) from None
+        digest = sha256_bytes(data)
         vintage = listed.get(digest)
         if vintage is None:
             raise BarImportRefused(
-                f"{path} has SHA-256 {digest}, which is no vintage this module lists, so nothing "
-                "was imported. Fetch the file at the commit the list names"
+                f"{path} has SHA-256 {digest}, so the file is not one the list pins and nothing "
+                "was imported"
             )
         if any(plan.ticker == vintage.ticker for plan in plans):
             raise BarImportRefused(
                 f"two sources name {vintage.ticker}, and one partition per ticker-day means the "
                 "first source imported holds each day, so nothing was imported"
             )
-        rows = _read_source(path, vintage)
+        rows, outside = _read_source(path, data, vintage, "nothing was imported")
         plans.append(
             _Plan(
                 ticker=vintage.ticker,
@@ -835,7 +1122,13 @@ def import_vintages(
                 manifest_source=vintage.manifest_source,
                 path=path,
                 bars=rows,
-                report=TickerImport(vintage.ticker, vintage.manifest_source, len(rows)),
+                report=TickerImport(
+                    vintage.ticker,
+                    vintage.manifest_source,
+                    len(rows),
+                    dropped=None if vintage.window is None else outside,
+                ),
+                window=vintage.window,
             )
         )
 
@@ -858,8 +1151,10 @@ def import_vintages(
     if history is None:
         # Started before the earliest date, because ``exchange_calendars`` moves a start that is
         # not a session forward to the next one, and ``is_session`` then raises on the date
-        # itself rather than answering no.
-        earliest = min(bar.day for plan in plans for bar in plan.bars)
+        # itself rather than answering no. A window can open before the earliest row.
+        starts = [bar.day for plan in plans for bar in plan.bars]
+        starts += [plan.window[0] for plan in plans if plan.window is not None]
+        earliest = min(starts)
         history = ExchangeCalendar(start=earliest - timedelta(days=_SESSION_LOOKAHEAD_DAYS))
     for plan in plans:
         plan.report.missing = _missing_sessions(plan, history)
@@ -1197,32 +1492,16 @@ class UndoSummary:
         )
 
 
-def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str]]:
-    """Where the manifest's trailing run of these imports' entries starts, and their partitions.
+def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str], set[str]]:
+    """Where the manifest's trailing run of these imports' entries starts, their partitions, and
+    every partition any line names.
 
     Refuses a torn last line, a line that is not an entry, and an entry of these imports that
     sits before an entry of anything else, which the cut would then take with it.
     """
-    if raw and not raw.endswith(b"\n"):
-        raise BarImportRefused(
-            "manifest.jsonl ends in a torn line, so the undo cannot tell where the import starts "
-            "and nothing was undone"
-        )
-    offsets: list[int] = []
-    sources: list[str] = []
-    partitions: list[str] = []
-    at = 0
-    for number, line in enumerate(raw.split(b"\n")[:-1], start=1):
-        offsets.append(at)
-        at += len(line) + 1
-        try:
-            entry = json.loads(line)
-            sources.append(str(entry["source"]))
-            partitions.append(str(entry["partition"]))
-        except (ValueError, KeyError, TypeError):
-            raise BarImportRefused(
-                f"line {number} of manifest.jsonl is not a whole entry, so nothing was undone"
-            ) from None
+    offsets, sources, partitions = _whole_lines(
+        raw, "the undo cannot tell where the import starts", "nothing was undone"
+    )
     start = len(sources)
     while start > 0 and sources[start - 1] in identities:
         start -= 1
@@ -1258,7 +1537,7 @@ def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str]]:
                 "partition, so nothing was undone"
             )
     cut = offsets[start] if start < len(offsets) else len(raw)
-    return cut, tail
+    return cut, tail, before.union(tail)
 
 
 # How the undo words its window refusals. Past the bound no undo can run before capture records
@@ -1371,29 +1650,30 @@ def undo_vintages(
             f"lake_root {root} holds no manifest.jsonl, so it may name the wrong directory and "
             "nothing was undone"
         )
-    chosen: list[tuple[Path, Vintage]] = []
+    chosen: list[tuple[Path, bytes, Vintage]] = []
     for source in sources:
         try:
-            digest = sha256_file(Path(source))
+            data = Path(source).read_bytes()
         except OSError as exc:
             raise BarImportRefused(
                 f"{source} cannot be read ({type(exc).__name__}), so nothing was undone"
             ) from None
+        digest = sha256_bytes(data)
         vintage = listed.get(digest)
         if vintage is None:
             raise BarImportRefused(
                 f"{source} has SHA-256 {digest}, which is no vintage this module lists, so "
                 "nothing was undone"
             )
-        chosen.append((Path(source), vintage))
-    identities = {vintage.manifest_source for _source, vintage in chosen}
+        chosen.append((Path(source), data, vintage))
+    identities = {vintage.manifest_source for _source, _data, vintage in chosen}
 
     def on_disk() -> list[Path]:
         paths = LakePaths(root)
         return [
             paths.bars_partition_path(vintage.ticker, DAILY_FREQ, bar.day)
-            for source, vintage in chosen
-            for bar in _read_source(source, vintage)
+            for source, data, vintage in chosen
+            for bar in _read_source(source, data, vintage, "nothing was undone")[0]
         ]
 
     return _undo(
@@ -1419,8 +1699,8 @@ def _undo(
 ) -> UndoSummary:
     """The undo's rule for any import, once its identities are known.
 
-    ``keys`` names every partition the imports would have written. It is read only when the
-    manifest records none of them, to refuse a killed import's unrecorded files. ``window`` is the
+    ``keys`` names every partition the imports would have written. It is read on every undo, to
+    refuse a killed import's unrecorded files, which the cut would leave behind. ``window`` is the
     caller's run-window check, so each refusal says which undo stopped. ``deadline`` is
     ``_undo_deadline``'s text, read when a refusal needs it.
     """
@@ -1431,18 +1711,31 @@ def _undo(
         raise BarImportRefused(
             f"{path} cannot be read ({type(exc).__name__}), so nothing was undone"
         ) from None
-    cut, tail = _import_tail(raw, identities)
+    cut, tail, named = _import_tail(raw, identities)
     summary = UndoSummary()
-    if not tail:
-        # A killed import can leave renamed files with no entry, which the undo cannot see in
-        # the manifest. The import's rerun records them, after which an undo removes them.
-        for target_path in keys():
-            if target_path.exists():
+    # A killed import can leave renamed files with no entry, in its second ticker with the first
+    # one's recorded, and the undo cannot see those in the manifest. The import's rerun records
+    # them, after which an undo removes them.
+    wanted = [(key, key.relative_to(root).as_posix()) for key in keys()]
+
+    def refuse_unrecorded() -> None:
+        for key, rel in wanted:
+            if rel in named:
+                continue
+            try:
+                found = key.exists()
+            except OSError as exc:
                 raise BarImportRefused(
-                    f"{target_path.relative_to(root).as_posix()} is on disk and the manifest "
-                    "records none of this import, which a killed import leaves. Run the "
-                    "import again to record it, then run the undo"
+                    f"{rel} cannot be looked for ({type(exc).__name__}), so nothing was undone"
+                ) from None
+            if found:
+                raise BarImportRefused(
+                    f"{rel} is on disk and no manifest line names it, which a killed import "
+                    "leaves. Run the import again to record it, then run the undo"
                 )
+
+    refuse_unrecorded()
+    if not tail:
         return summary
     if cut == 0:
         raise BarImportRefused(
@@ -1463,6 +1756,8 @@ def _undo(
                     "so the import's lines are no longer its last ones and nothing was undone. "
                     "No command undoes an import once anything is recorded after it"
                 )
+            # An import killed while it held the lock changes no manifest byte.
+            refuse_unrecorded()
             # The window check above keeps capture off the lock, so this second read costs it
             # nothing.
             again = _check_bucket(client, target, raw[:cut], tail, deadline)
@@ -1585,14 +1880,14 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     vintage = commands.add_parser(
         "vintage",
-        help="Import quantitative-trading vintages the module lists, by SHA-256.",
+        help="Import quantitative-trading vintages or Yahoo files the module lists, by SHA-256.",
     )
     vintage.add_argument(
         "sources",
         nargs="+",
         type=_source_file,
         metavar="CSV",
-        help="A vintage CSV outside lake_root. Its SHA-256 names its ticker.",
+        help="A listed CSV outside lake_root. Its SHA-256 names its ticker.",
     )
     vintage.add_argument(
         "--dry-run",
@@ -1609,7 +1904,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         type=_source_file,
         metavar="CSV",
-        help="A vintage CSV the import read. Its SHA-256 names the import to undo.",
+        help="A listed CSV the import read. Its SHA-256 names the import to undo.",
     )
     undo.add_argument("--config", help="Path to config.yaml (defaults to the standard place).")
     schwab = commands.add_parser(
@@ -1729,6 +2024,8 @@ def main(
 __all__ = [
     "BAR_IMPORT_SOURCE_PREFIX",
     "COMMAND",
+    "LAYOUT_ONE_ROW",
+    "LAYOUT_THREE_ROW",
     "SCHWAB_SESSIONS",
     "SCHWAB_SOURCE",
     "SHADOW_REFUSAL",
