@@ -56,6 +56,7 @@ import pyarrow as pa
 from lake import journal
 from lake.journal import ROW_KIND_DATA, ROW_KIND_GAP
 from lake.paths import SEGMENT_GLOB, LakePaths
+from lake.segment_join import merge_by_name
 
 # The final-fifteen-minutes window. It matches the option-close trailing span the
 # design breaks out, expressed as a duration so no session-time literal appears here.
@@ -80,8 +81,11 @@ def read_surface_cycles(
     """Read every journal segment for one surface, ticker, and day into one table.
 
     Slice 1 captures through one-off runner invocations, each its own writer session
-    and so its own segment. This concatenates them all. A day with no segments reads as
-    an empty table in the surface's pinned schema.
+    and so its own segment. This joins them all by name, through the join the seal makes,
+    so a column moved, added or dropped partway through the day reads back, with nulls on
+    the rows of a segment that lacks it. A column two segments hold at two types raises
+    ``pa.ArrowTypeError``, as the seal refuses it. A day with no segments reads as an empty
+    table in the surface's pinned schema.
 
     Pass a surface nothing journals and every day reads as that empty table, because a
     pinned schema is all ``schema_for`` asks for and bars never reach a segment. Both
@@ -96,7 +100,7 @@ def read_surface_cycles(
     tables = [journal.read_segment(path) for path in segments]
     if not tables:
         return schema.empty_table()
-    return pa.concat_tables(tables)
+    return merge_by_name(tables)
 
 
 # -- small numeric and symbol helpers ----------------------------------------
@@ -272,8 +276,18 @@ class DayOneMeasurements:
 
 
 def _oi_map(cycle_rows: list[dict]) -> dict[str, object]:
-    """A contract-to-open-interest map for one cycle's data rows."""
-    return {row["occ_symbol"]: row["open_interest"] for row in cycle_rows}
+    """A contract-to-open-interest map for one cycle's data rows.
+
+    A contract whose open interest is null is left out. A column that appears or goes away
+    partway through the day reads as nulls on the other segments' rows, and comparing a value
+    with one of those would report a refresh the vendor never made. The price is that such a
+    day shows no refresh at all.
+    """
+    return {
+        row["occ_symbol"]: row["open_interest"]
+        for row in cycle_rows
+        if row["open_interest"] is not None
+    }
 
 
 def measure_day(

@@ -76,11 +76,10 @@ Two rules keep the healing honest.
 
 What this module does not do is reshape a table. It fills a column, and it adds one only
 when a row actually carries a value for it. Projecting the running schema onto an arbitrary
-table is the loader's job, in slice 4, and that loader reads through this rather than
-reimplementing it.
+table is the loader's job, and the loader reads through this rather than reimplementing it.
 
-The projection is opt-in. Nothing that reads a captured row today calls it, so no existing
-reader's output moves.
+Two modules read through it. ``lake.loader`` runs it on every sealed read and ``lake.unsealed``
+on every read before the seal, and each refuses a projection that is not complete.
 """
 
 from __future__ import annotations

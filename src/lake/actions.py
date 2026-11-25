@@ -1526,7 +1526,7 @@ def _observation(lake_root: Path, ticker: str, day: date) -> dict[str, object] |
     takes the sign-off block for every ticker that did land with it.
 
     **What is deliberately not caught here, so nothing reads this list as exhaustive.**
-    ``LoadError`` has twelve direct subclasses. Most belong to doors this never opens, and two
+    Most of ``LoadError``'s subclasses belong to doors this never opens, and two
     of them, ``SnapMalformed`` and ``SnapAbsent``, come from resolving a ``snap`` argument,
     which this passes none of because it resolves at the close of record.
 
