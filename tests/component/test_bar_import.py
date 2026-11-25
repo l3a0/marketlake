@@ -19,6 +19,11 @@ Acceptance list.
    ``tests/component/test_bucket_resync.py``.
 9. One ``append_entries`` call lands each ticker's entries.
 
+Marketlake #1025 adds Yahoo Finance's files: a header of one row, a window, a list of splits
+checked against the file, a volume that lands, and an undo that looks for a killed import's files
+every time. Those cases follow that issue's Acceptance list, in their own section at the end.
+Their bars are made up, because Yahoo's terms forbid republishing its own.
+
 Every CSV is written here and hashed here with ``hashlib``, so no expected value comes from the
 code under test.
 """
@@ -26,9 +31,11 @@ code under test.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import astuple
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -43,7 +50,6 @@ from lake.capture_spans import CaptureSpans, spans_path
 from lake.config import BucketTarget
 from lake.loader import (
     BASIS_ADJUSTED,
-    ORIGIN_IMPORTED,
     Provenance,
     load_bars,
     read_provenance,
@@ -229,28 +235,58 @@ def test_a_session_the_file_lacks_is_counted_and_not_refused(tmp_path):
     assert "1 session(s) the calendar names and the file lacks" in summary.render()
 
 
-def test_the_listed_vintages_carry_the_values_the_issue_reviewed():
-    """The module's list matches the table in #950, written out here as literals."""
+def test_the_listed_vintages_carry_the_values_the_issues_reviewed():
+    """The module's list matches the tables in #950 and #1025, written out here as literals."""
     gld = "81e6295a8028362f82f9e96a89c686ef89991cb23afe42d4f884756019dc9d4c"
     uso = "94b6521980f64ce80feb5cdffb22168ed44f71eeaa93caca672f316eeda60ec2"
-    assert set(bar_import.VINTAGES) == {gld, uso}
-    assert bar_import.VINTAGES[gld].provenance == Provenance(
-        ORIGIN_IMPORTED,
-        BASIS_ADJUSTED,
-        "quantitative-trading:data/inputdata_etf/gld.csv",
-        f"sha256:{gld}",
-        date(2012, 4, 10),
-    )
-    assert bar_import.VINTAGES[uso].provenance == Provenance(
-        ORIGIN_IMPORTED,
-        BASIS_ADJUSTED,
-        "quantitative-trading:data/inputdata_etf/uso.csv",
-        f"sha256:{uso}",
-        date(2012, 4, 10),
-    )
-    assert bar_import.VINTAGES[gld].ticker == "GLD"
-    assert bar_import.VINTAGES[uso].ticker == "USO"
-    assert bar_import.VINTAGES[gld].manifest_source == f"bar-import:sha256:{gld}"
+    yahoo_uso = "72bb286f57f637c9ef517b98631a68f7e8f2d7869af4935441b555b11f60d561"
+    yahoo_gld = "b6675ed455acf0174854377f8a51061fb18c0b1bf0a9a0f7632ac557b6fcb4f9"
+    gap = (date(2012, 4, 10), date(2026, 9, 3))
+    assert {digest: astuple(v) for digest, v in bar_import.VINTAGES.items()} == {
+        gld: (
+            gld,
+            "GLD",
+            "quantitative-trading:data/inputdata_etf/gld.csv",
+            date(2012, 4, 10),
+            "adjusted",
+            "three-row",
+            None,
+            None,
+        ),
+        uso: (
+            uso,
+            "USO",
+            "quantitative-trading:data/inputdata_etf/uso.csv",
+            date(2012, 4, 10),
+            "adjusted",
+            "three-row",
+            None,
+            None,
+        ),
+        yahoo_uso: (
+            yahoo_uso,
+            "USO",
+            "yahoo:uso_daily_yahoo_2026-11-22.csv",
+            date(2026, 11, 22),
+            "adjusted",
+            "one-row",
+            gap,
+            ((date(2020, 4, 29), 0.125),),
+        ),
+        yahoo_gld: (
+            yahoo_gld,
+            "GLD",
+            "yahoo:gld_daily_yahoo_2026-11-22.csv",
+            date(2026, 11, 22),
+            "adjusted",
+            "one-row",
+            gap,
+            (),
+        ),
+    }
+    for digest, vintage in bar_import.VINTAGES.items():
+        assert vintage.manifest_source == f"bar-import:sha256:{digest}"
+        assert vintage.provenance.source_id == f"sha256:{digest}"
 
 
 # -- 2. the first capture span session ---------------------------------------------------
@@ -1659,3 +1695,740 @@ def test_a_bucket_setting_refusal_reaches_the_operator_as_one_line(tmp_path, mon
     assert exited.value.code == 2
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1 and "bucket_region is not set" in err[0]
+
+
+# -- the one-row layout, the window and the splits (marketlake #1025) ----------------------
+
+ONE_ROW_NAMES = (
+    "Date",
+    "Adj Close",
+    "Capital Gains",
+    "Close",
+    "Dividends",
+    "High",
+    "Low",
+    "Open",
+    "Stock Splits",
+    "Volume",
+)
+ONE_ROW = ",".join(ONE_ROW_NAMES)
+# Four sessions of 2012, Tuesday to Friday, with a session either side.
+WINDOW = (date(2012, 4, 10), date(2012, 4, 13))
+BEFORE, TUE, WED, THU, FRI, AFTER = (
+    "2012-04-09",
+    "2012-04-10",
+    "2012-04-11",
+    "2012-04-12",
+    "2012-04-13",
+    "2012-04-16",
+)
+FULL = (BEFORE, TUE, WED, THU, FRI, AFTER)
+SPLIT = ((date(2012, 4, 12), 0.125),)
+
+
+def _cells(day: str, n: int, **override: str) -> dict[str, str]:
+    """One made-up row. No two columns hold the same number, and volume is bare digits."""
+    close = 40.123456 + n
+    row = {
+        "Date": day,
+        "Adj Close": f"{close * 0.9:.6f}",
+        "Capital Gains": "0.001",
+        "Close": f"{close:.6f}",
+        "Dividends": "0.002",
+        "High": f"{close + 1.25:.6f}",
+        "Low": f"{close - 1.5:.6f}",
+        "Open": f"{close - 0.75:.6f}",
+        "Stock Splits": "0.0",
+        "Volume": str(1_000_300 + n),
+    }
+    row.update({key.replace("_", " "): value for key, value in override.items()})
+    return row
+
+
+def _one_row(path: Path, rows: list[dict[str, str]], names=ONE_ROW_NAMES) -> Path:
+    lines = [",".join(names), *(",".join(row[name] for name in names) for row in rows)]
+    return _text(path, "\n".join(lines) + "\n")
+
+
+def _text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def _days(*days: str, **by_day) -> list[dict[str, str]]:
+    """A row per day, ``d12={"Volume": "1"}`` overriding the cells of the 12th's."""
+    return [_cells(day, n, **by_day.get("d" + day[-2:], {})) for n, day in enumerate(days)]
+
+
+def _entry(
+    path: Path, ticker: str = "GLD", *, splits=(), window=WINDOW, layout=bar_import.LAYOUT_ONE_ROW
+) -> dict[str, Vintage]:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        digest: Vintage(
+            sha256=digest,
+            ticker=ticker,
+            source=f"yahoo:{path.name}",
+            source_as_of=AS_OF,
+            basis=BASIS_ADJUSTED,
+            layout=layout,
+            window=window,
+            splits=splits,
+        )
+    }
+
+
+def _dry(root: Path, sources, vintages) -> str:
+    return import_vintages(
+        root,
+        list(sources),
+        clock=ManualClock(MONDAY_0745),
+        calendar=CALENDAR,
+        vintages=vintages,
+        dry_run=True,
+    ).render()
+
+
+def _manifest_lines(root: Path) -> list[bytes]:
+    return (root / "manifest.jsonl").read_bytes().splitlines()
+
+
+def test_only_the_rows_inside_the_window_land_with_their_volume(tmp_path):
+    """#1025 acceptance 1. Catches a bound off by one, a column taken by position or from
+    ``Adj Close``, a rounded price, and a volume dropped."""
+    root = _lake(tmp_path)
+    other = "bar-import:sha256:" + "cd" * 32
+    outer = [_manifest_bars(root, "GLD", day, source=other) for day in (BEFORE, AFTER)]
+    before = _snapshot(root)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    vintages = _entry(source)
+
+    dry = _dry(root, [source], vintages)
+    assert dry.endswith(", 2 row(s) outside the window. Nothing was written")
+    assert _snapshot(root) == before
+    summary = _run(root, [source], vintages)
+    assert summary.render().endswith("found missing and written again, 2 row(s) outside the window")
+
+    table = load_bars("GLD", "1d", TUE, FRI, lake_root=root, adjust="none")
+    assert table.column("close").to_pylist() == [41.123456, 42.123456, 43.123456, 44.123456]
+    assert table.column("high").to_pylist() == [42.373456, 43.373456, 44.373456, 45.373456]
+    assert table.column("low").to_pylist() == [39.623456, 40.623456, 41.623456, 42.623456]
+    assert table.column("open").to_pylist() == [40.373456, 41.373456, 42.373456, 43.373456]
+    assert table.column("volume").to_pylist() == [1000301, 1000302, 1000303, 1000304]
+    assert table.column("origin").to_pylist() == ["imported"] * 4
+    assert table.column("basis").to_pylist() == ["adjusted"] * 4
+    assert table.column("source").to_pylist() == ["yahoo:gld.csv"] * 4
+    assert table.column("source_as_of").to_pylist() == ["2019-03-01"] * 4
+    assert table.column("bar_ts").to_pylist() == [
+        f"{day}T04:00:00+00:00" for day in (TUE, WED, THU, FRI)
+    ]
+    after = _snapshot(root)
+    assert {rel: after[rel] for rel in outer} == {rel: before[rel] for rel in outer}
+    assert after["manifest.jsonl"].startswith(before["manifest.jsonl"])
+    assert len(_manifest_lines(root)) == len(before["manifest.jsonl"].splitlines()) + 4
+
+
+@pytest.mark.parametrize("cell", ["57952", "0", "", "n/a"])
+def test_a_three_row_files_volume_still_lands_null(tmp_path, cell):
+    """#1025 acceptance 2. Catches a volume read in #950's layout, whose unit is unverified."""
+    root = _lake(tmp_path)
+    source = _text(tmp_path / "src" / "gld.csv", _HEADER + f"2006-04-26,1.0,2.0,0.5,1.5,{cell}\n")
+    digest, vintage = _vintage(source)
+
+    summary = _run(root, [source], {digest: vintage})
+
+    rel = _rel("GLD", "2006-04-26")
+    assert pq.read_table(root / rel).column("volume").to_pylist() == [None]
+    assert read_provenance(pq.read_schema(root / rel).metadata) == Provenance(
+        "imported", "adjusted", "test:gld.csv", f"sha256:{digest}", date(2019, 3, 1)
+    )
+    assert latest_entries(root)[rel]["source"] == f"bar-import:sha256:{digest}"
+    assert "outside" not in summary.render()
+    assert "outside" not in _dry(root, [source], {digest: vintage})
+
+
+def test_a_three_row_entry_with_a_window_drops_the_rows_outside_it(tmp_path):
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [(day, 10.0 + n) for n, day in enumerate(FULL)])
+    vintages = _entry(source, splits=None, layout=bar_import.LAYOUT_THREE_ROW)
+
+    summary = _run(root, [source], vintages)
+
+    assert _bars_files(root) == [_rel("GLD", day) for day in (TUE, WED, THU, FRI)]
+    assert summary.render().endswith(", 2 row(s) outside the window")
+
+
+def test_a_three_row_files_prices_are_read_inside_its_window_only(tmp_path):
+    """A row outside the window lands nothing, so its price cells are not judged."""
+    root = _lake(tmp_path)
+    rows = f"{BEFORE},nan,2.0,0.5,1.5,5\n{TUE},1.0,2.0,0.5,1.5,5\n"
+    source = _text(tmp_path / "src" / "gld.csv", _HEADER + rows)
+    vintages = _entry(source, splits=None, layout="three-row")
+
+    assert _run(root, [source], vintages).tickers[0].landed == 1
+
+
+# -- the bytes hashed are the bytes parsed
+
+
+class _Swap:
+    """Counts the opens of one file and puts the next of ``versions`` in it before each."""
+
+    def __init__(self, monkeypatch, path: Path, versions: list[bytes]) -> None:
+        self.opens = 0
+        real = io.open
+
+        def swapped(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)) and Path(file) == path:
+                with real(path, "wb") as handle:
+                    handle.write(versions[min(self.opens, len(versions) - 1)])
+                self.opens += 1
+            return real(file, *args, **kwargs)
+
+        monkeypatch.setattr(io, "open", swapped)
+        monkeypatch.setattr("builtins.open", swapped)
+
+
+def test_one_changed_byte_refuses_with_the_new_message(tmp_path):
+    """#1025 acceptance 3."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE, WED))
+    vintages = _entry(source)
+    source.write_bytes(source.read_bytes().replace(b"1000301", b"1000302"))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    before = _snapshot(root)
+
+    assert _refused(root, [source], vintages) == (
+        f"{source} has SHA-256 {digest}, so the file is not one the list pins and nothing was "
+        "imported"
+    )
+    assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize("listed_first", [True, False])
+def test_a_swapped_file_lands_only_bytes_whose_digest_is_listed(
+    tmp_path, monkeypatch, listed_first
+):
+    """Catches a file hashed on one open and parsed on another."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE, WED))
+    vintages = _entry(source)
+    good = source.read_bytes()
+    bad = good.replace(b"40.123456", b"99.123456")
+    assert bad != good
+    swap = _Swap(monkeypatch, source, [good, bad] if listed_first else [bad, good])
+
+    if listed_first:
+        _run(root, [source], vintages)
+        closes = pq.read_table(root / _rel("GLD", TUE)).column("close").to_pylist()
+        assert closes == [40.123456]
+    else:
+        assert "not one the list pins" in _refused(root, [source], vintages)
+        assert _bars_files(root) == []
+    assert swap.opens == 1
+
+
+def test_the_undo_reads_its_keys_from_the_bytes_it_hashed(tmp_path, monkeypatch):
+    """A killed import's file on Tuesday, and a swap to a file that names only Wednesday. Catches
+    an undo that hashes the listed bytes and takes its keys from the others."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE))
+    vintages = _entry(source)
+    good = source.read_bytes()
+    before = _snapshot(root)
+    _run(root, [source], vintages)
+    (root / "manifest.jsonl").write_bytes(before["manifest.jsonl"])
+    swap = _Swap(monkeypatch, source, [good, good.replace(b"2012-04-10", b"2012-04-11")])
+
+    assert _rel("GLD", TUE) in _undo_refused(root, [source], vintages)
+    assert swap.opens == 1
+
+
+# -- the splits
+
+
+SPLIT_CELL = "0.125"
+
+
+@pytest.mark.parametrize(
+    ("rows", "splits", "expected"),
+    [
+        (
+            _days(*FULL),
+            SPLIT,
+            "holds no split on 2012-04-12 in its Stock Splits column, which GLD's entry lists",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}, d13={"Stock_Splits": "0.25"}),
+            SPLIT,
+            "line 6 holds a split on 2012-04-13 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": "0.25"}),
+            SPLIT,
+            "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
+        ),
+        (
+            _days(*FULL, d11={"Stock_Splits": SPLIT_CELL}),
+            SPLIT,
+            "line 4 holds a split on 2012-04-11 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}, d16={"Stock_Splits": "0.5"}),
+            SPLIT,
+            "line 7 holds a split on 2012-04-16 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}),
+            (),
+            "line 5 holds a split on 2012-04-12 in its Stock Splits column, which GLD's entry "
+            "does not list",
+        ),
+        (
+            _days(*FULL, d12={"Stock_Splits": ""}),
+            (),
+            "line 5 has no finite number in its Stock Splits column on 2012-04-12",
+        ),
+        (
+            _days(*FULL, d09={"Stock_Splits": ""}),
+            (),
+            "line 2 has no finite number in its Stock Splits column on 2012-04-09",
+        ),
+        (
+            _days(*FULL, d16={"Stock_Splits": "x"}),
+            (),
+            "line 7 has no finite number in its Stock Splits column on 2012-04-16",
+        ),
+        (
+            _days(*FULL, d16={"Stock_Splits": "inf"}),
+            (),
+            "line 7 has no finite number in its Stock Splits column on 2012-04-16",
+        ),
+    ],
+    ids=[
+        "missing",
+        "unlisted",
+        "another-factor",
+        "another-date",
+        "outside-the-window",
+        "none-listed",
+        "blank",
+        "blank-outside",
+        "text-outside",
+        "inf-outside",
+    ],
+)
+def test_a_split_the_entry_does_not_record_refuses(tmp_path, rows, splits, expected):
+    """#1025 acceptance 4. Each message whole, and it holds no factor."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", rows)
+    before = _snapshot(root)
+
+    message = _refused(root, [source], _entry(source, splits=splits))
+
+    assert message == f"{source} {expected}, so nothing was imported"
+    assert not any(factor in message for factor in ("0.125", "0.25", "0.5"))
+    assert _snapshot(root) == before
+
+
+def test_the_listed_splits_land_and_tell_two_swapped_digests_apart(tmp_path):
+    """Two digests listed under each other's ticker. Nothing else in the file names its ticker."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    gld = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    uso = _one_row(tmp_path / "src" / "uso.csv", _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}))
+
+    assert _refused(root, [uso], _entry(uso, "GLD")) == (
+        f"{uso} line 5 holds a split on 2012-04-12 in its Stock Splits column, which GLD's entry "
+        "does not list, so nothing was imported"
+    )
+    assert _refused(root, [gld], _entry(gld, "USO", splits=SPLIT)) == (
+        f"{gld} holds no split on 2012-04-12 in its Stock Splits column, which USO's entry lists, "
+        "so nothing was imported"
+    )
+    assert _bars_files(root) == []
+    summary = _run(root, [gld, uso], {**_entry(gld), **_entry(uso, "USO", splits=SPLIT)})
+    assert [ticker.landed for ticker in summary.tickers] == [4, 4]
+
+
+# -- every other refusal of the one-row layout
+
+
+SEVEN = ("Date", "Open", "High", "Low", "Close", "Volume", "Stock Splits")
+
+
+def _header_cases():
+    for name in SEVEN:
+        absent = ",".join("Other" if n == name else n for n in ONE_ROW_NAMES)
+        twice = ",".join(name if n == "Dividends" else n for n in ONE_ROW_NAMES)
+        yield pytest.param(absent, name, 0, id=f"no-{name}")
+        yield pytest.param(twice, name, 2, id=f"two-{name}")
+
+
+@pytest.mark.parametrize(("header", "name", "count"), list(_header_cases()))
+def test_a_one_row_header_refuses_unless_each_column_is_named_once(tmp_path, header, name, count):
+    """#1025 acceptance 5."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    source.write_text(source.read_text().replace(ONE_ROW, header))
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 1 names its {name} column {count} time(s), so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_a_three_row_file_under_a_one_row_entry_refuses(tmp_path):
+    root = _lake(tmp_path)
+    source = _csv(tmp_path / "src" / "gld.csv", [(TUE, 10.0)])
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 1 names its Date column 0 time(s), so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_a_one_row_file_under_a_three_row_entry_refuses(tmp_path):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    before = _snapshot(root)
+    vintages = _entry(source, splits=None, layout=bar_import.LAYOUT_THREE_ROW)
+
+    assert _refused(root, [source], vintages) == (
+        f"{source} does not open with yfinance's three header rows, Price, Ticker and Date, so "
+        "nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def _cell_cases():
+    for name in ("Open", "High", "Low", "Close"):
+        for cell in ("", "nan", "inf", "x", "0.000000", "-5.500000"):
+            yield pytest.param(
+                name, cell, f"has no finite number above zero in its {name} column", id=name + cell
+            )
+    for cell in ("", "0", "-1", "+5", " 5", "0.5", "1_000", "٥", "9223372036854775808", "9" * 5000):
+        yield pytest.param(
+            "Volume",
+            cell,
+            "has no whole number from 1 to 2**63 - 1 in its Volume column",
+            id="Volume" + ascii(cell[:20]),
+        )
+
+
+@pytest.mark.parametrize(("name", "cell", "expected"), list(_cell_cases()))
+def test_a_bad_price_or_volume_refuses_inside_the_window_and_lands_outside_it(
+    tmp_path, name, cell, expected
+):
+    root = _lake(tmp_path)
+    bad = {name.replace(" ", "_"): cell}
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL, d11=bad))
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line 4 {expected}, so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+    outside = _one_row(tmp_path / "src" / "out.csv", _days(*FULL, d09=bad, d16=bad))
+    assert _run(root, [outside], _entry(outside)).tickers[0].landed == 4
+
+
+def _line_cases():
+    good = _days(*FULL)
+    yield pytest.param(
+        [*good[:5], _cells("2012-4-16", 5)],
+        "line 7 has no YYYY-MM-DD date in its Date column",
+        id="malformed-date",
+    )
+    yield pytest.param(
+        [*good, _cells(AFTER, 6)],
+        "line 8 repeats 2012-04-16 in its Date column",
+        id="duplicate-date",
+    )
+
+
+@pytest.mark.parametrize(("rows", "expected"), list(_line_cases()))
+def test_a_bad_date_outside_the_window_refuses(tmp_path, rows, expected):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", rows)
+    before = _snapshot(root)
+
+    message = _refused(root, [source], _entry(source))
+
+    assert message == f"{source} {expected}, so nothing was imported"
+    assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    ("names", "column"),
+    [(ONE_ROW_NAMES, "Volume"), (ONE_ROW_NAMES[::-1], "Date")],
+    ids=["file-order", "date-last"],
+)
+@pytest.mark.parametrize("row", [5, 1], ids=["outside", "inside"])
+def test_a_row_short_by_its_last_cell_refuses(tmp_path, names, column, row):
+    """Catches a width taken from the price columns alone, and a date read before the width,
+    which would raise on the order whose last column is the date."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL), names=names)
+    lines = source.read_text().splitlines()
+    lines[row + 1] = lines[row + 1].rsplit(",", 1)[0]
+    source.write_text("\n".join(lines) + "\n")
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} line {row + 2} has 9 field(s) and ends before {column}, so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_bytes_that_are_not_utf8_refuse_and_quote_nothing(tmp_path):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE))
+    source.write_bytes(source.read_bytes().replace(b"40.123456", b"40.12345\xff"))
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} cannot be read as CSV (UnicodeDecodeError), so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_one_row_columns_in_another_order_and_an_empty_line_read_back(tmp_path):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(TUE, WED), names=ONE_ROW_NAMES[::-1])
+    source.write_text(source.read_text().replace("2012-04-10\n", "2012-04-10\n\n"))
+
+    _run(root, [source], _entry(source))
+
+    table = load_bars("GLD", "1d", lake_root=root)
+    assert table.column("open").to_pylist() == [39.373456, 40.373456]
+    assert table.column("high").to_pylist() == [41.373456, 42.373456]
+    assert table.column("low").to_pylist() == [38.623456, 39.623456]
+    assert table.column("close").to_pylist() == [40.123456, 41.123456]
+    assert table.column("volume").to_pylist() == [1000300, 1000301]
+
+
+def test_the_smallest_and_the_largest_volume_land(tmp_path):
+    root = _lake(tmp_path)
+    rows = _days(TUE, WED, d10={"Volume": "1"}, d11={"Volume": "9223372036854775807"})
+    source = _one_row(tmp_path / "src" / "gld.csv", rows)
+
+    _run(root, [source], _entry(source))
+
+    assert load_bars("GLD", "1d", lake_root=root).column("volume").to_pylist() == [
+        1,
+        9223372036854775807,
+    ]
+
+
+# -- the sessions the window names
+
+
+@pytest.mark.parametrize(
+    ("days", "missing"),
+    [((WED, THU, FRI), 1), ((TUE, WED, THU), 1), ((TUE, FRI), 2), ((TUE, WED, THU, FRI), 0)],
+    ids=["first", "last", "middle", "none"],
+)
+def test_the_missing_count_runs_over_the_window(tmp_path, days, missing):
+    """#1025 acceptance 6. Catches a count bounded by the file's own first and last rows."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(BEFORE, *days, AFTER))
+
+    (ticker,) = _run(root, [source], _entry(source)).tickers
+
+    assert (ticker.landed, ticker.missing) == (len(days), missing)
+
+
+def test_a_file_starting_weeks_into_its_window_counts_them_all(tmp_path):
+    """Tuesday 2012-04-10 to Monday 2012-04-30 is 15 sessions. Catches a history calendar started
+    at the earliest row, which raises ``DateOutOfBounds`` on the window's first session."""
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days("2012-05-01"))
+    vintages = _entry(source, window=(date(2012, 4, 10), date(2012, 5, 1)))
+
+    (ticker,) = _run(root, [source], vintages).tickers
+
+    assert (ticker.landed, ticker.missing) == (1, 15)
+
+
+def test_a_file_with_no_row_inside_its_window_refuses(tmp_path):
+    root = _lake(tmp_path)
+    source = _one_row(tmp_path / "src" / "gld.csv", _days(BEFORE, AFTER))
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source)) == (
+        f"{source} holds no row inside its window, 2012-04-10 to 2012-04-13, so nothing was "
+        "imported"
+    )
+    assert _snapshot(root) == before
+
+
+def test_a_key_inside_the_window_held_by_another_source_refuses_both_tickers(tmp_path):
+    """#1025 acceptance 7."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    held = _manifest_bars(root, "USO", THU, source="bar-import:sha256:" + "cd" * 32)
+    gld = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    uso = _one_row(tmp_path / "src" / "uso.csv", _days(*FULL))
+    uso.write_text(uso.read_text() + "\n")
+    before = _snapshot(root)
+
+    message = _refused(root, [gld, uso], {**_entry(gld), **_entry(uso, "USO")})
+
+    assert message.startswith(f"{held} is already held by the import")
+    assert _snapshot(root) == before
+
+
+# -- the undo over a window
+
+
+def _pair(tmp_path: Path):
+    root = _lake(tmp_path, ("GLD", "USO"))
+    gld = _one_row(tmp_path / "src" / "gld.csv", _days(*FULL))
+    uso = _one_row(tmp_path / "src" / "uso.csv", _days(*FULL, d12={"Stock_Splits": SPLIT_CELL}))
+    return root, [gld, uso], {**_entry(gld), **_entry(uso, "USO", splits=SPLIT)}
+
+
+@pytest.mark.parametrize("recorded", [True, False], ids=["recorded", "unrecorded"])
+def test_an_undo_ignores_a_file_outside_the_window(tmp_path, monkeypatch, capsys, recorded):
+    """#1025 acceptance 8. The CSV holds rows on the two outer sessions. Catches an undo that
+    takes a neighbour's file for a killed import's own."""
+    root, sources, vintages = _pair(tmp_path)
+    for day in (BEFORE, AFTER):
+        if recorded:
+            _manifest_bars(root, "GLD", day, source="bar-import:sha256:" + "cd" * 32)
+        else:
+            write_bars(root, "GLD", "1d", day, [1.0], instrument_id=1)
+    before = _snapshot(root)
+    monkeypatch.setattr(bar_import, "VINTAGES", vintages)
+    monkeypatch.setattr(bar_import, "connect", lambda config: (UNDO_TARGET, FakeS3()))
+    config = write_config(tmp_path, root)
+
+    code = bar_import.main(
+        ["undo", *map(str, sources), "--config", str(config)],
+        clock=ManualClock(MONDAY_0745),
+        calendar=CALENDAR,
+    )
+
+    assert code == 0
+    assert capsys.readouterr().out == (
+        "bar_import: nothing to undo: the manifest records none of these imports\n"
+    )
+    assert _snapshot(root) == before
+
+
+def test_an_undo_of_a_windowed_import_leaves_the_lake_as_it_was(tmp_path):
+    root, sources, vintages = _pair(tmp_path)
+    for day in (BEFORE, AFTER):
+        _manifest_bars(root, "GLD", day, source="bar-import:sha256:" + "cd" * 32)
+    before = _snapshot(root)
+    _run(root, sources, vintages)
+
+    summary = _undo(root, sources, vintages)
+
+    assert (summary.lines, summary.partitions) == (8, 8)
+    assert _snapshot(root) == before
+
+
+def _kill_second_append(monkeypatch, root, sources, vintages):
+    real = bar_import.append_entries
+    calls = []
+
+    def crash(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:
+            raise Crash
+        return real(*args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import, "append_entries", crash)
+        with pytest.raises(Crash):
+            _run(root, sources, vintages)
+
+
+def test_an_undo_after_a_kill_in_the_second_ticker_refuses_until_a_rerun(tmp_path, monkeypatch):
+    """Catches an undo that looks for unrecorded files only when nothing is recorded."""
+    root, sources, vintages = _pair(tmp_path)
+    before = _snapshot(root)
+    _kill_second_append(monkeypatch, root, sources, vintages)
+    killed = _snapshot(root)
+    recorded = {rel for rel in latest_entries(root) if rel.startswith("bars/")}
+    assert recorded == {_rel("GLD", day) for day in (TUE, WED, THU, FRI)}
+    assert {rel for rel in killed if "ticker=USO" in rel} == {
+        _rel("USO", day) for day in (TUE, WED, THU, FRI)
+    }
+    client = FakeS3()
+
+    assert _undo_refused(root, sources, vintages, client=client) == (
+        f"{_rel('USO', TUE)} is on disk and no manifest line names it, which a killed import "
+        "leaves. Run the import again to record it, then run the undo"
+    )
+    assert _snapshot(root) == killed
+    assert client.calls == []
+
+    _run(root, sources, vintages)
+    _undo(root, sources, vintages)
+    assert _snapshot(root) == before
+
+
+def test_a_kill_while_the_undo_waits_for_the_lock_refuses_it(tmp_path, monkeypatch):
+    """The killed import appends nothing, so the manifest's bytes do not show it. Catches a check
+    made only before the lock."""
+    root, sources, vintages = _pair(tmp_path)
+    _run(root, sources[:1], vintages)
+    real = bar_import.lake_lock
+
+    snapshots: list[dict[str, bytes]] = []
+
+    @contextmanager
+    def killed_then_lock(path):
+        write_bars(root, "USO", "1d", FRI, [1.0], instrument_id=2)
+        snapshots.append(_snapshot(root))
+        with real(path):
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", killed_then_lock)
+
+    assert _undo_refused(root, sources, vintages) == (
+        f"{_rel('USO', FRI)} is on disk and no manifest line names it, which a killed import "
+        "leaves. Run the import again to record it, then run the undo"
+    )
+    assert _snapshot(root) == snapshots[0]
+
+
+def test_an_in_window_key_of_another_import_is_not_a_killed_imports(tmp_path):
+    """With nothing of this import recorded, and with its other ticker recorded after it."""
+    root, sources, vintages = _pair(tmp_path)
+    _manifest_bars(root, "GLD", WED, source="bar-import:sha256:" + "cd" * 32)
+    before = _snapshot(root)
+
+    assert _undo(root, sources, vintages).lines == 0
+    assert _snapshot(root) == before
+
+    _run(root, sources[1:], vintages)
+    assert _undo(root, sources, vintages).lines == 4
+    assert _snapshot(root) == before
+
+
+def test_a_rerun_of_a_windowed_import_writes_nothing_and_exits_zero(tmp_path, monkeypatch, capsys):
+    """#1025 acceptance 9."""
+    root, sources, vintages = _pair(tmp_path)
+    monkeypatch.setattr(bar_import, "VINTAGES", vintages)
+    config = write_config(tmp_path, root)
+    argv = ["vintage", *map(str, sources), "--config", str(config)]
+    assert bar_import.main(argv, clock=ManualClock(MONDAY_0745), calendar=CALENDAR) == 0
+    before = _snapshot(root)
+    mtimes = {rel: os.stat(root / rel).st_mtime_ns for rel in before}
+    capsys.readouterr()
+
+    assert bar_import.main(argv, clock=ManualClock(MONDAY_0745), calendar=CALENDAR) == 0
+
+    out = capsys.readouterr().out
+    assert out.count("landed 0 of 4 row(s)") == 2 and out.count("4 already imported") == 2
+    assert _snapshot(root) == before
+    assert {rel: os.stat(root / rel).st_mtime_ns for rel in before} == mtimes

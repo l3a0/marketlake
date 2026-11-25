@@ -834,10 +834,45 @@ def test_an_undo_after_a_killed_import_says_to_rerun_the_import(tmp_path):
     with pytest.raises(BarImportRefused) as refused:
         _undo(root)
 
-    assert f"{_rel('GLD', FIRST)} is on disk and the manifest records none of this import" in str(
-        refused.value
+    assert str(refused.value) == (
+        f"{_rel('GLD', FIRST)} is on disk and no manifest line names it, which a killed import "
+        "leaves. Run the import again to record it, then run the undo"
     )
     assert _snapshot(root) == after
+
+
+def test_an_undo_after_a_kill_in_the_second_ticker_refuses_until_a_rerun(tmp_path, monkeypatch):
+    """GLD recorded and USO renamed but not (marketlake #1025). Catches an undo that looks for
+    unrecorded files only when nothing is recorded."""
+    root = _lake(tmp_path, ("GLD", "USO"))
+    before = _snapshot(root)
+    real = bar_import.append_entries
+    calls = []
+
+    def crash(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:
+            raise RuntimeError("killed")
+        return real(*args, **kwargs)
+
+    def vendors():
+        return _Vendors(GLD=_vendor("GLD"), USO=_vendor("USO"))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import, "append_entries", crash)
+        with pytest.raises(RuntimeError, match="killed"):
+            _run(root, ("GLD", "USO"), vendor=vendors())
+    killed = _snapshot(root)
+
+    with pytest.raises(BarImportRefused) as refused:
+        _undo(root, ("GLD", "USO"))
+
+    assert f"{_rel('USO', FIRST)} is on disk and no manifest line names it" in str(refused.value)
+    assert _snapshot(root) == killed
+
+    _run(root, ("GLD", "USO"), vendor=vendors())
+    _undo(root, ("GLD", "USO"))
+    assert _snapshot(root) == before
 
 
 def test_an_undo_of_a_lake_root_with_no_manifest_refuses(tmp_path):

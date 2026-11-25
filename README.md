@@ -132,16 +132,18 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   the hours the scheduled jobs run in.
 - `src/lake/bar_import.py` imports daily bars marketlake did not capture into `bars/`,
   for sessions before a ticker's capture began.
-  `python -m lake.bar_import vintage <csv>...` lands the quantitative-trading vintages the
-  module lists by SHA-256. It runs on the primary only, refuses any key the manifest
-  names under another source, skips the keys it already imported, and marks each bar
-  imported with its source and price basis. `--dry-run` checks every rule and writes
-  nothing. `python -m lake.bar_import schwab <ticker>...` lands Schwab's daily bars for the
+  `python -m lake.bar_import vintage <csv>...` lands the quantitative-trading vintages and
+  the Yahoo Finance files the module lists by SHA-256, the second only inside the window the
+  list gives. It runs on the primary only, refuses any key the manifest names under another
+  source, skips the keys it already imported, and marks each bar imported with its source
+  and price basis. `--dry-run` checks every rule and writes nothing.
+  `python -m lake.bar_import schwab <ticker>...` lands Schwab's daily bars for the
   40 sessions before each ticker's first capture span session, marked imported and
   split-adjusted as of the fetch. `python -m lake.bar_import undo <csv>...` and
   `python -m lake.bar_import schwab-undo <ticker>...` remove an import while its entries are
-  still the manifest's last lines and the bucket holds none of it, so only until the nightly
-  upload sends it.
+  still the manifest's last lines and the bucket holds none of it, so only until the next
+  upload sends it. Both refuse on an import's file that no manifest line names, which a
+  killed import leaves, until a rerun of the import records it.
 - `tests/support` holds the fakes, the fixture-lake builder, the enforcement scanners,
   the proxy pool that measures a read's peak Arrow memory, and `status_dom.js`, the DOM
   stub the Cost panel's page test runs the dashboard's script against.
