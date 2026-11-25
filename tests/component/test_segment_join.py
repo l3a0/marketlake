@@ -184,7 +184,9 @@ def test_a_torn_segment_gives_the_rows_before_the_tear(lake_root, surface):
 
 def test_the_first_segments_metadata_is_the_partitions(lake_root, surface):
     _segment(lake_root, surface, 31, PINNED.with_metadata({b"k": b"first"}), 1.5, 10, "data")
-    _segment(lake_root, surface, 32, PINNED.with_metadata({b"k": b"later"}), 2.5, 20, "data")
+    _segment(
+        lake_root, surface, 32, PINNED.with_metadata({b"k": b"later", b"n": b"1"}), 2.5, 20, "data"
+    )
     # All of it, because a partition's metadata is part of what the seal writes.
     assert _sealed(lake_root, surface).schema.metadata == {b"k": b"first"}
 

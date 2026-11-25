@@ -913,7 +913,7 @@ that.
 A replay reads the sealed day in four steps.
 
 1. Call `load_quotes` at the decision's minute, an Eastern `HH:MM`. `SnapAbsent` means that minute
-   holds no row.
+   holds no data row.
 2. Cut the answer with `captured_by` at the decision's instant.
 3. Step back a minute until a row is left, as far as the session's open by the consumer's own
    calendar, and take the newest.
@@ -940,7 +940,8 @@ Parquet. Five differences are part of the contract.
 
 1. **The seal holds more.** A row from a segment with no manifest entry never reaches the bucket's
    live prefix, and a listing misses what lands after it. `load_quotes` may also carry a column
-   that only a segment the caller did not name holds, such as a gap marker's, null on these rows.
+   that only a segment the caller did not name holds, such as a gap marker's, null on these rows,
+   and it may place a lifted column elsewhere.
 2. **The seal holds less.** A segment lost from the capture host after its upload is usually a
    `segment_lost` gap row. It has no row when its minute already held one, or when a restore lost
    its manifest entry too.
@@ -1011,10 +1012,14 @@ It imports `lake.unsealed`, `lake.loader`, `lake.paths.is_reader_file` and
 - **Pin pyarrow to the version `uv.lock` holds at that commit.** The capture host installs that
   one, and marketlake's suite runs on no other. `pyproject.toml` admits older ones, and on some of
   them `load_quotes` raises.
-- **Watch `main` to learn that a raise is due.** Every deployed commit is on `main` first, so a
-  change there to `src/lake/segment_join.py`, `uv.lock` or `SCHEMA_VERSION` comes before the host
-  runs it. A merge can wait days for its deploy, and this contract promises no record of the commit
-  the host runs.
+- **Watch `main` for what is coming.** Every deployed commit is on `main` first. A higher
+  `lake.journal.SCHEMA_VERSION` there says to raise the pin now. A change to what `lake.segment_join`
+  does or to the pyarrow in `uv.lock` says that the host's join will move. A merge can wait days for
+  its deploy, a rollback can move the host back, and this contract promises no record of the commit
+  the host runs. Until the deploy the old pin matches and afterwards the new one does, and nothing
+  here says which. So raise for the join alone only once the deploy is known by other means. Where the
+  same raise carries a higher version, raise now, because a refused version stops every read, and take
+  its rows as possibly unequal to the seal's until then.
 
 ## Install on a Linux host
 
