@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The VM's release, so the suite runs the VM's scripts against its own tools. It moves
+    # with the image pattern in infra/live/vm.tf (#1034).
+    runs-on: ubuntu-24.04
     # This ceiling sits far above the job's usual run time, so it only fires on a
     # hang, and it replaces GitHub's six-hour default.
     timeout-minutes: 15
