@@ -823,6 +823,23 @@ def test_an_undo_inside_the_session_refuses_before_it_reads_the_lake(tmp_path):
     assert "security master" not in str(refused.value).lower()
 
 
+def test_an_import_onto_a_torn_manifest_refuses(tmp_path):
+    """The landing is shared, so the check is (marketlake #1025)."""
+    root = _lake(tmp_path)
+    with (root / "manifest.jsonl").open("ab") as handle:
+        handle.write(b'{"partition": "torn')
+    before = _snapshot(root)
+
+    with pytest.raises(BarImportRefused) as refused:
+        _run(root)
+
+    assert str(refused.value) == (
+        "manifest.jsonl ends in a torn line, so an entry appended to it would be lost and nothing "
+        "was imported"
+    )
+    assert _snapshot(root) == before
+
+
 def test_an_undo_after_a_killed_import_says_to_rerun_the_import(tmp_path):
     """A killed import leaves files no manifest line records, which the undo cannot cut."""
     root = _lake(tmp_path)

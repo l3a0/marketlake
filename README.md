@@ -144,9 +144,10 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   for sessions before a ticker's capture began.
   `python -m lake.bar_import vintage <csv>...` lands the quantitative-trading vintages and
   the Yahoo Finance files the module lists by SHA-256, the second only inside the window the
-  list gives. It runs on the primary only, refuses any key the manifest names under another
-  source, skips the keys it already imported, and marks each bar imported with its source
-  and price basis. `--dry-run` checks every rule and writes nothing.
+  list gives. It runs on the primary only, refuses a damaged manifest and any key the
+  manifest names under another source, skips the keys it already imported, and marks each
+  bar imported with its source and price basis. `--dry-run` checks every rule and writes
+  nothing.
   `python -m lake.bar_import schwab <ticker>...` lands Schwab's daily bars for the
   40 sessions before each ticker's first capture span session, marked imported and
   split-adjusted as of the fetch. `python -m lake.bar_import undo <csv>...` and

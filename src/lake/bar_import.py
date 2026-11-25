@@ -103,6 +103,9 @@ nothing and pass a different source in silence. The import instant goes in the e
    first asks the bucket, by ``_Plan.rewrite_check``, and refuses once the bucket holds the key.
 7. The Schwab import's own rules, its window, the not-final guard and the checks on its
    response, are the Schwab paragraph's above and ``_schwab_bars``'.
+8. Every line of the manifest is a whole entry, checked under the lock and in the dry run, so no
+   entry is appended behind damage that hides it. ``_import_tail`` refuses an undo on the same
+   damage.
 
 **A stop leaves nothing unrecorded.** A refusal or a write failure part-way through a ticker
 records the partitions it already renamed into place, in one manifest append, and then says
@@ -807,6 +810,46 @@ def _holder(rel: str, held: str) -> str:
     return f"{rel} is already held by captured bars (manifest source {held!r})"
 
 
+def _whole_lines(raw: bytes, cost: str, outcome: str) -> tuple[list[int], list[str], list[str]]:
+    """Where each line of the manifest starts, its source and its partition.
+
+    Refuses a torn last line, whose ``cost`` the refusal names, and a line that is not an entry. A
+    read of the manifest stops at the first line it cannot parse, so entries recorded past one are
+    hidden from every reader while the file holds them.
+    """
+    if raw and not raw.endswith(b"\n"):
+        raise BarImportRefused(f"manifest.jsonl ends in a torn line, so {cost} and {outcome}")
+    offsets: list[int] = []
+    sources: list[str] = []
+    partitions: list[str] = []
+    at = 0
+    for number, line in enumerate(raw.split(b"\n")[:-1], start=1):
+        offsets.append(at)
+        at += len(line) + 1
+        try:
+            entry = json.loads(line)
+            sources.append(str(entry["source"]))
+            partitions.append(str(entry["partition"]))
+        except (ValueError, KeyError, TypeError):
+            raise BarImportRefused(
+                f"line {number} of manifest.jsonl is not a whole entry, so {outcome}"
+            ) from None
+    return offsets, sources, partitions
+
+
+def _refuse_damaged_manifest(root: Path) -> None:
+    """Refuse an import that would append behind damage.
+
+    Its entries would be hidden from every reader, capture's later ones with them, and the undo
+    refuses on the same damage, so nothing could take the import back.
+    """
+    _whole_lines(
+        manifest_path(root).read_bytes(),
+        "an entry appended to it would be lost",
+        "nothing was imported",
+    )
+
+
 def _decide(
     root: Path,
     plans: Sequence[_Plan],
@@ -907,6 +950,7 @@ def _land(
 
     if dry_run:
         try:
+            _refuse_damaged_manifest(root)
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
         except ManifestError as exc:
             raise BarImportRefused(f"{exc}, so nothing was imported") from None
@@ -923,6 +967,7 @@ def _land(
             why = window()
             if why is not None:
                 raise refuse(why)
+            _refuse_damaged_manifest(root)
             _decide(root, plans, latest_entries(root), latest_trimmed(root))
             _check_rewrites(plans, refuse)
             for plan in plans:
@@ -1452,26 +1497,9 @@ def _import_tail(raw: bytes, identities: set[str]) -> tuple[int, list[str], set[
     Refuses a torn last line, a line that is not an entry, and an entry of these imports that
     sits before an entry of anything else, which the cut would then take with it.
     """
-    if raw and not raw.endswith(b"\n"):
-        raise BarImportRefused(
-            "manifest.jsonl ends in a torn line, so the undo cannot tell where the import starts "
-            "and nothing was undone"
-        )
-    offsets: list[int] = []
-    sources: list[str] = []
-    partitions: list[str] = []
-    at = 0
-    for number, line in enumerate(raw.split(b"\n")[:-1], start=1):
-        offsets.append(at)
-        at += len(line) + 1
-        try:
-            entry = json.loads(line)
-            sources.append(str(entry["source"]))
-            partitions.append(str(entry["partition"]))
-        except (ValueError, KeyError, TypeError):
-            raise BarImportRefused(
-                f"line {number} of manifest.jsonl is not a whole entry, so nothing was undone"
-            ) from None
+    offsets, sources, partitions = _whole_lines(
+        raw, "the undo cannot tell where the import starts", "nothing was undone"
+    )
     start = len(sources)
     while start > 0 and sources[start - 1] in identities:
         start -= 1

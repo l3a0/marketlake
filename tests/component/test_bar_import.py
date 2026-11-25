@@ -1425,7 +1425,10 @@ def test_a_torn_manifest_tail_refuses_the_undo(tmp_path):
         handle.write(b'{"partition": "torn')
     after = _snapshot(root)
 
-    assert "torn line" in _undo_refused(root, sources, vintages)
+    assert _undo_refused(root, sources, vintages) == (
+        "manifest.jsonl ends in a torn line, so the undo cannot tell where the import starts and "
+        "nothing was undone"
+    )
     assert _snapshot(root) == after
 
 
@@ -1995,6 +1998,115 @@ def test_the_undo_reads_its_keys_from_the_bytes_it_hashed(tmp_path, monkeypatch)
 
     assert _rel("GLD", TUE) in _undo_refused(root, [source], vintages)
     assert swap.opens == 1
+
+
+# -- a damaged manifest
+
+
+TORN = (
+    "manifest.jsonl ends in a torn line, so an entry appended to it would be lost and nothing was "
+    "imported"
+)
+NOT_WHOLE = "line 2 of manifest.jsonl is not a whole entry, so nothing was imported"
+DAMAGE = [
+    pytest.param(b'{"partition": "x", "sou', TORN, id="torn"),
+    pytest.param(b'{"partition": "x", "source": "y"}', TORN, id="short-by-its-newline"),
+    pytest.param(b'{"partition": "x", "sou\n', NOT_WHOLE, id="fragment"),
+    pytest.param(b'{"part{"partition": "x", "source": "y"}\n', NOT_WHOLE, id="fused"),
+    pytest.param(
+        b'{"part{"partition": "x", "source": "y"}\n{"partition": "z", "source": "y"}\n',
+        NOT_WHOLE,
+        id="fused-with-a-line-behind-it",
+    ),
+    pytest.param(b"\n", NOT_WHOLE, id="blank"),
+    pytest.param(b'["x", "y"]\n', NOT_WHOLE, id="a-list"),
+    pytest.param(b'{"partition": "x"}\n', NOT_WHOLE, id="no-source"),
+    pytest.param(b'{"source": "y"}\n', NOT_WHOLE, id="no-partition"),
+    pytest.param(b"\xff\n", NOT_WHOLE, id="not-utf8"),
+]
+WHOLE = b'{"partition": "reference/odd.parquet", "source": "y"}\n'
+
+
+@pytest.mark.parametrize(("damage", "expected"), DAMAGE)
+def test_an_import_onto_a_damaged_manifest_refuses(tmp_path, damage, expected):
+    """Its entries would be hidden from every reader, capture's later ones with them, and the undo
+    refuses on the same damage. Catches a landing that reads no line it appends behind, in the run
+    and in the dry run."""
+    root, sources, vintages = _pair(tmp_path)
+    (root / "manifest.jsonl").write_bytes(WHOLE + damage)
+    before = _snapshot(root)
+
+    assert _refused(root, sources, vintages) == expected
+    with pytest.raises(BarImportRefused) as refused:
+        _dry(root, sources, vintages)
+    assert str(refused.value) == expected
+    assert _snapshot(root) == before
+
+
+@pytest.mark.parametrize(("damage", "expected"), DAMAGE)
+def test_an_undo_on_a_damaged_manifest_refuses_with_nothing_recorded(tmp_path, damage, expected):
+    """Catches an undo that says nothing to undo over lines it could not read."""
+    root, sources, vintages = _pair(tmp_path)
+    (root / "manifest.jsonl").write_bytes(WHOLE + damage)
+    before = _snapshot(root)
+
+    message = _undo_refused(root, sources, vintages)
+
+    assert message == expected.replace(
+        "an entry appended to it would be lost", "the undo cannot tell where the import starts"
+    ).replace("nothing was imported", "nothing was undone")
+    assert _snapshot(root) == before
+
+
+def test_a_manifest_damaged_while_the_import_waits_for_the_lock_refuses(tmp_path, monkeypatch):
+    """Catches a check made only before the lock."""
+    root, sources, vintages = _pair(tmp_path)
+    (root / "manifest.jsonl").write_bytes(WHOLE)
+    real = bar_import.lake_lock
+
+    @contextmanager
+    def torn_then_lock(path):
+        (root / "manifest.jsonl").write_bytes(WHOLE + b'{"partition": "x')
+        with real(path):
+            yield
+
+    monkeypatch.setattr(bar_import, "lake_lock", torn_then_lock)
+
+    assert _refused(root, sources, vintages) == TORN
+    assert not any(rel.startswith("bars/") for rel in _snapshot(root))
+
+
+def test_a_rerun_after_a_short_append_refuses_and_lands_once_the_fragment_is_cut(
+    tmp_path, monkeypatch
+):
+    """The second ticker's append is cut short, as a full disk leaves it. Catches a rerun that
+    prints a good count over entries no reader can see."""
+    root, sources, vintages = _pair(tmp_path)
+    before = _snapshot(root)
+    real = bar_import.append_entries
+    calls = []
+
+    def short(*args, **kwargs):
+        calls.append(args)
+        real(*args, **kwargs)
+        if len(calls) == 2:
+            raw = (root / "manifest.jsonl").read_bytes()
+            (root / "manifest.jsonl").write_bytes(raw[:-40])
+            raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(bar_import, "append_entries", short)
+        _refused(root, sources, vintages)
+    torn = _snapshot(root)
+
+    assert _refused(root, sources, vintages) == TORN
+    assert _snapshot(root) == torn
+
+    raw = (root / "manifest.jsonl").read_bytes()
+    (root / "manifest.jsonl").write_bytes(raw[: raw.rindex(b"\n") + 1])
+    _run(root, sources, vintages)
+    _undo(root, sources, vintages)
+    assert _snapshot(root) == before
 
 
 # -- the splits
