@@ -243,3 +243,122 @@ def test_reads_across_multiple_segments(fixture_lake):
     root = fixture_lake.build()
     m = measure.measure_day(root, "SPY", DAY)
     assert m.data_cycles == 2
+
+
+# -- a day whose segments disagree about columns, marketlake #143 --------------
+
+
+def _segment(lake_root, start_ts: str, rows: list[dict], schema: pa.Schema) -> None:
+    path = journal.segment_path(lake_root, "chains", "SPY", DAY, start_ts, 4242)
+    with journal.SegmentWriter(path, schema) as writer:
+        writer.write_cycle(pa.Table.from_pylist(rows, schema=schema))
+
+
+def _without(name: str) -> pa.Schema:
+    return pa.schema([field for field in journal.CHAINS_SCHEMA if field.name != name])
+
+
+def test_a_column_moved_mid_day_reads_back(lake_root):
+    moved = pa.schema([journal.CHAINS_SCHEMA.field("theta"), *_without("theta")])
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), journal.CHAINS_SCHEMA)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), moved)
+
+    table = measure.read_surface_cycles(lake_root, "chains", "SPY", DAY)
+    assert table.column("open_interest").to_pylist() == [1000, 500, 1200, 500]
+    # The reader joins and leaves the order alone, which no measurement reads.
+    assert table.schema.names == journal.CHAINS_SCHEMA.names
+    assert measure.measure_day(lake_root, "SPY", DAY).data_cycles == 2
+
+
+def test_a_column_added_mid_day_reads_back(lake_root):
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), _without("bid"))
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), journal.CHAINS_SCHEMA)
+
+    table = measure.read_surface_cycles(lake_root, "chains", "SPY", DAY)
+    assert table.column("bid").to_pylist() == [None, None, 4.2, 4.2]
+    assert measure.measure_day(lake_root, "SPY", DAY).data_cycles == 2
+
+
+def test_a_column_dropped_mid_day_reads_back(lake_root):
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), journal.CHAINS_SCHEMA)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), _without("bid"))
+
+    table = measure.read_surface_cycles(lake_root, "chains", "SPY", DAY)
+    assert table.column("bid").to_pylist() == [4.2, 4.2, None, None]
+    assert measure.measure_day(lake_root, "SPY", DAY).data_cycles == 2
+
+
+def test_a_column_retyped_mid_day_is_refused(lake_root):
+    index = journal.CHAINS_SCHEMA.get_field_index("open_interest")
+    retyped = journal.CHAINS_SCHEMA.set(index, pa.field("open_interest", pa.float64()))
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), journal.CHAINS_SCHEMA)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), retyped)
+
+    with pytest.raises(pa.ArrowTypeError):
+        measure.read_surface_cycles(lake_root, "chains", "SPY", DAY)
+
+
+@pytest.mark.parametrize("bare", ["first", "last"])
+def test_open_interest_on_some_cycles_alone_is_no_refresh(lake_root, bare):
+    # The column came or went partway through the day, so some cycles hold no open interest.
+    # Nothing refreshed, and the price is that the day's own change goes unreported too.
+    schemas = [_without("open_interest"), journal.CHAINS_SCHEMA]
+    if bare == "last":
+        schemas.reverse()
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), schemas[0])
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), schemas[1])
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.observed is False
+    assert refresh.changed_contracts == 0
+
+
+@pytest.mark.parametrize("last", ["dropped", "null"])
+def test_a_refresh_before_the_open_interest_goes_is_never_atomic(lake_root, last):
+    # The refresh lands between two cycles that hold the value, and the last cycle holds none, so
+    # nothing is left to say whether the refreshed state was the one that held.
+    schema = journal.CHAINS_SCHEMA
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), schema)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), schema)
+    rows = [{**row, "open_interest": None} for row in _cycle(_T2, 0.4, far_oi=0)]
+    _segment(lake_root, "c", rows, _without("open_interest") if last == "dropped" else schema)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.observed is True
+    assert refresh.refresh_slot == _T1.isoformat()
+    assert refresh.changed_contracts == 1
+    assert refresh.atomic is False
+
+
+@pytest.mark.parametrize("bare", [0, 2])
+def test_a_contract_with_no_open_interest_takes_only_itself_out(lake_root, bare):
+    # The same-day contract holds none in the first cycle, or in the last. The other contract's
+    # refresh is still seen, and still atomic.
+    oi = (1000, 1200, 1200)
+    for index, snap in enumerate((_OPEN, _T1, _T2)):
+        rows = _cycle(snap, 0.5, far_oi=oi[index])
+        if index == bare:
+            rows[1]["open_interest"] = None
+        _segment(lake_root, f"{index}", rows, journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert (refresh.observed, refresh.changed_contracts, refresh.atomic) == (True, 1, True)
+
+
+def test_a_refresh_that_goes_on_moving_is_not_atomic(lake_root):
+    for name, snap, far_oi in (("a", _OPEN, 1000), ("b", _T1, 1200), ("c", _T2, 1300)):
+        _segment(lake_root, name, _cycle(snap, 0.5, far_oi=far_oi), journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.refresh_slot == _T1.isoformat()
+    assert refresh.atomic is False
+
+
+def test_zero_open_interest_is_a_value(lake_root):
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=0), journal.CHAINS_SCHEMA)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=700), journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.observed is True
+    assert refresh.changed_contracts == 1
+    assert refresh.atomic is True

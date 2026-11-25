@@ -32,8 +32,8 @@ The four measurements, each glossed at first use.
 4. *The OI-refresh moment.* Open interest, OI, is the count of contracts outstanding.
    Schwab loads a session's settled OI at some moment early in the next session. This
    finds the first cycle whose OI differs from the session's first cycle, and reports
-   that slot, how many contracts changed, and whether the change looks atomic (a single
-   settled state that then holds). This was meant to calibrate the OI view's quorum
+   that slot, how many contracts changed, and whether the change looks atomic (its state is
+   already the last cycle's). This was meant to calibrate the OI view's quorum
    fraction and plateau count and does not, because open interest does not move inside a
    stored session: the refresh lands between sessions, outside captured hours, so this
    reports no refresh on every session the lake holds. marketlake #313 records the
@@ -56,6 +56,7 @@ import pyarrow as pa
 from lake import journal
 from lake.journal import ROW_KIND_DATA, ROW_KIND_GAP
 from lake.paths import SEGMENT_GLOB, LakePaths
+from lake.segment_join import merge_by_name
 
 # The final-fifteen-minutes window. It matches the option-close trailing span the
 # design breaks out, expressed as a duration so no session-time literal appears here.
@@ -80,8 +81,11 @@ def read_surface_cycles(
     """Read every journal segment for one surface, ticker, and day into one table.
 
     Slice 1 captures through one-off runner invocations, each its own writer session
-    and so its own segment. This concatenates them all. A day with no segments reads as
-    an empty table in the surface's pinned schema.
+    and so its own segment. This joins them all by name, through the join the seal makes,
+    so a column moved, added or dropped partway through the day reads back, with nulls on
+    the rows of a segment that lacks it. A column two segments hold at two types raises
+    ``pa.ArrowTypeError``, as the seal refuses it. A day with no segments reads as an empty
+    table in the surface's pinned schema.
 
     Pass a surface nothing journals and every day reads as that empty table, because a
     pinned schema is all ``schema_for`` asks for and bars never reach a segment. Both
@@ -96,7 +100,7 @@ def read_surface_cycles(
     tables = [journal.read_segment(path) for path in segments]
     if not tables:
         return schema.empty_table()
-    return pa.concat_tables(tables)
+    return merge_by_name(tables)
 
 
 # -- small numeric and symbol helpers ----------------------------------------
@@ -199,9 +203,10 @@ class SameDayExpiry:
 class OiRefresh:
     """The intra-session OI-refresh moment, if one was observed.
 
-    ``observed`` is false when there were too few cycles to detect a change, or the OI
-    never moved that session. ``atomic`` is true when the refreshed cycle already held
-    the session's settled OI on the contracts it shares with the final cycle.
+    ``observed`` is false when there were too few cycles to detect a change, or no contract
+    that holds open interest in the first cycle moved that session. ``atomic`` is true when
+    the refreshed cycle shares a contract holding open interest with the final cycle, and
+    already held its settled OI on every one it shares.
     """
 
     refresh_slot: str | None
@@ -272,8 +277,20 @@ class DayOneMeasurements:
 
 
 def _oi_map(cycle_rows: list[dict]) -> dict[str, object]:
-    """A contract-to-open-interest map for one cycle's data rows."""
-    return {row["occ_symbol"]: row["open_interest"] for row in cycle_rows}
+    """A contract-to-open-interest map for one cycle's data rows.
+
+    A contract whose open interest is null is left out, because comparing a value with a null
+    would report a refresh the vendor never made. A null is what the vendor sent, or what the
+    join fills on the rows of a segment that lacks the column. The prices are per contract. One
+    that holds no open interest in the first cycle shows no refresh. One that holds none in the
+    last cycle has no say in whether a refresh was atomic, and where every contract is like
+    that, none reads as atomic.
+    """
+    return {
+        row["occ_symbol"]: row["open_interest"]
+        for row in cycle_rows
+        if row["open_interest"] is not None
+    }
 
 
 def measure_day(
@@ -448,7 +465,7 @@ def _oi_refresh(cycles: dict[str, list[dict]], order: list[str]) -> OiRefresh:
         changed = [key for key in common if current[key] != baseline[key]]
         if changed:
             shared = current.keys() & final_map.keys()
-            atomic = all(current[key] == final_map[key] for key in shared)
+            atomic = bool(shared) and all(current[key] == final_map[key] for key in shared)
             return OiRefresh(
                 refresh_slot=slot,
                 changed_contracts=len(changed),

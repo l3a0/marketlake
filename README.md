@@ -47,6 +47,10 @@ once the owner creates its switch file
 ([#868](https://github.com/l3a0/marketlake/issues/868)). The schedule that starts it again
 each morning is [#867](https://github.com/l3a0/marketlake/issues/867).
 
+A consumer that decides before the close can read the day's quotes before the seal, through
+`lake.unsealed` and from the segments the live upload sent
+([#1004](https://github.com/l3a0/marketlake/issues/1004)).
+
 [MVP 3](https://github.com/l3a0/marketlake/milestone/6), see what the lake costs, added a
 nightly cost read. On a host whose `config.yaml` names `cost_export`, the 18:30 sweep reads the AWS
 cost and usage export each night and files a summary under `reports/aws_cost/`, and the
@@ -128,6 +132,12 @@ Production code lives under `src/lake`. Tests and their fakes live under `tests`
   ([#943](https://github.com/l3a0/marketlake/issues/943)).
   `python -m lake.live_upload lag --date YYYY-MM-DD` reads how long each segment took to
   arrive, from the bucket alone.
+- `src/lake/unsealed.py` is the published reader of a day's quotes before its seal, from the
+  segments the live upload put in the bucket
+  ([#1004](https://github.com/l3a0/marketlake/issues/1004)).
+  [Read an unsealed day](#read-an-unsealed-day) is its contract. `src/lake/segment_join.py` is
+  how a ticker-day's segments join by name into one table, which that reader, the seal and the
+  day-one measurements all call.
 - `src/lake/deploy_window.py` says whether a deploy of the hosted VM may start now, from
   the hours the scheduled jobs run in.
 - `src/lake/bar_import.py` imports daily bars marketlake did not capture into `bars/`,
@@ -735,6 +745,281 @@ check against is the lake's own.
 
 Versioning keeps every version of a partition and 30 days of the files rewritten nightly,
 per the lifecycle rules above.
+
+## Read an unsealed day
+
+A consumer that decides before the close cannot wait for the close+15 seal, so `lake.unsealed`
+reads a day's quotes from the capture segments the bucket already holds
+([#1004](https://github.com/l3a0/marketlake/issues/1004)). A *segment* is the Arrow file one
+capture cycle writes for one ticker, and the *seal* joins a ticker-day's segments into one
+Parquet partition. Both join segments through `lake.segment_join`, so a row read before the seal
+is the row `load_quotes` returns after it, apart from
+[the differences below](#where-the-door-and-the-sealed-day-differ). This section is the contract a
+consumer may depend on. Anything it does not state may change without notice.
+
+### How to read the rows captured by a time
+
+1. List the bucket's keys under `<prefix>-live/` plus `segment_prefix(ticker, day)`, in pages.
+2. Ask each object's stored SHA-256 with a `GET` or `HEAD` in checksum mode, and decode it from
+   base64 to hex.
+3. Download each object to its lake-relative path under a directory, and put that directory's
+   `quarantine.jsonl` beside them as [What the door reads](#what-the-door-reads) says.
+4. Call the door with the paths and digests, and take the row with the latest `fetch_end_ts`.
+5. Judge that row. The door judges its schema version, its kind, its ticker, its day, its `extra`
+   and that its response landed by `at`, however long before. It judges no other value in it, nor
+   whether its stamps agree. So a price can be null, not finite or not positive, and it can be old
+   in a row captured a second ago. `fetch_end_ts` dates the capture, and Schwab's own stamps date
+   the price. The caller sets its own limit on the age of each. An empty table says that no named
+   data row was captured by `at`.
+
+```python
+from lake.unsealed import load_unsealed_quotes, segment_prefix
+
+prefix = segment_prefix("SPY", "2026-11-24")
+# 'journal/date=2026-11-24/surface=quotes/ticker=SPY/'
+
+rows = load_unsealed_quotes(
+    "SPY",
+    "2026-11-24",
+    at,  # a datetime with a UTC offset
+    segments=segments,  # {lake-relative path: SHA-256 as 64 lowercase hex digits}
+    lake_root=mirror,  # the directory the segments were downloaded under
+)
+```
+
+### What each function returns and raises
+
+Three functions are published, and every call is safe to repeat.
+
+1. `load_unsealed_quotes(ticker, day, at, *, segments, lake_root)` returns a `pyarrow.Table` of
+   the data rows the named segments hold whose `fetch_end_ts`, the instant the response landed,
+   is at or before `at`. No such row is an empty table with its columns. `lake_root` has no
+   default.
+2. `segment_prefix(ticker, day)` returns the path prefix a caller lists. It ends in `/`, so a
+   listing for SPY never returns SPYG's segments. It raises `UnsealedArgument`.
+3. `captured_by(table, at)` keeps the data rows a table holds that were captured by `at`, as the
+   door does. A replay makes the same cut with it on what `load_quotes` returns. It raises
+   `UnsealedArgument` for a naive `at`, and `UnsealedRefused` for a missing column, a row with no
+   `row_kind`, or a data row whose `fetch_end_ts` names no instant.
+
+**Table:** What `load_unsealed_quotes` raises
+
+| Case | Raised | Its message says |
+| --- | --- | --- |
+| No segment is named | `SegmentAbsent`, with `segment` `None` | which ticker and day, and that none was named |
+| A named segment is not under the root | `SegmentAbsent` | the path, and to download it again |
+| A named segment's bytes differ from its digest | `SegmentMismatch`, with `expected` and `actual` | the path, both digests, and to download it again |
+| A row's version is unknown to this code | `SchemaVersionUnknown`, with the segment's unknown `versions`, a tuple with `None` first | the path, the versions, and to raise the marketlake pin |
+| A bad argument | `UnsealedArgument`, also a `ValueError` | the argument |
+| Any other refusal | `UnsealedRefused` | the path where one segment is at fault, and the ticker and day otherwise |
+
+`UnsealedRefused` is a `loader.LoadError` and the base of the other four, so one `except` catches
+every refusal. Its `segment` is the lake-relative path at fault, or `None`. Every path in a
+message is lake-relative, apart from a bad argument, which is quoted as given. `lake.unsealed`'s
+docstring lists the eight steps and what each one refuses. Two things escape as themselves:
+`MemoryError`, and an `OSError` from opening a named segment other than a missing file, such as a
+permission refused, because it says nothing about the bytes.
+
+A bad segment after `at` refuses too, as `load_quotes` refuses a whole day.
+
+### What the door reads
+
+The door reads only the root it is given. It opens no connection, reads no clock and no
+`config.yaml`, and writes nothing. It opens three kinds of file.
+
+1. The segments the caller names, and no other file beside them.
+2. `quarantine.jsonl`, for the validation battery's verdict on the ticker-day. A missing one reads
+   as no verdict, so a caller checks that its copy is there. A day the battery withholds is
+   refused, and no argument reads it anyway.
+3. `reference/schema_versions.parquet`, only when a row is at an older version than this code
+   writes. `load_quotes` always needs it.
+
+The last two are files `lake.paths.is_reader_file` names. A caller checks their digests against
+the bucket's `manifest.jsonl` through `lake.manifest.latest_entries`, as it does for a sealed
+partition.
+
+### What the object and its digest are
+
+Each quotes segment is one object at `<prefix>-live/` plus its lake-relative path, which is
+`lake-live/journal/date=D/surface=quotes/ticker=T/seg-….arrows` for a `/lake` target. Nothing
+else sits under `segment_prefix`. The name is `seg-`, then ASCII letters, digits and `-`, then
+`.arrows`. It is opaque apart from that and one thing more: paths under one prefix sort by cycle
+start.
+
+The digest is the whole-object SHA-256 S3 stores with the object, `ChecksumSHA256` in base64. It
+is the one marketlake's manifest records, because S3 refuses the upload otherwise. A caller passes
+it as hex, and the door's verdict is the check. The object's user metadata is not part of this
+contract.
+
+`SegmentMismatch` and `SegmentAbsent` speak of the copy under the root. So the caller downloads
+the same object version again, and halts when a fresh copy still differs. A `SegmentAbsent` whose
+`segment` is `None` has nothing to download.
+
+**The check covers the object as uploaded and the download after it.** It cannot see an overwrite
+of the key. The uploader never replaces a key the bucket still holds, and sends one again only
+when its day is still unsealed after the object expired, with the same bytes. S3 itself refuses no
+overwrite until [#985](https://github.com/l3a0/marketlake/issues/985) closes. So #985 is due
+before a reader trades on these rows.
+
+### How long a segment is readable
+
+A segment is readable for seven days after its upload, and its versions for about 90 more
+([#995](https://github.com/l3a0/marketlake/issues/995)). Compaction does not remove it. Once the
+day is sealed, read it through `load_quotes`, which raises `PartitionAbsent` until then.
+
+### How late a segment may be
+
+From the cycle's start to its segment in the bucket, the bound is 90 seconds
+([#943](https://github.com/l3a0/marketlake/issues/943)). The largest of 1,624 segments measured
+10.7 seconds on 2026-11-03 ([#984](https://github.com/l3a0/marketlake/issues/984)), and
+`python -m lake.live_upload lag --date YYYY-MM-DD` measures any day within its last week.
+
+**Nothing enforces the bound.** The capture host pages, at most once a day, when a segment has
+waited ten minutes since the running daemon first read its manifest entry. So no page says
+nothing about lag, and a segment may never arrive. A listing taken at `at` plus 90 seconds and
+the two hosts' clock offset holds every uploaded row captured by `at` when the bound held.
+
+A listing is not a prefix of capture order, because one segment the host cannot read waits while
+later ones go up. A cycle's segments land one ticker at a time.
+
+**`at` is compared with the capture host's clock**, because that clock stamps `fetch_end_ts`. A
+capture clock running behind lets through a row that landed after `at`. marketlake publishes no
+bound on the offset. Its own check asks only whether the clock is synchronized, once each weekday
+morning before the open. So the consumer sets the margin it needs.
+
+### What an absent minute means
+
+A segment the caller names and does not hold is refused. A minute no named segment covers is no
+row, and the door cannot say whether capture missed it, the upload is late or the segment was
+lost. The caller's own age limit decides.
+
+A caller may name any subset, such as the last few. The answer's columns are then those the named
+segments hold, and behind them any column none of them holds that the door lifts a value into from
+`extra`. So a column that arrived later in the day can be absent rather than null, or sit in another
+place than `load_quotes` gives it. Read a column by name.
+
+To reproduce a decision, pass the mapping it used. Once that refuses, because the segments expired
+or the sealed day was withheld, the decision's own snapshot is the record.
+
+### Which row is the newest
+
+Row order is the seal's, which is not time order. One minute can hold two rows, and a stamp
+compares as an instant, never as text. The newest row is the one with the latest `fetch_end_ts`.
+
+One batched request gives every ticker of a cycle the same `fetch_end_ts`. So a consumer that
+needs two tickers of one cycle matches them on it. The door answers one ticker and cannot check
+that.
+
+A replay reads the sealed day in four steps.
+
+1. Call `load_quotes` at the decision's minute, an Eastern `HH:MM`. `SnapAbsent` means that minute
+   holds no data row.
+2. Cut the answer with `captured_by` at the decision's instant.
+3. Step back a minute until a row is left, as far as the session's open by the consumer's own
+   calendar, and take the newest.
+4. For two tickers, step both until one minute holds a matching pair.
+
+Over one set of rows, the walk reaches the newest, because the capture loop abandons a cycle before
+the next minute's can land. A cycle that lands later than that, such as one run by hand, is the
+exception.
+
+**The sealed day's rows are not always the rows a decision read.** It can hold one the decision's
+listing did not, and lack one it did, as
+[the next section](#where-the-door-and-the-sealed-day-differ) says, and nothing in it says when a
+row became readable. So a replay can take a newer row than the decision could see, or an older one,
+with no refusal. Where the two differ, only the decision's own mapping reproduces it, or its own
+snapshot once that refuses. A backtest has no mapping, so it cuts earlier than the instant it decides
+at, by the lag it allows. That cut covers a late row, and not one that never reached the bucket.
+
+### Where the door and the sealed day differ
+
+For the segments named, each minute equals what `load_quotes` returns for it after the seal. The
+partition itself can differ where `load_quotes` does not. A field promoted partway through the day
+stays in `extra` on its earlier rows there, so compare through `load_quotes` rather than with the
+Parquet. Five differences are part of the contract.
+
+1. **The seal holds more.** A row from a segment with no manifest entry never reaches the bucket's
+   live prefix, and a listing misses what lands after it. `load_quotes` may also carry a column
+   that only a segment the caller did not name holds, such as a gap marker's, null on these rows,
+   and it may place a lifted column elsewhere.
+2. **The seal holds less.** A segment lost from the capture host after its upload is usually a
+   `segment_lost` gap row. It has no row when its minute already held one, or when a restore lost
+   its manifest entry too.
+3. **The seal refuses** the day, for a segment the caller did not name.
+4. **The door refuses** where the seal or `load_quotes` answers: a version unknown to this code, an
+   older one the root's ledger lacks and another minute carries, a torn or empty segment, a row
+   with no capture instant or of another day or ticker, or a retype an operator authorized through
+   `recompact_ticker_day`.
+5. **`load_quotes` refuses** where the door answered: a schema-version ledger that lacks the
+   running version or holds another shape for it, or a verdict written since. Where that other
+   shape lacks a column, the door refuses a value routed to `extra` that `load_quotes` lifts.
+
+### What the columns are
+
+The stamps sit on two clocks. `snap_ts`, `fetch_ts` and `fetch_end_ts` are the capture host's, and
+`snap_ts` is the minute the cycle fired for. The other four are Schwab's. `vendor_quote_ts` is
+marketlake's rendering of its `quoteTime`, and `bid_time`, `ask_time` and `trade_time` are its
+epoch milliseconds. Only `trade_time` dates `last`.
+
+A vendor field is as received. marketlake states no venue coverage, session scope or delay for
+`bid`, `ask` and `last`, no counting rule for `total_volume` and no normal value for
+`security_status`. `realtime` is Schwab's own flag. No validation has run on these rows.
+
+The door checks the type of `schema_version`, `row_kind`, `fetch_end_ts`, `snap_ts`, `ticker` and
+`extra`, and of no other column. The rest hold the types below in every version so far. A caller
+that needs them at those types checks the table it got.
+
+**Table:** The published columns, at the Arrow types this package pins
+
+| Column | Arrow type | May be null | What it is |
+| --- | --- | --- | --- |
+| `snap_ts` | `string` | no | the minute slot the cycle fired for, ISO with an offset |
+| `fetch_ts` | `string` | yes | when the request went out, ISO with an offset |
+| `fetch_end_ts` | `string` | no | when the response landed, ISO with an offset |
+| `vendor_quote_ts` | `string` | yes | Schwab's `quoteTime`, ISO with an offset |
+| `bid_time` | `int64` | yes | Schwab's epoch milliseconds for the bid |
+| `ask_time` | `int64` | yes | Schwab's epoch milliseconds for the ask |
+| `trade_time` | `int64` | yes | Schwab's epoch milliseconds for `last` |
+| `ticker` | `string` | no | the ticker asked for |
+| `bid` | `double` | yes | Schwab's `bidPrice` |
+| `ask` | `double` | yes | Schwab's `askPrice` |
+| `last` | `double` | yes | Schwab's `lastPrice` |
+| `bid_size` | `int64` | yes | Schwab's `bidSize` |
+| `ask_size` | `int64` | yes | Schwab's `askSize` |
+| `last_size` | `int64` | yes | Schwab's `lastSize` |
+| `total_volume` | `int64` | yes | Schwab's `totalVolume` |
+| `security_status` | `string` | yes | Schwab's `securityStatus` |
+| `realtime` | `bool` | yes | Schwab's `realtime` flag for the symbol |
+| `close_tag` | `string` | yes | `option_close` or `spot_close` on a close cycle's rows |
+| `session_phase` | `string` | yes | `post_equity_close` on a row past the equity close |
+| `row_kind` | `string` | no | `data` on every row the door returns |
+| `schema_version` | `int64` | no | the version of the code that captured the row |
+
+### How a consumer pins it
+
+A consumer depends on the package at one full commit SHA on `main`, since marketlake has no tags.
+It imports `lake.unsealed`, `lake.loader`, `lake.paths.is_reader_file` and
+`lake.manifest.latest_entries`.
+
+- **Raise the pin before the capture host's version moves.** A pinned reader reads every version up
+  to its own `SCHEMA_VERSION`, and refuses a newer one. A bump on any surface moves the version on
+  quotes rows, so a pin older than the deployed capture refuses every read until it is raised. A
+  newer pin reads older rows. So the pin is raised first, before the first read of a session
+  captured under the new version, and marketlake does not wait for it. The version has moved once,
+  from 1 to 2, for bars alone.
+- **Match the join.** The rows equal the seal's only while the pin's `lake.segment_join` and
+  pyarrow match the deployed ones. A change to what that module does is a change to this contract.
+- **Pin pyarrow to the version `uv.lock` holds at that commit.** The capture host installs that
+  one, and marketlake's suite runs on no other. `pyproject.toml` admits older ones, and on some of
+  them `load_quotes` raises.
+- **Watch `main` for what is coming.** Every deployed commit is on `main` first. A higher
+  `lake.journal.SCHEMA_VERSION` there says to raise the pin now. A change to what `lake.segment_join`
+  does or to the pyarrow in `uv.lock` says that the host's join will move. A merge can wait days for
+  its deploy, a rollback can move the host back, and this contract promises no record of the commit
+  the host runs. Until the deploy the old pin matches and afterwards the new one does, and nothing
+  here says which. So raise for the join alone only once the deploy is known by other means. Where the
+  same raise carries a higher version, raise now, because a refused version stops every read, and take
+  its rows as possibly unequal to the seal's until then.
 
 ## Install on a Linux host
 

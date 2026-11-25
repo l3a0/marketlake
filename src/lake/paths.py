@@ -247,8 +247,10 @@ def is_reader_file(rel: str) -> bool:
     1. A missing ``quarantine.jsonl`` reads as no verdicts, so a withheld partition is admitted.
     2. A missing ``actions/corporate_actions.jsonl`` reads as no actions, so as-traded numbers
        come back labelled ``split`` or ``total``.
-    3. A missing ``reference/schema_versions.parquet`` refuses every read. It surfaces as
-       ``loader.PartialRead`` naming an unrecorded version rather than as a missing file.
+    3. A missing ``reference/schema_versions.parquet`` refuses every read of a sealed partition.
+       It surfaces as ``loader.PartialRead`` naming an unrecorded version rather than as a
+       missing file. ``lake.unsealed`` needs it only for a row at an older version than this
+       code writes, and refuses that read as ``UnsealedRefused``.
 
     The first two fail open, which is why they are worth checking first.
 

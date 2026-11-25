@@ -617,12 +617,10 @@ def schema_fingerprint(surface: str) -> dict[str, str]:
     reorder captures the same values. A null on a reordered row means exactly what it
     meant before, so a reorder mints no version and moving one column past another should
     not fail the suite. Whether a reorder is safe to *ship* is a separate question with a
-    separate answer. ``compact`` merges segments with ``promote_options="default"``, the
-    dashboard's multi-day read uses DuckDB's ``union_by_name``, and the dashboard's
-    per-segment read projects each segment into a fixed schema before it concatenates, so
-    all three absorb one. ``measure.read_surface_cycles`` calls ``pa.concat_tables`` plain
-    and refuses a reordered schema outright. That gap is marketlake #143 and not this
-    function's to catch.
+    separate answer. The seal, ``lake.unsealed`` and ``measure.read_surface_cycles`` join
+    segments by name through ``lake.segment_join``, the dashboard's multi-day read uses
+    DuckDB's ``union_by_name``, and the dashboard's per-segment read projects each segment
+    into a fixed schema before it concatenates, so all of them absorb one.
 
     The two reference tables that carry a version of their own, the security master and
     the capture spans, are deliberately out of scope. Neither file is ever unlinked, so
@@ -2477,8 +2475,8 @@ class SegmentDamaged(pa.ArrowInvalid):
 _EOS_MARKER = b"\xff\xff\xff\xff\x00\x00\x00\x00"
 
 
-def _ends_in_eos(source: pa.MemoryMappedFile) -> bool:
-    """Whether the file's last eight bytes are the end-of-stream marker.
+def _ends_in_eos(source: pa.NativeFile) -> bool:
+    """Whether the source's last eight bytes are the end-of-stream marker.
 
     ``read_at`` leaves the stream's position alone, so the read after this starts at the
     first byte.
@@ -2494,7 +2492,7 @@ _BYTE_FAILURES = (pa.ArrowException, OSError)
 
 
 def _complete_batches(
-    path: Path, source: pa.MemoryMappedFile
+    path: Path, source: pa.NativeFile
 ) -> tuple[pa.Schema, list[pa.RecordBatch], bool]:
     """A stream's schema, every complete batch, and whether it ended at a clean EOS.
 
@@ -2524,8 +2522,10 @@ def _complete_batches(
     failure after it is the torn tail. Both of those drop rows without a word, so anything
     else, a programming error for one, propagates rather than reading a durable batch as
     torn. ``MemoryError`` propagates from either kind of file, because running out of memory
-    says nothing about the bytes. The memory map is opened by the caller, outside this, so a
+    says nothing about the bytes. The source is opened by the caller, outside this, so a
     missing file still raises ``FileNotFoundError`` and a refused one ``PermissionError``.
+    ``read_segment`` opens a memory map, and ``lake.unsealed`` a buffer over bytes it has
+    already read.
     """
     finished = _ends_in_eos(source)
     try:
