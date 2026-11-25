@@ -527,6 +527,9 @@ _HEADER = "Price,Close,High,Low,Open,Volume\nTicker,GLD,GLD,GLD,GLD,GLD\nDate,,,
         (_HEADER + "2006-04-26,1.0\n", "short of its header"),
         (_HEADER, "holds no rows"),
         (_HEADER.replace("Close", "Other"), "names its Close column 0 time(s) in its Price row, "),
+        (_HEADER.replace("Volume", "Open"), "names its Open column 2 time(s) in its Price row, "),
+        (_HEADER.replace("Volume", "High"), "names its High column 2 time(s) in its Price row, "),
+        (_HEADER.replace("Volume", "Low"), "names its Low column 2 time(s) in its Price row, "),
         (
             _HEADER.replace("Volume", "Close"),
             "names its Close column 2 time(s) in its Price row, ",
@@ -544,6 +547,9 @@ _HEADER = "Price,Close,High,Low,Open,Volume\nTicker,GLD,GLD,GLD,GLD,GLD\nDate,,,
         "short-line",
         "no-rows",
         "no-close",
+        "two-opens",
+        "two-highs",
+        "two-lows",
         "two-closes",
         "no-date-row",
         "mixed-ticker",
@@ -2017,12 +2023,12 @@ SPLIT_CELL = "0.125"
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
         (
-            _days(*FULL, d12={"Stock_Splits": "0.12499999"}),
+            _days(*FULL, d12={"Stock_Splits": "0.12499999999999999"}),
             SPLIT,
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
         (
-            _days(*FULL, d12={"Stock_Splits": "0.12500001"}),
+            _days(*FULL, d12={"Stock_Splits": "0.12500000000000003"}),
             SPLIT,
             "line 5 holds another Stock Splits factor for 2012-04-12 than GLD's entry lists",
         ),
@@ -2509,13 +2515,13 @@ def test_an_undo_of_a_windowed_import_leaves_the_lake_as_it_was(tmp_path):
     assert _snapshot(root) == before
 
 
-def _kill_second_append(monkeypatch, root, sources, vintages):
+def _kill_append(monkeypatch, root, sources, vintages, *, nth):
     real = bar_import.append_entries
     calls = []
 
     def crash(*args, **kwargs):
         calls.append(args)
-        if len(calls) == 2:
+        if len(calls) == nth:
             raise Crash
         return real(*args, **kwargs)
 
@@ -2529,7 +2535,7 @@ def test_an_undo_after_a_kill_in_the_second_ticker_refuses_until_a_rerun(tmp_pat
     """Catches an undo that looks for unrecorded files only when nothing is recorded."""
     root, sources, vintages = _pair(tmp_path)
     before = _snapshot(root)
-    _kill_second_append(monkeypatch, root, sources, vintages)
+    _kill_append(monkeypatch, root, sources, vintages, nth=2)
     killed = _snapshot(root)
     recorded = {rel for rel in latest_entries(root) if rel.startswith("bars/")}
     assert recorded == {_rel("GLD", day) for day in (TUE, WED, THU, FRI)}
@@ -2548,6 +2554,17 @@ def test_an_undo_after_a_kill_in_the_second_ticker_refuses_until_a_rerun(tmp_pat
     _run(root, sources, vintages)
     _undo(root, sources, vintages)
     assert _snapshot(root) == before
+
+
+def test_an_undo_after_a_kill_in_the_first_ticker_refuses(tmp_path, monkeypatch):
+    """Nothing recorded, and the first file's partitions on disk. Catches an undo that looks for
+    the last file's keys alone."""
+    root, sources, vintages = _pair(tmp_path)
+    _kill_append(monkeypatch, root, sources, vintages, nth=1)
+    killed = _snapshot(root)
+
+    assert _undo_refused(root, sources, vintages).startswith(f"{_rel('GLD', TUE)} is on disk and ")
+    assert _snapshot(root) == killed
 
 
 def test_a_kill_while_the_undo_waits_for_the_lock_refuses_it(tmp_path, monkeypatch):
