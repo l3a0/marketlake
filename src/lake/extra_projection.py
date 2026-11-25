@@ -79,7 +79,7 @@ when a row actually carries a value for it. Projecting the running schema onto a
 table is the loader's job, and the loader reads through this rather than reimplementing it.
 
 Two modules read through it. ``lake.loader`` runs it on every sealed read and ``lake.unsealed``
-on every read before the seal, and each refuses a projection that is not complete.
+on every read through its door, and each refuses a projection that is not complete.
 """
 
 from __future__ import annotations

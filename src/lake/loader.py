@@ -69,8 +69,8 @@ Four defaults are settled by marketlake #135, which is authoritative for this de
 1. The return is a ``pyarrow.Table``.
 2. Sealed partitions only. Today's data is not sealed until close+15, and reading live
    journal segments carries a locking problem that belongs elsewhere. ``lake.unsealed`` is
-   where a consumer reads segments before the seal. It meets no lock, because it reads a copy
-   of the segments the bucket holds and never the journal capture is writing.
+   where a consumer reads segments before the seal. It meets no lock, because a segment named
+   by its digest was closed before it was hashed.
 3. ``snap`` is an ET wall-clock minute. The lake stores ``snap_ts`` in UTC, so this
    converts. A reader asking for ``10:31`` means the session minute.
 4. Data rows only. A gap row records a minute that was missed and why, with every vendor

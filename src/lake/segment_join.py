@@ -1,11 +1,19 @@
-"""How a ticker-day's segments become one table, in the one place every reader calls.
+"""How a ticker-day's segments join by name into one table.
 
-Three callers join a ticker-day's segments: the close+15 seal (``lake.compact``), the door
-onto an unsealed day (``lake.unsealed``) and the day-one measurements (``lake.measure``). Two
-joins can disagree, and then a row read before the seal is not the row sealed. So the join is
-these two pure functions and every caller takes it from here. The module imports pyarrow alone.
+Three callers join by name: the close+15 seal (``lake.compact``), the door onto an unsealed day
+(``lake.unsealed``) and the day-one measurements (``lake.measure``). Two joins can disagree, and
+then a row read before the seal is not the row sealed. So the join is these two pure functions,
+and each of the three takes it from here. The module imports pyarrow alone.
 
-**A change here is a change to a published contract.** A consumer pins this package at one
+Two reads of a ticker-day's segments join another way on purpose. The seal's authorized-retype
+repair (``compact._merge_authorized``) widens a column a human said may be widened, and the
+dashboard projects each segment into one fixed schema first.
+
+**A change here changes what the seal writes.** The seal unlinks the segments once it has written
+this result, with only a row count and a footer check after it, and captured data cannot be
+recaptured. So an edit made for a reader is reviewed as an edit to that path.
+
+**A change here is also a change to a published contract.** A consumer pins this package at one
 commit and reads unsealed rows through ``lake.unsealed``. Its rows equal the seal's only while
 this module matches the deployed one, so a change has to reach a consumer's pin as well as the
 capture host, and ``README.md``'s ``## Read an unsealed day`` says so.

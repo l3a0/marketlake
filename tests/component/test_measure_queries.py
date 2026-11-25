@@ -311,3 +311,30 @@ def test_open_interest_on_some_cycles_alone_is_no_refresh(lake_root, bare):
     refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
     assert refresh.observed is False
     assert refresh.changed_contracts == 0
+
+
+@pytest.mark.parametrize("last", ["dropped", "null"])
+def test_a_refresh_before_the_open_interest_goes_is_never_atomic(lake_root, last):
+    # The refresh lands between two cycles that hold the value, and the last cycle holds none, so
+    # nothing is left to say whether the refreshed state was the one that held.
+    schema = journal.CHAINS_SCHEMA
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=1000), schema)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=1200), schema)
+    rows = [{**row, "open_interest": None} for row in _cycle(_T2, 0.4, far_oi=0)]
+    _segment(lake_root, "c", rows, _without("open_interest") if last == "dropped" else schema)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.observed is True
+    assert refresh.refresh_slot == _T1.isoformat()
+    assert refresh.changed_contracts == 1
+    assert refresh.atomic is False
+
+
+def test_zero_open_interest_is_a_value(lake_root):
+    _segment(lake_root, "a", _cycle(_OPEN, 0.5, far_oi=0), journal.CHAINS_SCHEMA)
+    _segment(lake_root, "b", _cycle(_T1, 0.3, far_oi=700), journal.CHAINS_SCHEMA)
+
+    refresh = measure.measure_day(lake_root, "SPY", DAY).oi_refresh
+    assert refresh.observed is True
+    assert refresh.changed_contracts == 1
+    assert refresh.atomic is True

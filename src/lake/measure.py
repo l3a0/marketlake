@@ -278,10 +278,12 @@ class DayOneMeasurements:
 def _oi_map(cycle_rows: list[dict]) -> dict[str, object]:
     """A contract-to-open-interest map for one cycle's data rows.
 
-    A contract whose open interest is null is left out. A column that appears or goes away
-    partway through the day reads as nulls on the other segments' rows, and comparing a value
-    with one of those would report a refresh the vendor never made. The price is that such a
-    day shows no refresh at all.
+    A contract whose open interest is null is left out, because comparing a value with a null
+    would report a refresh the vendor never made. A null is what the vendor sent, or what the
+    join fills on the rows of a segment that lacks the column. Two prices follow. A day whose
+    first cycle holds no open interest shows no refresh at all. A day whose last cycle holds
+    none still shows a refresh between two cycles that do, and it never reads as atomic, since
+    nothing is left to compare the refreshed state with.
     """
     return {
         row["occ_symbol"]: row["open_interest"]
@@ -462,7 +464,7 @@ def _oi_refresh(cycles: dict[str, list[dict]], order: list[str]) -> OiRefresh:
         changed = [key for key in common if current[key] != baseline[key]]
         if changed:
             shared = current.keys() & final_map.keys()
-            atomic = all(current[key] == final_map[key] for key in shared)
+            atomic = bool(shared) and all(current[key] == final_map[key] for key in shared)
             return OiRefresh(
                 refresh_slot=slot,
                 changed_contracts=len(changed),

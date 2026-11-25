@@ -1,17 +1,16 @@
-"""The seal's output did not move when its join became ``lake.segment_join`` (marketlake #1004).
+"""The join every by-name reader of a ticker-day's segments takes, and what the seal makes of it.
 
-Captured data cannot be recaptured, and the seal runs on a live capture host and deletes the
-segments it joins. So the proof is on the bytes. Each day below is sealed twice, once by the
-code as it stands and once with the join the seal held before the move, which is written out
-here and shares nothing with the module. The two partitions have to be the same file.
+The seal runs on a live capture host and deletes the segments it joins, and captured data cannot
+be recaptured. So each way a day's segments can disagree is sealed here and compared with the
+whole table written out, which shares nothing with the code. The schema is this file's own, so a
+column the lake pins later moves none of it.
 
-The join the seal held stays written out on purpose. ``lake.segment_join`` is a published
-contract, and a change to what it does has to be made here too, in the same diff.
+``lake.segment_join`` is also a published contract (marketlake #1004), so two tests keep the seal,
+the door and the measurements on the one join rather than on copies of it.
 """
 
 from __future__ import annotations
 
-import shutil
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -20,10 +19,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from lake import compact as compact_module
-from lake import journal, segment_join
+from lake import journal, measure, segment_join, unsealed
 from lake.calendar import MARKET_TZ
 from lake.compact import CompactionResult, compact
-from lake.journal import CHAINS_SCHEMA, QUOTES_SCHEMA
 from lake.paths import LakePaths
 from tests.support.backup import FakeBackup
 from tests.support.calendar import FakeCalendar, SessionTimes
@@ -31,97 +29,42 @@ from tests.support.clock import ManualClock
 from tests.support.pinger import FakePinger
 
 DAY = date(2026, 8, 24)
-SCHEMAS = {"chains": CHAINS_SCHEMA, "quotes": QUOTES_SCHEMA}
 
-# One column of each surface to move about, off the middle of its pinned schema.
-MOVED = {"chains": "open_interest", "quotes": "bid_size"}
-
-
-def _seal_joined(tables: list[pa.Table]) -> pa.Table:
-    """The line ``compact._seal`` merged with before the move."""
-    return pa.concat_tables(tables, promote_options="default")
-
-
-def _seal_ordered(table: pa.Table, pinned: pa.Schema) -> pa.Table:
-    """The body of ``compact._pinned_order`` before the move."""
-    present = set(table.schema.names)
-    named = set(pinned.names)
-    order = [name for name in pinned.names if name in present]
-    order += [name for name in table.schema.names if name not in named]
-    if order == table.schema.names:
-        return table
-    return table.select(order)
+PINNED = pa.schema(
+    [
+        ("snap_ts", pa.string()),
+        ("bid", pa.float64()),
+        ("size", pa.int64()),
+        ("row_kind", pa.string()),
+    ]
+)
+NAMES = ["snap_ts", "bid", "size", "row_kind"]
 
 
-def _rows(surface: str, minute: int, **over: object) -> list[dict]:
-    stamp = f"2026-08-24T13:{minute:02d}:00+00:00"
-    row = {
-        "snap_ts": stamp,
-        "fetch_ts": stamp,
-        "fetch_end_ts": stamp,
-        "ticker": "SPY",
-        "bid": 1.25 + minute,
-        MOVED[surface]: 100 + minute,
-        "row_kind": "data",
-        "suspect": False,
-        "schema_version": 2,
-        **over,
-    }
-    if surface == "chains":
-        return [{**row, "occ_symbol": f"SPY   260918C00{strike}000"} for strike in (640, 650)]
-    return [row]
+def _snap(minute: int) -> str:
+    return f"2026-08-24T13:{minute}:00+00:00"
 
 
-def _segment(
-    root: Path, surface: str, minute: int, schema: pa.Schema, *, rows: list[dict] | None = None
-) -> None:
-    rows = _rows(surface, minute) if rows is None else rows
-    arrays = [pa.array([row.get(field.name) for row in rows], type=field.type) for field in schema]
-    path = journal.segment_path(root, surface, "SPY", DAY, f"20260824T13{minute:02d}00", 4242)
+def _segment(root: Path, surface: str, minute: int, schema: pa.Schema, *values: object) -> Path:
+    """One closed one-row segment, its values in the schema's order behind ``snap_ts``."""
+    row = {"snap_ts": _snap(minute), **dict(zip(_names(schema), values, strict=True))}
+    path = journal.segment_path(root, surface, "SPY", DAY, f"20260824T13{minute}00", 4242)
+    arrays = [pa.array([row[field.name]], type=field.type) for field in schema]
     with journal.SegmentWriter(path, schema) as writer:
         writer.write_cycle(pa.Table.from_arrays(arrays, schema=schema))
+    return path
 
 
-def _without(schema: pa.Schema, *names: str) -> pa.Schema:
-    return pa.schema([field for field in schema if field.name not in names])
+def _names(schema: pa.Schema) -> list[str]:
+    return [name for name in schema.names if name != "snap_ts"]
 
 
-def _retyped(schema: pa.Schema, name: str, kind: pa.DataType) -> pa.Schema:
-    return schema.set(schema.get_field_index(name), pa.field(name, kind))
+def _without(name: str) -> pa.Schema:
+    return pa.schema([field for field in PINNED if field.name != name])
 
 
-def _day(root: Path, surface: str, shape: str) -> None:
-    """One day's segments, in the shape named."""
-    pinned = SCHEMAS[surface]
-    column = MOVED[surface]
-    moved = pa.schema([pinned.field(column), *_without(pinned, column)])
-    extra = pinned.append(pa.field("vendor_new_field", pa.string()))
-    other = {
-        "one schema": pinned,
-        "a column moved": moved,
-        "a column added": pinned,
-        "a column dropped": _without(pinned, column),
-        "a column nothing pins": extra,
-        "a null column": _retyped(pinned, column, pa.null()),
-        "schema metadata": pinned.with_metadata({b"origin": b"later"}),
-        "a gap row": pinned,
-        "a torn tail": pinned,
-        "a retyped column": _retyped(pinned, column, pa.float64()),
-    }[shape]
-    first = _without(pinned, column) if shape == "a column added" else pinned
-    _segment(root, surface, 31, first)
-    if shape == "a null column":
-        _segment(root, surface, 32, other, rows=_rows(surface, 32, **{column: None}))
-    elif shape == "a gap row":
-        gap = {"row_kind": "gap", "error_class": "timeout", "bid": None, column: None}
-        _segment(root, surface, 32, other, rows=_rows(surface, 32, **gap)[:1])
-    else:
-        _segment(root, surface, 32, other)
-    _segment(root, surface, 33, pinned)
-    if shape == "a torn tail":
-        path = journal.segment_path(root, surface, "SPY", DAY, "20260824T133400", 4242)
-        _segment(root, surface, 34, pinned)
-        path.write_bytes(path.read_bytes()[:-400])
+def _retyped(name: str, kind: pa.DataType) -> pa.Schema:
+    return PINNED.set(PINNED.get_field_index(name), pa.field(name, kind))
 
 
 def _seal(root: Path) -> CompactionResult:
@@ -145,65 +88,111 @@ def _seal(root: Path) -> CompactionResult:
     )
 
 
-def _tree(root: Path) -> dict[str, bytes]:
-    return {
-        path.relative_to(root).as_posix(): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
+@pytest.fixture(params=["quotes", "chains"])
+def surface(request, monkeypatch) -> str:
+    real = journal.schema_for
+    monkeypatch.setattr(
+        journal, "schema_for", lambda asked: PINNED if asked == request.param else real(asked)
+    )
+    return request.param
 
 
-SHAPES = [
-    "one schema",
-    "a column moved",
-    "a column added",
-    "a column dropped",
-    "a column nothing pins",
-    "a null column",
-    "schema metadata",
-    "a gap row",
-    "a torn tail",
-]
-
-
-@pytest.mark.parametrize("surface", SCHEMAS)
-@pytest.mark.parametrize("shape", SHAPES)
-def test_a_day_seals_to_the_bytes_it_sealed_to_before_the_move(
-    tmp_path, monkeypatch, surface, shape
-):
-    now = tmp_path / "now" / "lake"
-    _day(now, surface, shape)
-    before = tmp_path / "before" / "lake"
-    shutil.copytree(now, before)
-
-    result = _seal(now)
-    monkeypatch.setattr(compact_module, "merge_by_name", _seal_joined)
-    monkeypatch.setattr(compact_module, "pinned_order", _seal_ordered)
-    _seal(before)
-
-    # Every file the seal left, the manifest and any finding among them, is the same.
+def _sealed(root: Path, surface: str) -> pa.Table:
+    result = _seal(root)
     assert [item.surface for item in result.sealed] == [surface]
-    assert _tree(now) == _tree(before)
-    assert LakePaths(now).partition_path(surface, "SPY", DAY).is_file()
+    assert not any((root / "journal").rglob("*.arrows"))
+    return pq.read_table(LakePaths(root).partition_path(surface, "SPY", DAY), partitioning=None)
 
 
-@pytest.mark.parametrize("surface", SCHEMAS)
-def test_a_retyped_day_is_refused_as_it_was_before_the_move(tmp_path, monkeypatch, surface):
-    now = tmp_path / "now" / "lake"
-    _day(now, surface, "a retyped column")
-    before = tmp_path / "before" / "lake"
-    shutil.copytree(now, before)
+def _holds(table: pa.Table, names: list[str], types: dict[str, pa.DataType], rows: list) -> None:
+    assert table.schema.names == names
+    assert table.schema.types == [types.get(name, PINNED.field(0).type) for name in names]
+    assert [tuple(row.values()) for row in table.to_pylist()] == rows
 
-    result = _seal(now)
-    monkeypatch.setattr(compact_module, "merge_by_name", _seal_joined)
-    _seal(before)
 
+TYPES = {"bid": pa.float64(), "size": pa.int64()}
+
+
+# -- what each day seals to ---------------------------------------------------
+
+
+def test_one_schema(lake_root, surface):
+    _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data")
+    _segment(lake_root, surface, 32, PINNED, 2.5, None, "gap")
+    rows = [(_snap(31), 1.5, 10, "data"), (_snap(32), 2.5, None, "gap")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_a_column_moved(lake_root, surface):
+    moved = pa.schema([PINNED.field("size"), *_without("size")])
+    _segment(lake_root, surface, 31, moved, 10, 1.5, "data")
+    _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    rows = [(_snap(31), 1.5, 10, "data"), (_snap(32), 2.5, 20, "data")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_a_column_added(lake_root, surface):
+    _segment(lake_root, surface, 31, _without("size"), 1.5, "data")
+    _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    rows = [(_snap(31), 1.5, None, "data"), (_snap(32), 2.5, 20, "data")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_a_column_dropped(lake_root, surface):
+    _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data")
+    _segment(lake_root, surface, 32, _without("size"), 2.5, "data")
+    rows = [(_snap(31), 1.5, 10, "data"), (_snap(32), 2.5, None, "data")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_two_columns_nothing_pins_stay_behind_the_pinned_ones_in_the_order_met(lake_root, surface):
+    wide = pa.schema([("z", pa.string()), *PINNED, ("a", pa.string())])
+    _segment(lake_root, surface, 31, wide, "z1", 1.5, 10, "data", "a1")
+    _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    rows = [
+        (_snap(31), 1.5, 10, "data", "z1", "a1"),
+        (_snap(32), 2.5, 20, "data", None, None),
+    ]
+    _holds(_sealed(lake_root, surface), [*NAMES, "z", "a"], TYPES, rows)
+
+
+def test_a_null_column_takes_the_other_segments_type(lake_root, surface):
+    _segment(lake_root, surface, 31, _retyped("size", pa.null()), 1.5, None, "data")
+    _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    rows = [(_snap(31), 1.5, None, "data"), (_snap(32), 2.5, 20, "data")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_a_torn_segment_gives_the_rows_before_the_tear(lake_root, surface):
+    _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data")
+    torn = _segment(lake_root, surface, 32, PINNED, 2.5, 20, "data")
+    torn.write_bytes(torn.read_bytes()[:-60])
+    _segment(lake_root, surface, 33, PINNED, 3.5, 30, "data")
+    rows = [(_snap(31), 1.5, 10, "data"), (_snap(33), 3.5, 30, "data")]
+    _holds(_sealed(lake_root, surface), NAMES, TYPES, rows)
+
+
+def test_the_first_segments_metadata_is_the_partitions(lake_root, surface):
+    _segment(lake_root, surface, 31, PINNED.with_metadata({b"k": b"first"}), 1.5, 10, "data")
+    _segment(lake_root, surface, 32, PINNED.with_metadata({b"k": b"later"}), 2.5, 20, "data")
+    assert _sealed(lake_root, surface).schema.metadata == {b"k": b"first"}
+
+
+@pytest.mark.parametrize("kind", [pa.float64(), pa.int32(), pa.string()])
+def test_a_retyped_column_seals_nothing_and_keeps_both_segments(lake_root, surface, kind):
+    value = "20" if kind == pa.string() else 20
+    paths = [
+        _segment(lake_root, surface, 31, PINNED, 1.5, 10, "data"),
+        _segment(lake_root, surface, 32, _retyped("size", kind), 2.5, value, "data"),
+    ]
+    before = [path.read_bytes() for path in paths]
+    result = _seal(lake_root)
     assert result.sealed == ()
     assert [item.surface for item in result.refused] == [surface]
-    assert _tree(now) == _tree(before)
+    assert [path.read_bytes() for path in paths] == before
 
 
-# -- the two functions, against literals -------------------------------------
+# -- the two functions -------------------------------------------------------
 
 
 def test_the_join_fills_a_missing_column_with_nulls_in_the_order_given():
@@ -230,11 +219,14 @@ def test_the_order_is_the_pinned_one_with_the_rest_kept_behind_it():
     assert ordered.to_pylist() == [{"a": 1, "b": 2, "z": 4, "y": 3}]
 
 
-def test_a_sealed_partition_holds_the_joined_rows(tmp_path):
-    root = tmp_path / "lake"
-    _day(root, "quotes", "a column added")
-    _seal(root)
-    table = pq.read_table(LakePaths(root).quotes_partition_path("SPY", DAY))
-    assert table.column("bid_size").to_pylist() == [None, 132, 133]
-    assert table.column("bid").to_pylist() == [32.25, 33.25, 34.25]
-    assert table.schema.names == QUOTES_SCHEMA.names
+# -- one join, not three -----------------------------------------------------
+
+
+@pytest.mark.parametrize("module", [compact_module, unsealed, measure])
+def test_each_by_name_reader_joins_through_the_one_function(module):
+    assert module.merge_by_name is segment_join.merge_by_name
+
+
+@pytest.mark.parametrize("module", [compact_module, unsealed])
+def test_the_seal_and_the_door_order_through_the_one_function(module):
+    assert module.pinned_order is segment_join.pinned_order

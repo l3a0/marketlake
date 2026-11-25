@@ -18,7 +18,8 @@ is cut by ``at`` until the last step, so a bad segment refuses whichever minute 
 2. *The quarantine guard.* No verdict exists before the seal, and a segment stays readable for
    days after it. So a day the battery withholds is refused here by the sealed doors' own
    ``withholding`` call, or this door would be a read path past the quarantine. It has no
-   argument that reads a withheld day anyway.
+   argument that reads a withheld day anyway. A root with no ``quarantine.jsonl`` reads as no
+   verdict, as it does at every door, so the caller checks that its copy is there.
 3. *The bytes.* Each file is read once and checked against the digest it was named with.
 4. *The read*, from those same bytes. Compaction reads a torn segment as fewer rows, because a
    power loss can tear one. A manifested segment was closed before it was hashed, so a tear here
@@ -45,9 +46,9 @@ classes, because each list ``journal._complete_batches`` tried missed a member. 
 ``OSError`` other than ``FileNotFoundError`` escapes, because it says nothing about the bytes,
 which is the rule ``compact._read_complete`` states.
 
-A message names a file by its lake-relative path. So where a step reads the root's ledgers, the
-message carries the class of what was raised and leaves its text, which can hold an absolute
-path, on the cause.
+A message names a file by its lake-relative path, apart from a bad argument, which it quotes as
+given. So where a step reads the root's ledgers, the message carries the class of what was raised
+and leaves its text, which can hold an absolute path, on the cause.
 
 Nothing here reads a clock, a config file or the network, and nothing is written.
 """
@@ -70,6 +71,8 @@ from lake.manifest import latest_quarantine_by_check, sha256_bytes, withholding
 from lake.paths import (
     DATE_PREFIX,
     QUARANTINE_FILE,
+    SEGMENT_PREFIX,
+    SEGMENT_SUFFIX,
     LakePaths,
     parse_date_dir,
     parse_segment_rel,
@@ -87,7 +90,9 @@ _SURFACE = journal.QUOTES_SURFACE
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 # A segment's file name. ``paths.parse_segment_rel`` checks the suffix and nothing else of it.
-_NAME = re.compile(r"seg-[A-Za-z0-9-]+\.arrows")
+# The middle is wider than the stamp and pid the writer puts there, and it keeps a separator or
+# a control character out of a path this module opens.
+_NAME = re.compile(rf"{re.escape(SEGMENT_PREFIX)}[A-Za-z0-9-]+{re.escape(SEGMENT_SUFFIX)}")
 
 _VERSION = "schema_version"
 _FETCH_END = "fetch_end_ts"

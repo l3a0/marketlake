@@ -28,11 +28,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
-from lake import config, journal, loader, unsealed
+from lake import capture, config, journal, loader, unsealed
 from lake.calendar import MARKET_TZ
+from lake.chain_plan import ChainPlan
 from lake.compact import CompactionResult, compact
 from lake.journal import QUOTES_SCHEMA
 from lake.loader import SnapAbsent, load_quotes
+from lake.manifest import latest_entries
 from lake.paths import LakePaths
 from lake.schema_versions import (
     RecordedVersion,
@@ -40,6 +42,7 @@ from lake.schema_versions import (
     ledger_path,
     running_fingerprints,
 )
+from lake.tickers import Roster
 from lake.unsealed import (
     SchemaVersionUnknown,
     SegmentAbsent,
@@ -210,8 +213,13 @@ def _ledger(root: Path, *versions: int, without: dict[int, tuple[str, ...]] | No
     return SchemaVersionLedger(entries).write(ledger_path(root))
 
 
-def _withhold(root: Path, partition: str = PARTITION, verdict: str = "quarantined") -> None:
-    entry = {"partition": partition, "check": "spread", "verdict": verdict}
+def _withhold(
+    root: Path,
+    partition: str = PARTITION,
+    verdict: str = "quarantined",
+    check: str = "spread",
+) -> None:
+    entry = {"partition": partition, "check": check, "verdict": verdict}
     with (root / "quarantine.jsonl").open("a") as ledger:
         ledger.write(json.dumps(entry) + "\n")
 
@@ -259,6 +267,64 @@ def _ordinary(root: Path) -> list[str]:
         # An earlier minute than the segments before it, landed after them.
         _write(root, "20260824T133500", [_row(_utc(13, 30), _utc(13, 35, 1), bid=6.0)]),
     ]
+
+
+def test_a_captured_segment_reads_the_way_the_readme_calls_the_door(lake_root, cassette_vendor):
+    # Capture's own segment, under the name capture gives it, with the digest its manifest entry
+    # records and the day and root as text.
+    capture.run_cycle(
+        ManualClock(start=datetime(2026, 8, 24, 13, 30, 45, tzinfo=UTC)),
+        cassette_vendor,
+        Roster.from_mapping(
+            {ticker: {"options": True, "chain_cadence": "1m"} for ticker in ("SPY", "QQQ")}
+        ),
+        lake_root,
+        pid=PID,
+        plan=ChainPlan(((0, None),)),
+    )
+    prefix = segment_prefix("SPY", DAY_TEXT)
+    segments = {
+        rel: entry["sha256"]
+        for rel, entry in latest_entries(lake_root).items()
+        if rel.startswith(prefix)
+    }
+    assert list(segments) == [f"{PREFIX}seg-20260824T133045000000-4242.arrows"]
+
+    answer = load_unsealed_quotes(
+        "SPY", DAY_TEXT, LATE, segments=segments, lake_root=str(lake_root)
+    )
+    assert answer.num_rows == 1
+    assert answer.column("snap_ts").to_pylist() == ["2026-08-24T13:30:00+00:00"]
+    assert answer.column("bid").to_pylist() == [649.98]
+    _seal(lake_root)
+    _same(answer, _sealed_rows(lake_root))
+
+
+def test_every_batch_of_a_segment_is_read(lake_root):
+    path = journal.segment_path(lake_root, "quotes", "SPY", DAY, "a", PID)
+    with journal.SegmentWriter(path, QUOTES_SCHEMA) as writer:
+        for minute in (31, 32):
+            row = _row(_utc(13, minute), _utc(13, minute, 1), bid=float(minute))
+            writer.write_cycle(_table([row]))
+    rel = path.relative_to(lake_root).as_posix()
+    assert _read(lake_root, _named(lake_root, rel)).column("bid").to_pylist() == [31.0, 32.0]
+
+
+def test_a_vendor_value_is_as_received(lake_root):
+    # None of the three is a reason to drop a row: a zero price, a null one and capture's flag.
+    rels = [
+        _minute(lake_root, 31, bid=0.0),
+        _minute(lake_root, 32, bid=None),
+        _minute(lake_root, 33, bid=3.0, suspect=True),
+    ]
+    answer = _read(lake_root, _named(lake_root, *rels))
+    assert answer.column("bid").to_pylist() == [0.0, None, 3.0]
+    assert answer.column("suspect").to_pylist() == [False, False, True]
+
+
+def test_a_row_of_neither_kind_is_not_returned(lake_root):
+    rels = [_minute(lake_root, 31, bid=1.0), _minute(lake_root, 32, row_kind="backfill")]
+    assert _read(lake_root, _named(lake_root, *rels)).column("bid").to_pylist() == [1.0]
 
 
 def test_the_rows_equal_the_sealed_data_rows(lake_root):
@@ -349,6 +415,20 @@ def test_a_moved_an_added_and_a_dropped_column_read_as_the_seal_reads_them(lake_
         assert table.column("mark").to_pylist() == [1.2, 2.2, None]
         assert table.column("volatility").to_pylist() == [0.1, 0.2, None]
     _same(answer, _sealed_rows(lake_root))
+
+
+def test_the_columns_are_those_the_named_segments_hold(lake_root):
+    # ``bid_size`` arrives with the second segment. A subset before it has no such column, and
+    # the sealed doors take theirs from the whole day.
+    _ledger(lake_root, 2)
+    rels = [_minute(lake_root, 31, _without(QUOTES_SCHEMA, "bid_size")), _minute(lake_root, 32)]
+    subset = _read(lake_root, _named(lake_root, rels[0]))
+    whole = _read(lake_root, _named(lake_root, *rels))
+    _seal(lake_root)
+    assert "bid_size" not in subset.column_names
+    assert whole.column("bid_size").to_pylist() == [None, 3]
+    sealed = load_quotes("SPY", DAY, "09:31", lake_root=lake_root)
+    assert sealed.column("bid_size").to_pylist() == [None]
 
 
 def test_a_retyped_column_refuses_here_and_at_the_seal(lake_root):
@@ -650,6 +730,12 @@ def test_each_unknown_version_is_named_with_none_first(lake_root):
     assert refused.versions == (None, 0, 9)
 
 
+def test_a_gap_rows_version_is_judged_too(lake_root):
+    rel = _write(lake_root, "a", [_gap(_utc(13, 31), None, schema_version=99)])
+    refused = _refusal(lake_root, _named(lake_root, rel), SchemaVersionUnknown)
+    assert refused.versions == (99,)
+
+
 _STEP_FIVE = ["schema_version", "row_kind", "fetch_end_ts", "snap_ts", "ticker", "extra"]
 
 
@@ -677,6 +763,22 @@ def test_another_tickers_rows_under_this_path_are_refused(lake_root, ticker):
     refused = _refusal(lake_root, _named(lake_root, good, rel))
     assert refused.segment == rel
     assert repr(ticker) in str(refused)
+
+
+@pytest.mark.parametrize("build", [_row, _gap])
+def test_one_row_of_another_ticker_is_refused(lake_root, build):
+    rows = [
+        _row(_utc(13, 31), _utc(13, 31, 1)),
+        build(_utc(13, 31), _utc(13, 31, 1), ticker="QQQ"),
+    ]
+    rel = _write(lake_root, "a", rows)
+    assert _refusal(lake_root, _named(lake_root, rel)).segment == rel
+
+
+def test_one_row_of_another_day_is_refused(lake_root):
+    yesterday = datetime(2026, 8, 23, 19, 39, tzinfo=UTC)
+    rel = _write(lake_root, "a", [_row(_utc(13, 31), _utc(13, 31, 1)), _row(yesterday, yesterday)])
+    assert _refusal(lake_root, _named(lake_root, rel)).segment == rel
 
 
 @pytest.mark.parametrize(
@@ -872,6 +974,15 @@ def test_a_withheld_partition_is_refused(lake_root):
     assert "spread" in str(refused)
 
 
+def test_a_clean_verdict_of_another_check_buries_no_withholding_one(lake_root):
+    _withhold(lake_root)
+    _withhold(lake_root, verdict="clean", check="volume")
+    rel = _minute(lake_root, 31)
+    refused = _refusal(lake_root, _named(lake_root, rel))
+    assert "spread" in str(refused)
+    assert "volume" not in str(refused)
+
+
 @pytest.mark.parametrize(
     ("partition", "verdict"),
     [
@@ -900,16 +1011,24 @@ def test_a_segment_that_may_not_be_read_escapes_as_itself(lake_root):
         (lake_root / rel).chmod(0o644)
 
 
+def test_a_directory_at_a_segments_path_escapes_as_itself(lake_root):
+    rel = PREFIX + "seg-a-4242.arrows"
+    (lake_root / rel).mkdir(parents=True)
+    with pytest.raises(IsADirectoryError):
+        _read(lake_root, {rel: ZEROS})
+
+
 @pytest.mark.parametrize("step", ["latest_quarantine_by_check", "merge_by_name", "project_extra"])
-def test_running_out_of_memory_escapes_as_itself(lake_root, monkeypatch, step):
+@pytest.mark.parametrize("escapes", [MemoryError, KeyboardInterrupt])
+def test_what_is_not_about_the_data_escapes_as_itself(lake_root, monkeypatch, step, escapes):
     rel = _minute(lake_root, 31)
     segments = _named(lake_root, rel)
 
-    def starve(*args: object, **kwargs: object) -> None:
-        raise MemoryError
+    def stop(*args: object, **kwargs: object) -> None:
+        raise escapes
 
-    monkeypatch.setattr(unsealed, step, starve)
-    with pytest.raises(MemoryError):
+    monkeypatch.setattr(unsealed, step, stop)
+    with pytest.raises(escapes):
         _read(lake_root, segments)
 
 
@@ -1105,6 +1224,18 @@ def test_the_newest_row_is_the_one_a_replay_reaches(lake_root, at, bid):
     assert newest == _replay(lake_root, at)
 
 
+def test_a_replay_sees_a_row_that_reached_the_bucket_after_the_decision(lake_root):
+    # 13:39's row was captured by ``at``, and its segment was not yet listed. The sealed day
+    # cannot say so, which is why a decision's mapping is what reproduces it.
+    _ledger(lake_root, 2)
+    rels = [_minute(lake_root, minute, bid=float(minute)) for minute in (38, 39)]
+    at = _utc(13, 39, 5)
+    decided = _newest(_read(lake_root, _named(lake_root, rels[0]), at))
+    _seal(lake_root)
+    assert decided["bid"] == 38.0
+    assert _replay(lake_root, at)["bid"] == 39.0
+
+
 @pytest.mark.parametrize("name", ["row_kind", "fetch_end_ts"])
 def test_captured_by_refuses_a_missing_column(name):
     table = _table([_row(_utc(13, 31), _utc(13, 31, 1))], _without(QUOTES_SCHEMA, name))
@@ -1152,9 +1283,12 @@ def test_the_readmes_column_table_is_the_published_columns_at_their_pinned_types
     start = text.index("\n## Read an unsealed day\n")
     section = text[start : text.index("\n## ", start + 1)]
     table = section[section.index("**Table:** The published columns") :]
-    rows = re.findall(r"^ *\| `(\w+)` \| `(\w+)` \|", table, re.M)
+    rows = re.findall(r"^ *\| `(\w+)` \| `(\w+)` \| (yes|no) \|", table, re.M)
     assert len(rows) == len(_PUBLISHED)
-    assert dict(rows) == {name: str(QUOTES_SCHEMA.field(name).type) for name in _PUBLISHED}
+    types = {name: kind for name, kind, _ in rows}
+    assert types == {name: str(QUOTES_SCHEMA.field(name).type) for name in _PUBLISHED}
+    never_null = {name for name, _, may_be_null in rows if may_be_null == "no"}
+    assert never_null == {"ticker", "snap_ts", "fetch_end_ts", "row_kind", "schema_version"}
 
 
 @pytest.mark.parametrize("day", [DAY, DAY_TEXT])
