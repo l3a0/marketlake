@@ -1363,7 +1363,8 @@ runs the daemon.
 
    Without a default VPC, the pull request's plan fails at the `data "aws_vpc"` lookup,
    before anything is created. The zone is a literal in the code. On
-   2026-11-25 `aws ec2 describe-instance-type-offerings` listed `t4g.medium` there.
+   2026-11-25 `aws ec2 describe-instance-type-offerings` listed `t4g.small`, `t4g.medium`,
+   `t4g.large` and `m7g.medium` there.
 
    The image lookup in `infra/live/vm.tf` names Ubuntu's images by a pattern. On
    2026-10-07 this command printed `ubuntu-noble-24.04-arm64-server-20261004`, so the
@@ -1732,8 +1733,15 @@ vmstat 1 5
 `swapon --show` lists the file and how much of it is in use. In `vmstat`, the `si` and
 `so` columns count what moves in from swap and out to it each second, and both read 0
 while nothing moves pages. A little swap in use with those columns at 0 means the
-pages sit idle. Swap in use is not a shortage by itself, because reading gigabytes of files
-pushes idle memory out. A low `available` in `free -m` is. These reads show only the present, and the nightly stop empties swap, so a
+pages sit idle. Swap in use is not a shortage by itself, as the design's paragraph "The VM is
+a `t4g.medium`" says. A kernel kill is, and the kernel log keeps it after a stop. Read it
+across boots, because `journalctl -k` reads only the current boot:
+
+```bash
+journalctl _TRANSPORT=kernel --since "30 days ago" | grep -i 'out of memory: killed'
+```
+
+No line means no kill. The reads above show only the present, and the nightly stop empties swap, so a
 morning reading says nothing about the evening before.
 
 The design's paragraph "The VM is a `t4g.medium`", in its
@@ -1817,7 +1825,7 @@ sudo systemctl daemon-reload
 ```
 
 The next deploy restores all of it, until a commit drops the step. A rollback leaves swap
-on, which does nothing until memory runs short.
+on, which is harmless.
 
 ### Deploy a commit
 
@@ -2298,7 +2306,7 @@ because a different key was seen before, clear the old key with
 
 ### The nightly stop
 
-The VM costs about $19.6 a month running around the clock, while capture and its jobs need
+The VM costs about $31.9 a month running around the clock, while capture and its jobs need
 it for about 62 to 68 of the week's 168 hours. So it powers itself off once the day's work
 is done ([#865](https://github.com/l3a0/marketlake/issues/865)). The stop is
 [#868](https://github.com/l3a0/marketlake/issues/868)'s. The start is
@@ -2400,7 +2408,7 @@ thing that feeds it is live: `vm-up` after the deploy that installs its timer, a
 `vm-stop` on the day the switch is created. Pressed earlier, a check pages every morning or
 night until then.
 
-Every failure that only `vm-stop` catches costs about $0.02 an hour, since a hung job is
+Every failure that only `vm-stop` catches costs about $0.04 an hour, since a hung job is
 already paged by `eod-sweep`, `evening-upload` or `sunday`. So the recommendation, the
 owner's to set, is to route `vm-stop` to email only, so a cost alarm does not train the
 owner to ignore pages. A check created in the healthchecks UI gets every integration, so
@@ -2454,7 +2462,8 @@ instance is stopped, then start it.
 aws ec2 modify-instance-attribute --instance-id "<instance-id>" --instance-type Value=t4g.large --profile marketlake-admin --region us-east-1
 ```
 
-The image is arm64, so the type must be too, such as `t4g.large` or `m7g.medium`. The
+The image is arm64, so the type must be too, such as `t4g.large`, `t4g.small` or
+`m7g.medium`. The `t4g.small` has run every job here, with swap doing the evening. The
 price is drift from `instance_type` in `infra/live/`, which the next apply reverts with a
 stop and a start. Approve that apply outside the hours in
 [Replace the instance, and the approval window](#replace-the-instance-and-the-approval-window).

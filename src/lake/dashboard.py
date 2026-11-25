@@ -184,7 +184,7 @@ PANEL_SURFACES = (CHAINS, QUOTES)
 SLOT = timedelta(minutes=1)
 
 # The connection's resource caps. The service shares its host with the minutely capture
-# daemon. The host is a laptop or a 2-core, 1.8 GiB VM, and the capture loop's minute
+# daemon. The host is a laptop or a 2-core VM, and the capture loop's minute
 # budget owns the machine. The dashboard is the guest, so it takes a small fixed share
 # rather than the machine default, which is every core and most of RAM. One thread leaves
 # the VM's second core to capture. The memory cap is a fixed value rather than a fraction

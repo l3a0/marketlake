@@ -2734,7 +2734,7 @@ def test_a_day_spanning_several_batches_gives_the_median_of_the_whole_day(lake: 
 
 
 def test_the_read_holds_one_batch_at_a_time_rather_than_the_whole_day(lake: Path):
-    """The 18:30 sweep ran on a 2 GiB host, where SPY's whole-day read peaked at 1,295.8 MiB.
+    """The 18:30 sweep runs on a 2 GiB host, where SPY's whole-day read peaked at 1,295.8 MiB.
 
     The reference is the whole-table read of the same five columns, which is what the read did
     before it streamed, taken without threads so nothing frees through its pool late.

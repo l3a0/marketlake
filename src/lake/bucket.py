@@ -4481,8 +4481,8 @@ class ResyncSummary:
 def _sha256_stream(path: Path) -> str:
     """A file's hex SHA-256, read in ``_READ_CHUNK`` pieces.
 
-    A sealed partition runs to a few hundred megabytes, and the hosted VM keeps about 1.1 GiB
-    for a job, so a file is never read into memory whole here, unlike ``sha256_file``.
+    A sealed partition runs to a few hundred megabytes, so a file is never read into
+    memory whole here, unlike ``sha256_file``.
     """
     digest = hashlib.sha256()
     with open(path, "rb") as handle:

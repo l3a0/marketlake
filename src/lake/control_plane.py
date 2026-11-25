@@ -740,7 +740,7 @@ class SystemdRootUnit:
     2. ``TimeoutStartSec=`` bounds a run. A timer never starts a service that is still
        running, so one hung run with no timeout would stop every later one.
     3. ``CPUSchedulingPolicy=idle`` and ``IOSchedulingClass=idle`` keep a run behind every
-       other process on the VM.
+       other process on the 2 GiB VM.
     4. ``requires_mounts_for`` is the lake's mount, as on every other unit, so a failed
        mount leaves the VM up for the owner to repair.
     5. The timer's ``OnCalendar=`` repeats within the hour, so it names no zone, and it has

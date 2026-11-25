@@ -315,7 +315,7 @@ if [[ $INNER == 0 ]]; then
   # Without -p StandardOutput a transient unit writes to the journal, which is not mode
   # 0600. Without --pipe, a write the agent stopped reading cannot kill the deploy with
   # SIGPIPE. OOMPolicy=continue keeps the unit running when the kernel kills a child for
-  # memory, such as uv sync on a small host, so that reads as a failed bootstrap and
+  # memory, such as uv sync on a 2 GiB host, so that reads as a failed bootstrap and
   # reaches the rollback rather than stopping the whole unit.
   ENVS=(--setenv="PATH=$PATH" --setenv="MARKETLAKE_DEPLOY_RESULT=$WRAPPER_RESULT")
   if [[ "${MARKETLAKE_INSTALL_TEST:-}" == 1 ]]; then
