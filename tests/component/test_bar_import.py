@@ -22,9 +22,9 @@ Acceptance list.
 Marketlake #1025 adds Yahoo Finance's files: a header of one row, a window, a list of splits
 checked against the file, a volume that lands, and an undo that looks for a killed import's files
 every time. Those cases follow that issue's Acceptance list, in their own section at the end.
-Marketlake #1043 lists the same download of SPY and QQQ, and its one case reads a made-up file
-from 1993 with a split of 2.0. Their bars are made up, because Yahoo's terms forbid republishing
-its own.
+Marketlake #1043 lists SPY's and QQQ's files, downloaded the same way, and its one case reads a
+made-up file from 1993 with a split of 2.0. Their bars are made up, because Yahoo's terms forbid
+republishing its own.
 
 Every CSV is written here and hashed here with ``hashlib``, so no expected value comes from the
 code under test.
@@ -2846,8 +2846,8 @@ def test_a_rerun_of_a_windowed_import_writes_nothing_and_exits_zero(tmp_path, mo
 
 def test_a_file_from_1993_with_a_split_of_two_lands_its_window(tmp_path):
     """#1043 acceptance 2. SPY's file starts in 1993 and QQQ's records a split of 2.0. Catches a
-    history calendar that stops 20 years back, and a split check that takes only factors below
-    one. Every row carries a dividend, which the import does not read."""
+    history calendar that stops 20 years back, and a split check that takes or compares only
+    factors below one. Every row carries a dividend, which the import does not read."""
     root = _lake(tmp_path)
     days = ("1993-01-28", "1993-01-29", "1993-02-01", "1993-02-02", "1993-02-03")
     rows = _days(*days, d01={"Stock_Splits": "2.000000"})
@@ -2860,6 +2860,11 @@ def test_a_file_from_1993_with_a_split_of_two_lands_its_window(tmp_path):
         f"{source} line 4 holds a split on 1993-02-01 in its Stock Splits column, which GLD's "
         "entry does not list, so nothing was imported"
     )
+    four = ((date(1993, 2, 1), 4.0),)
+    assert _refused(root, [source], _entry(source, window=window, splits=four)) == (
+        f"{source} line 4 holds another Stock Splits factor for 1993-02-01 than GLD's entry "
+        "lists, so nothing was imported"
+    )
     assert _snapshot(root) == before
 
     summary = _run(root, [source], _entry(source, window=window, splits=split))
@@ -2871,6 +2876,8 @@ def test_a_file_from_1993_with_a_split_of_two_lands_its_window(tmp_path):
     table = load_bars("GLD", "1d", "1993-01-29", "1993-02-02", lake_root=root, adjust="none")
     assert table.column("close").to_pylist() == [41.123456, 42.123456, 43.123456]
     assert table.column("open").to_pylist() == [40.373456, 41.373456, 42.373456]
+    assert table.column("high").to_pylist() == [42.373456, 43.373456, 44.373456]
+    assert table.column("low").to_pylist() == [39.623456, 40.623456, 41.623456]
     assert table.column("volume").to_pylist() == [1000301, 1000302, 1000303]
     assert table.column("bar_ts").to_pylist() == [
         f"{day}T05:00:00+00:00" for day in ("1993-01-29", "1993-02-01", "1993-02-02")

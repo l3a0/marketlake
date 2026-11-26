@@ -399,13 +399,14 @@ ADJUST_SPLIT = "split"
 ADJUST_TOTAL = "total"
 ADJUSTMENTS = (ADJUST_NONE, ADJUST_SPLIT, ADJUST_TOTAL)
 
-# The four columns every answer from ``load_bars`` carries beside ``adjust``, saying where each
-# row came from and what its stored numbers are. ``origin`` is ``captured`` for a bar the sweep
-# fetched and ``imported`` for one an importer wrote from another source. ``basis`` is ``raw``
-# for as-traded numbers and ``adjusted`` for numbers the source had already adjusted. ``source``
-# and ``source_as_of`` name an imported row's source and the date that source recorded its
-# values, and both are null on a captured row. They are columns for the reason ``adjust`` is:
-# a stitch of an imported partition and a captured one keeps a column per row and keeps only
+# The four columns every answer from ``load_bars`` carries beside ``adjust``, saying where each row
+# came from and what its stored numbers are. ``origin`` is ``captured`` for a bar the sweep fetched
+# and ``imported`` for one an importer wrote from another source. ``basis`` is ``raw`` for
+# as-traded numbers and ``adjusted`` for numbers the source had already adjusted. ``source`` and
+# ``source_as_of`` name an imported row's source and the date that source recorded its values, and
+# both are null on a captured row. That date is a Yahoo download's UTC date and a Schwab import's
+# Eastern fetch date, as ``bar_import.Vintage`` says. They are columns for the reason ``adjust``
+# is: a stitch of an imported partition and a captured one keeps a column per row and keeps only
 # the first table's schema metadata.
 ORIGIN_COLUMN = "origin"
 BASIS_COLUMN = "basis"
