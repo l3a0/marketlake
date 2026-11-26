@@ -2406,8 +2406,10 @@ healthchecks measures each deadline from the last ping, so the 07:40 ping counts
 morning's 07:35 slot, and the night's stop counts for that evening's slot. A check that was
 never pinged stays `new` and never pages. So press Ping Now on each check only once the
 thing that feeds it is live: `vm-up` after the deploy that installs its timer, and
-`vm-stop` on the day the switch is created. Pressed earlier, a check pages every morning or
-night until then.
+`vm-stop` on the day the switch is created. Pressed earlier, a check goes down at its first
+deadline, sends one alert, a push or an email by its routing, and then stays down without another,
+because healthchecks.io alerts only when a check changes state. If its feeder then goes live and fails from the start, the check is already down
+and sends nothing.
 
 Every failure that only `vm-stop` catches costs about $0.04 an hour, since a hung job is
 already paged by `eod-sweep`, `evening-upload` or `sunday`. So the recommendation, the
@@ -2602,7 +2604,9 @@ refuses. After the home address changes, edit the `owner_ssh_cidr` line in place
 ### Captured data not in the bucket
 
 A failed upload pages when the `compaction` and `evening-upload` checks go down, and nothing
-in this repository repeats that page. So the 18:30 vendor sweep reads how far the bucket's
+in this repository repeats that page. healthchecks.io pushes to the phone once when a check
+goes down and once when it comes back up, never while it stays down, and its reminders go by
+email, which the account has off. So the 18:30 vendor sweep reads how far the bucket's
 `manifest.jsonl` reaches and pages every weekday until the bucket catches up, and
 [the design](../docs/design.md#deployment-laptop-now-dedicated-later) carries the reasoning under "A bucket that stays
 behind keeps paging".
@@ -2679,14 +2683,28 @@ crash lost is known only by its file, so this check says nothing about it.
 
 #### Drill the page and the two checks
 
-Nothing has recorded either `compaction` or `evening-upload` reaching the phone, and the
-`live` lifecycle rule relies on both. So run these three parts once, after the deploy that
-carries `--bucket-check`, and post each push's arrival time on [#996](https://github.com/l3a0/marketlake/issues/996) and on
-[PR #997](https://github.com/l3a0/marketlake/pull/997). None of them touches the lake or
-writes to the bucket. Each check's page in healthchecks shows its grace, so read both before
-starting. A push that has not arrived by the deadline plus the grace means that alarm failed,
-which is the finding the drill exists for: post that instead, and leave the veto on
-[PR #997](https://github.com/l3a0/marketlake/pull/997) standing.
+The `live` lifecycle rule relies on both `compaction` and `evening-upload` reaching the
+phone. So run these three parts once, after the deploy that carries `--bucket-check`, and
+post each push's arrival time on [#996](https://github.com/l3a0/marketlake/issues/996) and on
+[PR #997](https://github.com/l3a0/marketlake/pull/997). [#996](https://github.com/l3a0/marketlake/issues/996)
+records which parts have run. None of them touches the lake or writes to the bucket.
+
+Each check goes down at a deadline that already includes its grace.
+
+1. `compaction` goes down at about 17:00. Its schedule is 13:30 on weekdays and its grace is
+   3 hours 30 minutes.
+2. `evening-upload` goes down at about 20:30. Its schedule is 18:30 on weekdays and its grace
+   is 2 hours.
+
+Each check's page in healthchecks shows its schedule and grace, so read both before
+starting. A push that has not arrived a few minutes after that deadline means that alarm
+failed, which is the finding the drill exists for. The `live` rule has been in force since
+2026-11-07, so a failed alarm does not hold anything back. Post it on
+[#996](https://github.com/l3a0/marketlake/issues/996) for the owner, who decides whether to
+stop the rule as
+[Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back)
+says. healthchecks.io pushes once when a check goes down and once when it comes back up, so
+each down check sends one `is DOWN` push and nothing more until its `is UP`.
 
 **Part 1, the page.** Run this as `ubuntu` on the VM at any hour it is up. It copies the
 manifest to a scratch directory, adds one file the bucket has never held, and points a copy of
@@ -2725,19 +2743,47 @@ upload read the same key.
 mv ~/.config/marketlake/config.yaml.drill ~/.config/marketlake/config.yaml && grep '^backup_target' ~/.config/marketlake/config.yaml
 ```
 
-The check goes down after its deadline, about 17:00, plus its grace. Record the push, and
-record whether a second one arrives while the check stays down, which settles whether the
-account sends reminders. The evening upload then carries the day, so nothing stays behind, and
-the next session's ping clears the check.
+The check goes down at about 17:00. Record the push. The evening upload then carries the
+day, so nothing stays behind. The check comes back up on the next compaction run that
+uploads. The daemon runs a day's compaction a minute after close+15, and a daemon started
+later than that runs it on its second minute. So any daemon start that evening, such as a
+VM started by hand or a deploy that restarts the daemon, clears the check within a few
+minutes. A deploy of the commit already running restarts nothing. Otherwise the next
+weekday's run clears it: close+15 on a session day, or 16:30 on a holiday.
 
 **Part 3, `evening-upload`.** On another session day, run the same two commands around the
-18:30 sweep: the edit at about 18:25, and the restore once
-`journalctl -u com.marketlake.eod-sweep` shows the run has ended, a few minutes later. Stay
+18:30 sweep: the edit at about 18:25, and the restore once the upload has stopped. Stay
 logged in until the restore's `grep` prints the real prefix, because the VM can power off from
 18:45 once no terminal is logged in, and this edit would then reach the next morning's daemon.
-The sweep sends `Capture at risk: bucket copy not checked`, which drills that page too, and the
-upload it hands off to stops before its ping. The check goes down after its deadline, about
-20:30, plus its grace. Record both pushes. The next close+15 run carries the evening's bars,
+
+1. The sweep's bucket check runs before its walks, so `Capture at risk: bucket copy not
+   checked` reaches the phone within about a minute of 18:30. Its body gives the reason
+   `the bucket holds no usable manifest copy`. This drills that page too.
+2. Wait for the upload's own line before the restore. The upload reads the config only after
+   the sweep's walks, so a restore made by the clock can let it succeed and leave the check
+   untested. Watch for the sweep's `sweep: handing off to` line, then the upload's
+   `compact: the bucket holds no manifest.jsonl, so the nightly upload has no watermark`.
+
+   ```bash
+   journalctl -u com.marketlake.eod-sweep -f
+   ```
+
+   That second line names `first-upload`. Do not run it, because against `lake-drill` it
+   would write the lake to the bucket.
+3. Any of three signs means the sweep itself failed, and such a run proves nothing about
+   `evening-upload`. Restore at once and run Part 3 again on another session day.
+   1. A `sweep: no hand-off to compaction:` line.
+   2. A systemd line that the unit failed, such as `Failed with result 'oom-kill'`, which is
+      how the sweep that ran out of memory on 2026-11-06 ended. A sweep killed that way
+      prints neither of the lines in step 2.
+   3. No `compact:` line by about 19:00, when the `eod-sweep` check goes down and pushes.
+4. The check goes down at about 20:30. Record both pushes.
+5. Only the sweep's hand-off pings `evening-upload`. The daemon's own compaction pings
+   `compaction`, so a VM started by hand does not clear this check. It comes back up on the
+   next weekday's evening upload, a few minutes after 18:30, and until then a failed upload
+   sends no push. Check that it reads up on the next weekday evening.
+
+The next close+15 run carries the evening's bars,
 so a restore that night would be a day behind on bars and actions, and on nothing captured.
 Hold any deploy while the edit stands, because a deploy renders `config.yaml` again. A
 session can approve a deploy, so add the stop entry that `CLAUDE.md`'s "Deployment
