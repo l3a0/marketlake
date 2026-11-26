@@ -262,14 +262,17 @@ def _cassette(
     tickers: tuple[str, ...] = ("SPY",),
     freqs: tuple[str, ...] = (MINUTE_FREQ, DAILY_FREQ),
     daily_closes: dict[date, float] | None = None,
+    daily_candles: dict[date, dict] | None = None,
 ) -> Cassette:
     """A cassette holding one recording per ticker, frequency and session.
 
     A window it was not built for raises rather than replaying a neighbour's, which is what makes
     the range itself an assertion: a walk reaching a session this does not cover fails loudly.
-    ``daily_closes`` gives a session's daily candle its own close.
+    ``daily_closes`` gives a session's daily candle its own close, and ``daily_candles`` replaces
+    a session's daily candle whole.
     """
     daily_closes = daily_closes or {}
+    daily_candles = daily_candles or {}
     interactions: list = []
     for ticker in tickers:
         for day in sessions:
@@ -294,7 +297,10 @@ def _cassette(
                             (
                                 open_et - DAY_MARGIN,
                                 close_et + DAY_MARGIN,
-                                [_daily_candle(day, daily_closes.get(day, SETTLED_CLOSE))],
+                                [
+                                    daily_candles.get(day)
+                                    or _daily_candle(day, daily_closes.get(day, SETTLED_CLOSE))
+                                ],
                             )
                         ],
                     )
@@ -2054,12 +2060,21 @@ def test_the_plan_orders_by_the_whole_date_across_a_month_boundary():
 
 
 def _minute_table(
-    day: date, close: float = SETTLED_CLOSE, *, ticker: str = "SPY", instrument_id: int = 1
+    day: date,
+    close: float = SETTLED_CLOSE,
+    *,
+    ticker: str = "SPY",
+    instrument_id: int = 1,
+    candles: list[dict] | None = None,
 ) -> pa.Table:
-    """A 1-minute partition an earlier run landed, whose last candle closes at ``close``."""
+    """A 1-minute partition an earlier run landed, whose last candle closes at ``close``.
+
+    ``candles`` replaces the fixture's two candles, and ``close`` is then unused.
+    """
     open_et, close_et = _bounds(day)
+    candles = candles if candles is not None else _minute_candles(day, close)
     built = journal.bars_rows(
-        {"candles": _minute_candles(day, close), "symbol": ticker, "empty": False},
+        {"candles": candles, "symbol": ticker, "empty": False},
         ticker=ticker,
         freq=MINUTE_FREQ,
         instrument_id=instrument_id,
@@ -2544,3 +2559,216 @@ def test_a_fallback_leaves_the_next_ticker_on_the_same_session_on_its_own_quote(
     assert gated[("QQQ", day)] == CHECK_BAR_MINUTE_CLOSE
     assert gated[("SPY", day)] == CHECK_BAR_CLOSE
     assert all(check == CHECK_BAR_CLOSE for (_, session), check in gated.items() if session != day)
+
+
+# -- the fallback when the closing auction moves away from the last trade (marketlake #1038) ----
+
+# SPY on 2026-11-20, as #1038 quotes it. The official close, 689.81, sits 14.5 basis points below
+# the 15:59 candle's close and inside that candle's low-to-high range, and the daily bar's high
+# and low are the session's own 1-minute high and low. The fixture puts those prices on an outage
+# session, so the bar is gated against its 1-minute partition. Three candles carry the session:
+# the open sets the high, a midday candle the low, and the last is the 15:59 candle.
+AUCTION_DAY = date(2026, 9, 9)
+AUCTION_CLOSE = 689.81
+AUCTION_LAST = {"open_": 687.86, "high": 690.93, "low": 687.42, "close": 690.81}
+AUCTION_HIGH = 718.29
+AUCTION_LOW = 686.75
+# The SPY dividend #947 measured, as a fraction.
+SPY_DIVIDEND = 25.13e-4
+
+
+def _auction_minute_table(day: date = AUCTION_DAY) -> pa.Table:
+    first, last = _bounds(day)
+    candles = [
+        bars_candle(first, open_=713.61, high=AUCTION_HIGH, low=712.0, close=714.0, volume=1),
+        bars_candle(
+            first + timedelta(hours=3), open_=690.0, high=691.0, low=AUCTION_LOW, close=688.0
+        ),
+        bars_candle(last - timedelta(minutes=1), volume=7_000_000, **AUCTION_LAST),
+    ]
+    return _minute_table(day, candles=candles)
+
+
+def _auction_daily(
+    day: date = AUCTION_DAY,
+    *,
+    close: float = AUCTION_CLOSE,
+    high: float = AUCTION_HIGH,
+    low: float = AUCTION_LOW,
+    scale: float = 1.0,
+) -> dict:
+    """The session's daily candle, every price multiplied by ``scale`` the way a vendor adjusts."""
+    when = datetime.fromisoformat(f"{day.isoformat()}T00:00:00-04:00")
+    return bars_candle(
+        when,
+        open_=713.56 * scale,
+        high=high * scale,
+        low=low * scale,
+        close=close * scale,
+        volume=150_000_000,
+    )
+
+
+def _auction_run(fixture_lake: FixtureLake, daily: dict, *, quotes=None):
+    root = _lake(
+        fixture_lake,
+        quotes=quotes if quotes is not None else _outage_quotes(),
+        bars_partitions=(("SPY", MINUTE_FREQ, AUCTION_DAY, _auction_minute_table()),),
+    )
+    vendor = RecordingVendor(_cassette(freqs=(DAILY_FREQ,), daily_candles={AUCTION_DAY: daily}))
+    return root, _run(root, vendor, roster=_roster({"SPY": [DAILY_FREQ]}))
+
+
+def test_a_close_the_auction_moved_lands_when_the_high_and_low_match(fixture_lake: FixtureLake):
+    """2026-11-20's SPY bar lands against its 1-minute bars, 14.5 basis points from 15:59.
+
+    Before marketlake #1038 the fallback compared the close alone at 5 basis points, so this
+    correct bar was held and re-fetched every night. Its close lies inside the 15:59 candle and its
+    high and low are the session's own, so it lands, and ``gated_by`` still names the fallback.
+    """
+    gap = abs(AUCTION_CLOSE - AUCTION_LAST["close"]) / AUCTION_LAST["close"]
+    assert gap > bars.CLOSE_CROSS_TOLERANCE, "the fixture must sit outside the close test"
+    root, result = _auction_run(fixture_lake, _auction_daily())
+
+    assert result.held == ()
+    gated = {e.session: e.gated_by for e in result.landed if e.freq == DAILY_FREQ}
+    assert gated[AUCTION_DAY] == CHECK_BAR_MINUTE_CLOSE
+    assert _partition(root, "SPY", DAILY_FREQ, AUCTION_DAY).exists()
+
+
+def test_a_dividend_adjusted_bar_inside_the_last_candle_is_held(fixture_lake: FixtureLake):
+    """The range alone would land an adjustment, and the high and low are what refuse it.
+
+    Every price of the bar is lowered by SPY's 25.13 basis point dividend, the shape of a vendor
+    serving pre-adjusted history. Its close, 688.08, is still inside the 15:59 candle's range,
+    which is how the range rule #1038 first proposed would have let it through. Its high and low
+    now sit 25 basis points under the session's own, so it is held under the fallback's check,
+    with the last 1-minute close as what it was compared against.
+    """
+    adjusted = AUCTION_CLOSE * (1 - SPY_DIVIDEND)
+    assert AUCTION_LAST["low"] <= adjusted <= AUCTION_LAST["high"]
+    root, result = _auction_run(fixture_lake, _auction_daily(scale=1 - SPY_DIVIDEND))
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE]
+    finding = result.held[0].finding
+    assert finding.observed_on == AUCTION_DAY
+    assert finding.computed == pytest.approx(adjusted)
+    assert finding.against == AUCTION_LAST["close"]
+    assert not _partition(root, "SPY", DAILY_FREQ, AUCTION_DAY).exists()
+
+
+@pytest.mark.parametrize(
+    ("label", "daily"),
+    [
+        # QQQ's 2026-11-05 shape: the auction printed below every regular trade of the day.
+        ("close below the last candle", {"close": 687.0, "low": 687.0}),
+        ("close above the last candle", {"close": 691.5}),
+        ("high off by six basis points", {"high": AUCTION_HIGH * 1.0006}),
+        ("low off by six basis points", {"low": AUCTION_LOW * 0.9994}),
+    ],
+)
+def test_the_range_branch_holds_a_bar_that_fails_any_one_of_its_tests(
+    fixture_lake: FixtureLake, label: str, daily: dict
+):
+    """Each of the three tests the range branch adds is needed on its own.
+
+    Every case here is more than 5 basis points from the 15:59 close, so only the range branch
+    could land it, and each fails exactly one of its tests. A bar whose low is the close itself
+    stays held, which is QQQ on 2026-11-05: its close was the day's low, outside the 15:59 candle.
+    """
+    _, result = _auction_run(fixture_lake, _auction_daily(**daily))
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_MINUTE_CLOSE], label
+    assert AUCTION_DAY not in {e.session for e in result.landed}, label
+
+
+def test_the_range_branch_never_reaches_a_bar_gated_against_its_16_15_quote(
+    fixture_lake: FixtureLake,
+):
+    """The 16:15 reference keeps its 5 basis point close test unchanged.
+
+    The session has a 16:15 quote at the 15:59 close and a 1-minute partition whose range and
+    extremes would land this bar on the fallback. The 16:15 quote matched the vendor's close to
+    the cent on every partition measured, so a bar 14.5 basis points from it is held, under
+    ``CHECK_BAR_CLOSE``.
+    """
+    quotes = {("SPY", d): [_quote_row(d)] for d in (*SESSIONS, date(2026, 9, 17))}
+    quotes[("SPY", AUCTION_DAY)] = [_quote_row(AUCTION_DAY, captured=AUCTION_LAST["close"])]
+    _, result = _auction_run(fixture_lake, _auction_daily(), quotes=quotes)
+
+    assert [held.finding.check for held in result.held] == [CHECK_BAR_CLOSE]
+    assert result.held[0].finding.against == AUCTION_LAST["close"]
+
+
+def _reference(**overrides) -> bars.MinuteReference:
+    figures = {
+        "close": AUCTION_LAST["close"],
+        "last_low": AUCTION_LAST["low"],
+        "last_high": AUCTION_LAST["high"],
+        "session_low": AUCTION_LOW,
+        "session_high": AUCTION_HIGH,
+    }
+    figures.update(overrides)
+    return bars.MinuteReference(**figures)
+
+
+def test_the_range_branch_is_inclusive_at_both_ends_of_the_last_candle():
+    """A close equal to the candle's low or high lies inside it, and a cent past either does not.
+
+    The reference's last close sits more than 5 basis points from both ends, so only the range
+    branch can decide each case.
+    """
+    reference = _reference(close=689.0)
+    low, high = AUCTION_LAST["low"], AUCTION_LAST["high"]
+    for close in (low, high, low - 0.01, high + 0.01):
+        assert abs(close - reference.close) / reference.close > bars.CLOSE_CROSS_TOLERANCE
+    check = bars.check_minute_close_cross
+    for close in (low, high):
+        assert check(close, AUCTION_HIGH, AUCTION_LOW, reference).agrees is True, close
+    for close in (low - 0.01, high + 0.01):
+        assert check(close, AUCTION_HIGH, AUCTION_LOW, reference).agrees is False, close
+
+
+def test_the_range_branch_compares_the_extremes_at_the_tolerance():
+    """The high and low agree up to ``CLOSE_CROSS_TOLERANCE`` and not past it."""
+    edge = bars.CLOSE_CROSS_TOLERANCE * 0.99
+    past = bars.CLOSE_CROSS_TOLERANCE * 1.01
+    check = bars.check_minute_close_cross
+    assert check(AUCTION_CLOSE, AUCTION_HIGH * (1 + edge), AUCTION_LOW, _reference()).agrees
+    assert check(AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW * (1 - edge), _reference()).agrees
+    assert not check(AUCTION_CLOSE, AUCTION_HIGH * (1 + past), AUCTION_LOW, _reference()).agrees
+    assert not check(AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW * (1 - past), _reference()).agrees
+
+
+@pytest.mark.parametrize(
+    ("bar", "reference"),
+    [
+        ((AUCTION_CLOSE, None, AUCTION_LOW), {}),
+        ((AUCTION_CLOSE, AUCTION_HIGH, None), {}),
+        ((None, AUCTION_HIGH, AUCTION_LOW), {}),
+        ((AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW), {"last_low": None}),
+        ((AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW), {"last_high": None}),
+        ((AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW), {"session_low": None}),
+        ((AUCTION_CLOSE, AUCTION_HIGH, AUCTION_LOW), {"session_high": None}),
+    ],
+)
+def test_a_missing_figure_fails_the_range_branch(bar: tuple, reference: dict):
+    """Each figure the range branch reads is required, so a missing one never lands a bar."""
+    cross = bars.check_minute_close_cross(*bar, _reference(**reference))
+    assert cross.agrees is False
+    assert (cross.computed, cross.against) == (bar[0], AUCTION_LAST["close"])
+
+
+def test_the_close_branch_still_passes_without_a_range():
+    """A close within 5 basis points of 15:59 agrees with no range or extremes at all."""
+    reference = bars.MinuteReference(close=650.0)
+    assert bars.check_minute_close_cross(650.195, None, None, reference).agrees is True
+
+
+def test_one_unreadable_candle_leaves_the_session_extreme_unknown():
+    """An extreme taken over the readable rows could miss the candle that set it."""
+    rows = [{"low": 700.0}, {"low": None}, {"low": 690.0}]
+    assert bars._session_extreme(rows, "low", min) is None
+    assert bars._session_extreme([{"low": float("nan")}, {"low": 690.0}], "low", min) is None
+    assert bars._session_extreme([{"low": 700.0}, {"low": 690.0}], "low", min) == 690.0
+    assert bars._session_extreme([], "low", min) is None

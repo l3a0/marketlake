@@ -27,8 +27,8 @@ What one run does, per ticker and per configured frequency, for one session.
    nothing and says so.
 2. On ``1d``, read the close the gate would compare against, and skip the ticker-day that has
    none rather than spending a request on a gate that cannot pass. Marketlake #434. A sealed
-   session whose quotes hold no usable close is judged against its own last 1-minute close
-   instead, when that partition has landed. Marketlake #947.
+   session whose quotes hold no usable close is judged against its own 1-minute bars instead,
+   when that partition has landed. Marketlake #947 and #1038.
 3. Fetch the window this module names for that frequency, outside the lake lock.
 4. Build the rows, dropping any candle whose stamp the epoch transform refuses and, on
    ``1d``, any candle belonging to another session.
@@ -293,6 +293,18 @@ MINUTE_EXTENDED_HOURS = False
 # those tickers the fallback refuses an adjustment above about 7.2 basis points, which still sits
 # under the smallest dividend above. GLD and USO, and early-close sessions, are unmeasured: neither
 # lake held a session of either ticker, or an early close, when this was measured.
+#
+# That drift is not bounded on a day the closing auction moves away from the last trade. On
+# 2026-11-20 the 15:59 candle sat 14.5 basis points from SPY's close and 22.8 from QQQ's, and
+# marketlake #1038 measured 112 SPY and QQQ ticker-days from 2026-09-08 to 2026-11-24, the laptop
+# lake's 1-minute bars against daily bars that matched the lake's own closes on all 52 it holds.
+# Four sat more than 5 basis points off, all in November. So the fallback also accepts a close
+# inside the last candle's range when the bar's high and low match the session's 1-minute high and
+# low at this same tolerance. The highs matched within 0.43 basis points on all 112 and the lows
+# within 1.08 on 111, which leaves a one-dividend adjustment at least 10 basis points outside it.
+# The 112th, SPY on 2026-11-13, holds a stray 11:38 print in Schwab's 1-minute low that the other
+# vendor's daily low leaves out, 35.5 basis points apart. A stray print can only make the bar
+# disagree, so its price is a held bar on such a day, never a landed adjustment.
 CLOSE_CROSS_TOLERANCE = 5e-4
 
 # The reason an abandoned ticker-day carries when the reference read produced no number and
@@ -519,14 +531,33 @@ class CloseCross:
     """What the close cross-check compared, and whether the two agreed.
 
     ``computed`` is the bar's own close and ``against`` is the session's own close as the lake
-    captured it, the 16:15 quote :func:`_captured_close` reads. Either is ``None`` when the
-    comparison had no such number, and a check missing an input has not agreed, which is what
-    makes a partial payload a held bar rather than a silent one.
+    captured it, the 16:15 quote :func:`_captured_close` reads, or the last 1-minute close on the
+    fallback. Either is ``None`` when the comparison had no such number, and a check missing an
+    input has not agreed, which is what makes a partial payload a held bar rather than a silent
+    one.
     """
 
     agrees: bool
     computed: float | None
     against: float | None
+
+
+@dataclass(frozen=True)
+class MinuteReference:
+    """What the 1-minute fallback gate reads from a session's own 1-minute partition.
+
+    ``close``, ``last_low`` and ``last_high`` belong to the last candle, the 15:59 one on a regular
+    session. ``session_low`` and ``session_high`` are the lowest low and the highest high over
+    every candle of the session. Any of the last four is ``None`` when the partition does not
+    hold a readable figure for it, and :func:`check_minute_close_cross` then refuses the
+    comparison that needs it.
+    """
+
+    close: float
+    last_low: float | None = None
+    last_high: float | None = None
+    session_low: float | None = None
+    session_high: float | None = None
 
 
 def bar_window(freq: str, bounds, *, margin: timedelta = DAILY_WINDOW_MARGIN) -> BarWindow:
@@ -908,6 +939,55 @@ def check_close_cross(
         return CloseCross(agrees=bar_close == 0, computed=bar_close, against=quote_close)
     difference = abs(bar_close - quote_close) / abs(quote_close)
     return CloseCross(agrees=difference <= tolerance, computed=bar_close, against=quote_close)
+
+
+def check_minute_close_cross(
+    bar_close: float | None,
+    bar_high: float | None,
+    bar_low: float | None,
+    minute: MinuteReference,
+    *,
+    tolerance: float = CLOSE_CROSS_TOLERANCE,
+) -> CloseCross:
+    """Whether a daily bar agrees with its session's own 1-minute bars, on the fallback.
+
+    The 1-minute fallback of marketlake #947 compares the official close against the 15:59
+    candle's last regular trade, and the 16:00 closing auction can move away from that trade. On
+    2026-11-20 it did, by 14.5 basis points on SPY and 22.8 on QQQ, and both correct bars were
+    held (marketlake #1038). So the bar agrees when either of two things holds.
+
+    1. Its close is within ``tolerance`` of the last candle's close, which is
+       :func:`check_close_cross` unchanged.
+    2. Its close lies inside the last candle's low-to-high range, and its high and its low are
+       each within ``tolerance`` of the session's high and low over every 1-minute candle.
+
+    **The range alone is too wide, and the high and low are what narrow it.** On the 112
+    ticker-days #1038 measured, a bar lowered by one dividend would still have closed inside the
+    last candle's range on 9, so the range on its own would land the adjustment this gate exists
+    to catch. A vendor adjustment scales every price of the bar by one factor, so it moves the
+    high and the low by the dividend too. Those two agreed with the 1-minute session's to within
+    1.08 basis points on 111 of the 112, against 11.47 for the smallest dividend measured, and
+    ``CLOSE_CROSS_TOLERANCE`` carries the one that did not.
+
+    ``computed`` and ``against`` are the bar's close and the last candle's close whichever way the
+    answer goes, so a held finding reads the same as before. A missing figure fails the part that
+    needs it and never passes it.
+    """
+    cross = check_close_cross(bar_close, minute.close, tolerance=tolerance)
+    if cross.agrees or bar_close is None:
+        return cross
+    inside = (
+        minute.last_low is not None
+        and minute.last_high is not None
+        and minute.last_low <= bar_close <= minute.last_high
+    )
+    high = check_close_cross(bar_high, minute.session_high, tolerance=tolerance)
+    low = check_close_cross(bar_low, minute.session_low, tolerance=tolerance)
+    return CloseCross(
+        agrees=inside and high.agrees and low.agrees,
+        computed=bar_close,
+        against=minute.close,
+    )
 
 
 @dataclass(frozen=True)
@@ -1305,10 +1385,14 @@ class _GateClose:
     The token is enough for the reader it is written for. ``SnapAbsent`` and
     ``PartitionQuarantined`` are the two that want different things done about them, and a
     class name is what separates them.
+
+    ``minute`` is set only by :func:`_minute_close`, and carries the rest of the 1-minute
+    partition the fallback gate reads beside ``close``.
     """
 
     close: float | None = None
     reason: str | None = None
+    minute: MinuteReference | None = None
 
 
 def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _GateClose:
@@ -1403,19 +1487,32 @@ def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
     the first to need it. The message carries the class and never the exception's own text,
     which names an absolute path on the capture machine, for the reason :class:`_GateClose`
     gives.
+
+    **The same read carries what :func:`check_minute_close_cross` compares beyond the close**,
+    which is marketlake #1038: the last candle's low and high, and the session's own high and low
+    over every candle. A figure that any one row leaves unreadable comes back as ``None``, and
+    that comparison then fails rather than passing on the rows it could read.
     """
     try:
         table = load_bars(ticker, MINUTE_FREQ, session, session, lake_root=lake_root)
-        close = _bar_close(table.select(["bar_ts", "close"]).to_pylist())
+        rows = table.select(["bar_ts", "high", "low", "close"]).to_pylist()
     except (BarsAbsent, PartitionQuarantined, PartialRead) as exc:
         return _GateClose(reason=MINUTE_REASON_PREFIX + type(exc).__name__)
     except (OSError, UnicodeDecodeError) as exc:
         raise LoadError(
             f"{ticker} {session.isoformat()} 1m partition could not be read: {type(exc).__name__}"
         ) from exc
+    close = _bar_close(rows)
     if close is None:
         return _GateClose(reason=MINUTE_REASON_PREFIX + CLOSE_VALUE_ABSENT)
-    return _GateClose(close=close)
+    minute = MinuteReference(
+        close=close,
+        last_low=_bar_field(rows, "low"),
+        last_high=_bar_field(rows, "high"),
+        session_low=_session_extreme(rows, "low", min),
+        session_high=_session_extreme(rows, "high", max),
+    )
+    return _GateClose(close=close, minute=minute)
 
 
 def fetch_session_bars(
@@ -1633,6 +1730,7 @@ def _walk(
             continue
         window = bar_window(freq, bounds(session))
         reference: float | None = None
+        minute_reference: MinuteReference | None = None
         close_check = CHECK_BAR_CLOSE
         if freq == DAILY_FREQ:
             # **No wait for the next session.** A daily bar is fetched at the first run after its
@@ -1698,7 +1796,8 @@ def _walk(
                 # quarantine would step over the verdict. The 1-minute partition has to be one the
                 # manifest records or this walk landed, which is the seal the quotes side asks
                 # for: a file with no entry is one a killed run left. :func:`_minute_close`
-                # carries the read and ``CLOSE_CROSS_TOLERANCE`` the drift it was measured with.
+                # carries the read and :func:`check_minute_close_cross` the comparison, which
+                # takes the auction's move away from the last trade into account (#1038).
                 if (
                     gate_close.reason in PERMANENT_ABANDON_REASONS
                     and session_key in manifested
@@ -1746,6 +1845,7 @@ def _walk(
                 continue
             if minute.close is not None:
                 reference = minute.close
+                minute_reference = minute.minute
             elif gate_close.reason is not None:
                 # No recorded 1-minute partition, one that cannot be read, or a reason that wants
                 # a person. A fallback read that failed names itself, so the census can tell a
@@ -1774,6 +1874,7 @@ def _walk(
                 ticker=ticker,
                 window=window,
                 reference=reference,
+                minute_reference=minute_reference,
                 close_check=close_check,
                 partition=partition,
                 key=key,
@@ -1832,6 +1933,7 @@ def _land(
     window: BarWindow,
     reference: float | None,
     close_check: str,
+    minute_reference: MinuteReference | None = None,
     partition: Path,
     key: str,
     hold,
@@ -1848,6 +1950,8 @@ def _land(
     cross-check. ``close_check`` names what ``reference`` is, the 16:15 quote's
     ``CHECK_BAR_CLOSE`` or the 1-minute fallback's ``CHECK_BAR_MINUTE_CLOSE``, so a held bar
     files under the reference it failed against and a landed one records which judged it.
+    ``minute_reference`` is the rest of what the fallback read, set exactly when ``reference`` is
+    the last 1-minute close, and it sends the comparison to :func:`check_minute_close_cross`.
     """
     fetch_ts = clock.now()
     response = _fetch(vendor, ticker, window)
@@ -1949,7 +2053,15 @@ def _land(
         return
 
     if window.freq == DAILY_FREQ:
-        cross = check_close_cross(_bar_close(selected), reference)
+        if minute_reference is None:
+            cross = check_close_cross(_bar_close(selected), reference)
+        else:
+            cross = check_minute_close_cross(
+                _bar_close(selected),
+                _bar_field(selected, "high"),
+                _bar_field(selected, "low"),
+                minute_reference,
+            )
         if not cross.agrees:
             hold(
                 _finding(
@@ -2028,10 +2140,23 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
     instead, whose ``_sorted_by_instant`` parses every stamp by the same rule and raises a
     ``LoadError`` first, which the walk files.
     """
+    return _bar_field(rows, "close")
+
+
+def _bar_field(rows: Sequence[dict], field: str) -> float | None:
+    """One price of the session's last bar by stamp, read the way :func:`_bar_close` reads it.
+
+    The close, the high and the low of one bar come from one row, picked by one rule, so the
+    fallback gate of marketlake #1038 never compares the close of one candle against the range
+    of another.
+    """
     if not rows:
         return None
-    latest = sorted(rows, key=_instant)[-1]
-    value = latest.get("close")
+    return _price(sorted(rows, key=_instant)[-1].get(field))
+
+
+def _price(value) -> float | None:
+    """A price a comparison can use, or ``None`` when the value is not one."""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -2043,6 +2168,21 @@ def _bar_close(rows: Sequence[dict]) -> float | None:
         # and costing every ticker after it. A bool is excluded by name, because ``float(True)``
         # is ``1.0`` and would compare as a plausible price.
         return None
+
+
+def _session_extreme(rows: Sequence[dict], field: str, pick) -> float | None:
+    """The session's high or low over every row, or ``None`` when any row leaves it unreadable.
+
+    ``pick`` is ``max`` for the high and ``min`` for the low. One unreadable row makes the whole
+    answer ``None``, because an extreme taken over the rows that happened to read could miss the
+    very candle that set it, and the comparison it feeds would then pass on a figure the
+    partition does not hold. A NaN counts as unreadable, since ``min`` and ``max`` give no
+    reliable answer over one.
+    """
+    values = [_price(row.get(field)) for row in rows]
+    if not values or any(value is None or value != value for value in values):
+        return None
+    return pick(values)
 
 
 # -- the backfill: every session the capture spans cover ----------------------
@@ -2752,6 +2892,7 @@ __all__ = [
     "CloseCross",
     "GateSkip",
     "LandedPartition",
+    "MinuteReference",
     "SpanCoverage",
     "SpansAbsent",
     "StampNotAnInstant",
@@ -2764,6 +2905,7 @@ __all__ = [
     "bar_window",
     "check_bar_span",
     "check_close_cross",
+    "check_minute_close_cross",
     "daily_session_of",
     "fetch_session_bars",
     "fetch_session_bars_from_config",
