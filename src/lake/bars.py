@@ -197,7 +197,7 @@ VendorFactory = Callable[..., Vendor]
 CHECK_BAR_SPAN = "bar_span"
 CHECK_BAR_CLOSE = "bar_close"
 
-# The close cross-check again, against the session's own last 1-minute close rather than its 16:15
+# The close cross-check again, against the session's own 1-minute bars rather than its 16:15
 # quote. A daily bar is gated this way only when its sealed quotes hold no usable close
 # (marketlake #947), and a token of its own is what lets a withheld record and a landed partition
 # say which reference judged the bar.
@@ -289,22 +289,29 @@ MINUTE_EXTENDED_HOURS = False
 # candle's last regular trade rather than the official close. On SPY and QQQ that candle stayed
 # within 2.23 basis points of the vendor's close over 42 ticker-days on the laptop lake,
 # 2026-09-14 to 2026-10-12, and 1.82 over 42 on the VM, 2026-10-01 to 2026-10-29. The two overlap
-# on 16, so the sample is 68 distinct ticker-days, and it matched to the cent on 3 of them. So on
-# those tickers the fallback refuses an adjustment above about 7.2 basis points, which still sits
-# under the smallest dividend above. GLD and USO, and early-close sessions, are unmeasured: neither
-# lake held a session of either ticker, or an early close, when this was measured.
+# on 16, so the sample is 68 distinct ticker-days, and it matched to the cent on 3 of them. On
+# that sample the close test alone refused an adjustment above about 7.2 basis points, under the
+# smallest dividend above. GLD and USO, and early-close sessions, are unmeasured: neither lake
+# held a session of either ticker, or an early close, when this was measured.
 #
 # That drift is not bounded on a day the closing auction moves away from the last trade. On
-# 2026-11-20 the 15:59 candle sat 14.5 basis points from SPY's close and 22.8 from QQQ's, and
-# marketlake #1038 measured 112 SPY and QQQ ticker-days from 2026-09-08 to 2026-11-24, the laptop
-# lake's 1-minute bars against daily bars that matched the lake's own closes on all 52 it holds.
-# Four sat more than 5 basis points off, all in November. So the fallback also accepts a close
-# inside the last candle's range when the bar's high and low match the session's 1-minute high and
-# low at this same tolerance. The highs matched within 0.43 basis points on all 112 and the lows
-# within 1.08 on 111, which leaves a one-dividend adjustment at least 10 basis points outside it.
-# The 112th, SPY on 2026-11-13, holds a stray 11:38 print in Schwab's 1-minute low that the other
-# vendor's daily low leaves out, 35.5 basis points apart. A stray print can only make the bar
-# disagree, so its price is a held bar on such a day, never a landed adjustment.
+# 2026-11-20 the 15:59 candle sat 14.5 basis points from SPY's close and 22.8 from QQQ's
+# (marketlake #1038). That issue measured 112 SPY and QQQ ticker-days from 2026-09-08 to
+# 2026-11-24, the laptop lake's 1-minute bars against daily bars: Schwab's own on the 52 to
+# 2026-10-13, and Massive's after, whose close matched Schwab's on all 52 where both exist. Four
+# sat more than 5 basis points off, all in November. A wider drift also lets the close test alone
+# pass an adjustment. On QQQ 2026-11-09 the auction lifted the close 8.6 basis points above the
+# 15:59 close, and a close lowered by QQQ's dividend sat under 3 from it.
+#
+# So on the fallback the bar's high and low must each match the session's 1-minute high and low
+# at this same tolerance, and the close then passes within it or inside the last candle's range.
+# The highs matched within 0.42 basis points on all 112 and the lows within 1.08 on 111. That
+# leaves a one-dividend adjustment at least 10 basis points from the session's figure, more than
+# 5 past this tolerance. Schwab's own daily high and low were compared on the 52 days to
+# 2026-10-13 only, and the rule was chosen from these same 112 days, so no day outside them has
+# tested it. The 112th, SPY on 2026-11-13, holds a stray 11:38 print in Schwab's 1-minute low
+# that Massive's daily low leaves out, 35.5 basis points apart. A single stray print can only make
+# a correct bar disagree, so its price on such a day is a held bar.
 CLOSE_CROSS_TOLERANCE = 5e-4
 
 # The reason an abandoned ticker-day carries when the reference read produced no number and
@@ -534,12 +541,14 @@ class CloseCross:
     captured it, the 16:15 quote :func:`_captured_close` reads, or the last 1-minute close on the
     fallback. Either is ``None`` when the comparison had no such number, and a check missing an
     input has not agreed, which is what makes a partial payload a held bar rather than a silent
-    one.
+    one. ``by_range`` is set only by :func:`check_minute_close_cross`, on a close that agreed by
+    lying inside the last 1-minute candle rather than within the tolerance.
     """
 
     agrees: bool
     computed: float | None
     against: float | None
+    by_range: bool = False
 
 
 @dataclass(frozen=True)
@@ -954,39 +963,43 @@ def check_minute_close_cross(
     The 1-minute fallback of marketlake #947 compares the official close against the 15:59
     candle's last regular trade, and the 16:00 closing auction can move away from that trade. On
     2026-11-20 it did, by 14.5 basis points on SPY and 22.8 on QQQ, and both correct bars were
-    held (marketlake #1038). So the bar agrees when either of two things holds.
+    held (marketlake #1038). So the bar now agrees when both of two things hold.
 
-    1. Its close is within ``tolerance`` of the last candle's close, which is
-       :func:`check_close_cross` unchanged.
-    2. Its close lies inside the last candle's low-to-high range, and its high and its low are
-       each within ``tolerance`` of the session's high and low over every 1-minute candle.
+    1. Its high and its low are each within ``tolerance`` of the session's high and low over
+       every 1-minute candle.
+    2. Its close is within ``tolerance`` of the last candle's close, or lies inside that candle's
+       low-to-high range.
 
-    **The range alone is too wide, and the high and low are what narrow it.** On the 112
+    **The high and low are what catch an adjustment, and the close alone cannot.** A vendor
+    adjustment scales every price of the bar by one factor, so it moves the high and the low by
+    the dividend as well as the close, while the auction moves only the close. On the 112
     ticker-days #1038 measured, a bar lowered by one dividend would still have closed inside the
-    last candle's range on 9, so the range on its own would land the adjustment this gate exists
-    to catch. A vendor adjustment scales every price of the bar by one factor, so it moves the
-    high and the low by the dividend too. Those two agreed with the 1-minute session's to within
-    1.08 basis points on 111 of the 112, against 11.47 for the smallest dividend measured, and
-    ``CLOSE_CROSS_TOLERANCE`` carries the one that did not.
+    last candle's range on 9, and within 5 basis points of the last close on 1, QQQ on
+    2026-11-09, where the auction lifted the close 8.6 basis points above the last trade. So
+    neither close test on its own refuses the adjustment this gate exists to catch, and the
+    high and low test applies to both. ``CLOSE_CROSS_TOLERANCE`` carries how closely those
+    matched.
 
     ``computed`` and ``against`` are the bar's close and the last candle's close whichever way the
-    answer goes, so a held finding reads the same as before. A missing figure fails the part that
-    needs it and never passes it.
+    answer goes, so a held finding reads the same as before. ``by_range`` says the close passed
+    on the range rather than within the tolerance. A missing figure fails the part that needs it
+    and never passes it.
     """
-    cross = check_close_cross(bar_close, minute.close, tolerance=tolerance)
-    if cross.agrees or bar_close is None:
-        return cross
+    close = check_close_cross(bar_close, minute.close, tolerance=tolerance)
     inside = (
-        minute.last_low is not None
+        bar_close is not None
+        and minute.last_low is not None
         and minute.last_high is not None
         and minute.last_low <= bar_close <= minute.last_high
     )
     high = check_close_cross(bar_high, minute.session_high, tolerance=tolerance)
     low = check_close_cross(bar_low, minute.session_low, tolerance=tolerance)
+    agrees = high.agrees and low.agrees and (close.agrees or inside)
     return CloseCross(
-        agrees=inside and high.agrees and low.agrees,
+        agrees=agrees,
         computed=bar_close,
         against=minute.close,
+        by_range=agrees and not close.agrees,
     )
 
 
@@ -997,6 +1010,9 @@ class LandedPartition:
     ``gated_by`` is the close cross-check the bar passed, ``CHECK_BAR_CLOSE`` or
     ``CHECK_BAR_MINUTE_CLOSE``, and ``None`` on a ``1m`` partition, which runs none. The reports
     name the second, because a bar judged against the 1-minute fallback was judged more loosely.
+    ``by_range`` marks a fallback bar whose close passed by lying inside the last 1-minute candle
+    rather than within the tolerance of its close (marketlake #1038), so a reader can pick out the
+    bars only that test admitted.
     """
 
     ticker: str
@@ -1005,12 +1021,15 @@ class LandedPartition:
     partition: str
     rows: int
     gated_by: str | None = None
+    by_range: bool = False
 
     def __str__(self) -> str:
         line = f"{self.ticker} {self.freq} {self.session.isoformat()} {self.rows} row(s) at "
         line += self.partition
         if self.gated_by == CHECK_BAR_MINUTE_CLOSE:
-            line += ", gated against the 1m close"
+            line += ", gated against the 1m bars"
+            if self.by_range:
+                line += ", its close inside the last 1m candle"
         return line
 
 
@@ -1458,7 +1477,7 @@ def _gate_close(lake_root: Path, ticker: str, session: date, minute: str) -> _Ga
 
 
 def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
-    """The session's last 1-minute close as the lake holds it, or the reason it cannot be read.
+    """The session's 1-minute bars as the fallback gate reads them, or why they cannot be read.
 
     This is the reference a daily bar is gated against when its sealed quotes hold no usable
     close, which is marketlake #947. The six abandoned ticker-days on the live lake each lost the
@@ -1474,9 +1493,9 @@ def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
     here is a partition that should be readable and is not. The three refusals that mean it cannot
     be read come back as a reason under ``MINUTE_REASON_PREFIX``: ``BarsAbsent`` for a file the
     trim moved to the bucket, ``PartitionQuarantined`` for one awaiting a sign-off, and
-    ``PartialRead`` for a schema change. A partition whose last row carries no close comes back
-    the same way. Every other ``LoadError`` says a file contradicts its writer, and reaches the
-    walk's filing catch, which files it under ``CHECK_BAR_MINUTE_CLOSE``.
+    ``PartialRead`` for a schema change. A partition whose last row carries no close, or a NaN,
+    comes back the same way. Every other ``LoadError`` says a file contradicts its writer, and
+    reaches the walk's filing catch, which files it under ``CHECK_BAR_MINUTE_CLOSE``.
 
     The read goes through ``load_bars``, so a quarantined partition is refused rather than read.
 
@@ -1498,12 +1517,17 @@ def _minute_close(lake_root: Path, ticker: str, session: date) -> _GateClose:
         rows = table.select(["bar_ts", "high", "low", "close"]).to_pylist()
     except (BarsAbsent, PartitionQuarantined, PartialRead) as exc:
         return _GateClose(reason=MINUTE_REASON_PREFIX + type(exc).__name__)
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, KeyError) as exc:
+        # ``KeyError`` is a partition missing one of the four columns, which pyarrow's ``select``
+        # raises. The writer always writes all four, so it is a file that contradicts its
+        # writer, and it is filed rather than left to end the sweep.
         raise LoadError(
             f"{ticker} {session.isoformat()} 1m partition could not be read: {type(exc).__name__}"
         ) from exc
     close = _bar_close(rows)
-    if close is None:
+    # A NaN close is no figure, the same as a missing one. Left in, it would fail the close test
+    # and leave the range test to pass a bar against a candle with no readable close.
+    if close is None or close != close:
         return _GateClose(reason=MINUTE_REASON_PREFIX + CLOSE_VALUE_ABSENT)
     minute = MinuteReference(
         close=close,
@@ -2052,6 +2076,7 @@ def _land(
         )
         return
 
+    by_range = False
     if window.freq == DAILY_FREQ:
         if minute_reference is None:
             cross = check_close_cross(_bar_close(selected), reference)
@@ -2074,6 +2099,7 @@ def _land(
                 )
             )
             return
+        by_range = cross.by_range
 
     # The write and its manifest entry, inside one lock hold. The fetch above is outside it on
     # purpose: ``lake_lock`` is a blocking exclusive ``flock`` on the manifest, and a vendor
@@ -2101,6 +2127,7 @@ def _land(
             partition=key,
             rows=rows,
             gated_by=close_check if window.freq == DAILY_FREQ else None,
+            by_range=by_range,
         )
     )
 
