@@ -51,9 +51,9 @@ the top of the digest, which is truncated at ``DIGEST_BYTE_CAP``. Marketlake #43
 on a primary whose ``backup_target`` is a bucket. It reads how far the bucket's manifest copy
 reaches through ``bucket.capture_owed``, and it pages every run while a captured file dated
 before the last compacted session stays past that point. A failed upload pages once, on the
-transition of the ``compaction`` and ``evening-upload`` checks, and nothing repeats that page:
-not this repository, and not the healthchecks account, whose setting for ongoing reminders
-reads "Do not remind me". So this job is what keeps saying so, and a run holds no state
+transition of the ``compaction`` and ``evening-upload`` checks, and nothing in this repository
+repeats that page. healthchecks.io pushes only on the transition, and its reminders go by
+email, which the account has off. So this job is what keeps saying so, and a run holds no state
 between nights: the page clears when the watermark passes the file, through the upload, or
 through a restore from the bucket, whose manifest ends where the copy ends. A read that could
 not answer pages too, under its own title, because an alarm that cannot look must
