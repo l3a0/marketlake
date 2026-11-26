@@ -91,9 +91,15 @@ def _export(flags: list[str]) -> set[str]:
 
 
 def _linux_install_sync_flags() -> list[str]:
-    """The flags the VM's install passes to ``uv sync``, read from the script it runs."""
-    found = re.findall(r'/uv" sync ([^\n#]*)', LINUX_INSTALL.read_text())
-    assert len(found) == 1, f"expected one uv sync in {LINUX_INSTALL.name}, found {found}"
+    """The flags the VM's install passes to ``uv sync``, read from the script it runs.
+
+    The whole line must be ``as_owner <uv> sync <flags>``, so a prefix such as
+    ``env UV_NO_DEFAULT_GROUPS=1``, which changes the groups without a flag, fails here.
+    """
+    text = LINUX_INSTALL.read_text()
+    assert text.count('uv" sync') == 1, f"expected one uv sync in {LINUX_INSTALL.name}"
+    found = re.findall(r'^as_owner "\$OWNER_HOME/\.local/bin/uv" sync ([^\n#]*)$', text, re.M)
+    assert len(found) == 1, f"the uv sync in {LINUX_INSTALL.name} is not a plain as_owner line"
     return [flag for flag in shlex.split(found[0]) if flag != "--frozen"]
 
 
