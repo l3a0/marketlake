@@ -11,13 +11,17 @@ holds every rule that does not depend on the source.
 own. #950's files are quantitative-trading's, in yfinance's three header rows. marketlake #1025's
 are Yahoo Finance downloads of GLD and USO in one header row, which fill the sessions from
 2012-04-10 to 2026-09-03 between #950's and the Schwab import's. They hold more than that gap, so
-their entries carry a ``window`` and the rows outside it are counted and left out. Their prices
-and volume are Yahoo's, adjusted for the splits it knew on the download date, so USO's before its
-one-for-eight reverse split of 2020-04-29 read eight times what traded and its volume an eighth.
-No ledger entry records that split, because ``load_bars``' adjusted views refuse an imported row
-and a reader that applied one to these rows itself would take the factor twice. Yahoo's terms
-forbid republishing the bytes, so the one-row layout's refusals quote no price, volume or split
-value.
+their entries carry a ``window`` and the rows outside it are counted and left out. Their prices and
+volume are Yahoo's, adjusted for the splits it knew on the download date, so USO's before its
+one-for-eight reverse split of 2020-04-29 read eight times what traded and its volume an eighth. No
+ledger entry records that split, because ``load_bars``' adjusted views refuse an imported row and a
+reader that applied one to these rows itself would take the factor twice. marketlake #1043's are
+SPY's and QQQ's, downloaded the same way on 2026-11-26, from each fund's first session to
+2026-09-04, the session before their first capture span session. QQQ's prices before its
+two-for-one split of 2000-03-20 read half what traded and its volume twice, and neither file's
+``Close`` carries a dividend adjustment. That split has no ledger entry either, for the same
+reason. Yahoo's terms forbid republishing the bytes, so the one-row layout's refusals quote no
+price, volume or split value.
 
 **The Schwab import** lands the ``SCHWAB_SESSIONS`` sessions ending the session before a
 ticker's first capture span session, from one ``vendor.get_daily_bars`` response per ticker,
@@ -81,15 +85,15 @@ nothing and pass a different source in silence. The import instant goes in the e
    name one ticker. The Schwab import refuses a ticker named twice for the same reason. The file
    is read once, and the bytes hashed are the bytes parsed, so a file swapped between a hash and
    a second read cannot land under the listed digest.
-4. A vintage file is read by column name, because the layouts order their columns differently.
-   A three-row file's ``Ticker`` row must name the listed ticker. A one-row file names none, so
-   its whole ``Stock Splits`` column must equal the entry's ``splits``, which is the one check
-   inside the file against two digests listed under each other's ticker. Every row's date is
-   parsed, and a duplicate refuses, inside the window or not. A row inside the window on a date
-   the exchange did not trade refuses. A session the calendar names and the file lacks is
-   counted, not refused, over the window where the entry has one. The calendar is built with an
-   explicit start, because ``exchange_calendars`` starts 20 years before today and raises
-   ``DateOutOfBounds`` before that, and about 130 of each #950 file's rows already fall there.
+4. A vintage file is read by column name, because the layouts order their columns differently. A
+   three-row file's ``Ticker`` row must name the listed ticker. A one-row file names none, so its
+   whole ``Stock Splits`` column must equal the entry's ``splits``, which is the one check inside
+   the file against two digests listed under each other's ticker. Every row's date is parsed, and a
+   duplicate refuses, inside the window or not. A row inside the window on a date the exchange did
+   not trade refuses. A session the calendar names and the file lacks is counted, not refused, over
+   the window where the entry has one. The calendar is built with an explicit start, because
+   ``exchange_calendars`` starts 20 years before today and raises ``DateOutOfBounds`` before that,
+   and about 130 of each #950 file's rows, and most of #1043's, already fall there.
 5. No date on or after the ticker's first capture span session. That is the first session
    ``bars.span_covers`` accepts for any span of any instrument the ticker has named, which is
    ``bars._span_sessions``' rule without its ceiling of today's close. A key landed for such a
@@ -276,11 +280,13 @@ class Vintage:
     """One accepted source file, keyed by its SHA-256 in ``VINTAGES``.
 
     ``source`` names the file without a commit or a local path, which change between runs.
-    ``source_as_of`` is the date the source recorded its values, which ``read_provenance``
-    requires for an ``adjusted`` basis. ``layout`` is one of the two layout constants.
-    ``window`` is the first and last session to land, or ``None`` for every row. ``splits`` is
-    the one-row file's whole record of splits, a date and a factor each in date order, checked
-    against the file on every read, or ``None`` where the layout carries no such column.
+    ``source_as_of`` is the date the source recorded its values, which ``read_provenance`` requires
+    for an ``adjusted`` basis. For a Yahoo file it is the download's UTC date, which the file's
+    name carries, while the Schwab import writes its fetch's Eastern date. ``layout`` is one of the
+    two layout constants. ``window`` is the first and last session to land, or ``None`` for every
+    row. ``splits`` is the one-row file's whole record of splits, a date and a factor each in date
+    order, checked against the file on every read, or ``None`` where the layout carries no such
+    column.
     """
 
     sha256: str
@@ -332,25 +338,42 @@ def _vintage(sha256: str, ticker: str, path: str) -> Vintage:
     )
 
 
-def _yahoo(sha256: str, ticker: str, name: str, splits: tuple[tuple[date, float], ...]) -> Vintage:
+def _yahoo(
+    sha256: str,
+    ticker: str,
+    name: str,
+    splits: tuple[tuple[date, float], ...],
+    *,
+    downloaded: date,
+    window: tuple[date, date],
+) -> Vintage:
     # yfinance 1.8.0 with ``auto_adjust=False``, so the prices and the volume carry Yahoo's split
-    # adjustment as of the download. The window is the gap between #950's last session and the
-    # Schwab import's first (marketlake #1025).
+    # adjustment as of the download, and ``Close`` carries no dividend adjustment. ``downloaded``
+    # is the download's UTC date, which the file's name carries too.
     return Vintage(
         sha256=sha256,
         ticker=ticker,
         source=f"yahoo:{name}",
-        source_as_of=date(2026, 11, 22),
+        source_as_of=downloaded,
         basis=BASIS_ADJUSTED,
         layout=LAYOUT_ONE_ROW,
-        window=(date(2012, 4, 10), date(2026, 9, 3)),
+        window=window,
         splits=splits,
     )
 
 
+# The window of marketlake #1025's two files, the gap between #950's last session and the Schwab
+# import's first.
+_GAP_1025 = (date(2012, 4, 10), date(2026, 9, 3))
+# The window of marketlake #1043's two files, each fund's first session to the session before
+# its first capture span session, 2026-09-08.
+_SPY_1043 = (date(1993, 1, 29), date(2026, 9, 4))
+_QQQ_1043 = (date(1999, 3, 10), date(2026, 9, 4))
+
+
 # Every accepted vintage, reviewed in the pull request that adds it, so every run writes the
 # same metadata. #950's digests are quantitative-trading's ``data/checksums.sha256`` at 5787cd23.
-# The Yahoo digests are the two files' own, in marketlake #1025's table.
+# The Yahoo digests are each file's own, in the tables of marketlake #1025 and #1043.
 VINTAGES: Mapping[str, Vintage] = {
     v.sha256: v
     for v in (
@@ -370,6 +393,8 @@ VINTAGES: Mapping[str, Vintage] = {
             "USO",
             "uso_daily_yahoo_2026-11-22.csv",
             ((date(2020, 4, 29), 0.125),),
+            downloaded=date(2026, 11, 22),
+            window=_GAP_1025,
         ),
         # Downloaded at 2026-11-22T17:12:03Z.
         _yahoo(
@@ -377,6 +402,26 @@ VINTAGES: Mapping[str, Vintage] = {
             "GLD",
             "gld_daily_yahoo_2026-11-22.csv",
             (),
+            downloaded=date(2026, 11, 22),
+            window=_GAP_1025,
+        ),
+        # Downloaded at 2026-11-26T04:39:06Z.
+        _yahoo(
+            "c2aafddba5c921de725a341b10c1a3f7a9424866906479ad0abcea67855832c6",
+            "SPY",
+            "spy_daily_yahoo_2026-11-26.csv",
+            (),
+            downloaded=date(2026, 11, 26),
+            window=_SPY_1043,
+        ),
+        # Downloaded at 2026-11-26T04:39:07Z.
+        _yahoo(
+            "f9edb7d87e161d62ebc27d6618d512726a6fe8ae0dfe49eb4b2911a76f5a8662",
+            "QQQ",
+            "qqq_daily_yahoo_2026-11-26.csv",
+            ((date(2000, 3, 20), 2.0),),
+            downloaded=date(2026, 11, 26),
+            window=_QQQ_1043,
         ),
     )
 }
