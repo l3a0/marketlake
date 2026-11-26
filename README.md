@@ -1002,7 +1002,9 @@ that needs them at those types checks the table it got.
 
 A consumer depends on the package at one full commit SHA on `main`, since marketlake has no tags.
 It imports `lake.unsealed`, `lake.loader`, `lake.paths.is_reader_file` and
-`lake.manifest.latest_entries`.
+`lake.manifest.latest_entries`, among the modules
+[Which install to use](#which-install-to-use) lists. That install leaves out capture's packages,
+`schwab-py` among them.
 
 - **Raise the pin before the capture host's version moves.** A pinned reader reads every version up
   to its own `SCHEMA_VERSION`, and refuses a newer one. A bump on any surface moves the version on
@@ -1023,6 +1025,48 @@ It imports `lake.unsealed`, `lake.loader`, `lake.paths.is_reader_file` and
   here says which. So raise for the join alone only once the deploy is known by other means. Where the
   same raise carries a higher version, raise now, because a refused version stops every read, and take
   its rows as possibly unequal to the seal's until then.
+
+## Which install to use
+
+A program that only reads the lake needs none of capture's vendor client, `schwab-py`, nor the AWS
+and DuckDB clients the bucket jobs and the dashboard use, and an image that carries them costs every
+security review of it more to read
+([#1024](https://github.com/l3a0/marketlake/issues/1024)). So the package installs two ways.
+
+**Table:** what each install carries and who uses it
+
+| Install | How | Carries | Used by |
+| --- | --- | --- | --- |
+| Reader | a dependency on `marketlake @ git+https://github.com/l3a0/marketlake@<sha>` | `exchange-calendars`, `pyarrow`, `pyyaml` | a consumer, such as ithildin-runtime |
+| Capture | `uv sync` in a checkout | the reader's packages, and the `capture` group: `boto3`, `duckdb`, `schwab-py` | the VM, the laptop and CI |
+
+The reader install imports these modules, which are every one that ithildin-runtime's code and
+tests import:
+
+- `lake.actions`, `lake.config`, `lake.loader`, `lake.manifest`, `lake.paths` and `lake.unsealed`,
+  which its code imports.
+- `lake.bar_import`, `lake.battery`, `lake.calendar`, `lake.capture_spans`, `lake.gap`,
+  `lake.journal`, `lake.schema_versions`, `lake.security_master` and `lake.segment_join`, which its
+  tests import to build and check a fixture lake.
+
+Any other module may need capture's packages. So may a function inside one of these that reaches
+a capture module when it runs, such as `lake.bar_import`'s undo, which reads the bucket.
+
+`[tool.uv] default-groups` in `pyproject.toml` puts the `capture` group in every `uv sync` in a
+checkout, so `uv sync --frozen --no-dev`, which `deploy/linux-install.sh` runs on the VM, installs
+it and leaves out only the `dev` group. A consumer's installer reads `[project] dependencies` alone,
+so it never sees the group. Never sync a checkout that captures in a way that leaves out the
+`capture` group, such as with `--no-default-groups`, `--no-group capture`, `--only-dev` or an
+`--only-group` that names another group, or with `UV_NO_DEFAULT_GROUPS` or `UV_NO_GROUP` set.
+
+`tests/component/test_reader_install.py` checks both installs.
+
+1. It syncs the reader form into a clean virtualenv and imports each module above with no capture
+   package present.
+2. It fails when one of those modules' own source imports a capture package, inside a function
+   included, and when this list and its own differ.
+3. It fails when the flags `deploy/linux-install.sh` syncs with leave out a package any module in
+   `src/lake` imports.
 
 ## Install on a Linux host
 

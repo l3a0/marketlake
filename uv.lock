@@ -448,15 +448,17 @@ name = "marketlake"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
-    { name = "boto3" },
-    { name = "duckdb" },
     { name = "exchange-calendars" },
     { name = "pyarrow" },
     { name = "pyyaml" },
-    { name = "schwab-py" },
 ]
 
 [package.dev-dependencies]
+capture = [
+    { name = "boto3" },
+    { name = "duckdb" },
+    { name = "schwab-py" },
+]
 dev = [
     { name = "pytest" },
     { name = "pytest-xdist" },
@@ -466,15 +468,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", specifier = ">=1.43.108" },
-    { name = "duckdb", specifier = ">=1.5.5" },
     { name = "exchange-calendars", specifier = ">=4.5" },
     { name = "pyarrow", specifier = ">=17" },
     { name = "pyyaml", specifier = ">=6" },
-    { name = "schwab-py", specifier = ">=1.5" },
 ]
 
 [package.metadata.requires-dev]
+capture = [
+    { name = "boto3", specifier = ">=1.43.108" },
+    { name = "duckdb", specifier = ">=1.5.5" },
+    { name = "schwab-py", specifier = ">=1.5" },
+]
 dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-xdist", specifier = ">=3.8" },

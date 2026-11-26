@@ -4,22 +4,31 @@ version = "0.0.0"
 description = "Capture-first market data lake for Schwab option chains and equity quotes."
 readme = "README.md"
 requires-python = ">=3.12"
+# The plain install reads the lake, and is what a consumer pinning this package gets. The
+# capture group below holds what only capture, the bucket jobs and the dashboard import, and
+# default-groups makes every uv sync in a checkout install it, --no-dev included. The README's
+# "Which install to use" says which install is which.
 dependencies = [
-    "boto3>=1.43.108",
-    "duckdb>=1.5.5",
     "exchange-calendars>=4.5",
     "pyarrow>=17",
     "pyyaml>=6",
-    "schwab-py>=1.5",
 ]
 
 [dependency-groups]
+capture = [
+    "boto3>=1.43.108",
+    "duckdb>=1.5.5",
+    "schwab-py>=1.5",
+]
 dev = [
     "pytest>=8",
     "pytest-xdist>=3.8",
     "python-hcl2>=8.1.4",
     "ruff>=0.8",
 ]
+
+[tool.uv]
+default-groups = ["capture", "dev"]
 
 [build-system]
 requires = ["hatchling"]
