@@ -2407,8 +2407,8 @@ morning's 07:35 slot, and the night's stop counts for that evening's slot. A che
 never pinged stays `new` and never pages. So press Ping Now on each check only once the
 thing that feeds it is live: `vm-up` after the deploy that installs its timer, and
 `vm-stop` on the day the switch is created. Pressed earlier, a check goes down at its first
-deadline, sends one push, and then stays down without another, because healthchecks.io pushes only
-on the transition. If its feeder then goes live and fails from the start, the check is already down
+deadline, sends one alert, a push or an email by its routing, and then stays down without another,
+because healthchecks.io alerts only when a check changes state. If its feeder then goes live and fails from the start, the check is already down
 and sends nothing.
 
 Every failure that only `vm-stop` catches costs about $0.04 an hour, since a hung job is
@@ -2604,9 +2604,9 @@ refuses. After the home address changes, edit the `owner_ssh_cidr` line in place
 ### Captured data not in the bucket
 
 A failed upload pages when the `compaction` and `evening-upload` checks go down, and nothing
-in this repository repeats that page. healthchecks.io pushes to the phone only when a check
-goes down, and its reminders go by email, which the account has off. So the 18:30 vendor
-sweep reads how far the bucket's
+in this repository repeats that page. healthchecks.io pushes to the phone once when a check
+goes down and once when it comes back up, never while it stays down, and its reminders go by
+email, which the account has off. So the 18:30 vendor sweep reads how far the bucket's
 `manifest.jsonl` reaches and pages every weekday until the bucket catches up, and
 [the design](../docs/design.md#deployment-laptop-now-dedicated-later) carries the reasoning under "A bucket that stays
 behind keeps paging".
@@ -2703,8 +2703,8 @@ failed, which is the finding the drill exists for. The `live` rule has been in f
 [#996](https://github.com/l3a0/marketlake/issues/996) for the owner, who decides whether to
 stop the rule as
 [Stop the live rule, or read a live segment back](#stop-the-live-rule-or-read-a-live-segment-back)
-says. healthchecks.io pushes only when a check goes down, so each down check sends one push
-and no more.
+says. healthchecks.io pushes once when a check goes down and once when it comes back up, so
+each down check sends one `is DOWN` push and nothing more until its `is UP`.
 
 **Part 1, the page.** Run this as `ubuntu` on the VM at any hour it is up. It copies the
 manifest to a scratch directory, adds one file the bucket has never held, and points a copy of
@@ -2747,7 +2747,8 @@ The check goes down at about 17:00. Record the push. The evening upload then car
 day, so nothing stays behind. The check comes back up on the next compaction run that
 uploads. The daemon runs a day's compaction a minute after close+15, and a daemon started
 later than that runs it on its second minute. So any daemon start that evening, such as a
-VM started by hand or a deploy, clears the check within a few minutes. Otherwise the next
+VM started by hand or a deploy that restarts the daemon, clears the check within a few
+minutes. A deploy of the commit already running restarts nothing. Otherwise the next
 weekday's run clears it: close+15 on a session day, or 16:30 on a holiday.
 
 **Part 3, `evening-upload`.** On another session day, run the same two commands around the
@@ -2767,11 +2768,15 @@ logged in until the restore's `grep` prints the real prefix, because the VM can 
    journalctl -u com.marketlake.eod-sweep -f
    ```
 
-   That second line, and the page's table row above, name `first-upload`. Do not run it,
-   because against `lake-drill` it would write the lake to the bucket.
-3. A `sweep: no hand-off to compaction:` line, or an `eod-sweep` push, means the sweep itself
-   failed, as it did when it ran out of memory on 2026-11-06. Such a run proves nothing about
-   `evening-upload`, so restore and run Part 3 again on another session day.
+   That second line names `first-upload`. Do not run it, because against `lake-drill` it
+   would write the lake to the bucket.
+3. Any of three signs means the sweep itself failed, and such a run proves nothing about
+   `evening-upload`. Restore at once and run Part 3 again on another session day.
+   1. A `sweep: no hand-off to compaction:` line.
+   2. A systemd line that the unit failed, such as `Failed with result 'oom-kill'`, which is
+      how the sweep that ran out of memory on 2026-11-06 ended. A sweep killed that way
+      prints neither of the lines in step 2.
+   3. No `compact:` line by about 19:00, when the `eod-sweep` check goes down and pushes.
 4. The check goes down at about 20:30. Record both pushes.
 5. Only the sweep's hand-off pings `evening-upload`. The daemon's own compaction pings
    `compaction`, so a VM started by hand does not clear this check. It comes back up on the
