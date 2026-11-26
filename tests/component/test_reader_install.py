@@ -7,10 +7,11 @@ the installer, so they sit in the component tier.
 
 1. The reader install, synced offline from uv.lock into a clean virtualenv, imports every
    module a consumer imports and holds none of the capture-only packages.
-2. The capture install, read from ``uv export`` under the flags ``deploy/linux-install.sh``
+2. Those modules' own source imports no capture-only package anywhere, inside functions
+   included, since an import there fails only when the function runs.
+3. The README's "Which install to use" lists exactly those modules.
+4. The capture install, read from ``uv export`` under the flags ``deploy/linux-install.sh``
    syncs with, holds every third-party package any module in ``src/lake`` imports.
-
-The README's "Which install to use" says which install is which.
 """
 
 from __future__ import annotations
@@ -31,16 +32,26 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = REPO_ROOT / "src" / "lake"
 LINUX_INSTALL = REPO_ROOT / "deploy" / "linux-install.sh"
+README = REPO_ROOT / "README.md"
 
-# What l3a0/ithildin-runtime imports, and what the README's "How a consumer pins it" names.
-# lake.bar_import is imported by the runtime's tests alone, to build a fixture lake.
+# Every lake module l3a0/ithildin-runtime's code and tests import, read at its 09c4547. Its
+# code imports actions, config, loader, manifest, paths and unsealed, and its tests import
+# the rest to build and check a fixture lake.
 READER_MODULES = (
     "lake.actions",
     "lake.bar_import",
+    "lake.battery",
+    "lake.calendar",
+    "lake.capture_spans",
     "lake.config",
+    "lake.gap",
+    "lake.journal",
     "lake.loader",
     "lake.manifest",
     "lake.paths",
+    "lake.schema_versions",
+    "lake.security_master",
+    "lake.segment_join",
     "lake.unsealed",
 )
 
@@ -61,8 +72,9 @@ def _run(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
     result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         pytest.fail(
-            f"{shlex.join(args)} exited {result.returncode}. An offline install needs the "
-            f"wheels uv.lock pins in uv's cache, which `uv sync` puts there.\n{result.stderr}"
+            f"{shlex.join(args)} exited {result.returncode}. An offline sync needs the wheels "
+            f"uv.lock pins, and the hatchling that builds the package, in uv's cache, where "
+            f"the checkout's own `uv sync` puts them.\n{result.stderr}"
         )
     return result.stdout
 
@@ -85,22 +97,31 @@ def _linux_install_sync_flags() -> list[str]:
     return [flag for flag in shlex.split(found[0]) if flag != "--frozen"]
 
 
+def _capture_only() -> set[str]:
+    """The distributions the capture install holds and the reader install does not."""
+    capture_only = _export(_linux_install_sync_flags()) - _export(["--no-default-groups"])
+    # The split as pyproject.toml states it today, so a derivation gone empty cannot pass
+    # for a clean install. Moving a package across the split changes this line too.
+    assert {"schwab-py", "boto3", "duckdb"} <= capture_only, capture_only
+    return capture_only
+
+
 def test_reader_install_imports_every_reader_module_without_capture_packages(tmp_path):
     uv = _uv()
-    reader = _export(["--no-default-groups"])
-    capture_only = _export(_linux_install_sync_flags()) - reader
-    # The split itself, so a derivation gone empty cannot pass for a clean install.
-    assert {"schwab-py", "boto3", "duckdb"} <= capture_only
+    capture_only = _capture_only()
 
     # The package's own dependencies and no group, at uv.lock's versions, with the package
     # built as a wheel rather than linked to the checkout. A frozen sync installs from the
     # lock's URLs, so it works offline from what the checkout's own sync cached. A resolve,
-    # as `uv pip install` does, would need index pages a frozen sync never fetched.
+    # as `uv pip install` does, would need index pages a frozen sync never fetched. uv keys
+    # its cached build of a local package on pyproject.toml's modification time, so an edit
+    # under src/lake alone would reuse a stale wheel without --reinstall-package.
     venv = tmp_path / "venv"
     _run(
         [
             uv, "sync", "--quiet", "--frozen", "--offline", "--no-default-groups",
-            "--no-editable", "--python", sys.executable, "--project", str(REPO_ROOT),
+            "--no-editable", "--reinstall-package", "marketlake",
+            "--python", sys.executable, "--project", str(REPO_ROOT),
         ],
         tmp_path,
         env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv)},
@@ -125,14 +146,14 @@ print(json.dumps({{"files": files, "installed": installed, "prefix": sys.prefix}
     assert not installed & capture_only, f"the reader install holds {installed & capture_only}"
 
 
-def _third_party_imports() -> dict[str, set[str]]:
-    """Every top-level module name ``src/lake`` imports outside the standard library.
+def _third_party_imports(paths: list[Path] | None = None) -> dict[str, set[str]]:
+    """Every top-level module name the files import outside the standard library.
 
-    Function-local imports count, since ``lake.schwab`` imports ``schwab`` only inside its
-    functions and capture still needs it installed.
+    The files default to all of ``src/lake``. Function-local imports count, since
+    ``lake.schwab`` imports ``schwab`` only inside its functions and capture still needs it.
     """
     found: dict[str, set[str]] = {}
-    for path in sorted(SOURCE.rglob("*.py")):
+    for path in paths if paths is not None else sorted(SOURCE.rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
@@ -145,6 +166,24 @@ def _third_party_imports() -> dict[str, set[str]]:
                 if top != "lake" and top not in sys.stdlib_module_names:
                     found.setdefault(top, set()).add(path.name)
     return found
+
+
+def test_reader_modules_import_no_capture_package_anywhere():
+    capture_only = _capture_only()
+    providers = importlib.metadata.packages_distributions()
+    files = [SOURCE / f"{name.removeprefix('lake.')}.py" for name in READER_MODULES]
+    found = {
+        top: sorted(names)
+        for top, names in _third_party_imports(files).items()
+        if {_normalize(d) for d in providers.get(top, [])} & capture_only
+    }
+    assert not found, f"reader modules import capture-only packages: {found}"
+
+
+def test_readme_lists_the_reader_modules():
+    section = README.read_text().split("\n## Which install to use\n", 1)[1].split("\n## ", 1)[0]
+    listed = section.split("The reader install imports", 1)[1].split("Any other module", 1)[0]
+    assert set(re.findall(r"`(lake\.[a-z_]+)`", listed)) == set(READER_MODULES)
 
 
 def test_capture_install_carries_every_package_lake_imports():
