@@ -5,7 +5,7 @@ needs. Every ``uv sync`` in a checkout also installs the ``capture`` group, whic
 only capture, the bucket jobs and the dashboard import. These tests cross one real boundary,
 the installer, so they sit in the component tier.
 
-1. The reader install, built offline from uv's cache into a clean virtualenv, imports every
+1. The reader install, synced offline from uv.lock into a clean virtualenv, imports every
    module a consumer imports and holds none of the capture-only packages.
 2. The capture install, read from ``uv export`` under the flags ``deploy/linux-install.sh``
    syncs with, holds every third-party package any module in ``src/lake`` imports.
@@ -57,8 +57,8 @@ def _uv() -> str:
     return uv
 
 
-def _run(args: list[str], cwd: Path) -> str:
-    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+def _run(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
         pytest.fail(
             f"{shlex.join(args)} exited {result.returncode}. An offline install needs the "
@@ -67,14 +67,10 @@ def _run(args: list[str], cwd: Path) -> str:
     return result.stdout
 
 
-def _export(flags: list[str], output: Path | None = None) -> set[str]:
+def _export(flags: list[str]) -> set[str]:
     """The distributions ``uv export --frozen`` lists under ``flags``, without the project."""
     args = [_uv(), "export", "--frozen", "--no-hashes", "--no-emit-project", *flags]
-    if output is None:
-        text = _run(args, REPO_ROOT)
-    else:
-        _run([*args, "--output-file", str(output)], REPO_ROOT)
-        text = output.read_text()
+    text = _run(args, REPO_ROOT)
     return {
         _normalize(line.split("==", 1)[0])
         for line in text.splitlines()
@@ -91,21 +87,25 @@ def _linux_install_sync_flags() -> list[str]:
 
 def test_reader_install_imports_every_reader_module_without_capture_packages(tmp_path):
     uv = _uv()
-    reader = _export(["--no-default-groups"], output=tmp_path / "constraints.txt")
+    reader = _export(["--no-default-groups"])
     capture_only = _export(_linux_install_sync_flags()) - reader
     # The split itself, so a derivation gone empty cannot pass for a clean install.
     assert {"schwab-py", "boto3", "duckdb"} <= capture_only
 
+    # The package's own dependencies and no group, at uv.lock's versions, with the package
+    # built as a wheel rather than linked to the checkout. A frozen sync installs from the
+    # lock's URLs, so it works offline from what the checkout's own sync cached. A resolve,
+    # as `uv pip install` does, would need index pages a frozen sync never fetched.
     venv = tmp_path / "venv"
-    _run([uv, "venv", "--quiet", "--python", sys.executable, str(venv)], tmp_path)
-    python = venv / "bin" / "python"
     _run(
         [
-            uv, "pip", "install", "--quiet", "--offline", "--python", str(python),
-            "--constraints", str(tmp_path / "constraints.txt"), str(REPO_ROOT),
+            uv, "sync", "--quiet", "--frozen", "--offline", "--no-default-groups",
+            "--no-editable", "--python", sys.executable, "--project", str(REPO_ROOT),
         ],
         tmp_path,
+        env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(venv)},
     )  # fmt: skip
+    python = venv / "bin" / "python"
 
     # -I keeps the working directory and every PYTHON* variable off sys.path, and the
     # working directory sits outside the checkout, so lake can only come from the install.
