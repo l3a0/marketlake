@@ -15,7 +15,11 @@ their entries carry a ``window`` and the rows outside it are counted and left ou
 and volume are Yahoo's, adjusted for the splits it knew on the download date, so USO's before its
 one-for-eight reverse split of 2020-04-29 read eight times what traded and its volume an eighth.
 No ledger entry records that split, because ``load_bars``' adjusted views refuse an imported row
-and a reader that applied one to these rows itself would take the factor twice. Yahoo's terms
+and a reader that applied one to these rows itself would take the factor twice. marketlake #1043's
+are the same download of SPY and QQQ, from each fund's first session to 2026-09-04, the session
+before their first capture span session. QQQ's prices before its two-for-one split of 2000-03-20
+read half what traded and its volume twice, and neither file's ``Close`` carries a dividend
+adjustment. That split has no ledger entry either, for the same reason. Yahoo's terms
 forbid republishing the bytes, so the one-row layout's refusals quote no price, volume or split
 value.
 
@@ -332,25 +336,42 @@ def _vintage(sha256: str, ticker: str, path: str) -> Vintage:
     )
 
 
-def _yahoo(sha256: str, ticker: str, name: str, splits: tuple[tuple[date, float], ...]) -> Vintage:
+def _yahoo(
+    sha256: str,
+    ticker: str,
+    name: str,
+    splits: tuple[tuple[date, float], ...],
+    *,
+    downloaded: date,
+    window: tuple[date, date],
+) -> Vintage:
     # yfinance 1.8.0 with ``auto_adjust=False``, so the prices and the volume carry Yahoo's split
-    # adjustment as of the download. The window is the gap between #950's last session and the
-    # Schwab import's first (marketlake #1025).
+    # adjustment as of the download, and ``Close`` carries no dividend adjustment. ``downloaded``
+    # is the download's UTC date, which the file's name carries too.
     return Vintage(
         sha256=sha256,
         ticker=ticker,
         source=f"yahoo:{name}",
-        source_as_of=date(2026, 11, 22),
+        source_as_of=downloaded,
         basis=BASIS_ADJUSTED,
         layout=LAYOUT_ONE_ROW,
-        window=(date(2012, 4, 10), date(2026, 9, 3)),
+        window=window,
         splits=splits,
     )
 
 
+# The window of marketlake #1025's two files, the gap between #950's last session and the Schwab
+# import's first.
+_GAP_1025 = (date(2012, 4, 10), date(2026, 9, 3))
+# The window of marketlake #1043's two files, each fund's first session to the session before
+# its first capture span session, 2026-09-08.
+_SPY_1043 = (date(1993, 1, 29), date(2026, 9, 4))
+_QQQ_1043 = (date(1999, 3, 10), date(2026, 9, 4))
+
+
 # Every accepted vintage, reviewed in the pull request that adds it, so every run writes the
 # same metadata. #950's digests are quantitative-trading's ``data/checksums.sha256`` at 5787cd23.
-# The Yahoo digests are the two files' own, in marketlake #1025's table.
+# The Yahoo digests are each file's own, in the tables of marketlake #1025 and #1043.
 VINTAGES: Mapping[str, Vintage] = {
     v.sha256: v
     for v in (
@@ -370,6 +391,8 @@ VINTAGES: Mapping[str, Vintage] = {
             "USO",
             "uso_daily_yahoo_2026-11-22.csv",
             ((date(2020, 4, 29), 0.125),),
+            downloaded=date(2026, 11, 22),
+            window=_GAP_1025,
         ),
         # Downloaded at 2026-11-22T17:12:03Z.
         _yahoo(
@@ -377,6 +400,26 @@ VINTAGES: Mapping[str, Vintage] = {
             "GLD",
             "gld_daily_yahoo_2026-11-22.csv",
             (),
+            downloaded=date(2026, 11, 22),
+            window=_GAP_1025,
+        ),
+        # Downloaded at 2026-11-26T04:39:06Z.
+        _yahoo(
+            "c2aafddba5c921de725a341b10c1a3f7a9424866906479ad0abcea67855832c6",
+            "SPY",
+            "spy_daily_yahoo_2026-11-26.csv",
+            (),
+            downloaded=date(2026, 11, 26),
+            window=_SPY_1043,
+        ),
+        # Downloaded at 2026-11-26T04:39:07Z.
+        _yahoo(
+            "f9edb7d87e161d62ebc27d6618d512726a6fe8ae0dfe49eb4b2911a76f5a8662",
+            "QQQ",
+            "qqq_daily_yahoo_2026-11-26.csv",
+            ((date(2000, 3, 20), 2.0),),
+            downloaded=date(2026, 11, 26),
+            window=_QQQ_1043,
         ),
     )
 }

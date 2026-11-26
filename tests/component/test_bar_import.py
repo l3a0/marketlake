@@ -22,7 +22,9 @@ Acceptance list.
 Marketlake #1025 adds Yahoo Finance's files: a header of one row, a window, a list of splits
 checked against the file, a volume that lands, and an undo that looks for a killed import's files
 every time. Those cases follow that issue's Acceptance list, in their own section at the end.
-Their bars are made up, because Yahoo's terms forbid republishing its own.
+Marketlake #1043 lists the same download of SPY and QQQ, and its one case reads a made-up file
+from 1993 with a split of 2.0. Their bars are made up, because Yahoo's terms forbid republishing
+its own.
 
 Every CSV is written here and hashed here with ``hashlib``, so no expected value comes from the
 code under test.
@@ -236,11 +238,13 @@ def test_a_session_the_file_lacks_is_counted_and_not_refused(tmp_path):
 
 
 def test_the_listed_vintages_carry_the_values_the_issues_reviewed():
-    """The module's list matches the tables in #950 and #1025, written out here as literals."""
+    """The module's list matches the tables in #950, #1025 and #1043, written out as literals."""
     gld = "81e6295a8028362f82f9e96a89c686ef89991cb23afe42d4f884756019dc9d4c"
     uso = "94b6521980f64ce80feb5cdffb22168ed44f71eeaa93caca672f316eeda60ec2"
     yahoo_uso = "72bb286f57f637c9ef517b98631a68f7e8f2d7869af4935441b555b11f60d561"
     yahoo_gld = "b6675ed455acf0174854377f8a51061fb18c0b1bf0a9a0f7632ac557b6fcb4f9"
+    yahoo_spy = "c2aafddba5c921de725a341b10c1a3f7a9424866906479ad0abcea67855832c6"
+    yahoo_qqq = "f9edb7d87e161d62ebc27d6618d512726a6fe8ae0dfe49eb4b2911a76f5a8662"
     gap = (date(2012, 4, 10), date(2026, 9, 3))
     assert {digest: astuple(v) for digest, v in bar_import.VINTAGES.items()} == {
         gld: (
@@ -282,6 +286,26 @@ def test_the_listed_vintages_carry_the_values_the_issues_reviewed():
             "one-row",
             gap,
             (),
+        ),
+        yahoo_spy: (
+            yahoo_spy,
+            "SPY",
+            "yahoo:spy_daily_yahoo_2026-11-26.csv",
+            date(2026, 11, 26),
+            "adjusted",
+            "one-row",
+            (date(1993, 1, 29), date(2026, 9, 4)),
+            (),
+        ),
+        yahoo_qqq: (
+            yahoo_qqq,
+            "QQQ",
+            "yahoo:qqq_daily_yahoo_2026-11-26.csv",
+            date(2026, 11, 26),
+            "adjusted",
+            "one-row",
+            (date(1999, 3, 10), date(2026, 9, 4)),
+            ((date(2000, 3, 20), 2.0),),
         ),
     }
     for digest, vintage in bar_import.VINTAGES.items():
@@ -2815,3 +2839,39 @@ def test_a_rerun_of_a_windowed_import_writes_nothing_and_exits_zero(tmp_path, mo
     assert out.count("landed 0 of 4 row(s)") == 2 and out.count("4 already imported") == 2
     assert _snapshot(root) == before
     assert {rel: os.stat(root / rel).st_mtime_ns for rel in before} == mtimes
+
+
+# -- a history from 1993 with a forward split (marketlake #1043) ---------------------------
+
+
+def test_a_file_from_1993_with_a_split_of_two_lands_its_window(tmp_path):
+    """#1043 acceptance 2. SPY's file starts in 1993 and QQQ's records a split of 2.0. Catches a
+    history calendar that stops 20 years back, and a split check that takes only factors below
+    one. Every row carries a dividend, which the import does not read."""
+    root = _lake(tmp_path)
+    days = ("1993-01-28", "1993-01-29", "1993-02-01", "1993-02-02", "1993-02-03")
+    rows = _days(*days, d01={"Stock_Splits": "2.000000"})
+    source = _one_row(tmp_path / "src" / "qqq.csv", rows)
+    window = (date(1993, 1, 29), date(1993, 2, 2))
+    split = ((date(1993, 2, 1), 2.0),)
+    before = _snapshot(root)
+
+    assert _refused(root, [source], _entry(source, window=window)) == (
+        f"{source} line 4 holds a split on 1993-02-01 in its Stock Splits column, which GLD's "
+        "entry does not list, so nothing was imported"
+    )
+    assert _snapshot(root) == before
+
+    summary = _run(root, [source], _entry(source, window=window, splits=split))
+
+    assert summary.render().endswith(
+        "0 recorded file(s) found missing and written again, 2 row(s) outside the window"
+    )
+    assert [(t.landed, t.missing) for t in summary.tickers] == [(3, 0)]
+    table = load_bars("GLD", "1d", "1993-01-29", "1993-02-02", lake_root=root, adjust="none")
+    assert table.column("close").to_pylist() == [41.123456, 42.123456, 43.123456]
+    assert table.column("open").to_pylist() == [40.373456, 41.373456, 42.373456]
+    assert table.column("volume").to_pylist() == [1000301, 1000302, 1000303]
+    assert table.column("bar_ts").to_pylist() == [
+        f"{day}T05:00:00+00:00" for day in ("1993-01-29", "1993-02-01", "1993-02-02")
+    ]
