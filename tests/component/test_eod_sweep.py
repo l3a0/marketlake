@@ -233,8 +233,10 @@ def _master(tickers: tuple[str, ...] = ("SPY",)) -> SecurityMaster:
 
 
 def _daily_candle(session: date = SESSION, *, close: float = SETTLED_CLOSE) -> dict:
+    # The high and low are ``_minute_bars_table``'s session high and low, which the 1-minute
+    # fallback compares against (marketlake #1038).
     when = datetime.fromisoformat(f"{session.isoformat()}T00:00:00-04:00")
-    return bars_candle(when, open_=645.0, high=651.0, low=644.0, close=close, volume=70_000_000)
+    return bars_candle(when, open_=648.0, high=650.5, low=647.5, close=close, volume=70_000_000)
 
 
 def _cassette(close: float = SETTLED_CLOSE, *, session: date = SESSION) -> Cassette:
@@ -3421,8 +3423,11 @@ def _judged_quotes_table(rows: list[dict]) -> pa.Table:
     return pa.table(columns, schema=JUDGED_QUOTES_SCHEMA)
 
 
-def _minute_bars_table(day: date) -> pa.Table:
-    """A 1-minute partition an earlier run landed, whose last candle closes at the daily close."""
+def _minute_bars_table(day: date, close: float = SETTLED_CLOSE) -> pa.Table:
+    """A 1-minute partition an earlier run landed, whose last candle closes at ``close``.
+
+    The default is the daily close. The session's high and low are the daily candle's.
+    """
     day_open, day_close = _bounds(day)
     candles = [
         bars_candle(day_open, open_=648.0, high=649.0, low=647.5, close=648.5, volume=1_400_000),
@@ -3431,7 +3436,7 @@ def _minute_bars_table(day: date) -> pa.Table:
             open_=649.5,
             high=650.5,
             low=649.0,
-            close=SETTLED_CLOSE,
+            close=close,
             volume=2_100_000,
         ),
     ]
@@ -3456,6 +3461,7 @@ def _operator_night(
     lost: date | None = None,
     minute_bars: tuple[date, ...] = (),
     trim_minutes: bool = False,
+    minute_close: float = SETTLED_CLOSE,
 ):
     """A sweep over the lake shape the operator read on 2026-09-17 (marketlake #530).
 
@@ -3471,6 +3477,7 @@ def _operator_night(
     disk for each outage day it names, so the walk gates that day's daily bar against it
     (marketlake #947) and lands it. ``trim_minutes`` then removes those files while their
     manifest entries stay, the way the trim leaves a partition it moved to the bucket.
+    ``minute_close`` is those partitions' last close.
     """
     night = date(2026, 9, 18)
     baseline = date(2026, 9, 17)
@@ -3486,7 +3493,7 @@ def _operator_night(
         fixture_lake.with_quotes("SPY", day, _judged_quotes_table(rows))
         fixture_lake.with_chains("SPY", day, sample_chains_table())
     for day in minute_bars:
-        fixture_lake.with_bars("SPY", MINUTE_FREQ, day, _minute_bars_table(day))
+        fixture_lake.with_bars("SPY", MINUTE_FREQ, day, _minute_bars_table(day, minute_close))
     root = _lake(fixture_lake, quotes={})
     if lost is not None:
         (root / QUOTES / "ticker=SPY" / f"date={lost.isoformat()}.parquet").unlink()
@@ -3568,9 +3575,9 @@ def test_a_bar_gated_against_the_minute_close_is_counted_on_its_own_line(
     root, outcome = _operator_night(fixture_lake, minute_bars=(rescued,))
     assert outcome.nightly.report[:2] == (
         "bars abandoned: 5 ticker-day(s), 5 SnapAbsent",
-        "bars gated against the 1m close: 1 ticker-day(s)",
+        "bars gated against the 1m bars: 1 ticker-day(s)",
     )
-    assert kind_of(outcome.nightly, "bars gated against the 1m close") == INFO
+    assert kind_of(outcome.nightly, "bars gated against the 1m bars") == INFO
     assert outcome.nightly.problems == ()
     assert LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, rescued).exists()
 
@@ -3596,8 +3603,27 @@ def test_the_gated_line_stands_when_every_outage_day_is_rescued(fixture_lake: Fi
     _, outcome = _operator_night(fixture_lake, minute_bars=OUTAGE_SESSIONS)
     lines = outcome.nightly.report
     assert not any(line.startswith("bars abandoned") for line in lines)
-    assert f"bars gated against the 1m close: {len(OUTAGE_SESSIONS)} ticker-day(s)" in lines
-    assert kind_of(outcome.nightly, "bars gated against the 1m close") == INFO
+    assert f"bars gated against the 1m bars: {len(OUTAGE_SESSIONS)} ticker-day(s)" in lines
+    assert kind_of(outcome.nightly, "bars gated against the 1m bars") == INFO
+    assert not any(line.startswith("bars whose close passed") for line in lines)
+
+
+def test_a_bar_whose_close_passed_inside_the_last_candle_is_counted_apart(
+    fixture_lake: FixtureLake,
+):
+    # Marketlake #1038. The last 1-minute candle closes at 650.4, so the daily close of 650.00
+    # sits 6.2 basis points off it, past the close test, and inside that candle's 649.0 to 650.5
+    # range. The daily high and low are the session's own, so the bar lands, and a second
+    # ``info`` line counts it apart from the bars that passed within 5 basis points.
+    rescued = OUTAGE_SESSIONS[:2]
+    root, outcome = _operator_night(fixture_lake, minute_bars=rescued, minute_close=650.4)
+    lines = outcome.nightly.report
+    assert "bars gated against the 1m bars: 2 ticker-day(s)" in lines
+    assert "bars whose close passed inside the last 1m candle: 2 ticker-day(s)" in lines
+    assert kind_of(outcome.nightly, "bars whose close passed inside the last 1m candle") == INFO
+    assert outcome.nightly.problems == ()
+    for day in rescued:
+        assert LakePaths(root).bars_partition_path("SPY", DAILY_FREQ, day).exists()
 
 
 def test_a_lost_quotes_day_never_falls_back_and_still_asks_for_a_restore(

@@ -1708,19 +1708,28 @@ def sweep(
                         f"bars abandoned: {len(walked.abandoned)} ticker-day(s), {census}",
                         INFO if set(reasons) <= PERMANENT_ABANDON_REASONS else ACTION,
                     )
-                # A daily bar gated against its session's 1-minute close because its 16:15 quote
+                # A daily bar gated against its session's 1-minute bars because its 16:15 quote
                 # was missed, which is marketlake #947. It reports no fault: the bar landed, and
                 # the vendor's daily candle is the same official close whichever reference judged
                 # it. The reference is looser, the last regular trade rather than the close, so
-                # the line counts the bars it judged, night by night. It names none of them, for
-                # the reason the abandoned census above gives, and the by-hand ``--backfill``
-                # block names each. It carries one ``": "`` so ``report.redacted`` keeps it whole.
+                # the line counts the bars it judged, night by night, and a second line counts
+                # those whose close passed only by lying inside the last candle (#1038). Neither
+                # names a bar, for the reason the abandoned census above gives, and the by-hand
+                # ``--backfill`` block names each. Each carries one ``": "`` so
+                # ``report.redacted`` keeps it whole.
                 minute_gated = [
                     entry for entry in walked.landed if entry.gated_by == CHECK_BAR_MINUTE_CLOSE
                 ]
                 if minute_gated:
                     report.add(
-                        f"bars gated against the 1m close: {len(minute_gated)} ticker-day(s)",
+                        f"bars gated against the 1m bars: {len(minute_gated)} ticker-day(s)",
+                        INFO,
+                    )
+                by_range = [entry for entry in minute_gated if entry.by_range]
+                if by_range:
+                    report.add(
+                        f"bars whose close passed inside the last 1m candle: {len(by_range)} "
+                        "ticker-day(s)",
                         INFO,
                     )
                 # A ticker-day the run's request budget stopped it from fetching, which is
